@@ -19,7 +19,7 @@ findings:
   - resolved: DEP-008 and the foundation exit evidence formerly left transitive helpers ambiguous; the exit evidence now distinguishes app-selected direct role providers from implementation details used only inside an approved dependency (independent d922070 1)
   - resolved: DEP-001 formerly allowed forbidden appearance identifiers assembled from source fragments; it now compares normalized source as well as contiguous spellings (independent d922070 2)
   - resolved: DEP-003 formerly checked only dependency metadata; it now rejects Rust source that combines Desktop Entry content with hand-written line and key/value parsing (independent d922070 3)
-  - open: DEP-007 can false-pass with its four required crates moved to package metadata because it matches dependency-like text in any TOML section and omits Cargo.lock (independent d922070 4)
+  - resolved: DEP-007 formerly parsed dependency-like TOML text; it now uses locked Cargo metadata for normal workspace dependencies and verifies approved resolved versions in Cargo.lock (independent d922070 4)
   - open: DEP-007 can false-pass compiled raw-libc and mount-table bypasses when imports are aliased and paths are assembled from string fragments (independent d922070 5)
   - open: DEP-008 can false-pass a compiled second traversal provider because its finite blacklist does not include the `ignore` crate (independent d922070 6)
   - open: DEP-008 can false-pass lossless local paths represented by Camino when the crate import is aliased (independent d922070 7)
@@ -65,6 +65,10 @@ again after the probe was removed.
 For independent finding d922070 3, DEP-003 passed on the clean tree and rejected
 a temporary, compiling parser over `[Desktop Entry]` key/value lines. It passed
 again after the parser was removed.
+
+For independent finding d922070 4, DEP-007 passed on the clean tree and rejected
+a temporary move of `nix` from normal dependencies into package metadata. It
+passed again after restoring the dependency declaration.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

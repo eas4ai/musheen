@@ -9,27 +9,23 @@ const tracked = (...pathspecs) =>
   })
     .split("\0")
     .filter(Boolean);
-const manifests = tracked(":(glob)**/Cargo.toml").map((path) => ({
-  path,
-  text: readFileSync(path, "utf8"),
-}));
+const metadata = JSON.parse(execFileSync(
+  "cargo",
+  ["metadata", "--locked", "--no-deps", "--format-version", "1"],
+  { encoding: "utf8" },
+));
+const workspaceMembers = new Set(metadata.workspace_members);
+const dependencies = metadata.packages
+  .filter(({ id }) => workspaceMembers.has(id))
+  .flatMap(({ dependencies: packageDependencies, manifest_path: path }) =>
+    packageDependencies
+      .filter(({ kind }) => kind === null)
+      .map((dependency) => ({ ...dependency, path }))
+  );
+const lock = readFileSync("Cargo.lock", "utf8");
 const failures = [];
 
-const declarations = (name) => {
-  const expression = new RegExp(
-    `^\\s*${name.replaceAll("-", "\\-")}\\s*=\\s*(?:"([^"]+)"|\\{([^}]*)\\})\\s*$`,
-    "m",
-  );
-  return manifests.flatMap(({ path, text }) => {
-    const match = expression.exec(text);
-    if (!match) return [];
-    return [{
-      path,
-      version: match[1] ?? /\bversion\s*=\s*"([^"]+)"/.exec(match[2])?.[1],
-      details: match[2] ?? "",
-    }];
-  });
-};
+const declarations = (name) => dependencies.filter((dependency) => dependency.name === name);
 
 const required = [
   ["nix", /^(?:\^|~)?0\.31(?:\.\d+)?$/],
@@ -40,25 +36,25 @@ const required = [
 for (const [name, versionPattern] of required) {
   const found = declarations(name);
   if (found.length === 0) failures.push(`${name} is not declared`);
-  for (const { path, version } of found) {
-    if (!versionPattern.test(version ?? "")) {
-      failures.push(`${path} declares ${name} ${version ?? "without a version"}`);
+  for (const { path, req } of found) {
+    if (!versionPattern.test(req ?? "")) {
+      failures.push(`${path} declares ${name} ${req ?? "without a version"}`);
     }
   }
+  const lockedVersions = [...lock.matchAll(
+    new RegExp(`\\[\\[package\\]\\]\\nname = "${name}"\\nversion = "([^"]+)"`, "g"),
+  )].map((match) => match[1]);
+  if (!lockedVersions.some((version) => versionPattern.test(version))) {
+    failures.push(`Cargo.lock does not resolve an approved ${name} version`);
+  }
 }
-for (const { path, details } of declarations("nix")) {
-  if (!/"fs"/.test(details)) failures.push(`${path} declares nix without its fs feature`);
+for (const { path, features } of declarations("nix")) {
+  if (!features.includes("fs")) failures.push(`${path} declares nix without its fs feature`);
 }
 
 for (const name of ["libc", "libmount", "mountpoints", "procfs", "sys-mount"]) {
   for (const { path } of declarations(name)) {
     failures.push(`${path} directly declares forbidden competing package ${name}`);
-  }
-  const alias = new RegExp(`\\bpackage\\s*=\\s*"${name}"`);
-  for (const { path, text } of manifests) {
-    if (alias.test(text)) {
-      failures.push(`${path} aliases forbidden competing package ${name}`);
-    }
   }
 }
 
