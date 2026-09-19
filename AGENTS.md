@@ -53,4 +53,7 @@ list commands run, and include screenshots for UI changes.
 Cairn is disabled while it is being rebuilt. Do not run `cairn`, treat
 `.cairn/` as historical data, and do not let Cairn records override the current
 task. Preserve unrelated working-tree changes and use the local
-`best-practices` skill for implementation and review work.
+`best-practices` skill for implementation and review work. For every Cargo
+command on this machine, set `CARGO_TARGET_DIR` to
+`/home/shawn/workspace2/scratchpads/musheen-target`; never share another
+project's target directory, including `suprnova-target`.
