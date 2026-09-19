@@ -11,4 +11,5 @@ Vendor native-theme-gpui 0.5.8 and remove only the two assignments to ThemeColor
 
 ## Realized by
 
-(none yet: recorded, not built)
+- 77a45a31f3695a55618087ecfb7b54a86ea19e59 build: add native theme dependencies
+- 443ca23b6b411b80a6e73ffac1e05dc1ee64b1c1 build: trim vendored theme connector
