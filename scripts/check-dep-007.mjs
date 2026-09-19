@@ -64,6 +64,9 @@ for (const path of tracked(":(glob)**/*.rs")) {
   if (/\blibc\s*::/.test(source) || /\bnix\s*::\s*libc\b/.test(source)) {
     failures.push(`${path} calls or imports libc directly`);
   }
+  if (/\b(?:unsafe\s+)?extern\s*"C"\s*\{[^}]*\b(?:f?statfs|f?statvfs)\s*\(/s.test(source)) {
+    failures.push(`${path} binds a filesystem-capacity call through raw C FFI`);
+  }
   const mountPaths = [
     "/etc/mtab",
     "/proc/mounts",
