@@ -1,0 +1,9 @@
+command: node scripts/check-dep-007.mjs
+inputs:
+  - :(glob)**/Cargo.toml
+  - :(glob)**/*.rs
+  - scripts/check-dep-007.mjs
+requirements:
+  - DEP-007
+results: per-requirement
+reviewed:
