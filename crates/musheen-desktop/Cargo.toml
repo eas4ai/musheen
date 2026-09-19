@@ -10,7 +10,6 @@ publish.workspace = true
 freedesktop.workspace = true
 musheen-core = { path = "../musheen-core" }
 musheen-ops = { path = "../musheen-ops" }
-native-theme.workspace = true
 open.workspace = true
 wax.workspace = true
 

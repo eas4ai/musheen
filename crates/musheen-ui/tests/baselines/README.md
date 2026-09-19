@@ -18,4 +18,6 @@ MUSHEEN_THEME_PREVIEW=dark GPUI_X11_SCALE_FACTOR=2 \
 
 Use `MUSHEEN_THEME_PREVIEW=high-contrast` for the accessibility baseline and
 `MUSHEEN_PREVIEW_WINDOW_WIDTH=720` for the narrow baseline. Capture only after
-the status bar reports `3 items`.
+the status bar reports `3 items`. For repeatable headless captures, start one
+1920x1200 Xvfb display, launch one Musheen instance on that display, and capture
+the application window with an X11 screenshot tool before stopping the instance.

@@ -73,6 +73,7 @@ pub enum CommandAction {
     Search,
     ViewList,
     ViewGrid,
+    ToggleInfo,
     SelectAll,
     ClearSelection,
     OpenSettings,
@@ -421,6 +422,14 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             &[],
             Predicate::Always,
             Action::ViewGrid,
+        ),
+        command(
+            "view.info",
+            "command.info-pane",
+            "info",
+            &[],
+            Predicate::Always,
+            Action::ToggleInfo,
         ),
         command(
             "selection.select_all",

@@ -1,4 +1,4 @@
-pub(crate) const COMMAND_IDS: [&str; 9] = [
+pub(crate) const COMMAND_IDS: [&str; 10] = [
     "navigation.back",
     "navigation.forward",
     "navigation.parent",
@@ -7,5 +7,6 @@ pub(crate) const COMMAND_IDS: [&str; 9] = [
     "view.search",
     "view.list",
     "view.grid",
+    "view.info",
     "app.settings",
 ];

@@ -21,6 +21,7 @@ pub enum FocusTarget {
     Location,
     Search,
     ViewMode,
+    InfoToggle,
     Settings,
     Sidebar,
     Directory,
@@ -44,7 +45,7 @@ const INFO_REGIONS: [SemanticRegion; 6] = [
     SemanticRegion::StatusBar,
 ];
 
-const BASE_FOCUS: [FocusTarget; 11] = [
+const BASE_FOCUS: [FocusTarget; 12] = [
     FocusTarget::Tabs,
     FocusTarget::Back,
     FocusTarget::Forward,
@@ -53,12 +54,13 @@ const BASE_FOCUS: [FocusTarget; 11] = [
     FocusTarget::Location,
     FocusTarget::Search,
     FocusTarget::ViewMode,
+    FocusTarget::InfoToggle,
     FocusTarget::Settings,
     FocusTarget::Sidebar,
     FocusTarget::Directory,
 ];
 
-const INFO_FOCUS: [FocusTarget; 12] = [
+const INFO_FOCUS: [FocusTarget; 13] = [
     FocusTarget::Tabs,
     FocusTarget::Back,
     FocusTarget::Forward,
@@ -67,6 +69,7 @@ const INFO_FOCUS: [FocusTarget; 12] = [
     FocusTarget::Location,
     FocusTarget::Search,
     FocusTarget::ViewMode,
+    FocusTarget::InfoToggle,
     FocusTarget::Settings,
     FocusTarget::Sidebar,
     FocusTarget::Directory,
@@ -114,6 +117,15 @@ impl ShellModel {
     #[must_use]
     pub fn commands(&self) -> &CommandRegistry {
         &self.commands
+    }
+
+    #[must_use]
+    pub const fn info_visible(&self) -> bool {
+        self.info_visible
+    }
+
+    pub fn toggle_info(&mut self) {
+        self.info_visible = !self.info_visible;
     }
 }
 

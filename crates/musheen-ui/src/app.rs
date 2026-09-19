@@ -17,6 +17,7 @@ use musheen_core::{CommandAction, DisplayPath, ItemKind, ResourceLimits, Store, 
 use musheen_local::LocalStore;
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
+use native_theme_gpui::NativeTheme;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -177,6 +178,11 @@ struct MusheenApp {
 }
 
 impl MusheenApp {
+    fn high_contrast(cx: &Context<Self>) -> bool {
+        cx.try_global::<NativeTheme>()
+            .is_some_and(|theme| theme.accessibility().high_contrast)
+    }
+
     fn new(initial_path: PathBuf, cx: &mut Context<Self>) -> Self {
         let limits = ResourceLimits::default();
         let initial = StorePath::from_unix_path(initial_path.into_os_string());
@@ -276,6 +282,10 @@ impl MusheenApp {
                 self.view_mode = ViewMode::Grid;
                 cx.notify();
             }
+            Some(CommandAction::ToggleInfo) => {
+                self.shell.toggle_info();
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -311,8 +321,26 @@ impl MusheenApp {
             }))
     }
 
+    fn location_button(&self) -> Button {
+        Button::new("navigation.location")
+            .label(self.current_location_text())
+            .accessibility_label("Current location")
+            .tooltip("Current location")
+            .secondary()
+            .small()
+            .min_w(px(120.))
+            .flex_grow(1.0)
+            .flex_shrink_1()
+            .overflow_hidden()
+    }
+
     fn render_tab_strip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
+        let boundary = if Self::high_contrast(cx) {
+            colors.foreground
+        } else {
+            colors.sidebar_border
+        };
         let label = TabLabel(
             self.directory
                 .location()
@@ -334,7 +362,7 @@ impl MusheenApp {
             .gap_1()
             .bg(colors.sidebar)
             .border_b_1()
-            .border_color(colors.sidebar_border)
+            .border_color(boundary)
             .child(
                 div()
                     .id("active-tab")
@@ -369,7 +397,12 @@ impl MusheenApp {
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
-        debug_assert_eq!(COMMAND_IDS.len(), 9);
+        let boundary = if Self::high_contrast(cx) {
+            colors.foreground
+        } else {
+            colors.border
+        };
+        debug_assert_eq!(COMMAND_IDS.len(), 10);
         let no_parent = self
             .directory
             .location()
@@ -389,7 +422,7 @@ impl MusheenApp {
             .px_3()
             .bg(colors.background)
             .border_b_1()
-            .border_color(colors.border)
+            .border_color(boundary)
             .child(self.toolbar_button(
                 "navigation.back",
                 "Back",
@@ -422,15 +455,7 @@ impl MusheenApp {
                 false,
                 cx,
             ))
-            .child(
-                Button::new("navigation.location")
-                    .label(self.current_location_text())
-                    .accessibility_label("Current location")
-                    .tooltip("Current location")
-                    .secondary()
-                    .small()
-                    .flex_grow(1.0),
-            )
+            .child(self.location_button())
             .child(self.toolbar_button("view.search", "Search", IconName::Search, false, false, cx))
             .child(self.toolbar_button(
                 "view.list",
@@ -449,6 +474,14 @@ impl MusheenApp {
                 cx,
             ))
             .child(self.toolbar_button(
+                "view.info",
+                "Information pane",
+                IconName::Info,
+                false,
+                self.shell.info_visible(),
+                cx,
+            ))
+            .child(self.toolbar_button(
                 "app.settings",
                 "Settings",
                 IconName::Settings,
@@ -461,6 +494,11 @@ impl MusheenApp {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let transparent = cx.theme().transparent;
+        let boundary = if Self::high_contrast(cx) {
+            colors.foreground
+        } else {
+            colors.sidebar_border
+        };
         let current = self.directory.location().cloned();
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let places = PLACES.into_iter().map(|place| {
@@ -517,7 +555,7 @@ impl MusheenApp {
             .p_3()
             .bg(colors.sidebar)
             .border_r_1()
-            .border_color(colors.sidebar_border)
+            .border_color(boundary)
             .child(
                 div()
                     .text_xs()
@@ -583,6 +621,45 @@ impl MusheenApp {
             .bg(colors.background)
             .child(body)
             .into_any_element()
+    }
+
+    fn render_info_pane(&self, wide: bool, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let boundary = if Self::high_contrast(cx) {
+            colors.foreground
+        } else {
+            colors.sidebar_border
+        };
+        let pane = div()
+            .id("info-pane")
+            .test_support()
+            .role(Role::Region)
+            .aria_label("Information pane")
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .p_4()
+            .bg(colors.sidebar)
+            .border_l_1()
+            .border_color(boundary)
+            .text_color(colors.muted_foreground)
+            .child(Icon::new(IconName::Info).large())
+            .child(div().text_sm().child("No item selected"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_center()
+                    .child("Select an item to see its details."),
+            );
+        if wide {
+            pane.w(px(280.)).into_any_element()
+        } else {
+            pane.flex_grow(1.0).into_any_element()
+        }
     }
 
     fn render_loading(&self, skeleton: gpui_kit::Hsla) -> AnyElement {
@@ -830,6 +907,16 @@ impl Render for MusheenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let status = status_text(self.directory.items().len(), 0);
+        let info_visible = self.shell.info_visible();
+        let wide = window.viewport_size().width.as_f32() >= 960.0;
+        let high_contrast = Self::high_contrast(cx);
+        let boundary = if high_contrast {
+            colors.foreground
+        } else {
+            colors.border
+        };
+        let directory = (!info_visible || wide).then(|| self.render_directory(window, cx));
+        let info = info_visible.then(|| self.render_info_pane(wide, cx));
         div()
             .id("musheen-shell")
             .test_support()
@@ -838,6 +925,8 @@ impl Render for MusheenApp {
             .flex_col()
             .bg(colors.background)
             .text_color(colors.foreground)
+            .border_color(boundary)
+            .when(high_contrast, |shell| shell.border_2())
             .child(self.render_tab_strip(cx))
             .child(self.render_toolbar(cx))
             .child(
@@ -846,7 +935,8 @@ impl Render for MusheenApp {
                     .min_h(px(0.))
                     .flex()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_directory(window, cx)),
+                    .children(directory)
+                    .children(info),
             )
             .child(
                 div()
@@ -862,7 +952,7 @@ impl Render for MusheenApp {
                     .text_color(colors.muted_foreground)
                     .bg(colors.background)
                     .border_t_1()
-                    .border_color(colors.border)
+                    .border_color(boundary)
                     .child(status),
             )
     }
@@ -965,6 +1055,11 @@ mod tests {
                 assert!(window.find(id).visible(), "missing visible region {id}");
             }
             assert_eq!(window.find("status-bar").label(), Some("3 items"));
+            assert!(window.try_find("info-pane").is_none());
+            window.click("view.info", cx);
+            assert!(window.find("info-pane").visible());
+            window.click("view.info", cx);
+            assert!(window.try_find("info-pane").is_none());
         })
         .expect("test window remains open");
     }

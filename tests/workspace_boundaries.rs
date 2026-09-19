@@ -57,13 +57,28 @@ fn workspace_contains_each_domain_crate() {
 fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
     let crates_root = repository_root().join("crates");
     let mut violations = Vec::new();
+    let direct_filesystem_apis = [
+        "std::fs",
+        "tokio::fs",
+        "async_std::fs",
+        "async_std :: fs",
+        "rustix::fs",
+        "rustix :: fs",
+        "nix::fcntl",
+        "nix :: fcntl",
+        "nix::unistd",
+        "nix :: unistd",
+    ];
 
     for crate_name in ["musheen-ui", "musheen-ops"] {
         let mut rust_files = Vec::new();
         rust_files_below(&crates_root.join(crate_name).join("src"), &mut rust_files);
         for file in rust_files {
             let source = fs::read_to_string(&file).expect("Rust source should be readable");
-            if source.contains("std::fs") {
+            if direct_filesystem_apis
+                .iter()
+                .any(|api| source.contains(api))
+            {
                 violations.push(file);
             }
         }
@@ -72,5 +87,38 @@ fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
     assert!(
         violations.is_empty(),
         "UI and operation domains must use provider or desktop boundaries: {violations:?}"
+    );
+}
+
+#[test]
+fn only_the_ui_crate_owns_native_theme_integration() {
+    let crates_root = repository_root().join("crates");
+    let mut violations = Vec::new();
+
+    for crate_name in REQUIRED_CRATES {
+        if crate_name == "musheen-ui" {
+            continue;
+        }
+
+        let crate_root = crates_root.join(crate_name);
+        let manifest = fs::read_to_string(crate_root.join("Cargo.toml"))
+            .expect("crate manifest should be readable");
+        if manifest.contains("native-theme") || manifest.contains("native_theme") {
+            violations.push(crate_root.join("Cargo.toml"));
+        }
+
+        let mut rust_files = Vec::new();
+        rust_files_below(&crate_root.join("src"), &mut rust_files);
+        for file in rust_files {
+            let source = fs::read_to_string(&file).expect("Rust source should be readable");
+            if source.contains("native_theme") || source.contains("native-theme") {
+                violations.push(file);
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "native-theme integration must remain behind the UI boundary: {violations:?}"
     );
 }

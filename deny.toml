@@ -1,3 +1,12 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0384", reason = "Informational unmaintained notice for instant, inherited through GPUI Kit; the advisory offers no safe upgrade." },
+    { id = "RUSTSEC-2024-0436", reason = "Informational unmaintained notice for paste, inherited through GPUI Kit; the advisory offers no safe upgrade." },
+    { id = "RUSTSEC-2025-0134", reason = "Informational unmaintained notice for rustls-pemfile, inherited through GPUI Kit assets; the advisory offers no safe upgrade." },
+    { id = "RUSTSEC-2026-0192", reason = "Informational unmaintained notice for ttf-parser, required by GPUI's font and SVG stack; the advisory offers no safe upgrade." },
+    { id = "RUSTSEC-2026-0206", reason = "Informational unmaintained notice for rustybuzz, required by GPUI's SVG stack; the advisory offers no safe upgrade." },
+]
+
 [licenses]
 allow = [
     "0BSD",

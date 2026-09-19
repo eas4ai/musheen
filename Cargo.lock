@@ -4346,7 +4346,6 @@ dependencies = [
  "freedesktop",
  "musheen-core",
  "musheen-ops",
- "native-theme",
  "open",
  "tempfile",
  "wax",

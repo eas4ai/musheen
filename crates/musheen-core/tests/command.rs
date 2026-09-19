@@ -14,6 +14,7 @@ mod command {
             "view.search",
             "view.list",
             "view.grid",
+            "view.info",
             "selection.select_all",
             "selection.clear",
             "app.settings",
