@@ -25,4 +25,8 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
-exceptions = []
+exceptions = [
+    # acl-sys is required by the approved posix-acl provider. LGPL-2.1-only is
+    # compatible with Musheen's GPL-3.0-or-later distribution license.
+    { allow = ["LGPL-2.1"], crate = "acl-sys" },
+]

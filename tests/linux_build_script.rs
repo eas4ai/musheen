@@ -173,6 +173,7 @@ fn linux_build_installs_gpui_native_link_dependencies() {
         .expect("Linux build Dockerfile should be readable");
 
     for package in [
+        "libacl1-dev",
         "libfontconfig1-dev",
         "libfreetype6-dev",
         "libxcb1-dev",

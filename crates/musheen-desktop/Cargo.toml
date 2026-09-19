@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+blake3.workspace = true
 fast_image_resize.workspace = true
 freedesktop.workspace = true
 image.workspace = true
@@ -15,8 +16,12 @@ musheen-core = { path = "../musheen-core" }
 musheen-ops = { path = "../musheen-ops" }
 open.workspace = true
 png.workspace = true
+posix-acl.workspace = true
+sha2.workspace = true
 tree_magic_mini.workspace = true
+walkdir.workspace = true
 wax.workspace = true
+xattr.workspace = true
 xdg-mime.workspace = true
 
 [dev-dependencies]

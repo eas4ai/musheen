@@ -1,3 +1,7 @@
+use crate::dialogs::{
+    PropertiesFailureWindow, PropertiesWindow, PropertiesWindowData,
+    install_properties_key_bindings, properties_window_options,
+};
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
 use crate::icons::{ContentIdentity, freedesktop_icon_name};
 use crate::info_pane::{
@@ -105,10 +109,12 @@ gpui_kit::actions!(
         ViewColumnsShortcut,
         ViewAdaptiveShortcut,
         ToggleSidebarShortcut,
+        OpenPropertiesShortcut,
     ]
 );
 
 fn install_navigation_key_bindings(cx: &mut App) {
+    install_properties_key_bindings(cx);
     cx.bind_keys([
         KeyBinding::new("alt-left", GoBack, None),
         KeyBinding::new("alt-right", GoForward, None),
@@ -133,6 +139,7 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-5", ViewColumnsShortcut, None),
         KeyBinding::new("ctrl-6", ViewAdaptiveShortcut, None),
         KeyBinding::new("ctrl-b", ToggleSidebarShortcut, None),
+        KeyBinding::new("alt-enter", OpenPropertiesShortcut, None),
     ]);
 }
 
@@ -964,6 +971,49 @@ impl MusheenApp {
         self.dispatch_action(action, cx);
     }
 
+    fn open_selected_properties(&mut self, cx: &mut Context<Self>) {
+        let view = self.focused_directory().view();
+        let selected = view
+            .selected_ids()
+            .iter()
+            .filter_map(|id| view.item(id))
+            .filter_map(|item| {
+                item.path()
+                    .as_unix_path()
+                    .map(|path| (item.display_name().as_str().to_owned(), path.to_path_buf()))
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return;
+        }
+        let title = if selected.len() == 1 {
+            format!("{} Properties", selected[0].0)
+        } else {
+            format!("{} items — Properties", selected.len())
+        };
+        let paths = selected
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect::<Vec<_>>();
+        let options = properties_window_options(title, cx);
+        let work = cx.background_spawn(async move { PropertiesWindowData::load(&paths) });
+        cx.spawn(async move |_, cx| {
+            let result = work.await;
+            cx.open_window(options, move |window, cx| match result {
+                Ok(data) => {
+                    let view = cx.new(|cx| PropertiesWindow::new(data, window, cx));
+                    cx.new(|cx| Root::new(view, window, cx))
+                }
+                Err(error) => {
+                    let view = cx.new(|cx| PropertiesFailureWindow::new(error.to_string(), cx));
+                    cx.new(|cx| Root::new(view, window, cx))
+                }
+            })
+            .expect("Musheen could not open a Properties window");
+        })
+        .detach();
+    }
+
     fn dispatch_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
         match action {
             CommandAction::NavigateBack
@@ -1000,6 +1050,7 @@ impl MusheenApp {
             CommandAction::SelectAll | CommandAction::ClearSelection => {
                 self.dispatch_selection_action(action, cx);
             }
+            CommandAction::OpenProperties => self.open_selected_properties(cx),
             CommandAction::OpenSettings => {}
         }
     }
@@ -3563,6 +3614,9 @@ impl Render for MusheenApp {
             .on_action(cx.listener(|this, _: &ToggleSidebarShortcut, _, cx| {
                 this.dispatch_command("view.sidebar", cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenPropertiesShortcut, _, cx| {
+                this.dispatch_command("item.properties", cx);
+            }))
             .on_action(cx.listener(|this, _: &Escape, _, cx| {
                 this.handle_escape(cx);
             }))
@@ -4150,6 +4204,52 @@ mod tests {
             assert!(window.try_find("info-pane").is_none());
         })
         .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn alt_enter_opens_properties_for_the_current_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            state.dispatch_command("selection.select_all", cx);
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("alt-enter", cx);
+        })
+        .expect("the browser window remains open");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            cx.windows().len() == 2
+        })
+        .await;
+
+        let browser: gpui_kit::AnyWindowHandle = handle.into();
+        let properties = cx
+            .windows()
+            .into_iter()
+            .find(|candidate| *candidate != browser)
+            .expect("Alt+Enter opens a second window");
+        cx.update_window(properties, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("properties-dialog").visible());
+            assert!(window.find("properties-identity").visible());
+        })
+        .expect("the Properties window remains open");
     }
 
     #[gpui_kit::test]

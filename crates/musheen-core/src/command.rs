@@ -97,6 +97,7 @@ pub enum CommandAction {
     FocusNextPane,
     SelectAll,
     ClearSelection,
+    OpenProperties,
     OpenSettings,
 }
 
@@ -635,6 +636,14 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             &[("Escape", Browser)],
             Predicate::HasSelection,
             Action::ClearSelection,
+        ),
+        command(
+            "item.properties",
+            "command.properties",
+            "info",
+            &[("Alt+Enter", Browser)],
+            Predicate::HasSelection,
+            Action::OpenProperties,
         ),
         command(
             "app.settings",

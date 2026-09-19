@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalFilesystemInfo {
     filesystem_type: Box<str>,
+    source: PathBuf,
     mount_point: PathBuf,
     read_only: bool,
     available_bytes: u64,
@@ -21,6 +22,11 @@ impl LocalFilesystemInfo {
     #[must_use]
     pub fn filesystem_type(&self) -> &str {
         &self.filesystem_type
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.source
     }
 
     #[must_use]
@@ -36,6 +42,11 @@ impl LocalFilesystemInfo {
     #[must_use]
     pub fn available_bytes(&self) -> u64 {
         self.available_bytes
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> CapabilityMatrix {
+        capabilities_from_info(self)
     }
 }
 
@@ -70,6 +81,9 @@ pub(crate) fn probe(path: &StorePath) -> Result<LocalFilesystemInfo, StoreError>
     let mount_point = mount
         .as_ref()
         .map_or_else(|| PathBuf::from("/"), |mount| mount.dest.clone());
+    let source = mount
+        .as_ref()
+        .map_or_else(|| PathBuf::from("unknown"), |mount| mount.source.clone());
     let read_only = mount
         .as_ref()
         .is_some_and(|mount| mount.options.iter().any(|option| option == "ro"));
@@ -78,6 +92,7 @@ pub(crate) fn probe(path: &StorePath) -> Result<LocalFilesystemInfo, StoreError>
 
     Ok(LocalFilesystemInfo {
         filesystem_type,
+        source,
         mount_point,
         read_only,
         available_bytes: blocks.saturating_mul(block_size),
@@ -86,7 +101,7 @@ pub(crate) fn probe(path: &StorePath) -> Result<LocalFilesystemInfo, StoreError>
 
 pub(crate) fn capabilities(path: &StorePath) -> CapabilityMatrix {
     match probe(path) {
-        Ok(info) => capabilities_from_info(&info),
+        Ok(info) => info.capabilities(),
         Err(error) => {
             let reason = CapabilityReason::new(format!("filesystem probe failed: {error}"))
                 .expect("a formatted probe error is visible");

@@ -22,6 +22,7 @@ serde_json.workspace = true
 futures-lite.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+xattr.workspace = true
 
 [lints]
 workspace = true

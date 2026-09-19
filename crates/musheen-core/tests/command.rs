@@ -38,6 +38,7 @@ mod command {
             "pane.focus_next",
             "selection.select_all",
             "selection.clear",
+            "item.properties",
             "app.settings",
         ];
         let actual = registry
@@ -91,6 +92,7 @@ mod command {
             ("view.sidebar", "Ctrl+B"),
             ("selection.select_all", "Ctrl+A"),
             ("selection.clear", "Escape"),
+            ("item.properties", "Alt+Enter"),
             ("app.settings", "Ctrl+,"),
         ] {
             let entry = registry.get(id).expect("the command is registered");

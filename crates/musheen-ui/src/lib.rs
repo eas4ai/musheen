@@ -1,6 +1,7 @@
 //! Native-themed GPUI application shell.
 
 mod app;
+pub mod dialogs;
 mod directory;
 mod icons;
 mod info_pane;
@@ -14,6 +15,7 @@ mod toolbar;
 pub mod views;
 
 pub use app::run;
+pub use dialogs::*;
 pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
 };

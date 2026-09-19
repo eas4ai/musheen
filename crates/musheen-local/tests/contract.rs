@@ -67,6 +67,7 @@ fn local_capabilities_are_total_and_read_only_mutations_are_refused() {
         .expect("the filesystem probe succeeds");
 
     assert!(!filesystem.filesystem_type().is_empty());
+    assert!(!filesystem.source().as_os_str().is_empty());
     assert!(directory.path().starts_with(filesystem.mount_point()));
 
     for kind in CapabilityKind::ALL {
