@@ -1,5 +1,5 @@
 use crate::MutationError;
-use musheen_core::StorePath;
+use musheen_core::{CancellationToken, StorePath};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AclQualifier {
@@ -400,7 +400,18 @@ impl MetadataPlan {
     }
 
     pub fn execute(self, provider: &mut impl MetadataProvider) -> Result<(), MutationError> {
+        self.execute_controlled(provider, &CancellationToken::new())
+    }
+
+    pub fn execute_controlled(
+        self,
+        provider: &mut impl MetadataProvider,
+        cancellation: &CancellationToken,
+    ) -> Result<(), MutationError> {
         for (entry, change) in self.entries {
+            cancellation
+                .wait_if_paused()
+                .map_err(|_| MutationError::Cancelled)?;
             provider.apply_metadata(&entry, &change)?;
         }
         Ok(())

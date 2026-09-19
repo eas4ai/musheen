@@ -9,6 +9,8 @@ pub enum JobState {
     Running,
     Paused,
     Cancelling,
+    Cancelled,
+    Interrupted,
     Failed,
     Recoverable,
     Completed,
@@ -16,12 +18,14 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Planned,
         Self::Queued,
         Self::Running,
         Self::Paused,
         Self::Cancelling,
+        Self::Cancelled,
+        Self::Interrupted,
         Self::Failed,
         Self::Recoverable,
         Self::Completed,
@@ -35,7 +39,7 @@ impl JobState {
             (Self::Planned, Self::Queued | Self::Failed)
                 | (
                     Self::Queued,
-                    Self::Running | Self::Cancelling | Self::Failed
+                    Self::Running | Self::Cancelling | Self::Cancelled | Self::Failed
                 )
                 | (
                     Self::Running,
@@ -43,15 +47,21 @@ impl JobState {
                         | Self::Cancelling
                         | Self::Failed
                         | Self::Recoverable
+                        | Self::Interrupted
                         | Self::Completed
                 )
                 | (
                     Self::Paused,
-                    Self::Running | Self::Cancelling | Self::Failed | Self::Recoverable
+                    Self::Running
+                        | Self::Cancelling
+                        | Self::Failed
+                        | Self::Recoverable
+                        | Self::Interrupted
+                        | Self::Completed
                 )
                 | (
                     Self::Cancelling,
-                    Self::Failed | Self::Recoverable | Self::RolledBack
+                    Self::Cancelled | Self::Failed | Self::Recoverable | Self::RolledBack
                 )
                 | (Self::Failed, Self::Recoverable)
                 | (Self::Recoverable, Self::RolledBack)
@@ -60,7 +70,7 @@ impl JobState {
 
     #[must_use]
     pub const fn terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::RolledBack)
+        matches!(self, Self::Cancelled | Self::Completed | Self::RolledBack)
     }
 }
 
@@ -148,7 +158,10 @@ impl JobStateMachine {
     }
 
     pub fn retry(&mut self, occurred_at: u64) -> Result<EventGeneration, StateError> {
-        if !matches!(self.state, JobState::Failed | JobState::Recoverable) {
+        if !matches!(
+            self.state,
+            JobState::Failed | JobState::Recoverable | JobState::Interrupted
+        ) {
             return Err(StateError::RetryUnavailable(self.state));
         }
         if occurred_at < self.last_event_at {

@@ -1,26 +1,806 @@
 use crate::LocalStore;
-use musheen_core::{CapabilityKind, CapabilityState, StorePath};
+use crate::operation::{remove_path, sync_parent};
+use musheen_core::{CancellationToken, CapabilityKind, CapabilityState, StorePath};
 use musheen_ops::{
-    AclChange, AclEntry, AclQualifier, CreateKind, DeleteProvider, DeleteTarget, LinkProvider,
-    MetadataEntry, MetadataEntryKind, MetadataProvider, MetadataScope, MutationError,
-    MutationProvider, ResolvedMetadataChange, TrashReceipt,
+    AclChange, AclEntry, AclQualifier, ConflictChoice, ConflictDecision, CopyRequest, CopySession,
+    CreateKind, DeleteProvider, DeleteTarget, LinkProvider, MetadataEntry, MetadataEntryKind,
+    MetadataProvider, MetadataScope, MutationError, MutationProvider, OperationFailure,
+    OperationKind, ResolvedMetadataChange, StagingPath, TrashReceipt, execute_move,
 };
 use posix_acl::{ACL_EXECUTE, ACL_READ, ACL_WRITE, PosixACL, Qualifier};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, Gid, Mode, OFlags, RenameFlags, StatxFlags, Uid, chownat, fchmod, fchown, fsync,
+    AtFlags, CWD, Gid, Mode, OFlags, RenameFlags, StatxFlags, Uid, chownat, fchmod, fchown, fsync,
     linkat, mkdirat, open, openat, renameat_with, statx, symlinkat, unlinkat,
 };
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 static TRASH_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_RESTORE_NAME: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+pub(crate) enum ResolvedTransferFailure {
+    Transfer(OperationFailure),
+    Failed(Box<str>),
+    NeedsAttention(Box<str>),
+}
+
+impl From<OperationFailure> for ResolvedTransferFailure {
+    fn from(error: OperationFailure) -> Self {
+        Self::Transfer(error)
+    }
+}
+
+impl From<Box<str>> for ResolvedTransferFailure {
+    fn from(message: Box<str>) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl fmt::Display for ResolvedTransferFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transfer(error) => error.fmt(formatter),
+            Self::Failed(message) | Self::NeedsAttention(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn resolved_move_aside_failure(error: MutationError) -> ResolvedTransferFailure {
+    match error {
+        MutationError::RecoveryRequired(message) => {
+            ResolvedTransferFailure::NeedsAttention(message)
+        }
+        error => ResolvedTransferFailure::Failed(error.to_string().into()),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalTrashEntry {
+    receipt: TrashReceipt,
+    deleted_at_unix_seconds: i64,
+    kind: musheen_ops::ConflictItemKind,
+}
+
+impl LocalTrashEntry {
+    #[must_use]
+    pub const fn receipt(&self) -> &TrashReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub const fn deleted_at_unix_seconds(&self) -> i64 {
+        self.deleted_at_unix_seconds
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> musheen_ops::ConflictItemKind {
+        self.kind
+    }
+}
+
+impl LocalStore {
+    #[must_use]
+    pub fn recovery_staging_available(&self, staging: &StorePath) -> bool {
+        StagingPath::is_owned_path(staging)
+            && staging
+                .as_unix_path()
+                .is_some_and(|path| fs::symlink_metadata(path).is_ok())
+    }
+
+    pub fn discard_recovery_staging(&mut self, staging: &StorePath) -> Result<(), MutationError> {
+        if !StagingPath::is_owned_path(staging) {
+            return Err(MutationError::InvalidScope);
+        }
+        let staging = staging.as_unix_path().ok_or(MutationError::Unsupported)?;
+        remove_path(staging).map_err(|error| MutationError::Provider(error.to_string().into()))?;
+        sync_parent(staging).map_err(|error| {
+            MutationError::RecoveryRequired(
+                format!(
+                    "recovery staging was removed, but the directory update could not be made \
+                     durable: {error}"
+                )
+                .into(),
+            )
+        })
+    }
+
+    pub fn conflict_item_kind(
+        &self,
+        path: &StorePath,
+    ) -> Result<musheen_ops::ConflictItemKind, MutationError> {
+        let path = path.as_unix_path().ok_or(MutationError::Unsupported)?;
+        let metadata = fs::symlink_metadata(path).map_err(map_io_error)?;
+        Ok(if metadata.file_type().is_symlink() {
+            musheen_ops::ConflictItemKind::SymbolicLink
+        } else if metadata.is_dir() {
+            musheen_ops::ConflictItemKind::Directory
+        } else {
+            musheen_ops::ConflictItemKind::File
+        })
+    }
+
+    pub fn list_trash(&mut self) -> Result<Vec<LocalTrashEntry>, MutationError> {
+        let _guard = TRASH_LOCK
+            .lock()
+            .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
+        let mut entries = trash::os_limited::list()
+            .map_err(map_trash_error)?
+            .into_iter()
+            .map(|item| {
+                let metadata =
+                    fs::symlink_metadata(trash_payload_path(&item)?).map_err(map_io_error)?;
+                let kind = if metadata.file_type().is_symlink() {
+                    musheen_ops::ConflictItemKind::SymbolicLink
+                } else if metadata.is_dir() {
+                    musheen_ops::ConflictItemKind::Directory
+                } else {
+                    musheen_ops::ConflictItemKind::File
+                };
+                Ok(LocalTrashEntry {
+                    receipt: TrashReceipt::new(
+                        StorePath::from_unix_path(item.original_path().into_os_string()),
+                        item.id.as_bytes().to_vec(),
+                    ),
+                    deleted_at_unix_seconds: item.time_deleted,
+                    kind,
+                })
+            })
+            .collect::<Result<Vec<_>, MutationError>>()?;
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.deleted_at_unix_seconds));
+        Ok(entries)
+    }
+
+    pub fn purge_trash(&mut self, receipts: &[TrashReceipt]) -> Result<(), MutationError> {
+        if receipts.is_empty() {
+            return Err(MutationError::InvalidScope);
+        }
+        let _guard = TRASH_LOCK
+            .lock()
+            .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
+        let mut available = trash::os_limited::list()
+            .map_err(map_trash_error)?
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut requested = std::collections::HashSet::with_capacity(receipts.len());
+        let mut selected = Vec::with_capacity(receipts.len());
+        for receipt in receipts {
+            if !requested.insert(receipt.provider_reference().to_vec()) {
+                return Err(MutationError::BatchCollision);
+            }
+            let id = OsString::from_vec(receipt.provider_reference().to_vec());
+            selected.push(available.remove(&id).ok_or(MutationError::Missing)?);
+        }
+        trash::os_limited::purge_all(selected).map_err(map_trash_error)
+    }
+
+    pub fn resolve_restore_conflict(
+        &mut self,
+        receipt: &TrashReceipt,
+        decision: &ConflictDecision,
+    ) -> Result<(), MutationError> {
+        if decision.operation() != OperationKind::Restore
+            || decision.destination() != receipt.original_path()
+            || decision.source_identity() != receipt.provider_reference()
+        {
+            return Err(MutationError::InvalidScope);
+        }
+        let _guard = TRASH_LOCK
+            .lock()
+            .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
+        let source_id = OsString::from_vec(receipt.provider_reference().to_vec());
+        let source_item = trash::os_limited::list()
+            .map_err(map_trash_error)?
+            .into_iter()
+            .find(|item| item.id == source_id)
+            .ok_or(MutationError::Missing)?;
+        let current = MutationProvider::identity(self, receipt.original_path())?
+            .ok_or(MutationError::Missing)?;
+        if current.as_ref() != decision.destination_identity() {
+            return Err(MutationError::SourceChanged);
+        }
+        match decision.choice() {
+            ConflictChoice::Skip => Ok(()),
+            ConflictChoice::KeepBoth => {
+                self.restore_after_moving_destination(receipt, RestoreDisposition::KeepBoth)
+            }
+            ConflictChoice::Replace | ConflictChoice::ReplaceTree => {
+                self.restore_after_moving_destination(receipt, RestoreDisposition::Replace)
+            }
+            ConflictChoice::MergeDirectory => merge_restored_directory(
+                &source_item,
+                receipt
+                    .original_path()
+                    .as_unix_path()
+                    .ok_or(MutationError::Unsupported)?,
+            ),
+        }
+    }
+
+    fn restore_after_moving_destination(
+        &mut self,
+        receipt: &TrashReceipt,
+        disposition: RestoreDisposition,
+    ) -> Result<(), MutationError> {
+        let destination = receipt
+            .original_path()
+            .as_unix_path()
+            .ok_or(MutationError::Unsupported)?;
+        let moved = move_destination_aside(destination, disposition)?;
+        if let Err(error) = restore_receipt_no_replace(receipt) {
+            renameat_with(CWD, &moved, CWD, destination, RenameFlags::NOREPLACE).map_err(
+                |rollback| {
+                    MutationError::RecoveryRequired(
+                        format!(
+                            "restore failed ({error}); the original destination remains at {} \
+                             because rollback failed: {rollback}",
+                            moved.display()
+                        )
+                        .into(),
+                    )
+                },
+            )?;
+            sync_parent(destination).map_err(|rollback| {
+                MutationError::RecoveryRequired(
+                    format!(
+                        "restore failed ({error}); the original destination was restored, but \
+                         rollback could not be made durable: {rollback}"
+                    )
+                    .into(),
+                )
+            })?;
+            return Err(error);
+        }
+        sync_parent(destination).map_err(|error| {
+            MutationError::RecoveryRequired(
+                format!(
+                    "the trashed item was restored at {}, but the directory update could not be \
+                     made durable: {error}; the previous destination remains at {}",
+                    destination.display(),
+                    moved.display()
+                )
+                .into(),
+            )
+        })?;
+        if disposition == RestoreDisposition::Replace {
+            remove_path(&moved).map_err(|error| {
+                MutationError::RecoveryRequired(
+                    format!(
+                        "the trashed item was restored, but the previous destination remains at \
+                         {}: {error}",
+                        moved.display()
+                    )
+                    .into(),
+                )
+            })?;
+            sync_parent(&moved).map_err(|error| {
+                MutationError::RecoveryRequired(
+                    format!(
+                        "the trashed item was restored, but removing the previous destination \
+                         could not be made durable: {error}"
+                    )
+                    .into(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreDisposition {
+    KeepBoth,
+    Replace,
+}
+
+fn move_destination_aside(
+    destination: &Path,
+    disposition: RestoreDisposition,
+) -> Result<PathBuf, MutationError> {
+    move_destination_aside_with_sync(destination, disposition, sync_parent)
+}
+
+fn move_destination_aside_with_sync(
+    destination: &Path,
+    disposition: RestoreDisposition,
+    mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<PathBuf, MutationError> {
+    let parent = destination.parent().ok_or(MutationError::InvalidScope)?;
+    let name = destination.file_name().ok_or(MutationError::InvalidScope)?;
+    loop {
+        let sequence = NEXT_RESTORE_NAME.fetch_add(1, Ordering::Relaxed);
+        let candidate = match disposition {
+            RestoreDisposition::KeepBoth => {
+                let mut candidate = name.to_os_string();
+                candidate.push(format!(" (existing {sequence})"));
+                parent.join(candidate)
+            }
+            RestoreDisposition::Replace => parent.join(format!(
+                ".musheen-restore-backup-{}-{sequence}",
+                std::process::id()
+            )),
+        };
+        match renameat_with(CWD, destination, CWD, &candidate, RenameFlags::NOREPLACE) {
+            Ok(()) => {
+                if let Err(sync_error) = sync(destination) {
+                    renameat_with(CWD, &candidate, CWD, destination, RenameFlags::NOREPLACE)
+                        .map_err(|rollback_error| {
+                            MutationError::RecoveryRequired(
+                                format!(
+                                    "destination was moved to {} after directory sync failed \
+                                     ({sync_error}); rollback failed: {rollback_error}",
+                                    candidate.display()
+                                )
+                                .into(),
+                            )
+                        })?;
+                    if let Err(rollback_sync_error) = sync(destination) {
+                        return Err(MutationError::RecoveryRequired(
+                            format!(
+                                "destination was restored after directory sync failed \
+                                 ({sync_error}), but the rollback could not be made durable: \
+                                 {rollback_sync_error}"
+                            )
+                            .into(),
+                        ));
+                    }
+                    return Err(map_io_error(sync_error));
+                }
+                return Ok(candidate);
+            }
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(error) => return Err(map_errno(error)),
+        }
+    }
+}
+
+fn merge_restored_directory(
+    item: &trash::TrashItem,
+    destination: &Path,
+) -> Result<(), MutationError> {
+    let source = trash_payload_path(item)?;
+    let source_metadata = fs::symlink_metadata(&source).map_err(map_io_error)?;
+    let destination_metadata = fs::symlink_metadata(destination).map_err(map_io_error)?;
+    if !source_metadata.is_dir() || !destination_metadata.is_dir() {
+        return Err(MutationError::InvalidScope);
+    }
+    preflight_directory_merge(&source, destination)?;
+
+    let backup = move_destination_aside(destination, RestoreDisposition::Replace)?;
+    if let Err(error) = renameat_with(CWD, &source, CWD, destination, RenameFlags::NOREPLACE) {
+        let error = map_errno(error);
+        restore_moved_destination(&backup, destination).map_err(|rollback| {
+            MutationError::RecoveryRequired(
+                format!(
+                    "restoring the trashed directory failed ({error}); the previous destination \
+                     remains at {} because rollback failed: {rollback}",
+                    backup.display()
+                )
+                .into(),
+            )
+        })?;
+        return Err(error);
+    }
+    if let Err(error) = sync_parent(destination) {
+        return Err(rollback_restore_merge_failure(
+            map_io_error(error),
+            &backup,
+            destination,
+            &source,
+            &[],
+        ));
+    }
+
+    let mut moved = Vec::new();
+    if let Err(error) = merge_directory_entries(&backup, destination, &mut moved) {
+        return Err(rollback_restore_merge_failure(
+            error,
+            &backup,
+            destination,
+            &source,
+            &moved,
+        ));
+    }
+    if let Err(error) = fs::remove_file(&item.id) {
+        return Err(rollback_restore_merge_failure(
+            map_io_error(error),
+            &backup,
+            destination,
+            &source,
+            &moved,
+        ));
+    }
+    sync_parent(Path::new(&item.id)).map_err(|error| {
+        MutationError::RecoveryRequired(
+            format!(
+                "the directory was restored and its trash receipt was removed, but the receipt \
+                 update could not be made durable: {error}; the previous destination remains at \
+                 {}",
+                backup.display()
+            )
+            .into(),
+        )
+    })?;
+    remove_path(&backup).map_err(|error| {
+        MutationError::RecoveryRequired(
+            format!(
+                "the directory was restored, but the previous destination remains at {}: {error}",
+                backup.display()
+            )
+            .into(),
+        )
+    })?;
+    sync_parent(destination).map_err(|error| {
+        MutationError::RecoveryRequired(
+            format!("the restored directory could not be made durable: {error}").into(),
+        )
+    })
+}
+
+fn rollback_restore_merge_failure(
+    error: MutationError,
+    backup: &Path,
+    destination: &Path,
+    trash_source: &Path,
+    moved: &[(PathBuf, PathBuf)],
+) -> MutationError {
+    let original = error.to_string();
+    match rollback_directory_merge(backup, destination, trash_source, moved) {
+        Ok(()) => error,
+        Err(rollback) => MutationError::RecoveryRequired(
+            format!(
+                "restore failed ({original}); rollback also failed: {rollback}; inspect {} and {}",
+                destination.display(),
+                trash_source.display()
+            )
+            .into(),
+        ),
+    }
+}
+
+fn trash_payload_path(item: &trash::TrashItem) -> Result<PathBuf, MutationError> {
+    let info = Path::new(&item.id);
+    let info_directory = info.parent().ok_or(MutationError::InvalidScope)?;
+    if info_directory.file_name() != Some(OsStr::new("info")) {
+        return Err(MutationError::InvalidScope);
+    }
+    let trash_root = info_directory.parent().ok_or(MutationError::InvalidScope)?;
+    let name = info
+        .file_stem()
+        .filter(|_| info.extension() == Some(OsStr::new("trashinfo")))
+        .ok_or(MutationError::InvalidScope)?;
+    Ok(trash_root.join("files").join(name))
+}
+
+fn preflight_directory_merge(source: &Path, destination: &Path) -> Result<(), MutationError> {
+    for entry in fs::read_dir(source).map_err(map_io_error)? {
+        let entry = entry.map_err(map_io_error)?;
+        let source_child = entry.path();
+        let destination_child = destination.join(entry.file_name());
+        let source_metadata = fs::symlink_metadata(&source_child).map_err(map_io_error)?;
+        match fs::symlink_metadata(&destination_child) {
+            Ok(destination_metadata)
+                if source_metadata.is_dir() && destination_metadata.is_dir() =>
+            {
+                preflight_directory_merge(&source_child, &destination_child)?;
+            }
+            Ok(_) => return Err(MutationError::Conflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(map_io_error(error)),
+        }
+    }
+    Ok(())
+}
+
+fn merge_directory_entries(
+    source: &Path,
+    destination: &Path,
+    moved: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), MutationError> {
+    for entry in fs::read_dir(source).map_err(map_io_error)? {
+        let entry = entry.map_err(map_io_error)?;
+        let source_child = entry.path();
+        let destination_child = destination.join(entry.file_name());
+        let source_metadata = fs::symlink_metadata(&source_child).map_err(map_io_error)?;
+        match fs::symlink_metadata(&destination_child) {
+            Ok(destination_metadata)
+                if source_metadata.is_dir() && destination_metadata.is_dir() =>
+            {
+                merge_directory_entries(&source_child, &destination_child, moved)?;
+            }
+            Ok(_) => return Err(MutationError::Conflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                renameat_with(
+                    CWD,
+                    &source_child,
+                    CWD,
+                    &destination_child,
+                    RenameFlags::NOREPLACE,
+                )
+                .map_err(map_errno)?;
+                moved.push((source_child, destination_child));
+            }
+            Err(error) => return Err(map_io_error(error)),
+        }
+    }
+    Ok(())
+}
+
+fn rollback_directory_merge(
+    backup: &Path,
+    destination: &Path,
+    trash_source: &Path,
+    moved: &[(PathBuf, PathBuf)],
+) -> Result<(), MutationError> {
+    fs::create_dir_all(backup).map_err(map_io_error)?;
+    for (source, target) in moved.iter().rev() {
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent).map_err(map_io_error)?;
+        }
+        renameat_with(CWD, target, CWD, source, RenameFlags::NOREPLACE).map_err(map_errno)?;
+    }
+    renameat_with(CWD, destination, CWD, trash_source, RenameFlags::NOREPLACE)
+        .map_err(map_errno)?;
+    restore_moved_destination(backup, destination)?;
+    sync_parent(destination).map_err(map_io_error)
+}
+
+fn restore_moved_destination(backup: &Path, destination: &Path) -> Result<(), MutationError> {
+    renameat_with(CWD, backup, CWD, destination, RenameFlags::NOREPLACE).map_err(map_errno)?;
+    sync_parent(destination).map_err(map_io_error)
+}
+
+pub(crate) fn execute_resolved_transfer(
+    store: &mut LocalStore,
+    request: &CopyRequest,
+    decision: &ConflictDecision,
+    cancellation: &CancellationToken,
+) -> Result<(), ResolvedTransferFailure> {
+    validate_transfer_decision(store, request, decision)
+        .map_err(|error| ResolvedTransferFailure::Failed(error.to_string().into()))?;
+    match decision.choice() {
+        ConflictChoice::Skip => Ok(()),
+        ConflictChoice::KeepBoth => {
+            let destination = keep_both_destination(request.destination())?;
+            let alternate = CopyRequest::new(
+                request.job_id(),
+                request.generation(),
+                request.source().clone(),
+                destination,
+            )
+            .with_options(request.options());
+            execute_transfer(store, &alternate, decision.operation(), cancellation)
+        }
+        ConflictChoice::Replace | ConflictChoice::ReplaceTree => {
+            execute_replacing_transfer(store, request, decision.operation(), cancellation)
+        }
+        ConflictChoice::MergeDirectory => {
+            execute_merging_transfer(store, request, decision.operation(), cancellation)
+        }
+    }
+}
+
+fn validate_transfer_decision(
+    store: &mut LocalStore,
+    request: &CopyRequest,
+    decision: &ConflictDecision,
+) -> Result<(), MutationError> {
+    if !matches!(
+        decision.operation(),
+        OperationKind::Copy | OperationKind::Move
+    ) || decision.source() != request.source()
+        || decision.destination() != request.destination()
+    {
+        return Err(MutationError::InvalidScope);
+    }
+    let source =
+        MutationProvider::identity(store, request.source())?.ok_or(MutationError::Missing)?;
+    if source.as_ref() != decision.source_identity() {
+        return Err(MutationError::SourceChanged);
+    }
+    let destination =
+        MutationProvider::identity(store, request.destination())?.ok_or(MutationError::Missing)?;
+    if destination.as_ref() != decision.destination_identity() {
+        return Err(MutationError::SourceChanged);
+    }
+    Ok(())
+}
+
+fn execute_transfer(
+    store: &mut LocalStore,
+    request: &CopyRequest,
+    operation: OperationKind,
+    cancellation: &CancellationToken,
+) -> Result<(), ResolvedTransferFailure> {
+    match operation {
+        OperationKind::Copy => CopySession::default()
+            .execute(store, request, cancellation)
+            .map(|_| ())
+            .map_err(ResolvedTransferFailure::Transfer),
+        OperationKind::Move => execute_move(store, request, cancellation)
+            .map(|_| ())
+            .map_err(ResolvedTransferFailure::Transfer),
+        _ => Err(ResolvedTransferFailure::Failed(
+            "the conflict does not describe a transfer".into(),
+        )),
+    }
+}
+
+fn keep_both_destination(destination: &StorePath) -> Result<StorePath, Box<str>> {
+    let destination = destination
+        .as_unix_path()
+        .ok_or_else(|| Box::<str>::from("the destination is not a local path"))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Box::<str>::from("the destination has no parent"))?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| Box::<str>::from("the destination has no file name"))?;
+    for sequence in 1_u64.. {
+        let mut alternate = name.to_os_string();
+        alternate.push(format!(" (copy {sequence})"));
+        let alternate = parent.join(alternate);
+        match fs::symlink_metadata(&alternate) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StorePath::from_unix_path(alternate.into_os_string()));
+            }
+            Err(error) => return Err(error.to_string().into()),
+        }
+    }
+    unreachable!("the keep-both sequence is unbounded")
+}
+
+fn execute_replacing_transfer(
+    store: &mut LocalStore,
+    request: &CopyRequest,
+    operation: OperationKind,
+    cancellation: &CancellationToken,
+) -> Result<(), ResolvedTransferFailure> {
+    let destination = request.destination().as_unix_path().ok_or_else(|| {
+        ResolvedTransferFailure::Failed("the destination is not a local path".into())
+    })?;
+    let backup = move_destination_aside(destination, RestoreDisposition::Replace)
+        .map_err(resolved_move_aside_failure)?;
+    if let Err(error) = execute_transfer(store, request, operation, cancellation) {
+        let original_error = error.to_string();
+        if destination.try_exists().unwrap_or(true) {
+            remove_path(destination).map_err(|rollback| {
+                ResolvedTransferFailure::NeedsAttention(
+                    format!(
+                        "{original_error}; rollback could not remove the new destination: \
+                         {rollback}"
+                    )
+                    .into(),
+                )
+            })?;
+        }
+        restore_moved_destination(&backup, destination).map_err(|rollback| {
+            ResolvedTransferFailure::NeedsAttention(
+                format!(
+                    "{original_error}; rollback could not restore the old destination: {rollback}"
+                )
+                .into(),
+            )
+        })?;
+        return Err(error);
+    }
+    remove_path(&backup).map_err(|error| {
+        ResolvedTransferFailure::NeedsAttention(
+            format!(
+                "the destination was published, but its previous version remains at {}: {error}",
+                backup.display()
+            )
+            .into(),
+        )
+    })?;
+    sync_parent(destination).map_err(|error| {
+        ResolvedTransferFailure::NeedsAttention(
+            format!("the destination was published but could not be made durable: {error}").into(),
+        )
+    })
+}
+
+fn execute_merging_transfer(
+    store: &mut LocalStore,
+    request: &CopyRequest,
+    operation: OperationKind,
+    cancellation: &CancellationToken,
+) -> Result<(), ResolvedTransferFailure> {
+    let source = request
+        .source()
+        .as_unix_path()
+        .ok_or_else(|| ResolvedTransferFailure::Failed("the source is not a local path".into()))?;
+    let destination = request.destination().as_unix_path().ok_or_else(|| {
+        ResolvedTransferFailure::Failed("the destination is not a local path".into())
+    })?;
+    preflight_directory_merge(source, destination)
+        .map_err(|error| ResolvedTransferFailure::Failed(error.to_string().into()))?;
+    let backup = move_destination_aside(destination, RestoreDisposition::Replace)
+        .map_err(resolved_move_aside_failure)?;
+    if let Err(error) = execute_transfer(store, request, operation, cancellation) {
+        let original_error = error.to_string();
+        restore_moved_destination(&backup, destination).map_err(|rollback| {
+            ResolvedTransferFailure::NeedsAttention(
+                format!(
+                    "{original_error}; rollback could not restore the old destination: {rollback}"
+                )
+                .into(),
+            )
+        })?;
+        return Err(error);
+    }
+
+    let mut moved = Vec::new();
+    if let Err(error) = merge_directory_entries(&backup, destination, &mut moved) {
+        rollback_transfer_merge(&backup, request, operation, &moved).map_err(|rollback| {
+            ResolvedTransferFailure::NeedsAttention(
+                format!("{error}; merge rollback failed: {rollback}").into(),
+            )
+        })?;
+        return Err(ResolvedTransferFailure::Failed(error.to_string().into()));
+    }
+    remove_path(&backup).map_err(|error| {
+        ResolvedTransferFailure::NeedsAttention(
+            format!(
+                "the merged destination was published, but its backup remains at {}: {error}",
+                backup.display()
+            )
+            .into(),
+        )
+    })?;
+    sync_parent(destination).map_err(|error| {
+        ResolvedTransferFailure::NeedsAttention(
+            format!("the merged destination was published but could not be made durable: {error}")
+                .into(),
+        )
+    })
+}
+
+fn rollback_transfer_merge(
+    backup: &Path,
+    request: &CopyRequest,
+    operation: OperationKind,
+    moved: &[(PathBuf, PathBuf)],
+) -> Result<(), MutationError> {
+    let destination = request
+        .destination()
+        .as_unix_path()
+        .ok_or(MutationError::Unsupported)?;
+    fs::create_dir_all(backup).map_err(map_io_error)?;
+    for (source, target) in moved.iter().rev() {
+        if let Some(parent) = source.parent() {
+            fs::create_dir_all(parent).map_err(map_io_error)?;
+        }
+        renameat_with(CWD, target, CWD, source, RenameFlags::NOREPLACE).map_err(map_errno)?;
+    }
+    match operation {
+        OperationKind::Copy => {
+            remove_path(destination)
+                .map_err(|error| MutationError::Provider(error.to_string().into()))?;
+        }
+        OperationKind::Move => {
+            let source = request
+                .source()
+                .as_unix_path()
+                .ok_or(MutationError::Unsupported)?;
+            renameat_with(CWD, destination, CWD, source, RenameFlags::NOREPLACE)
+                .map_err(map_errno)?;
+        }
+        _ => return Err(MutationError::InvalidScope),
+    }
+    restore_moved_destination(backup, destination)
+}
 
 impl MutationProvider for LocalStore {
     fn allows_create(
@@ -327,13 +1107,7 @@ impl DeleteProvider for LocalStore {
         let _guard = TRASH_LOCK
             .lock()
             .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
-        let id = OsString::from_vec(receipt.provider_reference().to_vec());
-        let item = trash::os_limited::list()
-            .map_err(map_trash_error)?
-            .into_iter()
-            .find(|item| item.id == id)
-            .ok_or(MutationError::Missing)?;
-        trash::os_limited::restore_all([item]).map_err(map_trash_error)
+        restore_receipt_no_replace(receipt)
     }
 
     fn permanently_delete(&mut self, target: &DeleteTarget) -> Result<(), MutationError> {
@@ -366,6 +1140,16 @@ impl DeleteProvider for LocalStore {
         }
         fsync(&root.parent).map_err(map_errno)
     }
+}
+
+fn restore_receipt_no_replace(receipt: &TrashReceipt) -> Result<(), MutationError> {
+    let id = OsString::from_vec(receipt.provider_reference().to_vec());
+    let item = trash::os_limited::list()
+        .map_err(map_trash_error)?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or(MutationError::Missing)?;
+    trash::os_limited::restore_all([item]).map_err(map_trash_error)
 }
 
 #[derive(Debug)]
@@ -692,5 +1476,30 @@ fn map_errno(error: rustix::io::Errno) -> MutationError {
         rustix::io::Errno::ACCESS | rustix::io::Errno::PERM => MutationError::PermissionDenied,
         rustix::io::Errno::XDEV | rustix::io::Errno::OPNOTSUPP => MutationError::Unsupported,
         _ => MutationError::Provider(error.to_string().into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moving_a_destination_aside_rolls_back_when_directory_sync_fails() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let destination = temporary.path().join("destination.txt");
+        fs::write(&destination, b"original").expect("destination writes");
+
+        let result =
+            move_destination_aside_with_sync(&destination, RestoreDisposition::Replace, |_| {
+                Err(std::io::Error::other("forced sync failure"))
+            });
+
+        assert!(matches!(result, Err(MutationError::RecoveryRequired(_))));
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        let names = fs::read_dir(temporary.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![OsString::from("destination.txt")]);
     }
 }

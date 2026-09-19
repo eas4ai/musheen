@@ -286,12 +286,12 @@ fn read_if_present(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
-fn append_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = open_private_append(path)?;
     file.write_all(bytes)
 }
 
-fn open_private_append(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_append(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -325,7 +325,7 @@ fn create_unique_private_file(directory: &Path, stem: &str, bytes: &[u8]) -> io:
     }
 }
 
-fn create_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -333,6 +333,6 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }

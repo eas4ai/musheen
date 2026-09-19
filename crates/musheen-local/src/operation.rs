@@ -805,7 +805,7 @@ fn rename_without_replacement(source: &Path, destination: &Path) -> Result<(), P
     }
 }
 
-fn remove_path(path: &Path) -> Result<(), ProviderError> {
+pub(crate) fn remove_path(path: &Path) -> Result<(), ProviderError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => {
             remove_tree_without_crossing(path, mount_identity(path, &metadata)?)
@@ -862,7 +862,7 @@ fn mount_identity(path: &Path, metadata: &fs::Metadata) -> Result<u64, ProviderE
     }
 }
 
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
@@ -870,11 +870,9 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 }
 
 fn check_cancel(cancellation: &CancellationToken) -> Result<(), ProviderError> {
-    if cancellation.is_cancelled() {
-        Err(ProviderError::Cancelled)
-    } else {
-        Ok(())
-    }
+    cancellation
+        .wait_if_paused()
+        .map_err(|_| ProviderError::Cancelled)
 }
 
 fn map_io(error: std::io::Error) -> ProviderError {

@@ -19,8 +19,12 @@ use musheen_core::{
 use musheen_ops::{MetadataKind, SourceMetadata};
 use std::path::PathBuf;
 
+pub use mutation::LocalTrashEntry;
 pub use probe::LocalFilesystemInfo;
-pub use queue::{DropAction, DropError, FileDragPayload, LocalOperationQueue, ReadyLocalOperation};
+pub use queue::{
+    DropAction, DropError, FileDragPayload, LocalFailureDisposition, LocalOperationFailure,
+    LocalOperationQueue, ReadyLocalOperation,
+};
 pub use traverse::{LocalTraversal, TraversalOptions};
 
 pub struct LocalStore {

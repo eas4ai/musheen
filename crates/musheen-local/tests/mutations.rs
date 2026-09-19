@@ -2,10 +2,12 @@ use musheen_core::StorePath;
 use musheen_local::LocalStore;
 use musheen_ops::{
     AclChange, AclEntry, AclQualifier, BatchRenameJournal, BatchRenamePlan, BatchRenameStep,
-    CreateKind, CreateRequest, DeleteTarget, HardLinkRequest, MetadataChange, MetadataPlan,
-    MetadataScope, MutationError, MutationProvider, PermanentDeleteRequest, RenameMapping,
-    RenameRequest, SymbolicLinkRequest, execute_create, execute_delete, execute_hard_link,
-    execute_permanent_delete, execute_rename, execute_restore, execute_symbolic_link,
+    ConflictChoice, ConflictDecision, ConflictDecisionJournal, ConflictItemKind, ConflictPolicies,
+    ConflictRecord, CreateKind, CreateRequest, DeleteTarget, HardLinkRequest, MetadataChange,
+    MetadataPlan, MetadataScope, MutationError, MutationProvider, OperationKind,
+    PermanentDeleteRequest, RenameMapping, RenameRequest, SymbolicLinkRequest, execute_create,
+    execute_delete, execute_hard_link, execute_permanent_delete, execute_rename,
+    execute_symbolic_link,
 };
 use posix_acl::{ACL_READ, PosixACL, Qualifier};
 use std::ffi::OsString;
@@ -19,6 +21,15 @@ use tempfile::tempdir;
 struct TestJournal {
     planned: bool,
     completed: usize,
+}
+
+#[derive(Default)]
+struct TestConflictJournal;
+
+impl ConflictDecisionJournal for TestConflictJournal {
+    fn persist_decision(&mut self, _decision: &ConflictDecision) -> Result<(), MutationError> {
+        Ok(())
+    }
 }
 
 impl BatchRenameJournal for TestJournal {
@@ -51,11 +62,96 @@ fn local_trash_round_trip() {
         .unwrap();
         assert_eq!(outcome.trashed().len(), 1);
         assert!(!path.as_unix_path().unwrap().exists());
-        execute_restore(&mut store, &outcome.trashed()[0]).unwrap();
+        let listed = store.list_trash().unwrap();
+        let listed_item = listed
+            .iter()
+            .find(|item| item.receipt() == &outcome.trashed()[0])
+            .expect("trashed item is listed with its receipt");
+        assert!(listed_item.deleted_at_unix_seconds() > 0);
+        fs::write(path.as_unix_path().unwrap(), b"new occupant").unwrap();
+        let destination_identity = MutationProvider::identity(&mut store, &path)
+            .unwrap()
+            .unwrap();
+        let conflict = ConflictRecord::new(
+            OperationKind::Restore,
+            StorePath::from_provider_key(
+                musheen_core::ProviderId::new("local.trash").unwrap(),
+                outcome.trashed()[0].provider_reference().to_vec(),
+            )
+            .unwrap(),
+            outcome.trashed()[0].provider_reference().to_vec(),
+            ConflictItemKind::File,
+            path.clone(),
+            destination_identity.to_vec(),
+            ConflictItemKind::File,
+        )
+        .unwrap();
+        let decision = ConflictPolicies::default()
+            .decide(
+                &conflict,
+                ConflictChoice::KeepBoth,
+                musheen_ops::ApplyScope::ThisConflict,
+                &mut TestConflictJournal,
+            )
+            .unwrap();
+        store
+            .resolve_restore_conflict(&outcome.trashed()[0], &decision)
+            .unwrap();
         assert_eq!(
             fs::read(path.as_unix_path().unwrap()).unwrap(),
             b"restore me"
         );
+        assert!(
+            fs::read_dir(root.as_path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.path() != path.as_unix_path().unwrap()
+                        && fs::read(entry.path()).ok().as_deref() == Some(b"new occupant")
+                })
+        );
+        let identity = MutationProvider::identity(&mut store, &path)
+            .unwrap()
+            .unwrap();
+        let outcome = execute_delete(
+            &mut store,
+            vec![DeleteTarget::new(path.clone(), identity.to_vec())],
+        )
+        .unwrap();
+        store.purge_trash(outcome.trashed()).unwrap();
+        assert!(
+            store
+                .list_trash()
+                .unwrap()
+                .iter()
+                .all(|item| item.receipt() != &outcome.trashed()[0])
+        );
+
+        let link_target = root.join("link-target");
+        let link_path = root.join("trashed-link");
+        fs::write(&link_target, b"target stays").unwrap();
+        symlink(&link_target, &link_path).unwrap();
+        let link_store_path = StorePath::from_unix_path(link_path.into_os_string());
+        let link_identity = MutationProvider::identity(&mut store, &link_store_path)
+            .unwrap()
+            .unwrap();
+        let link_outcome = execute_delete(
+            &mut store,
+            vec![DeleteTarget::new(link_store_path, link_identity.to_vec())],
+        )
+        .unwrap();
+        let link_receipt = &link_outcome.trashed()[0];
+        let listed_link = store
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.receipt() == link_receipt)
+            .expect("the trashed symbolic link remains listable");
+        assert_eq!(listed_link.kind(), ConflictItemKind::SymbolicLink);
+        store
+            .purge_trash(std::slice::from_ref(link_receipt))
+            .unwrap();
+        assert!(link_target.exists());
         return;
     }
 
@@ -67,6 +163,143 @@ fn local_trash_round_trip() {
         .arg("local_trash_round_trip")
         .arg("--nocapture")
         .env("MUSHEEN_TRASH_HELPER", "1")
+        .env("MUSHEEN_TRASH_ROOT", root.path())
+        .env("XDG_DATA_HOME", xdg_data)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn local_trash_directory_merge_preserves_both_trees() {
+    if std::env::var_os("MUSHEEN_TRASH_MERGE_HELPER").is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());
+        let path = root.join("trashed-directory");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("from-trash"), b"restore me").unwrap();
+        let store_path = StorePath::from_unix_path(path.clone().into_os_string());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &store_path)
+            .unwrap()
+            .unwrap();
+        let outcome = execute_delete(
+            &mut store,
+            vec![DeleteTarget::new(store_path.clone(), identity.to_vec())],
+        )
+        .unwrap();
+
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("already-here"), b"keep me").unwrap();
+        let destination_identity = MutationProvider::identity(&mut store, &store_path)
+            .unwrap()
+            .unwrap();
+        let receipt = &outcome.trashed()[0];
+        let conflict = ConflictRecord::new(
+            OperationKind::Restore,
+            StorePath::from_provider_key(
+                musheen_core::ProviderId::new("local.trash").unwrap(),
+                receipt.provider_reference().to_vec(),
+            )
+            .unwrap(),
+            receipt.provider_reference().to_vec(),
+            ConflictItemKind::Directory,
+            store_path,
+            destination_identity.to_vec(),
+            ConflictItemKind::Directory,
+        )
+        .unwrap();
+        let decision = ConflictPolicies::default()
+            .decide(
+                &conflict,
+                ConflictChoice::MergeDirectory,
+                musheen_ops::ApplyScope::ThisConflict,
+                &mut TestConflictJournal,
+            )
+            .unwrap();
+
+        store.resolve_restore_conflict(receipt, &decision).unwrap();
+
+        assert_eq!(fs::read(path.join("from-trash")).unwrap(), b"restore me");
+        assert_eq!(fs::read(path.join("already-here")).unwrap(), b"keep me");
+        assert!(
+            store
+                .list_trash()
+                .unwrap()
+                .iter()
+                .all(|item| item.receipt() != receipt)
+        );
+
+        let colliding_path = root.join("colliding-directory");
+        fs::create_dir(&colliding_path).unwrap();
+        fs::write(colliding_path.join("same-name"), b"from trash").unwrap();
+        let colliding_store_path =
+            StorePath::from_unix_path(colliding_path.clone().into_os_string());
+        let identity = MutationProvider::identity(&mut store, &colliding_store_path)
+            .unwrap()
+            .unwrap();
+        let colliding_outcome = execute_delete(
+            &mut store,
+            vec![DeleteTarget::new(
+                colliding_store_path.clone(),
+                identity.to_vec(),
+            )],
+        )
+        .unwrap();
+        fs::create_dir(&colliding_path).unwrap();
+        fs::write(colliding_path.join("same-name"), b"existing").unwrap();
+        let destination_identity = MutationProvider::identity(&mut store, &colliding_store_path)
+            .unwrap()
+            .unwrap();
+        let colliding_receipt = &colliding_outcome.trashed()[0];
+        let conflict = ConflictRecord::new(
+            OperationKind::Restore,
+            StorePath::from_provider_key(
+                musheen_core::ProviderId::new("local.trash").unwrap(),
+                colliding_receipt.provider_reference().to_vec(),
+            )
+            .unwrap(),
+            colliding_receipt.provider_reference().to_vec(),
+            ConflictItemKind::Directory,
+            colliding_store_path,
+            destination_identity.to_vec(),
+            ConflictItemKind::Directory,
+        )
+        .unwrap();
+        let decision = ConflictPolicies::default()
+            .decide(
+                &conflict,
+                ConflictChoice::MergeDirectory,
+                musheen_ops::ApplyScope::ThisConflict,
+                &mut TestConflictJournal,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.resolve_restore_conflict(colliding_receipt, &decision),
+            Err(MutationError::Conflict)
+        );
+        assert_eq!(
+            fs::read(colliding_path.join("same-name")).unwrap(),
+            b"existing"
+        );
+        assert!(
+            store
+                .list_trash()
+                .unwrap()
+                .iter()
+                .any(|item| item.receipt() == colliding_receipt)
+        );
+        return;
+    }
+
+    let root = tempdir().unwrap();
+    let xdg_data = root.path().join("xdg-data");
+    fs::create_dir(&xdg_data).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("local_trash_directory_merge_preserves_both_trees")
+        .arg("--nocapture")
+        .env("MUSHEEN_TRASH_MERGE_HELPER", "1")
         .env("MUSHEEN_TRASH_ROOT", root.path())
         .env("XDG_DATA_HOME", xdg_data)
         .status()

@@ -55,5 +55,7 @@ Cairn is disabled while it is being rebuilt. Do not run `cairn`, treat
 task. Preserve unrelated working-tree changes and use the local
 `best-practices` skill for implementation and review work. For every Cargo
 command on this machine, set `CARGO_TARGET_DIR` to
-`/home/shawn/workspace2/scratchpads/musheen-target`; never share another
-project's target directory, including `suprnova-target`.
+`/home/shawn/workspace2/scratchpads/musheen-target`. The `scratchpads/`
+directory is only the parent for project-specific scratch space; never use it
+as a Cargo target or shared build directory. Never use another project's
+target directory, including `suprnova-target`.

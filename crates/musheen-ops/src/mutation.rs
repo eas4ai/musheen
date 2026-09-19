@@ -40,12 +40,14 @@ pub enum MutationError {
     CrossFilesystem,
     Unsupported,
     PermissionDenied,
+    Cancelled,
     ScopeNotReviewed,
     NoChanges,
     InvalidMetadata,
     TrashUnsupported,
     ConfirmationRequired,
     InvalidScope,
+    RecoveryRequired(Box<str>),
     Provider(Box<str>),
 }
 
@@ -62,6 +64,7 @@ impl fmt::Display for MutationError {
             }
             Self::Unsupported => formatter.write_str("the provider does not support this mutation"),
             Self::PermissionDenied => formatter.write_str("permission denied"),
+            Self::Cancelled => formatter.write_str("the operation was cancelled"),
             Self::ScopeNotReviewed => formatter.write_str("recursive scope was not reviewed"),
             Self::NoChanges => formatter.write_str("the metadata plan has no changes"),
             Self::InvalidMetadata => formatter.write_str("the metadata change is invalid"),
@@ -70,6 +73,7 @@ impl fmt::Display for MutationError {
                 formatter.write_str("permanent deletion requires an exact confirmation")
             }
             Self::InvalidScope => formatter.write_str("the operation scope is invalid"),
+            Self::RecoveryRequired(message) => formatter.write_str(message),
             Self::Provider(message) => formatter.write_str(message),
         }
     }

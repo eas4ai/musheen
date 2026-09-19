@@ -1,4 +1,4 @@
-use crate::operations::spawn_ready_local_operations;
+use crate::operations::{OperationHub, spawn_ready_hub_operations};
 use crate::{ApplicationIdentity, DropError, LocalOperationQueue, PermissionsPageModel};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
@@ -19,10 +19,10 @@ use musheen_desktop::{
     RecursiveSize, XattrState,
 };
 use musheen_local::LocalStore;
-use musheen_ops::JobId;
+use musheen_ops::{JobId, MetadataChange, MetadataScope};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -151,6 +151,13 @@ impl PropertiesDialogModel {
         &self,
         queue: &mut LocalOperationQueue,
     ) -> Result<Vec<JobId>, DropError> {
+        let (roots, scope, change) = self.permission_request()?;
+        queue.submit_metadata_changes(roots, scope, change)
+    }
+
+    fn permission_request(
+        &self,
+    ) -> Result<(Vec<StorePath>, MetadataScope, MetadataChange), DropError> {
         if self.state != PropertiesState::Ready {
             return Err(DropError::Mutation(
                 musheen_ops::MutationError::SourceChanged,
@@ -162,11 +169,11 @@ impl PropertiesDialogModel {
             .iter()
             .map(|item| StorePath::from_unix_path(item.path().as_os_str()))
             .collect();
-        queue.submit_metadata_changes(
+        Ok((
             roots,
             self.permissions.scope(),
             self.permissions.change().clone(),
-        )
+        ))
     }
 
     pub fn refresh(&mut self) -> Result<PropertyRefresh, PropertyError> {
@@ -302,6 +309,7 @@ struct PermissionInputs {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PermissionBatchOutcome {
+    Ignored,
     Pending,
     Succeeded,
     Failed,
@@ -309,27 +317,26 @@ enum PermissionBatchOutcome {
 
 #[derive(Debug, Default)]
 struct PermissionBatchState {
-    pending: usize,
+    pending: BTreeSet<JobId>,
     failed: bool,
 }
 
 impl PermissionBatchState {
     fn is_active(&self) -> bool {
-        self.pending > 0
+        !self.pending.is_empty()
     }
 
-    fn begin(&mut self, pending: usize) {
-        self.pending = pending;
+    fn begin(&mut self, pending: impl IntoIterator<Item = JobId>) {
+        self.pending = pending.into_iter().collect();
         self.failed = false;
     }
 
-    fn finish(&mut self, succeeded: bool) -> PermissionBatchOutcome {
-        if self.pending == 0 {
-            return PermissionBatchOutcome::Failed;
+    fn finish(&mut self, id: JobId, succeeded: bool) -> PermissionBatchOutcome {
+        if !self.pending.remove(&id) {
+            return PermissionBatchOutcome::Ignored;
         }
-        self.pending -= 1;
         self.failed |= !succeeded;
-        if self.pending > 0 {
+        if !self.pending.is_empty() {
             PermissionBatchOutcome::Pending
         } else if self.failed {
             PermissionBatchOutcome::Failed
@@ -431,26 +438,25 @@ pub(crate) struct PropertiesWindow {
     permission_inputs: PermissionInputs,
     permission_inputs_need_sync: bool,
     permission_subscriptions: Vec<Subscription>,
-    operation_queue: Arc<Mutex<LocalOperationQueue>>,
+    operation_hub: OperationHub,
     permission_error: Option<Box<str>>,
     permission_batch: PermissionBatchState,
 }
 
 impl PropertiesWindow {
+    #[cfg(test)]
     pub fn new(data: PropertiesWindowData, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_queue(
+        Self::with_hub(
             data,
-            Arc::new(Mutex::new(LocalOperationQueue::new(
-                &musheen_core::ResourceLimits::default(),
-            ))),
+            OperationHub::new(&musheen_core::ResourceLimits::default()),
             window,
             cx,
         )
     }
 
-    fn with_queue(
+    pub(crate) fn with_hub(
         data: PropertiesWindowData,
-        operation_queue: Arc<Mutex<LocalOperationQueue>>,
+        operation_hub: OperationHub,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -496,7 +502,7 @@ impl PropertiesWindow {
             permission_inputs,
             permission_inputs_need_sync: false,
             permission_subscriptions: Vec::new(),
-            operation_queue,
+            operation_hub,
             permission_error: None,
             permission_batch: PermissionBatchState::default(),
         };
@@ -585,19 +591,19 @@ impl PropertiesWindow {
         if self.permission_batch.is_active() {
             return;
         }
-        let submitted = self
-            .operation_queue
-            .lock()
-            .map_err(|_| "the operation queue lock is poisoned".into())
-            .and_then(|mut queue| {
-                self.model
-                    .submit_permissions(&mut queue)
+        let submitted: Result<Vec<JobId>, Box<str>> = self
+            .model
+            .permission_request()
+            .map_err(|error| error.to_string().into())
+            .and_then(|(roots, scope, change)| {
+                self.operation_hub
+                    .submit_metadata_changes(roots, scope, change)
                     .map_err(|error| error.to_string().into())
             });
         match submitted {
             Ok(jobs) => {
-                self.permission_error = None;
-                self.permission_batch.begin(jobs.len());
+                self.permission_error = self.operation_hub.persistence_error();
+                self.permission_batch.begin(jobs);
                 self.pump_operation_queue(cx);
             }
             Err(error) => {
@@ -608,21 +614,27 @@ impl PropertiesWindow {
     }
 
     fn pump_operation_queue(&mut self, cx: &mut Context<Self>) {
-        let queue = Arc::clone(&self.operation_queue);
-        let result =
-            spawn_ready_local_operations(queue, cx, |state: &mut Self, succeeded, error, cx| {
+        let result = spawn_ready_hub_operations(
+            self.operation_hub.clone(),
+            cx,
+            |state: &mut Self, id, succeeded, error, cx| {
                 let succeeded = succeeded && error.is_none();
+                let outcome = state.permission_batch.finish(id, succeeded);
+                if outcome == PermissionBatchOutcome::Ignored {
+                    return;
+                }
                 if let Some(error) = error {
                     state.permission_error = Some(error);
                 }
-                if state.permission_batch.finish(succeeded) == PermissionBatchOutcome::Succeeded {
+                if outcome == PermissionBatchOutcome::Succeeded {
                     state.model.clear_permission_edits();
                 }
                 state.pump_operation_queue(cx);
                 cx.notify();
-            });
+            },
+        );
         if let Err(error) = result {
-            self.permission_error = Some(error);
+            self.permission_error = Some(error.to_string().into());
             cx.notify();
         }
     }
@@ -1661,18 +1673,28 @@ mod tests {
     #[test]
     fn permission_batches_clear_edits_only_after_every_job_succeeds() {
         let mut batch = PermissionBatchState::default();
+        let first = JobId::new(11).expect("non-zero job ID");
+        let second = JobId::new(12).expect("non-zero job ID");
+        let unrelated = JobId::new(99).expect("non-zero job ID");
         assert!(!batch.is_active());
-        batch.begin(2);
+        batch.begin([first, second]);
         assert!(batch.is_active());
 
-        assert_eq!(batch.finish(true), PermissionBatchOutcome::Pending);
+        assert_eq!(
+            batch.finish(unrelated, true),
+            PermissionBatchOutcome::Ignored
+        );
+        assert_eq!(batch.finish(first, true), PermissionBatchOutcome::Pending);
         assert!(batch.is_active());
-        assert_eq!(batch.finish(false), PermissionBatchOutcome::Failed);
+        assert_eq!(batch.finish(second, false), PermissionBatchOutcome::Failed);
         assert!(!batch.is_active());
 
-        batch.begin(2);
-        assert_eq!(batch.finish(true), PermissionBatchOutcome::Pending);
-        assert_eq!(batch.finish(true), PermissionBatchOutcome::Succeeded);
+        batch.begin([first, second]);
+        assert_eq!(batch.finish(first, true), PermissionBatchOutcome::Pending);
+        assert_eq!(
+            batch.finish(second, true),
+            PermissionBatchOutcome::Succeeded
+        );
     }
 
     #[gpui_kit::test]

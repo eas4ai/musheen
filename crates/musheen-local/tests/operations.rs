@@ -215,6 +215,33 @@ fn local_copy_preserves_an_existing_recovery_staging_path() {
 }
 
 #[test]
+fn recovery_staging_can_be_discarded_only_through_an_app_owned_name() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = root.path().join("destination");
+    let staging = StagingPath::for_destination(
+        &StorePath::from_unix_path(destination.as_os_str()),
+        JobId::new(9).unwrap(),
+        EventGeneration::new(2),
+    )
+    .unwrap();
+    fs::write(staging.path().as_unix_path().unwrap(), b"partial").unwrap();
+    let unrelated = root.path().join("unrelated");
+    fs::write(&unrelated, b"keep").unwrap();
+    let mut provider = LocalStore::new();
+
+    assert!(provider.recovery_staging_available(staging.path()));
+    provider.discard_recovery_staging(staging.path()).unwrap();
+    assert!(!provider.recovery_staging_available(staging.path()));
+    assert!(!staging.path().as_unix_path().unwrap().exists());
+    assert!(
+        provider
+            .discard_recovery_staging(&StorePath::from_unix_path(unrelated.as_os_str()))
+            .is_err()
+    );
+    assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+}
+
+#[test]
 fn local_copy_preserves_extended_attributes_and_access_control_lists() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source-with-metadata");

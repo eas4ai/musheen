@@ -233,3 +233,47 @@ fn cancellation_tokens_are_per_job_and_scheduler_limits_are_snapshotted() {
     assert_eq!(scheduler.limits().operation_data_mutations(), 2);
     assert_eq!(lowered.operation_data_mutations(), 1);
 }
+
+#[test]
+fn pause_resume_cancel_retry_and_restart_states_are_explicit() {
+    let limits = ResourceLimits::default();
+    let clock = ManualClock::default();
+    let mut scheduler = Scheduler::with_clock(&limits, clock.clone());
+    let local = provider("local-controls", ProviderLimits::unbounded());
+    let paused = scheduler
+        .enqueue(plan(100, OperationKind::Copy, local.clone()))
+        .unwrap();
+    let failed = scheduler
+        .enqueue(plan(101, OperationKind::Copy, local.clone()))
+        .unwrap();
+    let interrupted = scheduler
+        .enqueue(plan(102, OperationKind::SetPermissions, local))
+        .unwrap();
+    let started = scheduler.start_ready().unwrap();
+    assert_eq!(started.len(), 3);
+
+    scheduler.pause(paused).unwrap();
+    assert_eq!(scheduler.state(paused), Some(JobState::Paused));
+    scheduler.resume(paused).unwrap();
+    assert_eq!(scheduler.state(paused), Some(JobState::Running));
+    scheduler.cancel(paused).unwrap();
+    assert_eq!(scheduler.state(paused), Some(JobState::Cancelling));
+    scheduler.finish_cancel(paused).unwrap();
+    assert_eq!(scheduler.state(paused), Some(JobState::Cancelled));
+
+    scheduler.fail(failed).unwrap();
+    let old_generation = started
+        .iter()
+        .find(|job| job.id() == failed)
+        .unwrap()
+        .generation();
+    scheduler.retry(failed).unwrap();
+    assert_eq!(scheduler.state(failed), Some(JobState::Queued));
+    let retried = scheduler.start_ready().unwrap();
+    assert_eq!(retried[0].generation().get(), old_generation.get() + 1);
+
+    scheduler.interrupt(interrupted).unwrap();
+    assert_eq!(scheduler.state(interrupted), Some(JobState::Interrupted));
+    scheduler.retry(interrupted).unwrap();
+    assert_eq!(scheduler.state(interrupted), Some(JobState::Queued));
+}

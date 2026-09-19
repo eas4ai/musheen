@@ -12,6 +12,7 @@ pub mod search;
 mod shell;
 pub mod sidebar;
 mod status_bar;
+mod status_center;
 mod theme;
 mod toolbar;
 pub mod views;
@@ -29,4 +30,9 @@ pub use icons::{
 pub use info_pane::*;
 pub use operations::*;
 pub use shell::{FocusTarget, SemanticRegion, ShellModel};
+pub use status_center::{
+    ConfirmationDefault, DestructiveConfirmation, EmptyTrashChallenge, EmptyTrashConfirmation,
+    OperationFailure, OperationStatus, OperationStatusEntry, RecoveryAction, StatusCenterError,
+    StatusCenterModel, TrashItem, TrashSurfaceModel,
+};
 pub use theme::{AppearanceMode, MotionPolicy, ThemeProfile};

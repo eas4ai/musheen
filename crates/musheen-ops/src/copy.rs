@@ -177,6 +177,16 @@ impl CopyRequest {
     }
 
     #[must_use]
+    pub const fn job_id(&self) -> JobId {
+        self.job_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> EventGeneration {
+        self.generation
+    }
+
+    #[must_use]
     pub const fn destination(&self) -> &StorePath {
         &self.destination
     }
@@ -671,7 +681,7 @@ fn check_cancellation(
     cancellation: &CancellationToken,
     destination: &StorePath,
 ) -> Result<(), OperationFailure> {
-    cancellation.check().map_err(|error| match error {
+    cancellation.wait_if_paused().map_err(|error| match error {
         StoreError::Cancelled => {
             OperationFailure::before_publish(FailureKind::Cancelled, destination)
         }

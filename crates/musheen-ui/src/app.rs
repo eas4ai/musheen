@@ -1,5 +1,6 @@
 use crate::dialogs::{
-    PropertiesFailureWindow, PropertiesWindow, PropertiesWindowData,
+    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
+    PropertiesWindow, PropertiesWindowData, conflict_window_options,
     install_properties_key_bindings, properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
@@ -13,12 +14,11 @@ use crate::navigation::{
     ApplicationSession, BreadcrumbTrail, MAX_WINDOWS, NavigationError, OmnibarMode, OmnibarState,
     OmnibarSubmission, PaneId, TabId, WindowSession, resolve_path_input,
 };
-use crate::operations::{
-    DropAction, FileDragPayload, LocalOperationQueue, spawn_ready_local_operations,
-};
+use crate::operations::{DropAction, FileDragPayload, OperationHub, spawn_ready_hub_operations};
 use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, SearchState};
 use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
+use crate::status_center::{OperationStatus, OperationStatusEntry, TrashItem, TrashSurfaceModel};
 use crate::toolbar::COMMAND_IDS;
 use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
@@ -27,6 +27,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Root, Selectable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -36,15 +37,20 @@ use gpui_kit::{
 };
 use musheen_core::{
     CancellationToken, CommandAction, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page,
-    ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch, SearchCompletion,
-    SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath,
-    WatchEvent,
+    ProviderId, ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch,
+    SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem,
+    StorePath, WatchEvent,
 };
 use musheen_desktop::{
-    MimeDetector, PreviewDocument, SessionStore, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
-    ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
+    ConflictDecisionStore, MimeDetector, PreviewDocument, SessionStore, ThumbnailCache,
+    ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService,
+    ThumbnailSize,
 };
 use musheen_local::LocalStore;
+use musheen_ops::{
+    ApplyScope, ConflictChoice, ConflictDecision, ConflictItemKind, ConflictPolicies,
+    ConflictRecord, MutationError, MutationProvider, OperationKind,
+};
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::NativeTheme;
@@ -87,6 +93,7 @@ const CONTENT_PADDING: f32 = 32.0;
 const GRID_ITEM_WIDTH: f32 = 128.0;
 const GRID_GAP: f32 = 8.0;
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(250);
+const OPERATION_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
 
 gpui_kit::actions!(
     musheen,
@@ -243,6 +250,32 @@ struct SearchItemRenderSpec {
     mime: Option<Box<str>>,
 }
 
+#[derive(Clone, Debug)]
+enum TrashState {
+    Loading,
+    Ready(TrashSurfaceModel),
+    Error(Box<str>),
+}
+
+enum TrashRestoreResult {
+    Restored,
+    Conflict {
+        receipt: musheen_ops::TrashReceipt,
+        conflict: ConflictRecord,
+    },
+    Failed(MutationError),
+}
+
+struct PendingDrop {
+    payload: FileDragPayload,
+    target: StorePath,
+    conflicts: Vec<ConflictRecord>,
+    next_conflict: usize,
+    decisions: Vec<ConflictDecision>,
+    policies: ConflictPolicies,
+    automatic_scope: bool,
+}
+
 pub fn run(initial_path: PathBuf) {
     gpui_kit::application()
         .with_assets(MusheenAssets)
@@ -275,6 +308,7 @@ pub fn run(initial_path: PathBuf) {
                 store,
                 application.windows().to_vec(),
             )));
+            let operation_hub = OperationHub::for_current_user(&ResourceLimits::default());
             let windows = coordinator
                 .lock()
                 .expect("session coordinator lock is not poisoned")
@@ -287,6 +321,7 @@ pub fn run(initial_path: PathBuf) {
                         SessionBinding {
                             coordinator: Arc::clone(&coordinator),
                             window_id,
+                            operation_hub: operation_hub.clone(),
                         },
                     )
                 })
@@ -512,6 +547,7 @@ impl SessionCoordinator {
 struct SessionBinding {
     coordinator: Arc<Mutex<SessionCoordinator>>,
     window_id: u64,
+    operation_hub: OperationHub,
 }
 
 #[derive(Debug)]
@@ -566,6 +602,7 @@ impl SessionBinding {
         Ok(Self {
             coordinator: Arc::clone(&self.coordinator),
             window_id,
+            operation_hub: self.operation_hub.clone(),
         })
     }
 }
@@ -594,8 +631,14 @@ struct MusheenApp {
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
     info_panes: HashMap<TabId, InfoPaneModel>,
     catalog: Catalog,
-    operation_queue: Arc<Mutex<LocalOperationQueue>>,
+    operation_hub: OperationHub,
+    operation_status_revision: u64,
     operation_error: Option<Box<str>>,
+    status_center_open: bool,
+    trash_states: HashMap<TabId, TrashState>,
+    pending_empty_trash: Option<Vec<musheen_ops::TrashReceipt>>,
+    pending_drop: Option<PendingDrop>,
+    conflict_subscriptions: Vec<Subscription>,
 }
 
 impl Drop for MusheenApp {
@@ -652,6 +695,7 @@ impl MusheenApp {
                 Some(SessionBinding {
                     coordinator,
                     window_id,
+                    operation_hub: OperationHub::new(&limits),
                 }),
             )
         } else {
@@ -677,7 +721,12 @@ impl MusheenApp {
         directories.insert(focused_tab, directory);
         let mut sidebars = HashMap::new();
         sidebars.insert(focused_tab, default_sidebar_model(pins.clone()));
-        let operation_queue = Arc::new(Mutex::new(LocalOperationQueue::new(&limits)));
+        let operation_hub = session_binding
+            .as_ref()
+            .map(|binding| binding.operation_hub.clone())
+            .unwrap_or_else(|| OperationHub::new(&limits));
+        let operation_error = operation_hub.persistence_error();
+        let operation_status_revision = operation_hub.status_revision();
         let mut this = Self {
             directories,
             searches: HashMap::new(),
@@ -702,15 +751,44 @@ impl MusheenApp {
             icon_cache: HashMap::new(),
             info_panes: HashMap::new(),
             catalog: Catalog::system().expect("the built-in locale catalogs are valid"),
-            operation_queue,
-            operation_error: None,
+            operation_hub,
+            operation_status_revision,
+            operation_error,
+            status_center_open: false,
+            trash_states: HashMap::new(),
+            pending_empty_trash: None,
+            pending_drop: None,
+            conflict_subscriptions: Vec::new(),
         };
         this.start_load(location, cx);
+        this.start_operation_status_refresh(cx);
         this
+    }
+
+    fn start_operation_status_refresh(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(OPERATION_STATUS_REFRESH_INTERVAL)
+                    .await;
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |state, cx| {
+                    let revision = state.operation_hub.status_revision();
+                    if revision != state.operation_status_revision {
+                        state.operation_status_revision = revision;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     fn start_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
+        let trash = is_trash_location(&location);
         if !self.directories.contains_key(&tab_id) {
             let mut directory = DirectoryModel::new(self.limits.snapshot());
             if let Some(tab) = self.navigation.tab(tab_id) {
@@ -727,6 +805,11 @@ impl MusheenApp {
             .entry(tab_id)
             .or_insert_with(|| DirectoryModel::new(self.limits.snapshot()))
             .begin_navigation(location);
+        if trash {
+            self.start_trash_load(tab_id, cx);
+            return;
+        }
+        self.trash_states.remove(&tab_id);
         let worker_load = load.clone();
         let result_load = load.clone();
         let store = Arc::clone(&self.store);
@@ -749,6 +832,50 @@ impl MusheenApp {
         if self.watch_directories {
             self.start_watch(tab_id, load, cx);
         }
+    }
+
+    fn start_trash_load(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        self.trash_states.insert(tab_id, TrashState::Loading);
+        let work = cx.background_spawn(async move {
+            let mut store = LocalStore::new();
+            store.list_trash().map(|entries| {
+                TrashSurfaceModel::new(
+                    entries
+                        .into_iter()
+                        .map(|entry| {
+                            TrashItem::with_kind(
+                                entry.receipt().clone(),
+                                entry.deleted_at_unix_seconds(),
+                                entry.kind(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if state
+                    .navigation
+                    .tab(tab_id)
+                    .is_some_and(|tab| is_trash_location(tab.location()))
+                {
+                    state.trash_states.insert(
+                        tab_id,
+                        match result {
+                            Ok(surface) => TrashState::Ready(surface),
+                            Err(error) => TrashState::Error(error.to_string().into()),
+                        },
+                    );
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn start_watch(&mut self, tab_id: TabId, load: DirectoryLoad, cx: &mut Context<Self>) {
@@ -880,11 +1007,14 @@ impl MusheenApp {
             self.pending_omnibar_value = Some(display);
         }
         self.pending_content_focus = true;
-        let loaded = self
-            .directories
-            .get(&tab_id)
-            .and_then(DirectoryModel::location)
-            == Some(&location);
+        let loaded = if is_trash_location(&location) {
+            self.trash_states.contains_key(&tab_id)
+        } else {
+            self.directories
+                .get(&tab_id)
+                .and_then(DirectoryModel::location)
+                == Some(&location)
+        };
         if loaded {
             cx.notify();
         } else {
@@ -1029,12 +1159,14 @@ impl MusheenApp {
             .map(|(_, path)| path)
             .collect::<Vec<_>>();
         let options = properties_window_options(title, cx);
+        let operation_hub = self.operation_hub.clone();
         let work = cx.background_spawn(async move { PropertiesWindowData::load(&paths) });
         cx.spawn(async move |_, cx| {
             let result = work.await;
             cx.open_window(options, move |window, cx| match result {
                 Ok(data) => {
-                    let view = cx.new(|cx| PropertiesWindow::new(data, window, cx));
+                    let view =
+                        cx.new(|cx| PropertiesWindow::with_hub(data, operation_hub, window, cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 }
                 Err(error) => {
@@ -1288,18 +1420,42 @@ impl MusheenApp {
         target: StorePath,
         cx: &mut Context<Self>,
     ) {
-        let submitted = self
-            .operation_queue
-            .lock()
-            .map_err(|_| "the operation queue lock is poisoned".into())
-            .and_then(|mut queue| {
-                queue
-                    .submit_drop(payload, target)
-                    .map_err(|error| error.to_string().into())
+        let conflicts = match self.operation_hub.conflicts_for_drop(&payload, &target) {
+            Ok(conflicts) => conflicts,
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        if !conflicts.is_empty() {
+            self.pending_drop = Some(PendingDrop {
+                payload,
+                target,
+                conflicts,
+                next_conflict: 0,
+                decisions: Vec::new(),
+                policies: ConflictPolicies::default(),
+                automatic_scope: false,
             });
+            self.advance_pending_drop(cx);
+            return;
+        }
+        let submitted = self
+            .operation_hub
+            .submit_drop(payload, target)
+            .map_err(|error| Box::<str>::from(error.to_string()));
+        self.finish_drop_submission(submitted, cx);
+    }
+
+    fn finish_drop_submission(
+        &mut self,
+        submitted: Result<Vec<musheen_ops::JobId>, Box<str>>,
+        cx: &mut Context<Self>,
+    ) {
         match submitted {
             Ok(_) => {
-                self.operation_error = None;
+                self.operation_error = self.operation_hub.persistence_error();
                 self.pump_operation_queue(cx);
             }
             Err(error) => {
@@ -1309,19 +1465,145 @@ impl MusheenApp {
         }
     }
 
+    fn advance_pending_drop(&mut self, cx: &mut Context<Self>) {
+        loop {
+            let Some(pending) = self.pending_drop.as_ref() else {
+                return;
+            };
+            if pending.next_conflict >= pending.conflicts.len() {
+                let pending = self
+                    .pending_drop
+                    .take()
+                    .expect("the completed drop remains pending");
+                let submitted = self
+                    .operation_hub
+                    .submit_drop_resolved(pending.payload, pending.target, pending.decisions)
+                    .map_err(|error| Box::<str>::from(error.to_string()));
+                self.finish_drop_submission(submitted, cx);
+                return;
+            }
+            let conflict = pending.conflicts[pending.next_conflict].clone();
+            if pending.automatic_scope {
+                match self.resolve_saved_drop_decision(&conflict) {
+                    Ok(Some(decision)) => {
+                        let pending = self
+                            .pending_drop
+                            .as_mut()
+                            .expect("the drop remains pending while applying a policy");
+                        pending.decisions.push(decision);
+                        pending.next_conflict += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.pending_drop = None;
+                        self.operation_error = Some(error);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            self.open_drop_conflict(conflict, cx);
+            return;
+        }
+    }
+
+    fn resolve_saved_drop_decision(
+        &mut self,
+        conflict: &ConflictRecord,
+    ) -> Result<Option<ConflictDecision>, Box<str>> {
+        let mut store = LocalStore::new();
+        let source = MutationProvider::identity(&mut store, conflict.source())
+            .map_err(|error| Box::<str>::from(error.to_string()))?
+            .ok_or_else(|| Box::<str>::from("the conflict source no longer exists"))?;
+        let destination = MutationProvider::identity(&mut store, conflict.destination())
+            .map_err(|error| Box::<str>::from(error.to_string()))?
+            .ok_or_else(|| Box::<str>::from("the conflict destination no longer exists"))?;
+        let mut journal = ConflictDecisionStore::for_current_user()
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        self.pending_drop
+            .as_mut()
+            .expect("a saved decision is resolved only for a pending drop")
+            .policies
+            .resolve_saved_decision(conflict, &source, &destination, &mut journal)
+            .map_err(|error| error.to_string().into())
+    }
+
+    fn open_drop_conflict(&mut self, conflict: ConflictRecord, cx: &mut Context<Self>) {
+        let options = conflict_window_options(cx);
+        let model = ConflictDialogModel::new(conflict);
+        let mut dialog = None;
+        cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ConflictDialog::new(model, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .expect("Musheen could not open a conflict dialog");
+        let dialog = dialog.expect("the conflict window constructs its view");
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
+            ConflictDialogEvent::Resolved(choice, scope) => {
+                this.resolve_pending_drop_conflict(*choice, *scope, cx);
+            }
+            ConflictDialogEvent::Cancelled => {
+                this.pending_drop = None;
+                cx.notify();
+            }
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    fn resolve_pending_drop_conflict(
+        &mut self,
+        choice: ConflictChoice,
+        scope: ApplyScope,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_drop.as_mut() else {
+            return;
+        };
+        let Some(conflict) = pending.conflicts.get(pending.next_conflict) else {
+            return;
+        };
+        let decision = ConflictDecisionStore::for_current_user()
+            .map_err(|error| error.to_string())
+            .and_then(|mut journal| {
+                pending
+                    .policies
+                    .decide(conflict, choice, scope, &mut journal)
+                    .map_err(|error| error.to_string())
+            });
+        match decision {
+            Ok(decision) => {
+                pending.decisions.push(decision);
+                pending.next_conflict += 1;
+                pending.automatic_scope |= scope == ApplyScope::CompatibleRemaining;
+                self.advance_pending_drop(cx);
+            }
+            Err(error) => {
+                self.pending_drop = None;
+                self.operation_error = Some(error.into());
+                cx.notify();
+            }
+        }
+    }
+
     fn pump_operation_queue(&mut self, cx: &mut Context<Self>) {
-        let queue = Arc::clone(&self.operation_queue);
-        let result =
-            spawn_ready_local_operations(queue, cx, |state: &mut Self, succeeded, error, cx| {
-                state.operation_error = error;
+        let result = spawn_ready_hub_operations(
+            self.operation_hub.clone(),
+            cx,
+            |state: &mut Self, _, succeeded, error, cx| {
+                if let Some(error) = error {
+                    state.operation_error = Some(error);
+                }
                 if succeeded {
                     state.load_focused_tab(cx);
                 }
                 state.pump_operation_queue(cx);
                 cx.notify();
-            });
+            },
+        );
         if let Err(error) = result {
-            self.operation_error = Some(error);
+            self.operation_error = Some(error.to_string().into());
             cx.notify();
         }
     }
@@ -2403,7 +2685,7 @@ impl MusheenApp {
                                     let navigation_location = location.clone();
                                     let can_drop_location = location.clone();
                                     let drop_location = location.clone();
-                                    let operation_queue = Arc::clone(&self.operation_queue);
+                                    let operation_hub = self.operation_hub.clone();
                                     let selected = current.as_ref() == Some(&location);
                                     let label = entry.label().to_owned();
                                     let icon = match (kind, label.as_str()) {
@@ -2425,10 +2707,10 @@ impl MusheenApp {
                                         .can_drop(move |value, _, _| {
                                             value.downcast_ref::<FileDragPayload>().is_some_and(
                                                 |payload| {
-                                                    operation_queue.lock().is_ok_and(|queue| {
-                                                        queue
-                                                            .can_accept(payload, &can_drop_location)
-                                                    })
+                                                    operation_hub.can_accept_drop(
+                                                        payload,
+                                                        &can_drop_location,
+                                                    )
                                                 },
                                             )
                                         })
@@ -2573,7 +2855,13 @@ impl MusheenApp {
             .get(&spec.tab_id)
             .map(|directory| directory.state().clone())
             .unwrap_or(DirectoryState::Loading);
-        let body = if self.searches.contains_key(&spec.tab_id) {
+        let trash = self
+            .navigation
+            .tab(spec.tab_id)
+            .is_some_and(|tab| is_trash_location(tab.location()));
+        let body = if trash {
+            self.render_trash_surface(spec.tab_id, cx)
+        } else if self.searches.contains_key(&spec.tab_id) {
             self.render_search_results(spec.tab_id, spec.pane_index, cx)
         } else {
             match state {
@@ -2611,6 +2899,341 @@ impl MusheenApp {
             .bg(colors.background)
             .child(body)
             .into_any_element()
+    }
+
+    fn render_trash_surface(&self, tab_id: TabId, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let state = self
+            .trash_states
+            .get(&tab_id)
+            .cloned()
+            .unwrap_or(TrashState::Loading);
+        match state {
+            TrashState::Loading => self.render_loading(colors.skeleton),
+            TrashState::Error(message) => self.render_error(message, cx),
+            TrashState::Ready(surface) => {
+                let items = surface.items().to_vec();
+                let rows = items.iter().cloned().enumerate().map(|(index, item)| {
+                    let receipt = item.receipt().clone();
+                    let kind = item.kind();
+                    let original = DisplayPath::from_store_path(receipt.original_path())
+                        .as_str()
+                        .to_owned();
+                    div()
+                        .id(SharedString::from(format!("trash-item-{index}")))
+                        .test_support()
+                        .role(Role::ListItem)
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_4()
+                        .py_3()
+                        .border_b_1()
+                        .border_color(colors.border)
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .flex()
+                                .flex_col()
+                                .child(original)
+                                .child(div().text_xs().text_color(colors.muted_foreground).child(
+                                    format!(
+                                        "Deleted at Unix time {}",
+                                        item.deleted_at_unix_seconds()
+                                    ),
+                                )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("trash-restore-{index}")))
+                                .label("Restore")
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.restore_trash_item(receipt.clone(), kind, cx);
+                                })),
+                        )
+                });
+                let receipts = items
+                    .iter()
+                    .map(|item| item.receipt().clone())
+                    .collect::<Vec<_>>();
+                let count = receipts.len();
+                let confirmation = self.pending_empty_trash.as_ref().map(|pending| {
+                    let pending_count = pending.len();
+                    let label = if pending_count == 1 {
+                        "Permanently delete 1 item from Trash? This cannot be undone.".to_owned()
+                    } else {
+                        format!(
+                            "Permanently delete {pending_count} items from Trash? This cannot be undone."
+                        )
+                    };
+                    div()
+                        .id("trash-empty-confirmation")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(label.clone())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_3()
+                        .border_t_1()
+                        .border_color(colors.border)
+                        .child(div().flex_grow(1.0).child(label))
+                        .child(
+                            Button::new("trash-empty-cancel")
+                                .label("Cancel")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pending_empty_trash = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("trash-empty-confirm")
+                                .label("Empty Trash")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_empty_trash(cx);
+                                })),
+                        )
+                });
+                div()
+                    .id("trash-surface")
+                    .test_support()
+                    .role(Role::Region)
+                    .aria_label("Trash contents")
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px_4()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(colors.border)
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .child(format!("{count} items in Trash")),
+                            )
+                            .when(count > 0, |header| {
+                                header.child(
+                                    Button::new("trash-empty")
+                                        .label("Empty Trash")
+                                        .small()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.pending_empty_trash = Some(receipts.clone());
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("trash-items")
+                            .test_support()
+                            .role(Role::List)
+                            .aria_label("Deleted items")
+                            .flex_grow(1.0)
+                            .min_h(px(0.))
+                            .overflow_y_scrollbar()
+                            .children(rows),
+                    )
+                    .children(confirmation)
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn restore_trash_item(
+        &mut self,
+        receipt: musheen_ops::TrashReceipt,
+        source_kind: ConflictItemKind,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = self.navigation.focused_tab().id();
+        let work = cx.background_spawn(async move {
+            let mut store = LocalStore::new();
+            match musheen_ops::execute_restore(&mut store, &receipt) {
+                Ok(()) => TrashRestoreResult::Restored,
+                Err(MutationError::Conflict) => {
+                    let destination_identity =
+                        match MutationProvider::identity(&mut store, receipt.original_path()) {
+                            Ok(Some(identity)) => identity,
+                            Ok(None) => return TrashRestoreResult::Failed(MutationError::Missing),
+                            Err(error) => return TrashRestoreResult::Failed(error),
+                        };
+                    let destination_kind = match store.conflict_item_kind(receipt.original_path()) {
+                        Ok(kind) => kind,
+                        Err(error) => return TrashRestoreResult::Failed(error),
+                    };
+                    let source = match StorePath::from_provider_key(
+                        ProviderId::new("local.trash").expect("the Trash provider ID is valid"),
+                        receipt.provider_reference().to_vec(),
+                    ) {
+                        Ok(source) => source,
+                        Err(error) => {
+                            return TrashRestoreResult::Failed(MutationError::Provider(
+                                error.to_string().into(),
+                            ));
+                        }
+                    };
+                    match ConflictRecord::new(
+                        OperationKind::Restore,
+                        source,
+                        receipt.provider_reference().to_vec(),
+                        source_kind,
+                        receipt.original_path().clone(),
+                        destination_identity.to_vec(),
+                        destination_kind,
+                    ) {
+                        Ok(conflict) => TrashRestoreResult::Conflict { receipt, conflict },
+                        Err(error) => TrashRestoreResult::Failed(MutationError::Provider(
+                            error.to_string().into(),
+                        )),
+                    }
+                }
+                Err(error) => TrashRestoreResult::Failed(error),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                TrashRestoreResult::Restored => state.start_trash_load(tab_id, cx),
+                TrashRestoreResult::Conflict { receipt, conflict } => {
+                    state.open_restore_conflict(tab_id, receipt, conflict, cx);
+                }
+                TrashRestoreResult::Failed(error) => {
+                    state.operation_error = Some(error.to_string().into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_restore_conflict(
+        &mut self,
+        tab_id: TabId,
+        receipt: musheen_ops::TrashReceipt,
+        conflict: ConflictRecord,
+        cx: &mut Context<Self>,
+    ) {
+        let options = conflict_window_options(cx);
+        let model = ConflictDialogModel::new(conflict.clone());
+        let mut dialog = None;
+        cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ConflictDialog::new(model, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .expect("Musheen could not open a conflict dialog");
+        let dialog = dialog.expect("the conflict window constructs its view");
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
+            ConflictDialogEvent::Resolved(choice, scope) => {
+                this.apply_restore_decision(
+                    tab_id,
+                    receipt.clone(),
+                    conflict.clone(),
+                    *choice,
+                    *scope,
+                    cx,
+                );
+            }
+            ConflictDialogEvent::Cancelled => {
+                this.start_trash_load(tab_id, cx);
+            }
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    fn apply_restore_decision(
+        &mut self,
+        tab_id: TabId,
+        receipt: musheen_ops::TrashReceipt,
+        conflict: ConflictRecord,
+        choice: ConflictChoice,
+        scope: ApplyScope,
+        cx: &mut Context<Self>,
+    ) {
+        let decision = ConflictDecisionStore::for_current_user()
+            .map_err(|error| MutationError::Provider(error.to_string().into()))
+            .and_then(|mut journal| {
+                ConflictPolicies::default()
+                    .decide(&conflict, choice, scope, &mut journal)
+                    .map_err(|error| MutationError::Provider(error.to_string().into()))
+            });
+        let decision = match decision {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let work = cx.background_spawn(async move {
+            let mut store = LocalStore::new();
+            store.resolve_restore_conflict(&receipt, &decision)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(()) => state.start_trash_load(tab_id, cx),
+                Err(error) => {
+                    state.operation_error = Some(error.to_string().into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_empty_trash(&mut self, cx: &mut Context<Self>) {
+        let Some(receipts) = self.pending_empty_trash.take() else {
+            return;
+        };
+        let tab_id = self.navigation.focused_tab().id();
+        let confirmed = self
+            .trash_states
+            .get(&tab_id)
+            .and_then(|state| match state {
+                TrashState::Ready(surface) => Some(surface.empty_challenge()),
+                TrashState::Loading | TrashState::Error(_) => None,
+            })
+            .is_some_and(|challenge| challenge.confirm(receipts.len(), true).is_ok());
+        if !confirmed {
+            self.operation_error = Some("Trash changed before it could be emptied".into());
+            cx.notify();
+            return;
+        }
+        let work = cx.background_spawn(async move {
+            let mut store = LocalStore::new();
+            store.purge_trash(&receipts)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(()) => state.start_trash_load(tab_id, cx),
+                Err(error) => {
+                    state.operation_error = Some(error.to_string().into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn render_search_results(
@@ -3601,15 +4224,11 @@ impl MusheenApp {
         .when(is_drop_target, |item| {
             let can_target = drop_target.clone();
             let drop_target = drop_target.clone();
-            let can_queue = Arc::clone(&self.operation_queue);
+            let operation_hub = self.operation_hub.clone();
             item.can_drop(move |value, _, _| {
                 value
                     .downcast_ref::<FileDragPayload>()
-                    .is_some_and(|payload| {
-                        can_queue
-                            .lock()
-                            .is_ok_and(|queue| queue.can_accept(payload, &can_target))
-                    })
+                    .is_some_and(|payload| operation_hub.can_accept_drop(payload, &can_target))
             })
             .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
                 this.submit_file_drop(payload.clone(), drop_target.clone(), cx);
@@ -3634,6 +4253,16 @@ impl MusheenApp {
 
     fn focused_status_text(&self) -> String {
         let tab_id = self.navigation.focused_tab().id();
+        if is_trash_location(self.navigation.focused_tab().location()) {
+            return match self.trash_states.get(&tab_id) {
+                Some(TrashState::Ready(surface)) => match surface.items().len() {
+                    1 => "1 item in Trash".into(),
+                    count => format!("{count} items in Trash"),
+                },
+                Some(TrashState::Error(_)) => "Trash unavailable".into(),
+                Some(TrashState::Loading) | None => "Loading Trash".into(),
+            };
+        }
         if let Some(search) = self.searches.get(&tab_id) {
             return search.status_text();
         }
@@ -3651,6 +4280,308 @@ impl MusheenApp {
             selected_bytes,
             view.is_complete(),
         )
+    }
+
+    fn operation_status_summary(&self) -> String {
+        let status = self.operation_hub.status();
+        let Ok(status) = status.lock() else {
+            return "Operation status unavailable".into();
+        };
+        let active = status
+            .history()
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.status(),
+                    OperationStatus::Pending | OperationStatus::Running | OperationStatus::Paused
+                )
+            })
+            .collect::<Vec<_>>();
+        match active.as_slice() {
+            [entry] => match entry.total_items() {
+                Some(total) => {
+                    format!("{:?}: {} of {total}", entry.kind(), entry.completed_items())
+                }
+                None => format!("{:?}: {} complete", entry.kind(), entry.completed_items()),
+            },
+            entries @ [_, _, ..] => {
+                let completed = entries
+                    .iter()
+                    .map(|entry| entry.completed_items())
+                    .sum::<u64>();
+                let total = entries
+                    .iter()
+                    .map(|entry| entry.total_items())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|totals| totals.into_iter().sum::<u64>());
+                match total {
+                    Some(total) => {
+                        format!(
+                            "{} active operations: {completed} of {total}",
+                            entries.len()
+                        )
+                    }
+                    None => format!("{} active operations", entries.len()),
+                }
+            }
+            [] if status.history().is_empty() => "No operations".into(),
+            [] => format!("{} past operations", status.history().len()),
+        }
+    }
+
+    fn operation_status_entries(&self) -> Vec<OperationStatusEntry> {
+        self.operation_hub
+            .status()
+            .lock()
+            .map(|status| status.visible_entries().into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_operation_control_error(
+        &mut self,
+        result: Result<(), crate::OperationHubError>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match result {
+            Ok(()) => {
+                self.operation_error = self.operation_hub.persistence_error();
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    fn pause_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.pause(id);
+        self.record_operation_control_error(result, cx);
+    }
+
+    fn resume_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.resume(id);
+        self.record_operation_control_error(result, cx);
+    }
+
+    fn cancel_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.cancel(id);
+        self.record_operation_control_error(result, cx);
+    }
+
+    fn retry_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.retry(id);
+        if self.record_operation_control_error(result, cx) {
+            self.pump_operation_queue(cx);
+        }
+    }
+
+    fn resume_recovery_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.resume_recovery(id);
+        if self.record_operation_control_error(result, cx) {
+            self.pump_operation_queue(cx);
+        }
+    }
+
+    fn discard_recovery_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.discard_recovery(id);
+        self.record_operation_control_error(result, cx);
+    }
+
+    fn view_operation_location(&mut self, location: StorePath, cx: &mut Context<Self>) {
+        self.status_center_open = false;
+        self.navigate(operation_browser_location(&location), true, cx);
+    }
+
+    fn dismiss_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.dismiss(id);
+        self.record_operation_control_error(result, cx);
+    }
+
+    fn render_operation_status_center(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let boundary = if Self::high_contrast(cx) {
+            colors.foreground
+        } else {
+            colors.border
+        };
+        let entries = self.operation_status_entries();
+        let rows = entries.into_iter().map(|entry| {
+            let id = entry.id();
+            let id_value = id.get();
+            let status = entry.status();
+            let can_retry = self.operation_hub.can_retry(id);
+            let can_resume_recovery = self.operation_hub.can_resume_recovery(id);
+            let can_discard_recovery = self.operation_hub.can_discard_recovery(id);
+            let has_failures = !entry.failures().is_empty();
+            let browser_location = operation_browser_location(entry.location());
+            let location = DisplayPath::from_store_path(entry.location())
+                .as_str()
+                .to_owned();
+            let label = format!("{:?} — {:?} — {location}", entry.kind(), status);
+            let failures = entry
+                .failures()
+                .iter()
+                .map(|failure| failure.message(entry.kind()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            div()
+                .id(SharedString::from(format!("operation-status-{id_value}")))
+                .test_support()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(boundary)
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .min_w(px(0.))
+                        .flex()
+                        .flex_col()
+                        .text_sm()
+                        .child(label)
+                        .when(!failures.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted_foreground)
+                                    .child(failures),
+                            )
+                        }),
+                )
+                .when(status == OperationStatus::Running, |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!("operation-pause-{id_value}")))
+                            .label("Pause")
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pause_operation(id, cx);
+                            })),
+                    )
+                })
+                .when(status == OperationStatus::Paused, |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!("operation-resume-{id_value}")))
+                            .label("Resume")
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resume_operation(id, cx);
+                            })),
+                    )
+                })
+                .when(
+                    matches!(
+                        status,
+                        OperationStatus::Pending
+                            | OperationStatus::Running
+                            | OperationStatus::Paused
+                    ),
+                    |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("operation-cancel-{id_value}")))
+                                .label("Cancel")
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.cancel_operation(id, cx);
+                                })),
+                        )
+                    },
+                )
+                .when(
+                    can_retry
+                        && matches!(
+                            status,
+                            OperationStatus::Failed
+                                | OperationStatus::PartialSuccess
+                                | OperationStatus::Interrupted
+                        ),
+                    |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("operation-retry-{id_value}")))
+                                .label("Retry failed")
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.retry_operation(id, cx);
+                                })),
+                        )
+                    },
+                )
+                .when(can_resume_recovery, |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!(
+                            "operation-recovery-resume-{id_value}"
+                        )))
+                        .label("Resume")
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.resume_recovery_operation(id, cx);
+                        })),
+                    )
+                })
+                .when(can_discard_recovery, |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!(
+                            "operation-recovery-discard-{id_value}"
+                        )))
+                        .label("Discard staging")
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.discard_recovery_operation(id, cx);
+                        })),
+                    )
+                })
+                .when(has_failures, |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!("operation-view-{id_value}")))
+                            .label("View location")
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.view_operation_location(browser_location.clone(), cx);
+                            })),
+                    )
+                })
+                .when(
+                    !matches!(
+                        status,
+                        OperationStatus::Pending
+                            | OperationStatus::Running
+                            | OperationStatus::Paused
+                    ),
+                    |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!(
+                                "operation-dismiss-{id_value}"
+                            )))
+                            .label("Dismiss")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.dismiss_operation(id, cx);
+                                },
+                            )),
+                        )
+                    },
+                )
+        });
+        div()
+            .id("operation-status-center")
+            .test_support()
+            .role(Role::Status)
+            .aria_label("Operation history")
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .bg(colors.background)
+            .border_t_1()
+            .border_color(boundary)
+            .children(rows)
+            .into_any_element()
     }
 }
 
@@ -3670,6 +4601,7 @@ impl Render for MusheenApp {
         }
         let colors = cx.theme().colors;
         let status = self.focused_status_text();
+        let operation_summary = self.operation_status_summary();
         let info_visible = self.shell.info_visible();
         let wide = window.viewport_size().width.as_f32() >= 960.0;
         let high_contrast = Self::high_contrast(cx);
@@ -3799,6 +4731,9 @@ impl Render for MusheenApp {
                     .children(panes)
                     .children(info),
             )
+            .when(self.status_center_open, |shell| {
+                shell.child(self.render_operation_status_center(cx))
+            })
             .child(
                 div()
                     .id("status-bar")
@@ -3814,23 +4749,53 @@ impl Render for MusheenApp {
                     .bg(colors.background)
                     .border_t_1()
                     .border_color(boundary)
-                    .child(status),
+                    .child(status)
+                    .child(div().flex_grow(1.0))
+                    .child(
+                        Button::new("operation-status-summary")
+                            .label(operation_summary)
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.status_center_open = !this.status_center_open;
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 }
 
 fn place_path(label: &str, home: Option<&Path>) -> Option<StorePath> {
+    if label == "Trash" {
+        return Some(trash_store_path());
+    }
     let home = home?;
     match label {
         "Home" => Some(StorePath::from_unix_path(home.as_os_str())),
         "Desktop" | "Documents" | "Downloads" => {
             Some(StorePath::from_unix_path(home.join(label).into_os_string()))
         }
-        "Trash" => Some(StorePath::from_unix_path(
-            home.join(".local/share/Trash/files").into_os_string(),
-        )),
         _ => None,
     }
+}
+
+fn operation_browser_location(path: &StorePath) -> StorePath {
+    path.as_unix_path()
+        .and_then(Path::parent)
+        .map(|parent| StorePath::from_unix_path(parent.as_os_str()))
+        .unwrap_or_else(|| path.clone())
+}
+
+fn trash_store_path() -> StorePath {
+    StorePath::from_provider_key(
+        ProviderId::new("musheen.trash").expect("the built-in Trash provider ID is valid"),
+        b"root".to_vec(),
+    )
+    .expect("the built-in Trash path is valid")
+}
+
+fn is_trash_location(path: &StorePath) -> bool {
+    path == &trash_store_path()
 }
 
 fn default_sidebar_model(pins: PinStore) -> SidebarModel {
@@ -4177,6 +5142,7 @@ mod tests {
         let binding = SessionBinding {
             coordinator,
             window_id: first_id,
+            operation_hub: OperationHub::new(&ResourceLimits::default()),
         };
 
         let prepared = binding
@@ -4201,6 +5167,34 @@ mod tests {
     }
 
     #[test]
+    fn detached_windows_share_one_application_operation_hub() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
+            SessionStore::at(temporary.path().join("session.json")),
+            vec![WindowSession::new(StorePath::from_unix_path("/first"))],
+        )));
+        let window_id = coordinator
+            .lock()
+            .expect("coordinator lock is available")
+            .entries()[0]
+            .0;
+        let binding = SessionBinding {
+            coordinator,
+            window_id,
+            operation_hub: OperationHub::new(&ResourceLimits::default()),
+        };
+
+        let detached = binding
+            .append_window(WindowSession::new(StorePath::from_unix_path("/second")))
+            .expect("detached window is accepted");
+
+        assert!(Arc::ptr_eq(
+            &binding.operation_hub.status(),
+            &detached.operation_hub.status()
+        ));
+    }
+
+    #[test]
     fn an_older_window_save_cannot_overwrite_a_newer_session() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
@@ -4215,6 +5209,7 @@ mod tests {
         let binding = SessionBinding {
             coordinator,
             window_id,
+            operation_hub: OperationHub::new(&ResourceLimits::default()),
         };
         let older = binding
             .prepare_save(WindowSession::new(StorePath::from_unix_path("/older")))
@@ -4462,6 +5457,185 @@ mod tests {
             assert!(window.find("info-pane").visible());
             window.click("view.info", cx);
             assert!(window.try_find("info-pane").is_none());
+        })
+        .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn status_bar_opens_shared_operation_history(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let recovery_directory = tempfile::tempdir().expect("recovery directory is available");
+        let recovery_destination = StorePath::from_unix_path(
+            recovery_directory
+                .path()
+                .join("restored.txt")
+                .into_os_string(),
+        );
+        let recovery_id = musheen_ops::JobId::new(43).expect("non-zero job ID");
+        let recovery_staging = musheen_ops::StagingPath::for_destination(
+            &recovery_destination,
+            recovery_id,
+            musheen_ops::EventGeneration::new(0),
+        )
+        .expect("staging path derives")
+        .path()
+        .clone();
+        filesystem::write(
+            recovery_staging.as_unix_path().expect("staging is local"),
+            b"partial",
+        )
+        .expect("staging writes");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let id = musheen_ops::JobId::new(41).expect("non-zero job ID");
+                state
+                    .operation_hub
+                    .status()
+                    .lock()
+                    .expect("status center lock is available")
+                    .register(
+                        id,
+                        musheen_ops::EventGeneration::new(0),
+                        musheen_ops::OperationKind::Copy,
+                        StorePath::from_unix_path("/fixture/Welcome.md"),
+                        Some(1),
+                    )
+                    .expect("operation registers");
+                let completed = musheen_ops::JobId::new(42).expect("non-zero job ID");
+                let status = state.operation_hub.status();
+                let mut status = status.lock().expect("status center lock is available");
+                status
+                    .register(
+                        completed,
+                        musheen_ops::EventGeneration::new(0),
+                        musheen_ops::OperationKind::Move,
+                        StorePath::from_unix_path("/fixture/Archive"),
+                        Some(1),
+                    )
+                    .expect("completed operation registers");
+                status.mark_running(completed).unwrap();
+                status.record_item_success(completed).unwrap();
+                status.complete(completed).unwrap();
+                status
+                    .register(
+                        recovery_id,
+                        musheen_ops::EventGeneration::new(0),
+                        musheen_ops::OperationKind::Copy,
+                        recovery_destination.clone(),
+                        Some(1),
+                    )
+                    .unwrap();
+                status.mark_running(recovery_id).unwrap();
+                status
+                    .record_recoverable_failure(
+                        recovery_id,
+                        recovery_destination.clone(),
+                        recovery_staging.clone(),
+                        "recovery staging remains",
+                    )
+                    .unwrap();
+                status.mark_recoverable(recovery_id).unwrap();
+                cx.notify();
+            });
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("operation-status-summary").label(),
+                Some("Copy: 0 of 1")
+            );
+            window.click("operation-status-summary", cx);
+            window.render_frame(cx);
+            assert!(window.find("operation-status-center").visible());
+            assert!(window.find("operation-status-41").visible());
+            assert!(window.find("operation-status-42").visible());
+            assert!(window.find("operation-recovery-discard-43").visible());
+            assert!(window.try_find("operation-recovery-resume-43").is_none());
+            assert!(window.find("operation-view-43").visible());
+            window.click("operation-recovery-discard-43", cx);
+            window.render_frame(cx);
+            assert!(
+                !recovery_staging
+                    .as_unix_path()
+                    .expect("staging is local")
+                    .exists()
+            );
+            assert!(window.try_find("operation-recovery-discard-43").is_none());
+            window.click("operation-dismiss-42", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("operation-status-42").is_none());
+        })
+        .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn trash_sidebar_uses_receipts_and_requires_a_second_empty_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let tab_id = state.navigation.focused_tab().id();
+                state.navigation.navigate_focused(trash_store_path());
+                state.trash_states.insert(
+                    tab_id,
+                    TrashState::Ready(TrashSurfaceModel::new(vec![TrashItem::new(
+                        musheen_ops::TrashReceipt::new(
+                            StorePath::from_unix_path("/home/user/Documents/old.txt"),
+                            b"trash-id".to_vec(),
+                        ),
+                        1_726_742_400,
+                    )])),
+                );
+                cx.notify();
+            });
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("trash-surface").visible());
+            assert!(window.find("trash-item-0").visible());
+            assert!(window.find("trash-restore-0").visible());
+            window.click("trash-empty", cx);
+            window.render_frame(cx);
+            assert!(window.find("trash-empty-confirmation").visible());
+            assert_eq!(
+                window.find("trash-empty-confirmation").label(),
+                Some("Permanently delete 1 item from Trash? This cannot be undone.")
+            );
         })
         .expect("test window remains open");
     }

@@ -1,6 +1,7 @@
 //! Recoverable file-operation engine.
 
 mod batch_rename;
+mod conflict;
 mod copy;
 mod create;
 mod delete;
@@ -54,6 +55,10 @@ pub use staging::{StagingError, StagingPath};
 pub use state::{JobState, JobStateMachine, StateError};
 pub use verify::source_unchanged;
 
+pub use conflict::{
+    ApplyScope, ConflictChoice, ConflictDecision, ConflictDecisionJournal, ConflictError,
+    ConflictItemKind, ConflictPolicies, ConflictRecord,
+};
 pub use copy::{
     CopyCapabilities, CopyOptions, CopyOutcome, CopyProvider, CopyRequest, CopySession,
     CopyStrategy, EntryKind, EntrySnapshot, FailureKind, OperationFailure, ProviderError,

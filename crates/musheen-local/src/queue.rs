@@ -1,9 +1,11 @@
 use crate::LocalStore;
-use musheen_core::{ResourceLimits, Store, StorePath};
+use crate::mutation::{ResolvedTransferFailure, execute_resolved_transfer};
+use musheen_core::{DisplayPath, ResourceLimits, Store, StorePath};
 use musheen_ops::{
-    CopyRequest, CopySession, EventGeneration, JobId, JobState, MetadataChange, MetadataPlan,
-    MetadataScope, MutationError, MutationProvider, OperationKind, OperationPlan, ProviderLimits,
-    ProviderSnapshot, Scheduler, SchedulerError, execute_move,
+    ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest, CopySession, EventGeneration,
+    JobId, JobState, MetadataChange, MetadataPlan, MetadataScope, MutationError, MutationProvider,
+    OperationFailure, OperationKind, OperationPlan, ProviderLimits, ProviderSnapshot,
+    PublicationState, Scheduler, SchedulerError, SourceState, execute_move,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -58,8 +60,31 @@ enum LocalOperation {
         action: DropAction,
         source: StorePath,
         destination: StorePath,
+        decision: Option<ConflictDecision>,
     },
     Metadata(MetadataPlan),
+}
+
+impl LocalOperation {
+    const fn kind(&self) -> OperationKind {
+        match self {
+            Self::Transfer { action, .. } => action.operation_kind(),
+            Self::Metadata(plan) => {
+                if plan.requires_permissions() {
+                    OperationKind::SetPermissions
+                } else {
+                    OperationKind::SetOwnership
+                }
+            }
+        }
+    }
+
+    fn affected_path(&self) -> &StorePath {
+        match self {
+            Self::Transfer { source, .. } => source,
+            Self::Metadata(plan) => plan.root(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -70,34 +95,142 @@ pub struct ReadyLocalOperation {
     operation: LocalOperation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalFailureDisposition {
+    Failed,
+    Recoverable,
+    NeedsAttention,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalOperationFailure {
+    message: Box<str>,
+    disposition: LocalFailureDisposition,
+    recovery_staging: Option<StorePath>,
+}
+
+impl LocalOperationFailure {
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> LocalFailureDisposition {
+        self.disposition
+    }
+
+    #[must_use]
+    pub const fn recovery_staging(&self) -> Option<&StorePath> {
+        self.recovery_staging.as_ref()
+    }
+
+    fn failed(message: impl Into<Box<str>>) -> Self {
+        Self {
+            message: message.into(),
+            disposition: LocalFailureDisposition::Failed,
+            recovery_staging: None,
+        }
+    }
+
+    fn from_transfer(error: OperationFailure) -> Self {
+        let disposition = if error.publication_state() == PublicationState::Unknown
+            || error.source_state() == SourceState::Unknown
+            || error.destination_published()
+        {
+            LocalFailureDisposition::NeedsAttention
+        } else if error.staging_retained().is_some() {
+            LocalFailureDisposition::Recoverable
+        } else {
+            LocalFailureDisposition::Failed
+        };
+        let recovery_staging = error.staging_retained().cloned();
+        let destination = DisplayPath::from_store_path(error.destination());
+        let message = match error.staging_retained() {
+            Some(staging) => format!(
+                "{error} for destination {}; recovery staging remains at {}",
+                destination.as_str(),
+                DisplayPath::from_store_path(staging).as_str()
+            ),
+            None => format!("{error} for destination {}", destination.as_str()),
+        };
+        Self {
+            message: message.into(),
+            disposition,
+            recovery_staging,
+        }
+    }
+
+    fn from_resolved(error: ResolvedTransferFailure) -> Self {
+        match error {
+            ResolvedTransferFailure::Transfer(error) => Self::from_transfer(error),
+            ResolvedTransferFailure::Failed(message) => Self::failed(message),
+            ResolvedTransferFailure::NeedsAttention(message) => Self {
+                message,
+                disposition: LocalFailureDisposition::NeedsAttention,
+                recovery_staging: None,
+            },
+        }
+    }
+}
+
 impl ReadyLocalOperation {
     #[must_use]
     pub const fn id(&self) -> JobId {
         self.id
     }
 
+    #[must_use]
+    pub const fn generation(&self) -> EventGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> OperationKind {
+        self.operation.kind()
+    }
+
+    #[must_use]
+    pub fn affected_path(&self) -> &StorePath {
+        self.operation.affected_path()
+    }
+
     pub fn execute(self) -> Result<(), Box<str>> {
+        self.execute_detailed().map_err(|error| error.message)
+    }
+
+    pub fn execute_detailed(self) -> Result<(), LocalOperationFailure> {
         let mut store = LocalStore::new();
         match self.operation {
             LocalOperation::Transfer {
                 action,
                 source,
                 destination,
+                decision,
             } => {
                 let request = CopyRequest::new(self.id, self.generation, source, destination);
+                if let Some(decision) = decision {
+                    return execute_resolved_transfer(
+                        &mut store,
+                        &request,
+                        &decision,
+                        &self.cancellation,
+                    )
+                    .map_err(LocalOperationFailure::from_resolved);
+                }
                 match action {
                     DropAction::Copy => CopySession::default()
                         .execute(&mut store, &request, &self.cancellation)
                         .map(|_| ())
-                        .map_err(|error| error.to_string().into()),
+                        .map_err(LocalOperationFailure::from_transfer),
                     DropAction::Move => execute_move(&mut store, &request, &self.cancellation)
                         .map(|_| ())
-                        .map_err(|error| error.to_string().into()),
+                        .map_err(LocalOperationFailure::from_transfer),
                 }
             }
             LocalOperation::Metadata(plan) => plan
-                .execute(&mut store)
-                .map_err(|error| error.to_string().into()),
+                .execute_controlled(&mut store, &self.cancellation)
+                .map_err(|error| LocalOperationFailure::failed(error.to_string())),
         }
     }
 }
@@ -121,7 +254,19 @@ impl LocalOperationQueue {
 
     #[must_use]
     pub fn can_accept(&self, payload: &FileDragPayload, target: &StorePath) -> bool {
-        self.plan_drop(payload, target).is_ok()
+        self.inspect_drop(payload, target).is_ok()
+    }
+
+    pub fn conflicts_for_drop(
+        &self,
+        payload: &FileDragPayload,
+        target: &StorePath,
+    ) -> Result<Vec<ConflictRecord>, DropError> {
+        Ok(self
+            .inspect_drop(payload, target)?
+            .into_iter()
+            .filter_map(|candidate| candidate.conflict)
+            .collect())
     }
 
     pub fn submit_drop(
@@ -129,7 +274,17 @@ impl LocalOperationQueue {
         payload: FileDragPayload,
         target: StorePath,
     ) -> Result<Vec<JobId>, DropError> {
-        let planned = self.plan_drop(&payload, &target)?;
+        let planned = self.plan_drop(&payload, &target, &[])?;
+        self.enqueue_planned(planned)
+    }
+
+    pub fn submit_drop_resolved(
+        &mut self,
+        payload: FileDragPayload,
+        target: StorePath,
+        decisions: Vec<ConflictDecision>,
+    ) -> Result<Vec<JobId>, DropError> {
+        let planned = self.plan_drop(&payload, &target, &decisions)?;
         self.enqueue_planned(planned)
     }
 
@@ -196,14 +351,64 @@ impl LocalOperationQueue {
     }
 
     pub fn finish(&mut self, id: JobId, result: Result<(), Box<str>>) -> Result<(), DropError> {
+        if self.scheduler.state(id) == Some(JobState::Cancelling) {
+            self.scheduler.finish_cancel(id)?;
+            self.failures.remove(&id);
+            self.operations.remove(&id);
+            return Ok(());
+        }
         match result {
-            Ok(()) => self.scheduler.complete(id)?,
+            Ok(()) => {
+                self.scheduler.complete(id)?;
+                self.operations.remove(&id);
+            }
             Err(error) => {
                 self.scheduler.fail(id)?;
                 self.failures.insert(id, error);
             }
         }
-        self.operations.remove(&id);
+        Ok(())
+    }
+
+    pub fn pause(&mut self, id: JobId) -> Result<(), DropError> {
+        self.scheduler.pause(id)?;
+        Ok(())
+    }
+
+    pub fn resume(&mut self, id: JobId) -> Result<(), DropError> {
+        self.scheduler.resume(id)?;
+        Ok(())
+    }
+
+    pub fn cancel(&mut self, id: JobId) -> Result<(), DropError> {
+        let queued = self.scheduler.state(id) == Some(JobState::Queued);
+        self.scheduler.cancel(id)?;
+        if queued {
+            self.operations.remove(&id);
+        }
+        Ok(())
+    }
+
+    pub fn retry(&mut self, id: JobId) -> Result<EventGeneration, DropError> {
+        if !self.operations.contains_key(&id) {
+            return Err(DropError::MissingOperation(id));
+        }
+        let generation = self.scheduler.retry(id)?;
+        self.failures.remove(&id);
+        Ok(generation)
+    }
+
+    #[must_use]
+    pub fn can_retry(&self, id: JobId) -> bool {
+        self.operations.contains_key(&id)
+            && matches!(
+                self.scheduler.state(id),
+                Some(JobState::Failed | JobState::Interrupted)
+            )
+    }
+
+    pub fn interrupt(&mut self, id: JobId) -> Result<(), DropError> {
+        self.scheduler.interrupt(id)?;
         Ok(())
     }
 
@@ -214,7 +419,20 @@ impl LocalOperationQueue {
 
     #[must_use]
     pub fn job_count(&self) -> usize {
-        self.operations.len()
+        self.operations
+            .keys()
+            .filter(|id| {
+                matches!(
+                    self.scheduler.state(**id),
+                    Some(
+                        JobState::Queued
+                            | JobState::Running
+                            | JobState::Paused
+                            | JobState::Cancelling
+                    )
+                )
+            })
+            .count()
     }
 
     #[must_use]
@@ -239,9 +457,48 @@ impl LocalOperationQueue {
         &self,
         payload: &FileDragPayload,
         target: &StorePath,
+        decisions: &[ConflictDecision],
     ) -> Result<Vec<(OperationPlan, LocalOperation)>, DropError> {
+        let candidates = self.inspect_drop(payload, target)?;
+        let mut matched = HashSet::with_capacity(decisions.len());
+        let mut planned = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let decision = if let Some(conflict) = candidate.conflict.as_ref() {
+                let (index, decision) = decisions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, decision)| decision_matches_conflict(decision, conflict))
+                    .ok_or_else(|| DropError::DestinationExists(conflict.destination().clone()))?;
+                if !matched.insert(index) {
+                    return Err(DropError::Mutation(MutationError::InvalidScope));
+                }
+                Some(decision.clone())
+            } else {
+                None
+            };
+            planned.push((
+                candidate.plan,
+                LocalOperation::Transfer {
+                    action: candidate.action,
+                    source: candidate.source,
+                    destination: candidate.destination,
+                    decision,
+                },
+            ));
+        }
+        if matched.len() != decisions.len() {
+            return Err(DropError::Mutation(MutationError::InvalidScope));
+        }
+        Ok(planned)
+    }
+
+    fn inspect_drop(
+        &self,
+        payload: &FileDragPayload,
+        target: &StorePath,
+    ) -> Result<Vec<DropCandidate>, DropError> {
         let target_path = writable_directory(target)?;
-        let store = LocalStore::new();
+        let mut store = LocalStore::new();
         let provider = provider_snapshot(&store, target);
         let mut sources = HashSet::with_capacity(payload.sources.len());
         let mut destinations = HashSet::with_capacity(payload.sources.len());
@@ -279,14 +536,34 @@ impl LocalOperationQueue {
                     destination_path.as_os_str(),
                 )));
             }
-            if destination_path.try_exists().map_err(|error| {
-                DropError::Plan(format!("could not inspect destination: {error}").into())
-            })? {
-                return Err(DropError::DestinationExists(StorePath::from_unix_path(
-                    destination_path.as_os_str(),
-                )));
-            }
             let destination = StorePath::from_unix_path(destination_path.as_os_str());
+            let conflict = match fs::symlink_metadata(&destination_path) {
+                Ok(destination_metadata) => {
+                    let source_identity = MutationProvider::identity(&mut store, source)?
+                        .ok_or(MutationError::Missing)?;
+                    let destination_identity =
+                        MutationProvider::identity(&mut store, &destination)?
+                            .ok_or(MutationError::Missing)?;
+                    Some(
+                        ConflictRecord::new(
+                            payload.action.operation_kind(),
+                            source.clone(),
+                            source_identity.to_vec(),
+                            conflict_kind(&metadata),
+                            destination.clone(),
+                            destination_identity.to_vec(),
+                            conflict_kind(&destination_metadata),
+                        )
+                        .map_err(|error| DropError::Plan(error.to_string().into()))?,
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(DropError::Plan(
+                        format!("could not inspect destination: {error}").into(),
+                    ));
+                }
+            };
             let plan = OperationPlan::new(
                 payload.action.operation_kind(),
                 provider.clone(),
@@ -294,16 +571,41 @@ impl LocalOperationQueue {
                 destination.clone(),
             )
             .map_err(|error| DropError::Plan(error.to_string().into()))?;
-            planned.push((
+            planned.push(DropCandidate {
                 plan,
-                LocalOperation::Transfer {
-                    action: payload.action,
-                    source: source.clone(),
-                    destination,
-                },
-            ));
+                action: payload.action,
+                source: source.clone(),
+                destination,
+                conflict,
+            });
         }
         Ok(planned)
+    }
+}
+
+struct DropCandidate {
+    plan: OperationPlan,
+    action: DropAction,
+    source: StorePath,
+    destination: StorePath,
+    conflict: Option<ConflictRecord>,
+}
+
+fn decision_matches_conflict(decision: &ConflictDecision, conflict: &ConflictRecord) -> bool {
+    decision.operation() == conflict.operation()
+        && decision.source() == conflict.source()
+        && decision.destination() == conflict.destination()
+        && decision.source_identity() == conflict.source_identity()
+        && decision.destination_identity() == conflict.destination_identity()
+}
+
+fn conflict_kind(metadata: &fs::Metadata) -> ConflictItemKind {
+    if metadata.file_type().is_symlink() {
+        ConflictItemKind::SymbolicLink
+    } else if metadata.is_dir() {
+        ConflictItemKind::Directory
+    } else {
+        ConflictItemKind::File
     }
 }
 
@@ -404,5 +706,27 @@ impl From<MutationError> for DropError {
 impl From<SchedulerError> for DropError {
     fn from(error: SchedulerError) -> Self {
         Self::Scheduler(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_transaction_attention_is_never_flattened_to_retryable_failure() {
+        let failure =
+            LocalOperationFailure::from_resolved(ResolvedTransferFailure::NeedsAttention(
+                "the published destination needs inspection".into(),
+            ));
+
+        assert_eq!(
+            failure.disposition(),
+            LocalFailureDisposition::NeedsAttention
+        );
+        assert_eq!(
+            failure.message(),
+            "the published destination needs inspection"
+        );
     }
 }

@@ -1,12 +1,15 @@
 use crate::StoreError;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::Waker;
 
 /// A cheap, clonable cancellation signal checked at provider work boundaries.
 #[derive(Debug, Default)]
 struct CancellationState {
     cancelled: AtomicBool,
+    paused: AtomicBool,
+    pause_lock: Mutex<()>,
+    pause_waiters: Condvar,
     waiters: Mutex<Vec<Waker>>,
 }
 
@@ -23,6 +26,7 @@ impl CancellationToken {
         if self.0.cancelled.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.0.pause_waiters.notify_all();
         let mut waiters = self
             .0
             .waiters
@@ -44,6 +48,40 @@ impl CancellationToken {
         } else {
             Ok(())
         }
+    }
+
+    pub fn pause(&self) {
+        if !self.is_cancelled() {
+            self.0.paused.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn resume(&self) {
+        if self.0.paused.swap(false, Ordering::AcqRel) {
+            self.0.pause_waiters.notify_all();
+        }
+    }
+
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.0.paused.load(Ordering::Acquire)
+    }
+
+    /// Blocks a provider worker at a safe boundary while this token is paused.
+    pub fn wait_if_paused(&self) -> Result<(), StoreError> {
+        let mut guard = self
+            .0
+            .pause_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while self.is_paused() && !self.is_cancelled() {
+            guard = self
+                .0
+                .pause_waiters
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        self.check()
     }
 
     /// Registers a pending operation to be polled when cancellation occurs.

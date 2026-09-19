@@ -177,6 +177,32 @@ impl<C: Clock> Scheduler<C> {
         Ok(())
     }
 
+    pub fn pause(&mut self, id: JobId) -> Result<(), SchedulerError> {
+        if !self.running.contains(&id) {
+            return Err(SchedulerError::NotRunning(id));
+        }
+        self.transition(id, JobState::Paused)?;
+        self.jobs
+            .get(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .cancellation
+            .pause();
+        Ok(())
+    }
+
+    pub fn resume(&mut self, id: JobId) -> Result<(), SchedulerError> {
+        if !self.running.contains(&id) {
+            return Err(SchedulerError::NotRunning(id));
+        }
+        self.transition(id, JobState::Running)?;
+        self.jobs
+            .get(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .cancellation
+            .resume();
+        Ok(())
+    }
+
     pub fn cancel(&mut self, id: JobId) -> Result<(), SchedulerError> {
         let state = self.state(id).ok_or(SchedulerError::UnknownJob(id))?;
         let cancellation = self
@@ -186,11 +212,53 @@ impl<C: Clock> Scheduler<C> {
             .cancellation
             .clone();
         cancellation.cancel();
-        self.transition(id, JobState::Cancelling)?;
         if state == JobState::Queued {
             self.queued.retain(|queued| *queued != id);
-            self.transition(id, JobState::RolledBack)?;
+            self.transition(id, JobState::Cancelled)?;
+        } else {
+            self.transition(id, JobState::Cancelling)?;
         }
+        Ok(())
+    }
+
+    pub fn finish_cancel(&mut self, id: JobId) -> Result<(), SchedulerError> {
+        if !self.running.contains(&id) {
+            return Err(SchedulerError::NotRunning(id));
+        }
+        self.transition(id, JobState::Cancelled)?;
+        self.running.remove(&id);
+        Ok(())
+    }
+
+    pub fn retry(&mut self, id: JobId) -> Result<EventGeneration, SchedulerError> {
+        let generation = self
+            .jobs
+            .get_mut(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .state
+            .retry(self.clock.now())?;
+        let record = self
+            .jobs
+            .get_mut(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?;
+        record.cancellation = CancellationToken::new();
+        self.queued.push_back(id);
+        Ok(generation)
+    }
+
+    pub fn interrupt(&mut self, id: JobId) -> Result<(), SchedulerError> {
+        if !self.running.contains(&id) {
+            return Err(SchedulerError::NotRunning(id));
+        }
+        let cancellation = self
+            .jobs
+            .get(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .cancellation
+            .clone();
+        cancellation.cancel();
+        self.transition(id, JobState::Interrupted)?;
+        self.running.remove(&id);
         Ok(())
     }
 

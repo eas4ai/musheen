@@ -96,20 +96,20 @@ create `crates/musheen-ops/tests/{copy,move}.rs`.
 `crates/musheen-ui/src/{status_center,dialogs/conflict.rs}`; create
 `crates/musheen-ui/tests/operations.rs`.
 
-- [ ] Test replace, skip, keep-both, merge-folder, apply-to-all scoping,
+- [x] Test replace, skip, keep-both, merge-folder, apply-to-all scoping,
   stale-destination revalidation, pause/resume/cancel, retry, partial success,
   dismissed-status persistence, and destructive confirmations that name command,
   scope, reversibility, and location without defaulting focus to destruction.
-- [ ] Run `cargo test -p musheen-ui --test operations`; expect failure.
-- [ ] Implement conflict decisions as journaled inputs tied to exact source and
+- [x] Run `cargo test -p musheen-ui --test operations`; expect failure.
+- [x] Implement conflict decisions as journaled inputs tied to exact source and
   destination identities. Revalidate before applying a saved decision.
-- [ ] Render compact active progress plus a status center with completed,
+- [x] Render compact active progress plus a status center with completed,
   failed, recoverable, and needs-attention histories. Errors name affected
   paths and safe next actions.
-- [ ] Add a Trash surface that lists original location and deletion time,
+- [x] Add a Trash surface that lists original location and deletion time,
   restores through conflict handling, and confirms Empty Trash by item count.
-- [ ] Run keyboard, accessibility, and restart-recovery UI tests.
-- [ ] Commit with `feat(ui): add conflict workflow and status center`.
+- [x] Run keyboard, accessibility, and restart-recovery UI tests.
+- [x] Commit with `feat(ui): add conflict workflow and status center`.
 
 ### Task 6: Close the phase
 
