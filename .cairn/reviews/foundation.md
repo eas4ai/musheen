@@ -30,7 +30,7 @@ findings:
   - resolved: DEP-007 formerly required the mountinfo path components to be contiguous; it now rejects source containing both `/proc/self` and `mountinfo` components even when runtime code joins them (independent 38c61f0 3)
   - resolved: DEP-008 formerly allowed configuration modules to export Camino under another name; it now rejects Camino type aliases and renamed imports before applying the config/URI path allowance (independent 38c61f0 4)
   - resolved: DEP-015 formerly selected archive paths manually and omitted root `build.rs`; it now archives the full exact commit and copies that complete tracked tree into the Linux build container (independent 38c61f0 5)
-  - open: DEP-001 can pass a direct GTK settings-file read when `gtk-3.0` and `settings.ini` are defined in separate Rust modules (independent 602a385 1)
+  - resolved: DEP-001 formerly matched fragmented GTK paths one file at a time; it now aggregates normalized Rust source across the complete tree before checking required path components (independent 602a385 1)
   - open: DEP-003 can pass a hand-written Desktop Entry parser when the domain marker and generic line/key-value parser are split between modules (independent 602a385 2)
   - open: DEP-007 can pass a hand-written mount-table parser that reads `/etc/mtab` (independent 602a385 3)
   - open: DEP-008 can pass a Camino wrapper type exported from config and consumed as a local store root (independent 602a385 4)
@@ -119,6 +119,10 @@ alias guard matched the reviewer's `pub type ConfigPath = Utf8PathBuf` escape.
 For independent finding 38c61f0 5, the checker now passes an unrestricted
 `git archive` of the candidate to Docker, and the Dockerfile copies the entire
 archive before running the locked build.
+
+For independent finding 602a385 1, DEP-001 now aggregates all tracked Rust
+source before checking GTK directory and settings-file components, so splitting
+the constants across modules no longer changes the result.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

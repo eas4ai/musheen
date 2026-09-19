@@ -89,6 +89,10 @@ const fragmentedAppearanceReads = [
   [["gtk-3.0", "settings.ini"], "direct GTK 3 settings-file access"],
   [["gtk-4.0", "settings.ini"], "direct GTK 4 settings-file access"],
 ];
+const compactTreeSource = rustSources
+  .map((path) => readFileSync(path, "utf8"))
+  .join("\n")
+  .replace(/[^A-Za-z0-9_.-]/g, "");
 
 for (const path of rustSources) {
   const source = readFileSync(path, "utf8");
@@ -99,10 +103,10 @@ for (const path of rustSources) {
       failures.push(`${path}: ${description}`);
     }
   }
-  for (const [needles, description] of fragmentedAppearanceReads) {
-    if (needles.every((needle) => compactSource.includes(needle))) {
-      failures.push(`${path}: ${description}`);
-    }
+}
+for (const [needles, description] of fragmentedAppearanceReads) {
+  if (needles.every((needle) => compactTreeSource.includes(needle))) {
+    failures.push(`Rust source tree: ${description}`);
   }
 }
 
