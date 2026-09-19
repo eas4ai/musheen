@@ -8,7 +8,7 @@ examined:
 findings:
   - resolved: DEP-001 formerly allowed an aliased dark-light dependency; the mechanism now rejects known competing appearance providers by dependency key, package alias, and resolved lockfile package.
   - resolved: DEP-007 and DEP-008 formerly inspected only dependency keys; both mechanisms now reject competing packages declared under aliases.
-  - open: DEP-015 runs a locked local build, but the repository has no CI workflow to run it as the agreed mechanism requires.
+  - resolved: DEP-015 formerly ran only a local locked build; the repository now has CI that runs `cargo build --locked`, and the mechanism verifies that command remains in the workflow.
   - open: The commitment promises an advisory review even though its included requirements and mechanisms cover licenses only; that exit statement cannot be proved by this commitment.
 
 # Foundation completion review
@@ -26,3 +26,7 @@ same check passed again after removing the probe.
 For the second resolution, the clean checks passed, then DEP-007 rejected a
 `procfs` package alias and DEP-008 rejected a `glob` package alias. Both checks
 passed again after those temporary probes were removed.
+
+For the third resolution, DEP-015 passed with the committed workflow, failed
+when its command was temporarily changed to an unlocked build, and passed again
+after restoring `cargo build --locked`.

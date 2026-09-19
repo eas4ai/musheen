@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 const failures = [];
 const trackedLockfile = spawnSync(
@@ -10,6 +11,11 @@ const trackedLockfile = spawnSync(
 );
 if (trackedLockfile.status !== 0) {
   failures.push("Cargo.lock is not committed");
+}
+
+const workflow = readFileSync(".github/workflows/ci.yml", "utf8");
+if (!/^\s*run:\s*cargo build --locked\s*$/m.test(workflow)) {
+  failures.push("the CI workflow does not run cargo build --locked");
 }
 
 const build = spawnSync("cargo", ["build", "--locked"], {

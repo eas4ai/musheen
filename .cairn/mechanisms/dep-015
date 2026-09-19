@@ -3,6 +3,7 @@ inputs:
   - :(glob)**/Cargo.toml
   - Cargo.lock
   - :(glob)**/*.rs
+  - .github/workflows/ci.yml
   - scripts/check-dep-015.mjs
 requirements:
   - DEP-015
