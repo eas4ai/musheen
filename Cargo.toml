@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+camino = "1"
 freedesktop = "0.0"
 native-theme = "0.5"
 native-theme-gpui = { version = "0.5", default-features = false, features = ["svg-rasterize"] }
 nix = { version = "0.31", features = ["fs"] }
+notify = "8"
+open = "5"
 proc-mounts = "0.3"
 reflink-copy = "0.1"
+rustix = { version = "1", features = ["fs"] }
+walkdir = "2"
+wax = "0.7"
 xattr = "1"
 
 [patch.crates-io]
