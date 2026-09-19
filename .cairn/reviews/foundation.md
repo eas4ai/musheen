@@ -7,7 +7,7 @@ examined:
   - repository automation for the required locked CI build
 findings:
   - resolved: DEP-001 formerly allowed an aliased dark-light dependency; the mechanism now rejects known competing appearance providers by dependency key, package alias, and resolved lockfile package.
-  - open: DEP-007 and DEP-008 inspect dependency keys but not package aliases, so declarations such as mounts = { package = "procfs", version = "..." } or patterns = { package = "glob", version = "..." } bypass their competing-crate checks.
+  - resolved: DEP-007 and DEP-008 formerly inspected only dependency keys; both mechanisms now reject competing packages declared under aliases.
   - open: DEP-015 runs a locked local build, but the repository has no CI workflow to run it as the agreed mechanism requires.
   - open: The commitment promises an advisory review even though its included requirements and mechanisms cover licenses only; that exit statement cannot be proved by this commitment.
 
@@ -22,3 +22,7 @@ four findings above must be resolved before this commitment can be complete.
 For the first resolution, the check passed on the repository and failed after
 temporarily adding `appearance_probe = { package = "dark-light", ... }`; the
 same check passed again after removing the probe.
+
+For the second resolution, the clean checks passed, then DEP-007 rejected a
+`procfs` package alias and DEP-008 rejected a `glob` package alias. Both checks
+passed again after those temporary probes were removed.

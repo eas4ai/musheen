@@ -64,6 +64,12 @@ for (const name of [
   for (const { path } of declarations(name)) {
     failures.push(`${path} directly declares competing package ${name}`);
   }
+  const alias = new RegExp(`\\bpackage\\s*=\\s*"${name}"`);
+  for (const { path, text } of manifests) {
+    if (alias.test(text)) {
+      failures.push(`${path} aliases competing package ${name}`);
+    }
+  }
 }
 
 for (const path of tracked(":(glob)**/*.rs")) {

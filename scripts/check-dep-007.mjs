@@ -54,6 +54,12 @@ for (const name of ["libc", "libmount", "mountpoints", "procfs", "sys-mount"]) {
   for (const { path } of declarations(name)) {
     failures.push(`${path} directly declares forbidden competing package ${name}`);
   }
+  const alias = new RegExp(`\\bpackage\\s*=\\s*"${name}"`);
+  for (const { path, text } of manifests) {
+    if (alias.test(text)) {
+      failures.push(`${path} aliases forbidden competing package ${name}`);
+    }
+  }
 }
 
 for (const path of tracked(":(glob)**/*.rs")) {
