@@ -16,6 +16,15 @@ findings:
   - resolved: The DEP-008 mechanism formerly omitted Cargo.lock and allowed direct `globwalk`; it now verifies approved locked versions, rejects direct or aliased `globwalk`, and documents that alternate providers internal to approved dependencies are transitive implementation details rather than app-selected role providers (independent 12d3043 4)
   - resolved: The DEP-015 check formerly accepted a disabled workflow step; it now requires push and pull-request triggers, scopes the locked command to the `locked-build` job, rejects conditional execution and error suppression, and executes the same locked build for Cairn evidence (independent 12d3043 5)
   - resolved: The commitment formerly excluded all code changes despite the recorded vendored connector patch; its outcome now permits dependency-enablement changes while continuing to exclude user-facing behavior (independent 12d3043 6)
+  - open: DEP-008 and the foundation exit evidence do not authorize the checker's transitive-provider exception; the lockfile contains alternate transitive traversal, matching, and notification providers that the mechanism explicitly ignores (independent d922070 1)
+  - open: DEP-001 can false-pass a compiled direct appearance bypass when `gsettings` and its schema are assembled from separate string fragments (independent d922070 2)
+  - open: DEP-003 can false-pass a compiled hand-written parser for Desktop Entry key/value lines because it checks dependencies but no source boundary (independent d922070 3)
+  - open: DEP-007 can false-pass with its four required crates moved to package metadata because it matches dependency-like text in any TOML section and omits Cargo.lock (independent d922070 4)
+  - open: DEP-007 can false-pass compiled raw-libc and mount-table bypasses when imports are aliased and paths are assembled from string fragments (independent d922070 5)
+  - open: DEP-008 can false-pass a compiled second traversal provider because its finite blacklist does not include the `ignore` crate (independent d922070 6)
+  - open: DEP-008 can false-pass lossless local paths represented by Camino when the crate import is aliased (independent d922070 7)
+  - open: DEP-015 can false-pass a workflow that excludes every branch under both declared triggers (independent d922070 8)
+  - open: The DEP-015 receipt proves a local locked build and committed CI configuration but records no GitHub Actions run identity, status, or log for the named candidate (independent d922070 9)
 
 # Foundation completion review
 
