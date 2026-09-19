@@ -1,5 +1,6 @@
 use crate::CoreError;
 use crate::error::validate_bounded_bytes;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -30,6 +31,25 @@ impl ProviderId {
     }
 }
 
+impl Serialize for ProviderId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A lossless operation target owned by a storage provider.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StorePath(StorePathInner);
@@ -41,6 +61,13 @@ enum StorePathInner {
         provider: ProviderId,
         key: Box<[u8]>,
     },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum StorePathDocument {
+    Unix { bytes: Vec<u8> },
+    Provider { provider: ProviderId, key: Vec<u8> },
 }
 
 impl StorePath {
@@ -91,6 +118,40 @@ impl StorePath {
         match &self.0 {
             StorePathInner::Unix(_) => None,
             StorePathInner::ProviderKey { provider, key } => Some((provider, key)),
+        }
+    }
+}
+
+impl Serialize for StorePath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let document = match &self.0 {
+            #[cfg(unix)]
+            StorePathInner::Unix(path) => StorePathDocument::Unix {
+                bytes: path.as_os_str().as_bytes().to_vec(),
+            },
+            StorePathInner::ProviderKey { provider, key } => StorePathDocument::Provider {
+                provider: provider.clone(),
+                key: key.to_vec(),
+            },
+        };
+        document.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StorePath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match StorePathDocument::deserialize(deserializer)? {
+            #[cfg(unix)]
+            StorePathDocument::Unix { bytes } => Ok(Self::from_unix_bytes(bytes)),
+            StorePathDocument::Provider { provider, key } => {
+                Self::from_provider_key(provider, key).map_err(serde::de::Error::custom)
+            }
         }
     }
 }

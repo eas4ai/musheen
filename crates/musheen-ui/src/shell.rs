@@ -22,6 +22,7 @@ pub enum FocusTarget {
     Search,
     ViewMode,
     InfoToggle,
+    PaneSplit,
     Settings,
     Sidebar,
     Directory,
@@ -45,7 +46,7 @@ const INFO_REGIONS: [SemanticRegion; 6] = [
     SemanticRegion::StatusBar,
 ];
 
-const BASE_FOCUS: [FocusTarget; 12] = [
+const BASE_FOCUS: [FocusTarget; 13] = [
     FocusTarget::Tabs,
     FocusTarget::Back,
     FocusTarget::Forward,
@@ -55,12 +56,13 @@ const BASE_FOCUS: [FocusTarget; 12] = [
     FocusTarget::Search,
     FocusTarget::ViewMode,
     FocusTarget::InfoToggle,
+    FocusTarget::PaneSplit,
     FocusTarget::Settings,
     FocusTarget::Sidebar,
     FocusTarget::Directory,
 ];
 
-const INFO_FOCUS: [FocusTarget; 13] = [
+const INFO_FOCUS: [FocusTarget; 14] = [
     FocusTarget::Tabs,
     FocusTarget::Back,
     FocusTarget::Forward,
@@ -70,6 +72,7 @@ const INFO_FOCUS: [FocusTarget; 13] = [
     FocusTarget::Search,
     FocusTarget::ViewMode,
     FocusTarget::InfoToggle,
+    FocusTarget::PaneSplit,
     FocusTarget::Settings,
     FocusTarget::Sidebar,
     FocusTarget::Directory,

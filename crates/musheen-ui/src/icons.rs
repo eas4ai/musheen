@@ -17,6 +17,11 @@ pub enum LucideIcon {
     Network,
     Trash,
     Info,
+    Plus,
+    Copy,
+    RotateCcw,
+    Columns2,
+    PanelRight,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +75,11 @@ pub fn lucide_icon(icon_key: &str) -> Option<LucideIcon> {
         "network" => LucideIcon::Network,
         "trash" => LucideIcon::Trash,
         "info" => LucideIcon::Info,
+        "plus" => LucideIcon::Plus,
+        "copy" => LucideIcon::Copy,
+        "rotate-ccw" => LucideIcon::RotateCcw,
+        "columns-2" => LucideIcon::Columns2,
+        "panel-right" => LucideIcon::PanelRight,
         _ => return None,
     })
 }

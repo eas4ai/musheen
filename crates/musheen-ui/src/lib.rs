@@ -3,10 +3,10 @@
 mod app;
 mod directory;
 mod icons;
+pub mod navigation;
 mod shell;
 mod sidebar;
 mod status_bar;
-mod tab_bar;
 mod theme;
 mod toolbar;
 

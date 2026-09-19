@@ -52,6 +52,7 @@ fn keyboard_focus_order_follows_the_visible_shell() {
             FocusTarget::Search,
             FocusTarget::ViewMode,
             FocusTarget::InfoToggle,
+            FocusTarget::PaneSplit,
             FocusTarget::Settings,
             FocusTarget::Sidebar,
             FocusTarget::Directory,
@@ -76,6 +77,7 @@ fn toolbar_uses_stable_command_registry_ids() {
             "view.list",
             "view.grid",
             "view.info",
+            "pane.split",
             "app.settings",
         ]
     );

@@ -320,7 +320,7 @@ fn serialize(document: &SettingsDocument) -> String {
     output
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), SettingsError> {
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), SettingsError> {
     ensure_parent(path)?;
     let parent = parent_directory(path);
     let temp_path = unique_temp_path(path);

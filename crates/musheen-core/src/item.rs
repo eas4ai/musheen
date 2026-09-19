@@ -1,5 +1,6 @@
 use crate::error::validate_bounded_bytes;
 use crate::{CoreError, ProviderId};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{DisplayPath, StorePath};
 
@@ -8,6 +9,12 @@ use crate::{DisplayPath, StorePath};
 pub struct ItemId {
     provider: ProviderId,
     key: Box<[u8]>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ItemIdDocument {
+    provider: ProviderId,
+    key: Vec<u8>,
 }
 
 impl ItemId {
@@ -21,6 +28,29 @@ impl ItemId {
     #[must_use]
     pub fn provider(&self) -> &ProviderId {
         &self.provider
+    }
+}
+
+impl Serialize for ItemId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ItemIdDocument {
+            provider: self.provider.clone(),
+            key: self.key.to_vec(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ItemId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let document = ItemIdDocument::deserialize(deserializer)?;
+        Self::new(document.provider, document.key).map_err(serde::de::Error::custom)
     }
 }
 

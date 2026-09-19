@@ -21,6 +21,19 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
+    /// Returns false only when a local session location is known to be absent.
+    /// Permission and transient I/O failures remain restorable so startup can
+    /// present the real provider error instead of silently replacing the path.
+    #[must_use]
+    pub fn session_location_exists(path: &StorePath) -> bool {
+        let Some(path) = path.as_unix_path() else {
+            return true;
+        };
+        path.try_exists().unwrap_or(true)
+    }
+}
+
+impl LocalStore {
     #[must_use]
     pub fn new() -> Self {
         let provider = ProviderId::new("local").expect("the built-in provider ID is valid");

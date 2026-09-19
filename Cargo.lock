@@ -4336,6 +4336,7 @@ name = "musheen-core"
 version = "0.1.0"
 dependencies = [
  "futures-lite",
+ "serde",
  "trybuild",
 ]
 
@@ -4395,6 +4396,9 @@ dependencies = [
  "musheen-ops",
  "native-theme",
  "native-theme-gpui",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -14,10 +14,13 @@ musheen-local = { path = "../musheen-local" }
 musheen-ops = { path = "../musheen-ops" }
 native-theme.workspace = true
 native-theme-gpui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 futures-lite.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true
