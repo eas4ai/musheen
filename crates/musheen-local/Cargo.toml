@@ -17,3 +17,8 @@ xattr.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+musheen-test-support = { path = "../musheen-test-support" }
+tempfile.workspace = true

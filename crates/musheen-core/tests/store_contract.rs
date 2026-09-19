@@ -87,10 +87,7 @@ impl Store for MillionItemStore {
     }
 
     fn validate_mutation(&self, request: &MutationRequest) -> Result<(), StoreError> {
-        Err(StoreError::unsupported(
-            request.kind().as_str(),
-            "fixture is read-only",
-        ))
+        Err(request.unsupported("fixture is read-only"))
     }
 
     fn mutate<'a>(

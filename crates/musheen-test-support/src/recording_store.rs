@@ -169,10 +169,7 @@ impl Store for RecordingStore {
     }
 
     fn validate_mutation(&self, request: &MutationRequest) -> Result<(), StoreError> {
-        Err(StoreError::unsupported(
-            request.kind().as_str(),
-            "recording store is read-only",
-        ))
+        Err(request.unsupported("recording store is read-only"))
     }
 
     fn mutate<'a>(

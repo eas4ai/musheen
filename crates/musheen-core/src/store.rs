@@ -142,6 +142,11 @@ impl MutationRequest {
             | Self::SetExtendedAttribute { target } => target,
         }
     }
+
+    #[must_use]
+    pub fn unsupported(&self, reason: &'static str) -> StoreError {
+        StoreError::unsupported(self.kind().as_str(), reason)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,6 +173,12 @@ pub enum StoreError {
         maximum: usize,
     },
     WatchEnded,
+    Io {
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+        path: Option<StorePath>,
+        message: Box<str>,
+    },
     Backend(Box<str>),
 }
 
@@ -217,6 +228,22 @@ impl fmt::Display for StoreError {
                 )
             }
             Self::WatchEnded => formatter.write_str("directory watch ended unexpectedly"),
+            Self::Io {
+                operation,
+                kind,
+                path,
+                message,
+            } => {
+                write!(formatter, "{operation} failed with {kind:?}")?;
+                if let Some(path) = path {
+                    write!(
+                        formatter,
+                        " for {}",
+                        crate::DisplayPath::from_store_path(path).as_str()
+                    )?;
+                }
+                write!(formatter, ": {message}")
+            }
             Self::Backend(message) => formatter.write_str(message),
         }
     }

@@ -3,7 +3,7 @@ use musheen_core::{
     CancellationToken, Continuation, MutationRequest, PageRequest, ResourceLimits, Store,
     StoreError, StorePath, WatchEvent, WatchFailure, WatchSemantics,
 };
-use musheen_test_support::{MillionItemFixture, RecordingStore};
+use musheen_test_support::{MillionItemFixture, RecordingStore, verify_read_only_provider};
 
 #[test]
 fn million_item_fixture_generates_only_requested_pages() {
@@ -87,4 +87,15 @@ fn recording_watch_reports_scripted_invalidation_and_then_ends() {
         block_on(watch.next_event(CancellationToken::new())),
         Err(StoreError::WatchEnded)
     ));
+}
+
+#[test]
+fn recording_store_passes_the_shared_provider_contract() {
+    let store =
+        RecordingStore::read_only(MillionItemFixture::new(513).expect("the fixture size is valid"));
+    let location = StorePath::from_provider_key(store.provider_id().clone(), b"root".to_vec())
+        .expect("the location is valid");
+
+    block_on(verify_read_only_provider(&store, location))
+        .expect("the recording provider satisfies the shared contract");
 }

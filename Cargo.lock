@@ -3385,11 +3385,14 @@ dependencies = [
 name = "musheen-local"
 version = "0.1.0"
 dependencies = [
+ "futures-lite",
  "musheen-core",
+ "musheen-test-support",
  "nix",
  "notify 8.2.0",
  "proc-mounts",
  "rustix",
+ "tempfile",
  "walkdir",
  "xattr",
 ]
