@@ -1,19 +1,20 @@
-use musheen_core::{CancellationToken, ItemKind};
+use musheen_core::{CancellationToken, ItemKind, ResourceLimits};
 use musheen_desktop::{
     AggregateValue, ChecksumAlgorithm, ChecksumError, ChecksumService, PropertyRefresh,
     PropertySnapshot, RecursiveSize, XattrState,
 };
 use musheen_ui::{
-    ApplicationChoice, OpenWithIntent, OpenWithModel, PropertiesDialogModel, PropertiesPage,
-    PropertiesState,
+    ApplicationChoice, LocalOperationQueue, OpenWithIntent, OpenWithModel, PropertiesDialogModel,
+    PropertiesPage, PropertiesState,
 };
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
 #[test]
 fn snapshots_cover_file_folder_symlink_xattrs_and_mixed_values() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::symlink;
 
     let temporary = tempfile::tempdir().unwrap();
     let file = temporary.path().join("file.txt");
@@ -140,7 +141,7 @@ fn a_change_during_streaming_never_returns_a_current_checksum() {
 }
 
 #[test]
-fn properties_model_keeps_pages_read_only_and_detects_replaced_targets() {
+fn properties_model_only_offers_apply_for_dirty_valid_reviewed_edits() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("selected");
     fs::write(&path, b"first").unwrap();
@@ -152,14 +153,58 @@ fn properties_model_keeps_pages_read_only_and_detects_replaced_targets() {
     assert!(model.pages().contains(&PropertiesPage::Permissions));
     assert!(model.pages().contains(&PropertiesPage::Checksums));
     assert!(!model.apply_visible());
-    assert!(model.permissions().edit_disabled_reason().is_some());
+    assert!(model.permissions().edit_disabled_reason().is_none());
     model.select_page(PropertiesPage::Permissions).unwrap();
     assert_eq!(model.page(), PropertiesPage::Permissions);
+    model.permissions_mut().set_file_mode_text("not-octal");
+    assert_eq!(
+        model.permissions().edit_disabled_reason(),
+        Some("mode must be an octal number")
+    );
+    assert!(!model.apply_visible());
+    model.permissions_mut().set_file_mode_text("0640");
+    assert!(model.permissions().edit_disabled_reason().is_none());
+    model.permissions_mut().set_recursive(false);
+    assert!(!model.apply_visible());
+    model.permissions_mut().review_recursive_scope();
+    assert!(model.apply_visible());
+    let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+    let jobs = model.submit_permissions(&mut queue).unwrap();
+    assert_eq!(jobs.len(), 1);
+    for operation in queue.start_ready().unwrap() {
+        let id = operation.id();
+        let result = operation.execute();
+        queue.finish(id, result).unwrap();
+    }
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+        0o640
+    );
 
     fs::remove_file(&path).unwrap();
     fs::write(&path, b"second").unwrap();
     assert_eq!(model.refresh().unwrap(), PropertyRefresh::Replaced);
     assert_eq!(model.state(), PropertiesState::Replaced);
+}
+
+#[cfg(unix)]
+#[test]
+fn properties_model_never_discards_dirty_permissions_during_refresh() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("selected");
+    fs::write(&path, b"contents").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let snapshot = PropertySnapshot::load(std::slice::from_ref(&path)).unwrap();
+    let mut model = PropertiesDialogModel::new(snapshot);
+
+    model.permissions_mut().set_file_mode_text("0600");
+    assert!(model.permissions().is_dirty());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+    assert_eq!(model.refresh().unwrap(), PropertyRefresh::MetadataChanged);
+    assert_eq!(model.state(), PropertiesState::Replaced);
+    assert!(model.permissions().is_dirty());
+    assert!(!model.apply_visible());
 }
 
 #[test]

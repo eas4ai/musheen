@@ -168,6 +168,15 @@ impl<C: Clock> Scheduler<C> {
         Ok(())
     }
 
+    pub fn fail(&mut self, id: JobId) -> Result<(), SchedulerError> {
+        if !self.running.contains(&id) {
+            return Err(SchedulerError::NotRunning(id));
+        }
+        self.transition(id, JobState::Failed)?;
+        self.running.remove(&id);
+        Ok(())
+    }
+
     pub fn cancel(&mut self, id: JobId) -> Result<(), SchedulerError> {
         let state = self.state(id).ok_or(SchedulerError::UnknownJob(id))?;
         let cancellation = self

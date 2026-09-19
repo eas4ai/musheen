@@ -1,31 +1,54 @@
 //! Recoverable file-operation engine.
 
+mod batch_rename;
 mod copy;
+mod create;
+mod delete;
 mod event;
 mod job;
 mod journal;
+mod link;
+mod metadata;
 mod metadata_copy;
 mod r#move;
+mod mutation;
 mod plan;
 mod recovery;
+mod rename;
 mod scheduler;
 mod staging;
 mod state;
 mod verify;
 
+pub use batch_rename::{BatchRenameJournal, BatchRenamePlan, BatchRenameStep, RenameMapping};
+pub use create::{CreateKind, CreateRequest, NameError, execute_create, validate_local_name};
+pub use delete::{
+    DeleteFailure, DeleteOutcome, DeleteProvider, DeleteTarget, PermanentDeleteChallenge,
+    PermanentDeleteConfirmation, PermanentDeleteRequest, TrashReceipt, execute_delete,
+    execute_permanent_delete, execute_restore,
+};
 pub use event::{JobEvent, Progress, ProgressError, ProgressUnit};
 pub use job::{EventGeneration, JobId};
 pub use journal::{
     CorruptSource, Durability, Journal, JournalError, JournalPhase, JournalRecord, JournalStorage,
     StorageAction,
 };
+pub use link::{
+    HardLinkRequest, LinkProvider, SymbolicLinkRequest, execute_hard_link, execute_symbolic_link,
+};
+pub use metadata::{
+    AclChange, AclEntry, AclQualifier, MetadataChange, MetadataEntry, MetadataEntryKind,
+    MetadataPlan, MetadataProvider, MetadataScope, ResolvedMetadataChange,
+};
 pub use metadata_copy::{MetadataKind, MetadataReport};
 pub use r#move::{MoveOutcome, MoveStrategy, execute_move};
+pub use mutation::{MutationError, MutationProvider};
 pub use plan::{
     InverseTemplate, OperationKind, OperationPlan, PlanError, ProviderLimits, ProviderSnapshot,
     WorkClass,
 };
 pub use recovery::{RecoveryContext, RecoveryDecision, decide_recovery};
+pub use rename::{RenameRequest, execute_rename};
 pub use scheduler::{Clock, ScheduledJob, Scheduler, SchedulerError, SystemClock};
 pub use staging::{StagingError, StagingPath};
 pub use state::{JobState, JobStateMachine, StateError};

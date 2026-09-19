@@ -7,6 +7,7 @@ mod i18n;
 mod icons;
 mod info_pane;
 pub mod navigation;
+mod operations;
 pub mod search;
 mod shell;
 pub mod sidebar;
@@ -26,5 +27,6 @@ pub use icons::{
     lucide_icon_or_fallback,
 };
 pub use info_pane::*;
+pub use operations::*;
 pub use shell::{FocusTarget, SemanticRegion, ShellModel};
 pub use theme::{AppearanceMode, MotionPolicy, ThemeProfile};

@@ -1,6 +1,7 @@
 //! Linux desktop-service adapters.
 
 mod checksum;
+mod clipboard;
 mod mime;
 mod operation_journal;
 mod permissions;
@@ -11,6 +12,7 @@ mod settings;
 mod thumbnail;
 
 pub use checksum::*;
+pub use clipboard::*;
 pub use mime::*;
 pub use operation_journal::*;
 pub use permissions::*;

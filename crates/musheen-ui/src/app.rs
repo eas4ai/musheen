@@ -13,6 +13,9 @@ use crate::navigation::{
     ApplicationSession, BreadcrumbTrail, MAX_WINDOWS, NavigationError, OmnibarMode, OmnibarState,
     OmnibarSubmission, PaneId, TabId, WindowSession, resolve_path_input,
 };
+use crate::operations::{
+    DropAction, FileDragPayload, LocalOperationQueue, spawn_ready_local_operations,
+};
 use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, SearchState};
 use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
@@ -28,8 +31,8 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, Root, Selectable, Siza
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, ImageSource, IntoElement,
-    KeyBinding, Render, Role, SharedString, Subscription, TestSupportExt, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, img, px, size, uniform_list,
+    KeyBinding, Pixels, Point, Render, Role, SharedString, Subscription, TestSupportExt,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, div, img, px, size, uniform_list,
 };
 use musheen_core::{
     CancellationToken, CommandAction, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page,
@@ -156,6 +159,7 @@ struct ItemRenderSpec {
     pane_index: usize,
     index: usize,
     id: ItemId,
+    path: StorePath,
     name: String,
     kind: ItemKind,
     size: Option<u64>,
@@ -163,6 +167,27 @@ struct ItemRenderSpec {
     columns: Vec<(ColumnKey, u16)>,
     layout: Layout,
     selected: bool,
+}
+
+struct FileDragPreview {
+    label: String,
+    position: Point<Pixels>,
+}
+
+impl Render for FileDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .ml(self.position.x)
+            .mt(self.position.y)
+            .max_w(px(280.))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(cx.theme().colors.popover)
+            .text_color(cx.theme().colors.popover_foreground)
+            .shadow_md()
+            .child(self.label.clone())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -569,6 +594,8 @@ struct MusheenApp {
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
     info_panes: HashMap<TabId, InfoPaneModel>,
     catalog: Catalog,
+    operation_queue: Arc<Mutex<LocalOperationQueue>>,
+    operation_error: Option<Box<str>>,
 }
 
 impl Drop for MusheenApp {
@@ -650,6 +677,7 @@ impl MusheenApp {
         directories.insert(focused_tab, directory);
         let mut sidebars = HashMap::new();
         sidebars.insert(focused_tab, default_sidebar_model(pins.clone()));
+        let operation_queue = Arc::new(Mutex::new(LocalOperationQueue::new(&limits)));
         let mut this = Self {
             directories,
             searches: HashMap::new(),
@@ -674,6 +702,8 @@ impl MusheenApp {
             icon_cache: HashMap::new(),
             info_panes: HashMap::new(),
             catalog: Catalog::system().expect("the built-in locale catalogs are valid"),
+            operation_queue,
+            operation_error: None,
         };
         this.start_load(location, cx);
         this
@@ -1236,6 +1266,64 @@ impl MusheenApp {
         self.refresh_info_pane(tab_id, cx);
         self.schedule_session_save(cx);
         cx.notify();
+    }
+
+    fn drag_payload(&self, spec: &ItemRenderSpec) -> Option<FileDragPayload> {
+        let view = self.directories.get(&spec.tab_id)?.view();
+        let sources = if spec.selected {
+            view.selected_ids()
+                .iter()
+                .filter_map(|id| view.item(id))
+                .map(|item| item.path().clone())
+                .collect()
+        } else {
+            vec![spec.path.clone()]
+        };
+        FileDragPayload::new(sources, DropAction::Move).ok()
+    }
+
+    fn submit_file_drop(
+        &mut self,
+        payload: FileDragPayload,
+        target: StorePath,
+        cx: &mut Context<Self>,
+    ) {
+        let submitted = self
+            .operation_queue
+            .lock()
+            .map_err(|_| "the operation queue lock is poisoned".into())
+            .and_then(|mut queue| {
+                queue
+                    .submit_drop(payload, target)
+                    .map_err(|error| error.to_string().into())
+            });
+        match submitted {
+            Ok(_) => {
+                self.operation_error = None;
+                self.pump_operation_queue(cx);
+            }
+            Err(error) => {
+                self.operation_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    fn pump_operation_queue(&mut self, cx: &mut Context<Self>) {
+        let queue = Arc::clone(&self.operation_queue);
+        let result =
+            spawn_ready_local_operations(queue, cx, |state: &mut Self, succeeded, error, cx| {
+                state.operation_error = error;
+                if succeeded {
+                    state.load_focused_tab(cx);
+                }
+                state.pump_operation_queue(cx);
+                cx.notify();
+            });
+        if let Err(error) = result {
+            self.operation_error = Some(error);
+            cx.notify();
+        }
     }
 
     fn refresh_info_pane(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
@@ -2312,6 +2400,10 @@ impl MusheenApp {
                                 .enumerate()
                                 .map(|(entry_index, entry)| {
                                     let location = entry.location().clone();
+                                    let navigation_location = location.clone();
+                                    let can_drop_location = location.clone();
+                                    let drop_location = location.clone();
+                                    let operation_queue = Arc::clone(&self.operation_queue);
                                     let selected = current.as_ref() == Some(&location);
                                     let label = entry.label().to_owned();
                                     let icon = match (kind, label.as_str()) {
@@ -2330,6 +2422,25 @@ impl MusheenApp {
                                         } else {
                                             transparent
                                         })
+                                        .can_drop(move |value, _, _| {
+                                            value.downcast_ref::<FileDragPayload>().is_some_and(
+                                                |payload| {
+                                                    operation_queue.lock().is_ok_and(|queue| {
+                                                        queue
+                                                            .can_accept(payload, &can_drop_location)
+                                                    })
+                                                },
+                                            )
+                                        })
+                                        .on_drop(cx.listener(
+                                            move |this, payload: &FileDragPayload, _, cx| {
+                                                this.submit_file_drop(
+                                                    payload.clone(),
+                                                    drop_location.clone(),
+                                                    cx,
+                                                );
+                                            },
+                                        ))
                                         .child(
                                             Button::new(SharedString::from(format!(
                                                 "sidebar-{section_index}-{entry_index}"
@@ -2342,7 +2453,11 @@ impl MusheenApp {
                                             .selected(selected)
                                             .w_full()
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.navigate(location.clone(), true, cx);
+                                                this.navigate(
+                                                    navigation_location.clone(),
+                                                    true,
+                                                    cx,
+                                                );
                                             })),
                                         )
                                         .into_any_element()
@@ -3313,6 +3428,7 @@ impl MusheenApp {
             pane_index,
             index,
             id: item.id().clone(),
+            path: item.path().clone(),
             name: item.display_name().as_str().to_owned(),
             kind: item.kind(),
             size: item.size(),
@@ -3347,9 +3463,13 @@ impl MusheenApp {
             SharedString::from(format!("directory-item-{}-{}", spec.pane_index, spec.index));
         let tab_id = spec.tab_id;
         let stable_id = spec.id.clone();
-        match spec.layout {
+        let drag_payload = self.drag_payload(&spec);
+        let is_drop_target = spec.kind == ItemKind::Directory;
+        let drop_target = spec.path.clone();
+        let item = match spec.layout {
             Layout::Cards | Layout::Grid | Layout::Adaptive => div()
                 .id(item_id)
+                .test_support()
                 .role(Role::ListItem)
                 .aria_label(spec.name.clone())
                 .w(if spec.layout == Layout::Cards {
@@ -3371,9 +3491,6 @@ impl MusheenApp {
                         .border_color(colors.list_active_border)
                 })
                 .hover(|style| style.bg(colors.list_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_item(tab_id, stable_id.clone(), cx);
-                }))
                 .child(icon)
                 .child(
                     div()
@@ -3382,10 +3499,10 @@ impl MusheenApp {
                         .text_center()
                         .overflow_hidden()
                         .child(spec.name),
-                )
-                .into_any_element(),
+                ),
             Layout::List => div()
                 .id(item_id)
+                .test_support()
                 .role(Role::ListItem)
                 .aria_label(spec.name.clone())
                 .h(px(38.))
@@ -3401,9 +3518,6 @@ impl MusheenApp {
                         .border_color(colors.list_active_border)
                 })
                 .hover(|style| style.bg(colors.list_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_item(tab_id, stable_id.clone(), cx);
-                }))
                 .child(div().w(px(28.)).flex().justify_center().child(icon))
                 .child(div().flex_grow(1.0).text_sm().child(spec.name))
                 .child(
@@ -3413,8 +3527,7 @@ impl MusheenApp {
                         .text_xs()
                         .text_color(colors.muted_foreground)
                         .child(spec.size.map_or_else(String::new, format_size)),
-                )
-                .into_any_element(),
+                ),
             Layout::Details | Layout::Columns => {
                 let mut icon = Some(icon);
                 let cells = spec
@@ -3452,6 +3565,7 @@ impl MusheenApp {
                     .collect::<Vec<_>>();
                 div()
                     .id(item_id)
+                    .test_support()
                     .role(Role::ListItem)
                     .aria_label(spec.name)
                     .h(px(38.))
@@ -3467,13 +3581,41 @@ impl MusheenApp {
                             .border_color(colors.list_active_border)
                     })
                     .hover(|style| style.bg(colors.list_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_item(tab_id, stable_id.clone(), cx);
-                    }))
                     .children(cells)
-                    .into_any_element()
             }
-        }
+        };
+        item.on_click(cx.listener(move |this, _, _, cx| {
+            this.select_item(tab_id, stable_id.clone(), cx);
+        }))
+        .when_some(drag_payload, |item, payload| {
+            item.cursor_move()
+                .on_drag(payload, |payload, position, _, cx| {
+                    let label = if payload.sources().len() == 1 {
+                        "Move 1 item".to_owned()
+                    } else {
+                        format!("Move {} items", payload.sources().len())
+                    };
+                    cx.new(|_| FileDragPreview { label, position })
+                })
+        })
+        .when(is_drop_target, |item| {
+            let can_target = drop_target.clone();
+            let drop_target = drop_target.clone();
+            let can_queue = Arc::clone(&self.operation_queue);
+            item.can_drop(move |value, _, _| {
+                value
+                    .downcast_ref::<FileDragPayload>()
+                    .is_some_and(|payload| {
+                        can_queue
+                            .lock()
+                            .is_ok_and(|queue| queue.can_accept(payload, &can_target))
+                    })
+            })
+            .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
+                this.submit_file_drop(payload.clone(), drop_target.clone(), cx);
+            }))
+        })
+        .into_any_element()
     }
 
     fn content_icon(&mut self, name: &str) -> Option<ImageSource> {
@@ -3542,6 +3684,10 @@ impl Render for MusheenApp {
             Vec::new()
         };
         let info = info_visible.then(|| self.render_info_pane(wide, cx));
+        let operation_error = self
+            .operation_error
+            .as_deref()
+            .map(|error| SharedString::from(format!("File operation failed: {error}")));
         div()
             .id("musheen-shell")
             .test_support()
@@ -3626,6 +3772,22 @@ impl Render for MusheenApp {
             }))
             .child(self.render_tab_strip(cx))
             .child(self.render_toolbar(window, cx))
+            .when_some(operation_error, |shell, message| {
+                shell.child(
+                    div()
+                        .id("operation-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(message.clone())
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .bg(colors.background)
+                        .border_b_1()
+                        .border_color(boundary)
+                        .child(message),
+                )
+            })
             .child(
                 div()
                     .flex_grow(1.0)
@@ -3801,12 +3963,14 @@ mod tests {
     use super::*;
     use crate::Locale;
     use crate::search::SearchState;
-    use gpui_kit::TestAppContext;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
     use musheen_core::{
         CapabilityMatrix, CapabilityReason, CapabilityState, MutationRequest, PageRequest,
         ProviderId, SearchCapabilities, SearchResult, SearchScopeError,
     };
+    use standard_library::fs as filesystem;
+    use std as standard_library;
     use std::time::Duration;
 
     struct ImmediateSearchStream(Option<SearchBatch>);
@@ -4500,5 +4664,200 @@ mod tests {
                 Some("search provider ended before reporting completion")
             );
         });
+    }
+
+    #[gpui_kit::test]
+    async fn dragging_an_item_onto_a_folder_runs_the_shared_move_queue(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let source = temporary.path().join("source.txt");
+        let destination = temporary.path().join("destination");
+        filesystem::write(&source, b"move through the UI").unwrap();
+        filesystem::create_dir(&destination).unwrap();
+
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        let (source_index, destination_index) = cx.read(|cx| {
+            let state = app.read(cx);
+            let tab_id = state.navigation.focused_tab().id();
+            let items = state.filtered_items(tab_id);
+            let source_index = items
+                .iter()
+                .position(|item| item.display_name().as_str() == "source.txt")
+                .expect("source item is visible");
+            let destination_index = items
+                .iter()
+                .position(|item| item.display_name().as_str() == "destination")
+                .expect("destination item is visible");
+            (source_index, destination_index)
+        });
+        let (source_bounds, destination_bounds) = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window
+                        .find(format!("directory-item-0-{source_index}"))
+                        .bounds(),
+                    window
+                        .find(format!("directory-item-0-{destination_index}"))
+                        .bounds(),
+                )
+            })
+            .expect("the application window remains open");
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        visual.simulate_mouse_down(source_bounds.center(), MouseButton::Left, Modifiers::none());
+        visual.simulate_mouse_move(
+            destination_bounds.center(),
+            Some(MouseButton::Left),
+            Modifiers::none(),
+        );
+        visual.simulate_mouse_up(
+            destination_bounds.center(),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        visual.run_until_parked();
+
+        assert_eq!(
+            filesystem::read(destination.join("source.txt")).unwrap(),
+            b"move through the UI"
+        );
+        assert!(!source.exists());
+    }
+
+    #[gpui_kit::test]
+    async fn dragging_an_item_onto_a_sidebar_folder_uses_the_same_queue(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let source = temporary.path().join("source.txt");
+        let destination = temporary.path().join("destination");
+        filesystem::write(&source, b"move through the sidebar").unwrap();
+        filesystem::create_dir(&destination).unwrap();
+
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            state.pins.replace([SidebarEntry::new(
+                "Drop destination",
+                StorePath::from_unix_path(destination.as_os_str()),
+            )]);
+            cx.notify();
+        });
+
+        let (source_index, pinned_section_index) = cx.read(|cx| {
+            let state = app.read(cx);
+            let tab_id = state.navigation.focused_tab().id();
+            let source_index = state
+                .filtered_items(tab_id)
+                .iter()
+                .position(|item| item.display_name().as_str() == "source.txt")
+                .expect("source item is visible");
+            let section_index = state
+                .sidebars
+                .get(&tab_id)
+                .unwrap()
+                .sections()
+                .iter()
+                .position(|section| section.kind() == SidebarSectionKind::Pinned)
+                .expect("pinned section is visible");
+            (source_index, section_index)
+        });
+        let (source_bounds, destination_bounds) = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window
+                        .find(format!("directory-item-0-{source_index}"))
+                        .bounds(),
+                    window
+                        .find(format!("sidebar-{pinned_section_index}-0"))
+                        .bounds(),
+                )
+            })
+            .expect("the application window remains open");
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        visual.simulate_mouse_down(source_bounds.center(), MouseButton::Left, Modifiers::none());
+        visual.simulate_mouse_move(
+            destination_bounds.center(),
+            Some(MouseButton::Left),
+            Modifiers::none(),
+        );
+        visual.simulate_mouse_up(
+            destination_bounds.center(),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        visual.run_until_parked();
+
+        assert_eq!(
+            filesystem::read(destination.join("source.txt")).unwrap(),
+            b"move through the sidebar"
+        );
+        assert!(!source.exists());
+    }
+
+    #[gpui_kit::test]
+    async fn operation_failures_are_exposed_in_the_shell(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        app.update(cx, |state, cx| {
+            state.operation_error = Some("destination became read-only".into());
+            cx.notify();
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let alert = window.find("operation-error");
+            assert!(alert.visible());
+            assert_eq!(
+                alert.label(),
+                Some("File operation failed: destination became read-only")
+            );
+        })
+        .expect("the application window remains open");
     }
 }

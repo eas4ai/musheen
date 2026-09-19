@@ -18,6 +18,7 @@ posix-acl.workspace = true
 proc-mounts.workspace = true
 reflink-copy.workspace = true
 rustix.workspace = true
+trash.workspace = true
 walkdir.workspace = true
 xattr.workspace = true
 

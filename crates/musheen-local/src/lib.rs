@@ -2,8 +2,10 @@
 
 mod enumerate;
 mod metadata;
+mod mutation;
 mod operation;
 mod probe;
+mod queue;
 mod search;
 mod traverse;
 mod watch;
@@ -18,6 +20,7 @@ use musheen_ops::{MetadataKind, SourceMetadata};
 use std::path::PathBuf;
 
 pub use probe::LocalFilesystemInfo;
+pub use queue::{DropAction, DropError, FileDragPayload, LocalOperationQueue, ReadyLocalOperation};
 pub use traverse::{LocalTraversal, TraversalOptions};
 
 pub struct LocalStore {
