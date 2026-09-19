@@ -38,6 +38,7 @@ open = "5"
 proc-mounts = "0.3"
 reflink-copy = "0.1"
 rustix = { version = "1", features = ["fs"] }
+trybuild = "1"
 walkdir = "2"
 wax = "0.7"
 xattr = "1"
