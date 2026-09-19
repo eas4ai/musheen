@@ -88,8 +88,12 @@ const forbiddenAppearanceReads = [
 
 for (const path of rustSources) {
   const source = readFileSync(path, "utf8");
+  const compactSource = source.replace(/[^A-Za-z0-9_.-]/g, "");
   for (const [needle, description] of forbiddenAppearanceReads) {
-    if (source.includes(needle)) failures.push(`${path}: ${description}`);
+    const compactNeedle = needle.replace(/[^A-Za-z0-9_.-]/g, "");
+    if (source.includes(needle) || compactSource.includes(compactNeedle)) {
+      failures.push(`${path}: ${description}`);
+    }
   }
 }
 

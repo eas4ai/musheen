@@ -17,7 +17,7 @@ findings:
   - resolved: The DEP-015 check formerly accepted a disabled workflow step; it now requires push and pull-request triggers, scopes the locked command to the `locked-build` job, rejects conditional execution and error suppression, and executes the same locked build for Cairn evidence (independent 12d3043 5)
   - resolved: The commitment formerly excluded all code changes despite the recorded vendored connector patch; its outcome now permits dependency-enablement changes while continuing to exclude user-facing behavior (independent 12d3043 6)
   - resolved: DEP-008 and the foundation exit evidence formerly left transitive helpers ambiguous; the exit evidence now distinguishes app-selected direct role providers from implementation details used only inside an approved dependency (independent d922070 1)
-  - open: DEP-001 can false-pass a compiled direct appearance bypass when `gsettings` and its schema are assembled from separate string fragments (independent d922070 2)
+  - resolved: DEP-001 formerly allowed forbidden appearance identifiers assembled from source fragments; it now compares normalized source as well as contiguous spellings (independent d922070 2)
   - open: DEP-003 can false-pass a compiled hand-written parser for Desktop Entry key/value lines because it checks dependencies but no source boundary (independent d922070 3)
   - open: DEP-007 can false-pass with its four required crates moved to package metadata because it matches dependency-like text in any TOML section and omits Cargo.lock (independent d922070 4)
   - open: DEP-007 can false-pass compiled raw-libc and mount-table bypasses when imports are aliased and paths are assembled from string fragments (independent d922070 5)
@@ -57,6 +57,10 @@ the declaration was removed.
 For independent finding 5, DEP-015 passed with the committed workflow, failed
 when the `locked-build` job was temporarily disabled with `if: ${{ false }}`,
 and passed again after restoring unconditional execution.
+
+For independent finding d922070 2, DEP-001 passed on the clean tree and rejected
+a temporary, compiling `gsettings` command assembled with `concat!`. It passed
+again after the probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
