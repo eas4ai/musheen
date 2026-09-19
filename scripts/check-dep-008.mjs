@@ -86,6 +86,11 @@ for (const path of tracked(":(glob)**/*.rs")) {
     || /\b(?:pub\s+)?use\s+camino\b[^;]*\bas\s+\w+/.test(source);
   const wrapsCaminoType = /\b(?:pub(?:\([^)]*\))?\s+)?struct\s+\w+(?:\s*<[^>{;]*>)?\s*(?:\([^;]*\bUtf8Path(?:Buf)?\b[^;]*\)\s*;|\{[^}]*\bUtf8Path(?:Buf)?\b[^}]*\})/s.test(source)
     || /\b(?:pub(?:\([^)]*\))?\s+)?enum\s+\w+(?:\s*<[^>{;]*>)?\s*\{[^}]*\bUtf8Path(?:Buf)?\b[^}]*\}/s.test(source);
+  const convertsLossyLocalPath = /\bto_string_lossy\s*\(/.test(source);
+  if (convertsLossyLocalPath) {
+    failures.push(`${path} converts a lossy local path into a Camino path`);
+    continue;
+  }
   if (aliasesCaminoType || wrapsCaminoType) {
     failures.push(`${path} exports a Camino path type across module boundaries`);
     continue;

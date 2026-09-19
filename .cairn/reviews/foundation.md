@@ -40,7 +40,7 @@ findings:
   - resolved: DEP-003 formerly checked only a finite list of competing icon packages; it now rejects Rust source that combines the hicolor theme with direct filesystem path traversal. (independent 3f6a354 3)
   - resolved: DEP-007 formerly detected `libc::` spellings but not direct C bindings; it now rejects raw C FFI declarations for the `statfs` and `statvfs` filesystem-capacity families that nix provides. (independent 3f6a354 4)
   - resolved: DEP-007 formerly missed proc mount-table paths assembled with ordinary path joins; it now rejects `/proc` or `/proc/self` roots joined to mount-table components. (independent 3f6a354 5)
-  - open: DEP-008 treats any unwrapped Camino type use in a `config` or `uri` path as valid without checking the data's role or UTF-8 validation. A compiling `config.rs` probe converted a local store `Path` through `to_string_lossy()` into `Utf8PathBuf` and still passed DEP-008. (independent 3f6a354 6)
+  - resolved: DEP-008 formerly allowed config or URI modules to convert lossless local paths through `to_string_lossy()` into Camino values; it now rejects every lossy local-path conversion in a source file that uses Camino types. (independent 3f6a354 6)
 
 # Foundation completion review
 
@@ -166,6 +166,10 @@ was removed. The same guard covers `statvfs` and both file-descriptor variants.
 For independent finding 3f6a354 5, DEP-007 passed on the clean tree and rejected
 a compiling parser for `Path::new("/proc").join("self").join("mounts")`. It
 passed again after the probe was removed.
+
+For independent finding 3f6a354 6, DEP-008 passed on the clean tree and rejected
+a compiling `config.rs` probe that converted a local store `Path` through
+`to_string_lossy()` into `Utf8PathBuf`. It passed again after removal.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
