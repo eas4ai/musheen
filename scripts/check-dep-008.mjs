@@ -13,6 +13,7 @@ const manifests = tracked(":(glob)**/Cargo.toml").map((path) => ({
   path,
   text: readFileSync(path, "utf8"),
 }));
+const lock = readFileSync("Cargo.lock", "utf8");
 const failures = [];
 
 const declarations = (name) => {
@@ -47,6 +48,12 @@ for (const [name, versionPattern] of required) {
       failures.push(`${path} declares ${name} ${version ?? "without a version"}`);
     }
   }
+  const lockedVersions = [...lock.matchAll(
+    new RegExp(`\\[\\[package\\]\\]\\nname = "${name}"\\nversion = "([^"]+)"`, "g"),
+  )].map((match) => match[1]);
+  if (!lockedVersions.some((version) => versionPattern.test(version))) {
+    failures.push(`Cargo.lock does not resolve an approved ${name} version`);
+  }
 }
 for (const { path, details } of declarations("rustix")) {
   if (!/"fs"/.test(details)) failures.push(`${path} declares rustix without its fs feature`);
@@ -56,6 +63,7 @@ for (const name of [
   "fs_extra",
   "glob",
   "globset",
+  "globwalk",
   "jwalk",
   "notify-debouncer-full",
   "notify-debouncer-mini",
@@ -71,6 +79,9 @@ for (const name of [
     }
   }
 }
+
+// Competing packages may be implementation details of an approved dependency.
+// They violate DEP-008 only when a workspace manifest selects them directly.
 
 for (const path of tracked(":(glob)**/*.rs")) {
   const source = readFileSync(path, "utf8");
