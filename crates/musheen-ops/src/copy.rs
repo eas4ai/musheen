@@ -461,6 +461,13 @@ impl OperationFailure {
         matches!(self.source_state, SourceState::Retained)
     }
 
+    /// Whether rollback may remove the published destination without risking
+    /// the only known copy of the source data.
+    #[must_use]
+    pub const fn destination_can_be_removed_for_rollback(&self) -> bool {
+        self.source_retained()
+    }
+
     #[must_use]
     pub const fn source_state(&self) -> SourceState {
         self.source_state

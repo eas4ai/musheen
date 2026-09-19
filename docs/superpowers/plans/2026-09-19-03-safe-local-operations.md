@@ -113,11 +113,11 @@ create `crates/musheen-ops/tests/{copy,move}.rs`.
 
 ### Task 6: Close the phase
 
-- [ ] Run every operation test under fault injection and repeat the recovery
+- [x] Run every operation test under fault injection and repeat the recovery
   matrix with forced process termination.
-- [ ] Run format, Clippy, workspace tests, locked release build, and license
+- [x] Run format, Clippy, workspace tests, locked release build, and license
   audit.
-- [ ] Inspect all deletion, overwrite, privilege, and path-conversion call sites
+- [x] Inspect all deletion, overwrite, privilege, and path-conversion call sites
   manually; document why the last valid copy cannot be lost.
-- [ ] Perform the rule 13 self-review, rerun affected checks, and commit with
+- [x] Perform the rule 13 self-review, rerun affected checks, and commit with
   `test: close safe local operations evidence`.

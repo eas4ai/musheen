@@ -674,6 +674,17 @@ fn execute_replacing_transfer(
         .map_err(resolved_move_aside_failure)?;
     if let Err(error) = execute_transfer(store, request, operation, cancellation) {
         let original_error = error.to_string();
+        if !replacement_destination_can_be_removed(&error) {
+            return Err(ResolvedTransferFailure::NeedsAttention(
+                format!(
+                    "{original_error}; the source state is uncertain, so Musheen preserved the \
+                     possible new destination at {} and the previous destination at {}",
+                    destination.display(),
+                    backup.display()
+                )
+                .into(),
+            ));
+        }
         if destination.try_exists().unwrap_or(true) {
             remove_path(destination).map_err(|rollback| {
                 ResolvedTransferFailure::NeedsAttention(
@@ -709,6 +720,14 @@ fn execute_replacing_transfer(
             format!("the destination was published but could not be made durable: {error}").into(),
         )
     })
+}
+
+fn replacement_destination_can_be_removed(error: &ResolvedTransferFailure) -> bool {
+    matches!(
+        error,
+        ResolvedTransferFailure::Transfer(failure)
+            if failure.destination_can_be_removed_for_rollback()
+    )
 }
 
 fn execute_merging_transfer(

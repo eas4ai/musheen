@@ -9,6 +9,11 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+const FORCED_TERMINATION_ROOT: &str = "MUSHEEN_FORCED_TERMINATION_ROOT";
+const FORCED_TERMINATION_PHASE: &str = "MUSHEEN_FORCED_TERMINATION_PHASE";
 
 #[test]
 fn file_storage_round_trips_snapshot_and_journal_tail() {
@@ -147,6 +152,82 @@ fn batch_rename_journal_durably_records_plan_and_completed_steps() {
     assert_eq!(recovery.steps().len(), 1);
     assert_eq!(recovery.completed_steps(), &[0]);
     journal.finish().unwrap();
+}
+
+#[test]
+fn file_journal_recovers_every_phase_after_forced_process_termination() {
+    let phases = [
+        JournalPhase::Planned,
+        JournalPhase::StagingCreated,
+        JournalPhase::DataCopied,
+        JournalPhase::MetadataApplied,
+        JournalPhase::DestinationPublished,
+        JournalPhase::SourceRemoved,
+        JournalPhase::StagingCleaned,
+    ];
+
+    for (phase_index, expected_phase) in phases.into_iter().enumerate() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "forced_termination_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(FORCED_TERMINATION_ROOT, root.path())
+            .env(FORCED_TERMINATION_PHASE, phase_index.to_string())
+            .spawn()
+            .unwrap();
+        let ready = root.path().join("ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child exited before phase {expected_phase:?} became durable"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "child did not make phase {expected_phase:?} durable"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let recovered = Journal::open(FileJournalStorage::at(root.path()).unwrap()).unwrap();
+        assert_eq!(recovered.records().len(), phase_index + 1);
+        assert_eq!(recovered.records()[phase_index].phase(), expected_phase);
+    }
+}
+
+#[test]
+#[ignore = "spawned by file_journal_recovers_every_phase_after_forced_process_termination"]
+fn forced_termination_child() {
+    let Some(root) = std::env::var_os(FORCED_TERMINATION_ROOT) else {
+        return;
+    };
+    let phase_index = std::env::var(FORCED_TERMINATION_PHASE)
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let phases = [
+        JournalPhase::Planned,
+        JournalPhase::StagingCreated,
+        JournalPhase::DataCopied,
+        JournalPhase::MetadataApplied,
+        JournalPhase::DestinationPublished,
+        JournalPhase::SourceRemoved,
+        JournalPhase::StagingCleaned,
+    ];
+    let mut journal = Journal::open(FileJournalStorage::at(&root).unwrap()).unwrap();
+    for (generation, phase) in phases.into_iter().take(phase_index + 1).enumerate() {
+        append(&mut journal, EventGeneration::new(generation as u64), phase);
+    }
+    std::fs::write(std::path::Path::new(&root).join("ready"), b"ready").unwrap();
+    loop {
+        std::thread::park();
+    }
 }
 
 fn append(
