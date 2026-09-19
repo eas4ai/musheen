@@ -98,9 +98,11 @@ const compactTreeSource = rustSources
   .join("\n")
   .replace(/[^A-Za-z0-9]/g, "")
   .toLowerCase();
-const parsesKeyValueLines = rustSources.some((source) =>
-  /\.lines\s*\(|split_once\s*\(\s*['"]=['"]/.test(source));
-if (compactTreeSource.includes("desktopentry") && parsesKeyValueLines) {
+const traversesTextLines = rustSources.some((source) =>
+  /\.lines\s*\(|\.(?:split|split_terminator)\s*\(\s*['"]\\n['"]/.test(source));
+const splitsKeyValue = rustSources.some((source) =>
+  /split_once\s*\(\s*['"]=['"]|splitn\s*\(\s*\d+\s*,\s*['"]=['"]|\.split\s*\(\s*['"]=['"]/.test(source));
+if (compactTreeSource.includes("desktopentry") && traversesTextLines && splitsKeyValue) {
   failures.push("Rust source tree contains a hand-written Desktop Entry parser");
 }
 
