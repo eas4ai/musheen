@@ -1,0 +1,18 @@
+mechanism: dep-015
+commit: bf3866f07ada1b4ca08a9a2ae5ff606f96e12fb8
+inputs_digest: sha256:17c2551aa241b16189e6337adfb6431a76b17310c9848e8a5eab2f5a39e4b37f
+mechanism_digest: sha256:cc89fbd3b8ae8c74cc5303e9b0413b40489191293d31f6bfe454545bc49b7c86
+kernel_digest: sha256:24ec9309c12d7ddb5b8693ffc74f3aad4a3ea660e4a42980c57ad2031d6f6f05
+inputs_detail: .cairn/evidence/runs/20260919T101616918Z-513926.inputs.json
+command: node scripts/check-dep-015.mjs
+cwd: .
+exit: 0
+output_digest: sha256:ff8782a1c9d8054b0d7369b64578c8c84b33a004599a5d3b7e8118553a0a7864
+output: .cairn/evidence/runs/20260919T101616918Z-513926.out
+stderr_output: .cairn/evidence/runs/20260919T101616918Z-513926.err
+stderr_digest: sha256:38768edb37e631f55a9de75c3ac2a08d64652cf642ec41381c3d94fac8fd462e
+signal: none
+execution_error: null
+recorded: 2026-09-19T10:20:14.184Z
+results:
+  - DEP-015 pass line sha256:a685817b102b9f8079af327fe652594ffd91aec4aed565ad7d0ee8638126fac6 6 sha256:dacd18dd3d8dc63d3c36ca115d37910040df9756d5120feb2a80715419d8b2a2
