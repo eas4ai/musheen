@@ -1,0 +1,5 @@
+DEP-003: freedesktop is not declared with a concrete version
+DEP-003: Cargo.lock does not contain freedesktop
+DEP-003: Cargo.lock does not contain freedesktop-core
+DEP-003: Cargo.lock does not contain freedesktop-apps
+DEP-003: Cargo.lock does not contain freedesktop-icon
