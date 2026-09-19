@@ -20,7 +20,7 @@ findings:
   - resolved: DEP-001 formerly allowed forbidden appearance identifiers assembled from source fragments; it now compares normalized source as well as contiguous spellings (independent d922070 2)
   - resolved: DEP-003 formerly checked only dependency metadata; it now rejects Rust source that combines Desktop Entry content with hand-written line and key/value parsing (independent d922070 3)
   - resolved: DEP-007 formerly parsed dependency-like TOML text; it now uses locked Cargo metadata for normal workspace dependencies and verifies approved resolved versions in Cargo.lock (independent d922070 4)
-  - open: DEP-007 can false-pass compiled raw-libc and mount-table bypasses when imports are aliased and paths are assembled from string fragments (independent d922070 5)
+  - resolved: DEP-007 formerly allowed aliased `nix::libc` imports and fragmented mount-table paths; it now rejects libc imports or calls and compares normalized source for all forbidden mount paths (independent d922070 5)
   - open: DEP-008 can false-pass a compiled second traversal provider because its finite blacklist does not include the `ignore` crate (independent d922070 6)
   - open: DEP-008 can false-pass lossless local paths represented by Camino when the crate import is aliased (independent d922070 7)
   - open: DEP-015 can false-pass a workflow that excludes every branch under both declared triggers (independent d922070 8)
@@ -69,6 +69,10 @@ again after the parser was removed.
 For independent finding d922070 4, DEP-007 passed on the clean tree and rejected
 a temporary move of `nix` from normal dependencies into package metadata. It
 passed again after restoring the dependency declaration.
+
+For independent finding d922070 5, DEP-007 passed on the clean tree and rejected
+a temporary, compiling `nix::libc as ffi` call plus a mountinfo path assembled
+with `concat!`. It passed again after the probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
