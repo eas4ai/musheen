@@ -39,7 +39,7 @@ findings:
   - resolved: DEP-003 formerly recognized only `.lines()` or `split_once('=')`; it now also detects newline traversal with `split` or `split_terminator` and key/value parsing with `split` or `splitn`. (independent 3f6a354 2)
   - resolved: DEP-003 formerly checked only a finite list of competing icon packages; it now rejects Rust source that combines the hicolor theme with direct filesystem path traversal. (independent 3f6a354 3)
   - resolved: DEP-007 formerly detected `libc::` spellings but not direct C bindings; it now rejects raw C FFI declarations for the `statfs` and `statvfs` filesystem-capacity families that nix provides. (independent 3f6a354 4)
-  - open: DEP-007 misses mount-table paths assembled with ordinary path joins except for its special `mountinfo` case. A compiling parser for `Path::new("/proc").join("self").join("mounts")` still passed DEP-007. (independent 3f6a354 5)
+  - resolved: DEP-007 formerly missed proc mount-table paths assembled with ordinary path joins; it now rejects `/proc` or `/proc/self` roots joined to mount-table components. (independent 3f6a354 5)
   - open: DEP-008 treats any unwrapped Camino type use in a `config` or `uri` path as valid without checking the data's role or UTF-8 validation. A compiling `config.rs` probe converted a local store `Path` through `to_string_lossy()` into `Utf8PathBuf` and still passed DEP-008. (independent 3f6a354 6)
 
 # Foundation completion review
@@ -162,6 +162,10 @@ It passed again after the probe was removed.
 For independent finding 3f6a354 4, DEP-007 passed on the clean tree and rejected
 a compiling raw C FFI declaration for `statfs`. It passed again after the probe
 was removed. The same guard covers `statvfs` and both file-descriptor variants.
+
+For independent finding 3f6a354 5, DEP-007 passed on the clean tree and rejected
+a compiling parser for `Path::new("/proc").join("self").join("mounts")`. It
+passed again after the probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

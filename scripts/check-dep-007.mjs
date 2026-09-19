@@ -81,6 +81,12 @@ for (const path of tracked(":(glob)**/*.rs")) {
   if (compactSource.includes("procself") && compactSource.includes("mountinfo")) {
     failures.push(`${path} assembles the mountinfo table path directly`);
   }
+  const joinsProcMountPath = /['"]\/proc(?:\/self)?['"]/.test(source)
+    && /['"](?:self|mounts|mountinfo)['"]/.test(source)
+    && /\.join\s*\(/.test(source);
+  if (joinsProcMountPath) {
+    failures.push(`${path} assembles a proc mount-table path with path joins`);
+  }
 }
 
 if (failures.length > 0) {
