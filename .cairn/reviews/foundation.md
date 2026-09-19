@@ -25,7 +25,7 @@ findings:
   - resolved: DEP-008 formerly recognized only `camino::Utf8Path` spellings; it now rejects every `Utf8Path` or `Utf8PathBuf` type use outside configuration and URI modules regardless of import alias (independent d922070 7)
   - resolved: DEP-015 formerly checked only for trigger keys; it now requires unfiltered `push` and `pull_request` triggers and rejects nested branch or path filters (independent d922070 8)
   - resolved: DEP-015 formerly relied on GitHub workflow text without a run attestation; by developer direction it now archives the exact commit and records a single clean Linux Docker build using `cargo build --locked`, with no GitHub CI during development (independent d922070 9)
-  - open: DEP-001 can pass a direct GTK settings-file read when the path is assembled from variables (independent 38c61f0 1)
+  - resolved: DEP-001 formerly required the GTK directory and settings filename to be contiguous; it now rejects files containing both path components even when variables assemble them at runtime (independent 38c61f0 1)
   - open: DEP-003 can pass a hand-written Desktop Entry parser whose names do not contain exact case-sensitive `DesktopEntry` text (independent 38c61f0 2)
   - open: DEP-007 can pass a hand-written mount-table parser when `/proc/self` and `mountinfo` are joined at runtime (independent 38c61f0 3)
   - open: DEP-008 can pass a local store path represented by a Camino type exported under an alias from an allowed configuration module (independent 38c61f0 4)
@@ -95,6 +95,10 @@ For independent finding d922070 9, the developer declined GitHub CI during
 development and authorized one Linux Docker container at a time. DEP-015
 archived the exact commit and completed `cargo build --locked` in that clean
 container with one Cargo job; Cairn recorded the image build log and pass.
+
+For independent finding 38c61f0 1, DEP-001 rejected a temporary compiling read
+whose `gtk-3.0` directory and `settings.ini` filename were stored in separate
+variables, then passed after the probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
