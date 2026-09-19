@@ -56,10 +56,6 @@ system-icons = ["native-theme/system-icons"]
 name = "native_theme_gpui"
 path = "src/lib.rs"
 
-[[example]]
-name = "showcase-gpui"
-path = "examples/showcase-gpui.rs"
-
 [dependencies.gpui]
 version = "0.3.3"
 package = "gpui-pre"
