@@ -3,7 +3,8 @@ use crate::dialogs::{
     install_properties_key_bindings, properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
-use crate::icons::{ContentIdentity, freedesktop_icon_name};
+use crate::i18n::Catalog;
+use crate::icons::{ApplicationIdentity, ContentIdentity, freedesktop_icon_name};
 use crate::info_pane::{
     InfoPaneDetails, InfoPaneModel, InfoPaneResult, InfoPaneState, InfoPaneWork,
     PreviewPresentation,
@@ -68,6 +69,7 @@ gpui_kit::assets::icon_assets!(
         Network,
         PanelRight,
         Plus,
+        Puzzle,
         RefreshCw,
         Search,
         Settings,
@@ -77,7 +79,6 @@ gpui_kit::assets::icon_assets!(
     ]
 );
 
-const APP_ICON: &[u8] = include_bytes!("../../../assets/icons/musheen.svg");
 const SIDEBAR_WIDTH: f32 = 220.0;
 const CONTENT_PADDING: f32 = 32.0;
 const GRID_ITEM_WIDTH: f32 = 128.0;
@@ -293,7 +294,7 @@ fn application_window_options(width: f32, height: f32, cx: &App) -> WindowOption
             title: Some("Musheen".into()),
             ..TitlebarOptions::default()
         }),
-        app_id: Some("io.musheen.Musheen".into()),
+        app_id: Some(ApplicationIdentity::ID.into()),
         window_min_size: Some(size(px(720.), px(480.))),
         ..WindowOptions::default()
     }
@@ -305,7 +306,7 @@ fn detached_window_options() -> WindowOptions {
             title: Some("Musheen".into()),
             ..TitlebarOptions::default()
         }),
-        app_id: Some("io.musheen.Musheen".into()),
+        app_id: Some(ApplicationIdentity::ID.into()),
         window_min_size: Some(size(px(720.), px(480.))),
         ..WindowOptions::default()
     }
@@ -567,6 +568,7 @@ struct MusheenApp {
     sidebar_visible: bool,
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
     info_panes: HashMap<TabId, InfoPaneModel>,
+    catalog: Catalog,
 }
 
 impl Drop for MusheenApp {
@@ -671,6 +673,7 @@ impl MusheenApp {
             sidebar_visible: true,
             icon_cache: HashMap::new(),
             info_panes: HashMap::new(),
+            catalog: Catalog::system().expect("the built-in locale catalogs are valid"),
         };
         this.start_load(location, cx);
         this
@@ -1791,18 +1794,26 @@ impl MusheenApp {
         label: &'static str,
         icon: IconName,
         disabled: bool,
-        selected: bool,
+        toggled: Option<bool>,
         cx: &mut Context<Self>,
     ) -> Button {
+        let label = self
+            .shell
+            .commands()
+            .get(id)
+            .and_then(|command| self.catalog.message(command.label_key()).ok())
+            .unwrap_or(label)
+            .to_owned();
         Button::new(id)
             .icon(icon)
-            .accessibility_label(label)
+            .accessibility_label(label.clone())
             .tooltip(label)
             .ghost()
             .small()
             .compact()
             .disabled(disabled)
-            .selected(selected)
+            .selected(toggled.unwrap_or(false))
+            .when_some(toggled, |button, toggled| button.toggled(toggled))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.dispatch_command(id, cx);
             }))
@@ -2008,7 +2019,7 @@ impl MusheenApp {
             .bg(colors.sidebar)
             .border_b_1()
             .border_color(boundary)
-            .child(Icon::default().data(APP_ICON).small())
+            .child(Icon::default().data(ApplicationIdentity::ICON_SVG).small())
             .children(tabs)
             .child(
                 Button::new("tab.new")
@@ -2058,7 +2069,7 @@ impl MusheenApp {
                 "Back",
                 IconName::ArrowLeft,
                 !self.navigation.focused_tab().history().can_go_back(),
-                false,
+                None,
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2066,7 +2077,7 @@ impl MusheenApp {
                 "Forward",
                 IconName::ArrowRight,
                 !self.navigation.focused_tab().history().can_go_forward(),
-                false,
+                None,
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2074,7 +2085,7 @@ impl MusheenApp {
                 "Parent folder",
                 IconName::ArrowUp,
                 no_parent,
-                false,
+                None,
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2082,11 +2093,11 @@ impl MusheenApp {
                 "Refresh",
                 IconName::RefreshCw,
                 false,
-                false,
+                None,
                 cx,
             ))
             .child(self.render_omnibar(cx))
-            .child(self.toolbar_button("view.search", "Search", IconName::Search, false, false, cx))
+            .child(self.toolbar_button("view.search", "Search", IconName::Search, false, None, cx))
             .when(compact, |toolbar| {
                 toolbar.child(self.render_view_overflow(cx))
             })
@@ -2098,7 +2109,7 @@ impl MusheenApp {
                 "Sidebar",
                 IconName::PanelRight,
                 false,
-                self.sidebar_visible,
+                Some(self.sidebar_visible),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2106,7 +2117,7 @@ impl MusheenApp {
                 "Information pane",
                 IconName::Info,
                 false,
-                self.shell.info_visible(),
+                Some(self.shell.info_visible()),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2114,7 +2125,7 @@ impl MusheenApp {
                 "Split pane",
                 IconName::Columns2,
                 self.navigation.panes().len() >= 2,
-                self.navigation.panes().len() == 2,
+                Some(self.navigation.panes().len() == 2),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2122,7 +2133,7 @@ impl MusheenApp {
                 "Switch pane",
                 IconName::PanelRight,
                 self.navigation.panes().len() < 2,
-                false,
+                None,
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2130,7 +2141,7 @@ impl MusheenApp {
                 "Settings",
                 IconName::Settings,
                 false,
-                false,
+                None,
                 cx,
             ))
     }
@@ -2146,7 +2157,7 @@ impl MusheenApp {
                 "Details view",
                 IconName::ListChecks,
                 false,
-                preferences.layout == Layout::Details,
+                Some(preferences.layout == Layout::Details),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2154,7 +2165,7 @@ impl MusheenApp {
                 "List view",
                 IconName::List,
                 false,
-                preferences.layout == Layout::List,
+                Some(preferences.layout == Layout::List),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2162,7 +2173,7 @@ impl MusheenApp {
                 "Cards view",
                 IconName::Grid2x2,
                 false,
-                preferences.layout == Layout::Cards,
+                Some(preferences.layout == Layout::Cards),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2170,7 +2181,7 @@ impl MusheenApp {
                 "Grid view",
                 IconName::Grid2x2,
                 false,
-                preferences.layout == Layout::Grid,
+                Some(preferences.layout == Layout::Grid),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2178,7 +2189,7 @@ impl MusheenApp {
                 "Columns view",
                 IconName::Columns2,
                 false,
-                preferences.layout == Layout::Columns,
+                Some(preferences.layout == Layout::Columns),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2186,23 +2197,16 @@ impl MusheenApp {
                 "Adaptive view",
                 IconName::PanelRight,
                 false,
-                preferences.layout == Layout::Adaptive,
+                Some(preferences.layout == Layout::Adaptive),
                 cx,
             ))
-            .child(self.toolbar_button(
-                "view.sort",
-                "Change sort",
-                IconName::List,
-                false,
-                false,
-                cx,
-            ))
+            .child(self.toolbar_button("view.sort", "Change sort", IconName::List, false, None, cx))
             .child(self.toolbar_button(
                 "view.group",
                 "Change grouping",
                 IconName::ListChecks,
                 false,
-                preferences.group != GroupKey::None,
+                Some(preferences.group != GroupKey::None),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2210,7 +2214,7 @@ impl MusheenApp {
                 "Show folders first",
                 IconName::Folder,
                 false,
-                preferences.directories_first,
+                Some(preferences.directories_first),
                 cx,
             ))
             .child(self.toolbar_button(
@@ -2218,7 +2222,7 @@ impl MusheenApp {
                 "Show hidden items",
                 IconName::TextCursorInput,
                 false,
-                preferences.show_hidden,
+                Some(preferences.show_hidden),
                 cx,
             ))
             .into_any_element()
@@ -3795,6 +3799,7 @@ fn column_label(column: ColumnKey) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Locale;
     use crate::search::SearchState;
     use gpui_kit::TestAppContext;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
@@ -4099,6 +4104,97 @@ mod tests {
             Err(NavigationError::LimitReached("windows"))
         ));
         assert_eq!(coordinator.entries().len(), MAX_WINDOWS);
+    }
+
+    #[gpui_kit::test]
+    async fn pseudo_localized_controls_keep_semantics_bounds_and_content_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(720.), px(480.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut state = MusheenApp::new_with_session_store(fixture, None, cx);
+                state.catalog = Catalog::load(Locale::EnXa).expect("the pseudo catalog is valid");
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.set_scale_factor(2.0);
+            window.render_frame(cx);
+            assert_eq!(window.scale_factor(), 2.0);
+            assert_eq!(window.find("navigation.back").label(), Some("⟦Ɓȧƈķ··⟧"));
+            assert_eq!(window.find("directory-content").focused(), Some(true));
+
+            let shell_bounds = window.find("musheen-shell").bounds();
+            let snapshots = gpui_kit::base::test_support::snapshots(window);
+            let interactive = snapshots
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.visible()
+                        && matches!(snapshot.role(), Some(Role::Button | Role::TextInput))
+                })
+                .collect::<Vec<_>>();
+            assert!(interactive.len() >= 12, "too few observed controls");
+            for control in interactive {
+                assert!(
+                    control.role().is_some(),
+                    "missing role: {:?}",
+                    control.path()
+                );
+                assert!(
+                    control
+                        .label()
+                        .is_some_and(|label| !label.trim().is_empty()),
+                    "missing name: {:?}",
+                    control.path()
+                );
+                let bounds = control.bounds();
+                assert!(
+                    bounds.origin.x >= shell_bounds.origin.x,
+                    "left clip: {:?}",
+                    control.path()
+                );
+                assert!(
+                    bounds.origin.y >= shell_bounds.origin.y,
+                    "top clip: {:?}",
+                    control.path()
+                );
+                assert!(
+                    bounds.bottom_right().x <= shell_bounds.bottom_right().x,
+                    "right clip: {:?}",
+                    control.path()
+                );
+                assert!(
+                    bounds.bottom_right().y <= shell_bounds.bottom_right().y,
+                    "bottom clip: {:?}",
+                    control.path()
+                );
+            }
+            assert_eq!(window.find("view.sidebar").checked(), Some(true));
+            assert_eq!(window.find("view.info").checked(), Some(false));
+            assert_eq!(window.find("pane.split").checked(), Some(false));
+
+            app.update(cx, |state, cx| {
+                state.dispatch_command("view.details", cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(window.find("directory-content").focused(), Some(true));
+        })
+        .expect("test window remains open");
     }
 
     #[gpui_kit::test]

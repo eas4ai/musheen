@@ -1,4 +1,4 @@
-use crate::PermissionsPageModel;
+use crate::{ApplicationIdentity, PermissionsPageModel};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
@@ -41,7 +41,7 @@ pub(crate) fn properties_window_options(title: impl Into<SharedString>, cx: &App
             title: Some(title.into()),
             ..TitlebarOptions::default()
         }),
-        app_id: Some("io.musheen.Musheen.Properties".into()),
+        app_id: Some(format!("{}.Properties", ApplicationIdentity::ID)),
         window_min_size: Some(size(px(560.), px(420.))),
         ..WindowOptions::default()
     }

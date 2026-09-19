@@ -3,6 +3,7 @@
 mod app;
 pub mod dialogs;
 mod directory;
+mod i18n;
 mod icons;
 mod info_pane;
 pub mod navigation;
@@ -19,7 +20,11 @@ pub use dialogs::*;
 pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
 };
-pub use icons::{ContentIdentity, LucideIcon, freedesktop_icon_name, lucide_icon};
+pub use i18n::{Catalog, CatalogError, Locale};
+pub use icons::{
+    ApplicationIdentity, ContentIdentity, LucideIcon, freedesktop_icon_name, lucide_icon,
+    lucide_icon_or_fallback,
+};
 pub use info_pane::*;
 pub use shell::{FocusTarget, SemanticRegion, ShellModel};
 pub use theme::{AppearanceMode, MotionPolicy, ThemeProfile};

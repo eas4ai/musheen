@@ -1,3 +1,11 @@
+pub struct ApplicationIdentity;
+
+impl ApplicationIdentity {
+    pub const ID: &'static str = "io.musheen.Musheen";
+    pub const ICON_NAME: &'static str = "musheen";
+    pub const ICON_SVG: &'static [u8] = include_bytes!("../../../assets/icons/musheen.svg");
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LucideIcon {
     ArrowLeft,
@@ -21,6 +29,8 @@ pub enum LucideIcon {
     Plus,
     Copy,
     RotateCcw,
+    File,
+    Puzzle,
     Columns2,
     PanelRight,
 }
@@ -80,10 +90,17 @@ pub fn lucide_icon(icon_key: &str) -> Option<LucideIcon> {
         "plus" => LucideIcon::Plus,
         "copy" => LucideIcon::Copy,
         "rotate-ccw" => LucideIcon::RotateCcw,
+        "file" => LucideIcon::File,
+        "puzzle" => LucideIcon::Puzzle,
         "columns-2" => LucideIcon::Columns2,
         "panel-right" => LucideIcon::PanelRight,
         _ => return None,
     })
+}
+
+#[must_use]
+pub fn lucide_icon_or_fallback(icon_key: &str) -> LucideIcon {
+    lucide_icon(icon_key).unwrap_or(LucideIcon::Puzzle)
 }
 
 #[must_use]
