@@ -41,6 +41,18 @@ findings:
   - resolved: DEP-007 formerly detected `libc::` spellings but not direct C bindings; it now rejects raw C FFI declarations for the `statfs` and `statvfs` filesystem-capacity families that nix provides. (independent 3f6a354 4)
   - resolved: DEP-007 formerly missed proc mount-table paths assembled with ordinary path joins; it now rejects `/proc` or `/proc/self` roots joined to mount-table components. (independent 3f6a354 5)
   - resolved: DEP-008 formerly allowed config or URI modules to convert lossless local paths through `to_string_lossy()` into Camino values; it now rejects every lossy local-path conversion in a source file that uses Camino types. (independent 3f6a354 6)
+  - resolved: DEP-001 now aggregates portal service, method, and appearance fragments across tracked Rust modules, so the prior split portal probe is rejected. (independent d4c184e 1)
+  - resolved: DEP-003 now recognizes split and split_terminator line traversal plus split and splitn key/value parsing, so the prior alternate Desktop Entry parser is rejected. (independent d4c184e 2)
+  - resolved: DEP-003 now rejects a hicolor resolver combined with direct filesystem path construction, so the prior hicolor path probe is rejected. (independent d4c184e 3)
+  - resolved: DEP-007 now rejects raw C declarations for statfs, fstatfs, statvfs, and fstatvfs, so the prior raw statfs probe is rejected. (independent d4c184e 4)
+  - resolved: DEP-007 now rejects proc mount-table paths built with ordinary path joins, so the prior joined `/proc/self/mounts` probe is rejected. (independent d4c184e 5)
+  - resolved: DEP-008 now rejects `to_string_lossy` in a source file that uses Camino types, so the prior same-file lossy conversion is rejected. (independent d4c184e 6)
+  - open: DEP-001 checks the kdeglobals spelling per file. A compiling probe split `kde` and `globals` across two tracked modules, joined the result under `/etc/xdg`, read the theme file directly, and still passed DEP-001. (independent d4c184e 7)
+  - open: DEP-003 recognizes only a small set of line and key/value operations. A compiling `[Desktop Entry]` parser used `.lines()` with `find('=')` and slicing, and still passed DEP-003. (independent d4c184e 8)
+  - open: DEP-003 recognizes a hand-written icon resolver only when the source also names hicolor. A compiling resolver walked `/usr/share/icons/Adwaita` with `std::fs::read_dir` and still passed DEP-003. (independent d4c184e 9)
+  - open: DEP-007 lists only the global and self mount-table paths. A compiling parser read `/proc/1/mountinfo` directly and still passed DEP-007. (independent d4c184e 10)
+  - open: DEP-007 rejects raw C bindings only for the statfs and statvfs families. A compiling probe called raw `stat`, which nix provides, and still passed DEP-007. (independent d4c184e 11)
+  - open: DEP-008 treats a Camino type in a config module as valid unless that same file calls `to_string_lossy`. A compiling config probe converted a local `Path` through `path.display().to_string()` into `Utf8PathBuf` and still passed DEP-008. (independent d4c184e 12)
 
 # Foundation completion review
 
