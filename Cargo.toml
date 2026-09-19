@@ -28,6 +28,7 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+async-channel = "2"
 camino = "1"
 freedesktop = "0.0"
 futures-lite = "2"

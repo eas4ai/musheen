@@ -4,6 +4,7 @@ mod app;
 mod directory;
 mod icons;
 pub mod navigation;
+pub mod search;
 mod shell;
 pub mod sidebar;
 mod status_bar;

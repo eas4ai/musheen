@@ -4,6 +4,7 @@ use crate::navigation::{
     ApplicationSession, BreadcrumbTrail, MAX_WINDOWS, NavigationError, OmnibarMode, OmnibarState,
     OmnibarSubmission, PaneId, TabId, WindowSession, resolve_path_input,
 };
+use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, SearchState};
 use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
 use crate::toolbar::COMMAND_IDS;
@@ -23,7 +24,9 @@ use gpui_kit::{
 };
 use musheen_core::{
     CancellationToken, CommandAction, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page,
-    ResourceLimits, Store, StoreError, StoreItem, StorePath, WatchEvent,
+    ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch, SearchCompletion,
+    SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath,
+    WatchEvent,
 };
 use musheen_desktop::SessionStore;
 use musheen_local::LocalStore;
@@ -79,6 +82,7 @@ gpui_kit::actions!(
         Reload,
         EditLocation,
         SearchLocation,
+        FilterLocation,
         OpenCommandMode,
         NewTabShortcut,
         CloseTabShortcut,
@@ -105,6 +109,7 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("f5", Reload, None),
         KeyBinding::new("ctrl-l", EditLocation, None),
         KeyBinding::new("ctrl-f", SearchLocation, None),
+        KeyBinding::new("ctrl-shift-f", FilterLocation, None),
         KeyBinding::new("ctrl-shift-p", OpenCommandMode, None),
         KeyBinding::new("ctrl-t", NewTabShortcut, None),
         KeyBinding::new("ctrl-w", CloseTabShortcut, None),
@@ -112,6 +117,7 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("f3", SplitPaneShortcut, None),
         KeyBinding::new("f6", FocusNextPaneShortcut, None),
         KeyBinding::new("ctrl-a", SelectAllShortcut, None),
+        KeyBinding::new("escape", Escape, None),
         KeyBinding::new("ctrl-h", ToggleHiddenShortcut, None),
         KeyBinding::new("ctrl-1", ViewDetailsShortcut, None),
         KeyBinding::new("ctrl-2", ViewListShortcut, None),
@@ -151,6 +157,50 @@ enum ColumnAction {
     MoveRight(ColumnKey),
     Narrower(ColumnKey),
     Wider(ColumnKey),
+}
+
+struct ActiveSearch {
+    model: SearchResultModel,
+    cancellation: CancellationToken,
+    expression: String,
+    error: Option<Box<str>>,
+    retryable: bool,
+}
+
+impl ActiveSearch {
+    fn status_text(&self) -> String {
+        let total = self.model.total_results();
+        let results = if total == 1 {
+            "1 result".to_owned()
+        } else {
+            format!("{total} results")
+        };
+        let scope_errors = self.model.errors().len() + self.model.dropped_error_count();
+        match self.model.state() {
+            SearchState::Idle => "Idle".to_owned(),
+            SearchState::Running => format!("Searching — {total} found"),
+            SearchState::Complete => results,
+            SearchState::Partial => format!("{results} — {scope_errors} scope errors"),
+            SearchState::RefineRequired => format!("{results} — refine the search to continue"),
+            SearchState::Cancelled => "Search cancelled".to_owned(),
+            SearchState::Error => self.error.as_deref().unwrap_or("Search failed").to_owned(),
+        }
+    }
+}
+
+struct ActiveFilter {
+    filter: Option<DirectoryFilter>,
+    expression: String,
+    error: Option<Box<str>>,
+}
+
+#[derive(Clone)]
+struct SearchItemRenderSpec {
+    index: usize,
+    name: String,
+    path: String,
+    kind: ItemKind,
+    mime: Option<Box<str>>,
 }
 
 pub fn run(initial_path: PathBuf) {
@@ -482,6 +532,8 @@ impl SessionBinding {
 
 struct MusheenApp {
     directories: HashMap<TabId, DirectoryModel>,
+    searches: HashMap<TabId, ActiveSearch>,
+    filters: HashMap<TabId, ActiveFilter>,
     sidebars: HashMap<TabId, SidebarModel>,
     pins: PinStore,
     limits: ResourceLimits,
@@ -506,6 +558,9 @@ impl Drop for MusheenApp {
     fn drop(&mut self) {
         for directory in self.directories.values() {
             directory.cancel();
+        }
+        for search in self.searches.values() {
+            search.cancellation.cancel();
         }
     }
 }
@@ -577,6 +632,8 @@ impl MusheenApp {
         sidebars.insert(focused_tab, default_sidebar_model(pins.clone()));
         let mut this = Self {
             directories,
+            searches: HashMap::new(),
+            filters: HashMap::new(),
             sidebars,
             pins,
             limits,
@@ -730,6 +787,9 @@ impl MusheenApp {
     }
 
     fn navigate(&mut self, location: StorePath, remember: bool, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        self.cancel_search(tab_id);
+        self.filters.remove(&tab_id);
         if remember {
             self.navigation.navigate_focused(location.clone());
             self.schedule_session_save(cx);
@@ -753,10 +813,20 @@ impl MusheenApp {
     fn load_focused_tab(&mut self, cx: &mut Context<Self>) {
         let location = self.navigation.focused_tab().location().clone();
         let display = DisplayPath::from_store_path(&location).as_str().to_owned();
-        self.omnibar.enter(OmnibarMode::Path, display.clone());
-        self.pending_omnibar_value = Some(display);
-        self.pending_content_focus = true;
         let tab_id = self.navigation.focused_tab().id();
+        if let Some(search) = self.searches.get(&tab_id) {
+            self.omnibar
+                .enter(OmnibarMode::Search, search.expression.clone());
+            self.pending_omnibar_value = Some(search.expression.clone());
+        } else if let Some(filter) = self.filters.get(&tab_id) {
+            self.omnibar
+                .enter(OmnibarMode::Filter, filter.expression.clone());
+            self.pending_omnibar_value = Some(filter.expression.clone());
+        } else {
+            self.omnibar.enter(OmnibarMode::Path, display.clone());
+            self.pending_omnibar_value = Some(display);
+        }
+        self.pending_content_focus = true;
         let loaded = self
             .directories
             .get(&tab_id)
@@ -780,6 +850,32 @@ impl MusheenApp {
         self.directories
             .get_mut(&self.navigation.focused_tab().id())
             .expect("the focused tab owns a directory model")
+    }
+
+    #[cfg(test)]
+    fn active_search(&self) -> Option<&SearchResultModel> {
+        self.searches
+            .get(&self.navigation.focused_tab().id())
+            .map(|search| &search.model)
+    }
+
+    fn cancel_search(&mut self, tab_id: TabId) {
+        if let Some(search) = self.searches.remove(&tab_id) {
+            search.cancellation.cancel();
+        }
+    }
+
+    fn filtered_items(&self, tab_id: TabId) -> Vec<&StoreItem> {
+        let Some(directory) = self.directories.get(&tab_id) else {
+            return Vec::new();
+        };
+        self.filters
+            .get(&tab_id)
+            .and_then(|filter| filter.filter.as_ref())
+            .map_or_else(
+                || directory.view().visible_items(),
+                |filter| filter.apply(directory.view()),
+            )
     }
 
     fn activate_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
@@ -852,9 +948,10 @@ impl MusheenApp {
             | CommandAction::NavigateForward
             | CommandAction::NavigateParent
             | CommandAction::Refresh => self.dispatch_navigation_action(action, cx),
-            CommandAction::FocusLocation | CommandAction::Search | CommandAction::FocusCommand => {
-                self.dispatch_omnibar_action(action, cx);
-            }
+            CommandAction::FocusLocation
+            | CommandAction::Search
+            | CommandAction::Filter
+            | CommandAction::FocusCommand => self.dispatch_omnibar_action(action, cx),
             CommandAction::ViewDetails
             | CommandAction::ViewList
             | CommandAction::ViewCards
@@ -921,6 +1018,7 @@ impl MusheenApp {
         self.requested_omnibar_mode = match action {
             CommandAction::FocusLocation => Some(OmnibarMode::Path),
             CommandAction::Search => Some(OmnibarMode::Search),
+            CommandAction::Filter => Some(OmnibarMode::Filter),
             CommandAction::FocusCommand => Some(OmnibarMode::Command),
             _ => None,
         };
@@ -1214,6 +1312,8 @@ impl MusheenApp {
             this.omnibar.enter(this.omnibar.mode(), value);
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.submit_omnibar(cx);
+            } else if this.omnibar.mode() == OmnibarMode::Filter {
+                this.apply_filter(this.omnibar.text().to_owned(), cx);
             } else {
                 cx.notify();
             }
@@ -1225,11 +1325,12 @@ impl MusheenApp {
     fn activate_omnibar(&mut self, mode: OmnibarMode, window: &mut Window, cx: &mut Context<Self>) {
         let value = match mode {
             OmnibarMode::Path => self.current_location_text().to_string(),
-            OmnibarMode::Search | OmnibarMode::Command => String::new(),
+            OmnibarMode::Search | OmnibarMode::Filter | OmnibarMode::Command => String::new(),
         };
         let placeholder = match mode {
             OmnibarMode::Path => "Enter a path",
             OmnibarMode::Search => "Search this location",
+            OmnibarMode::Filter => "Filter loaded items",
             OmnibarMode::Command => "Run a command",
         };
         self.omnibar.enter(mode, value.clone());
@@ -1252,7 +1353,13 @@ impl MusheenApp {
                     self.navigate(location, true, cx);
                 }
             }
-            OmnibarSubmission::Search(_) => {
+            OmnibarSubmission::Search(expression) => {
+                self.start_search(expression, cx);
+                self.pending_content_focus = true;
+                cx.notify();
+            }
+            OmnibarSubmission::Filter(expression) => {
+                self.apply_filter(expression, cx);
                 self.pending_content_focus = true;
                 cx.notify();
             }
@@ -1287,7 +1394,179 @@ impl MusheenApp {
         }
     }
 
+    fn start_search(&mut self, expression: String, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        self.cancel_search(tab_id);
+        self.filters.remove(&tab_id);
+        let scope = self.navigation.focused_tab().location().clone();
+        let include_hidden = self.focused_directory().view().preferences().show_hidden;
+        let query = match SearchQuery::parse(&expression)
+            .map(|query| query.with_default_hidden_policy(include_hidden))
+            .and_then(|query| {
+                self.store
+                    .search_capabilities(&scope)
+                    .validate(&query)
+                    .map(|()| query)
+            }) {
+            Ok(query) => query,
+            Err(error) => {
+                let query = SearchQuery::parse("name:__invalid_search__")
+                    .expect("the static fallback search is valid")
+                    .with_default_hidden_policy(include_hidden);
+                let mut model = SearchResultModel::new(
+                    scope,
+                    query,
+                    SEARCH_RETAINED_RESULTS,
+                    SEARCH_RESULT_LIMIT,
+                );
+                let generation = model.begin();
+                model.fail(generation);
+                self.searches.insert(
+                    tab_id,
+                    ActiveSearch {
+                        model,
+                        cancellation: CancellationToken::new(),
+                        expression,
+                        error: Some(error.to_string().into()),
+                        retryable: false,
+                    },
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let cancellation = CancellationToken::new();
+        let mut model = SearchResultModel::new(
+            scope.clone(),
+            query.clone(),
+            SEARCH_RETAINED_RESULTS,
+            SEARCH_RESULT_LIMIT,
+        );
+        let generation = model.begin();
+        self.searches.insert(
+            tab_id,
+            ActiveSearch {
+                model,
+                cancellation: cancellation.clone(),
+                expression,
+                error: None,
+                retryable: false,
+            },
+        );
+        let store = Arc::clone(&self.store);
+        let worker_cancellation = cancellation.clone();
+        let work = cx.background_spawn(async move {
+            let mut stream = store
+                .search(&scope, query, worker_cancellation.clone())
+                .await?;
+            let batch = stream.next_batch(worker_cancellation).await?;
+            Ok::<_, StoreError>((stream, batch))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.apply_search_step(tab_id, generation, cancellation, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_filter(&mut self, expression: String, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        if expression.trim().is_empty() {
+            self.filters.remove(&tab_id);
+            cx.notify();
+            return;
+        }
+        let active = match SearchQuery::parse(&expression).and_then(DirectoryFilter::from_query) {
+            Ok(filter) => ActiveFilter {
+                filter: Some(filter),
+                expression,
+                error: None,
+            },
+            Err(error) => ActiveFilter {
+                filter: None,
+                expression,
+                error: Some(error.to_string().into()),
+            },
+        };
+        self.filters.insert(tab_id, active);
+        cx.notify();
+    }
+
+    fn continue_search(
+        &mut self,
+        tab_id: TabId,
+        generation: SearchGeneration,
+        cancellation: CancellationToken,
+        mut stream: Box<dyn SearchStream>,
+        cx: &mut Context<Self>,
+    ) {
+        let worker_cancellation = cancellation.clone();
+        let work = cx.background_spawn(async move {
+            let batch = stream.next_batch(worker_cancellation).await?;
+            Ok::<_, StoreError>((stream, batch))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.apply_search_step(tab_id, generation, cancellation, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_search_step(
+        &mut self,
+        tab_id: TabId,
+        generation: SearchGeneration,
+        cancellation: CancellationToken,
+        result: Result<(Box<dyn SearchStream>, Option<SearchBatch>), StoreError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(search) = self.searches.get_mut(&tab_id) else {
+            return;
+        };
+        match result {
+            Ok((stream, Some(batch))) => {
+                let complete = batch.completion() != SearchCompletion::Running;
+                if search.model.apply(generation, batch)
+                    && search.model.state() == SearchState::Running
+                    && !complete
+                {
+                    self.continue_search(tab_id, generation, cancellation, stream, cx);
+                }
+            }
+            Ok((_, None)) => {
+                if search.model.fail(generation) {
+                    search.error = Some(
+                        "search provider ended before reporting completion"
+                            .to_owned()
+                            .into(),
+                    );
+                    search.retryable = true;
+                }
+            }
+            Err(StoreError::Cancelled) => search.model.cancel(),
+            Err(error) => {
+                search.model.fail(generation);
+                search.error = Some(error.to_string().into());
+                search.retryable = true;
+            }
+        }
+        cx.notify();
+    }
+
     fn cancel_omnibar(&mut self, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        self.cancel_search(tab_id);
+        self.filters.remove(&tab_id);
         let value = self.current_location_text().to_string();
         self.omnibar.cancel();
         self.omnibar.enter(OmnibarMode::Path, value.clone());
@@ -1447,6 +1726,12 @@ impl MusheenApp {
                 "omnibar-search",
                 "Search",
                 OmnibarMode::Search,
+                cx,
+            ))
+            .child(mode_button(
+                "omnibar-filter",
+                "Filter",
+                OmnibarMode::Filter,
                 cx,
             ))
             .child(mode_button(
@@ -1977,11 +2262,17 @@ impl MusheenApp {
             .get(&spec.tab_id)
             .map(|directory| directory.state().clone())
             .unwrap_or(DirectoryState::Loading);
-        let body = match state {
-            DirectoryState::Loading => self.render_loading(colors.skeleton),
-            DirectoryState::Empty => self.render_empty(colors.muted_foreground),
-            DirectoryState::Error(message) => self.render_error(message, cx),
-            DirectoryState::Ready => self.render_items(spec.tab_id, spec.pane_index, window, cx),
+        let body = if self.searches.contains_key(&spec.tab_id) {
+            self.render_search_results(spec.tab_id, spec.pane_index, cx)
+        } else {
+            match state {
+                DirectoryState::Loading => self.render_loading(colors.skeleton),
+                DirectoryState::Empty => self.render_empty(colors.muted_foreground),
+                DirectoryState::Error(message) => self.render_error(message, cx),
+                DirectoryState::Ready => {
+                    self.render_items(spec.tab_id, spec.pane_index, window, cx)
+                }
+            }
         };
         let content_id = if spec.pane_index == 0 {
             SharedString::from("directory-content")
@@ -2008,6 +2299,212 @@ impl MusheenApp {
             .focus(|style| style.border_color(colors.ring))
             .bg(colors.background)
             .child(body)
+            .into_any_element()
+    }
+
+    fn render_search_results(
+        &mut self,
+        tab_id: TabId,
+        pane_index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(search) = self.searches.get(&tab_id) else {
+            return div().into_any_element();
+        };
+        let scope = DisplayPath::from_store_path(search.model.scope())
+            .as_str()
+            .to_owned();
+        let hidden_policy = if search.model.query().include_hidden() {
+            "Hidden items included"
+        } else {
+            "Hidden items excluded"
+        };
+        let link_policy = if search.model.query().follow_links() {
+            "Symbolic links followed"
+        } else {
+            "Symbolic links not followed"
+        };
+        let scope_label = format!(
+            "Search '{}' in {scope} · {hidden_policy} · {link_policy}",
+            search.expression
+        );
+        let state = search.model.state();
+        let state_label = search.status_text();
+        let error_panel = self.render_search_errors(search, state, cx);
+        let items = search
+            .model
+            .retained_results()
+            .iter()
+            .enumerate()
+            .map(|(index, result)| SearchItemRenderSpec {
+                index,
+                name: result.item().display_name().as_str().to_owned(),
+                path: DisplayPath::from_store_path(result.item().path())
+                    .as_str()
+                    .to_owned(),
+                kind: result.item().kind(),
+                mime: result.mime().map(Into::into),
+            })
+            .collect::<Vec<_>>();
+        let items = Arc::new(items);
+        let list_items = Arc::clone(&items);
+        let rows = uniform_list(
+            SharedString::from(format!("search-list-{pane_index}")),
+            items.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                range
+                    .filter_map(|index| list_items.get(index).cloned())
+                    .map(|item| this.render_search_item(pane_index, item, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .w_full()
+        .flex_grow(1.0)
+        .min_h(px(0.));
+        div()
+            .id("search-results")
+            .test_support()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("search-scope")
+                    .test_support()
+                    .aria_label(scope_label.clone())
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(cx.theme().colors.border)
+                    .child(scope_label)
+                    .child(state_label),
+            )
+            .children(error_panel)
+            .child(rows)
+            .into_any_element()
+    }
+
+    fn render_search_errors(
+        &self,
+        search: &ActiveSearch,
+        state: SearchState,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let error_count = search.model.errors().len() + search.model.dropped_error_count();
+        if error_count == 0 && state != SearchState::Error {
+            return None;
+        }
+        let error_rows = search
+            .model
+            .errors()
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, error)| {
+                let path = DisplayPath::from_store_path(error.path());
+                let message = format!("{}: {}", path.as_str(), error.message());
+                div()
+                    .id(SharedString::from(format!("search-error-{index}")))
+                    .test_support()
+                    .aria_label(message.clone())
+                    .text_xs()
+                    .child(message)
+            })
+            .collect::<Vec<_>>();
+        let hidden_error_count = error_count.saturating_sub(error_rows.len());
+        let can_retry = search.retryable
+            || search
+                .model
+                .errors()
+                .iter()
+                .any(SearchScopeError::retryable);
+        let retry_expression = search.expression.clone();
+        Some(
+            div()
+                .id("search-errors")
+                .test_support()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .py_2()
+                .border_b_1()
+                .border_color(cx.theme().colors.border)
+                .children(error_rows)
+                .when(hidden_error_count > 0, |panel| {
+                    panel.child(format!("and {hidden_error_count} more"))
+                })
+                .when(can_retry, |panel| {
+                    panel.child(
+                        Button::new("search-retry")
+                            .label("Retry")
+                            .accessibility_label("Retry search")
+                            .secondary()
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_search(retry_expression.clone(), cx);
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_search_item(
+        &mut self,
+        pane_index: usize,
+        item: SearchItemRenderSpec,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let identity = match item.kind {
+            ItemKind::Directory => ContentIdentity::directory(),
+            ItemKind::SymbolicLink => ContentIdentity::symbolic_link(),
+            ItemKind::RegularFile | ItemKind::Other => item
+                .mime
+                .clone()
+                .map_or(ContentIdentity::GenericFile, ContentIdentity::Mime),
+        };
+        let icon = self
+            .content_icon(freedesktop_icon_name(&identity))
+            .map_or_else(
+                || {
+                    Icon::new(if item.kind == ItemKind::Directory {
+                        IconName::Folder
+                    } else {
+                        IconName::File
+                    })
+                    .into_any_element()
+                },
+                |source| img(source).size(px(28.)).into_any_element(),
+            );
+        div()
+            .id(SharedString::from(format!(
+                "search-item-{pane_index}-{}",
+                item.index
+            )))
+            .role(Role::ListItem)
+            .h(px(44.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .hover(|style| style.bg(cx.theme().colors.list_hover))
+            .child(icon)
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .child(div().child(item.name))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().colors.muted_foreground)
+                            .child(item.path),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2138,11 +2635,13 @@ impl MusheenApp {
         } else {
             configured
         };
-        let item_count = self
-            .directories
-            .get(&tab_id)
-            .map(|directory| directory.view().visible_count())
-            .unwrap_or_default();
+        let item_count = self.filtered_items(tab_id).len();
+        let filter_label = self.filters.get(&tab_id).map(|filter| {
+            filter.error.as_deref().map_or_else(
+                || format!("Filtered view — {item_count} matches"),
+                |error| format!("Filter error — {error}"),
+            )
+        });
         let list =
             match layout {
                 Layout::Details | Layout::List | Layout::Columns => uniform_list(
@@ -2210,6 +2709,21 @@ impl MusheenApp {
             .size_full()
             .flex()
             .flex_col()
+            .when_some(filter_label, |items, label| {
+                items.child(
+                    div()
+                        .id("filter-summary")
+                        .test_support()
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .px_4()
+                        .border_b_1()
+                        .border_color(cx.theme().colors.border)
+                        .text_sm()
+                        .child(label),
+                )
+            })
             .when(layout == Layout::Details, |items| {
                 items.child(self.render_details_header(tab_id, cx))
             })
@@ -2359,7 +2873,7 @@ impl MusheenApp {
         layout: Layout,
     ) -> Option<ItemRenderSpec> {
         let view = self.directories.get(&tab_id)?.view();
-        let item = view.visible_items().get(index)?.to_owned();
+        let item = self.filtered_items(tab_id).get(index)?.to_owned();
         Some(ItemRenderSpec {
             tab_id,
             pane_index,
@@ -2541,6 +3055,27 @@ impl MusheenApp {
             })
             .clone()
     }
+
+    fn focused_status_text(&self) -> String {
+        let tab_id = self.navigation.focused_tab().id();
+        if let Some(search) = self.searches.get(&tab_id) {
+            return search.status_text();
+        }
+        let visible_count = self.filtered_items(tab_id).len();
+        let view = self.focused_directory().view();
+        let selected_bytes = view
+            .selected_ids()
+            .iter()
+            .map(|id| view.item(id).and_then(StoreItem::size))
+            .collect::<Option<Vec<_>>>()
+            .map(|sizes| sizes.into_iter().sum());
+        status_text_with_size(
+            visible_count,
+            view.selected_ids().len(),
+            selected_bytes,
+            view.is_complete(),
+        )
+    }
 }
 
 impl Render for MusheenApp {
@@ -2558,19 +3093,7 @@ impl Render for MusheenApp {
             self.pending_content_focus = false;
         }
         let colors = cx.theme().colors;
-        let view = self.focused_directory().view();
-        let selected_bytes = view
-            .selected_ids()
-            .iter()
-            .map(|id| view.item(id).and_then(StoreItem::size))
-            .collect::<Option<Vec<_>>>()
-            .map(|sizes| sizes.into_iter().sum());
-        let status = status_text_with_size(
-            view.visible_count(),
-            view.selected_ids().len(),
-            selected_bytes,
-            view.is_complete(),
-        );
+        let status = self.focused_status_text();
         let info_visible = self.shell.info_visible();
         let wide = window.viewport_size().width.as_f32() >= 960.0;
         let high_contrast = Self::high_contrast(cx);
@@ -2612,6 +3135,9 @@ impl Render for MusheenApp {
             }))
             .on_action(cx.listener(|this, _: &SearchLocation, _, cx| {
                 this.dispatch_command("view.search", cx);
+            }))
+            .on_action(cx.listener(|this, _: &FilterLocation, _, cx| {
+                this.dispatch_command("view.filter", cx);
             }))
             .on_action(cx.listener(|this, _: &OpenCommandMode, _, cx| {
                 this.dispatch_command("view.command", cx);
@@ -2774,9 +3300,149 @@ fn column_label(column: ColumnKey) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::SearchState;
     use gpui_kit::TestAppContext;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use musheen_core::{
+        CapabilityMatrix, CapabilityReason, CapabilityState, MutationRequest, PageRequest,
+        ProviderId, SearchCapabilities, SearchResult, SearchScopeError,
+    };
     use std::time::Duration;
+
+    struct ImmediateSearchStream(Option<SearchBatch>);
+
+    impl SearchStream for ImmediateSearchStream {
+        fn next_batch<'a>(
+            &'a mut self,
+            cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Option<SearchBatch>, StoreError>> {
+            let batch = self.0.take();
+            Box::pin(async move {
+                cancellation.check()?;
+                Ok(batch)
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ImmediateSearchOutcome {
+        Complete,
+        Partial,
+        MissingTerminal,
+    }
+
+    struct ImmediateSearchStore {
+        provider: ProviderId,
+        outcome: ImmediateSearchOutcome,
+    }
+
+    impl ImmediateSearchStore {
+        fn new() -> Self {
+            Self {
+                provider: ProviderId::new("search.test").unwrap(),
+                outcome: ImmediateSearchOutcome::Complete,
+            }
+        }
+
+        fn partial() -> Self {
+            Self {
+                provider: ProviderId::new("search.test.partial").unwrap(),
+                outcome: ImmediateSearchOutcome::Partial,
+            }
+        }
+
+        fn without_terminal_batch() -> Self {
+            Self {
+                provider: ProviderId::new("search.test.empty").unwrap(),
+                outcome: ImmediateSearchOutcome::MissingTerminal,
+            }
+        }
+    }
+
+    impl Store for ImmediateSearchStore {
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider
+        }
+
+        fn capabilities(&self, _location: &StorePath) -> CapabilityMatrix {
+            CapabilityMatrix::new(|_| {
+                CapabilityState::Unsupported(CapabilityReason::new("test store").unwrap())
+            })
+        }
+
+        fn search_capabilities(&self, _location: &StorePath) -> SearchCapabilities {
+            SearchCapabilities::all()
+        }
+
+        fn search<'a>(
+            &'a self,
+            scope: &'a StorePath,
+            _query: SearchQuery,
+            cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Box<dyn SearchStream>, StoreError>> {
+            if matches!(self.outcome, ImmediateSearchOutcome::MissingTerminal) {
+                return Box::pin(async {
+                    Ok(Box::new(ImmediateSearchStream(None)) as Box<dyn SearchStream>)
+                });
+            }
+            let item = StoreItem::new(
+                ItemId::new(self.provider.clone(), b"welcome".to_vec()).unwrap(),
+                StorePath::from_unix_path("/fixture/Welcome.md"),
+                DisplayPath::new("Welcome.md"),
+                ItemKind::RegularFile,
+                Some(7),
+            );
+            let result = cancellation.check().and_then(|()| {
+                let errors = matches!(self.outcome, ImmediateSearchOutcome::Partial)
+                    .then(|| {
+                        vec![SearchScopeError::new(
+                            StorePath::from_unix_path("/fixture/denied"),
+                            "permission denied",
+                            true,
+                        )]
+                    })
+                    .unwrap_or_default();
+                SearchBatch::new(
+                    vec![SearchResult::new(item, Some("text/plain"))],
+                    errors,
+                    SearchCompletion::Complete,
+                )
+            });
+            let _ = scope;
+            Box::pin(async move {
+                Ok(Box::new(ImmediateSearchStream(Some(result?))) as Box<dyn SearchStream>)
+            })
+        }
+
+        fn read_directory<'a>(
+            &'a self,
+            _location: &'a StorePath,
+            _request: PageRequest,
+            _cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Page<StoreItem>, StoreError>> {
+            Box::pin(async { Err(StoreError::unsupported("read_directory", "test store")) })
+        }
+
+        fn watch_directory<'a>(
+            &'a self,
+            _location: &'a StorePath,
+            _cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Box<dyn DirectoryWatch>, StoreError>> {
+            Box::pin(async { Err(StoreError::unsupported("watch_directory", "test store")) })
+        }
+
+        fn validate_mutation(&self, request: &MutationRequest) -> Result<(), StoreError> {
+            Err(request.unsupported("test store"))
+        }
+
+        fn mutate<'a>(
+            &'a self,
+            request: MutationRequest,
+            _cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move { Err(request.unsupported("test store")) })
+        }
+    }
 
     #[test]
     fn preview_theme_parser_accepts_only_supported_profiles() {
@@ -2990,6 +3656,21 @@ mod tests {
             assert!(window.find("details-columns").visible());
             window.click("view.hidden", cx);
             assert_eq!(window.find("status-bar").label(), Some("3 items"));
+            window.press("ctrl-shift-f", cx);
+            window.render_frame(cx);
+            assert_eq!(app.read(cx).omnibar.mode(), OmnibarMode::Filter);
+            app.update(cx, |state, cx| {
+                state.omnibar.enter(OmnibarMode::Filter, "name:Welcome");
+                state.submit_omnibar(cx);
+            });
+            window.render_frame(cx);
+            assert!(window.find("filter-summary").visible());
+            assert_eq!(window.find("status-bar").label(), Some("1 item"));
+            assert_eq!(app.read(cx).focused_directory().items().len(), 3);
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("filter-summary").is_none());
+            assert_eq!(window.find("status-bar").label(), Some("3 items"));
             window.press("ctrl-a", cx);
             assert!(
                 window
@@ -3065,5 +3746,122 @@ mod tests {
             assert!(window.try_find("pane-1").is_none());
         })
         .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn search_submission_streams_scoped_results_into_the_content_area(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.store = Arc::new(ImmediateSearchStore::new());
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .show_hidden = true;
+                state.omnibar.enter(OmnibarMode::Search, "name:Welcome");
+                state.submit_omnibar(cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .active_search()
+                .is_some_and(|search| search.state() == SearchState::Complete)
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("search-results").visible());
+            assert!(window.find("search-scope").visible());
+            let scope_label = window
+                .find("search-scope")
+                .label()
+                .expect("search scope has an accessible label")
+                .to_owned();
+            assert!(scope_label.contains("name:Welcome"));
+            assert!(scope_label.contains("Hidden items included"));
+            assert!(scope_label.contains("Symbolic links not followed"));
+            assert_eq!(window.find("status-bar").label(), Some("1 result"));
+            assert_eq!(
+                app.read(cx)
+                    .active_search()
+                    .expect("search remains active")
+                    .total_results(),
+                1
+            );
+        })
+        .expect("test window remains open");
+
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.store = Arc::new(ImmediateSearchStore::partial());
+                state.start_search("name:Welcome".to_owned(), cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .active_search()
+                .is_some_and(|search| search.state() == SearchState::Partial)
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("search-errors").visible());
+            assert!(window.find("search-error-0").visible());
+            assert!(window.find("search-retry").visible());
+        })
+        .expect("test window remains open");
+
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.store = Arc::new(ImmediateSearchStore::without_terminal_batch());
+                state.start_search("name:Welcome hidden:false".to_owned(), cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .active_search()
+                .is_some_and(|search| search.state() == SearchState::Error)
+        })
+        .await;
+        cx.update(|cx| {
+            let state = app.read(cx);
+            let tab_id = state.navigation.focused_tab().id();
+            assert!(
+                !state
+                    .searches
+                    .get(&tab_id)
+                    .expect("search remains active")
+                    .model
+                    .query()
+                    .include_hidden()
+            );
+            assert_eq!(
+                state
+                    .searches
+                    .get(&tab_id)
+                    .and_then(|search| search.error.as_deref()),
+                Some("search provider ended before reporting completion")
+            );
+        });
     }
 }

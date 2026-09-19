@@ -3,13 +3,15 @@
 mod enumerate;
 mod metadata;
 mod probe;
+mod search;
 mod traverse;
 mod watch;
 
 use enumerate::EnumerationRegistry;
 use musheen_core::{
     BoxFuture, CancellationToken, CapabilityMatrix, DirectoryWatch, MutationRequest, Page,
-    PageRequest, ProviderId, Store, StoreError, StoreItem, StorePath,
+    PageRequest, ProviderId, SearchCapabilities, SearchQuery, SearchStream, Store, StoreError,
+    StoreItem, StorePath,
 };
 
 pub use probe::LocalFilesystemInfo;
@@ -69,6 +71,24 @@ impl Store for LocalStore {
 
     fn capabilities(&self, location: &StorePath) -> CapabilityMatrix {
         probe::capabilities(location)
+    }
+
+    fn search_capabilities(&self, _location: &StorePath) -> SearchCapabilities {
+        SearchCapabilities::all()
+    }
+
+    fn search<'a>(
+        &'a self,
+        scope: &'a StorePath,
+        query: SearchQuery,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<Box<dyn SearchStream>, StoreError>> {
+        let result = self
+            .search_capabilities(scope)
+            .validate(&query)
+            .map_err(|error| StoreError::Backend(error.to_string().into()))
+            .and_then(|()| search::start(self.provider.clone(), scope, query, cancellation));
+        Box::pin(async move { result })
     }
 
     fn read_directory<'a>(

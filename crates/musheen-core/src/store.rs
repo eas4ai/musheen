@@ -1,6 +1,6 @@
 use crate::{
     CancellationToken, CapabilityMatrix, CapabilityReason, DirectoryWatch, Page, PageRequest,
-    ProviderId, StoreItem, StorePath,
+    ProviderId, SearchCapabilities, SearchQuery, SearchStream, StoreItem, StorePath,
 };
 use std::error::Error;
 use std::fmt;
@@ -256,6 +256,25 @@ pub trait Store: Send + Sync {
     fn provider_id(&self) -> &ProviderId;
 
     fn capabilities(&self, location: &StorePath) -> CapabilityMatrix;
+
+    fn search_capabilities(&self, _location: &StorePath) -> SearchCapabilities {
+        SearchCapabilities::default()
+    }
+
+    fn search<'a>(
+        &'a self,
+        _scope: &'a StorePath,
+        _query: SearchQuery,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<Box<dyn SearchStream>, StoreError>> {
+        Box::pin(async move {
+            cancellation.check()?;
+            Err(StoreError::unsupported(
+                "search",
+                "this provider does not implement recursive search",
+            ))
+        })
+    }
 
     fn read_directory<'a>(
         &'a self,

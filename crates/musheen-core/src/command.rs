@@ -71,6 +71,7 @@ pub enum CommandAction {
     Refresh,
     FocusLocation,
     Search,
+    Filter,
     FocusCommand,
     ViewDetails,
     ViewList,
@@ -426,6 +427,14 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             &[("Ctrl+F", Browser)],
             Predicate::Always,
             Action::Search,
+        ),
+        command(
+            "view.filter",
+            "command.filter",
+            "list-filter",
+            &[("Ctrl+Shift+F", Browser)],
+            Predicate::Always,
+            Action::Filter,
         ),
         command(
             "view.command",

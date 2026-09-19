@@ -22,6 +22,7 @@ pub enum OmnibarMode {
     #[default]
     Path,
     Search,
+    Filter,
     Command,
 }
 
@@ -29,6 +30,7 @@ pub enum OmnibarMode {
 pub enum OmnibarSubmission {
     Path(String),
     Search(String),
+    Filter(String),
     Command(String),
 }
 
@@ -59,6 +61,7 @@ impl OmnibarState {
         match self.mode {
             OmnibarMode::Path => OmnibarSubmission::Path(self.text.clone()),
             OmnibarMode::Search => OmnibarSubmission::Search(self.text.clone()),
+            OmnibarMode::Filter => OmnibarSubmission::Filter(self.text.clone()),
             OmnibarMode::Command => OmnibarSubmission::Command(self.text.clone()),
         }
     }

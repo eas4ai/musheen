@@ -131,6 +131,12 @@ fn omnibar_mode_unambiguously_controls_submission() {
         OmnibarSubmission::Search("type:image".to_owned())
     );
 
+    omnibar.enter(OmnibarMode::Filter, "name:report");
+    assert_eq!(
+        omnibar.submit(),
+        OmnibarSubmission::Filter("name:report".to_owned())
+    );
+
     omnibar.enter(OmnibarMode::Command, "settings");
     assert_eq!(
         omnibar.submit(),
