@@ -95,8 +95,8 @@ for (const name of competingPackages) {
 
 for (const path of rustPaths) {
   const source = readFileSync(path, "utf8");
-  const compactSource = source.replace(/[^A-Za-z0-9_.-]/g, "");
-  const hasDesktopEntryContent = compactSource.includes("DesktopEntry");
+  const compactSource = source.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  const hasDesktopEntryContent = compactSource.includes("desktopentry");
   const parsesKeyValueLines = /\.lines\s*\(|split_once\s*\(\s*['"]=['"]/.test(source);
   if (hasDesktopEntryContent && parsesKeyValueLines) {
     failures.push(`${path} contains a hand-written Desktop Entry parser`);
