@@ -105,6 +105,11 @@ const splitsKeyValue = rustSources.some((source) =>
 if (compactTreeSource.includes("desktopentry") && traversesTextLines && splitsKeyValue) {
   failures.push("Rust source tree contains a hand-written Desktop Entry parser");
 }
+const usesFilesystemPaths = rustSources.some((source) =>
+  /\bstd\s*::\s*path\b|\bPath(?:Buf)?\s*::|\.join\s*\(/.test(source));
+if (compactTreeSource.includes("hicolor") && usesFilesystemPaths) {
+  failures.push("Rust source tree contains a hand-written icon-theme resolver");
+}
 
 if (failures.length > 0) {
   console.log("cairn: DEP-003: fail");

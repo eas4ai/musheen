@@ -37,7 +37,7 @@ findings:
   - resolved: DEP-015 formerly omitted repository Cargo configuration and Rust toolchain files from its declared inputs; the mechanism now invalidates evidence when either build-control input changes (independent 602a385 5)
   - resolved: DEP-001 formerly checked complete portal identifiers within one Rust file; it now aggregates the portal service, method, and appearance namespace signals across the full Rust source tree, so a direct portal settings read cannot escape by splitting constants across modules. (independent 3f6a354 1)
   - resolved: DEP-003 formerly recognized only `.lines()` or `split_once('=')`; it now also detects newline traversal with `split` or `split_terminator` and key/value parsing with `split` or `splitn`. (independent 3f6a354 2)
-  - open: DEP-003 has no source guard for a hand-written icon resolver. A compiling hicolor lookup built with `std::path` still passed DEP-003, so its icon-resolver check detects only the finite list of competing packages. (independent 3f6a354 3)
+  - resolved: DEP-003 formerly checked only a finite list of competing icon packages; it now rejects Rust source that combines the hicolor theme with direct filesystem path traversal. (independent 3f6a354 3)
   - open: DEP-007 detects `libc::` spellings but not direct C bindings. A compiling `extern "C"` call to `statfs` still passed DEP-007 even though nix supplies that call. (independent 3f6a354 4)
   - open: DEP-007 misses mount-table paths assembled with ordinary path joins except for its special `mountinfo` case. A compiling parser for `Path::new("/proc").join("self").join("mounts")` still passed DEP-007. (independent 3f6a354 5)
   - open: DEP-008 treats any unwrapped Camino type use in a `config` or `uri` path as valid without checking the data's role or UTF-8 validation. A compiling `config.rs` probe converted a local store `Path` through `to_string_lossy()` into `Utf8PathBuf` and still passed DEP-008. (independent 3f6a354 6)
@@ -153,6 +153,10 @@ probe was removed.
 
 For independent finding 3f6a354 2, DEP-003 passed on the clean tree and rejected
 a compiling `[Desktop Entry]` parser that used `split_terminator` and `splitn`.
+It passed again after the probe was removed.
+
+For independent finding 3f6a354 3, DEP-003 passed on the clean tree and rejected
+a compiling hicolor lookup that traversed icon directories with `std::path`.
 It passed again after the probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
