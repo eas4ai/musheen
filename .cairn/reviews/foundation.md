@@ -27,7 +27,7 @@ findings:
   - resolved: DEP-015 formerly relied on GitHub workflow text without a run attestation; by developer direction it now archives the exact commit and records a single clean Linux Docker build using `cargo build --locked`, with no GitHub CI during development (independent d922070 9)
   - resolved: DEP-001 formerly required the GTK directory and settings filename to be contiguous; it now rejects files containing both path components even when variables assemble them at runtime (independent 38c61f0 1)
   - resolved: DEP-003 formerly matched `DesktopEntry` case-sensitively; it now normalizes source case and separators before pairing Desktop Entry identifiers with line/key-value parsing (independent 38c61f0 2)
-  - open: DEP-007 can pass a hand-written mount-table parser when `/proc/self` and `mountinfo` are joined at runtime (independent 38c61f0 3)
+  - resolved: DEP-007 formerly required the mountinfo path components to be contiguous; it now rejects source containing both `/proc/self` and `mountinfo` components even when runtime code joins them (independent 38c61f0 3)
   - open: DEP-008 can pass a local store path represented by a Camino type exported under an alias from an allowed configuration module (independent 38c61f0 4)
   - open: DEP-015 omits tracked build inputs such as root `build.rs` from its archive, so its container can pass while the exact clean checkout fails (independent 38c61f0 5)
 
@@ -103,6 +103,10 @@ variables, then passed after the probe was removed.
 For independent finding 38c61f0 2, DEP-003 rejected a temporary compiling
 `parse_desktop_entry` function without title-cased markers, then passed after
 the parser was removed.
+
+For independent finding 38c61f0 3, DEP-007 rejected a temporary compiling read
+that joined `/proc/self` and `mountinfo` variables at runtime, then passed after
+the probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

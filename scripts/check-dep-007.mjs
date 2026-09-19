@@ -70,6 +70,9 @@ for (const path of tracked(":(glob)**/*.rs")) {
     || compactSource.includes(mountPath.replace(/[^A-Za-z0-9_.-]/g, "")))) {
     failures.push(`${path} parses the mount table directly`);
   }
+  if (compactSource.includes("procself") && compactSource.includes("mountinfo")) {
+    failures.push(`${path} assembles the mountinfo table path directly`);
+  }
 }
 
 if (failures.length > 0) {
