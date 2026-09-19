@@ -1,5 +1,5 @@
 commitment: foundation
-commit: e4485cb
+commit: 3f6a354
 examined:
   - the six agreed dependency requirements and their falsifiers
   - every dependency mechanism, declaration, and latest evidence receipt
