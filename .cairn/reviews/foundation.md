@@ -35,6 +35,12 @@ findings:
   - resolved: DEP-007 formerly allowed a hand-written mount-table parser to read `/etc/mtab`; the mechanism now rejects that legacy mount-table path (independent 602a385 3)
   - resolved: DEP-008 formerly allowed configuration and URI modules to export Camino inside wrapper structs or enums; the mechanism now rejects those wrapper types before applying the boundary allowance (independent 602a385 4)
   - resolved: DEP-015 formerly omitted repository Cargo configuration and Rust toolchain files from its declared inputs; the mechanism now invalidates evidence when either build-control input changes (independent 602a385 5)
+  - open: DEP-001 checks complete portal identifiers within one Rust file. A compiling probe split `org.freedesktop.portal.Settings.Read` and `org.freedesktop.appearance` across modules, invoked `gdbus` directly, and still passed DEP-001, so a direct portal settings read can escape the mechanism. (independent 3f6a354 1)
+  - open: DEP-003 recognizes a hand-written Desktop Entry parser only when Rust source uses `.lines()` or `split_once('=')`. A compiling `[Desktop Entry]` parser using `split_terminator` and `splitn` still passed DEP-003. (independent 3f6a354 2)
+  - open: DEP-003 has no source guard for a hand-written icon resolver. A compiling hicolor lookup built with `std::path` still passed DEP-003, so its icon-resolver check detects only the finite list of competing packages. (independent 3f6a354 3)
+  - open: DEP-007 detects `libc::` spellings but not direct C bindings. A compiling `extern "C"` call to `statfs` still passed DEP-007 even though nix supplies that call. (independent 3f6a354 4)
+  - open: DEP-007 misses mount-table paths assembled with ordinary path joins except for its special `mountinfo` case. A compiling parser for `Path::new("/proc").join("self").join("mounts")` still passed DEP-007. (independent 3f6a354 5)
+  - open: DEP-008 treats any unwrapped Camino type use in a `config` or `uri` path as valid without checking the data's role or UTF-8 validation. A compiling `config.rs` probe converted a local store `Path` through `to_string_lossy()` into `Utf8PathBuf` and still passed DEP-008. (independent 3f6a354 6)
 
 # Foundation completion review
 
