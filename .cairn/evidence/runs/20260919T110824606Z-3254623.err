@@ -1,0 +1,42 @@
+#0 building with "default" instance using docker driver
+
+#1 [internal] load remote build context
+#1 DONE 0.0s
+
+#2 copy /context /
+#2 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/rust:1.95.0-slim-bookworm
+#3 ...
+
+#4 [auth] library/rust:pull token for registry-1.docker.io
+#4 DONE 0.0s
+
+#3 [internal] load metadata for docker.io/library/rust:1.95.0-slim-bookworm
+#3 DONE 9.5s
+
+#5 [stage-0 1/5] FROM docker.io/library/rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
+#5 DONE 0.0s
+
+#6 [stage-0 2/5] RUN apt-get update     && apt-get install --yes --no-install-recommends         build-essential         libfontconfig1-dev         libwayland-dev         libxkbcommon-x11-dev         pkg-config     && rm -rf /var/lib/apt/lists/*
+#6 CACHED
+
+#7 [stage-0 3/5] WORKDIR /workspace
+#7 CACHED
+
+#8 [stage-0 4/5] COPY . .
+#8 DONE 0.0s
+
+#9 [stage-0 5/5] RUN --mount=type=cache,id=musheen-cargo-registry,target=/usr/local/cargo/registry     --mount=type=cache,id=musheen-target,target=/workspace/target     cargo build --locked
+#9 0.645    Compiling native-theme-gpui v0.5.8 (/workspace/vendor/native-theme-gpui)
+#9 1.332    Compiling musheen v0.1.0 (/workspace)
+#9 1.411     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s
+#9 DONE 1.4s
+
+#10 exporting to image
+#10 exporting layers 0.0s done
+#10 writing image sha256:f71921af2a41d06ad79db6e0a04b04664cfb333371e6a1b374e044a6e46543fa done
+#10 naming to docker.io/library/musheen-dep-015:55e20176a3e4 done
+#10 DONE 0.0s
+
+View build details: docker-desktop://dashboard/build/default/default/w4i7z68xq7q6900ysw2k01ssp
