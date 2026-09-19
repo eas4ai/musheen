@@ -14,12 +14,20 @@ if (trackedLockfile.status !== 0) {
 }
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8");
+const workflowLines = workflow.split("\n");
 for (const trigger of ["push", "pull_request"]) {
-  if (!new RegExp(`^  ${trigger}:\\s*$`, "m").test(workflow)) {
+  const triggerIndex = workflowLines.findIndex((line) => line === `  ${trigger}:`);
+  if (triggerIndex < 0) {
     failures.push(`the CI workflow does not run on ${trigger}`);
+    continue;
+  }
+  const nextContent = workflowLines
+    .slice(triggerIndex + 1)
+    .find((line) => line.trim().length > 0);
+  if (nextContent?.startsWith("    ")) {
+    failures.push(`the CI ${trigger} trigger is filtered`);
   }
 }
-const workflowLines = workflow.split("\n");
 const jobStart = workflowLines.findIndex((line) => line === "  locked-build:");
 const jobEnd = workflowLines.findIndex(
   (line, index) => index > jobStart && /^  [\w-]+:\s*$/.test(line),

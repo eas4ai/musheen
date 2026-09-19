@@ -23,7 +23,7 @@ findings:
   - resolved: DEP-007 formerly allowed aliased `nix::libc` imports and fragmented mount-table paths; it now rejects libc imports or calls and compares normalized source for all forbidden mount paths (independent d922070 5)
   - resolved: DEP-008 formerly used a finite competitor blacklist; it now reads locked Cargo metadata and rejects every direct runtime package outside the foundation's reviewed dependency allowlist, including `ignore` under any alias (independent d922070 6)
   - resolved: DEP-008 formerly recognized only `camino::Utf8Path` spellings; it now rejects every `Utf8Path` or `Utf8PathBuf` type use outside configuration and URI modules regardless of import alias (independent d922070 7)
-  - open: DEP-015 can false-pass a workflow that excludes every branch under both declared triggers (independent d922070 8)
+  - resolved: DEP-015 formerly checked only for trigger keys; it now requires unfiltered `push` and `pull_request` triggers and rejects nested branch or path filters (independent d922070 8)
   - open: The DEP-015 receipt proves a local locked build and committed CI configuration but records no GitHub Actions run identity, status, or log for the named candidate (independent d922070 9)
 
 # Foundation completion review
@@ -81,6 +81,10 @@ It passed again after the dependency was removed and the lockfile regenerated.
 For independent finding d922070 7, DEP-008 passed on the clean tree and rejected
 a temporary, compiling `camino as utf8` local-path value in `src/main.rs`. It
 passed again after the probe was removed.
+
+For independent finding d922070 8, DEP-015 passed with unfiltered triggers,
+failed when both triggers temporarily ignored every branch, and passed again
+after the filters were removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
