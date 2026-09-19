@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+native-theme = "0.5"
+native-theme-gpui = "0.5"
+
+[patch.crates-io]
+native-theme-gpui = { path = "vendor/native-theme-gpui" }

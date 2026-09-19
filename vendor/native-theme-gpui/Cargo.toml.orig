@@ -1,0 +1,76 @@
+[package]
+name = "native-theme-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# NOT inherited: the gpui-pre closure declares a higher floor than the
+# workspace. Set to the lowest toolchain that compiles the library (spec §4.4);
+# measured 2026-09-06: 1.92.0-1.94.0 fail on unstable features used by
+# gpui-pre-util 0.3.3 and gpui-pre 0.3.3.
+rust-version = "1.95.0"
+repository.workspace = true
+homepage.workspace = true
+keywords = ["theme", "gpui", "gui", "native", "colors"]
+categories = ["gui", "config"]
+readme = "README.md"
+description = "gpui toolkit connector for native-theme"
+
+[package.metadata.docs.rs]
+# No `targets` list (spec §4.1, D40): every platform-gated public item of this
+# crate is Linux-gated and appears on docs.rs's default target; the other two
+# targets would render the same page minus those items at the cost of the
+# first-ever cross-target docs build of gpui-pre's macOS and Windows platform
+# crates.
+all-features = true
+
+[features]
+default = ["material-icons", "lucide-icons", "system-icons", "svg-rasterize"]
+material-icons = ["native-theme/material-icons"]
+lucide-icons = ["native-theme/lucide-icons"]
+system-icons = ["native-theme/system-icons"]
+svg-rasterize = ["native-theme/svg-rasterize"]
+
+[dependencies]
+# GPUI under the package name gpui-component 0.6.0 uses, so both edges unify.
+# gpui-component does not re-export gpui, so the connector names it. Caret:
+# an exact pin in a library would conflict with any consumer whose other
+# dependencies want a later snapshot.
+gpui = { package = "gpui-pre", version = "0.3.3" }
+gpui-component = "0.6.0"
+# For gpui_base::Theme, ScrollbarTheme, ResizableTheme (not re-exported).
+gpui-base = "0.6.0"
+native-theme = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+native-theme = { workspace = true, features = ["linux"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+native-theme = { workspace = true, features = ["macos"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+native-theme = { workspace = true, features = ["windows"] }
+
+[dev-dependencies]
+# Headless App for the apply/observer tests (#[gpui::test], TestAppContext).
+gpui = { package = "gpui-pre", version = "0.3.3", features = ["test-support"] }
+# The showcase uses the facade an application would: application(), init(),
+# and the Lucide assets under gpui_kit::assets.
+gpui-kit = "0.6.0"
+native-theme = { workspace = true, features = ["watch"] }
+# Field-by-field completeness check of ThemeColor via its Serialize impl.
+serde_json = "1.0.151"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2 = "0.6.4"
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+windows = { version = "0.62.2", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[example]]
+name = "showcase-gpui"
