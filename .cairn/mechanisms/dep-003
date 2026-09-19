@@ -1,0 +1,9 @@
+command: node scripts/check-dep-003.mjs
+inputs:
+  - :(glob)**/Cargo.toml
+  - Cargo.lock
+  - scripts/check-dep-003.mjs
+requirements:
+  - DEP-003
+results: per-requirement
+reviewed:
