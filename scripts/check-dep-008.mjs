@@ -81,7 +81,7 @@ for (const { name, path } of dependencies) {
 
 for (const path of tracked(":(glob)**/*.rs")) {
   const source = readFileSync(path, "utf8");
-  if (!/camino::Utf8Path(?:Buf)?/.test(source)) continue;
+  if (!/\bUtf8Path(?:Buf)?\b/.test(source)) continue;
   if (!/(?:^|\/)(?:config|uri)(?:\/|\.rs$)/.test(path)) {
     failures.push(`${path} uses Camino outside a configuration or URI boundary`);
   }
