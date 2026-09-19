@@ -3,6 +3,7 @@
 mod app;
 mod directory;
 mod icons;
+mod info_pane;
 pub mod navigation;
 pub mod search;
 mod shell;
@@ -17,5 +18,6 @@ pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
 };
 pub use icons::{ContentIdentity, LucideIcon, freedesktop_icon_name, lucide_icon};
+pub use info_pane::*;
 pub use shell::{FocusTarget, SemanticRegion, ShellModel};
 pub use theme::{AppearanceMode, MotionPolicy, ThemeProfile};

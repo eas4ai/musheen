@@ -1,5 +1,9 @@
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
 use crate::icons::{ContentIdentity, freedesktop_icon_name};
+use crate::info_pane::{
+    InfoPaneDetails, InfoPaneModel, InfoPaneResult, InfoPaneState, InfoPaneWork,
+    PreviewPresentation,
+};
 use crate::navigation::{
     ApplicationSession, BreadcrumbTrail, MAX_WINDOWS, NavigationError, OmnibarMode, OmnibarState,
     OmnibarSubmission, PaneId, TabId, WindowSession, resolve_path_input,
@@ -28,7 +32,10 @@ use musheen_core::{
     SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath,
     WatchEvent,
 };
-use musheen_desktop::SessionStore;
+use musheen_desktop::{
+    MimeDetector, PreviewDocument, SessionStore, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
+    ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
+};
 use musheen_local::LocalStore;
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
@@ -552,6 +559,7 @@ struct MusheenApp {
     watch_directories: bool,
     sidebar_visible: bool,
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
+    info_panes: HashMap<TabId, InfoPaneModel>,
 }
 
 impl Drop for MusheenApp {
@@ -561,6 +569,9 @@ impl Drop for MusheenApp {
         }
         for search in self.searches.values() {
             search.cancellation.cancel();
+        }
+        for info_pane in self.info_panes.values_mut() {
+            info_pane.cancel_active();
         }
     }
 }
@@ -652,6 +663,7 @@ impl MusheenApp {
             watch_directories,
             sidebar_visible: true,
             icon_cache: HashMap::new(),
+            info_panes: HashMap::new(),
         };
         this.start_load(location, cx);
         this
@@ -789,6 +801,7 @@ impl MusheenApp {
     fn navigate(&mut self, location: StorePath, remember: bool, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
         self.cancel_search(tab_id);
+        self.info_panes.entry(tab_id).or_default().clear();
         self.filters.remove(&tab_id);
         if remember {
             self.navigation.navigate_focused(location.clone());
@@ -879,14 +892,23 @@ impl MusheenApp {
     }
 
     fn activate_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let previous = self.navigation.focused_tab().id();
         if self.navigation.focused_pane_mut().activate_tab(id).is_ok() {
+            if previous != id {
+                self.info_panes.entry(previous).or_default().clear();
+            }
             self.schedule_session_save(cx);
             self.load_focused_tab(cx);
         }
     }
 
     fn focus_pane(&mut self, id: PaneId, cx: &mut Context<Self>) {
+        let previous = self.navigation.focused_tab().id();
         if self.navigation.focus_pane(id).is_ok() {
+            let focused = self.navigation.focused_tab().id();
+            if previous != focused {
+                self.info_panes.entry(previous).or_default().clear();
+            }
             self.schedule_session_save(cx);
             self.load_focused_tab(cx);
         }
@@ -1140,6 +1162,8 @@ impl MusheenApp {
         }
         let selected = self.focused_directory().view().selected_ids().to_vec();
         self.navigation.focused_tab_mut().set_selection(selected);
+        let tab_id = self.navigation.focused_tab().id();
+        self.refresh_info_pane(tab_id, cx);
         self.schedule_session_save(cx);
         cx.notify();
     }
@@ -1155,7 +1179,124 @@ impl MusheenApp {
         if let Some(tab) = self.navigation.tab_mut(tab_id) {
             tab.set_selection(selected);
         }
+        self.refresh_info_pane(tab_id, cx);
         self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    fn refresh_info_pane(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let selected = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| directory.view().selected_ids().to_vec())
+            .unwrap_or_default();
+        match selected.as_slice() {
+            [] => self.info_panes.entry(tab_id).or_default().clear(),
+            [id] => {
+                let item = self
+                    .directories
+                    .get(&tab_id)
+                    .and_then(|directory| directory.view().item(id))
+                    .cloned();
+                let Some(item) = item else {
+                    self.info_panes.entry(tab_id).or_default().clear();
+                    return;
+                };
+                let details = InfoPaneDetails::new(
+                    item.display_name().as_str(),
+                    item.kind(),
+                    item.size(),
+                    item.modified_unix_seconds(),
+                );
+                let Some(path) = item.path().as_unix_path().map(Path::to_path_buf) else {
+                    let model = self.info_panes.entry(tab_id).or_default();
+                    let work = model.begin(details, PathBuf::new());
+                    model.complete(
+                        work.generation(),
+                        InfoPaneResult::Details {
+                            mime_type: "application/octet-stream".into(),
+                        },
+                    );
+                    return;
+                };
+                let work = self
+                    .info_panes
+                    .entry(tab_id)
+                    .or_default()
+                    .begin(details, path);
+                self.start_info_work(tab_id, work, cx);
+            }
+            _ => self
+                .info_panes
+                .entry(tab_id)
+                .or_default()
+                .show_multiple(selected.len()),
+        }
+    }
+
+    fn start_info_work(&mut self, tab_id: TabId, work: InfoPaneWork, cx: &mut Context<Self>) {
+        let generation = work.generation();
+        let task = cx.background_spawn(async move { load_info_pane(work) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let model = state.info_panes.entry(tab_id).or_default();
+                let changed = match result {
+                    Ok(result) => model.complete(generation, result),
+                    Err(message) => model.fail(generation, message),
+                };
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn retry_info_pane(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let work = self.info_panes.entry(tab_id).or_default().retry();
+        if let Some(work) = work {
+            self.start_info_work(tab_id, work, cx);
+            cx.notify();
+        }
+    }
+
+    fn load_more_info_pane(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let Some(mut work) = self.info_panes.entry(tab_id).or_default().begin_load_more() else {
+            return;
+        };
+        let generation = work.generation();
+        let cancellation = work.cancellation().clone();
+        let task = cx.background_spawn(async move {
+            work.document_mut()
+                .load_more(cancellation)
+                .map_err(|error| error.to_string().into_boxed_str())?;
+            let (mime_type, document) = work.into_result_parts();
+            Ok::<_, Box<str>>(InfoPaneResult::Preview {
+                mime_type,
+                document,
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let model = state.info_panes.entry(tab_id).or_default();
+                let changed = match result {
+                    Ok(result) => model.complete(generation, result),
+                    Err(message) => model.fail(generation, message),
+                };
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2515,6 +2656,13 @@ impl MusheenApp {
         } else {
             colors.sidebar_border
         };
+        let tab_id = self.navigation.focused_tab().id();
+        let state = self
+            .info_panes
+            .get(&tab_id)
+            .map(InfoPaneModel::state)
+            .unwrap_or(&InfoPaneState::Empty);
+        let content = self.render_info_state(tab_id, state, cx);
         let pane = div()
             .id("info-pane")
             .test_support()
@@ -2526,12 +2674,49 @@ impl MusheenApp {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap_3()
             .p_4()
             .bg(colors.sidebar)
             .border_l_1()
             .border_color(boundary)
-            .text_color(colors.muted_foreground)
+            .child(content);
+        if wide {
+            pane.w(px(280.)).into_any_element()
+        } else {
+            pane.flex_grow(1.0).into_any_element()
+        }
+    }
+
+    fn render_info_state(
+        &self,
+        tab_id: TabId,
+        state: &InfoPaneState,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match state {
+            InfoPaneState::Empty => self.render_info_empty(cx),
+            InfoPaneState::Multiple { count } => self.render_info_multiple(*count, cx),
+            InfoPaneState::Loading { details, path } => self.render_info_loading(details, path, cx),
+            InfoPaneState::Error {
+                details,
+                path,
+                message,
+            } => self.render_info_error(tab_id, details, path, message, cx),
+            InfoPaneState::Ready {
+                details,
+                path,
+                mime_type,
+                preview,
+            } => self.render_info_ready(tab_id, details, path, mime_type, preview, cx),
+        }
+    }
+
+    fn render_info_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_3()
+            .text_color(cx.theme().colors.muted_foreground)
             .child(Icon::new(IconName::Info).large())
             .child(div().text_sm().child("No item selected"))
             .child(
@@ -2539,12 +2724,206 @@ impl MusheenApp {
                     .text_xs()
                     .text_center()
                     .child("Select an item to see its details."),
-            );
-        if wide {
-            pane.w(px(280.)).into_any_element()
-        } else {
-            pane.flex_grow(1.0).into_any_element()
+            )
+            .into_any_element()
+    }
+
+    fn render_info_multiple(&self, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_3()
+            .text_color(cx.theme().colors.muted_foreground)
+            .child(Icon::new(IconName::ListChecks).large())
+            .child(div().text_sm().child(format!("{count} items selected")))
+            .child(
+                div()
+                    .text_xs()
+                    .child("Properties are available for one item at a time."),
+            )
+            .into_any_element()
+    }
+
+    fn render_info_loading(
+        &self,
+        details: &InfoPaneDetails,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_sm().child(details.name().to_owned()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child("Loading preview…"),
+            )
+            .child(self.info_open_button("info-open-loading", path, cx))
+            .into_any_element()
+    }
+
+    fn render_info_error(
+        &self,
+        tab_id: TabId,
+        details: &InfoPaneDetails,
+        path: &Path,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_sm().child(details.name().to_owned()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(message.to_owned()),
+            )
+            .child(
+                Button::new("info-retry")
+                    .label("Retry preview")
+                    .small()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.retry_info_pane(tab_id, cx);
+                    })),
+            )
+            .child(self.info_open_button("info-open-error", path, cx))
+            .into_any_element()
+    }
+
+    fn render_info_ready(
+        &self,
+        tab_id: TabId,
+        details: &InfoPaneDetails,
+        path: &Path,
+        mime_type: &str,
+        preview: &PreviewPresentation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let can_load_more = matches!(
+            preview,
+            PreviewPresentation::Text(document) if document.has_more()
+        );
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_sm().child(details.name().to_owned()))
+            .child(self.render_info_preview(preview, cx))
+            .child(self.render_info_details(details, mime_type, cx))
+            .when(can_load_more, |pane| {
+                pane.child(
+                    Button::new("info-load-more")
+                        .label("Load 16 MiB more")
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.load_more_info_pane(tab_id, cx);
+                        })),
+                )
+            })
+            .child(self.info_open_button("info-open-ready", path, cx))
+            .into_any_element()
+    }
+
+    fn render_info_preview(
+        &self,
+        preview: &PreviewPresentation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match preview {
+            PreviewPresentation::Text(document) => {
+                let text = document
+                    .text()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(65_536)
+                    .collect::<String>();
+                div()
+                    .w_full()
+                    .max_h(px(260.))
+                    .overflow_hidden()
+                    .p_3()
+                    .rounded_md()
+                    .bg(cx.theme().colors.background)
+                    .text_xs()
+                    .child(text)
+                    .into_any_element()
+            }
+            PreviewPresentation::Binary { bytes_read } => div()
+                .w_full()
+                .p_3()
+                .rounded_md()
+                .bg(cx.theme().colors.background)
+                .text_xs()
+                .child(format!(
+                    "Binary or undecodable content ({})",
+                    format_size(*bytes_read as u64)
+                ))
+                .into_any_element(),
+            PreviewPresentation::Thumbnail(path) => img(ImageSource::from(path.clone()))
+                .size(px(220.))
+                .into_any_element(),
+            PreviewPresentation::DetailsOnly => div()
+                .text_xs()
+                .text_color(cx.theme().colors.muted_foreground)
+                .child("No inline preview is available.")
+                .into_any_element(),
         }
+    }
+
+    fn render_info_details(
+        &self,
+        details: &InfoPaneDetails,
+        mime_type: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_xs()
+            .text_color(cx.theme().colors.muted_foreground)
+            .child(format!("Type: {}", item_kind_label(details.kind())))
+            .child(format!("MIME: {mime_type}"))
+            .child(
+                details
+                    .size()
+                    .map(|size| format!("Size: {}", format_size(size)))
+                    .unwrap_or_else(|| "Size: Unknown".to_owned()),
+            )
+            .child(
+                details
+                    .modified_unix_seconds()
+                    .map(|value| format!("Modified: {value}"))
+                    .unwrap_or_else(|| "Modified: Unknown".to_owned()),
+            )
+            .into_any_element()
+    }
+
+    fn info_open_button(
+        &self,
+        id: &'static str,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open_path = path.to_path_buf();
+        Button::new(id)
+            .label("Open With…")
+            .small()
+            .on_click(cx.listener(move |_, _, _, _| {
+                let _ = open::that(&open_path);
+            }))
+            .into_any_element()
     }
 
     fn render_loading(&self, skeleton: gpui_kit::Hsla) -> AnyElement {
@@ -3286,6 +3665,68 @@ fn item_kind_label(kind: ItemKind) -> &'static str {
         ItemKind::SymbolicLink => "Link",
         ItemKind::Other => "Other",
     }
+}
+
+fn load_info_pane(work: InfoPaneWork) -> Result<InfoPaneResult, Box<str>> {
+    if work.cancellation().is_cancelled() {
+        return Err("Preview cancelled".into());
+    }
+    let detected = MimeDetector::default()
+        .detect(work.path())
+        .map_err(|error| error.to_string().into_boxed_str())?;
+    let mime_type: Box<str> = detected.mime_type().into();
+    if work.details().kind() != ItemKind::RegularFile {
+        return Ok(InfoPaneResult::Details { mime_type });
+    }
+    if mime_type.starts_with("image/") {
+        let cache =
+            ThumbnailCache::for_user().map_err(|error| error.to_string().into_boxed_str())?;
+        let request = ThumbnailRequest::new(
+            work.path(),
+            work.details()
+                .modified_unix_seconds()
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0),
+            ThumbnailSize::Large,
+        )
+        .map_err(|error| error.to_string().into_boxed_str())?;
+        let service = ThumbnailService::with_worker(
+            cache,
+            thumbnail_worker_path(),
+            ThumbnailLimits::default(),
+        );
+        return match service
+            .resolve(
+                &request,
+                ThumbnailMode::Generate,
+                work.cancellation().clone(),
+            )
+            .map_err(|error| error.to_string().into_boxed_str())?
+        {
+            ThumbnailLookup::Hit(path) => Ok(InfoPaneResult::Thumbnail { mime_type, path }),
+            ThumbnailLookup::Failed { reason } => Err(reason),
+            ThumbnailLookup::Miss => Err("Thumbnail worker produced no preview".into()),
+        };
+    }
+    let document = PreviewDocument::open(work.path(), work.cancellation().clone())
+        .map_err(|error| error.to_string().into_boxed_str())?;
+    Ok(InfoPaneResult::Preview {
+        mime_type,
+        document,
+    })
+}
+
+fn thumbnail_worker_path() -> PathBuf {
+    if let Some(path) =
+        std::env::var_os("MUSHEEN_THUMBNAIL_WORKER").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(path);
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_default()
+        .join("musheen-thumbnail-worker")
 }
 
 fn column_label(column: ColumnKey) -> &'static str {
