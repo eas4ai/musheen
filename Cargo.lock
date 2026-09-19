@@ -4445,8 +4445,11 @@ dependencies = [
 name = "musheen-ops"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "musheen-core",
  "reflink-copy",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

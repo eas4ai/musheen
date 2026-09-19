@@ -2,6 +2,7 @@
 
 mod checksum;
 mod mime;
+mod operation_journal;
 mod permissions;
 mod preview;
 mod properties;
@@ -11,6 +12,7 @@ mod thumbnail;
 
 pub use checksum::*;
 pub use mime::*;
+pub use operation_journal::*;
 pub use permissions::*;
 pub use preview::*;
 pub use properties::*;
