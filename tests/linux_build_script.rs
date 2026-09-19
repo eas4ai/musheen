@@ -20,9 +20,24 @@ fn linux_build_uses_the_dockerfile_from_its_archived_context() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let scratch = scratch_directory();
     let fake_bin = scratch.join("bin");
+    let repository = scratch.join("repository");
     let arguments = scratch.join("docker-arguments");
     let context = scratch.join("docker-context.tar");
     fs::create_dir_all(&fake_bin).expect("fake executable directory should be created");
+    fs::create_dir_all(repository.join("scripts"))
+        .expect("fixture scripts directory should be created");
+    fs::create_dir_all(repository.join("ci")).expect("fixture CI directory should be created");
+
+    fs::copy(
+        root.join("scripts/check-linux-build.sh"),
+        repository.join("scripts/check-linux-build.sh"),
+    )
+    .expect("Linux build script should be copied into the fixture");
+    fs::copy(
+        root.join("ci/linux-build.Dockerfile"),
+        repository.join("ci/linux-build.Dockerfile"),
+    )
+    .expect("Dockerfile should be copied into the fixture");
 
     let docker = fake_bin.join("docker");
     fs::write(
@@ -41,8 +56,46 @@ fn linux_build_uses_the_dockerfile_from_its_archived_context() {
         fake_bin.display(),
         std::env::var("PATH").expect("PATH should be set")
     );
-    let output = Command::new(root.join("scripts/check-linux-build.sh"))
-        .current_dir(&root)
+    let initialized = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository)
+        .status()
+        .expect("fixture Git repository should initialize");
+    assert!(
+        initialized.success(),
+        "fixture Git repository should initialize"
+    );
+    let committed = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Musheen Tests",
+            "-c",
+            "user.email=tests@musheen.invalid",
+            "add",
+            ".",
+        ])
+        .current_dir(&repository)
+        .status()
+        .expect("fixture files should be staged");
+    assert!(committed.success(), "fixture files should be staged");
+    let committed = Command::new("git")
+        .args([
+            "-c",
+            "user.name=Musheen Tests",
+            "-c",
+            "user.email=tests@musheen.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "test fixture",
+        ])
+        .current_dir(&repository)
+        .status()
+        .expect("fixture commit should be created");
+    assert!(committed.success(), "fixture commit should be created");
+
+    let output = Command::new(repository.join("scripts/check-linux-build.sh"))
+        .current_dir(&repository)
         .env("PATH", path)
         .env("MUSHEEN_DOCKER_ARGS", &arguments)
         .env("MUSHEEN_DOCKER_CONTEXT", &context)
