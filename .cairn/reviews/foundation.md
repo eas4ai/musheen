@@ -11,7 +11,7 @@ findings:
   - resolved: DEP-015 formerly ran only a local locked build; the repository now has CI that runs `cargo build --locked`, and the mechanism verifies that command remains in the workflow.
   - resolved: The commitment formerly promised an out-of-scope advisory review; its exit evidence now names only the agreed license review.
   - resolved: The foundation exit evidence required the dependency set to pass advisory review without a mechanism, CI step, or passing audit; the commitment now limits its exit evidence to the agreed license review (independent 12d3043 1)
-  - open: The DEP-001 source check does not enforce its direct-theme-file-read falsifier; Rust code that directly reads `/etc/gtk-3.0/settings.ini` still passes because the script checks only six fixed strings (independent 12d3043 2)
+  - resolved: The DEP-001 source check formerly allowed a direct read of `/etc/gtk-3.0/settings.ini`; it now rejects GTK 3 and GTK 4 settings-file paths (independent 12d3043 2)
   - open: The DEP-007 source check does not enforce its mount-table-parser falsifier; a parser for `/proc/self/mountinfo` still passes because the script checks only `/proc/mounts` and `/proc/self/mounts` (independent 12d3043 3)
   - open: The DEP-008 mechanism cannot establish that no second crate is introduced in its six roles; it omits Cargo.lock, uses a short fixed competitor list, and passes with a direct `globwalk` dependency while the lockfile already contains transitive alternate provider versions (independent 12d3043 4)
   - open: The DEP-015 evidence does not prove that CI runs the locked build; its unscoped text check still passes when the workflow step is disabled, and no CI attestation exists for the reviewed commit (independent 12d3043 5)
@@ -36,3 +36,7 @@ passed again after those temporary probes were removed.
 For the third resolution, DEP-015 passed with the committed workflow, failed
 when its command was temporarily changed to an unlocked build, and passed again
 after restoring `cargo build --locked`.
+
+For independent finding 2, DEP-001 passed on the clean tree and rejected a
+temporary, compiling direct read of `/etc/gtk-3.0/settings.ini`. It passed again
+after the probe was removed.

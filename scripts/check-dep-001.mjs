@@ -79,6 +79,8 @@ const forbiddenAppearanceReads = [
   ["org.freedesktop.portal.Settings", "direct portal Settings access"],
   ["org.freedesktop.appearance", "direct appearance-portal access"],
   ["gtk-theme-name", "direct GTK theme-file access"],
+  ["gtk-3.0/settings.ini", "direct GTK 3 settings-file access"],
+  ["gtk-4.0/settings.ini", "direct GTK 4 settings-file access"],
   ["kdeglobals", "direct KDE theme-file access"],
   ["GTK_THEME", "direct GTK_THEME environment access"],
   ["gsettings", "direct gsettings theme access"],
