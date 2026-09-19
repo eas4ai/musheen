@@ -3365,6 +3365,7 @@ dependencies = [
 name = "musheen-core"
 version = "0.1.0"
 dependencies = [
+ "futures-lite",
  "trybuild",
 ]
 
@@ -3405,6 +3406,7 @@ dependencies = [
 name = "musheen-test-support"
 version = "0.1.0"
 dependencies = [
+ "futures-lite",
  "musheen-core",
 ]
 

@@ -7,6 +7,7 @@ pub enum CoreError {
     InvalidProviderId,
     InvalidItemId,
     InvalidProviderKey,
+    InvalidContinuation,
     InvalidCapabilityReason,
     InvalidResourceLimit {
         field: &'static str,
@@ -27,6 +28,8 @@ impl fmt::Display for CoreError {
             Self::InvalidProviderKey => {
                 formatter.write_str("provider path keys must contain between 1 and 4,096 bytes")
             }
+            Self::InvalidContinuation => formatter
+                .write_str("provider continuations must contain between 1 and 4,096 bytes"),
             Self::InvalidCapabilityReason => {
                 formatter.write_str("capability reasons must contain visible text")
             }
@@ -43,3 +46,16 @@ impl fmt::Display for CoreError {
 }
 
 impl Error for CoreError {}
+
+pub(crate) fn validate_bounded_bytes(
+    bytes: impl Into<Box<[u8]>>,
+    maximum: usize,
+    error: CoreError,
+) -> Result<Box<[u8]>, CoreError> {
+    let bytes = bytes.into();
+    if bytes.is_empty() || bytes.len() > maximum {
+        Err(error)
+    } else {
+        Ok(bytes)
+    }
+}

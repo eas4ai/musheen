@@ -9,5 +9,8 @@ publish.workspace = true
 [dependencies]
 musheen-core = { path = "../musheen-core" }
 
+[dev-dependencies]
+futures-lite.workspace = true
+
 [lints]
 workspace = true

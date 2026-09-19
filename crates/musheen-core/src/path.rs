@@ -1,4 +1,5 @@
 use crate::CoreError;
+use crate::error::validate_bounded_bytes;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -60,11 +61,11 @@ impl StorePath {
         provider: ProviderId,
         key: impl Into<Box<[u8]>>,
     ) -> Result<Self, CoreError> {
-        let key = key.into();
-        if key.is_empty() || key.len() > Self::MAX_PROVIDER_KEY_BYTES {
-            return Err(CoreError::InvalidProviderKey);
-        }
-
+        let key = validate_bounded_bytes(
+            key,
+            Self::MAX_PROVIDER_KEY_BYTES,
+            CoreError::InvalidProviderKey,
+        )?;
         Ok(Self(StorePathInner::ProviderKey { provider, key }))
     }
 

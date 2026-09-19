@@ -30,6 +30,7 @@ unsafe_code = "forbid"
 [workspace.dependencies]
 camino = "1"
 freedesktop = "0.0"
+futures-lite = "2"
 native-theme = "0.5"
 native-theme-gpui = { version = "0.5", default-features = false, features = ["svg-rasterize"] }
 nix = { version = "0.31", features = ["fs"] }

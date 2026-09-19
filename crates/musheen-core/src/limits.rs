@@ -38,6 +38,8 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
+    pub const MAX_DIRECTORY_PAGE_ITEMS: usize = ResourceLimitConfig::MAX_DIRECTORY_PAGE_ITEMS;
+
     #[must_use]
     pub fn snapshot(&self) -> Self {
         self.clone()
