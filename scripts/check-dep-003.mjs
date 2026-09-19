@@ -93,14 +93,15 @@ for (const name of competingPackages) {
   }
 }
 
-for (const path of rustPaths) {
-  const source = readFileSync(path, "utf8");
-  const compactSource = source.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
-  const hasDesktopEntryContent = compactSource.includes("desktopentry");
-  const parsesKeyValueLines = /\.lines\s*\(|split_once\s*\(\s*['"]=['"]/.test(source);
-  if (hasDesktopEntryContent && parsesKeyValueLines) {
-    failures.push(`${path} contains a hand-written Desktop Entry parser`);
-  }
+const rustSources = rustPaths.map((path) => readFileSync(path, "utf8"));
+const compactTreeSource = rustSources
+  .join("\n")
+  .replace(/[^A-Za-z0-9]/g, "")
+  .toLowerCase();
+const parsesKeyValueLines = rustSources.some((source) =>
+  /\.lines\s*\(|split_once\s*\(\s*['"]=['"]/.test(source));
+if (compactTreeSource.includes("desktopentry") && parsesKeyValueLines) {
+  failures.push("Rust source tree contains a hand-written Desktop Entry parser");
 }
 
 if (failures.length > 0) {
