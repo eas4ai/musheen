@@ -9,7 +9,7 @@ findings:
   - resolved: DEP-001 formerly allowed an aliased dark-light dependency; the mechanism now rejects known competing appearance providers by dependency key, package alias, and resolved lockfile package.
   - resolved: DEP-007 and DEP-008 formerly inspected only dependency keys; both mechanisms now reject competing packages declared under aliases.
   - resolved: DEP-015 formerly ran only a local locked build; the repository now has CI that runs `cargo build --locked`, and the mechanism verifies that command remains in the workflow.
-  - open: The commitment promises an advisory review even though its included requirements and mechanisms cover licenses only; that exit statement cannot be proved by this commitment.
+  - resolved: The commitment formerly promised an out-of-scope advisory review; its exit evidence now names only the agreed license review.
 
 # Foundation completion review
 

@@ -28,7 +28,7 @@ not part of this commitment until the developer agrees to them.
   competing crates for the same roles.
 - Source checks find no direct appearance, mount-table, or raw-libc bypass of
   the selected abstraction boundaries.
-- The committed dependency set passes license and advisory review.
+- The committed dependency set passes license review.
 
 ## Excluded
 
