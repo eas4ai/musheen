@@ -1,40 +1,40 @@
 commitment: foundation
-commit: d922070e709c00f5688947ec554a34113e840627
+commit: 38c61f0d880d88b771c099c7a6f92a447ff2b496
 examined:
-  - The foundation commitment and DEP-001, DEP-003, DEP-007, DEP-008, DEP-014, and DEP-015 at the named commit.
-  - The a42909a^..d922070e709c00f5688947ec554a34113e840627 commit list and changed-file range.
-  - Cargo.toml, Cargo.lock, deny.toml, the vendored native-theme-gpui manifest and source patch, and the recorded compatibility decision.
-  - All six mechanism declarations and scripts, their captured receipts, input records, stdout, and stderr.
-  - The locked dependency graph, including duplicate and inverse trees for traversal, matching, and notification providers.
-  - The GitHub Actions locked-build job and the DEP-015 evidence recorded by d922070e709c00f5688947ec554a34113e840627.
-  - Baseline executions of every mechanism in an isolated archive of the named commit.
-  - Isolated compiled falsifiers and matched failure controls for dependency declarations, provider boundaries, license rejection, and CI activation.
+  - Foundation commitment and DEP-001, DEP-003, DEP-007, DEP-008, DEP-014, and DEP-015 requirement text
+  - Full 94-commit range from a42909a through 38c61f0
+  - Root and vendored manifests, the complete locked dependency graph, deny policy, and Linux Dockerfile
+  - All six mechanism declarations and check scripts
+  - Native-theme connector decision and the vendored 0.5.8 tree compared with the cached crates.io source
+  - DEP-015 escalation, developer answer, evidence ledger, failing baselines, current receipts, and committed Docker output
+  - Isolated exact-tree mechanism challenges and local locked checks; no Docker container was launched
 findings:
-  - open: DEP-008 and the foundation exit evidence do not authorize the checker's transitive-provider exception. Cargo.lock contains globwalk 0.8.1, globset 0.4.20, ignore 0.4.33, and notify 7.0.0 alongside the selected wax, walkdir, and notify 8 providers, while check-dep-008.mjs explicitly ignores transitive competitors. Either the contract needs this narrower app-owned-provider rule or the committed lockfile does not meet the stated no-competing-crates evidence.
-  - open: DEP-001 can false-pass a compiled direct appearance bypass. Replacing main with Command::new(concat!("g", "settings")) reading org.gnome.desktop.interface color-scheme passed DEP-001 and the locked build because the mechanism searches only contiguous forbidden spellings.
-  - open: DEP-003 can false-pass a compiled second .desktop parser. A hand-written parser over Desktop Entry key/value lines passed DEP-003 and the locked build because the mechanism examines manifests and Cargo.lock but no source boundary.
-  - open: DEP-007 can false-pass with none of its four required crates declared as dependencies. Moving nix, proc-mounts, xattr, and reflink-copy into package.metadata, regenerating Cargo.lock, and building with --locked passed both DEP-007 and DEP-015 because check-dep-007.mjs matches dependency-like text in any TOML section and does not examine Cargo.lock.
-  - open: DEP-007 can false-pass compiled raw-libc and mount-table bypasses. `use nix::libc as ffi` followed by ffi::statvfs and read_to_string(concat!("/proc/self/", "mountinfo")) passed DEP-007 and the locked build because the mechanism depends on exact source spellings.
-  - open: DEP-008 can false-pass a compiled second traversal provider. Adding ignore 0.4 as a direct dependency and calling ignore::WalkBuilder passed DEP-008 and the locked build because the competitor list is a finite package-name blacklist.
-  - open: DEP-008 can false-pass lossless local paths represented by Camino. `use camino as utf8` followed by utf8::Utf8PathBuf in src/main.rs passed DEP-008 and the locked build because the source check recognizes only the unaliased camino::Utf8Path spelling.
-  - open: DEP-015 can false-pass a workflow that never runs for branch pushes or pull requests. Adding branches-ignore: ["**"] under both declared triggers passed DEP-015 because the mechanism checks only that the trigger keys exist.
-  - open: The DEP-015 receipt does not demonstrate the requirement's CI execution. Its command runs cargo build --locked locally and parses the workflow text; the repository records no GitHub Actions run identity, status, or log for the named candidate.
+  - open: DEP-001 can pass a direct GTK settings-file read when the path is assembled from variables, so its mechanism does not prove the requirement's direct-read falsifier is absent.
+  - open: DEP-003 can pass a hand-written Desktop Entry parser whose names do not contain the exact case-sensitive text `DesktopEntry`, so its mechanism does not prove that a second parser is absent.
+  - open: DEP-007 can pass a hand-written mount-table parser when `/proc/self` and `mountinfo` are joined at runtime, so its mechanism does not prove that a second mount-table parser is absent.
+  - open: DEP-008 can pass a local store path represented by a Camino type when an allowed config module aliases the type and store code consumes the alias, so its mechanism does not prove the Camino boundary.
+  - open: DEP-015 archives only Cargo.toml, Cargo.lock, src, the vendored connector, and the Dockerfile; it omits tracked build inputs such as a root build.rs, so the container can pass while the exact clean checkout fails to build.
 
-# Independent adversarial review
+# Independent review
 
-I extracted the named tree into a temporary directory and initialized an
-isolated Git index so every script saw the exact tracked files without using
-the developer's dirty working tree. I did not use the prior independent report
-as review input.
+The committed manifests resolve the required direct dependency families at the
+agreed versions. The lockfile has only the root package and the patched
+native-theme-gpui crate as path packages. The vendored connector changes the
+two obsolete `tiles` assignments in its Rust source. `cargo deny check
+licenses` passed with the committed policy. The final DEP-015 receipt records a
+successful Rust 1.95 Linux Docker build of candidate `bf3866f0`; commit
+`38c61f0` adds that receipt and does not change the build inputs.
 
-All six mechanisms passed on the unmodified candidate. The locked build and
-the cargo-deny license audit also passed. The vendored connector's Rust source
-differs from the registry 0.5.8 source only at the two `tiles` assignments named
-by the decision. The vendored package also trims examples, docs, proposals, and
-the original manifest, and adds license files.
+The isolated challenges used a git snapshot of the exact reviewed tree. A Rust
+file that built `$HOME/gtk-3.0/settings.ini` from separate directory and file
+variables passed DEP-001. A parser based on `lines` and `split_once('=')` in a
+lowercase `parse_desktop_entry` function passed DEP-003. A parser that joined
+`/proc/self` and `mountinfo` with `format!` passed DEP-007.
 
-Matched controls failed as expected: literal `gsettings`, direct
-`nix::libc::`, freedesktop-desktop-entry, jwalk, an AGPL-3.0-only local
-dependency, and an explicit `if: false` on the CI job were all rejected. The
-open items above are therefore false-pass gaps in otherwise executable checks,
-not failures to run the tooling.
+For DEP-008, `src/config.rs` aliased `camino::Utf8PathBuf` and `src/store.rs`
+used that alias for a local store path. Both DEP-008 and `cargo check --locked
+--offline` passed. For DEP-015, a tracked root `build.rs` containing a compile
+error made the full checkout fail with exit 101. The mechanism's own archive
+contained no `build.rs`, and the extracted archive passed `cargo check
+--locked --offline`. This demonstrates the false pass without consuming a
+Docker container.
