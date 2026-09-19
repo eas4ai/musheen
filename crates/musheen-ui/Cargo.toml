@@ -7,11 +7,17 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+gpui-kit.workspace = true
 musheen-core = { path = "../musheen-core" }
 musheen-desktop = { path = "../musheen-desktop" }
+musheen-local = { path = "../musheen-local" }
 musheen-ops = { path = "../musheen-ops" }
 native-theme.workspace = true
 native-theme-gpui.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+gpui-kit = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
