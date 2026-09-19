@@ -29,7 +29,7 @@ findings:
   - resolved: DEP-003 formerly matched `DesktopEntry` case-sensitively; it now normalizes source case and separators before pairing Desktop Entry identifiers with line/key-value parsing (independent 38c61f0 2)
   - resolved: DEP-007 formerly required the mountinfo path components to be contiguous; it now rejects source containing both `/proc/self` and `mountinfo` components even when runtime code joins them (independent 38c61f0 3)
   - resolved: DEP-008 formerly allowed configuration modules to export Camino under another name; it now rejects Camino type aliases and renamed imports before applying the config/URI path allowance (independent 38c61f0 4)
-  - open: DEP-015 omits tracked build inputs such as root `build.rs` from its archive, so its container can pass while the exact clean checkout fails (independent 38c61f0 5)
+  - resolved: DEP-015 formerly selected archive paths manually and omitted root `build.rs`; it now archives the full exact commit and copies that complete tracked tree into the Linux build container (independent 38c61f0 5)
 
 # Foundation completion review
 
@@ -110,6 +110,10 @@ the probe was removed.
 
 For independent finding 38c61f0 4, the clean DEP-008 check passed and its new
 alias guard matched the reviewer's `pub type ConfigPath = Utf8PathBuf` escape.
+
+For independent finding 38c61f0 5, the checker now passes an unrestricted
+`git archive` of the candidate to Docker, and the Dockerfile copies the entire
+archive before running the locked build.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

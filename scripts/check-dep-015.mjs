@@ -17,17 +17,7 @@ const candidate = spawnSync("git", ["rev-parse", "HEAD"], {
 }).stdout.trim();
 const archive = spawnSync(
   "git",
-  [
-    "archive",
-    "--format=tar",
-    candidate,
-    "--",
-    "Cargo.toml",
-    "Cargo.lock",
-    "src",
-    "vendor/native-theme-gpui",
-    "ci/dep-015.Dockerfile",
-  ],
+  ["archive", "--format=tar", candidate],
   { maxBuffer: 50 * 1024 * 1024 },
 );
 if (archive.error) failures.push(`the committed candidate could not be archived: ${archive.error.message}`);
