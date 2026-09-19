@@ -81,6 +81,9 @@ for (const name of competingPackages) {
   for (const { path, text } of manifests) {
     if (alias.test(text)) failures.push(`${path} aliases competing package ${name}`);
   }
+  if (new RegExp(`\\[\\[package\\]\\]\\nname = "${name}"\\n`).test(lock)) {
+    failures.push(`Cargo.lock contains competing package ${name}`);
+  }
 }
 
 if (failures.length > 0) {
