@@ -34,7 +34,7 @@ findings:
   - resolved: DEP-003 formerly paired Desktop Entry markers and parsing operations per file; it now aggregates both signals across the complete Rust source tree (independent 602a385 2)
   - resolved: DEP-007 formerly allowed a hand-written mount-table parser to read `/etc/mtab`; the mechanism now rejects that legacy mount-table path (independent 602a385 3)
   - resolved: DEP-008 formerly allowed configuration and URI modules to export Camino inside wrapper structs or enums; the mechanism now rejects those wrapper types before applying the boundary allowance (independent 602a385 4)
-  - open: DEP-015 omits Cargo configuration files such as `.cargo/config.toml` from its declared input footprint, allowing stale container evidence (independent 602a385 5)
+  - resolved: DEP-015 formerly omitted repository Cargo configuration and Rust toolchain files from its declared inputs; the mechanism now invalidates evidence when either build-control input changes (independent 602a385 5)
 
 # Foundation completion review
 
@@ -135,6 +135,10 @@ For independent finding 602a385 4, DEP-008 passed on the clean tree and rejected
 a temporary `ConfigPath(Utf8PathBuf)` wrapper in an existing configuration
 module. It passed again after the probe was removed. The same guard covers named
 structs and enums.
+
+For independent finding 602a385 5, DEP-015 now declares every tracked `.cargo`
+file and `rust-toolchain` variant as an input, so repository build configuration
+changes make its Linux container evidence stale.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

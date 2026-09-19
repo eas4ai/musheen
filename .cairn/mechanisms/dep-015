@@ -2,6 +2,8 @@ command: node scripts/check-dep-015.mjs
 inputs:
   - :(glob)**/Cargo.toml
   - Cargo.lock
+  - :(glob)**/.cargo/**
+  - :(glob)**/rust-toolchain*
   - :(glob)**/*.rs
   - ci/dep-015.Dockerfile
   - vendor/native-theme-gpui
