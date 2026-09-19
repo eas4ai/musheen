@@ -1,5 +1,5 @@
 commitment: foundation
-commit: ccee1ff7d018db2a28d33fc2c98136577a66585a
+commit: 38c61f0d880d88b771c099c7a6f92a447ff2b496
 examined:
   - the six agreed dependency requirements and their falsifiers
   - every dependency mechanism, declaration, and latest evidence receipt
@@ -85,6 +85,11 @@ passed again after the probe was removed.
 For independent finding d922070 8, DEP-015 passed with unfiltered triggers,
 failed when both triggers temporarily ignored every branch, and passed again
 after the filters were removed.
+
+For independent finding d922070 9, the developer declined GitHub CI during
+development and authorized one Linux Docker container at a time. DEP-015
+archived the exact commit and completed `cargo build --locked` in that clean
+container with one Cargo job; Cairn recorded the image build log and pass.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
