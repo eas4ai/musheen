@@ -2,6 +2,7 @@ command: node scripts/check-dep-003.mjs
 inputs:
   - :(glob)**/Cargo.toml
   - Cargo.lock
+  - :(glob)**/*.rs
   - scripts/check-dep-003.mjs
 requirements:
   - DEP-003

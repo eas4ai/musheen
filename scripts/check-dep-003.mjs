@@ -14,6 +14,13 @@ const manifests = manifestPaths.map((path) => ({
   path,
   text: readFileSync(path, "utf8"),
 }));
+const rustPaths = execFileSync(
+  "git",
+  ["ls-files", "-z", "--", ":(glob)**/*.rs"],
+  { encoding: "utf8" },
+)
+  .split("\0")
+  .filter(Boolean);
 const failures = [];
 
 const dependency = (name) => {
@@ -83,6 +90,16 @@ for (const name of competingPackages) {
   }
   if (new RegExp(`\\[\\[package\\]\\]\\nname = "${name}"\\n`).test(lock)) {
     failures.push(`Cargo.lock contains competing package ${name}`);
+  }
+}
+
+for (const path of rustPaths) {
+  const source = readFileSync(path, "utf8");
+  const compactSource = source.replace(/[^A-Za-z0-9_.-]/g, "");
+  const hasDesktopEntryContent = compactSource.includes("DesktopEntry");
+  const parsesKeyValueLines = /\.lines\s*\(|split_once\s*\(\s*['"]=['"]/.test(source);
+  if (hasDesktopEntryContent && parsesKeyValueLines) {
+    failures.push(`${path} contains a hand-written Desktop Entry parser`);
   }
 }
 
