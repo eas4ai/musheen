@@ -61,6 +61,20 @@ for (const name of ["native-theme", "native-theme-gpui"]) {
   }
 }
 
+for (const name of ["dark-light", "system-theme", "system_theme"]) {
+  const direct = dependencyLine(name);
+  const alias = new RegExp(`\\bpackage\\s*=\\s*"${name}"`);
+  for (const path of manifests) {
+    const manifest = readFileSync(path, "utf8");
+    if (direct.test(manifest) || alias.test(manifest)) {
+      failures.push(`${path} declares competing appearance provider ${name}`);
+    }
+  }
+  if (new RegExp(`\\[\\[package\\]\\]\\nname = "${name}"\\n`).test(lock)) {
+    failures.push(`Cargo.lock contains competing appearance provider ${name}`);
+  }
+}
+
 const forbiddenAppearanceReads = [
   ["org.freedesktop.portal.Settings", "direct portal Settings access"],
   ["org.freedesktop.appearance", "direct appearance-portal access"],
