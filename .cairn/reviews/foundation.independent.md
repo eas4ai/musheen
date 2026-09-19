@@ -1,47 +1,49 @@
 commitment: foundation
-commit: 3f6a354
+commit: d4c184eef253362fccb22af98de0bc87c7a32d96
 examined:
-  - the exact candidate at 3f6a354 and commit range becceb5..3f6a354 in an isolated worktree
-  - the foundation commitment, all six agreed requirements, their falsifiers, and the connector decision record
-  - Cargo.toml, Cargo.lock, deny.toml, the vendored connector, and the locked-build Dockerfile
-  - all six mechanism declarations and check scripts
-  - the latest evidence receipts, input inventories, captured output, and the primary foundation review
-  - offline clean runs and compiling falsifier probes for the non-Docker mechanisms
+  - the exact candidate at d4c184e, the full commitment range becceb5..d4c184e, and every remediation commit in 3f6a354..d4c184e
+  - the foundation commitment, the six agreed dependency requirements, their falsifiers, and the connector decision record
+  - Cargo.toml, Cargo.lock, deny.toml, the vendored connector metadata and licenses, and the locked-build Dockerfile
+  - all six mechanism declarations and check scripts, the primary review, and the latest receipt, input inventory, output, and error capture for each requirement
+  - clean offline runs of DEP-001, DEP-003, DEP-007, DEP-008, DEP-014, and cargo check --locked --offline
+  - compiling offline falsifier probes against the source-boundary mechanisms; Docker was not run
 findings:
-  - open: DEP-001 checks complete portal identifiers within one Rust file. A compiling probe split `org.freedesktop.portal.Settings.Read` and `org.freedesktop.appearance` across modules, invoked `gdbus` directly, and still passed DEP-001, so a direct portal settings read can escape the mechanism.
-  - open: DEP-003 recognizes a hand-written Desktop Entry parser only when Rust source uses `.lines()` or `split_once('=')`. A compiling `[Desktop Entry]` parser using `split_terminator` and `splitn` still passed DEP-003.
-  - open: DEP-003 has no source guard for a hand-written icon resolver. A compiling hicolor lookup built with `std::path` still passed DEP-003, so its icon-resolver check detects only the finite list of competing packages.
-  - open: DEP-007 detects `libc::` spellings but not direct C bindings. A compiling `extern "C"` call to `statfs` still passed DEP-007 even though nix supplies that call.
-  - open: DEP-007 misses mount-table paths assembled with ordinary path joins except for its special `mountinfo` case. A compiling parser for `Path::new("/proc").join("self").join("mounts")` still passed DEP-007.
-  - open: DEP-008 treats any unwrapped Camino type use in a `config` or `uri` path as valid without checking the data's role or UTF-8 validation. A compiling `config.rs` probe converted a local store `Path` through `to_string_lossy()` into `Utf8PathBuf` and still passed DEP-008.
+  - resolved: DEP-001 now aggregates portal service, method, and appearance fragments across tracked Rust modules, so the prior split portal probe is rejected.
+  - resolved: DEP-003 now recognizes split and split_terminator line traversal plus split and splitn key/value parsing, so the prior alternate Desktop Entry parser is rejected.
+  - resolved: DEP-003 now rejects a hicolor resolver combined with direct filesystem path construction, so the prior hicolor path probe is rejected.
+  - resolved: DEP-007 now rejects raw C declarations for statfs, fstatfs, statvfs, and fstatvfs, so the prior raw statfs probe is rejected.
+  - resolved: DEP-007 now rejects proc mount-table paths built with ordinary path joins, so the prior joined /proc/self/mounts probe is rejected.
+  - resolved: DEP-008 now rejects to_string_lossy in a source file that uses Camino types, so the prior same-file lossy conversion is rejected.
+  - open: DEP-001 checks the kdeglobals spelling per file. A compiling probe split `kde` and `globals` across two tracked modules, joined the result under `/etc/xdg`, read the theme file directly, and still passed DEP-001.
+  - open: DEP-003 recognizes only a small set of line and key/value operations. A compiling `[Desktop Entry]` parser used `.lines()` with `find('=')` and slicing, and still passed DEP-003.
+  - open: DEP-003 recognizes a hand-written icon resolver only when the source also names hicolor. A compiling resolver walked `/usr/share/icons/Adwaita` with `std::fs::read_dir` and still passed DEP-003.
+  - open: DEP-007 lists only the global and self mount-table paths. A compiling parser read `/proc/1/mountinfo` directly and still passed DEP-007.
+  - open: DEP-007 rejects raw C bindings only for the statfs and statvfs families. A compiling probe called raw `stat`, which nix provides, and still passed DEP-007.
+  - open: DEP-008 treats a Camino type in a config module as valid unless that same file calls to_string_lossy. A compiling config probe converted a local `Path` through `path.display().to_string()` into `Utf8PathBuf` and still passed DEP-008.
 
 # Independent completion review
 
 The candidate declares the required direct dependency families. Offline Cargo
-metadata and the lockfile resolve the expected lines: native-theme and its GPUI
-connector at 0.5.8, the freedesktop family at 0.0.3, nix at 0.31.3,
-proc-mounts at 0.3.0, walkdir at 2.5.0, rustix at 1.1.5, open at 5.4.4,
-camino at 1.2.6, wax at 0.7.0, notify at 8.2.0, xattr at 1.6.1, and
-reflink-copy at 0.1.30. The vendored connector's runtime Rust source differs
-from the cached 0.5.8 source only in the two recorded `tiles` assignments.
-The omitted docs, examples, and matching example manifest entry do not enter
-the runtime build.
+metadata and the lockfile resolve native-theme and native-theme-gpui 0.5.8,
+freedesktop 0.0.3, nix 0.31.3, proc-mounts 0.3.0, walkdir 2.5.0,
+rustix 1.1.5, open 5.4.4, camino 1.2.6, wax 0.7.0, notify 8.2.0,
+xattr 1.6.1, and reflink-copy 0.1.30.
 
 Clean offline runs of DEP-001, DEP-003, DEP-007, DEP-008, and DEP-014 passed.
-Each source-boundary finding above was then demonstrated with a tracked probe
-that passed `cargo check --locked --offline` and also passed the requirement's
-checker. The probes were removed, and all five clean checks passed again.
+`cargo check --locked --offline` also passed. Each open source-boundary finding
+above was demonstrated with a probe that passed that requirement's checker and
+`cargo check --locked --offline`. The probes were removed, and all five clean
+checks plus the locked offline Cargo check passed again.
 
-DEP-014's committed receipt covers the current manifests, lockfile, license
-policy, vendored manifest, provenance, and license texts. A fresh offline
-`cargo deny check licenses` through its mechanism also passed.
+DEP-014's current receipt covers the unchanged manifests, lockfile, license
+policy, vendored manifest, provenance, and license texts. A fresh offline run
+of its cargo-deny mechanism passed.
 
 Per developer direction, Docker was not run during this review. The latest
 DEP-015 receipt records a successful Linux Docker build of archived commit
-166ba707 with `cargo build --locked`. Commit 3f6a354 adds only that receipt and
-its captured output after 166ba707, so the declared build inputs remain the
-ones that were built. The capture shows the expected locked direct versions
-and a successful musheen build.
+677ca6e with `cargo build --locked`. Commit d4c184e adds only that receipt and
+its captured files, so the declared build inputs match the built parent. The
+recorded output and error digests match the committed captures.
 
-The six open mechanism gaps above prevent the evidence from excluding the
-requirements' stated falsifiers. The commitment is not ready for Done.
+The six open mechanism gaps let the stated falsifiers pass as compiling code.
+The commitment is not ready for Done.
