@@ -65,7 +65,11 @@ for (const name of ["libc", "libmount", "mountpoints", "procfs", "sys-mount"]) {
 for (const path of tracked(":(glob)**/*.rs")) {
   const source = readFileSync(path, "utf8");
   if (/\blibc::/.test(source)) failures.push(`${path} calls libc directly`);
-  if (source.includes('"/proc/mounts"') || source.includes('"/proc/self/mounts"')) {
+  if (
+    source.includes('"/proc/mounts"')
+    || source.includes('"/proc/self/mounts"')
+    || source.includes('"/proc/self/mountinfo"')
+  ) {
     failures.push(`${path} parses the mount table directly`);
   }
 }

@@ -12,7 +12,7 @@ findings:
   - resolved: The commitment formerly promised an out-of-scope advisory review; its exit evidence now names only the agreed license review.
   - resolved: The foundation exit evidence required the dependency set to pass advisory review without a mechanism, CI step, or passing audit; the commitment now limits its exit evidence to the agreed license review (independent 12d3043 1)
   - resolved: The DEP-001 source check formerly allowed a direct read of `/etc/gtk-3.0/settings.ini`; it now rejects GTK 3 and GTK 4 settings-file paths (independent 12d3043 2)
-  - open: The DEP-007 source check does not enforce its mount-table-parser falsifier; a parser for `/proc/self/mountinfo` still passes because the script checks only `/proc/mounts` and `/proc/self/mounts` (independent 12d3043 3)
+  - resolved: The DEP-007 source check formerly allowed a parser for `/proc/self/mountinfo`; it now rejects that Linux mount-table path along with the existing mount paths (independent 12d3043 3)
   - open: The DEP-008 mechanism cannot establish that no second crate is introduced in its six roles; it omits Cargo.lock, uses a short fixed competitor list, and passes with a direct `globwalk` dependency while the lockfile already contains transitive alternate provider versions (independent 12d3043 4)
   - open: The DEP-015 evidence does not prove that CI runs the locked build; its unscoped text check still passes when the workflow step is disabled, and no CI attestation exists for the reviewed commit (independent 12d3043 5)
   - open: The commitment outcome says no code change is in scope, but the reviewed range adds and modifies compiled vendored connector source without reconciling that work with its dependency-record-only scope (independent 12d3043 6)
@@ -39,4 +39,8 @@ after restoring `cargo build --locked`.
 
 For independent finding 2, DEP-001 passed on the clean tree and rejected a
 temporary, compiling direct read of `/etc/gtk-3.0/settings.ini`. It passed again
+after the probe was removed.
+
+For independent finding 3, DEP-007 passed on the clean tree and rejected a
+temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
 after the probe was removed.
