@@ -1,14 +1,14 @@
 commitment: foundation
-commit: f5367bd692fa6e195cc6f11c46d7e3dd1ec0a294
+commit: ff7b27c
 examined:
   - the six agreed dependency requirements and their falsifiers
   - every dependency mechanism, declaration, and latest evidence receipt
   - Cargo manifests, the lockfile, the license policy, and vendored connector metadata
-  - repository automation for the required locked CI build
+  - repository automation for the required locked Linux build
 findings:
   - resolved: DEP-001 formerly allowed an aliased dark-light dependency; the mechanism now rejects known competing appearance providers by dependency key, package alias, and resolved lockfile package.
   - resolved: DEP-007 and DEP-008 formerly inspected only dependency keys; both mechanisms now reject competing packages declared under aliases.
-  - resolved: DEP-015 formerly ran only a local locked build; the repository now has CI that runs `cargo build --locked`, and the mechanism verifies that command remains in the workflow.
+  - resolved: DEP-015 formerly ran only a host build; the mechanism now records `cargo build --locked` in a clean Linux container from the exact commit.
   - resolved: The commitment formerly promised an out-of-scope advisory review; its exit evidence now names only the agreed license review.
   - resolved: The foundation exit evidence required the dependency set to pass advisory review without a mechanism, CI step, or passing audit; the commitment now limits its exit evidence to the agreed license review (independent 12d3043 1)
   - resolved: The DEP-001 source check formerly allowed a direct read of `/etc/gtk-3.0/settings.ini`; it now rejects GTK 3 and GTK 4 settings-file paths (independent 12d3043 2)
@@ -42,7 +42,7 @@ The selected dependency families, resolved versions, license compatibility,
 and current locked build are present. The review inspected the mechanisms for
 manifest-alias and additional-appearance-provider bypasses, then compared the
 commitment's exit claims with the automation actually in the repository. The
-four findings above must be resolved before this commitment can be complete.
+remaining findings above must be resolved before this commitment can be complete.
 
 For the first resolution, the check passed on the repository and failed after
 temporarily adding `appearance_probe = { package = "dark-light", ... }`; the
@@ -52,9 +52,9 @@ For the second resolution, the clean checks passed, then DEP-007 rejected a
 `procfs` package alias and DEP-008 rejected a `glob` package alias. Both checks
 passed again after those temporary probes were removed.
 
-For the third resolution, DEP-015 passed with the committed workflow, failed
-when its command was temporarily changed to an unlocked build, and passed again
-after restoring `cargo build --locked`.
+For the third resolution, DEP-015 passed with the committed container build,
+failed when its command was temporarily changed to an unlocked build, and
+passed again after restoring `cargo build --locked`.
 
 For independent finding 2, DEP-001 passed on the clean tree and rejected a
 temporary, compiling direct read of `/etc/gtk-3.0/settings.ini`. It passed again
