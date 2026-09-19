@@ -570,12 +570,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "camino"
-version = "1.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
-
-[[package]]
 name = "cc"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3362,19 +3356,64 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 name = "musheen"
 version = "0.1.0"
 dependencies = [
- "camino",
+ "musheen-desktop",
+ "musheen-local",
+ "musheen-ui",
+]
+
+[[package]]
+name = "musheen-core"
+version = "0.1.0"
+
+[[package]]
+name = "musheen-desktop"
+version = "0.1.0"
+dependencies = [
  "freedesktop",
+ "musheen-core",
+ "musheen-ops",
  "native-theme",
- "native-theme-gpui",
+ "open",
+ "wax",
+]
+
+[[package]]
+name = "musheen-local"
+version = "0.1.0"
+dependencies = [
+ "musheen-core",
  "nix",
  "notify 8.2.0",
- "open",
  "proc-mounts",
- "reflink-copy",
  "rustix",
  "walkdir",
- "wax",
  "xattr",
+]
+
+[[package]]
+name = "musheen-ops"
+version = "0.1.0"
+dependencies = [
+ "musheen-core",
+ "reflink-copy",
+]
+
+[[package]]
+name = "musheen-test-support"
+version = "0.1.0"
+dependencies = [
+ "musheen-core",
+]
+
+[[package]]
+name = "musheen-ui"
+version = "0.1.0"
+dependencies = [
+ "musheen-core",
+ "musheen-desktop",
+ "musheen-ops",
+ "native-theme",
+ "native-theme-gpui",
 ]
 
 [[package]]

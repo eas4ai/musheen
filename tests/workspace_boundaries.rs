@@ -1,0 +1,80 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const REQUIRED_CRATES: [&str; 6] = [
+    "musheen-core",
+    "musheen-local",
+    "musheen-ops",
+    "musheen-desktop",
+    "musheen-ui",
+    "musheen-test-support",
+];
+
+fn repository_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn rust_files_below(path: &Path, files: &mut Vec<PathBuf>) {
+    if !path.exists() {
+        return;
+    }
+
+    for entry in fs::read_dir(path).expect("workspace source directory should be readable") {
+        let entry = entry.expect("workspace source entry should be readable");
+        let path = entry.path();
+        if path.is_dir() {
+            rust_files_below(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+#[test]
+fn workspace_contains_each_domain_crate() {
+    let root = repository_root();
+    let manifest =
+        fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest should be readable");
+
+    for crate_name in REQUIRED_CRATES {
+        let crate_root = root.join("crates").join(crate_name);
+        assert!(
+            crate_root.join("Cargo.toml").is_file(),
+            "{crate_name} must have a manifest"
+        );
+        assert!(
+            crate_root.join("src/lib.rs").is_file(),
+            "{crate_name} must have a library root"
+        );
+        assert!(
+            manifest.contains(&format!("\"crates/{crate_name}\"")),
+            "the root workspace must include {crate_name}"
+        );
+    }
+}
+
+#[test]
+fn direct_filesystem_access_is_confined_to_the_local_crate() {
+    let crates_root = repository_root().join("crates");
+    let mut violations = Vec::new();
+
+    for crate_name in REQUIRED_CRATES {
+        if crate_name == "musheen-local" {
+            continue;
+        }
+
+        let mut rust_files = Vec::new();
+        rust_files_below(&crates_root.join(crate_name).join("src"), &mut rust_files);
+        for file in rust_files {
+            let source = fs::read_to_string(&file).expect("Rust source should be readable");
+            if source.contains("std::fs") {
+                violations.push(file);
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "only musheen-local may call std::fs directly: {violations:?}"
+    );
+}

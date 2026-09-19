@@ -1,0 +1,1 @@
+//! Recoverable file-operation engine.

@@ -1,0 +1,18 @@
+[package]
+name = "musheen-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+freedesktop.workspace = true
+musheen-core = { path = "../musheen-core" }
+musheen-ops = { path = "../musheen-ops" }
+native-theme.workspace = true
+open.workspace = true
+wax.workspace = true
+
+[lints]
+workspace = true

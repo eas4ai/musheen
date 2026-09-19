@@ -1,0 +1,19 @@
+[package]
+name = "musheen-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+musheen-core = { path = "../musheen-core" }
+nix.workspace = true
+notify.workspace = true
+proc-mounts.workspace = true
+rustix.workspace = true
+walkdir.workspace = true
+xattr.workspace = true
+
+[lints]
+workspace = true
