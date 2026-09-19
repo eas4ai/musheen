@@ -17,6 +17,7 @@ mod settings {
         let store = SettingsStore::from_config_home(root.path());
         let mut first = SettingsDocument::default();
         first.resource_limits_mut().directory_page_items = 256;
+        first.resource_limits_mut().operation_metadata_jobs = 3;
         store.save(&first).expect("the first document is saved");
         let mut second = first.clone();
         second.resource_limits_mut().directory_page_items = 128;
@@ -50,6 +51,10 @@ mod settings {
             ResourceLimitConfig::default().directory_page_items
         );
         assert_eq!(loaded.resource_limits().directory_retained_items, 1234);
+        assert_eq!(
+            loaded.resource_limits().operation_data_mutations,
+            ResourceLimitConfig::default().operation_data_mutations
+        );
     }
 
     #[test]
@@ -59,14 +64,23 @@ mod settings {
             .resource_limits_snapshot()
             .expect("the default limits are valid");
         document.resource_limits_mut().directory_page_items = 64;
+        document.resource_limits_mut().operation_data_mutations = 1;
 
         assert_eq!(snapshot.directory_page_items(), 512);
+        assert_eq!(snapshot.operation_data_mutations(), 2);
         assert_eq!(
             document
                 .resource_limits_snapshot()
                 .expect("the edited limits are valid")
                 .directory_page_items(),
             64
+        );
+        assert_eq!(
+            document
+                .resource_limits_snapshot()
+                .expect("the edited limits are valid")
+                .operation_data_mutations(),
+            1
         );
     }
 

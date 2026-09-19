@@ -8,6 +8,9 @@ fn default_directory_limits_match_the_production_budget() {
     assert_eq!(limits.directory_prefetch_pages(), 2);
     assert_eq!(limits.directory_retained_items(), 4_096);
     assert_eq!(limits.directory_rendered_viewports(), 3);
+    assert_eq!(limits.operation_data_mutations(), 2);
+    assert_eq!(limits.operation_metadata_jobs(), 4);
+    assert_eq!(limits.operation_hash_preview_jobs(), 4);
 }
 
 #[test]
@@ -49,6 +52,18 @@ fn zero_and_above_maximum_limits_are_rejected() {
         },
         ResourceLimitConfig {
             directory_rendered_viewports: 0,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            operation_data_mutations: 0,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            operation_metadata_jobs: 0,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            operation_hash_preview_jobs: 0,
             ..ResourceLimitConfig::default()
         },
     ] {

@@ -253,39 +253,61 @@ fn parse_document(path: &Path, text: &str) -> Result<SettingsDocument, SettingsE
         ));
     }
 
-    let defaults = ResourceLimitConfig::default();
-    let resource_limits = ResourceLimitConfig {
-        directory_page_items: take_limit(
-            &mut entries,
-            "directory_page_items",
-            defaults.directory_page_items,
-            ResourceLimitConfig::MAX_DIRECTORY_PAGE_ITEMS,
-        ),
-        directory_prefetch_pages: take_limit(
-            &mut entries,
-            "directory_prefetch_pages",
-            defaults.directory_prefetch_pages,
-            ResourceLimitConfig::MAX_DIRECTORY_PREFETCH_PAGES,
-        ),
-        directory_retained_items: take_limit(
-            &mut entries,
-            "directory_retained_items",
-            defaults.directory_retained_items,
-            ResourceLimitConfig::MAX_DIRECTORY_RETAINED_ITEMS,
-        ),
-        directory_rendered_viewports: take_limit(
-            &mut entries,
-            "directory_rendered_viewports",
-            defaults.directory_rendered_viewports,
-            ResourceLimitConfig::MAX_DIRECTORY_RENDERED_VIEWPORTS,
-        ),
-    };
+    let resource_limits = parse_resource_limits(&mut entries);
 
     Ok(SettingsDocument {
         schema_version: version,
         resource_limits,
         unknown: entries,
     })
+}
+
+fn parse_resource_limits(entries: &mut BTreeMap<Box<str>, Box<str>>) -> ResourceLimitConfig {
+    let defaults = ResourceLimitConfig::default();
+    ResourceLimitConfig {
+        directory_page_items: take_limit(
+            entries,
+            "directory_page_items",
+            defaults.directory_page_items,
+            ResourceLimitConfig::MAX_DIRECTORY_PAGE_ITEMS,
+        ),
+        directory_prefetch_pages: take_limit(
+            entries,
+            "directory_prefetch_pages",
+            defaults.directory_prefetch_pages,
+            ResourceLimitConfig::MAX_DIRECTORY_PREFETCH_PAGES,
+        ),
+        directory_retained_items: take_limit(
+            entries,
+            "directory_retained_items",
+            defaults.directory_retained_items,
+            ResourceLimitConfig::MAX_DIRECTORY_RETAINED_ITEMS,
+        ),
+        directory_rendered_viewports: take_limit(
+            entries,
+            "directory_rendered_viewports",
+            defaults.directory_rendered_viewports,
+            ResourceLimitConfig::MAX_DIRECTORY_RENDERED_VIEWPORTS,
+        ),
+        operation_data_mutations: take_limit(
+            entries,
+            "operation_data_mutations",
+            defaults.operation_data_mutations,
+            ResourceLimitConfig::MAX_OPERATION_DATA_MUTATIONS,
+        ),
+        operation_metadata_jobs: take_limit(
+            entries,
+            "operation_metadata_jobs",
+            defaults.operation_metadata_jobs,
+            ResourceLimitConfig::MAX_OPERATION_METADATA_JOBS,
+        ),
+        operation_hash_preview_jobs: take_limit(
+            entries,
+            "operation_hash_preview_jobs",
+            defaults.operation_hash_preview_jobs,
+            ResourceLimitConfig::MAX_OPERATION_HASH_PREVIEW_JOBS,
+        ),
+    }
 }
 
 fn take_limit(
@@ -304,12 +326,15 @@ fn take_limit(
 fn serialize(document: &SettingsDocument) -> String {
     let limits = &document.resource_limits;
     let mut output = format!(
-        "schema_version={}\ndirectory_page_items={}\ndirectory_prefetch_pages={}\ndirectory_retained_items={}\ndirectory_rendered_viewports={}\n",
+        "schema_version={}\ndirectory_page_items={}\ndirectory_prefetch_pages={}\ndirectory_retained_items={}\ndirectory_rendered_viewports={}\noperation_data_mutations={}\noperation_metadata_jobs={}\noperation_hash_preview_jobs={}\n",
         document.schema_version,
         limits.directory_page_items,
         limits.directory_prefetch_pages,
         limits.directory_retained_items,
         limits.directory_rendered_viewports,
+        limits.operation_data_mutations,
+        limits.operation_metadata_jobs,
+        limits.operation_hash_preview_jobs,
     );
     for (key, value) in &document.unknown {
         output.push_str(key);

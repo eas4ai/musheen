@@ -8,6 +8,9 @@ pub struct ResourceLimitConfig {
     pub directory_prefetch_pages: usize,
     pub directory_retained_items: usize,
     pub directory_rendered_viewports: usize,
+    pub operation_data_mutations: usize,
+    pub operation_metadata_jobs: usize,
+    pub operation_hash_preview_jobs: usize,
 }
 
 impl ResourceLimitConfig {
@@ -15,6 +18,9 @@ impl ResourceLimitConfig {
     pub const MAX_DIRECTORY_PREFETCH_PAGES: usize = 8;
     pub const MAX_DIRECTORY_RETAINED_ITEMS: usize = 65_536;
     pub const MAX_DIRECTORY_RENDERED_VIEWPORTS: usize = 8;
+    pub const MAX_OPERATION_DATA_MUTATIONS: usize = 32;
+    pub const MAX_OPERATION_METADATA_JOBS: usize = 64;
+    pub const MAX_OPERATION_HASH_PREVIEW_JOBS: usize = 64;
 }
 
 impl Default for ResourceLimitConfig {
@@ -24,6 +30,9 @@ impl Default for ResourceLimitConfig {
             directory_prefetch_pages: 2,
             directory_retained_items: 4_096,
             directory_rendered_viewports: 3,
+            operation_data_mutations: 2,
+            operation_metadata_jobs: 4,
+            operation_hash_preview_jobs: 4,
         }
     }
 }
@@ -35,6 +44,9 @@ pub struct ResourceLimits {
     directory_prefetch_pages: NonZeroUsize,
     directory_retained_items: NonZeroUsize,
     directory_rendered_viewports: NonZeroUsize,
+    operation_data_mutations: NonZeroUsize,
+    operation_metadata_jobs: NonZeroUsize,
+    operation_hash_preview_jobs: NonZeroUsize,
 }
 
 impl ResourceLimits {
@@ -64,6 +76,21 @@ impl ResourceLimits {
     pub fn directory_rendered_viewports(&self) -> usize {
         self.directory_rendered_viewports.get()
     }
+
+    #[must_use]
+    pub const fn operation_data_mutations(&self) -> usize {
+        self.operation_data_mutations.get()
+    }
+
+    #[must_use]
+    pub const fn operation_metadata_jobs(&self) -> usize {
+        self.operation_metadata_jobs.get()
+    }
+
+    #[must_use]
+    pub const fn operation_hash_preview_jobs(&self) -> usize {
+        self.operation_hash_preview_jobs.get()
+    }
 }
 
 impl TryFrom<ResourceLimitConfig> for ResourceLimits {
@@ -90,6 +117,21 @@ impl TryFrom<ResourceLimitConfig> for ResourceLimits {
                 "directory_rendered_viewports",
                 config.directory_rendered_viewports,
                 ResourceLimitConfig::MAX_DIRECTORY_RENDERED_VIEWPORTS,
+            )?,
+            operation_data_mutations: validate_limit(
+                "operation_data_mutations",
+                config.operation_data_mutations,
+                ResourceLimitConfig::MAX_OPERATION_DATA_MUTATIONS,
+            )?,
+            operation_metadata_jobs: validate_limit(
+                "operation_metadata_jobs",
+                config.operation_metadata_jobs,
+                ResourceLimitConfig::MAX_OPERATION_METADATA_JOBS,
+            )?,
+            operation_hash_preview_jobs: validate_limit(
+                "operation_hash_preview_jobs",
+                config.operation_hash_preview_jobs,
+                ResourceLimitConfig::MAX_OPERATION_HASH_PREVIEW_JOBS,
             )?,
         })
     }

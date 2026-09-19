@@ -114,6 +114,7 @@ fn paging_policy_captures_a_validated_limit_snapshot() {
         directory_prefetch_pages: 1,
         directory_retained_items: 128,
         directory_rendered_viewports: 2,
+        ..ResourceLimitConfig::default()
     })
     .expect("the custom limits are valid");
     let policy = PagingPolicy::from(&limits);
