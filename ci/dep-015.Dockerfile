@@ -10,8 +10,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
+ENV CARGO_BUILD_JOBS=1 \
+    CARGO_INCREMENTAL=0 \
+    RUST_MIN_STACK=16777216
+
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY vendor/native-theme-gpui ./vendor/native-theme-gpui
 
-RUN cargo build --locked
+RUN --mount=type=cache,id=musheen-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=musheen-target,target=/workspace/target \
+    cargo build --locked
