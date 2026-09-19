@@ -102,7 +102,10 @@ const traversesTextLines = rustSources.some((source) =>
   /\.lines\s*\(|\.(?:split|split_terminator)\s*\(\s*['"]\\n['"]/.test(source));
 const splitsKeyValue = rustSources.some((source) =>
   /split_once\s*\(\s*['"]=['"]|splitn\s*\(\s*\d+\s*,\s*['"]=['"]|\.split\s*\(\s*['"]=['"]/.test(source));
-if (compactTreeSource.includes("desktopentry") && traversesTextLines && splitsKeyValue) {
+const containsDesktopEntryHeader = rustSources.some((source) =>
+  /\[\s*desktop\s+entry\s*\]/i.test(source));
+if (containsDesktopEntryHeader
+  || (compactTreeSource.includes("desktopentry") && traversesTextLines && splitsKeyValue)) {
   failures.push("Rust source tree contains a hand-written Desktop Entry parser");
 }
 const usesFilesystemPaths = rustSources.some((source) =>
