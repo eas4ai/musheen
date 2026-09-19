@@ -1,5 +1,5 @@
 commitment: foundation
-commit: 89794b442f6b1b9cabc99e0a40c09b8721e132bd
+commit: a849855cbb8d2ba74231f0c6d104d9dadb9a7cef
 examined:
   - the six agreed dependency requirements and their falsifiers
   - every dependency mechanism, declaration, and latest evidence receipt
