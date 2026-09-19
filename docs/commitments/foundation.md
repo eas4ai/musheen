@@ -25,8 +25,10 @@ not part of this commitment until the developer agrees to them.
 
 ## Exit evidence
 
-- `Cargo.toml` and the lockfile use the selected dependency families without
-  competing crates for the same roles.
+- `Cargo.toml` selects the agreed app-facing dependency families without a
+  second direct provider for the same role, and the lockfile resolves their
+  approved versions. Internal crates used only by an approved dependency are
+  transitive implementation details, not additional Musheen role providers.
 - Source checks find no direct appearance, mount-table, or raw-libc bypass of
   the selected abstraction boundaries.
 - The committed dependency set passes license review.
