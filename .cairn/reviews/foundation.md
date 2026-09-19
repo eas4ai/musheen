@@ -21,7 +21,7 @@ findings:
   - resolved: DEP-003 formerly checked only dependency metadata; it now rejects Rust source that combines Desktop Entry content with hand-written line and key/value parsing (independent d922070 3)
   - resolved: DEP-007 formerly parsed dependency-like TOML text; it now uses locked Cargo metadata for normal workspace dependencies and verifies approved resolved versions in Cargo.lock (independent d922070 4)
   - resolved: DEP-007 formerly allowed aliased `nix::libc` imports and fragmented mount-table paths; it now rejects libc imports or calls and compares normalized source for all forbidden mount paths (independent d922070 5)
-  - open: DEP-008 can false-pass a compiled second traversal provider because its finite blacklist does not include the `ignore` crate (independent d922070 6)
+  - resolved: DEP-008 formerly used a finite competitor blacklist; it now reads locked Cargo metadata and rejects every direct runtime package outside the foundation's reviewed dependency allowlist, including `ignore` under any alias (independent d922070 6)
   - open: DEP-008 can false-pass lossless local paths represented by Camino when the crate import is aliased (independent d922070 7)
   - open: DEP-015 can false-pass a workflow that excludes every branch under both declared triggers (independent d922070 8)
   - open: The DEP-015 receipt proves a local locked build and committed CI configuration but records no GitHub Actions run identity, status, or log for the named candidate (independent d922070 9)
@@ -73,6 +73,10 @@ passed again after restoring the dependency declaration.
 For independent finding d922070 5, DEP-007 passed on the clean tree and rejected
 a temporary, compiling `nix::libc as ffi` call plus a mountinfo path assembled
 with `concat!`. It passed again after the probe was removed.
+
+For independent finding d922070 6, DEP-008 passed with the approved direct
+dependencies and rejected a temporary, locked, compiling `ignore` dependency.
+It passed again after the dependency was removed and the lockfile regenerated.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
