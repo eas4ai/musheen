@@ -25,6 +25,11 @@ findings:
   - resolved: DEP-008 formerly recognized only `camino::Utf8Path` spellings; it now rejects every `Utf8Path` or `Utf8PathBuf` type use outside configuration and URI modules regardless of import alias (independent d922070 7)
   - resolved: DEP-015 formerly checked only for trigger keys; it now requires unfiltered `push` and `pull_request` triggers and rejects nested branch or path filters (independent d922070 8)
   - resolved: DEP-015 formerly relied on GitHub workflow text without a run attestation; by developer direction it now archives the exact commit and records a single clean Linux Docker build using `cargo build --locked`, with no GitHub CI during development (independent d922070 9)
+  - open: DEP-001 can pass a direct GTK settings-file read when the path is assembled from variables (independent 38c61f0 1)
+  - open: DEP-003 can pass a hand-written Desktop Entry parser whose names do not contain exact case-sensitive `DesktopEntry` text (independent 38c61f0 2)
+  - open: DEP-007 can pass a hand-written mount-table parser when `/proc/self` and `mountinfo` are joined at runtime (independent 38c61f0 3)
+  - open: DEP-008 can pass a local store path represented by a Camino type exported under an alias from an allowed configuration module (independent 38c61f0 4)
+  - open: DEP-015 omits tracked build inputs such as root `build.rs` from its archive, so its container can pass while the exact clean checkout fails (independent 38c61f0 5)
 
 # Foundation completion review
 
