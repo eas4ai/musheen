@@ -2,6 +2,7 @@
 
 mod enumerate;
 mod metadata;
+mod operation;
 mod probe;
 mod search;
 mod traverse;
@@ -13,6 +14,8 @@ use musheen_core::{
     PageRequest, ProviderId, SearchCapabilities, SearchQuery, SearchStream, Store, StoreError,
     StoreItem, StorePath,
 };
+use musheen_ops::{MetadataKind, SourceMetadata};
+use std::path::PathBuf;
 
 pub use probe::LocalFilesystemInfo;
 pub use traverse::{LocalTraversal, TraversalOptions};
@@ -20,6 +23,8 @@ pub use traverse::{LocalTraversal, TraversalOptions};
 pub struct LocalStore {
     provider: ProviderId,
     enumerations: EnumerationRegistry,
+    operation_metadata_skips: Vec<MetadataKind>,
+    operation_timestamps: Vec<(PathBuf, SourceMetadata)>,
 }
 
 impl LocalStore {
@@ -42,6 +47,8 @@ impl LocalStore {
         Self {
             enumerations: EnumerationRegistry::new(provider.clone()),
             provider,
+            operation_metadata_skips: Vec::new(),
+            operation_timestamps: Vec::new(),
         }
     }
 

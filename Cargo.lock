@@ -4429,12 +4429,16 @@ name = "musheen-local"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "blake3",
  "futures-lite",
  "musheen-core",
+ "musheen-ops",
  "musheen-test-support",
  "nix",
  "notify 8.2.0",
+ "posix-acl",
  "proc-mounts",
+ "reflink-copy",
  "rustix",
  "tempfile",
  "walkdir",

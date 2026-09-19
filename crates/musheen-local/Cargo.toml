@@ -8,11 +8,15 @@ publish.workspace = true
 
 [dependencies]
 async-channel.workspace = true
+blake3.workspace = true
 futures-lite.workspace = true
 musheen-core = { path = "../musheen-core" }
+musheen-ops = { path = "../musheen-ops" }
 nix.workspace = true
 notify.workspace = true
+posix-acl.workspace = true
 proc-mounts.workspace = true
+reflink-copy.workspace = true
 rustix.workspace = true
 walkdir.workspace = true
 xattr.workspace = true
