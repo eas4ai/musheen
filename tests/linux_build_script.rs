@@ -165,3 +165,23 @@ fn linux_build_bounds_rust_compiler_resources() {
         "clean Docker builds must reuse compiled artifacts"
     );
 }
+
+#[test]
+fn linux_build_installs_gpui_native_link_dependencies() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dockerfile = fs::read_to_string(root.join("ci/linux-build.Dockerfile"))
+        .expect("Linux build Dockerfile should be readable");
+
+    for package in [
+        "libfontconfig1-dev",
+        "libfreetype6-dev",
+        "libxcb1-dev",
+        "libxkbcommon-dev",
+        "libxkbcommon-x11-dev",
+    ] {
+        assert!(
+            dockerfile.contains(package),
+            "clean Docker builds must install GPUI link dependency {package}"
+        );
+    }
+}

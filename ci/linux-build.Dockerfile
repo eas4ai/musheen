@@ -4,6 +4,15 @@ FROM rust:1.95-bookworm
 ENV CARGO_BUILD_JOBS=1 \
     RUST_MIN_STACK=16777216
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        libfontconfig1-dev \
+        libfreetype6-dev \
+        libxcb1-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN rustup component add --toolchain 1.95.0 clippy rustfmt
 
 WORKDIR /workspace
