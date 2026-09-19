@@ -1,23 +1,40 @@
 commitment: foundation
-commit: 12d304327a7ea34965b9bb53aac1857052fafea2
+commit: d922070e709c00f5688947ec554a34113e840627
 examined:
-  - docs/commitments/foundation.md and DEP-001, DEP-003, DEP-007, DEP-008, DEP-014, and DEP-015 in docs/spec/deps.md at the reviewed commit
-  - foundation history and diff from a42909a^ through 12d304327a7ea34965b9bb53aac1857052fafea2
-  - Cargo.toml, Cargo.lock, the resolved dependency graph, deny.toml, and the vendored native-theme-gpui source and licenses
-  - the native-theme-gpui compatibility decision and the vendored-source diff against crates.io native-theme-gpui 0.5.8
-  - all six mechanism declarations, check scripts, evidence receipts, captured output, and fresh executions at the reviewed commit
-  - .github/workflows/ci.yml, a fresh locked build, a fresh license audit, and a fresh advisory audit
-  - safe violating examples for the DEP-001, DEP-007, DEP-008, and DEP-015 mechanisms, followed by restoration of the reviewed tree
+  - The foundation commitment and DEP-001, DEP-003, DEP-007, DEP-008, DEP-014, and DEP-015 at the named commit.
+  - The a42909a^..d922070e709c00f5688947ec554a34113e840627 commit list and changed-file range.
+  - Cargo.toml, Cargo.lock, deny.toml, the vendored native-theme-gpui manifest and source patch, and the recorded compatibility decision.
+  - All six mechanism declarations and scripts, their captured receipts, input records, stdout, and stderr.
+  - The locked dependency graph, including duplicate and inverse trees for traversal, matching, and notification providers.
+  - The GitHub Actions locked-build job and the DEP-015 evidence recorded by d922070e709c00f5688947ec554a34113e840627.
+  - Baseline executions of every mechanism in an isolated archive of the named commit.
+  - Isolated compiled falsifiers and matched failure controls for dependency declarations, provider boundaries, license rejection, and CI activation.
 findings:
-  - open: The foundation exit evidence requires the dependency set to pass advisory review, but no mechanism, CI step, or recorded evidence runs an advisory check. A fresh `cargo deny check advisories` at the reviewed commit exits 1 for RUSTSEC-2024-0384, RUSTSEC-2024-0436, RUSTSEC-2025-0134, RUSTSEC-2026-0206, and RUSTSEC-2026-0192, so the stated exit condition is not met.
-  - open: The DEP-001 source check does not enforce its direct-theme-file-read falsifier. Adding compiling Rust code that reads `/etc/gtk-3.0/settings.ini` directly still produces `cairn: DEP-001: pass` because the script checks only six fixed strings and does not recognize that theme file.
-  - open: The DEP-007 source check does not enforce its mount-table-parser falsifier. Adding a compiling parser for `/proc/self/mountinfo` still produces `cairn: DEP-007: pass` because the script checks only `/proc/mounts` and `/proc/self/mounts`.
-  - open: The DEP-008 mechanism cannot establish that no second crate is introduced in its six roles. It omits Cargo.lock from its inputs, uses a short fixed competitor list, and still passes after a direct `globwalk = "0.8"` dependency is added even though globwalk combines recursive traversal and glob matching. The reviewed lockfile already resolves globwalk 0.8.1 and notify 7.0.0 transitively alongside the selected walkdir, wax, and notify 8.2.0, but the evidence neither detects nor explains why those are not competing providers.
-  - open: The DEP-015 evidence does not prove that the reviewed commit built in CI. The check only finds an unscoped `run: cargo build --locked` line and then builds locally; it still passes when that workflow step is disabled with `if: ${{ false }}`. The repository contains no CI result or attestation for commit 12d304327a7ea34965b9bb53aac1857052fafea2.
-  - open: The commitment outcome says that no code change is in scope, but the reviewed range adds compiled vendored connector source and changes two production assignments under the native-theme-gpui compatibility decision. The patch matches the decision, but the commitment never reconciles that code work with its stated dependency-record-only scope.
+  - open: DEP-008 and the foundation exit evidence do not authorize the checker's transitive-provider exception. Cargo.lock contains globwalk 0.8.1, globset 0.4.20, ignore 0.4.33, and notify 7.0.0 alongside the selected wax, walkdir, and notify 8 providers, while check-dep-008.mjs explicitly ignores transitive competitors. Either the contract needs this narrower app-owned-provider rule or the committed lockfile does not meet the stated no-competing-crates evidence.
+  - open: DEP-001 can false-pass a compiled direct appearance bypass. Replacing main with Command::new(concat!("g", "settings")) reading org.gnome.desktop.interface color-scheme passed DEP-001 and the locked build because the mechanism searches only contiguous forbidden spellings.
+  - open: DEP-003 can false-pass a compiled second .desktop parser. A hand-written parser over Desktop Entry key/value lines passed DEP-003 and the locked build because the mechanism examines manifests and Cargo.lock but no source boundary.
+  - open: DEP-007 can false-pass with none of its four required crates declared as dependencies. Moving nix, proc-mounts, xattr, and reflink-copy into package.metadata, regenerating Cargo.lock, and building with --locked passed both DEP-007 and DEP-015 because check-dep-007.mjs matches dependency-like text in any TOML section and does not examine Cargo.lock.
+  - open: DEP-007 can false-pass compiled raw-libc and mount-table bypasses. `use nix::libc as ffi` followed by ffi::statvfs and read_to_string(concat!("/proc/self/", "mountinfo")) passed DEP-007 and the locked build because the mechanism depends on exact source spellings.
+  - open: DEP-008 can false-pass a compiled second traversal provider. Adding ignore 0.4 as a direct dependency and calling ignore::WalkBuilder passed DEP-008 and the locked build because the competitor list is a finite package-name blacklist.
+  - open: DEP-008 can false-pass lossless local paths represented by Camino. `use camino as utf8` followed by utf8::Utf8PathBuf in src/main.rs passed DEP-008 and the locked build because the source check recognizes only the unaliased camino::Utf8Path spelling.
+  - open: DEP-015 can false-pass a workflow that never runs for branch pushes or pull requests. Adding branches-ignore: ["**"] under both declared triggers passed DEP-015 because the mechanism checks only that the trigger keys exist.
+  - open: The DEP-015 receipt does not demonstrate the requirement's CI execution. Its command runs cargo build --locked locally and parses the workflow text; the repository records no GitHub Actions run identity, status, or log for the named candidate.
 
-# Review notes
+# Independent adversarial review
 
-The selected direct dependency versions match the six requirement texts. The locked build and license audit pass. The vendored connector matches the crates.io 0.5.8 source apart from the two decided field removals and the removal of package-only examples, metadata, and documentation assets.
+I extracted the named tree into a temporary directory and initialized an
+isolated Git index so every script saw the exact tracked files without using
+the developer's dirty working tree. I did not use the prior independent report
+as review input.
 
-The violating examples were made only in a detached temporary worktree. Each applicable example compiled. The reviewed candidate was restored and the detached worktree was clean before this report was written.
+All six mechanisms passed on the unmodified candidate. The locked build and
+the cargo-deny license audit also passed. The vendored connector's Rust source
+differs from the registry 0.5.8 source only at the two `tiles` assignments named
+by the decision. The vendored package also trims examples, docs, proposals, and
+the original manifest, and adds license files.
+
+Matched controls failed as expected: literal `gsettings`, direct
+`nix::libc::`, freedesktop-desktop-entry, jwalk, an AGPL-3.0-only local
+dependency, and an explicit `if: false` on the CI job were all rejected. The
+open items above are therefore false-pass gaps in otherwise executable checks,
+not failures to run the tooling.
