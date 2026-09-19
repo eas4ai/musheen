@@ -12,8 +12,9 @@ Requirements:
 ## Outcome
 
 The foundation's agreed dependency choices are recorded and can be checked
-before implementation begins. No application behavior or code change is in
-this commitment while the behavioral requirements remain draft.
+before implementation begins. It includes only dependency-enablement changes,
+such as the recorded native-theme connector compatibility patch. It adds no
+user-facing application behavior while the behavioral requirements remain draft.
 
 ## Included requirements
 

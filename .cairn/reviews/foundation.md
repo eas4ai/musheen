@@ -15,7 +15,7 @@ findings:
   - resolved: The DEP-007 source check formerly allowed a parser for `/proc/self/mountinfo`; it now rejects that Linux mount-table path along with the existing mount paths (independent 12d3043 3)
   - resolved: The DEP-008 mechanism formerly omitted Cargo.lock and allowed direct `globwalk`; it now verifies approved locked versions, rejects direct or aliased `globwalk`, and documents that alternate providers internal to approved dependencies are transitive implementation details rather than app-selected role providers (independent 12d3043 4)
   - resolved: The DEP-015 check formerly accepted a disabled workflow step; it now requires push and pull-request triggers, scopes the locked command to the `locked-build` job, rejects conditional execution and error suppression, and executes the same locked build for Cairn evidence (independent 12d3043 5)
-  - open: The commitment outcome says no code change is in scope, but the reviewed range adds and modifies compiled vendored connector source without reconciling that work with its dependency-record-only scope (independent 12d3043 6)
+  - resolved: The commitment formerly excluded all code changes despite the recorded vendored connector patch; its outcome now permits dependency-enablement changes while continuing to exclude user-facing behavior (independent 12d3043 6)
 
 # Foundation completion review
 
