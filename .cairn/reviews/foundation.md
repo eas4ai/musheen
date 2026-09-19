@@ -136,9 +136,9 @@ a temporary `ConfigPath(Utf8PathBuf)` wrapper in an existing configuration
 module. It passed again after the probe was removed. The same guard covers named
 structs and enums.
 
-For independent finding 602a385 5, DEP-015 now declares every tracked `.cargo`
-file and `rust-toolchain` variant as an input, so repository build configuration
-changes make its Linux container evidence stale.
+For independent finding 602a385 5, DEP-015 uses pathspecs that include every
+tracked `.cargo` file and any root `rust-toolchain` variant, so repository build
+configuration changes make its Linux container evidence stale.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
