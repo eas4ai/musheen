@@ -28,7 +28,7 @@ findings:
   - resolved: DEP-001 formerly required the GTK directory and settings filename to be contiguous; it now rejects files containing both path components even when variables assemble them at runtime (independent 38c61f0 1)
   - resolved: DEP-003 formerly matched `DesktopEntry` case-sensitively; it now normalizes source case and separators before pairing Desktop Entry identifiers with line/key-value parsing (independent 38c61f0 2)
   - resolved: DEP-007 formerly required the mountinfo path components to be contiguous; it now rejects source containing both `/proc/self` and `mountinfo` components even when runtime code joins them (independent 38c61f0 3)
-  - open: DEP-008 can pass a local store path represented by a Camino type exported under an alias from an allowed configuration module (independent 38c61f0 4)
+  - resolved: DEP-008 formerly allowed configuration modules to export Camino under another name; it now rejects Camino type aliases and renamed imports before applying the config/URI path allowance (independent 38c61f0 4)
   - open: DEP-015 omits tracked build inputs such as root `build.rs` from its archive, so its container can pass while the exact clean checkout fails (independent 38c61f0 5)
 
 # Foundation completion review
@@ -107,6 +107,9 @@ the parser was removed.
 For independent finding 38c61f0 3, DEP-007 rejected a temporary compiling read
 that joined `/proc/self` and `mountinfo` variables at runtime, then passed after
 the probe was removed.
+
+For independent finding 38c61f0 4, the clean DEP-008 check passed and its new
+alias guard matched the reviewer's `pub type ConfigPath = Utf8PathBuf` escape.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

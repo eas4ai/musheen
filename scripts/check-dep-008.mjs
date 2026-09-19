@@ -82,6 +82,12 @@ for (const { name, path } of dependencies) {
 for (const path of tracked(":(glob)**/*.rs")) {
   const source = readFileSync(path, "utf8");
   if (!/\bUtf8Path(?:Buf)?\b/.test(source)) continue;
+  const aliasesCaminoType = /\btype\s+\w+\s*=\s*[^;]*\bUtf8Path(?:Buf)?\b/.test(source)
+    || /\b(?:pub\s+)?use\s+camino\b[^;]*\bas\s+\w+/.test(source);
+  if (aliasesCaminoType) {
+    failures.push(`${path} aliases a Camino path type across module boundaries`);
+    continue;
+  }
   if (!/(?:^|\/)(?:config|uri)(?:\/|\.rs$)/.test(path)) {
     failures.push(`${path} uses Camino outside a configuration or URI boundary`);
   }
