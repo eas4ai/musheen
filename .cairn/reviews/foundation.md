@@ -30,6 +30,11 @@ findings:
   - resolved: DEP-007 formerly required the mountinfo path components to be contiguous; it now rejects source containing both `/proc/self` and `mountinfo` components even when runtime code joins them (independent 38c61f0 3)
   - resolved: DEP-008 formerly allowed configuration modules to export Camino under another name; it now rejects Camino type aliases and renamed imports before applying the config/URI path allowance (independent 38c61f0 4)
   - resolved: DEP-015 formerly selected archive paths manually and omitted root `build.rs`; it now archives the full exact commit and copies that complete tracked tree into the Linux build container (independent 38c61f0 5)
+  - open: DEP-001 can pass a direct GTK settings-file read when `gtk-3.0` and `settings.ini` are defined in separate Rust modules (independent 602a385 1)
+  - open: DEP-003 can pass a hand-written Desktop Entry parser when the domain marker and generic line/key-value parser are split between modules (independent 602a385 2)
+  - open: DEP-007 can pass a hand-written mount-table parser that reads `/etc/mtab` (independent 602a385 3)
+  - open: DEP-008 can pass a Camino wrapper type exported from config and consumed as a local store root (independent 602a385 4)
+  - open: DEP-015 omits Cargo configuration files such as `.cargo/config.toml` from its declared input footprint, allowing stale container evidence (independent 602a385 5)
 
 # Foundation completion review
 
