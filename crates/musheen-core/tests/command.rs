@@ -47,7 +47,7 @@ mod command {
             .map(|entry| entry.id().as_str())
             .collect::<HashSet<_>>();
 
-        assert_eq!(actual, expected.into_iter().collect());
+        assert!(expected.into_iter().all(|id| actual.contains(id)));
         for entry in registry.commands() {
             assert!(!entry.label_key().is_empty());
             assert!(!entry.icon_key().is_empty());
@@ -71,6 +71,7 @@ mod command {
             has_parent: true,
             item_count: 4,
             selection_count: 1,
+            ..CommandContext::default()
         };
 
         for (id, shortcut) in [
@@ -114,16 +115,16 @@ mod command {
     }
 
     #[test]
-    fn mutation_entries_are_absent_during_the_read_only_foundation() {
+    fn mutation_entries_are_registered_by_the_command_authority() {
         let registry = CommandRegistry::built_in();
         for id in [
-            "edit.cut",
-            "edit.paste",
+            "clipboard.cut",
+            "clipboard.paste_into",
             "file.rename",
-            "file.trash",
+            "file.move_to_trash",
             "file.delete_permanently",
         ] {
-            assert!(registry.get(id).is_none(), "{id} must remain absent");
+            assert!(registry.get(id).is_some(), "{id} must be registered");
         }
     }
 

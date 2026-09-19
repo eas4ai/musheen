@@ -1217,6 +1217,7 @@ impl MusheenApp {
             }
             CommandAction::OpenProperties => self.open_selected_properties(cx),
             CommandAction::OpenSettings => {}
+            _ => {}
         }
     }
 

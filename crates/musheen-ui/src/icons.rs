@@ -94,6 +94,20 @@ pub fn lucide_icon(icon_key: &str) -> Option<LucideIcon> {
         "puzzle" => LucideIcon::Puzzle,
         "columns-2" => LucideIcon::Columns2,
         "panel-right" => LucideIcon::PanelRight,
+        "folder-open" | "folder-plus" => LucideIcon::Folder,
+        "app-window" | "file-plus" | "file-stack" | "pencil" => LucideIcon::File,
+        "star" | "link" | "terminal" | "terminal-square" | "tag" => LucideIcon::Puzzle,
+        "send" | "play" => LucideIcon::ArrowRight,
+        "scissors" => LucideIcon::X,
+        "copy-plus" | "clipboard-paste" => LucideIcon::Copy,
+        "archive" => LucideIcon::File,
+        "archive-restore" => LucideIcon::RotateCcw,
+        "eye" | "eye-off" | "shield" | "shield-check" | "pin" | "pin-off" | "map-pin" => {
+            LucideIcon::Info
+        }
+        "trash-2" => LucideIcon::Trash,
+        "share-2" => LucideIcon::Network,
+        "eject" | "power" => LucideIcon::HardDrive,
         _ => return None,
     })
 }
