@@ -14,7 +14,7 @@ findings:
   - resolved: The DEP-001 source check formerly allowed a direct read of `/etc/gtk-3.0/settings.ini`; it now rejects GTK 3 and GTK 4 settings-file paths (independent 12d3043 2)
   - resolved: The DEP-007 source check formerly allowed a parser for `/proc/self/mountinfo`; it now rejects that Linux mount-table path along with the existing mount paths (independent 12d3043 3)
   - resolved: The DEP-008 mechanism formerly omitted Cargo.lock and allowed direct `globwalk`; it now verifies approved locked versions, rejects direct or aliased `globwalk`, and documents that alternate providers internal to approved dependencies are transitive implementation details rather than app-selected role providers (independent 12d3043 4)
-  - open: The DEP-015 evidence does not prove that CI runs the locked build; its unscoped text check still passes when the workflow step is disabled, and no CI attestation exists for the reviewed commit (independent 12d3043 5)
+  - resolved: The DEP-015 check formerly accepted a disabled workflow step; it now requires push and pull-request triggers, scopes the locked command to the `locked-build` job, rejects conditional execution and error suppression, and executes the same locked build for Cairn evidence (independent 12d3043 5)
   - open: The commitment outcome says no code change is in scope, but the reviewed range adds and modifies compiled vendored connector source without reconciling that work with its dependency-record-only scope (independent 12d3043 6)
 
 # Foundation completion review
@@ -44,6 +44,10 @@ after the probe was removed.
 For independent finding 4, DEP-008 passed with the approved transitive graph,
 failed after a temporary direct `globwalk` declaration, and passed again after
 the declaration was removed.
+
+For independent finding 5, DEP-015 passed with the committed workflow, failed
+when the `locked-build` job was temporarily disabled with `if: ${{ false }}`,
+and passed again after restoring unconditional execution.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
