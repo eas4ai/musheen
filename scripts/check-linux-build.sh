@@ -22,6 +22,6 @@ git -C "$repository_root" archive --format=tar "$revision" \
     | DOCKER_CONFIG="$docker_config" docker build \
         --pull=false \
         --label "org.opencontainers.image.revision=$revision" \
-        --file "$repository_root/ci/linux-build.Dockerfile" \
+        --file ci/linux-build.Dockerfile \
         --tag "musheen-linux-build:${revision:0:12}" \
         -
