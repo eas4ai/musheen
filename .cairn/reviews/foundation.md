@@ -47,7 +47,7 @@ findings:
   - resolved: DEP-007 now rejects raw C declarations for statfs, fstatfs, statvfs, and fstatvfs, so the prior raw statfs probe is rejected. (independent d4c184e 4)
   - resolved: DEP-007 now rejects proc mount-table paths built with ordinary path joins, so the prior joined `/proc/self/mounts` probe is rejected. (independent d4c184e 5)
   - resolved: DEP-008 now rejects `to_string_lossy` in a source file that uses Camino types, so the prior same-file lossy conversion is rejected. (independent d4c184e 6)
-  - open: DEP-001 checks the kdeglobals spelling per file. A compiling probe split `kde` and `globals` across two tracked modules, joined the result under `/etc/xdg`, read the theme file directly, and still passed DEP-001. (independent d4c184e 7)
+  - resolved: DEP-001 formerly checked the `kdeglobals` spelling per file; it now aggregates the `kde` and `globals` components across all tracked Rust modules. (independent d4c184e 7)
   - open: DEP-003 recognizes only a small set of line and key/value operations. A compiling `[Desktop Entry]` parser used `.lines()` with `find('=')` and slicing, and still passed DEP-003. (independent d4c184e 8)
   - open: DEP-003 recognizes a hand-written icon resolver only when the source also names hicolor. A compiling resolver walked `/usr/share/icons/Adwaita` with `std::fs::read_dir` and still passed DEP-003. (independent d4c184e 9)
   - open: DEP-007 lists only the global and self mount-table paths. A compiling parser read `/proc/1/mountinfo` directly and still passed DEP-007. (independent d4c184e 10)
@@ -182,6 +182,10 @@ passed again after the probe was removed.
 For independent finding 3f6a354 6, DEP-008 passed on the clean tree and rejected
 a compiling `config.rs` probe that converted a local store `Path` through
 `to_string_lossy()` into `Utf8PathBuf`. It passed again after removal.
+
+For independent finding d4c184e 7, DEP-001 passed on the clean tree and rejected
+a compiling probe that split `kde` and `globals` constants across two tracked
+Rust modules. It passed again after the probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

@@ -88,6 +88,7 @@ const forbiddenAppearanceReads = [
 const fragmentedAppearanceReads = [
   [["org.freedesktop.portal", "Settings", "Read"], "direct portal Settings access"],
   [["org.freedesktop", "appearance"], "direct appearance-portal access"],
+  [["kde", "globals"], "direct KDE theme-file access"],
   [["gtk-3.0", "settings.ini"], "direct GTK 3 settings-file access"],
   [["gtk-4.0", "settings.ini"], "direct GTK 4 settings-file access"],
 ];
