@@ -33,7 +33,7 @@ findings:
   - resolved: DEP-001 formerly matched fragmented GTK paths one file at a time; it now aggregates normalized Rust source across the complete tree before checking required path components (independent 602a385 1)
   - resolved: DEP-003 formerly paired Desktop Entry markers and parsing operations per file; it now aggregates both signals across the complete Rust source tree (independent 602a385 2)
   - resolved: DEP-007 formerly allowed a hand-written mount-table parser to read `/etc/mtab`; the mechanism now rejects that legacy mount-table path (independent 602a385 3)
-  - open: DEP-008 can pass a Camino wrapper type exported from config and consumed as a local store root (independent 602a385 4)
+  - resolved: DEP-008 formerly allowed configuration and URI modules to export Camino inside wrapper structs or enums; the mechanism now rejects those wrapper types before applying the boundary allowance (independent 602a385 4)
   - open: DEP-015 omits Cargo configuration files such as `.cargo/config.toml` from its declared input footprint, allowing stale container evidence (independent 602a385 5)
 
 # Foundation completion review
@@ -130,6 +130,11 @@ markers and line/key-value parsing operations across all tracked Rust modules.
 For independent finding 602a385 3, DEP-007 passed on the clean tree and rejected
 a temporary, compiling direct read of `/etc/mtab`. It passed again after the
 probe was removed.
+
+For independent finding 602a385 4, DEP-008 passed on the clean tree and rejected
+a temporary `ConfigPath(Utf8PathBuf)` wrapper in an existing configuration
+module. It passed again after the probe was removed. The same guard covers named
+structs and enums.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

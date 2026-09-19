@@ -84,8 +84,10 @@ for (const path of tracked(":(glob)**/*.rs")) {
   if (!/\bUtf8Path(?:Buf)?\b/.test(source)) continue;
   const aliasesCaminoType = /\btype\s+\w+\s*=\s*[^;]*\bUtf8Path(?:Buf)?\b/.test(source)
     || /\b(?:pub\s+)?use\s+camino\b[^;]*\bas\s+\w+/.test(source);
-  if (aliasesCaminoType) {
-    failures.push(`${path} aliases a Camino path type across module boundaries`);
+  const wrapsCaminoType = /\b(?:pub(?:\([^)]*\))?\s+)?struct\s+\w+(?:\s*<[^>{;]*>)?\s*(?:\([^;]*\bUtf8Path(?:Buf)?\b[^;]*\)\s*;|\{[^}]*\bUtf8Path(?:Buf)?\b[^}]*\})/s.test(source)
+    || /\b(?:pub(?:\([^)]*\))?\s+)?enum\s+\w+(?:\s*<[^>{;]*>)?\s*\{[^}]*\bUtf8Path(?:Buf)?\b[^}]*\}/s.test(source);
+  if (aliasesCaminoType || wrapsCaminoType) {
+    failures.push(`${path} exports a Camino path type across module boundaries`);
     continue;
   }
   if (!/(?:^|\/)(?:config|uri)(?:\/|\.rs$)/.test(path)) {
