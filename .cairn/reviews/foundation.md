@@ -1,5 +1,5 @@
 commitment: foundation
-commit: e2c7a64bdf28e5aff7636341cec19a50b20bb97b
+commit: f5367bd692fa6e195cc6f11c46d7e3dd1ec0a294
 examined:
   - the six agreed dependency requirements and their falsifiers
   - every dependency mechanism, declaration, and latest evidence receipt
@@ -32,7 +32,7 @@ findings:
   - resolved: DEP-015 formerly selected archive paths manually and omitted root `build.rs`; it now archives the full exact commit and copies that complete tracked tree into the Linux build container (independent 38c61f0 5)
   - resolved: DEP-001 formerly matched fragmented GTK paths one file at a time; it now aggregates normalized Rust source across the complete tree before checking required path components (independent 602a385 1)
   - resolved: DEP-003 formerly paired Desktop Entry markers and parsing operations per file; it now aggregates both signals across the complete Rust source tree (independent 602a385 2)
-  - open: DEP-007 can pass a hand-written mount-table parser that reads `/etc/mtab` (independent 602a385 3)
+  - resolved: DEP-007 formerly allowed a hand-written mount-table parser to read `/etc/mtab`; the mechanism now rejects that legacy mount-table path (independent 602a385 3)
   - open: DEP-008 can pass a Camino wrapper type exported from config and consumed as a local store root (independent 602a385 4)
   - open: DEP-015 omits Cargo configuration files such as `.cargo/config.toml` from its declared input footprint, allowing stale container evidence (independent 602a385 5)
 
@@ -126,6 +126,10 @@ the constants across modules no longer changes the result.
 
 For independent finding 602a385 2, DEP-003 now aggregates Desktop Entry domain
 markers and line/key-value parsing operations across all tracked Rust modules.
+
+For independent finding 602a385 3, DEP-007 passed on the clean tree and rejected
+a temporary, compiling direct read of `/etc/mtab`. It passed again after the
+probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again

@@ -64,7 +64,12 @@ for (const path of tracked(":(glob)**/*.rs")) {
   if (/\blibc\s*::/.test(source) || /\bnix\s*::\s*libc\b/.test(source)) {
     failures.push(`${path} calls or imports libc directly`);
   }
-  const mountPaths = ["/proc/mounts", "/proc/self/mounts", "/proc/self/mountinfo"];
+  const mountPaths = [
+    "/etc/mtab",
+    "/proc/mounts",
+    "/proc/self/mounts",
+    "/proc/self/mountinfo",
+  ];
   if (mountPaths.some((mountPath) =>
     source.includes(mountPath)
     || compactSource.includes(mountPath.replace(/[^A-Za-z0-9_.-]/g, "")))) {
