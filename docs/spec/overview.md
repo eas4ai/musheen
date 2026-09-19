@@ -1,4 +1,4 @@
-Status: Agreed 2026-09-18
+Status: Draft
 
 # Musheen — overview
 
@@ -20,10 +20,12 @@ COM server, WinRT previews), no AFP (SMB is the substitute).
 - Ops engine (copy, move, delete via trash, rename, conflicts,
   progress) owns mutation with undo where the platform allows.
 - Core (storage abstraction, filesystem capabilities, watching,
-  traversal, paths) owns OS contact; everything above it is
-  portable Rust.
-- Desktop glue (MIME, launch, trash, portals, notifications, D-Bus
-  service, mounts) owns freedesktop integration.
+  traversal, paths) owns contact with filesystems and storage providers.
+- Desktop glue (MIME, launch, trash, portals, notifications, D-Bus,
+  secrets, terminals, and mounts) owns Linux desktop and process contact.
+- Shell, views, the model, and the ops policy layer depend only on the
+  portable traits exposed by core and desktop glue. Provider and desktop
+  implementations may contain platform-specific Rust behind those traits.
 - Theme system owns appearance, following the OS through
   native-theme and allowing full user theming in GPUI Kit.
 
@@ -55,9 +57,14 @@ mid-operation.
 - docs/spec/search.md (SEARCH) — search, filtering, preview,
   properties.
 - docs/spec/custom.md (CUSTOM) — settings, themes, actions and
-  shortcuts, tags.
+  shortcuts, tags, context-menu policy, and the settings window.
 - docs/spec/system.md (SYS) — mounts, trash, MIME and launch,
   D-Bus, portals, terminal, remote.
 - docs/spec/ux.md (UXF) — flows, keyboard model, feedback and
   recovery.
 - docs/spec/ui.md (UIV) — visual language, states, theming hooks.
+- docs/spec/icons.md (ICON) — icon family, semantic mapping, native
+  content-icon boundary, and asset rules.
+- docs/spec/limits.md (LIMIT) — default resource and timeout budgets.
+- docs/spec/roadmap.md — ordered delivery commitments and their exit
+  criteria.

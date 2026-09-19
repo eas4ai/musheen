@@ -156,7 +156,8 @@ Status: Agreed 2026-09-18
 Cargo.lock is committed and the tree builds from the locked versions.
 Falsifier: a clean checkout builds different dependency versions
 than the recorded lockfile.
-Mechanism: lockfile presence plus cargo build --locked in CI.
+Mechanism: lockfile presence plus `cargo build --locked` locally and in the
+release-only workflow.
 
 [DEP-016]
 Status: Draft
@@ -177,12 +178,13 @@ Mechanism: dependency feature check plus credential persistence tests.
 
 [DEP-018]
 Status: Draft
-The workspace declares Rust 1.95 as its minimum supported toolchain and CI
-tests that version as well as stable, matching the highest selected
-dependency MSRV at specification time.
+The workspace declares Rust 1.95 as its minimum supported toolchain. Local
+release checks and release-only automation test that version as well as stable,
+matching the highest selected dependency MSRV at specification time.
 Falsifier: the manifest advertises an older toolchain or locked dependencies
 fail to build on Rust 1.95.
-Mechanism: manifest check plus locked CI builds on 1.95 and stable.
+Mechanism: manifest check plus locked local and release-only builds on 1.95 and
+stable.
 
 [DEP-019]
 Status: Draft
