@@ -35,7 +35,7 @@ findings:
   - resolved: DEP-007 formerly allowed a hand-written mount-table parser to read `/etc/mtab`; the mechanism now rejects that legacy mount-table path (independent 602a385 3)
   - resolved: DEP-008 formerly allowed configuration and URI modules to export Camino inside wrapper structs or enums; the mechanism now rejects those wrapper types before applying the boundary allowance (independent 602a385 4)
   - resolved: DEP-015 formerly omitted repository Cargo configuration and Rust toolchain files from its declared inputs; the mechanism now invalidates evidence when either build-control input changes (independent 602a385 5)
-  - open: DEP-001 checks complete portal identifiers within one Rust file. A compiling probe split `org.freedesktop.portal.Settings.Read` and `org.freedesktop.appearance` across modules, invoked `gdbus` directly, and still passed DEP-001, so a direct portal settings read can escape the mechanism. (independent 3f6a354 1)
+  - resolved: DEP-001 formerly checked complete portal identifiers within one Rust file; it now aggregates the portal service, method, and appearance namespace signals across the full Rust source tree, so a direct portal settings read cannot escape by splitting constants across modules. (independent 3f6a354 1)
   - open: DEP-003 recognizes a hand-written Desktop Entry parser only when Rust source uses `.lines()` or `split_once('=')`. A compiling `[Desktop Entry]` parser using `split_terminator` and `splitn` still passed DEP-003. (independent 3f6a354 2)
   - open: DEP-003 has no source guard for a hand-written icon resolver. A compiling hicolor lookup built with `std::path` still passed DEP-003, so its icon-resolver check detects only the finite list of competing packages. (independent 3f6a354 3)
   - open: DEP-007 detects `libc::` spellings but not direct C bindings. A compiling `extern "C"` call to `statfs` still passed DEP-007 even though nix supplies that call. (independent 3f6a354 4)
@@ -145,6 +145,11 @@ structs and enums.
 For independent finding 602a385 5, DEP-015 uses pathspecs that include every
 tracked `.cargo` file and any root `rust-toolchain` variant, so repository build
 configuration changes make its Linux container evidence stale.
+
+For independent finding 3f6a354 1, DEP-001 passed on the clean tree and rejected
+a compiling probe that split the portal service, Settings/Read method, and
+appearance namespace across two tracked Rust modules. It passed again after the
+probe was removed.
 
 For independent finding 3, DEP-007 passed on the clean tree and rejected a
 temporary, compiling direct read of `/proc/self/mountinfo`. It passed again
