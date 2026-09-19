@@ -1,35 +1,23 @@
 commitment: foundation
-commit: b1557ab50d86b4830d91259ed92bf2d63ffb98bd
+commit: 12d304327a7ea34965b9bb53aac1857052fafea2
 examined:
-  - docs/commitments/foundation.md and the exact DEP-001, DEP-003, DEP-007, DEP-008, DEP-014, and DEP-015 texts in docs/spec/deps.md
-  - every commit and changed path in a42909a^..b1557ab50d86b4830d91259ed92bf2d63ffb98bd
-  - Cargo.toml, Cargo.lock, cargo metadata, and the resolved feature and package graph
-  - all six mechanism declarations and scripts, including their declared input footprints
-  - the latest evidence receipts and captured output for all six requirements
-  - deny.toml, the live cargo-deny license result, and the vendored connector license and provenance files
-  - .github/workflows/ci.yml and the live locked build
-  - the native-theme-gpui patch decision and a diff against the cached upstream 0.5.8 crate
-  - isolated falsifying examples for DEP-001, DEP-003, DEP-007, DEP-008, and DEP-015
+  - docs/commitments/foundation.md and DEP-001, DEP-003, DEP-007, DEP-008, DEP-014, and DEP-015 in docs/spec/deps.md at the reviewed commit
+  - foundation history and diff from a42909a^ through 12d304327a7ea34965b9bb53aac1857052fafea2
+  - Cargo.toml, Cargo.lock, the resolved dependency graph, deny.toml, and the vendored native-theme-gpui source and licenses
+  - the native-theme-gpui compatibility decision and the vendored-source diff against crates.io native-theme-gpui 0.5.8
+  - all six mechanism declarations, check scripts, evidence receipts, captured output, and fresh executions at the reviewed commit
+  - .github/workflows/ci.yml, a fresh locked build, a fresh license audit, and a fresh advisory audit
+  - safe violating examples for the DEP-001, DEP-007, DEP-008, and DEP-015 mechanisms, followed by restoration of the reviewed tree
 findings:
-  - open: The commitment says it contains no application behavior or code change, but the activation-to-HEAD range adds 7,340 lines of vendored Rust connector source and changes two upstream assignments before compiling that local patch through [patch.crates-io]; the patch decision explains the change but does not remove this direct conflict with the commitment's dependency-only scope.
-  - open: The DEP-001 mechanism does not prove that native-theme is the sole appearance source because it searches Rust source for only six literal strings; an isolated tracked src/main.rs that directly read /etc/gtk-3.0/settings.ini still produced `cairn: DEP-001: pass`.
-  - open: The DEP-003 mechanism uses a fixed seven-package denylist instead of proving that no second desktop parser or icon resolver exists; an isolated manifest that directly aliased the already locked rust-ini package as `desktop_parser` still produced `cairn: DEP-003: pass`.
-  - open: The DEP-007 mechanism does not cover the normal Linux mountinfo table or raw extern-C calls; an isolated tracked src/main.rs that directly read /proc/self/mountinfo still produced `cairn: DEP-007: pass`, so the stated mount-table falsifier is not enforced.
-  - open: The DEP-008 mechanism recognizes Camino use only when source contains the fully qualified `camino::Utf8Path` spelling; an isolated tracked src/main.rs imported Utf8PathBuf and used it for a local store path, yet still produced `cairn: DEP-008: pass`.
-  - open: The DEP-015 mechanism proves only that the workflow text contains a `run: cargo build --locked` line and that a separate local build succeeds; an isolated workflow with `if: false` on the entire locked-build job still produced `cairn: DEP-015: pass`, so it does not prove that CI runs the locked build.
+  - open: The foundation exit evidence requires the dependency set to pass advisory review, but no mechanism, CI step, or recorded evidence runs an advisory check. A fresh `cargo deny check advisories` at the reviewed commit exits 1 for RUSTSEC-2024-0384, RUSTSEC-2024-0436, RUSTSEC-2025-0134, RUSTSEC-2026-0206, and RUSTSEC-2026-0192, so the stated exit condition is not met.
+  - open: The DEP-001 source check does not enforce its direct-theme-file-read falsifier. Adding compiling Rust code that reads `/etc/gtk-3.0/settings.ini` directly still produces `cairn: DEP-001: pass` because the script checks only six fixed strings and does not recognize that theme file.
+  - open: The DEP-007 source check does not enforce its mount-table-parser falsifier. Adding a compiling parser for `/proc/self/mountinfo` still produces `cairn: DEP-007: pass` because the script checks only `/proc/mounts` and `/proc/self/mounts`.
+  - open: The DEP-008 mechanism cannot establish that no second crate is introduced in its six roles. It omits Cargo.lock from its inputs, uses a short fixed competitor list, and still passes after a direct `globwalk = "0.8"` dependency is added even though globwalk combines recursive traversal and glob matching. The reviewed lockfile already resolves globwalk 0.8.1 and notify 7.0.0 transitively alongside the selected walkdir, wax, and notify 8.2.0, but the evidence neither detects nor explains why those are not competing providers.
+  - open: The DEP-015 evidence does not prove that the reviewed commit built in CI. The check only finds an unscoped `run: cargo build --locked` line and then builds locally; it still passes when that workflow step is disabled with `if: ${{ false }}`. The repository contains no CI result or attestation for commit 12d304327a7ea34965b9bb53aac1857052fafea2.
+  - open: The commitment outcome says that no code change is in scope, but the reviewed range adds compiled vendored connector source and changes two production assignments under the native-theme-gpui compatibility decision. The patch matches the decision, but the commitment never reconciles that code work with its stated dependency-record-only scope.
 
-# Independent review
+# Review notes
 
-All six mechanisms pass on the reviewed tree. `cargo test --locked --all-targets`
-also passes, but it runs zero application tests. `cargo fmt --all -- --check`
-passes. The license audit reports `licenses ok`, and the current dependency graph
-uses the required direct dependency families and locked versions.
+The selected direct dependency versions match the six requirement texts. The locked build and license audit pass. The vendored connector matches the crates.io 0.5.8 source apart from the two decided field removals and the removal of package-only examples, metadata, and documentation assets.
 
-The falsifying examples used isolated shared clones of the reviewed commit. Each
-example changed only the file named in its finding and ran the owning mechanism.
-The current repository was not changed by those demonstrations.
-
-The five mechanism failures are independent of the current manifest being
-well-formed. They show that later changes can violate the agreed falsifiers while
-retaining passing evidence. The empty `reviewed:` lists in all six declarations
-also contain no record that these boundaries were challenged before completion.
+The violating examples were made only in a detached temporary worktree. Each applicable example compiled. The reviewed candidate was restored and the detached worktree was clean before this report was written.
