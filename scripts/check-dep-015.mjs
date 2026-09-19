@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 
 const failures = [];
 const trackedLockfile = spawnSync(
@@ -13,47 +12,53 @@ if (trackedLockfile.status !== 0) {
   failures.push("Cargo.lock is not committed");
 }
 
-const workflow = readFileSync(".github/workflows/ci.yml", "utf8");
-const workflowLines = workflow.split("\n");
-for (const trigger of ["push", "pull_request"]) {
-  const triggerIndex = workflowLines.findIndex((line) => line === `  ${trigger}:`);
-  if (triggerIndex < 0) {
-    failures.push(`the CI workflow does not run on ${trigger}`);
-    continue;
-  }
-  const nextContent = workflowLines
-    .slice(triggerIndex + 1)
-    .find((line) => line.trim().length > 0);
-  if (nextContent?.startsWith("    ")) {
-    failures.push(`the CI ${trigger} trigger is filtered`);
-  }
-}
-const jobStart = workflowLines.findIndex((line) => line === "  locked-build:");
-const jobEnd = workflowLines.findIndex(
-  (line, index) => index > jobStart && /^  [\w-]+:\s*$/.test(line),
+const candidate = spawnSync("git", ["rev-parse", "HEAD"], {
+  encoding: "utf8",
+}).stdout.trim();
+const archive = spawnSync(
+  "git",
+  [
+    "archive",
+    "--format=tar",
+    candidate,
+    "--",
+    "Cargo.toml",
+    "Cargo.lock",
+    "src",
+    "vendor/native-theme-gpui",
+    "ci/dep-015.Dockerfile",
+  ],
+  { maxBuffer: 50 * 1024 * 1024 },
 );
-const lockedJob = jobStart < 0
-  ? ""
-  : workflowLines.slice(jobStart, jobEnd < 0 ? undefined : jobEnd).join("\n");
-if (!lockedJob) {
-  failures.push("the CI workflow has no locked-build job");
-} else {
-  if (!/^\s*run:\s*cargo build --locked\s*$/m.test(lockedJob)) {
-    failures.push("the locked-build job does not run cargo build --locked");
-  }
-  if (/^\s*if\s*:/m.test(lockedJob)) {
-    failures.push("the locked-build job or one of its steps is conditional");
-  }
-  if (/^\s*continue-on-error:\s*true\s*$/m.test(lockedJob)) {
-    failures.push("the locked-build job suppresses a build failure");
-  }
-}
+if (archive.error) failures.push(`the committed candidate could not be archived: ${archive.error.message}`);
+if (archive.status !== 0) failures.push("git archive failed for the committed candidate");
 
-const build = spawnSync("cargo", ["build", "--locked"], {
-  stdio: "inherit",
-});
-if (build.error) failures.push(`the locked build could not run: ${build.error.message}`);
-if (build.status !== 0) failures.push("cargo build --locked failed");
+const build = archive.status === 0
+  ? spawnSync(
+      "docker",
+      [
+        "build",
+        "--progress=plain",
+        "--tag",
+        `musheen-dep-015:${candidate.slice(0, 12)}`,
+        "--file",
+        "ci/dep-015.Dockerfile",
+        "-",
+      ],
+      { input: archive.stdout, stdio: ["pipe", "inherit", "inherit"] },
+    )
+  : { status: 1 };
+if (build.error) failures.push(`the Linux container build could not run: ${build.error.message}`);
+if (build.status !== 0) failures.push("the committed tree failed cargo build --locked in Linux Docker");
+
+const activeChecks = spawnSync(
+  "docker",
+  ["ps", "--filter", "ancestor=musheen-dep-015", "--format", "{{.ID}}"],
+  { encoding: "utf8" },
+);
+if (activeChecks.status === 0 && activeChecks.stdout.trim()) {
+  failures.push("a DEP-015 verification container was left running");
+}
 
 if (failures.length > 0) {
   console.log("cairn: DEP-015: fail");

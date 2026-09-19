@@ -24,7 +24,7 @@ findings:
   - resolved: DEP-008 formerly used a finite competitor blacklist; it now reads locked Cargo metadata and rejects every direct runtime package outside the foundation's reviewed dependency allowlist, including `ignore` under any alias (independent d922070 6)
   - resolved: DEP-008 formerly recognized only `camino::Utf8Path` spellings; it now rejects every `Utf8Path` or `Utf8PathBuf` type use outside configuration and URI modules regardless of import alias (independent d922070 7)
   - resolved: DEP-015 formerly checked only for trigger keys; it now requires unfiltered `push` and `pull_request` triggers and rejects nested branch or path filters (independent d922070 8)
-  - open: The DEP-015 receipt proves a local locked build and committed CI configuration but records no GitHub Actions run identity, status, or log for the named candidate (independent d922070 9)
+  - resolved: DEP-015 formerly relied on GitHub workflow text without a run attestation; by developer direction it now archives the exact commit and records a single clean Linux Docker build using `cargo build --locked`, with no GitHub CI during development (independent d922070 9)
 
 # Foundation completion review
 

@@ -32,6 +32,7 @@ not part of this commitment until the developer agrees to them.
 - Source checks find no direct appearance, mount-table, or raw-libc bypass of
   the selected abstraction boundaries.
 - The committed dependency set passes license review.
+- A clean Linux container builds the exact committed tree with `--locked`.
 
 ## Excluded
 
