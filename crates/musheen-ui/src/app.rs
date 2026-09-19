@@ -4,12 +4,16 @@ use crate::navigation::{
     ApplicationSession, BreadcrumbTrail, MAX_WINDOWS, NavigationError, OmnibarMode, OmnibarState,
     OmnibarSubmission, PaneId, TabId, WindowSession, resolve_path_input,
 };
-use crate::sidebar::PLACES;
-use crate::status_bar::status_text;
+use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
+use crate::status_bar::status_text_with_size;
 use crate::toolbar::COMMAND_IDS;
+use crate::views::{
+    AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
+};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Root, Selectable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -18,8 +22,8 @@ use gpui_kit::{
     WindowBounds, WindowOptions, div, img, px, size, uniform_list,
 };
 use musheen_core::{
-    CommandAction, DisplayPath, ItemKind, Page, ResourceLimits, Store, StoreError, StoreItem,
-    StorePath,
+    CancellationToken, CommandAction, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page,
+    ResourceLimits, Store, StoreError, StoreItem, StorePath, WatchEvent,
 };
 use musheen_desktop::SessionStore;
 use musheen_local::LocalStore;
@@ -48,6 +52,7 @@ gpui_kit::assets::icon_assets!(
         List,
         ListChecks,
         Network,
+        PanelRight,
         Plus,
         RefreshCw,
         Search,
@@ -80,6 +85,15 @@ gpui_kit::actions!(
         ReopenClosedTabShortcut,
         SplitPaneShortcut,
         FocusNextPaneShortcut,
+        SelectAllShortcut,
+        ToggleHiddenShortcut,
+        ViewDetailsShortcut,
+        ViewListShortcut,
+        ViewCardsShortcut,
+        ViewGridShortcut,
+        ViewColumnsShortcut,
+        ViewAdaptiveShortcut,
+        ToggleSidebarShortcut,
     ]
 );
 
@@ -97,13 +111,16 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-t", ReopenClosedTabShortcut, None),
         KeyBinding::new("f3", SplitPaneShortcut, None),
         KeyBinding::new("f6", FocusNextPaneShortcut, None),
+        KeyBinding::new("ctrl-a", SelectAllShortcut, None),
+        KeyBinding::new("ctrl-h", ToggleHiddenShortcut, None),
+        KeyBinding::new("ctrl-1", ViewDetailsShortcut, None),
+        KeyBinding::new("ctrl-2", ViewListShortcut, None),
+        KeyBinding::new("ctrl-3", ViewCardsShortcut, None),
+        KeyBinding::new("ctrl-4", ViewGridShortcut, None),
+        KeyBinding::new("ctrl-5", ViewColumnsShortcut, None),
+        KeyBinding::new("ctrl-6", ViewAdaptiveShortcut, None),
+        KeyBinding::new("ctrl-b", ToggleSidebarShortcut, None),
     ]);
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ViewMode {
-    Grid,
-    List,
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +128,29 @@ struct PaneRenderSpec {
     tab_id: TabId,
     pane_index: usize,
     focused: bool,
+}
+
+struct ItemRenderSpec {
+    tab_id: TabId,
+    pane_index: usize,
+    index: usize,
+    id: ItemId,
+    name: String,
+    kind: ItemKind,
+    size: Option<u64>,
+    modified_unix_seconds: Option<i64>,
+    columns: Vec<(ColumnKey, u16)>,
+    layout: Layout,
+    selected: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ColumnAction {
+    Toggle(ColumnKey),
+    MoveLeft(ColumnKey),
+    MoveRight(ColumnKey),
+    Narrower(ColumnKey),
+    Wider(ColumnKey),
 }
 
 pub fn run(initial_path: PathBuf) {
@@ -169,6 +209,7 @@ pub fn run(initial_path: PathBuf) {
                                 navigation,
                                 Some(binding),
                                 ResourceLimits::default(),
+                                true,
                                 cx,
                             )
                         });
@@ -273,6 +314,14 @@ fn grid_item_range(row: usize, item_count: usize, columns: usize) -> std::ops::R
     let columns = columns.max(1);
     let start = row.saturating_mul(columns).min(item_count);
     start..start.saturating_add(columns).min(item_count)
+}
+
+async fn next_watch_event(
+    mut watcher: Box<dyn DirectoryWatch>,
+    cancellation: CancellationToken,
+) -> Result<(Box<dyn DirectoryWatch>, WatchEvent), StoreError> {
+    let event = watcher.next_event(cancellation).await?;
+    Ok((watcher, event))
 }
 
 fn restore_application_session(
@@ -433,6 +482,8 @@ impl SessionBinding {
 
 struct MusheenApp {
     directories: HashMap<TabId, DirectoryModel>,
+    sidebars: HashMap<TabId, SidebarModel>,
+    pins: PinStore,
     limits: ResourceLimits,
     store: Arc<dyn Store>,
     shell: crate::ShellModel,
@@ -446,8 +497,17 @@ struct MusheenApp {
     pending_content_focus: bool,
     session_binding: Option<SessionBinding>,
     session_save_generation: u64,
-    view_mode: ViewMode,
+    watch_directories: bool,
+    sidebar_visible: bool,
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
+}
+
+impl Drop for MusheenApp {
+    fn drop(&mut self) {
+        for directory in self.directories.values() {
+            directory.cancel();
+        }
+    }
 }
 
 impl MusheenApp {
@@ -495,21 +555,30 @@ impl MusheenApp {
         } else {
             (WindowSession::new(initial), None)
         };
-        Self::new_with_navigation(navigation, session_binding, limits, cx)
+        Self::new_with_navigation(navigation, session_binding, limits, false, cx)
     }
 
     fn new_with_navigation(
         navigation: WindowSession,
         session_binding: Option<SessionBinding>,
         limits: ResourceLimits,
+        watch_directories: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let location = navigation.focused_tab().location().clone();
         let focused_tab = navigation.focused_tab().id();
+        let pins = PinStore::default();
         let mut directories = HashMap::new();
-        directories.insert(focused_tab, DirectoryModel::new(limits.snapshot()));
+        let mut directory = DirectoryModel::new(limits.snapshot());
+        *directory.view_mut().preferences_mut() =
+            navigation.focused_tab().view_preferences().clone();
+        directories.insert(focused_tab, directory);
+        let mut sidebars = HashMap::new();
+        sidebars.insert(focused_tab, default_sidebar_model(pins.clone()));
         let mut this = Self {
             directories,
+            sidebars,
+            pins,
             limits,
             store: Arc::new(LocalStore::new()),
             shell: crate::ShellModel::default(),
@@ -523,7 +592,8 @@ impl MusheenApp {
             pending_content_focus: true,
             session_binding,
             session_save_generation: 0,
-            view_mode: ViewMode::Grid,
+            watch_directories,
+            sidebar_visible: true,
             icon_cache: HashMap::new(),
         };
         this.start_load(location, cx);
@@ -532,12 +602,24 @@ impl MusheenApp {
 
     fn start_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
+        if !self.directories.contains_key(&tab_id) {
+            let mut directory = DirectoryModel::new(self.limits.snapshot());
+            if let Some(tab) = self.navigation.tab(tab_id) {
+                *directory.view_mut().preferences_mut() =
+                    self.navigation.preferences_for(tab.location()).clone();
+            }
+            self.directories.insert(tab_id, directory);
+        }
+        self.sidebars
+            .entry(tab_id)
+            .or_insert_with(|| default_sidebar_model(self.pins.clone()));
         let load = self
             .directories
             .entry(tab_id)
             .or_insert_with(|| DirectoryModel::new(self.limits.snapshot()))
             .begin_navigation(location);
         let worker_load = load.clone();
+        let result_load = load.clone();
         let store = Arc::clone(&self.store);
         let limits = self.limits.snapshot();
         let work = cx.background_spawn(async move {
@@ -550,11 +632,80 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| {
-                state.apply_directory_result(tab_id, &load, result);
+                state.apply_directory_result(tab_id, &result_load, result);
                 cx.notify();
             });
         })
         .detach();
+        if self.watch_directories {
+            self.start_watch(tab_id, load, cx);
+        }
+    }
+
+    fn start_watch(&mut self, tab_id: TabId, load: DirectoryLoad, cx: &mut Context<Self>) {
+        let store = Arc::clone(&self.store);
+        let location = load.location().clone();
+        let cancellation = load.cancellation().clone();
+        let work = cx.background_spawn(async move {
+            let watcher = store
+                .watch_directory(&location, cancellation.clone())
+                .await?;
+            next_watch_event(watcher, cancellation).await
+        });
+        cx.spawn(async move |this, cx| match work.await {
+            Ok((watcher, event)) => {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |state, cx| {
+                    if state.apply_watch_event(tab_id, &load, event) {
+                        state.continue_watch(tab_id, load, watcher, cx);
+                        cx.notify();
+                    }
+                });
+            }
+            Err(StoreError::Cancelled) => {}
+            Err(error) => eprintln!("Musheen stopped watching a directory: {error}"),
+        })
+        .detach();
+    }
+
+    fn continue_watch(
+        &mut self,
+        tab_id: TabId,
+        load: DirectoryLoad,
+        watcher: Box<dyn DirectoryWatch>,
+        cx: &mut Context<Self>,
+    ) {
+        let cancellation = load.cancellation().clone();
+        let work = cx.background_spawn(next_watch_event(watcher, cancellation));
+        cx.spawn(async move |this, cx| match work.await {
+            Ok((watcher, event)) => {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |state, cx| {
+                    if state.apply_watch_event(tab_id, &load, event) {
+                        state.continue_watch(tab_id, load, watcher, cx);
+                        cx.notify();
+                    }
+                });
+            }
+            Err(StoreError::Cancelled) => {}
+            Err(error) => eprintln!("Musheen stopped watching a directory: {error}"),
+        })
+        .detach();
+    }
+
+    fn apply_watch_event(
+        &mut self,
+        tab_id: TabId,
+        load: &DirectoryLoad,
+        event: WatchEvent,
+    ) -> bool {
+        self.directories
+            .get_mut(&tab_id)
+            .is_some_and(|directory| directory.apply_watch_event(load, event))
     }
 
     fn apply_directory_result(
@@ -583,6 +734,11 @@ impl MusheenApp {
             self.navigation.navigate_focused(location.clone());
             self.schedule_session_save(cx);
         }
+        let preferences = self.navigation.preferences_for(&location).clone();
+        *self.focused_directory_mut().view_mut().preferences_mut() = preferences.clone();
+        self.navigation
+            .focused_tab_mut()
+            .set_view_preferences(preferences);
         self.pending_omnibar_value =
             Some(DisplayPath::from_store_path(&location).as_str().to_owned());
         self.omnibar.enter(
@@ -617,6 +773,12 @@ impl MusheenApp {
     fn focused_directory(&self) -> &DirectoryModel {
         self.directories
             .get(&self.navigation.focused_tab().id())
+            .expect("the focused tab owns a directory model")
+    }
+
+    fn focused_directory_mut(&mut self) -> &mut DirectoryModel {
+        self.directories
+            .get_mut(&self.navigation.focused_tab().id())
             .expect("the focused tab owns a directory model")
     }
 
@@ -693,9 +855,18 @@ impl MusheenApp {
             CommandAction::FocusLocation | CommandAction::Search | CommandAction::FocusCommand => {
                 self.dispatch_omnibar_action(action, cx);
             }
-            CommandAction::ViewList | CommandAction::ViewGrid | CommandAction::ToggleInfo => {
-                self.dispatch_view_action(action, cx);
-            }
+            CommandAction::ViewDetails
+            | CommandAction::ViewList
+            | CommandAction::ViewCards
+            | CommandAction::ViewGrid
+            | CommandAction::ViewColumns
+            | CommandAction::ViewAdaptive
+            | CommandAction::CycleSort
+            | CommandAction::CycleGroup
+            | CommandAction::ToggleDirectoriesFirst
+            | CommandAction::ToggleHidden
+            | CommandAction::ToggleSidebar
+            | CommandAction::ToggleInfo => self.dispatch_view_action(action, cx),
             CommandAction::NewTab
             | CommandAction::CloseTab
             | CommandAction::DuplicateTab
@@ -707,9 +878,10 @@ impl MusheenApp {
             CommandAction::SplitPane | CommandAction::FocusNextPane => {
                 self.dispatch_pane_action(action, cx);
             }
-            CommandAction::SelectAll
-            | CommandAction::ClearSelection
-            | CommandAction::OpenSettings => {}
+            CommandAction::SelectAll | CommandAction::ClearSelection => {
+                self.dispatch_selection_action(action, cx);
+            }
+            CommandAction::OpenSettings => {}
         }
     }
 
@@ -756,21 +928,137 @@ impl MusheenApp {
     }
 
     fn dispatch_view_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
-        match action {
-            CommandAction::ViewList => {
-                self.view_mode = ViewMode::List;
-                cx.notify();
+        let changed = match action {
+            CommandAction::ViewDetails => self.set_layout(Layout::Details),
+            CommandAction::ViewList => self.set_layout(Layout::List),
+            CommandAction::ViewCards => self.set_layout(Layout::Cards),
+            CommandAction::ViewGrid => self.set_layout(Layout::Grid),
+            CommandAction::ViewColumns => self.set_layout(Layout::Columns),
+            CommandAction::ViewAdaptive => self.set_layout(Layout::Adaptive),
+            CommandAction::CycleSort => {
+                let preferences = self.focused_directory_mut().view_mut().preferences_mut();
+                preferences.sort = SortSpec {
+                    key: match preferences.sort.key {
+                        SortKey::Name => SortKey::Size,
+                        SortKey::Size => SortKey::Kind,
+                        SortKey::Kind => SortKey::Modified,
+                        SortKey::Modified => SortKey::Name,
+                    },
+                    direction: SortDirection::Ascending,
+                };
+                true
             }
-            CommandAction::ViewGrid => {
-                self.view_mode = ViewMode::Grid;
-                cx.notify();
+            CommandAction::CycleGroup => {
+                let group = &mut self
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .group;
+                *group = match *group {
+                    GroupKey::None => GroupKey::Kind,
+                    GroupKey::Kind => GroupKey::FirstLetter,
+                    GroupKey::FirstLetter => GroupKey::Modified,
+                    GroupKey::Modified => GroupKey::None,
+                };
+                true
+            }
+            CommandAction::ToggleDirectoriesFirst => {
+                let value = &mut self
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .directories_first;
+                *value = !*value;
+                true
+            }
+            CommandAction::ToggleHidden => {
+                let value = &mut self
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .show_hidden;
+                *value = !*value;
+                true
+            }
+            CommandAction::ToggleSidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                false
             }
             CommandAction::ToggleInfo => {
                 self.shell.toggle_info();
-                cx.notify();
+                false
             }
-            _ => {}
+            _ => false,
+        };
+        if changed {
+            self.persist_focused_view_preferences(cx);
         }
+        cx.notify();
+    }
+
+    fn set_layout(&mut self, layout: Layout) -> bool {
+        self.focused_directory_mut()
+            .view_mut()
+            .preferences_mut()
+            .layout = layout;
+        true
+    }
+
+    fn persist_focused_view_preferences(&mut self, cx: &mut Context<Self>) {
+        self.persist_view_preferences(self.navigation.focused_tab().id(), cx);
+    }
+
+    fn persist_view_preferences(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let Some(preferences) = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| directory.view().preferences().clone())
+        else {
+            return;
+        };
+        let Some(location) = self
+            .navigation
+            .tab(tab_id)
+            .map(|tab| tab.location().clone())
+        else {
+            return;
+        };
+        if let Some(tab) = self.navigation.tab_mut(tab_id) {
+            tab.set_view_preferences(preferences.clone());
+        }
+        self.navigation.set_preferences_for(location, preferences);
+        self.schedule_session_save(cx);
+    }
+
+    fn dispatch_selection_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
+        match action {
+            CommandAction::SelectAll => {
+                self.focused_directory_mut().view_mut().select_all_visible()
+            }
+            CommandAction::ClearSelection => {
+                self.focused_directory_mut().view_mut().clear_selection()
+            }
+            _ => return,
+        }
+        let selected = self.focused_directory().view().selected_ids().to_vec();
+        self.navigation.focused_tab_mut().set_selection(selected);
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    fn select_item(&mut self, tab_id: TabId, id: ItemId, cx: &mut Context<Self>) {
+        let selected = {
+            let Some(directory) = self.directories.get_mut(&tab_id) else {
+                return;
+            };
+            directory.view_mut().select_item(id, SelectionMode::Replace);
+            directory.view().selected_ids().to_vec()
+        };
+        if let Some(tab) = self.navigation.tab_mut(tab_id) {
+            tab.set_selection(selected);
+        }
+        self.schedule_session_save(cx);
+        cx.notify();
     }
 
     fn dispatch_tab_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
@@ -898,6 +1186,7 @@ impl MusheenApp {
                         detached,
                         Some(binding),
                         ResourceLimits::default(),
+                        true,
                         cx,
                     )
                 });
@@ -1005,6 +1294,16 @@ impl MusheenApp {
         self.pending_omnibar_value = Some(value);
         self.pending_content_focus = true;
         cx.notify();
+    }
+
+    fn handle_escape(&mut self, cx: &mut Context<Self>) {
+        if self.omnibar.mode() != OmnibarMode::Path {
+            self.cancel_omnibar(cx);
+        } else if !self.focused_directory().view().selected_ids().is_empty() {
+            self.dispatch_selection_action(CommandAction::ClearSelection, cx);
+        } else {
+            self.cancel_omnibar(cx);
+        }
     }
 
     fn current_location_text(&self) -> SharedString {
@@ -1248,14 +1547,15 @@ impl MusheenApp {
             )
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors;
         let boundary = if Self::high_contrast(cx) {
             colors.foreground
         } else {
             colors.border
         };
-        debug_assert_eq!(COMMAND_IDS.len(), 11);
+        debug_assert_eq!(COMMAND_IDS.len(), 21);
+        let compact = window.viewport_size().width.as_f32() < 960.0;
         let no_parent = self
             .focused_directory()
             .location()
@@ -1310,20 +1610,18 @@ impl MusheenApp {
             ))
             .child(self.render_omnibar(cx))
             .child(self.toolbar_button("view.search", "Search", IconName::Search, false, false, cx))
+            .when(compact, |toolbar| {
+                toolbar.child(self.render_view_overflow(cx))
+            })
+            .when(!compact, |toolbar| {
+                toolbar.child(self.render_view_controls(cx))
+            })
             .child(self.toolbar_button(
-                "view.list",
-                "List view",
-                IconName::List,
+                "view.sidebar",
+                "Sidebar",
+                IconName::PanelRight,
                 false,
-                self.view_mode == ViewMode::List,
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.grid",
-                "Grid view",
-                IconName::Grid2x2,
-                false,
-                self.view_mode == ViewMode::Grid,
+                self.sidebar_visible,
                 cx,
             ))
             .child(self.toolbar_button(
@@ -1343,6 +1641,14 @@ impl MusheenApp {
                 cx,
             ))
             .child(self.toolbar_button(
+                "pane.focus_next",
+                "Switch pane",
+                IconName::PanelRight,
+                self.navigation.panes().len() < 2,
+                false,
+                cx,
+            ))
+            .child(self.toolbar_button(
                 "app.settings",
                 "Settings",
                 IconName::Settings,
@@ -1350,6 +1656,153 @@ impl MusheenApp {
                 false,
                 cx,
             ))
+    }
+
+    fn render_view_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let preferences = self.focused_directory().view().preferences();
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.toolbar_button(
+                "view.details",
+                "Details view",
+                IconName::ListChecks,
+                false,
+                preferences.layout == Layout::Details,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.list",
+                "List view",
+                IconName::List,
+                false,
+                preferences.layout == Layout::List,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.cards",
+                "Cards view",
+                IconName::Grid2x2,
+                false,
+                preferences.layout == Layout::Cards,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.grid",
+                "Grid view",
+                IconName::Grid2x2,
+                false,
+                preferences.layout == Layout::Grid,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.columns",
+                "Columns view",
+                IconName::Columns2,
+                false,
+                preferences.layout == Layout::Columns,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.adaptive",
+                "Adaptive view",
+                IconName::PanelRight,
+                false,
+                preferences.layout == Layout::Adaptive,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.sort",
+                "Change sort",
+                IconName::List,
+                false,
+                false,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.group",
+                "Change grouping",
+                IconName::ListChecks,
+                false,
+                preferences.group != GroupKey::None,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.directories_first",
+                "Show folders first",
+                IconName::Folder,
+                false,
+                preferences.directories_first,
+                cx,
+            ))
+            .child(self.toolbar_button(
+                "view.hidden",
+                "Show hidden items",
+                IconName::TextCursorInput,
+                false,
+                preferences.show_hidden,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_view_overflow(&self, cx: &mut Context<Self>) -> AnyElement {
+        let preferences = self.focused_directory().view().preferences().clone();
+        let view = cx.entity();
+        let items = [
+            (
+                "view.details",
+                "Details",
+                preferences.layout == Layout::Details,
+            ),
+            ("view.list", "List", preferences.layout == Layout::List),
+            ("view.cards", "Cards", preferences.layout == Layout::Cards),
+            ("view.grid", "Grid", preferences.layout == Layout::Grid),
+            (
+                "view.columns",
+                "Columns",
+                preferences.layout == Layout::Columns,
+            ),
+            (
+                "view.adaptive",
+                "Adaptive",
+                preferences.layout == Layout::Adaptive,
+            ),
+            ("view.sort", "Change sort", false),
+            (
+                "view.group",
+                "Change grouping",
+                preferences.group != GroupKey::None,
+            ),
+            (
+                "view.directories_first",
+                "Folders first",
+                preferences.directories_first,
+            ),
+            ("view.hidden", "Show hidden", preferences.show_hidden),
+        ];
+        Button::new("view.overflow")
+            .icon(IconName::ListChecks)
+            .accessibility_label("View options")
+            .tooltip("View options")
+            .ghost()
+            .small()
+            .compact()
+            .dropdown_menu(move |mut menu, _, _| {
+                for (command_id, label, checked) in items {
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.dispatch_command(command_id, cx);
+                            });
+                        },
+                    ));
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1361,46 +1814,87 @@ impl MusheenApp {
             colors.sidebar_border
         };
         let current = self.focused_directory().location().cloned();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let places = PLACES.into_iter().map(|place| {
-            let location = place_path(place.label, home.as_deref());
-            let selected = location
-                .as_ref()
-                .zip(current.as_ref())
-                .is_some_and(|(place, current)| place == current);
-            let icon = match place.label {
-                "Home" => IconName::House,
-                "Downloads" => IconName::Download,
-                "Trash" => IconName::Trash,
-                _ => IconName::Folder,
-            };
-            let mut button = Button::new(SharedString::from(format!(
-                "sidebar-{}",
-                place.label.to_ascii_lowercase()
-            )))
-            .label(place.label)
-            .icon(icon)
-            .accessibility_label(place.label)
-            .ghost()
-            .small()
-            .selected(selected)
-            .w_full();
-            if let Some(location) = location {
-                button = button.on_click(cx.listener(move |this, _, _, cx| {
-                    this.navigate(location.clone(), true, cx);
-                }));
-            } else {
-                button = button.disabled(true);
-            }
-            div()
-                .border_l_2()
-                .border_color(if selected {
-                    colors.primary
-                } else {
-                    transparent
+        let sections =
+            self.sidebars
+                .get(&self.navigation.focused_tab().id())
+                .map(|sidebar| {
+                    sidebar
+                        .sections()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(section_index, section)| {
+                            let kind = section.kind();
+                            let collapsed = sidebar.is_section_collapsed(kind);
+                            let entries = section
+                                .items()
+                                .iter()
+                                .enumerate()
+                                .map(|(entry_index, entry)| {
+                                    let location = entry.location().clone();
+                                    let selected = current.as_ref() == Some(&location);
+                                    let label = entry.label().to_owned();
+                                    let icon = match (kind, label.as_str()) {
+                                        (SidebarSectionKind::Home, _) => IconName::House,
+                                        (_, "Downloads") => IconName::Download,
+                                        (_, "Trash") => IconName::Trash,
+                                        (SidebarSectionKind::Mounts, _) => IconName::HardDrive,
+                                        (SidebarSectionKind::Network, _)
+                                        | (SidebarSectionKind::Remote, _) => IconName::Network,
+                                        _ => IconName::Folder,
+                                    };
+                                    div()
+                                        .border_l_2()
+                                        .border_color(if selected {
+                                            colors.primary
+                                        } else {
+                                            transparent
+                                        })
+                                        .child(
+                                            Button::new(SharedString::from(format!(
+                                                "sidebar-{section_index}-{entry_index}"
+                                            )))
+                                            .label(label.clone())
+                                            .icon(icon)
+                                            .accessibility_label(label)
+                                            .ghost()
+                                            .small()
+                                            .selected(selected)
+                                            .w_full()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.navigate(location.clone(), true, cx);
+                                            })),
+                                        )
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>();
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "sidebar-section-{section_index}"
+                                    )))
+                                    .label(section.label())
+                                    .accessibility_label(format!(
+                                        "{} section, {}",
+                                        section.label(),
+                                        if collapsed { "collapsed" } else { "expanded" }
+                                    ))
+                                    .ghost()
+                                    .small()
+                                    .w_full()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_sidebar_section(kind, cx);
+                                    })),
+                                )
+                                .when(!collapsed, |section| section.children(entries))
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>()
                 })
-                .child(button)
-        });
+                .unwrap_or_default();
 
         div()
             .id("sidebar")
@@ -1417,52 +1911,26 @@ impl MusheenApp {
             .bg(colors.sidebar)
             .border_r_1()
             .border_color(boundary)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(colors.muted_foreground)
-                    .px_2()
-                    .pb_1()
-                    .child("Places"),
-            )
-            .children(places)
-            .child(div().h(px(12.)))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(colors.muted_foreground)
-                    .px_2()
-                    .pb_1()
-                    .child("Storage"),
-            )
-            .child(
-                Button::new("sidebar-computer")
-                    .label("Computer")
-                    .icon(IconName::HardDrive)
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.navigate(StorePath::from_unix_path("/"), true, cx);
-                    })),
-            )
-            .child(
-                Button::new("sidebar-network")
-                    .label("Network")
-                    .icon(IconName::Network)
-                    .ghost()
-                    .small()
-                    .disabled(true)
-                    .w_full(),
-            )
+            .children(sections)
+    }
+
+    fn toggle_sidebar_section(&mut self, kind: SidebarSectionKind, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        if let Some(sidebar) = self.sidebars.get_mut(&tab_id) {
+            let collapsed = !sidebar.is_section_collapsed(kind);
+            sidebar.set_section_collapsed(kind, collapsed);
+            cx.notify();
+        }
     }
 
     fn render_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let focused = self.navigation.focused_pane_id();
+        let wide = window.viewport_size().width.as_f32() >= 960.0;
         let panes = self
             .navigation
             .panes()
             .iter()
+            .filter(|pane| wide || pane.id() == focused)
             .map(|pane| (pane.id(), pane.active_tab().id()))
             .collect::<Vec<_>>();
         panes
@@ -1660,74 +2128,74 @@ impl MusheenApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let configured = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| directory.view().preferences().layout)
+            .unwrap_or_default();
+        let layout = if configured == Layout::Adaptive {
+            AdaptiveLayout::resolve(window.viewport_size().width.as_f32())
+        } else {
+            configured
+        };
         let item_count = self
             .directories
             .get(&tab_id)
-            .map(|directory| directory.items().len())
+            .map(|directory| directory.view().visible_count())
             .unwrap_or_default();
-        let list = match self.view_mode {
-            ViewMode::List => uniform_list(
-                SharedString::from(format!("directory-items-list-{pane_index}")),
-                item_count,
-                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                    let items = range
-                        .filter_map(|index| {
-                            let item = this.directories.get(&tab_id)?.items().get(index)?;
-                            Some((
-                                index,
-                                item.display_name().as_str().to_owned(),
-                                item.kind(),
-                                item.size(),
-                            ))
-                        })
-                        .collect::<Vec<_>>();
-                    items
-                        .into_iter()
-                        .map(|(index, name, kind, size)| {
-                            div()
-                                .h(px(40.))
-                                .child(this.render_item(pane_index, index, name, kind, size, cx))
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .size_full()
-            .p_4()
-            .into_any_element(),
-            ViewMode::Grid => {
-                let columns = grid_column_count(window.viewport_size().width.as_f32());
-                uniform_list(
-                    SharedString::from(format!("directory-items-grid-{pane_index}")),
-                    grid_row_count(item_count, columns),
-                    cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
-                        rows.map(|row| {
-                            let items = grid_item_range(row, item_count, columns)
-                                .filter_map(|index| {
-                                    let item = this.directories.get(&tab_id)?.items().get(index)?;
-                                    Some((
-                                        index,
-                                        item.display_name().as_str().to_owned(),
-                                        item.kind(),
-                                        item.size(),
-                                    ))
-                                })
-                                .collect::<Vec<_>>();
-                            div()
-                                .h(px(116.))
-                                .flex()
-                                .gap_2()
-                                .children(items.into_iter().map(|(index, name, kind, size)| {
-                                    this.render_item(pane_index, index, name, kind, size, cx)
-                                }))
-                        })
-                        .collect::<Vec<_>>()
+        let list =
+            match layout {
+                Layout::Details | Layout::List | Layout::Columns => uniform_list(
+                    SharedString::from(format!("directory-items-list-{pane_index}")),
+                    item_count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        let items = range
+                            .filter_map(|index| {
+                                this.item_render_spec(tab_id, pane_index, index, layout)
+                            })
+                            .collect::<Vec<_>>();
+                        items
+                            .into_iter()
+                            .map(|item| div().h(px(40.)).child(this.render_item(item, cx)))
+                            .collect::<Vec<_>>()
                     }),
                 )
-                .size_full()
+                .w_full()
+                .flex_grow(1.0)
+                .min_h(px(0.))
                 .p_4()
-                .into_any_element()
-            }
-        };
+                .into_any_element(),
+                Layout::Cards | Layout::Grid | Layout::Adaptive => {
+                    let base_columns = grid_column_count(window.viewport_size().width.as_f32());
+                    let columns = if layout == Layout::Cards {
+                        base_columns.div_ceil(2)
+                    } else {
+                        base_columns
+                    };
+                    uniform_list(
+                        SharedString::from(format!("directory-items-grid-{pane_index}")),
+                        grid_row_count(item_count, columns),
+                        cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
+                            rows.map(|row| {
+                                let items = grid_item_range(row, item_count, columns)
+                                    .filter_map(|index| {
+                                        this.item_render_spec(tab_id, pane_index, index, layout)
+                                    })
+                                    .collect::<Vec<_>>();
+                                div().h(px(116.)).flex().gap_2().children(
+                                    items.into_iter().map(|item| this.render_item(item, cx)),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                        }),
+                    )
+                    .w_full()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .p_4()
+                    .into_any_element()
+                }
+            };
 
         let items_id = if pane_index == 0 {
             SharedString::from("directory-items")
@@ -1740,20 +2208,175 @@ impl MusheenApp {
             .role(Role::List)
             .aria_label("Items")
             .size_full()
+            .flex()
+            .flex_col()
+            .when(layout == Layout::Details, |items| {
+                items.child(self.render_details_header(tab_id, cx))
+            })
             .child(list)
             .into_any_element()
     }
 
-    fn render_item(
-        &mut self,
+    fn render_details_header(&self, tab_id: TabId, cx: &mut Context<Self>) -> AnyElement {
+        let column_layout = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| directory.view().preferences().columns.clone())
+            .unwrap_or_default();
+        let header =
+            column_layout
+                .visible_columns_with_widths()
+                .into_iter()
+                .map(|(column, width)| {
+                    let label = column_label(column);
+                    Button::new(SharedString::from(format!("details-{label}")))
+                        .label(label)
+                        .accessibility_label(format!("Sort by {label}"))
+                        .ghost()
+                        .small()
+                        .w(px(f32::from(width)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.sort_details(tab_id, column, cx);
+                        }))
+                });
+        let view = cx.entity();
+        let visible_columns = column_layout.visible_columns();
+        let column_menu = Button::new("details-columns")
+            .icon(IconName::Settings)
+            .accessibility_label("Configure details columns")
+            .tooltip("Configure details columns")
+            .ghost()
+            .small()
+            .compact()
+            .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.item(PopupMenuItem::label("Visible columns"));
+                for column in ColumnKey::ALL {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(column_label(column))
+                            .checked(column_layout.is_visible(column))
+                            .disabled(column == ColumnKey::Name)
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.adjust_column(tab_id, ColumnAction::Toggle(column), cx);
+                                });
+                            }),
+                    );
+                }
+                menu = menu.item(PopupMenuItem::separator());
+                for column in visible_columns.iter().copied() {
+                    for (label, action) in [
+                        (
+                            format!("Move {} left", column_label(column)),
+                            ColumnAction::MoveLeft(column),
+                        ),
+                        (
+                            format!("Move {} right", column_label(column)),
+                            ColumnAction::MoveRight(column),
+                        ),
+                        (
+                            format!("Narrow {}", column_label(column)),
+                            ColumnAction::Narrower(column),
+                        ),
+                        (
+                            format!("Widen {}", column_label(column)),
+                            ColumnAction::Wider(column),
+                        ),
+                    ] {
+                        let view = view.clone();
+                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.adjust_column(tab_id, action, cx);
+                            });
+                        }));
+                    }
+                }
+                menu
+            });
+        div()
+            .id("details-header")
+            .test_support()
+            .role(Role::Toolbar)
+            .aria_label("Details columns")
+            .h(px(36.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .children(header)
+            .child(column_menu)
+            .into_any_element()
+    }
+
+    fn sort_details(&mut self, tab_id: TabId, column: ColumnKey, cx: &mut Context<Self>) {
+        if let Some(directory) = self.directories.get_mut(&tab_id) {
+            directory.view_mut().toggle_details_sort(column);
+        }
+        self.persist_view_preferences(tab_id, cx);
+        cx.notify();
+    }
+
+    fn adjust_column(&mut self, tab_id: TabId, action: ColumnAction, cx: &mut Context<Self>) {
+        let Some(directory) = self.directories.get_mut(&tab_id) else {
+            return;
+        };
+        let columns = &mut directory.view_mut().preferences_mut().columns;
+        let changed = match action {
+            ColumnAction::Toggle(column) => {
+                if columns.is_visible(column) {
+                    columns.hide(column).is_ok()
+                } else {
+                    columns.show(column).is_ok()
+                }
+            }
+            ColumnAction::MoveLeft(column) => columns.move_left(column).is_ok(),
+            ColumnAction::MoveRight(column) => columns.move_right(column).is_ok(),
+            ColumnAction::Narrower(column) | ColumnAction::Wider(column) => {
+                let Some(width) = columns.width(column) else {
+                    return;
+                };
+                let delta = if matches!(action, ColumnAction::Narrower(_)) {
+                    -24.0
+                } else {
+                    24.0
+                };
+                columns
+                    .resize(column, (f32::from(width) + delta).clamp(48.0, 1_024.0))
+                    .is_ok()
+            }
+        };
+        if changed {
+            self.persist_view_preferences(tab_id, cx);
+            cx.notify();
+        }
+    }
+
+    fn item_render_spec(
+        &self,
+        tab_id: TabId,
         pane_index: usize,
         index: usize,
-        name: String,
-        kind: ItemKind,
-        size: Option<u64>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let identity = match kind {
+        layout: Layout,
+    ) -> Option<ItemRenderSpec> {
+        let view = self.directories.get(&tab_id)?.view();
+        let item = view.visible_items().get(index)?.to_owned();
+        Some(ItemRenderSpec {
+            tab_id,
+            pane_index,
+            index,
+            id: item.id().clone(),
+            name: item.display_name().as_str().to_owned(),
+            kind: item.kind(),
+            size: item.size(),
+            modified_unix_seconds: item.modified_unix_seconds(),
+            columns: view.preferences().columns.visible_columns_with_widths(),
+            layout,
+            selected: view.selected_ids().contains(item.id()),
+        })
+    }
+
+    fn render_item(&mut self, spec: ItemRenderSpec, cx: &mut Context<Self>) -> AnyElement {
+        let identity = match spec.kind {
             ItemKind::Directory => ContentIdentity::directory(),
             ItemKind::SymbolicLink => ContentIdentity::symbolic_link(),
             ItemKind::RegularFile | ItemKind::Other => ContentIdentity::GenericFile,
@@ -1761,7 +2384,7 @@ impl MusheenApp {
         let icon_name = freedesktop_icon_name(&identity);
         let icon = self.content_icon(icon_name).map_or_else(
             || {
-                Icon::new(if kind == ItemKind::Directory {
+                Icon::new(if spec.kind == ItemKind::Directory {
                     IconName::Folder
                 } else {
                     IconName::File
@@ -1772,13 +2395,20 @@ impl MusheenApp {
             |source| img(source).size(px(42.)).into_any_element(),
         );
         let colors = cx.theme().colors;
-        let item_id = SharedString::from(format!("directory-item-{pane_index}-{index}"));
-        match self.view_mode {
-            ViewMode::Grid => div()
+        let item_id =
+            SharedString::from(format!("directory-item-{}-{}", spec.pane_index, spec.index));
+        let tab_id = spec.tab_id;
+        let stable_id = spec.id.clone();
+        match spec.layout {
+            Layout::Cards | Layout::Grid | Layout::Adaptive => div()
                 .id(item_id)
                 .role(Role::ListItem)
-                .aria_label(name.clone())
-                .w(px(128.))
+                .aria_label(spec.name.clone())
+                .w(if spec.layout == Layout::Cards {
+                    px(240.)
+                } else {
+                    px(128.)
+                })
                 .h(px(108.))
                 .flex()
                 .flex_col()
@@ -1787,7 +2417,15 @@ impl MusheenApp {
                 .gap_2()
                 .px_2()
                 .rounded_md()
+                .when(spec.selected, |item| {
+                    item.bg(colors.list_active)
+                        .border_1()
+                        .border_color(colors.list_active_border)
+                })
                 .hover(|style| style.bg(colors.list_hover))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_item(tab_id, stable_id.clone(), cx);
+                }))
                 .child(icon)
                 .child(
                     div()
@@ -1795,13 +2433,13 @@ impl MusheenApp {
                         .text_sm()
                         .text_center()
                         .overflow_hidden()
-                        .child(name),
+                        .child(spec.name),
                 )
                 .into_any_element(),
-            ViewMode::List => div()
+            Layout::List => div()
                 .id(item_id)
                 .role(Role::ListItem)
-                .aria_label(name.clone())
+                .aria_label(spec.name.clone())
                 .h(px(38.))
                 .w_full()
                 .flex()
@@ -1809,18 +2447,84 @@ impl MusheenApp {
                 .gap_3()
                 .px_2()
                 .rounded_sm()
+                .when(spec.selected, |item| {
+                    item.bg(colors.list_active)
+                        .border_1()
+                        .border_color(colors.list_active_border)
+                })
                 .hover(|style| style.bg(colors.list_hover))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_item(tab_id, stable_id.clone(), cx);
+                }))
                 .child(div().w(px(28.)).flex().justify_center().child(icon))
-                .child(div().flex_grow(1.0).text_sm().child(name))
+                .child(div().flex_grow(1.0).text_sm().child(spec.name))
                 .child(
                     div()
                         .w(px(96.))
                         .text_right()
                         .text_xs()
                         .text_color(colors.muted_foreground)
-                        .child(size.map_or_else(String::new, format_size)),
+                        .child(spec.size.map_or_else(String::new, format_size)),
                 )
                 .into_any_element(),
+            Layout::Details | Layout::Columns => {
+                let mut icon = Some(icon);
+                let cells = spec
+                    .columns
+                    .iter()
+                    .map(|(column, width)| {
+                        let cell = div().w(px(f32::from(*width))).text_xs();
+                        match column {
+                            ColumnKey::Name => cell
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .w(px(28.))
+                                        .flex()
+                                        .justify_center()
+                                        .child(icon.take().expect("name is a required column")),
+                                )
+                                .child(spec.name.clone()),
+                            ColumnKey::Size => cell
+                                .text_right()
+                                .text_color(colors.muted_foreground)
+                                .child(spec.size.map_or_else(|| "—".to_owned(), format_size)),
+                            ColumnKey::Kind => cell
+                                .text_color(colors.muted_foreground)
+                                .child(item_kind_label(spec.kind)),
+                            ColumnKey::Modified => cell.text_color(colors.muted_foreground).child(
+                                spec.modified_unix_seconds
+                                    .map_or_else(|| "—".to_owned(), |value| value.to_string()),
+                            ),
+                        }
+                        .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+                div()
+                    .id(item_id)
+                    .role(Role::ListItem)
+                    .aria_label(spec.name)
+                    .h(px(38.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .rounded_sm()
+                    .when(spec.selected, |item| {
+                        item.bg(colors.list_active)
+                            .border_1()
+                            .border_color(colors.list_active_border)
+                    })
+                    .hover(|style| style.bg(colors.list_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_item(tab_id, stable_id.clone(), cx);
+                    }))
+                    .children(cells)
+                    .into_any_element()
+            }
         }
     }
 
@@ -1854,7 +2558,19 @@ impl Render for MusheenApp {
             self.pending_content_focus = false;
         }
         let colors = cx.theme().colors;
-        let status = status_text(self.focused_directory().items().len(), 0);
+        let view = self.focused_directory().view();
+        let selected_bytes = view
+            .selected_ids()
+            .iter()
+            .map(|id| view.item(id).and_then(StoreItem::size))
+            .collect::<Option<Vec<_>>>()
+            .map(|sizes| sizes.into_iter().sum());
+        let status = status_text_with_size(
+            view.visible_count(),
+            view.selected_ids().len(),
+            selected_bytes,
+            view.is_complete(),
+        );
         let info_visible = self.shell.info_visible();
         let wide = window.viewport_size().width.as_f32() >= 960.0;
         let high_contrast = Self::high_contrast(cx);
@@ -1915,17 +2631,46 @@ impl Render for MusheenApp {
             .on_action(cx.listener(|this, _: &FocusNextPaneShortcut, _, cx| {
                 this.dispatch_command("pane.focus_next", cx);
             }))
+            .on_action(cx.listener(|this, _: &SelectAllShortcut, _, cx| {
+                this.dispatch_command("selection.select_all", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleHiddenShortcut, _, cx| {
+                this.dispatch_command("view.hidden", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewDetailsShortcut, _, cx| {
+                this.dispatch_command("view.details", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewListShortcut, _, cx| {
+                this.dispatch_command("view.list", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewCardsShortcut, _, cx| {
+                this.dispatch_command("view.cards", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewGridShortcut, _, cx| {
+                this.dispatch_command("view.grid", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewColumnsShortcut, _, cx| {
+                this.dispatch_command("view.columns", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewAdaptiveShortcut, _, cx| {
+                this.dispatch_command("view.adaptive", cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebarShortcut, _, cx| {
+                this.dispatch_command("view.sidebar", cx);
+            }))
             .on_action(cx.listener(|this, _: &Escape, _, cx| {
-                this.cancel_omnibar(cx);
+                this.handle_escape(cx);
             }))
             .child(self.render_tab_strip(cx))
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(window, cx))
             .child(
                 div()
                     .flex_grow(1.0)
                     .min_h(px(0.))
                     .flex()
-                    .child(self.render_sidebar(cx))
+                    .when(self.sidebar_visible, |content| {
+                        content.child(self.render_sidebar(cx))
+                    })
                     .children(panes)
                     .children(info),
             )
@@ -1963,6 +2708,36 @@ fn place_path(label: &str, home: Option<&Path>) -> Option<StorePath> {
     }
 }
 
+fn default_sidebar_model(pins: PinStore) -> SidebarModel {
+    let mut model = SidebarModel::new(pins);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = home.as_deref() {
+        model.set_section_items(
+            SidebarSectionKind::Home,
+            [SidebarEntry::new(
+                "Home",
+                StorePath::from_unix_path(home.as_os_str()),
+            )],
+        );
+        model.set_section_items(
+            SidebarSectionKind::Places,
+            ["Desktop", "Documents", "Downloads", "Trash"]
+                .into_iter()
+                .filter_map(|label| {
+                    place_path(label, Some(home)).map(|path| SidebarEntry::new(label, path))
+                }),
+        );
+    }
+    model.set_section_items(
+        SidebarSectionKind::Mounts,
+        [SidebarEntry::new(
+            "Computer",
+            StorePath::from_unix_path("/"),
+        )],
+    );
+    model
+}
+
 fn format_size(bytes: u64) -> String {
     const KIB: u64 = 1_024;
     const MIB: u64 = KIB * 1_024;
@@ -1975,6 +2750,24 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn item_kind_label(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Directory => "Folder",
+        ItemKind::RegularFile => "File",
+        ItemKind::SymbolicLink => "Link",
+        ItemKind::Other => "Other",
+    }
+}
+
+fn column_label(column: ColumnKey) -> &'static str {
+    match column {
+        ColumnKey::Name => "Name",
+        ColumnKey::Size => "Size",
+        ColumnKey::Kind => "Type",
+        ColumnKey::Modified => "Modified",
     }
 }
 
@@ -2179,7 +2972,7 @@ mod tests {
             ] {
                 assert!(window.find(id).visible(), "missing visible region {id}");
             }
-            assert_eq!(window.find("status-bar").label(), Some("3 items"));
+            assert_eq!(window.find("status-bar").label(), Some("2 items"));
             assert!(window.find("tab-0").visible());
             assert!(window.find("omnibar").visible());
             assert!(window.find("omnibar-path").visible());
@@ -2187,6 +2980,39 @@ mod tests {
             assert!(window.find("omnibar-command").visible());
             assert!(window.find("breadcrumbs").visible());
             assert!(window.find("breadcrumb-current").visible());
+            assert!(window.find("sidebar-section-0").visible());
+            window.click("view.sidebar", cx);
+            assert!(window.try_find("sidebar").is_none());
+            window.click("view.sidebar", cx);
+            assert!(window.find("sidebar").visible());
+            window.click("view.details", cx);
+            assert!(window.find("details-header").visible());
+            assert!(window.find("details-columns").visible());
+            window.click("view.hidden", cx);
+            assert_eq!(window.find("status-bar").label(), Some("3 items"));
+            window.press("ctrl-a", cx);
+            assert!(
+                window
+                    .find("status-bar")
+                    .label()
+                    .is_some_and(|label| label.starts_with("3 items selected"))
+            );
+            window.click("view.grid", cx);
+            assert!(window.try_find("details-header").is_none());
+            for (command, layout) in [
+                ("view.list", Layout::List),
+                ("view.cards", Layout::Cards),
+                ("view.columns", Layout::Columns),
+                ("view.adaptive", Layout::Adaptive),
+                ("view.grid", Layout::Grid),
+            ] {
+                window.click(command, cx);
+                assert_eq!(
+                    app.read(cx).focused_directory().view().preferences().layout,
+                    layout
+                );
+                assert!(window.find("directory-items").visible());
+            }
             window.press("ctrl-f", cx);
             assert_eq!(app.read(cx).omnibar.mode(), OmnibarMode::Search);
             window.press("escape", cx);
@@ -2200,6 +3026,43 @@ mod tests {
             assert!(window.find("info-pane").visible());
             window.click("view.info", cx);
             assert!(window.try_find("info-pane").is_none());
+        })
+        .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn narrow_shell_uses_view_overflow_and_one_reachable_pane(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(720.), px(600.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("view.overflow").visible());
+            assert!(window.try_find("view.details").is_none());
+            window.press("f3", cx);
+            assert_eq!(app.read(cx).navigation.panes().len(), 2);
+            assert!(window.find("pane-0").visible());
+            assert!(window.try_find("pane-1").is_none());
+            let focused = app.read(cx).navigation.focused_pane_id();
+            window.press("f6", cx);
+            assert_ne!(app.read(cx).navigation.focused_pane_id(), focused);
+            assert!(window.find("pane-0").visible());
+            assert!(window.try_find("pane-1").is_none());
         })
         .expect("test window remains open");
     }

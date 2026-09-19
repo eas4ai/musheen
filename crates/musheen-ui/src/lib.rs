@@ -5,10 +5,11 @@ mod directory;
 mod icons;
 pub mod navigation;
 mod shell;
-mod sidebar;
+pub mod sidebar;
 mod status_bar;
 mod theme;
 mod toolbar;
+pub mod views;
 
 pub use app::run;
 pub use directory::{

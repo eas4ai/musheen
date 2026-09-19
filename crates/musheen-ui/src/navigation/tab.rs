@@ -1,4 +1,5 @@
 use super::{NavigationError, NavigationHistory};
+use crate::views::ViewPreferences;
 use musheen_core::{ItemId, StorePath};
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,8 @@ pub struct TabState {
     id: TabId,
     history: NavigationHistory,
     selection: Vec<ItemId>,
+    #[serde(default)]
+    view_preferences: ViewPreferences,
 }
 
 impl TabState {
@@ -35,6 +38,7 @@ impl TabState {
             id,
             history: NavigationHistory::new(location),
             selection: Vec::new(),
+            view_preferences: ViewPreferences::default(),
         }
     }
 
@@ -64,6 +68,15 @@ impl TabState {
 
     pub fn set_selection(&mut self, items: impl IntoIterator<Item = ItemId>) {
         self.selection = items.into_iter().collect();
+    }
+
+    #[must_use]
+    pub const fn view_preferences(&self) -> &ViewPreferences {
+        &self.view_preferences
+    }
+
+    pub fn set_view_preferences(&mut self, preferences: ViewPreferences) {
+        self.view_preferences = preferences;
     }
 
     pub(super) fn duplicate(&self, id: TabId) -> Self {

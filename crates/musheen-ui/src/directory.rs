@@ -1,5 +1,7 @@
+use crate::views::DirectoryViewModel;
 use musheen_core::{
     CancellationToken, Page, PageRequest, ResourceLimits, Store, StoreError, StoreItem, StorePath,
+    WatchEvent,
 };
 use std::ops::Range;
 
@@ -42,7 +44,7 @@ pub struct DirectoryModel {
     generation: u64,
     active: Option<DirectoryLoad>,
     state: DirectoryState,
-    items: Vec<StoreItem>,
+    view: DirectoryViewModel,
 }
 
 impl DirectoryModel {
@@ -53,7 +55,7 @@ impl DirectoryModel {
             generation: 0,
             active: None,
             state: DirectoryState::Empty,
-            items: Vec::new(),
+            view: DirectoryViewModel::new(limits.directory_retained_items()),
         }
     }
 
@@ -62,7 +64,7 @@ impl DirectoryModel {
             active.cancellation.cancel();
         }
         self.generation = self.generation.wrapping_add(1);
-        self.items.clear();
+        self.view.reset_items();
         self.state = DirectoryState::Loading;
         let load = DirectoryLoad {
             generation: self.generation,
@@ -71,6 +73,12 @@ impl DirectoryModel {
         };
         self.active = Some(load.clone());
         load
+    }
+
+    pub fn cancel(&self) {
+        if let Some(active) = &self.active {
+            active.cancellation.cancel();
+        }
     }
 
     #[must_use]
@@ -85,7 +93,16 @@ impl DirectoryModel {
 
     #[must_use]
     pub fn items(&self) -> &[StoreItem] {
-        &self.items
+        self.view.items()
+    }
+
+    #[must_use]
+    pub const fn view(&self) -> &DirectoryViewModel {
+        &self.view
+    }
+
+    pub fn view_mut(&mut self) -> &mut DirectoryViewModel {
+        &mut self.view
     }
 
     pub fn apply_page(&mut self, load: &DirectoryLoad, page: Page<StoreItem>) -> ApplyPageResult {
@@ -93,11 +110,10 @@ impl DirectoryModel {
             return ApplyPageResult::Stale;
         }
 
-        let retained = self.limits.directory_retained_items();
-        let available = retained.saturating_sub(self.items.len());
-        self.items
-            .extend(page.into_items().into_iter().take(available));
-        self.state = if self.items.is_empty() {
+        let complete = page.next_request().is_none();
+        self.view.extend(page.into_items());
+        self.view.set_complete(complete);
+        self.state = if self.view.items().is_empty() {
             DirectoryState::Empty
         } else {
             DirectoryState::Ready
@@ -113,11 +129,25 @@ impl DirectoryModel {
         true
     }
 
+    pub fn apply_watch_event(&mut self, load: &DirectoryLoad, event: WatchEvent) -> bool {
+        if !self.is_current(load) {
+            return false;
+        }
+        self.view.apply_watch_event(event);
+        self.state = if self.view.items().is_empty() {
+            DirectoryState::Empty
+        } else {
+            DirectoryState::Ready
+        };
+        true
+    }
+
     #[must_use]
     pub fn rendered_range(&self, first_visible: usize, viewport_items: usize) -> Range<usize> {
-        let start = first_visible.min(self.items.len());
+        let item_count = self.view.visible_count();
+        let start = first_visible.min(item_count);
         let rendered = viewport_items.saturating_mul(self.limits.directory_rendered_viewports());
-        start..start.saturating_add(rendered).min(self.items.len())
+        start..start.saturating_add(rendered).min(item_count)
     }
 
     fn is_current(&self, load: &DirectoryLoad) -> bool {

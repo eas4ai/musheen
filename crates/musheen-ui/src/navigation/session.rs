@@ -1,4 +1,5 @@
 use super::{NavigationError, PaneId, PaneState, TabId, TabState};
+use crate::views::{ViewPreferenceStore, ViewPreferences};
 use musheen_core::StorePath;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -29,6 +30,8 @@ pub struct WindowSession {
     panes: Vec<PaneState>,
     focused_pane: usize,
     next_pane_id: u64,
+    #[serde(default)]
+    view_preferences: ViewPreferenceStore,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -122,6 +125,7 @@ impl WindowSession {
             panes: vec![PaneState::new(PaneId::new(1), initial)],
             focused_pane: 0,
             next_pane_id: 2,
+            view_preferences: ViewPreferenceStore::default(),
         }
     }
 
@@ -145,12 +149,36 @@ impl WindowSession {
     }
 
     #[must_use]
+    pub fn preferences_for(&self, path: &StorePath) -> &ViewPreferences {
+        self.view_preferences.for_path(path)
+    }
+
+    pub fn set_preferences_for(&mut self, path: StorePath, preferences: ViewPreferences) {
+        self.view_preferences.set(path, preferences);
+    }
+
+    #[must_use]
     pub fn focused_tab(&self) -> &TabState {
         self.focused_pane().active_tab()
     }
 
     pub fn focused_tab_mut(&mut self) -> &mut TabState {
         self.focused_pane_mut().active_tab_mut()
+    }
+
+    #[must_use]
+    pub fn tab(&self, id: TabId) -> Option<&TabState> {
+        self.panes
+            .iter()
+            .flat_map(PaneState::tabs)
+            .find(|tab| tab.id() == id)
+    }
+
+    pub fn tab_mut(&mut self, id: TabId) -> Option<&mut TabState> {
+        self.panes
+            .iter_mut()
+            .flat_map(|pane| pane.tabs_mut())
+            .find(|tab| tab.id() == id)
     }
 
     pub fn focus_pane(&mut self, id: PaneId) -> Result<(), NavigationError> {
@@ -210,6 +238,7 @@ impl WindowSession {
             panes: vec![PaneState::from_tab(PaneId::new(1), tab)],
             focused_pane: 0,
             next_pane_id: 2,
+            view_preferences: self.view_preferences.clone(),
         })
     }
 

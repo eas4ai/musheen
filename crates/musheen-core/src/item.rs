@@ -80,6 +80,7 @@ pub struct StoreItem {
     display_name: DisplayPath,
     kind: ItemKind,
     size: Option<u64>,
+    modified_unix_seconds: Option<i64>,
 }
 
 impl StoreItem {
@@ -97,7 +98,14 @@ impl StoreItem {
             display_name,
             kind,
             size,
+            modified_unix_seconds: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_modified_unix_seconds(mut self, modified_unix_seconds: i64) -> Self {
+        self.modified_unix_seconds = Some(modified_unix_seconds);
+        self
     }
 
     #[must_use]
@@ -123,5 +131,10 @@ impl StoreItem {
     #[must_use]
     pub fn size(&self) -> Option<u64> {
         self.size
+    }
+
+    #[must_use]
+    pub fn modified_unix_seconds(&self) -> Option<i64> {
+        self.modified_unix_seconds
     }
 }

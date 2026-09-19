@@ -3,6 +3,7 @@ use musheen_ui::navigation::{
     ApplicationSession, BreadcrumbTrail, NavigationFocus, OmnibarMode, OmnibarState,
     OmnibarSubmission, SessionSink, SessionWriteDebouncer, WindowSession, suggest_local_paths,
 };
+use musheen_ui::views::{GroupKey, Layout, SortDirection, SortKey, ViewPreferences};
 use std::ffi::OsString;
 use std::time::Duration;
 
@@ -268,6 +269,30 @@ fn application_session_migrates_a_legacy_single_window_document() {
         restored.windows()[0].focused_tab().location(),
         &path("/legacy")
     );
+}
+
+#[test]
+fn session_preserves_lossless_per_directory_view_preferences() {
+    let location = StorePath::from_unix_bytes(b"/view/bad-\xff".to_vec());
+    let mut window = WindowSession::new(location.clone());
+    let preferences = ViewPreferences {
+        layout: Layout::Details,
+        group: GroupKey::Kind,
+        directories_first: false,
+        show_hidden: true,
+        sort: musheen_ui::views::SortSpec {
+            key: SortKey::Modified,
+            direction: SortDirection::Descending,
+        },
+        ..ViewPreferences::default()
+    };
+    window.set_preferences_for(location.clone(), preferences.clone());
+
+    let encoded = window.to_json().expect("view preferences serialize");
+    let restored = WindowSession::restore_json(&encoded, |_| true, path("/fallback"))
+        .expect("view preferences restore");
+
+    assert_eq!(restored.preferences_for(&location), &preferences);
 }
 
 #[derive(Default)]

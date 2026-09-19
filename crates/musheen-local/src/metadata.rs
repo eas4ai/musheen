@@ -48,13 +48,16 @@ fn item_from_path_with_metadata(
     let display_name = path.file_name().unwrap_or(path.as_os_str());
     let size = file_type.is_file().then_some(metadata.len());
 
-    Ok(StoreItem::new(
-        id,
-        store_path,
-        DisplayPath::from(display_name),
-        kind,
-        size,
-    ))
+    let item = StoreItem::new(id, store_path, DisplayPath::from(display_name), kind, size);
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+    Ok(match modified {
+        Some(seconds) => item.with_modified_unix_seconds(seconds),
+        None => item,
+    })
 }
 
 fn local_item_id(

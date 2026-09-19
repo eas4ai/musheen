@@ -57,6 +57,10 @@ impl PaneState {
         &self.tabs
     }
 
+    pub(super) fn tabs_mut(&mut self) -> &mut [TabState] {
+        &mut self.tabs
+    }
+
     #[must_use]
     pub fn active_tab(&self) -> &TabState {
         &self.tabs[self.active_tab]
