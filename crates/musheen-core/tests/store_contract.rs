@@ -207,6 +207,30 @@ fn overflow_invalidates_the_directory_and_reconciliation_deduplicates_ids() {
 }
 
 #[test]
+fn reconciliation_replaces_a_stale_identity_at_the_same_path() {
+    let original = store_item(1);
+    let replacement_identity = store_item(2).id().clone();
+    let replacement = StoreItem::new(
+        replacement_identity.clone(),
+        original.path().clone(),
+        DisplayPath::new("replacement"),
+        ItemKind::RegularFile,
+        Some(2),
+    );
+    let original_identity = original.id().clone();
+    let mut reconciler = ReconcileBuffer::new(4).expect("the limit is valid");
+
+    reconciler.apply(original).expect("the original item fits");
+    reconciler
+        .apply(replacement)
+        .expect("the replacement item fits");
+
+    assert_eq!(reconciler.len(), 1);
+    assert!(reconciler.get(&original_identity).is_none());
+    assert!(reconciler.get(&replacement_identity).is_some());
+}
+
+#[test]
 fn store_trait_is_object_safe() {
     fn accepts_store(_store: &dyn Store) {}
 

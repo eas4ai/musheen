@@ -2,6 +2,7 @@
 
 mod cancel;
 mod capability;
+mod command;
 mod error;
 mod item;
 mod limits;
@@ -12,6 +13,7 @@ mod watch;
 
 pub use cancel::CancellationToken;
 pub use capability::{CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState};
+pub use command::*;
 pub use error::CoreError;
 pub use item::{ItemId, ItemKind, StoreItem};
 pub use limits::{ResourceLimitConfig, ResourceLimits};

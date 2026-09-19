@@ -1,5 +1,5 @@
 use crate::{BoxFuture, CancellationToken, ItemId, StoreError, StoreItem, StorePath};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -53,6 +53,7 @@ pub trait DirectoryWatch: Send {
 pub struct ReconcileBuffer {
     maximum: NonZeroUsize,
     items: BTreeMap<ItemId, StoreItem>,
+    identities_by_path: HashMap<StorePath, ItemId>,
 }
 
 impl ReconcileBuffer {
@@ -66,18 +67,30 @@ impl ReconcileBuffer {
         Ok(Self {
             maximum,
             items: BTreeMap::new(),
+            identities_by_path: HashMap::new(),
         })
     }
 
     pub fn apply(&mut self, item: StoreItem) -> Result<(), StoreError> {
         let id = item.id().clone();
-        if !self.items.contains_key(&id) && self.items.len() == self.maximum.get() {
+        let path = StoreItem::path(&item).clone();
+        let replaced_id = self.identities_by_path.get(&path).cloned();
+        let adds_item = !self.items.contains_key(&id) && replaced_id.is_none();
+        if adds_item && self.items.len() == self.maximum.get() {
             return Err(StoreError::ResourceLimit {
                 resource: "reconciliation item models",
                 value: self.items.len() + 1,
                 maximum: self.maximum.get(),
             });
         }
+
+        if let Some(previous) = self.items.remove(&id) {
+            self.identities_by_path.remove(StoreItem::path(&previous));
+        }
+        if let Some(replaced_id) = replaced_id {
+            self.items.remove(&replaced_id);
+        }
+        self.identities_by_path.insert(path, id.clone());
         self.items.insert(id, item);
         Ok(())
     }
@@ -98,6 +111,8 @@ impl ReconcileBuffer {
     }
 
     pub fn remove(&mut self, id: &ItemId) -> Option<StoreItem> {
-        self.items.remove(id)
+        let item = self.items.remove(id)?;
+        self.identities_by_path.remove(StoreItem::path(&item));
+        Some(item)
     }
 }

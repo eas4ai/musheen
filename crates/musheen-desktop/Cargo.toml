@@ -14,5 +14,8 @@ native-theme.workspace = true
 open.workspace = true
 wax.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

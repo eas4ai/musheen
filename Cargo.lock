@@ -3378,6 +3378,7 @@ dependencies = [
  "musheen-ops",
  "native-theme",
  "open",
+ "tempfile",
  "wax",
 ]
 

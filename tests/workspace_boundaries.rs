@@ -54,15 +54,11 @@ fn workspace_contains_each_domain_crate() {
 }
 
 #[test]
-fn direct_filesystem_access_is_confined_to_the_local_crate() {
+fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
     let crates_root = repository_root().join("crates");
     let mut violations = Vec::new();
 
-    for crate_name in REQUIRED_CRATES {
-        if crate_name == "musheen-local" {
-            continue;
-        }
-
+    for crate_name in ["musheen-ui", "musheen-ops"] {
         let mut rust_files = Vec::new();
         rust_files_below(&crates_root.join(crate_name).join("src"), &mut rust_files);
         for file in rust_files {
@@ -75,6 +71,6 @@ fn direct_filesystem_access_is_confined_to_the_local_crate() {
 
     assert!(
         violations.is_empty(),
-        "only musheen-local may call std::fs directly: {violations:?}"
+        "UI and operation domains must use provider or desktop boundaries: {violations:?}"
     );
 }

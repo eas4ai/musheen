@@ -1,7 +1,7 @@
 use crate::metadata::{io_error, item_from_path};
 use musheen_core::{
-    BoxFuture, CancellationToken, DirectoryWatch, ItemId, ProviderId, StoreError, StorePath,
-    WatchEvent, WatchFailure, WatchSemantics,
+    BoxFuture, CancellationToken, DirectoryWatch, ItemId, ProviderId, StoreError, StoreItem,
+    StorePath, WatchEvent, WatchFailure, WatchSemantics,
 };
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -102,7 +102,7 @@ impl LocalWatch {
                 let current_path = event.paths[event.paths.len() - 1].clone();
                 let item = item_from_path(&self.provider, &current_path)?;
                 self.identities.remove(&previous_path);
-                self.remember(&current_path, item.id().clone());
+                self.remember_item(&item)?;
                 Ok(Some(WatchEvent::Renamed {
                     previous_path: StorePath::from_unix_path(previous_path.into_os_string()),
                     item,
@@ -141,7 +141,7 @@ impl LocalWatch {
             }) => return self.removed_event(Some(path)),
             Err(error) => return Err(error),
         };
-        self.remember(path, item.id().clone());
+        self.remember_item(&item)?;
         Ok(Some(if created {
             WatchEvent::Created(item)
         } else {
@@ -166,6 +166,14 @@ impl LocalWatch {
         if self.identities.len() < MAX_TRACKED_IDENTITIES || self.identities.contains_key(path) {
             self.identities.insert(path.to_path_buf(), id);
         }
+    }
+
+    fn remember_item(&mut self, item: &StoreItem) -> Result<(), StoreError> {
+        let path = item.path().as_unix_path().ok_or_else(|| {
+            StoreError::Backend("the local watcher produced a non-Unix item path".into())
+        })?;
+        self.remember(path, item.id().clone());
+        Ok(())
     }
 }
 
