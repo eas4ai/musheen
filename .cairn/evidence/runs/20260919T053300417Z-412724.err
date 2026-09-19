@@ -1,0 +1,4 @@
+DEP-001: native-theme is not declared with a concrete version
+DEP-001: native-theme-gpui is not declared with a concrete version
+DEP-001: Cargo.lock does not contain native-theme
+DEP-001: Cargo.lock does not contain native-theme-gpui
