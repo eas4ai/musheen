@@ -141,3 +141,27 @@ fn linux_build_uses_the_dockerfile_from_its_archived_context() {
 
     fs::remove_dir_all(scratch).expect("test scratch directory should be removable");
 }
+
+#[test]
+fn linux_build_bounds_rust_compiler_resources() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dockerfile = fs::read_to_string(root.join("ci/linux-build.Dockerfile"))
+        .expect("Linux build Dockerfile should be readable");
+
+    assert!(
+        dockerfile.contains("CARGO_BUILD_JOBS=1"),
+        "clean Docker builds must compile one crate job at a time"
+    );
+    assert!(
+        dockerfile.contains("RUST_MIN_STACK=16777216"),
+        "clean Docker builds must give rustc enough worker stack"
+    );
+    assert!(
+        dockerfile.contains("--mount=type=cache,target=/usr/local/cargo/registry"),
+        "clean Docker builds must reuse the Cargo registry cache"
+    );
+    assert!(
+        dockerfile.contains("--mount=type=cache,target=/workspace/target"),
+        "clean Docker builds must reuse compiled artifacts"
+    );
+}
