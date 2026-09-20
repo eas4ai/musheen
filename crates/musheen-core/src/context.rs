@@ -232,6 +232,7 @@ pub enum CommandParameters {
         targets: Vec<CommandTargetRef>,
         destination: StorePath,
     },
+    DestinationRequest(Vec<CommandTargetRef>),
     Location(StorePath),
     CustomAction {
         targets: Vec<CommandTargetRef>,
@@ -251,5 +252,10 @@ impl CommandParameters {
             targets,
             destination,
         }
+    }
+
+    #[must_use]
+    pub fn destination_request(targets: Vec<CommandTargetRef>) -> Self {
+        Self::DestinationRequest(targets)
     }
 }

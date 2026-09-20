@@ -783,6 +783,85 @@ fn handlers_reject_invalid_parameter_shapes_before_dispatch() {
 }
 
 #[test]
+fn destination_workflows_distinguish_chooser_requests_from_resolved_execution() {
+    let registry = CommandRegistry::built_in();
+    let mut dispatcher = RecordingDispatcher::default();
+
+    for (id, action, targets, chooser_context) in [
+        (
+            "clipboard.copy_to",
+            CommandAction::CopyTo,
+            vec![local_target(), local_target()],
+            CommandContext {
+                selection_count: 2,
+                target: CommandTarget::MultiSelection,
+                resolved_destination: None,
+                ..CommandContext::default()
+            },
+        ),
+        (
+            "clipboard.move_to",
+            CommandAction::MoveTo,
+            vec![local_target(), local_target()],
+            CommandContext {
+                selection_count: 2,
+                target: CommandTarget::MultiSelection,
+                location_is_writable: true,
+                mutation_is_supported: true,
+                resolved_destination: None,
+                ..CommandContext::default()
+            },
+        ),
+        (
+            "archive.extract",
+            CommandAction::Extract,
+            vec![local_target()],
+            CommandContext {
+                selection_count: 1,
+                target: CommandTarget::Archive,
+                resolved_destination: None,
+                ..CommandContext::default()
+            },
+        ),
+    ] {
+        let command = registry.get(id).unwrap();
+        assert!(command.state(&chooser_context).is_enabled(), "{id}");
+        let handler = command.handler();
+        handler
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::destination_request(targets.clone()),
+            )
+            .unwrap();
+        handler
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::destination(targets.clone(), StorePath::from_unix_path("/to")),
+            )
+            .unwrap();
+        assert!(
+            handler
+                .invoke(&mut dispatcher, CommandParameters::targets(targets))
+                .is_err()
+        );
+        assert_eq!(
+            dispatcher.actions[dispatcher.actions.len() - 2..],
+            [action, action]
+        );
+    }
+
+    let extract = registry.get("archive.extract").unwrap().handler();
+    assert!(
+        extract
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::destination_request(vec![local_target(), local_target()]),
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn destination_and_source_policies_distinguish_choosing_from_executing() {
     let registry = CommandRegistry::built_in();
     let copy_to = registry.get("clipboard.copy_to").unwrap();
@@ -917,7 +996,8 @@ fn every_single_target_contract_rejects_multiple_targets_before_dispatch() {
             CommandParameterContract::Targets(TargetCardinality::ExactlyOne) => {
                 CommandParameters::targets(vec![local_target(), local_target()])
             }
-            CommandParameterContract::Destination(TargetCardinality::ExactlyOne) => {
+            CommandParameterContract::Destination(TargetCardinality::ExactlyOne)
+            | CommandParameterContract::DestinationWorkflow(TargetCardinality::ExactlyOne) => {
                 CommandParameters::destination(
                     vec![local_target(), local_target()],
                     StorePath::from_unix_path("/destination"),

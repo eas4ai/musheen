@@ -575,6 +575,7 @@ pub enum CommandParameterContract {
     None,
     Targets(TargetCardinality),
     Destination(TargetCardinality),
+    DestinationWorkflow(TargetCardinality),
     Location,
     CustomAction(TargetCardinality),
 }
@@ -623,11 +624,14 @@ impl CommandAction {
             | CommandAction::PasteInto
             | CommandAction::DirectoryProperties
             | CommandAction::EmptyTrash => CommandParameterContract::Location,
-            CommandAction::SendTo | CommandAction::CopyTo | CommandAction::MoveTo => {
+            CommandAction::SendTo => {
                 CommandParameterContract::Destination(TargetCardinality::OneOrMore)
             }
+            CommandAction::CopyTo | CommandAction::MoveTo => {
+                CommandParameterContract::DestinationWorkflow(TargetCardinality::OneOrMore)
+            }
             CommandAction::Extract => {
-                CommandParameterContract::Destination(TargetCardinality::ExactlyOne)
+                CommandParameterContract::DestinationWorkflow(TargetCardinality::ExactlyOne)
             }
             CommandAction::CustomAction => {
                 CommandParameterContract::CustomAction(TargetCardinality::OneOrMore)
@@ -663,6 +667,14 @@ fn validate_parameters(
         }
         (
             CommandParameterContract::Destination(cardinality),
+            CommandParameters::Destination { targets, .. },
+        ) => cardinality_matches(cardinality, targets.len()),
+        (
+            CommandParameterContract::DestinationWorkflow(cardinality),
+            CommandParameters::DestinationRequest(targets),
+        ) => cardinality_matches(cardinality, targets.len()),
+        (
+            CommandParameterContract::DestinationWorkflow(cardinality),
             CommandParameters::Destination { targets, .. },
         ) => cardinality_matches(cardinality, targets.len()),
         (
@@ -1631,7 +1643,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
         command(
             "file.create_symbolic_link",
             "command.create-symbolic-link",
-            "link",
+            "file-symlink",
             &[],
             P::WritableExactlyOneSelectionCapability(CapabilityKind::SymbolicLinks),
             A::CreateSymbolicLink,
@@ -1641,7 +1653,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
         command(
             "file.create_hard_link",
             "command.create-hard-link",
-            "link",
+            "link-2",
             &[],
             P::WritableExactlyOneFileCapability(CapabilityKind::HardLinks),
             A::CreateHardLink,

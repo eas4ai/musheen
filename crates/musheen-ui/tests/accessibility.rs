@@ -35,6 +35,23 @@ fn an_unknown_action_icon_uses_the_extension_puzzle_fallback() {
 }
 
 #[test]
+fn command_icon_keys_resolve_to_semantic_lucide_glyphs() {
+    for (key, expected) in [
+        ("scissors", LucideIcon::Scissors),
+        ("terminal", LucideIcon::Terminal),
+        ("eye-off", LucideIcon::EyeOff),
+        ("eye", LucideIcon::Eye),
+        ("file-symlink", LucideIcon::FileSymlink),
+        ("link-2", LucideIcon::Link2),
+        ("tag", LucideIcon::Tag),
+        ("shield", LucideIcon::Shield),
+        ("pin", LucideIcon::Pin),
+    ] {
+        assert_eq!(lucide_icon(key), Some(expected), "{key}");
+    }
+}
+
+#[test]
 fn pseudo_locale_covers_and_expands_every_english_message() {
     let english = Catalog::load(Locale::EnUs).expect("the English catalog is valid");
     let pseudo = Catalog::load(Locale::EnXa).expect("the pseudo catalog is valid");
