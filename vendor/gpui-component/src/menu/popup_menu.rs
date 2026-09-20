@@ -916,7 +916,11 @@ impl PopupMenu {
         if let Some(ix) = self.selected_index {
             if let Some(item) = self.menu_items.get(ix) {
                 return match item {
-                    PopupMenuItem::Submenu { menu, .. } => Some(menu.clone()),
+                    PopupMenuItem::Submenu {
+                        menu,
+                        disabled: false,
+                        ..
+                    } => Some(menu.clone()),
                     _ => None,
                 };
             }
@@ -946,7 +950,10 @@ impl PopupMenu {
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_index {
             Some(index) => {
-                let item = self.menu_items.get(index);
+                let item = self
+                    .menu_items
+                    .get(index)
+                    .filter(|item| item.is_clickable());
                 match item {
                     Some(PopupMenuItem::Item {
                         handler, action, ..
@@ -1013,27 +1020,32 @@ impl PopupMenu {
         }
 
         let last_clickable_ix = self.clickable_menu_items().last().map(|(ix, _)| ix);
-        self.set_selected_index(last_clickable_ix.unwrap_or(0), cx);
+        if let Some(ix) = last_clickable_ix {
+            self.set_selected_index(ix, cx);
+        } else {
+            self.selected_index = None;
+            cx.notify();
+        }
     }
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        let Some(ix) = self.selected_index else {
-            self.set_selected_index(0, cx);
-            return;
-        };
-
-        if let Some((next_ix, _)) = self
-            .menu_items
-            .iter()
-            .enumerate()
-            .find(|(i, item)| *i > ix && item.is_clickable())
+        if let Some((next_ix, _)) =
+            self.menu_items.iter().enumerate().find(|(i, item)| {
+                self.selected_index.is_none_or(|ix| *i > ix) && item.is_clickable()
+            })
         {
             self.set_selected_index(next_ix, cx);
             return;
         }
 
-        self.set_selected_index(0, cx);
+        let first_clickable_ix = self.clickable_menu_items().next().map(|(ix, _)| ix);
+        if let Some(ix) = first_clickable_ix {
+            self.set_selected_index(ix, cx);
+        } else {
+            self.selected_index = None;
+            cx.notify();
+        }
     }
 
     fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
@@ -1078,7 +1090,8 @@ impl PopupMenu {
         if let Some(active_submenu) = self.active_submenu() {
             // Focus the submenu, so that can be handle the action.
             active_submenu.update(cx, |view, cx| {
-                view.set_selected_index(0, cx);
+                view.selected_index = None;
+                view.select_down(&SelectDown, window, cx);
                 view.focus_handle.focus(window, cx);
             });
             cx.notify();
@@ -1333,7 +1346,7 @@ impl PopupMenu {
             .items_center()
             .selected(selected)
             .on_hover(cx.listener(move |this, hovered, _, cx| {
-                if *hovered {
+                if *hovered && this.menu_items[ix].is_clickable() {
                     this.selected_index = Some(ix);
                 } else if !is_submenu && this.selected_index == Some(ix) {
                     // TODO: Better handle the submenu unselection when hover out

@@ -3025,6 +3025,35 @@ impl MusheenApp {
         target: CommandTarget,
         selection: &[CommandTargetRef],
     ) -> CapabilityState {
+        // Trash renders receipts in deletion order, independently of the
+        // directory view. Do not advertise preferences it cannot render.
+        if self
+            .navigation
+            .tab(tab_id)
+            .is_some_and(|tab| is_trash_location(tab.location()))
+            && matches!(
+                action,
+                CommandAction::ViewDetails
+                    | CommandAction::ViewList
+                    | CommandAction::ViewCards
+                    | CommandAction::ViewGrid
+                    | CommandAction::ViewColumns
+                    | CommandAction::ViewAdaptive
+                    | CommandAction::CycleSort
+                    | CommandAction::CycleGroup
+                    | CommandAction::ToggleDirectoriesFirst
+                    | CommandAction::ToggleHidden
+            )
+        {
+            return CapabilityState::Unsupported(
+                CapabilityReason::new(
+                    self.catalog
+                        .message("context.backend-unavailable")
+                        .expect("backend refusal is localized"),
+                )
+                .expect("backend refusal is nonempty"),
+            );
+        }
         let target_matches = match action {
             CommandAction::Restore => target == CommandTarget::TrashItem && selection.len() == 1,
             CommandAction::EmptyTrash => target == CommandTarget::TrashBackground,
@@ -8503,6 +8532,76 @@ mod tests {
             assert!(window.try_find("operation-status-42").is_none());
         })
         .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn trash_view_commands_are_disabled_by_the_live_registry(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let tab_id = state.navigation.focused_tab().id();
+                state.navigation.navigate_focused(trash_store_path());
+                state.trash_states.insert(
+                    tab_id,
+                    TrashState::Ready(TrashSurfaceModel::new(Vec::new())),
+                );
+                let before = state.focused_directory().view().preferences().clone();
+                let menu = state.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+                for id in ["view.hidden", "view.sort", "view.group"] {
+                    let entry = menu.entry(id).expect("Trash background view command");
+                    assert!(!entry.state().is_enabled(), "{id}");
+                    assert_eq!(
+                        entry.state().disabled_reason(),
+                        Some(
+                            state
+                                .catalog
+                                .message("context.backend-unavailable")
+                                .unwrap()
+                        )
+                    );
+                    state.dispatch_context_entry(entry.clone(), cx);
+                }
+                for id in [
+                    "view.details",
+                    "view.list",
+                    "view.cards",
+                    "view.grid",
+                    "view.columns",
+                    "view.adaptive",
+                    "view.sort",
+                    "view.group",
+                    "view.directories_first",
+                    "view.hidden",
+                ] {
+                    let command = state.shell.commands().get(id).unwrap();
+                    assert!(
+                        !command.state(&state.active_command_context()).is_enabled(),
+                        "{id}"
+                    );
+                    state.dispatch_command(id, cx);
+                }
+                assert_eq!(state.focused_directory().view().preferences(), &before);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("trash-surface").visible());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

@@ -476,6 +476,109 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn popup_keyboard_skips_disabled_rows_on_entry_wrap_and_submenu(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        cx.update(gpui_kit::init);
+        for (keys, expected) in [
+            (vec!["down", "enter"], 1),
+            (vec!["up", "up", "down", "down", "enter"], 1),
+            (vec!["down", "up", "up", "enter"], 2),
+            (vec!["up", "right", "enter"], 3),
+        ] {
+            let invoked = Rc::new(Cell::new(0));
+            let handle = cx.open_window(size(px(800.), px(480.)), |window, cx| {
+                let item = |label, value, disabled| {
+                    let invoked = invoked.clone();
+                    PopupMenuItem::new(label)
+                        .disabled(disabled)
+                        .on_click(move |_, _, _| invoked.set(value))
+                };
+                let child = PopupMenu::build(window, cx, |popup, _, _| {
+                    popup
+                        .item(item("Disabled child", 99, true))
+                        .item(PopupMenuItem::label("Child label"))
+                        .item(item("Child", 3, false))
+                });
+                let popup = PopupMenu::build(window, cx, |popup, _, _| {
+                    let disabled_invoked = invoked.clone();
+                    popup
+                        .item(item("Disabled first", 99, true))
+                        .item(PopupMenuItem::label("Section"))
+                        .item(PopupMenuItem::separator())
+                        .item(item("First", 1, false))
+                        .item(
+                            PopupMenuItem::element(|_, _| div().child("Disabled custom"))
+                                .disabled(true)
+                                .on_click(move |_, _, _| disabled_invoked.set(99)),
+                        )
+                        .item(item("Second", 2, false))
+                        .item(
+                            PopupMenuItem::submenu("Disabled submenu", child.clone())
+                                .disabled(true),
+                        )
+                        .item(PopupMenuItem::submenu("More", child))
+                        .item(item("Disabled last", 99, true))
+                });
+                popup.update(cx, |popup, cx| popup.focus_handle(cx).focus(window, cx));
+                Root::new(popup, window, cx)
+            });
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                for key in keys {
+                    window.press(key, cx);
+                    window.render_frame(cx);
+                }
+                assert_eq!(invoked.get(), expected);
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn popup_with_only_disabled_rows_does_not_invoke_or_dismiss(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        cx.update(gpui_kit::init);
+        let invoked = Rc::new(Cell::new(false));
+        let dismissed = Rc::new(Cell::new(false));
+        let mut subscription = None;
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let invoked = invoked.clone();
+            let popup = PopupMenu::build(window, cx, |popup, _, _| {
+                popup.item(
+                    PopupMenuItem::new("Disabled")
+                        .disabled(true)
+                        .on_click(move |_, _, _| invoked.set(true)),
+                )
+            });
+            let observed = popup.clone();
+            let dismissed = dismissed.clone();
+            popup.update(cx, |popup, cx| {
+                subscription = Some(cx.subscribe(
+                    &observed,
+                    move |_, _, _: &gpui_kit::DismissEvent, _| {
+                        dismissed.set(true);
+                    },
+                ));
+                popup.focus_handle(cx).focus(window, cx);
+            });
+            Root::new(popup, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            for key in ["down", "enter", "up", "enter"] {
+                window.press(key, cx);
+                window.render_frame(cx);
+            }
+            assert!(!invoked.get());
+            assert!(!dismissed.get());
+        })
+        .unwrap();
+        drop(subscription);
+    }
+
+    #[gpui_kit::test]
     fn viewport_bound_popup_scrolls_keyboard_selection_to_the_last_command(
         cx: &mut TestAppContext,
     ) {
