@@ -25,8 +25,14 @@ variables are not inherited.
 
 The runner uses null standard streams and a new process group. Timeout kills the
 group and reaps the direct child. Missing executables, nonzero exits, and timeouts
-are shown in the operation error surface. At most four actions run per browser
-window. Targets and the action definition are revalidated after confirmation.
+are shown as structured custom-action records in the shared status center. Each
+record names the action, folder, affected items, cause, and recovery step. Control
+characters in displayed names and paths are escaped. History retains 128 records;
+each records the item count and the first 16 affected paths. At most four actions
+run across the whole application. Closing the origin tab or window does not drop
+the job or its result. A successful action refreshes its original tab, if that tab
+still shows the original folder; it does not change the focused tab. Targets and
+the action definition are revalidated after confirmation.
 
 ## Script directory
 
@@ -36,10 +42,11 @@ manifest. Use Reload script-directory actions after changing its contents. An
 absent directory contributes nothing. Create script directory makes the displayed
 configuration folder with owner-only permissions. Scripts are loaded on a
 background worker and revalidated before execution. User-defined
-IDs take precedence over conflicting script IDs, with an error explaining the
+IDs take precedence over conflicting script IDs, with a source warning explaining the
 conflict. Remaining slots in the combined 64-action / 256-KiB limit are filled by
 script ID order; overflow reports a warning while accepted actions stay available.
-Disable the switch to remove all script contributions.
+Disable the switch to remove all script contributions. Source warnings are separate
+from operation failures and clear after resolving the conflict or disabling the source.
 
 Example manifest for an executable named `inspect` in that directory:
 
@@ -61,8 +68,15 @@ Example manifest for an executable named `inspect` in that directory:
 ```
 
 For a non-UTF-8 script name, `script` accepts `{"unix_bytes": [105, 255]}`.
-Symlinks, non-regular files, non-executable scripts, unknown fields, and resource
-limit violations fail closed. The loader caps directory entries, individual and
+The source directory, manifests, and executables must belong to the current user
+and must not be group- or other-writable. Use a private directory (mode 0700),
+manifests such as mode 0600, and executables such as mode 0700. Symlinks,
+non-regular files, non-executable scripts, unknown fields, and resource limit
+violations fail closed. Execution pins a validated file descriptor and uses its
+Linux `/proc/<parent-pid>/fd/<n>` reference, so replacing the original script path
+after validation cannot substitute another executable. The descriptor stays open
+until completion and is close-on-exec; other children do not inherit it. An
+unavailable `/proc` reference fails closed. The loader caps directory entries, individual and
 total manifest bytes, script sizes, and action count. Script manifests support
 direct execution only; shell interpreters belong in the script's shebang.
 

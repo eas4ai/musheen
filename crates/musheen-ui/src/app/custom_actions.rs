@@ -1,4 +1,5 @@
 use super::*;
+use crate::status_center::custom_actions::CustomActionContext;
 use musheen_desktop::{
     ActionSelection, CustomAction, CustomActionDocument, CustomActionError, CustomActionRunner,
     SettingsDocument,
@@ -94,6 +95,102 @@ impl LiveActionPopup {
 }
 
 impl MusheenApp {
+    pub(super) fn custom_action_warning_row(&self) -> Option<AnyElement> {
+        let message = self.custom_action_warning.map(|key| {
+            self.catalog
+                .message(key)
+                .expect("custom action warning is localized")
+        })?;
+        Some(
+            div()
+                .id("custom-action-source-warning")
+                .role(Role::Status)
+                .px_3()
+                .py_2()
+                .child(message.to_owned())
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn custom_action_status_summary(&self) -> Option<String> {
+        let status = self.operation_hub.status();
+        let status = status.lock().ok()?;
+        let entry = status
+            .custom_actions()
+            .iter()
+            .rev()
+            .find(|entry| entry.visible())?;
+        Some(format!(
+            "{} — {}",
+            crate::status_center::custom_actions::safe_text(&entry.context.label),
+            self.catalog
+                .message(match entry.status {
+                    OperationStatus::Running => "custom-action-job-running",
+                    OperationStatus::Completed => "custom-action-job-completed",
+                    _ => "custom-action-job-failed",
+                })
+                .expect("action status")
+        ))
+    }
+
+    pub(super) fn custom_action_status_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let status = self.operation_hub.status();
+        let Ok(status) = status.lock() else {
+            return Vec::new();
+        };
+        status
+            .custom_actions()
+            .iter()
+            .filter(|entry| entry.visible())
+            .map(|entry| {
+                let id = entry.id;
+                let message = entry.message(&self.catalog);
+                let location = entry.context.location.clone();
+                div()
+                    .id(SharedString::from(format!("custom-action-status-{id}")))
+                    .test_support()
+                    .role(Role::Status)
+                    .aria_label(message.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors.border)
+                    .child(div().flex_1().text_sm().child(message))
+                    .child(
+                        Button::new(SharedString::from(format!("custom-action-view-{id}")))
+                            .label(
+                                self.catalog
+                                    .message("custom-action-job-view")
+                                    .expect("action view"),
+                            )
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.view_operation_location(location.clone(), cx)
+                            })),
+                    )
+                    .when(entry.status != OperationStatus::Running, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("custom-action-dismiss-{id}")))
+                                .label(
+                                    self.catalog
+                                        .message("custom-action-job-dismiss")
+                                        .expect("action dismiss"),
+                                )
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.operation_hub.dismiss_custom_action(id);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     pub(super) fn track_live_action_popup(
         owner: gpui_kit::WeakEntity<Self>,
         menu: &ContextMenu,
@@ -262,6 +359,7 @@ impl MusheenApp {
             self.scripts_enabled = enabled;
             self.script_reload_revision = revision;
             self.script_actions = CustomActionDocument::default();
+            self.script_load_warning = None;
             if enabled {
                 self.reload_script_actions(revision, cx);
             }
@@ -271,14 +369,11 @@ impl MusheenApp {
         } else {
             (actions, None)
         };
-        if let Some(warning) = warning {
-            self.operation_error = Some(
-                self.catalog
-                    .message(warning)
-                    .expect("localized action warning")
-                    .into(),
-            );
-        }
+        self.custom_action_warning = if enabled {
+            warning.or(self.script_load_warning)
+        } else {
+            None
+        };
         self.custom_actions = actions;
     }
 
@@ -294,11 +389,11 @@ impl MusheenApp {
             this.update(cx, |this, cx| {
                 if this.scripts_enabled && this.script_reload_revision == revision {
                     match result {
-                        Ok(actions) => this.script_actions = actions,
-                        Err(error) => this.custom_action_error(
-                            CustomActionError::ScriptSource(Box::new(error)),
-                            cx,
-                        ),
+                        Ok(actions) => {
+                            this.script_actions = actions;
+                            this.script_load_warning = None;
+                        }
+                        Err(error) => this.script_load_warning = Some(error.message_key()),
                     }
                 }
                 cx.notify();
@@ -320,9 +415,6 @@ impl MusheenApp {
             .ok_or(CustomActionError::InvalidDocument)?;
         if action.requires_confirmation() && !confirmed {
             return Err(CustomActionError::ConfirmationRequired);
-        }
-        if self.running_custom_actions >= 4 {
-            return Err(CustomActionError::SelectionMismatch);
         }
         Ok(action.clone())
     }
@@ -356,60 +448,115 @@ impl MusheenApp {
             return;
         };
         self.refresh_custom_actions(cx);
+        let context = self.capture_custom_action_context(&id, &targets, &location);
         let action = match self.reviewed_custom_action(&id, &definition, confirmed) {
             Ok(action) => action,
             Err(error) => {
-                self.custom_action_error(error, cx);
+                self.reject_custom_action(context, error, cx);
                 return;
             }
         };
-        if let Err(error) = self.revalidate_context_targets(origin_tab, &targets) {
-            self.operation_error = Some(error);
-            cx.notify();
+        if self
+            .revalidate_context_targets(origin_tab, &targets)
+            .is_err()
+        {
+            self.reject_custom_action(context, CustomActionError::SelectionMismatch, cx);
             return;
         }
-        let store = Arc::clone(&self.store);
+        let id = match self.operation_hub.submit_custom_action(context.clone()) {
+            Ok(id) => id,
+            Err(error) => {
+                self.reject_custom_action(context, error, cx);
+                return;
+            }
+        };
         let work = CustomActionWork {
-            script_action: self.is_script_action(&id, cx),
+            script_action: self.is_script_action(&action.id, cx),
             action,
             targets,
             location,
             confirmed,
         };
+        self.spawn_custom_action(id, work, (origin_tab, context.location), cx);
+    }
+
+    fn capture_custom_action_context(
+        &self,
+        id: &str,
+        targets: &[CommandTargetRef],
+        location: &StorePath,
+    ) -> CustomActionContext {
+        CustomActionContext {
+            action_id: id.into(),
+            label: self
+                .custom_actions
+                .get(id)
+                .map_or_else(|| id.into(), |action| action.label.clone()),
+            targets: targets
+                .iter()
+                .take(16)
+                .map(|target| target.path().clone())
+                .collect(),
+            target_count: targets.len(),
+            location: location.clone(),
+        }
+    }
+
+    fn spawn_custom_action(
+        &mut self,
+        id: u64,
+        work: CustomActionWork,
+        origin: (Option<TabId>, StorePath),
+        cx: &mut Context<Self>,
+    ) {
+        let store = Arc::clone(&self.store);
+        let hub = self.operation_hub.clone();
         self.running_custom_actions += 1;
-        let work = cx.background_spawn(async move { work.run(store.as_ref()) });
+        let work = cx.background_spawn(async move {
+            let result = work.run(store.as_ref());
+            hub.finish_custom_action(id, &result);
+            result.is_ok()
+        });
         cx.spawn(async move |this, cx| {
-            let result = work.await;
+            let succeeded = work.await;
             let Some(this) = this.upgrade() else {
                 return;
             };
-            this.update(cx, |this, cx| this.finish_custom_action(result, cx));
+            this.update(cx, |this, cx| {
+                this.finish_custom_action(succeeded, origin.0, origin.1, cx)
+            });
         })
         .detach();
     }
 
     fn finish_custom_action(
         &mut self,
-        result: Result<(), CustomActionError>,
+        succeeded: bool,
+        origin_tab: Option<TabId>,
+        location: StorePath,
         cx: &mut Context<Self>,
     ) {
         self.running_custom_actions = self.running_custom_actions.saturating_sub(1);
-        match result {
-            Err(error) => self.custom_action_error(error, cx),
-            Ok(()) => self.load_focused_tab(cx),
+        if succeeded {
+            if let Some(tab) = origin_tab.and_then(|id| self.navigation.tab(id))
+                && tab.location() == &location
+            {
+                self.start_load_for_tab(tab.id(), location, cx);
+            }
+        } else {
+            self.status_center_open = true;
         }
         cx.notify();
     }
 
-    fn custom_action_error(&mut self, error: CustomActionError, cx: &mut Context<Self>) {
-        let message = self
-            .catalog
-            .message(error.message_key())
-            .expect("action error is localized");
-        self.operation_error = Some(match error {
-            CustomActionError::ExitStatus(code) => format!("{message} ({code:?})").into(),
-            _ => message.into(),
-        });
+    fn reject_custom_action(
+        &mut self,
+        context: CustomActionContext,
+        error: CustomActionError,
+        cx: &mut Context<Self>,
+    ) {
+        self.operation_hub.reject_custom_action(context, &error);
+        self.status_center_open = true;
         cx.notify();
     }
 }
@@ -424,7 +571,6 @@ struct CustomActionWork {
 
 impl CustomActionWork {
     fn run(self, store: &dyn Store) -> Result<(), CustomActionError> {
-        self.revalidate_script()?;
         revalidate_action_targets(store, &self.targets)?;
         let paths = self
             .targets
@@ -438,23 +584,17 @@ impl CustomActionWork {
             .iter()
             .filter_map(|key| std::env::var_os(key).map(|value| (key.clone(), value)))
             .collect();
-        let prepared = self.action.prepare(&selection, &environment)?;
+        let prepared = if self.script_action {
+            musheen_desktop::ScriptActionLoader::prepare(
+                &script_directory(),
+                &self.action,
+                &selection,
+                &environment,
+            )?
+        } else {
+            self.action.prepare(&selection, &environment)?
+        };
         CustomActionRunner::run(prepared, self.confirmed)
-    }
-
-    fn revalidate_script(&self) -> Result<(), CustomActionError> {
-        if !self.script_action {
-            return Ok(());
-        }
-        let scripts = musheen_desktop::ScriptActionLoader::load(&script_directory())
-            .map_err(|error| CustomActionError::ScriptSource(Box::new(error)))?;
-        if scripts
-            .get(&self.action.id)
-            .is_none_or(|current| current != &self.action)
-        {
-            return Err(CustomActionError::InvalidDocument);
-        }
-        Ok(())
     }
 }
 
@@ -493,6 +633,258 @@ mod tests {
     };
     use standard_library::fs as filesystem;
     use std as standard_library;
+
+    #[gpui_kit::test]
+    fn custom_action_script_warnings_clear_without_overwriting_operation_errors(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let root = tempfile::tempdir().unwrap();
+        let document = CustomActionDocument::new(vec![action(root.path())]).unwrap();
+        let mut settings = SettingsDocument::default();
+        settings
+            .set_value("advanced.custom_actions", &document.export())
+            .unwrap();
+        settings
+            .set_value("advanced.script_directory", "true")
+            .unwrap();
+        cx.update(|cx| {
+            cx.set_global(crate::settings::RuntimeSettings(settings.clone()));
+            let app = cx.new(|cx| MusheenApp::new_with_session_store(root.path().into(), None, cx));
+            app.update(cx, |app, cx| {
+                app.scripts_enabled = true;
+                app.script_actions = document;
+                app.operation_error = Some("unrelated operation error".into());
+                app.refresh_custom_actions(cx);
+                assert_eq!(
+                    app.operation_error.as_deref(),
+                    Some("unrelated operation error")
+                );
+                assert_eq!(
+                    app.custom_action_warning,
+                    Some("custom-action-script-collision")
+                );
+                app.script_actions = CustomActionDocument::default();
+                app.refresh_custom_actions(cx);
+                assert!(app.custom_action_warning.is_none());
+                settings
+                    .set_value("advanced.script_directory", "false")
+                    .unwrap();
+                cx.set_global(crate::settings::RuntimeSettings(settings));
+                app.refresh_custom_actions(cx);
+                assert!(app.custom_action_warning.is_none());
+                assert_eq!(
+                    app.operation_error.as_deref(),
+                    Some("unrelated operation error")
+                );
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn custom_action_completion_refreshes_origin_tab_without_changing_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.txt");
+        let output = root.path().join("created.txt");
+        filesystem::write(&source, "source").unwrap();
+        let mut action = action(&output);
+        action.execution = ActionExecution::Shell {
+            script: "/bin/sleep 0.15; /usr/bin/touch -- \"$1\"".into(),
+            opted_in: true,
+        };
+        action.arguments = vec![ActionArgument::Literal(output.to_str().unwrap().into())];
+        let mut settings = SettingsDocument::default();
+        settings
+            .set_value(
+                "advanced.custom_actions",
+                &CustomActionDocument::new(vec![action.clone()])
+                    .unwrap()
+                    .export(),
+            )
+            .unwrap();
+        cx.update(|cx| cx.set_global(crate::settings::RuntimeSettings(settings)));
+        let mut app = None;
+        let window = cx.open_window(size(px(900.), px(700.)), |window, cx| {
+            let view =
+                cx.new(|cx| MusheenApp::new_with_session_store(root.path().into(), None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(window.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let mut origin = None;
+        cx.update_window(window.into(), |_, _, cx| {
+            app.update(cx, |app, cx| {
+                let tab = app.navigation.focused_tab().id();
+                origin = Some(tab);
+                let item = app
+                    .focused_directory()
+                    .items()
+                    .iter()
+                    .find(|item| item.path().as_unix_path() == Some(source.as_path()))
+                    .unwrap();
+                let targets =
+                    vec![CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()];
+                app.run_custom_action(
+                    CommandParameters::CustomAction {
+                        targets,
+                        action_id: Some(action.id.clone().into()),
+                        definition: Some(action.fingerprint().into()),
+                        location: StorePath::from_unix_path(root.path()),
+                        supports_provider_uris: false,
+                    },
+                    Some(tab),
+                    true,
+                    cx,
+                );
+                app.dispatch_tab_action(CommandAction::NewTab, cx);
+                app.navigate(StorePath::from_unix_path(other.path()), true, cx);
+            })
+        })
+        .unwrap();
+        cx.wait_for(window.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).directories[&origin.unwrap()]
+                .items()
+                .iter()
+                .any(|item| item.path().as_unix_path() == Some(output.as_path()))
+        })
+        .await;
+        cx.update_window(window.into(), |_, _, cx| {
+            assert_ne!(app.read(cx).navigation.focused_tab().id(), origin.unwrap());
+            assert_eq!(
+                app.read(cx)
+                    .navigation
+                    .focused_tab()
+                    .location()
+                    .as_unix_path(),
+                Some(other.path())
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn custom_action_shared_result_survives_origin_window_close(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("hostile\n\x1b-name.txt");
+        filesystem::write(&source, "target").unwrap();
+        let mut action = action(root.path());
+        action.label = "Delayed failure".into();
+        action.execution = ActionExecution::Shell {
+            script: "/bin/sleep 0.15; exit 7".into(),
+            opted_in: true,
+        };
+        action.arguments = vec![ActionArgument::File];
+        let mut settings = SettingsDocument::default();
+        settings
+            .set_value(
+                "advanced.custom_actions",
+                &CustomActionDocument::new(vec![action.clone()])
+                    .unwrap()
+                    .export(),
+            )
+            .unwrap();
+        cx.update(|cx| cx.set_global(crate::settings::RuntimeSettings(settings)));
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let mut views = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            handles.push(cx.open_window(size(px(900.), px(700.)), |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut app = MusheenApp::new_with_session_store(root.path().into(), None, cx);
+                    app.operation_hub = hub.clone();
+                    app
+                });
+                views.push(view.clone());
+                Root::new(view, window, cx)
+            }));
+        }
+        cx.wait_for(handles[0].into(), Duration::from_secs(3), |_, cx| {
+            views[0].read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handles[0].into(), |_, window, cx| {
+            views[0].update(cx, |app, cx| {
+                let item = app
+                    .focused_directory()
+                    .items()
+                    .iter()
+                    .find(|item| item.path().as_unix_path() == Some(source.as_path()))
+                    .unwrap();
+                let targets =
+                    vec![CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()];
+                app.run_custom_action(
+                    CommandParameters::CustomAction {
+                        targets,
+                        action_id: Some(action.id.clone().into()),
+                        definition: Some(action.fingerprint().into()),
+                        location: StorePath::from_unix_path(root.path()),
+                        supports_provider_uris: false,
+                    },
+                    Some(app.navigation.focused_tab().id()),
+                    true,
+                    cx,
+                );
+            });
+            window.remove_window();
+        })
+        .unwrap();
+        let origin = views.remove(0);
+        let weak = origin.downgrade();
+        drop(origin);
+        cx.wait_for(handles[1].into(), Duration::from_secs(3), |_, _| {
+            hub.status()
+                .lock()
+                .unwrap()
+                .custom_actions()
+                .iter()
+                .any(|entry| entry.status == OperationStatus::Failed)
+        })
+        .await;
+        cx.update_window(handles[1].into(), |_, window, cx| {
+            assert!(
+                weak.upgrade().is_none(),
+                "origin view is gone before result is inspected"
+            );
+            views[0].update(cx, |app, cx| {
+                app.status_center_open = true;
+                cx.notify();
+            });
+            window.activate_accessibility_for_test();
+            window.render_frame(cx);
+            let status = hub.status();
+            let status = status.lock().unwrap();
+            let entry = status.custom_actions().last().unwrap();
+            let message = entry.message(&views[0].read(cx).catalog);
+            assert!(message.contains("Delayed failure"));
+            assert!(message.contains("hostile"));
+            assert!(message.contains("7"));
+            assert!(!message.chars().any(char::is_control));
+            assert!(!message.contains("File operation failed"));
+            let tree: serde_json::Value =
+                serde_json::from_str(&window.debug_a11y_tree_json().unwrap()).unwrap();
+            assert!(
+                tree["nodes"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|node| node["aria"]["label"] == message),
+                "the surviving window renders the shared result"
+            );
+            let roundtrip =
+                crate::StatusCenterModel::from_json(&status.to_json().unwrap()).unwrap();
+            assert_eq!(roundtrip.custom_actions().len(), 1);
+        })
+        .unwrap();
+    }
 
     fn action(destination: &Path) -> CustomAction {
         CustomAction {
@@ -717,7 +1109,16 @@ mod tests {
                 app.confirm_context_review(pending.unwrap(), cx)
             });
             assert_eq!(app.read(cx).running_custom_actions, 0);
-            assert!(app.read(cx).operation_error.is_some());
+            assert!(
+                app.read(cx)
+                    .operation_hub
+                    .status()
+                    .lock()
+                    .unwrap()
+                    .custom_actions()
+                    .iter()
+                    .any(|entry| entry.status == OperationStatus::Failed)
+            );
         })
         .unwrap();
         assert!(!output.exists());

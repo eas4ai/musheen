@@ -4,8 +4,8 @@
 //! loader never infers policy from a filename and never invokes a shell.
 
 use super::{
-    ActionArgument, ActionConfirmation, ActionExecution, CustomAction, CustomActionDocument,
-    CustomActionError, WorkingDirectory,
+    ActionArgument, ActionConfirmation, ActionExecution, ActionSelection, CustomAction,
+    CustomActionDocument, CustomActionError, PreparedCustomAction, WorkingDirectory,
 };
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -23,6 +23,31 @@ const MANIFEST_SUFFIX: &[u8] = b".musheen-action.json";
 pub struct ScriptActionLoader;
 
 impl ScriptActionLoader {
+    /// Reload policy, then pin and validate the executable inode used by the runner.
+    pub fn prepare(
+        directory: &Path,
+        expected: &CustomAction,
+        selection: &ActionSelection,
+        environment: &std::collections::BTreeMap<String, OsString>,
+    ) -> Result<PreparedCustomAction, CustomActionError> {
+        let document = Self::load(directory)
+            .map_err(|error| CustomActionError::ScriptSource(Box::new(error)))?;
+        let action = document
+            .get(&expected.id)
+            .filter(|action| *action == expected)
+            .ok_or(CustomActionError::InvalidDocument)?;
+        let ActionExecution::Direct { executable } = &action.execution else {
+            return Err(CustomActionError::InvalidDocument);
+        };
+        let file = open_no_follow(executable)
+            .map_err(|error| CustomActionError::ScriptSource(Box::new(error)))?;
+        let metadata = file.metadata().map_err(CustomActionError::Io)?;
+        validate_script(executable, &metadata)
+            .map_err(|error| CustomActionError::ScriptSource(Box::new(error)))?;
+        let mut prepared = action.prepare(selection, environment)?;
+        prepared.script_file = Some(file);
+        Ok(prepared)
+    }
     /// Called only by the explicit Settings control. Existing paths are not chmodded.
     pub fn create_directory(directory: &Path) -> Result<(), ScriptActionLoadError> {
         fs::DirBuilder::new()
@@ -96,6 +121,7 @@ impl LoadBudget {
         if before.file_type().is_symlink() || !before.file_type().is_file() {
             return Err(ScriptActionLoadError::InvalidManifest { path: path.into() });
         }
+        validate_owner_mode(path, &before)?;
         let length = usize::try_from(before.len()).unwrap_or(usize::MAX);
         if length > ScriptActionLoader::MAX_MANIFEST_BYTES {
             return Err(ScriptActionLoadError::ManifestTooLarge { path: path.into() });
@@ -207,6 +233,11 @@ impl ScriptReference {
 }
 
 fn canonical_directory(directory: &Path) -> Result<PathBuf, ScriptActionLoadError> {
+    let source = fs::symlink_metadata(directory)
+        .map_err(|source| ScriptActionLoadError::io(directory, source))?;
+    if source.file_type().is_symlink() {
+        return Err(ScriptActionLoadError::NotDirectory(directory.into()));
+    }
     let root = fs::canonicalize(directory)
         .map_err(|source| ScriptActionLoadError::io(directory, source))?;
     let metadata =
@@ -214,14 +245,36 @@ fn canonical_directory(directory: &Path) -> Result<PathBuf, ScriptActionLoadErro
     if !metadata.is_dir() {
         return Err(ScriptActionLoadError::NotDirectory(root));
     }
+    validate_owner_mode(&root, &metadata)?;
     Ok(root)
 }
 
+fn validate_owner_mode(path: &Path, metadata: &Metadata) -> Result<(), ScriptActionLoadError> {
+    if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o022 != 0 {
+        return Err(ScriptActionLoadError::UnsafeScript { path: path.into() });
+    }
+    Ok(())
+}
+
+fn open_no_follow(path: &Path) -> Result<File, ScriptActionLoadError> {
+    rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|source| ScriptActionLoadError::io(path, source.into()))
+}
+
 fn read_stable_manifest(path: &Path, before: &Metadata) -> Result<Vec<u8>, ScriptActionLoadError> {
-    let file = File::open(path).map_err(|source| ScriptActionLoadError::io(path, source))?;
+    let file = open_no_follow(path)?;
     let opened = file
         .metadata()
         .map_err(|source| ScriptActionLoadError::io(path, source))?;
+    validate_owner_mode(path, &opened)?;
     if !opened.is_file()
         || before.dev() != opened.dev()
         || before.ino() != opened.ino()
@@ -246,6 +299,7 @@ fn read_stable_manifest(path: &Path, before: &Metadata) -> Result<Vec<u8>, Scrip
 }
 
 fn validate_script(path: &Path, metadata: &Metadata) -> Result<(), ScriptActionLoadError> {
+    validate_owner_mode(path, metadata)?;
     let file_type = metadata.file_type();
     if file_type.is_symlink()
         || !file_type.is_file()
@@ -377,6 +431,29 @@ impl std::error::Error for ScriptActionLoadError {
             Self::Io { source, .. } => Some(source),
             Self::InvalidAction(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn all_script_source_metadata_requires_the_current_effective_owner() {
+        let private = tempfile::tempdir().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            validate_owner_mode(private.path(), &fs::metadata(private.path()).unwrap()).is_ok()
+        );
+        // Exercise the same metadata check used for roots, manifests, and binaries.
+        let other_owner = Path::new("/usr/bin/true");
+        let metadata = fs::metadata(other_owner).unwrap();
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            assert!(matches!(
+                validate_owner_mode(other_owner, &metadata),
+                Err(ScriptActionLoadError::UnsafeScript { .. })
+            ));
         }
     }
 }

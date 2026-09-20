@@ -1042,6 +1042,8 @@ struct MusheenApp {
     sidebar_visible: bool,
     customization_keys: Option<Subscription>,
     custom_actions: musheen_desktop::CustomActionDocument,
+    custom_action_warning: Option<&'static str>,
+    script_load_warning: Option<&'static str>,
     running_custom_actions: usize,
     script_actions: musheen_desktop::CustomActionDocument,
     scripts_enabled: bool,
@@ -1165,6 +1167,8 @@ impl MusheenApp {
         let operation_status_revision = operation_hub.status_revision();
         let mut this = Self {
             custom_actions: custom_actions::from_settings(settings.as_ref()),
+            custom_action_warning: None,
+            script_load_warning: None,
             running_custom_actions: 0,
             script_actions: musheen_desktop::CustomActionDocument::default(),
             scripts_enabled: false,
@@ -1246,6 +1250,10 @@ impl MusheenApp {
 
     fn start_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
+        self.start_load_for_tab(tab_id, location, cx);
+    }
+
+    fn start_load_for_tab(&mut self, tab_id: TabId, location: StorePath, cx: &mut Context<Self>) {
         let trash = is_trash_location(&location);
         if !self.directories.contains_key(&tab_id) {
             let mut directory = DirectoryModel::new(self.limits.snapshot());
@@ -6527,6 +6535,7 @@ impl MusheenApp {
     }
 
     fn operation_status_summary(&self) -> String {
+        let custom_summary = self.custom_action_status_summary();
         let status = self.operation_hub.status();
         let Ok(status) = status.lock() else {
             return "Operation status unavailable".into();
@@ -6568,8 +6577,13 @@ impl MusheenApp {
                     None => format!("{} active operations", entries.len()),
                 }
             }
-            [] if status.history().is_empty() => "No operations".into(),
-            [] => format!("{} past operations", status.history().len()),
+            [] => custom_summary.unwrap_or_else(|| {
+                if status.history().is_empty() {
+                    "No operations".into()
+                } else {
+                    format!("{} past operations", status.history().len())
+                }
+            }),
         }
     }
 
@@ -6825,6 +6839,7 @@ impl MusheenApp {
             .border_t_1()
             .border_color(boundary)
             .children(rows)
+            .children(self.custom_action_status_rows(cx))
             .into_any_element()
     }
 }
@@ -7011,6 +7026,7 @@ impl Render for MusheenApp {
             .child(self.render_tab_strip(cx))
             .child(self.render_toolbar(window, cx))
             .child(self.render_custom_toolbar(cx))
+            .children(self.custom_action_warning_row())
             .when_some(operation_error, |shell, message| {
                 shell.child(
                     div()

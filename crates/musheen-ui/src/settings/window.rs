@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 struct SettingsWindowOwner {
     handle: Option<WindowHandle<Root>>,
+    view: Option<gpui_kit::WeakEntity<SettingsWindow>>,
 }
 impl Global for SettingsWindowOwner {}
 
@@ -57,10 +58,14 @@ fn open_settings_at(store: SettingsStore, cx: &mut App) {
     match cx.open_window(options, move |window, cx| {
         let view = cx
             .new(|cx| SettingsWindow::new(store, SettingsBackends::default(), catalog, window, cx));
+        cx.global_mut::<SettingsWindowOwner>().view = Some(view.downgrade());
         cx.new(|cx| Root::new(view, window, cx))
     }) {
         Ok(handle) => cx.global_mut::<SettingsWindowOwner>().handle = Some(handle),
-        Err(error) => eprintln!("could not open Settings: {error}"),
+        Err(error) => {
+            cx.global_mut::<SettingsWindowOwner>().view = None;
+            eprintln!("could not open Settings: {error}");
+        }
     }
 }
 
@@ -210,9 +215,7 @@ impl SettingsWindow {
                 }
             }));
         this.subscriptions.push(cx.on_release(|this, cx| {
-            this.state.cancel();
-            this.preview_customization(cx);
-            this.appearance_base.restore(cx);
+            this.restore_committed_appearance(cx);
         }));
         this
     }
@@ -226,6 +229,13 @@ impl SettingsWindow {
     }
 
     pub(super) fn preview_appearance(&self, cx: &mut App) {
+        self.appearance_base.restore(cx);
+        apply_appearance(self.state.draft(), cx);
+    }
+
+    fn restore_committed_appearance(&mut self, cx: &mut App) {
+        self.state.cancel();
+        self.preview_customization(cx);
         self.appearance_base.restore(cx);
         apply_appearance(self.state.draft(), cx);
     }
@@ -251,7 +261,6 @@ impl SettingsWindow {
                         match result {
                             Ok(document) => {
                                 this.state.committed = document;
-                                this.appearance_base = AppearanceSnapshot::capture(cx);
                                 this.failure = None;
                             }
                             Err(_) => this.failure = Some("settings-save-error"),
@@ -626,9 +635,7 @@ impl Render for SettingsWindow {
                         .disabled(self.blocked())
                         .label(self.label("settings-cancel"))
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.state.cancel();
-                            this.preview_customization(cx);
-                            this.appearance_base.restore(cx);
+                            this.restore_committed_appearance(cx);
                             window.remove_window();
                         })),
                 )
@@ -679,7 +686,20 @@ pub(crate) fn apply_appearance(document: &SettingsDocument, cx: &mut App) {
 /// base, and then replay the saved user policy over it. Called on the GPUI
 /// thread by the runtime theme watcher.
 pub(crate) fn accept_native_theme_change(cx: &mut App) {
-    cx.set_global(DesktopAppearance(AppearanceSnapshot::capture(cx)));
+    let appearance = AppearanceSnapshot::capture(cx);
+    cx.set_global(DesktopAppearance(appearance.clone()));
+    let settings = cx
+        .try_global::<SettingsWindowOwner>()
+        .and_then(|owner| owner.view.as_ref())
+        .and_then(gpui_kit::WeakEntity::upgrade);
+    if let Some(settings) = settings {
+        settings.update(cx, |settings, cx| {
+            settings.appearance_base = appearance;
+            settings.preview_appearance(cx);
+            cx.notify();
+        });
+        return;
+    }
     if let Some(document) = cx
         .try_global::<super::RuntimeSettings>()
         .map(|settings| settings.0.clone())
@@ -787,6 +807,29 @@ mod tests {
     use super::*;
     use gpui_kit::TestAppContext;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+
+    fn install_native_pair(
+        preset: &str,
+        active_dark: bool,
+        cx: &mut App,
+    ) -> (
+        native_theme::theme::ResolvedTheme,
+        native_theme::theme::ResolvedTheme,
+    ) {
+        let preferences = native_theme::AccessibilityPreferences::default();
+        let (light_theme, light) =
+            native_theme_gpui::from_preset(preset, false, &preferences).unwrap();
+        let (dark_theme, dark) =
+            native_theme_gpui::from_preset(preset, true, &preferences).unwrap();
+        if active_dark {
+            native_theme_gpui::apply(light_theme, &light, &preferences, cx);
+            native_theme_gpui::apply(dark_theme, &dark, &preferences, cx);
+        } else {
+            native_theme_gpui::apply(dark_theme, &dark, &preferences, cx);
+            native_theme_gpui::apply(light_theme, &light, &preferences, cx);
+        }
+        (light, dark)
+    }
 
     #[gpui_kit::test]
     async fn toolbar_keyboard_move_previews_and_cancel_restores_runtime(cx: &mut TestAppContext) {
@@ -1034,6 +1077,151 @@ mod tests {
                     .resolved(cx)
                     .unwrap(),
                 &new_dark,
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn cancel_after_live_native_refresh_rebases_unsaved_preview(cx: &mut TestAppContext) {
+        use gpui_kit::component::{Theme, ThemeMode};
+
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        let handle = cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_native_pair("kde-breeze", false, cx);
+            open_settings_at(store, cx);
+            cx.global::<SettingsWindowOwner>().handle.unwrap()
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-page-appearance", cx);
+            window.render_frame(cx);
+            window.click("theme-starter", cx);
+            window.click("theme-preview", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                cx.theme().colors.background,
+                gpui_kit::Hsla::from(gpui_kit::rgb(0xffffff))
+            );
+        })
+        .unwrap();
+
+        let (new_light, new_dark) = cx.update(|cx| {
+            let variants = install_native_pair("adwaita", true, cx);
+            accept_native_theme_change(cx);
+            variants
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                cx.theme().colors.background,
+                gpui_kit::Hsla::from(gpui_kit::rgb(0xffffff)),
+                "native refresh must retain the unsaved custom preview",
+            );
+            window.click("settings-cancel", cx);
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            assert!(cx.theme().mode.is_dark());
+            assert_eq!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .resolved(cx)
+                    .unwrap(),
+                &new_dark,
+            );
+            Theme::change(ThemeMode::Light, None, cx);
+            assert_eq!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .resolved(cx)
+                    .unwrap(),
+                &new_light,
+            );
+            Theme::change(ThemeMode::Dark, None, cx);
+            assert_eq!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .resolved(cx)
+                    .unwrap(),
+                &new_dark,
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn apply_after_live_native_refresh_persists_cross_mode_preview(cx: &mut TestAppContext) {
+        use gpui_kit::component::{Theme, ThemeMode};
+
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        let handle = cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_native_pair("kde-breeze", false, cx);
+            open_settings_at(store.clone(), cx);
+            cx.global::<SettingsWindowOwner>().handle.unwrap()
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-page-appearance", cx);
+            window.render_frame(cx);
+            window.click("appearance.mode:light", cx);
+            window.click("theme-starter", cx);
+            window.click("theme-preview", cx);
+            window.render_frame(cx);
+            assert!(!cx.theme().mode.is_dark());
+        })
+        .unwrap();
+
+        let (new_light, new_dark) = cx.update(|cx| {
+            let variants = install_native_pair("adwaita", true, cx);
+            accept_native_theme_change(cx);
+            variants
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!cx.theme().mode.is_dark());
+            assert_eq!(
+                cx.theme().colors.background,
+                gpui_kit::Hsla::from(gpui_kit::rgb(0xffffff)),
+                "native refresh must retain the unsaved cross-mode preview",
+            );
+            window.click("settings-apply", cx);
+        })
+        .unwrap();
+        let expected_theme = crate::theme::document::ThemeDocument::starter().export();
+        cx.wait_for(handle.into(), std::time::Duration::from_secs(3), |_, _| {
+            store.load().is_ok_and(|document| {
+                document.value("appearance.mode").as_deref() == Some("light")
+                    && document.value("appearance.theme").as_deref()
+                        == Some(expected_theme.as_str())
+            })
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, _| window.remove_window())
+            .unwrap();
+
+        cx.update(|cx| {
+            assert!(!cx.theme().mode.is_dark());
+            assert_eq!(
+                cx.theme().colors.background,
+                gpui_kit::Hsla::from(gpui_kit::rgb(0xffffff))
+            );
+            assert_eq!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .resolved(cx)
+                    .unwrap()
+                    .button
+                    .primary_background,
+                new_light.button.primary_background,
+            );
+            Theme::change(ThemeMode::Dark, None, cx);
+            assert_eq!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .resolved(cx)
+                    .unwrap()
+                    .button
+                    .primary_background,
+                new_dark.button.primary_background,
             );
         });
     }

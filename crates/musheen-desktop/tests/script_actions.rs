@@ -77,6 +77,7 @@ fn absent_optional_directory_is_empty_and_explicit_creation_is_private() {
 }
 
 fn write_executable(directory: &Path, name: std::ffi::OsString, contents: &[u8]) {
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     let path = directory.join(name);
     fs::write(&path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -100,11 +101,75 @@ fn manifest(id: &str, script: Value) -> Value {
 }
 
 fn write_manifest(directory: &Path, name: &str, value: &Value) {
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         directory.join(format!("{name}.musheen-action.json")),
         serde_json::to_vec(value).unwrap(),
     )
     .unwrap();
+    fs::set_permissions(
+        directory.join(format!("{name}.musheen-action.json")),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+
+#[test]
+fn rejects_writable_root_manifest_and_executable() {
+    let root = tempfile::tempdir().unwrap();
+    write_executable(root.path(), "run".into(), b"#!/bin/sh\nexit 0\n");
+    write_manifest(root.path(), "run", &manifest("run", json!("run")));
+    for (path, safe_mode) in [
+        (root.path().to_path_buf(), 0o700),
+        (root.path().join("run.musheen-action.json"), 0o600),
+        (root.path().join("run"), 0o700),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(safe_mode | 0o022)).unwrap();
+        assert!(
+            ScriptActionLoader::load(root.path()).is_err(),
+            "untrusted mode accepted: {path:?}"
+        );
+        fs::set_permissions(path, fs::Permissions::from_mode(safe_mode)).unwrap();
+    }
+    assert!(ScriptActionLoader::load(root.path()).is_ok());
+    if !rustix::process::geteuid().is_root() {
+        assert!(
+            ScriptActionLoader::load(Path::new("/")).is_err(),
+            "root must belong to current euid"
+        );
+    }
+}
+
+#[test]
+fn validated_script_descriptor_survives_path_replacement() {
+    use musheen_core::StorePath;
+    use musheen_desktop::{ActionSelection, CustomActionRunner};
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("result");
+    write_executable(
+        root.path(),
+        "run".into(),
+        b"#!/bin/sh\nprintf original > \"$1\"\n",
+    );
+    write_manifest(root.path(), "run", &manifest("run", json!("run")));
+    fs::write(&output, "").unwrap();
+    let document = ScriptActionLoader::load(root.path()).unwrap();
+    let action = document.get("run").unwrap();
+    let selection = ActionSelection {
+        paths: vec![StorePath::from_unix_path(&output)],
+        mime_types: vec!["text/plain".into()],
+        location: StorePath::from_unix_path(root.path()),
+    };
+    let prepared =
+        ScriptActionLoader::prepare(root.path(), action, &selection, &Default::default()).unwrap();
+    fs::rename(root.path().join("run"), root.path().join("original-script")).unwrap();
+    write_executable(
+        root.path(),
+        "run".into(),
+        b"#!/bin/sh\nprintf swapped > \"$1\"\n",
+    );
+    CustomActionRunner::run(prepared, true).unwrap();
+    assert_eq!(fs::read_to_string(output).unwrap(), "original");
 }
 
 #[test]
@@ -209,6 +274,7 @@ fn rejects_duplicate_ids_and_bounded_directory_or_file_overflow() {
     for index in 0..=ScriptActionLoader::MAX_DIRECTORY_ENTRIES {
         fs::write(root.path().join(format!("ignored-{index}")), b"x").unwrap();
     }
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(
         ScriptActionLoader::load(root.path()),
         Err(ScriptActionLoadError::TooManyEntries)
@@ -219,6 +285,11 @@ fn rejects_duplicate_ids_and_bounded_directory_or_file_overflow() {
     fs::write(
         root.path().join("huge.musheen-action.json"),
         vec![b' '; ScriptActionLoader::MAX_MANIFEST_BYTES + 1],
+    )
+    .unwrap();
+    fs::set_permissions(
+        root.path().join("huge.musheen-action.json"),
+        fs::Permissions::from_mode(0o600),
     )
     .unwrap();
     assert!(matches!(
@@ -258,6 +329,11 @@ fn rejects_duplicate_ids_and_bounded_directory_or_file_overflow() {
         let mut bytes = serde_json::to_vec(&manifest(&id, json!("shared.sh"))).unwrap();
         bytes.resize(31 * 1024, b' ');
         fs::write(root.path().join(format!("{id}.musheen-action.json")), bytes).unwrap();
+        fs::set_permissions(
+            root.path().join(format!("{id}.musheen-action.json")),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
     }
     assert!(matches!(
         ScriptActionLoader::load(root.path()),

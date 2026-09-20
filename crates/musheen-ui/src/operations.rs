@@ -25,6 +25,47 @@ pub struct OperationHub {
 }
 
 impl OperationHub {
+    pub(crate) fn submit_custom_action(
+        &self,
+        context: crate::status_center::custom_actions::CustomActionContext,
+    ) -> Result<u64, musheen_desktop::CustomActionError> {
+        let id = self
+            .status
+            .lock()
+            .map_err(|_| musheen_desktop::CustomActionError::InvalidDocument)?
+            .register_custom_action(context)?;
+        self.persist_status();
+        Ok(id)
+    }
+
+    pub(crate) fn finish_custom_action(
+        &self,
+        id: u64,
+        result: &Result<(), musheen_desktop::CustomActionError>,
+    ) {
+        if let Ok(mut status) = self.status.lock() {
+            status.finish_custom_action(id, result);
+        }
+        self.persist_status();
+    }
+
+    pub(crate) fn reject_custom_action(
+        &self,
+        context: crate::status_center::custom_actions::CustomActionContext,
+        error: &musheen_desktop::CustomActionError,
+    ) {
+        if let Ok(mut status) = self.status.lock() {
+            status.reject_custom_action(context, error);
+        }
+        self.persist_status();
+    }
+
+    pub(crate) fn dismiss_custom_action(&self, id: u64) {
+        if let Ok(mut status) = self.status.lock() {
+            status.dismiss_custom_action(id);
+        }
+        self.persist_status();
+    }
     #[must_use]
     pub fn new(limits: &ResourceLimits) -> Self {
         Self {

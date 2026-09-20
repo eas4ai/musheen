@@ -298,6 +298,7 @@ impl CustomAction {
             return Err(CustomActionError::SelectionMismatch);
         }
         Ok(PreparedCustomAction {
+            script_file: None,
             executable,
             arguments,
             working_directory,
@@ -447,6 +448,9 @@ fn provider_uri(path: &StorePath) -> Result<OsString, CustomActionError> {
 }
 
 pub struct PreparedCustomAction {
+    // Kept open until the child exits, including while a shebang interpreter
+    // opens /proc/<parent>/fd/<n>. Never inherited by unrelated children.
+    script_file: Option<std::fs::File>,
     executable: PathBuf,
     arguments: Vec<OsString>,
     working_directory: PathBuf,
@@ -479,7 +483,15 @@ impl CustomActionRunner {
 }
 
 fn spawn_action(action: &PreparedCustomAction) -> Result<std::process::Child, CustomActionError> {
-    Command::new(&action.executable)
+    use std::os::fd::AsRawFd;
+    let executable = action.script_file.as_ref().map(|file| {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            file.as_raw_fd()
+        ))
+    });
+    Command::new(executable.as_ref().unwrap_or(&action.executable))
         .args(&action.arguments)
         .current_dir(&action.working_directory)
         .env_clear()
@@ -538,6 +550,7 @@ fn terminate_action_group(child: &mut std::process::Child) -> Result<(), CustomA
 #[derive(Debug)]
 pub enum CustomActionError {
     InvalidDocument,
+    ConcurrencyLimit,
     SelectionMismatch,
     ProviderUrisUnsupported,
     WorkingDirectory,
@@ -552,6 +565,7 @@ impl CustomActionError {
     pub fn message_key(&self) -> &'static str {
         match self {
             Self::InvalidDocument => "custom-action-invalid",
+            Self::ConcurrencyLimit => "custom-action-busy",
             Self::SelectionMismatch => "custom-action-selection",
             Self::ProviderUrisUnsupported => "custom-action-provider",
             Self::WorkingDirectory => "custom-action-directory",

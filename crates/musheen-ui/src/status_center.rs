@@ -1,4 +1,6 @@
 use musheen_core::{DisplayPath, StorePath};
+pub(crate) mod custom_actions;
+use custom_actions::CustomActionStatus;
 use musheen_ops::{EventGeneration, JobId, OperationKind, StagingPath, TrashReceipt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -142,6 +144,7 @@ impl OperationStatusEntry {
 
 #[derive(Debug, Default)]
 pub struct StatusCenterModel {
+    custom_actions: Vec<CustomActionStatus>,
     entries: BTreeMap<JobId, OperationStatusEntry>,
     order: Vec<JobId>,
 }
@@ -176,7 +179,7 @@ impl StatusCenterModel {
     }
 
     pub fn mark_unfinished_interrupted(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.interrupt_custom_actions();
         for entry in self.entries.values_mut() {
             if matches!(
                 entry.status,
@@ -500,6 +503,7 @@ impl StatusCenterModel {
             .map(EntryDocument::from)
             .collect();
         serde_json::to_vec(&StatusDocument {
+            custom_actions: self.custom_actions.clone(),
             schema_version: STATUS_SCHEMA_VERSION,
             entries,
         })
@@ -515,6 +519,17 @@ impl StatusCenterModel {
             ));
         }
         let mut model = Self::default();
+        if document.custom_actions.len() > 128
+            || document
+                .custom_actions
+                .iter()
+                .any(|entry| entry.context.targets.len() > 16)
+        {
+            return Err(StatusCenterError::Document(
+                "custom action history exceeds limits".into(),
+            ));
+        }
+        model.custom_actions = document.custom_actions;
         for entry in document.entries {
             let entry = OperationStatusEntry::try_from(entry)?;
             if model.entries.insert(entry.id, entry.clone()).is_some() {
@@ -583,6 +598,8 @@ fn remove_unavailable_resume_action(entry: &mut OperationStatusEntry) -> bool {
 
 #[derive(Serialize, Deserialize)]
 struct StatusDocument {
+    #[serde(default)]
+    custom_actions: Vec<CustomActionStatus>,
     schema_version: u32,
     entries: Vec<EntryDocument>,
 }
