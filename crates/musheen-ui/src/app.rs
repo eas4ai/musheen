@@ -1816,8 +1816,12 @@ impl MusheenApp {
             };
             let app = cx.entity().downgrade();
             let writer: TagWriter = Arc::new(move |desired, cx| {
-                app.update(cx, |state, _| {
-                    state.apply_properties_tags(&tag_targets, desired)
+                app.update(cx, |state, cx| {
+                    let result = state.apply_properties_tags(&tag_targets, desired);
+                    if result.is_ok() {
+                        cx.notify();
+                    }
+                    result
                 })
                 .map_err(|error| Box::<str>::from(error.to_string()))?
             });
@@ -7817,6 +7821,8 @@ mod tests {
         CapabilityMatrix, CapabilityReason, CapabilityState, MutationRequest, PageRequest,
         ProviderId, SearchCapabilities, SearchResult, SearchScopeError,
     };
+    use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
+    use musheen_ops::{ProviderLimits, ProviderSnapshot};
     use standard_library::fs as filesystem;
     use std as standard_library;
     use std::time::Duration;
@@ -8288,8 +8294,11 @@ mod tests {
         }
 
         fn capabilities(&self, _location: &StorePath) -> CapabilityMatrix {
+            let tags_supported = _location
+                .provider_key()
+                .is_none_or(|(provider, _)| provider.as_str() != "remote-no-tags");
             CapabilityMatrix::new(|kind| {
-                if kind == CapabilityKind::Tags {
+                if kind == CapabilityKind::Tags && tags_supported {
                     CapabilityState::Supported
                 } else {
                     CapabilityState::Unsupported(CapabilityReason::new("test store").unwrap())
@@ -8368,6 +8377,62 @@ mod tests {
             _cancellation: CancellationToken,
         ) -> musheen_core::BoxFuture<'a, Result<(), StoreError>> {
             Box::pin(async move { Err(request.unsupported("test store")) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct OpaqueTransferRoute {
+        provider: ProviderId,
+        expected_source: CommandTargetRef,
+        target_directory: StorePath,
+        completed: CommandTargetRef,
+    }
+
+    impl ProviderTransferRoute for OpaqueTransferRoute {
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider
+        }
+
+        fn plan_destination(
+            &self,
+            action: DropAction,
+            source: &StorePath,
+            target: &StorePath,
+            expected_identity: Option<&ItemId>,
+        ) -> Result<StorePath, Box<str>> {
+            assert_eq!(action, DropAction::Move);
+            assert_eq!(source, self.expected_source.path());
+            assert_eq!(target, &self.target_directory);
+            assert_eq!(expected_identity, Some(self.expected_source.id()));
+            Ok(self.completed.path().clone())
+        }
+
+        fn provider_snapshot(&self, _location: &StorePath) -> ProviderSnapshot {
+            ProviderSnapshot::new(
+                self.provider.clone(),
+                CapabilityMatrix::new(|_| CapabilityState::Supported),
+                ProviderLimits::default(),
+            )
+        }
+
+        fn execute_transfer(
+            &self,
+            execution: ProviderTransferExecution<'_>,
+        ) -> Result<CommandTargetRef, Box<str>> {
+            assert!(execution.id().get() > 0);
+            assert_eq!(execution.generation().get(), 0);
+            execution
+                .cancellation()
+                .check()
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            assert_eq!(execution.action(), DropAction::Move);
+            assert_eq!(execution.source(), self.expected_source.path());
+            assert_eq!(execution.destination(), self.completed.path());
+            assert_eq!(
+                execution.expected_identity(),
+                Some(self.expected_source.id())
+            );
+            Ok(self.completed.clone())
         }
     }
 
@@ -10775,7 +10840,6 @@ mod tests {
                     &[Box::<str>::from("fresh")].into_iter().collect(),
                 )
                 .unwrap();
-            cx.notify();
 
             let tab = state.navigation.focused_tab().id();
             let sidebar_tags = state
@@ -10844,45 +10908,167 @@ mod tests {
                 "{:?}",
                 state.operation_error
             );
+        });
+    }
 
-            state
-                .catalog_binding
-                .assign_tag(item.id(), &path, &state.store.capabilities(&path), "move")
+    #[gpui_kit::test]
+    async fn submitted_provider_move_returns_exact_opaque_target_to_catalog(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let supported_source_path = temporary.path().join("supported-source");
+        let unsupported_source_path = temporary.path().join("unsupported-source");
+        filesystem::write(&supported_source_path, b"supported").unwrap();
+        filesystem::write(&unsupported_source_path, b"unsupported").unwrap();
+        let local = LocalStore::new();
+        let supported_source_path =
+            StorePath::from_unix_path(supported_source_path.into_os_string());
+        let unsupported_source_path =
+            StorePath::from_unix_path(unsupported_source_path.into_os_string());
+        let supported_source = local.resolve_item(&supported_source_path).unwrap().unwrap();
+        let unsupported_source = local
+            .resolve_item(&unsupported_source_path)
+            .unwrap()
+            .unwrap();
+
+        let supported_provider = ProviderId::new("remote").unwrap();
+        let supported_directory =
+            StorePath::from_provider_key(supported_provider.clone(), b"opaque/folder".to_vec())
                 .unwrap();
+        let supported_target = CommandTargetRef::new(
+            ItemId::new(
+                supported_provider.clone(),
+                b"stable-completed-object".to_vec(),
+            )
+            .unwrap(),
+            StorePath::from_provider_key(
+                supported_provider.clone(),
+                b"opaque/folder/exact-kept-name".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let unsupported_provider = ProviderId::new("remote-no-tags").unwrap();
+        let unsupported_directory =
+            StorePath::from_provider_key(unsupported_provider.clone(), b"opaque/folder".to_vec())
+                .unwrap();
+        let unsupported_target = CommandTargetRef::new(
+            ItemId::new(
+                unsupported_provider.clone(),
+                b"stable-unsupported-object".to_vec(),
+            )
+            .unwrap(),
+            StorePath::from_provider_key(
+                unsupported_provider.clone(),
+                b"opaque/folder/exact-name".to_vec(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        app.update(cx, |state, cx| {
             state.store = Arc::new(ImmediateSearchStore::new());
-            let remote_provider = ProviderId::new("remote").unwrap();
-            let remote_path = StorePath::from_provider_key(
-                remote_provider.clone(),
-                b"opaque/destination".to_vec(),
-            )
-            .unwrap();
-            let remote = CommandTargetRef::new(
-                ItemId::new(remote_provider, b"remote-stable-id".to_vec()).unwrap(),
-                remote_path.clone(),
-            )
-            .unwrap();
-            let job = musheen_ops::JobId::new(9_001).unwrap();
-            state.pending_catalog_moves.insert(
-                job,
-                PendingCatalogMove {
-                    source: item.id().clone(),
-                    source_path: path.clone(),
-                    target_path: remote_path,
-                },
-            );
-            state.finish_catalog_move(
-                job,
-                LocalOperationOutcome::Transfer(TransferOutcome::Completed(remote.clone())),
-            );
+            for (source, path) in [
+                (&supported_source, &supported_source_path),
+                (&unsupported_source, &unsupported_source_path),
+            ] {
+                state
+                    .catalog_binding
+                    .assign_tag(source.id(), path, &local.capabilities(path), "move")
+                    .unwrap();
+            }
+            for (provider, source, directory, completed) in [
+                (
+                    supported_provider,
+                    supported_source.clone(),
+                    supported_directory.clone(),
+                    supported_target.clone(),
+                ),
+                (
+                    unsupported_provider,
+                    unsupported_source.clone(),
+                    unsupported_directory.clone(),
+                    unsupported_target.clone(),
+                ),
+            ] {
+                state
+                    .operation_hub
+                    .register_provider_transfer_route(Arc::new(OpaqueTransferRoute {
+                        provider,
+                        expected_source: CommandTargetRef::new(
+                            source.id().clone(),
+                            source.path().clone(),
+                        )
+                        .unwrap(),
+                        target_directory: directory.clone(),
+                        completed,
+                    }))
+                    .unwrap();
+                state.submit_reviewed_transfer(
+                    FileDragPayload::with_expected_identities(
+                        vec![source.path().clone()],
+                        vec![source.id().clone()],
+                        DropAction::Move,
+                    )
+                    .unwrap(),
+                    directory,
+                    cx,
+                );
+            }
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).pending_catalog_moves.is_empty()
+        })
+        .await;
+
+        app.update(cx, |state, _| {
             assert_eq!(
-                state.catalog_binding.tags_for_identity(remote.id()),
+                state
+                    .catalog_binding
+                    .tags_for_identity(supported_target.id()),
                 [Box::<str>::from("move")].into_iter().collect()
             );
             assert!(
                 state
                     .catalog_binding
-                    .tags_for_identity(item.id())
+                    .tags_for_identity(supported_source.id())
                     .is_empty()
+            );
+            assert_eq!(
+                state
+                    .catalog_binding
+                    .tags_for_identity(unsupported_source.id()),
+                [Box::<str>::from("move")].into_iter().collect()
+            );
+            assert!(
+                state
+                    .catalog_binding
+                    .tags_for_identity(unsupported_target.id())
+                    .is_empty()
+            );
+            assert!(
+                state
+                    .operation_error
+                    .as_deref()
+                    .is_some_and(|error| { error.contains("destination does not support tags") })
             );
         });
     }
@@ -10918,6 +11104,7 @@ mod tests {
         cx.update_window(handle.into(), |_, _, cx| {
             app.update(cx, |state, cx| {
                 state.store = Arc::new(ImmediateSearchStore::new());
+                state.navigate(home_store_path(), true, cx);
                 state.open_properties_targets(&[target], PropertiesPage::Tags, cx);
                 assert!(
                     state.operation_error.is_none(),
@@ -10942,12 +11129,29 @@ mod tests {
             assert!(window.find("provider-properties").visible());
             assert!(window.find("properties-tags-page").visible());
             assert!(window.try_find("properties-permissions-page").is_none());
+            assert!(window.find("provider-properties-page-general").visible());
+            assert!(window.find("provider-properties-page-tags").visible());
+            window.click("provider-properties-page-general", cx);
+            window.render_frame(cx);
+            assert!(window.find("provider-properties-general-page").visible());
+            assert!(window.find("provider-properties-provider-0").visible());
+            assert!(window.find("provider-properties-identity-0").visible());
+            assert!(window.find("provider-properties-location-0").visible());
+            window.click("provider-properties-page-tags", cx);
+            window.render_frame(cx);
             window.click("provider-properties-tag-input", cx);
             window.input("remote", cx);
             window.click("provider-properties-add-tag", cx);
             window.click("provider-properties-apply-tags", cx);
         })
         .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |window, _| {
+            gpui_kit::base::test_support::snapshots(window)
+                .iter()
+                .any(|node| node.label() == Some("remote"))
+                && window.find("home-section-tag").visible()
+        })
+        .await;
         app.update(cx, |state, _| {
             assert_eq!(
                 state.catalog_binding.tag_names(),
@@ -10965,5 +11169,63 @@ mod tests {
                     .is_some_and(|section| section.items()[0].label() == "remote")
             );
         });
+    }
+
+    #[gpui_kit::test]
+    async fn provider_properties_refuses_an_unavailable_tags_page(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let provider = ProviderId::new("remote-no-tags").unwrap();
+        let target = CommandTargetRef::new(
+            ItemId::new(provider.clone(), b"stable-object".to_vec()).unwrap(),
+            StorePath::from_provider_key(provider, b"share/object".to_vec()).unwrap(),
+        )
+        .unwrap();
+        cx.update_window(handle.into(), |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.store = Arc::new(ImmediateSearchStore::new());
+                state.open_properties_targets(&[target], PropertiesPage::Tags, cx);
+            });
+        })
+        .unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.windows().iter().any(|window| *window != browser)
+        })
+        .await;
+        let properties = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.update_window(properties, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("provider-properties-general-page").visible());
+            assert!(window.find("provider-properties-page-notice").visible());
+            assert!(window.find("provider-properties-page-tags").visible());
+            window.click("provider-properties-page-tags", cx);
+            window.render_frame(cx);
+            assert!(window.find("provider-properties-general-page").visible());
+            assert!(window.try_find("properties-tags-page").is_none());
+            assert!(window.try_find("provider-properties-tag-input").is_none());
+        })
+        .unwrap();
     }
 }

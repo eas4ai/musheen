@@ -9,12 +9,13 @@ use musheen_ops::{
     OperationFailure, OperationKind, OperationPlan, ProviderLimits, ProviderSnapshot,
     PublicationState, Scheduler, SchedulerError, SourceState, execute_move,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DropAction {
@@ -92,6 +93,7 @@ enum LocalOperation {
         destination: StorePath,
         decision: Option<ConflictDecision>,
         expected_identity: Option<ItemId>,
+        provider_route: Option<Arc<dyn ProviderTransferRoute>>,
     },
     Metadata(MetadataPlan),
 }
@@ -136,6 +138,76 @@ pub enum TransferOutcome {
 pub enum LocalOperationOutcome {
     Transfer(TransferOutcome),
     Metadata,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderTransferExecution<'a> {
+    id: JobId,
+    generation: EventGeneration,
+    action: DropAction,
+    source: &'a StorePath,
+    destination: &'a StorePath,
+    expected_identity: Option<&'a ItemId>,
+    cancellation: &'a musheen_core::CancellationToken,
+}
+
+impl<'a> ProviderTransferExecution<'a> {
+    #[must_use]
+    pub const fn id(&self) -> JobId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> EventGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn action(&self) -> DropAction {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &'a StorePath {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn destination(&self) -> &'a StorePath {
+        self.destination
+    }
+
+    #[must_use]
+    pub const fn expected_identity(&self) -> Option<&'a ItemId> {
+        self.expected_identity
+    }
+
+    #[must_use]
+    pub const fn cancellation(&self) -> &'a musheen_core::CancellationToken {
+        self.cancellation
+    }
+}
+
+/// Executes transfers whose destination uses a provider-owned opaque path.
+/// Implementations must revalidate `expected_identity` immediately before
+/// mutating the source and must return the exact completed destination target.
+pub trait ProviderTransferRoute: fmt::Debug + Send + Sync {
+    fn provider_id(&self) -> &musheen_core::ProviderId;
+
+    fn plan_destination(
+        &self,
+        action: DropAction,
+        source: &StorePath,
+        target: &StorePath,
+        expected_identity: Option<&ItemId>,
+    ) -> Result<StorePath, Box<str>>;
+
+    fn provider_snapshot(&self, location: &StorePath) -> ProviderSnapshot;
+
+    fn execute_transfer(
+        &self,
+        execution: ProviderTransferExecution<'_>,
+    ) -> Result<CommandTargetRef, Box<str>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,7 +325,24 @@ impl ReadyLocalOperation {
                 destination,
                 decision,
                 expected_identity,
+                provider_route,
             } => {
+                if let Some(route) = provider_route {
+                    let target = route
+                        .execute_transfer(ProviderTransferExecution {
+                            id: self.id,
+                            generation: self.generation,
+                            action,
+                            source: &source,
+                            destination: &destination,
+                            expected_identity: expected_identity.as_ref(),
+                            cancellation: &self.cancellation,
+                        })
+                        .map_err(LocalOperationFailure::failed)?;
+                    return Ok(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
+                        target,
+                    )));
+                }
                 if let Some(expected_identity) = expected_identity {
                     let current = crate::metadata::item_from_path(
                         store.provider_id(),
@@ -333,6 +422,7 @@ pub struct LocalOperationQueue {
     scheduler: Scheduler,
     operations: BTreeMap<JobId, LocalOperation>,
     failures: BTreeMap<JobId, Box<str>>,
+    provider_routes: HashMap<musheen_core::ProviderId, Arc<dyn ProviderTransferRoute>>,
 }
 
 impl LocalOperationQueue {
@@ -342,7 +432,13 @@ impl LocalOperationQueue {
             scheduler: Scheduler::new(limits),
             operations: BTreeMap::new(),
             failures: BTreeMap::new(),
+            provider_routes: HashMap::new(),
         }
+    }
+
+    pub fn register_provider_transfer_route(&mut self, route: Arc<dyn ProviderTransferRoute>) {
+        self.provider_routes
+            .insert(route.provider_id().clone(), route);
     }
 
     #[must_use]
@@ -577,6 +673,7 @@ impl LocalOperationQueue {
                     destination: candidate.destination,
                     decision,
                     expected_identity: candidate.expected_identity,
+                    provider_route: candidate.provider_route,
                 },
             ));
         }
@@ -591,6 +688,14 @@ impl LocalOperationQueue {
         payload: &FileDragPayload,
         target: &StorePath,
     ) -> Result<Vec<DropCandidate>, DropError> {
+        if let Some((provider, _)) = target.provider_key() {
+            let route = self
+                .provider_routes
+                .get(provider)
+                .cloned()
+                .ok_or_else(|| DropError::UnsupportedTarget(target.clone()))?;
+            return self.inspect_provider_drop(payload, target, route);
+        }
         let target_path = writable_directory(target)?;
         let mut store = LocalStore::new();
         let provider = provider_snapshot(&store, target);
@@ -682,6 +787,53 @@ impl LocalOperationQueue {
                 destination,
                 conflict,
                 expected_identity,
+                provider_route: None,
+            });
+        }
+        Ok(planned)
+    }
+
+    fn inspect_provider_drop(
+        &self,
+        payload: &FileDragPayload,
+        target: &StorePath,
+        route: Arc<dyn ProviderTransferRoute>,
+    ) -> Result<Vec<DropCandidate>, DropError> {
+        let mut sources = HashSet::with_capacity(payload.sources.len());
+        let mut destinations = HashSet::with_capacity(payload.sources.len());
+        let mut planned = Vec::with_capacity(payload.sources.len());
+        for (index, source) in payload.sources.iter().enumerate() {
+            if !sources.insert(source.clone()) {
+                return Err(DropError::DuplicateSource(source.clone()));
+            }
+            let expected_identity = payload.expected_identity(index).cloned();
+            let destination = route
+                .plan_destination(payload.action, source, target, expected_identity.as_ref())
+                .map_err(DropError::Plan)?;
+            if destination.provider_key().map(|(provider, _)| provider) != Some(route.provider_id())
+            {
+                return Err(DropError::Plan(
+                    "the provider route returned a destination owned by another provider".into(),
+                ));
+            }
+            if !destinations.insert(destination.clone()) {
+                return Err(DropError::DuplicateDestination(destination));
+            }
+            let plan = OperationPlan::new(
+                payload.action.operation_kind(),
+                route.provider_snapshot(&destination),
+                Some(source.clone()),
+                destination.clone(),
+            )
+            .map_err(|error| DropError::Plan(error.to_string().into()))?;
+            planned.push(DropCandidate {
+                plan,
+                action: payload.action,
+                source: source.clone(),
+                destination,
+                conflict: None,
+                expected_identity,
+                provider_route: Some(Arc::clone(&route)),
             });
         }
         Ok(planned)
@@ -695,6 +847,7 @@ struct DropCandidate {
     destination: StorePath,
     conflict: Option<ConflictRecord>,
     expected_identity: Option<ItemId>,
+    provider_route: Option<Arc<dyn ProviderTransferRoute>>,
 }
 
 fn decision_matches_conflict(decision: &ConflictDecision, conflict: &ConflictRecord) -> bool {

@@ -2006,7 +2006,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.tags",
             "tag",
             &[],
-            P::HasSelection,
+            P::Capability(CapabilityKind::Tags),
             A::ManageTags,
             G::Organization,
             D::None,

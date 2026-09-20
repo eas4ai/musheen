@@ -364,6 +364,7 @@ pub(crate) struct ProviderPropertiesWindow {
     tag_writer: Option<TagWriter>,
     tag_input: Entity<InputState>,
     tag_error: Option<Box<str>>,
+    page_notice: Option<Box<str>>,
 }
 
 impl ProviderPropertiesWindow {
@@ -374,13 +375,27 @@ impl ProviderPropertiesWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut model = data.model;
-        let _ = model.select_page(page);
+        let page_notice = model
+            .select_page(page)
+            .err()
+            .map(|_| provider_page_unavailable_message(&model, page));
         Self {
             model,
             tag_writer: data.tag_writer,
             tag_input: cx.new(|cx| InputState::new(window, cx).placeholder("Tag name")),
             tag_error: None,
+            page_notice,
         }
+    }
+
+    fn select_page(&mut self, page: PropertiesPage, cx: &mut Context<Self>) {
+        match self.model.select_page(page) {
+            Ok(()) => self.page_notice = None,
+            Err(_) => {
+                self.page_notice = Some(provider_page_unavailable_message(&self.model, page));
+            }
+        }
+        cx.notify();
     }
 
     fn apply_tags(&mut self, cx: &mut Context<Self>) {
@@ -400,94 +415,149 @@ impl ProviderPropertiesWindow {
         }
         cx.notify();
     }
-}
 
-impl Render for ProviderPropertiesWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_page_navigation(&self, cx: &mut Context<Self>) -> AnyElement {
+        let buttons = [PropertiesPage::General, PropertiesPage::Tags]
+            .into_iter()
+            .map(|page| {
+                let available = self.model.pages().contains(&page);
+                Button::new(SharedString::from(format!(
+                    "provider-properties-page-{}",
+                    page_id(page)
+                )))
+                .label(page_label(page))
+                .selected(self.model.page() == page)
+                .disabled(!available)
+                .on_click(cx.listener(move |this, _, _, cx| this.select_page(page, cx)))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("provider-properties-pages")
+            .test_support()
+            .role(Role::TabList)
+            .flex()
+            .gap_2()
+            .children(buttons)
+            .into_any_element()
+    }
+
+    fn render_tags_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let tags = self.model.tags().map(str::to_owned).collect::<Vec<_>>();
-        let capability_rows = CapabilityKind::ALL
+        div()
+            .id("properties-tags-page")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(tags.into_iter().enumerate().map(|(index, tag)| {
+                let remove = tag.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(tag)
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "provider-properties-remove-tag-{index}"
+                        )))
+                        .label("Remove")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.remove_tag(&remove);
+                            cx.notify();
+                        })),
+                    )
+            }))
+            .child(Input::new(&self.tag_input).id("provider-properties-tag-input"))
+            .child(
+                Button::new("provider-properties-add-tag")
+                    .label("Add tag")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let tag = this.tag_input.read(cx).value().to_string();
+                        this.tag_error = this
+                            .model
+                            .assign_tag(&tag)
+                            .err()
+                            .map(|error| error.to_string().into());
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("provider-properties-apply-tags")
+                    .label("Apply")
+                    .on_click(cx.listener(|this, _, _, cx| this.apply_tags(cx))),
+            )
+            .into_any_element()
+    }
+
+    fn render_general_page(&self) -> AnyElement {
+        let targets = self
+            .model
+            .targets()
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                div()
+                    .id(SharedString::from(format!(
+                        "provider-properties-target-{index}"
+                    )))
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .child(provider_property_row(
+                        format!("provider-properties-provider-{index}"),
+                        format!("Provider: {}", target.id().provider().as_str()),
+                    ))
+                    .child(provider_property_row(
+                        format!("provider-properties-identity-{index}"),
+                        format!("Stable identity: {:?}", target.id().opaque_key()),
+                    ))
+                    .child(provider_property_row(
+                        format!("provider-properties-location-{index}"),
+                        format!(
+                            "Location: {}",
+                            DisplayPath::from_store_path(target.path()).as_str()
+                        ),
+                    ))
+            });
+        let capabilities = CapabilityKind::ALL
             .iter()
             .copied()
-            .map(|kind| {
+            .enumerate()
+            .map(|(index, kind)| {
                 let values = self
                     .model
                     .capabilities()
                     .iter()
                     .map(|matrix| capability_state_label(matrix.get(kind)))
                     .collect::<Vec<_>>();
-                (
-                    capability_kind_label(kind).to_owned(),
-                    aggregate_strings(&values),
-                )
-            })
-            .collect::<Vec<_>>();
-        let content = if self.model.page() == PropertiesPage::Tags {
-            div()
-                .id("properties-tags-page")
-                .test_support()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .children(tags.into_iter().enumerate().map(|(index, tag)| {
-                    let remove = tag.clone();
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(tag)
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "provider-properties-remove-tag-{index}"
-                            )))
-                            .label("Remove")
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.model.remove_tag(&remove);
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                }))
-                .child(Input::new(&self.tag_input).id("provider-properties-tag-input"))
-                .child(
-                    Button::new("provider-properties-add-tag")
-                        .label("Add tag")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let tag = this.tag_input.read(cx).value().to_string();
-                            this.tag_error = this
-                                .model
-                                .assign_tag(&tag)
-                                .err()
-                                .map(|e| e.to_string().into());
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("provider-properties-apply-tags")
-                        .label("Apply")
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_tags(cx))),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .id("provider-properties-general-page")
-                .test_support()
-                .children(self.model.targets().iter().map(|target| {
-                    div().child(
-                        DisplayPath::from_store_path(target.path())
-                            .as_str()
-                            .to_owned(),
-                    )
-                }))
-                .children(capability_rows.into_iter().map(|(label, value)| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(label)
-                        .child(value)
-                }))
-                .into_any_element()
+                div()
+                    .id(SharedString::from(format!(
+                        "provider-properties-capability-{index}"
+                    )))
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(capability_kind_label(kind))
+                    .child(aggregate_strings(&values))
+            });
+        div()
+            .id("provider-properties-general-page")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(targets)
+            .children(capabilities)
+            .into_any_element()
+    }
+}
+
+impl Render for ProviderPropertiesWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content = match self.model.page() {
+            PropertiesPage::Tags => self.render_tags_page(cx),
+            _ => self.render_general_page(),
         };
         div()
             .id("provider-properties")
@@ -496,8 +566,48 @@ impl Render for ProviderPropertiesWindow {
             .flex()
             .flex_col()
             .gap_3()
+            .child(self.render_page_navigation(cx))
+            .when_some(self.page_notice.clone(), |view, notice| {
+                view.child(
+                    div()
+                        .id("provider-properties-page-notice")
+                        .test_support()
+                        .child(notice.to_string()),
+                )
+            })
             .child(content)
     }
+}
+
+fn provider_property_row(id: String, value: String) -> AnyElement {
+    div()
+        .id(SharedString::from(id))
+        .test_support()
+        .child(value)
+        .into_any_element()
+}
+
+fn provider_page_unavailable_message(
+    model: &ProviderPropertiesDialogModel,
+    page: PropertiesPage,
+) -> Box<str> {
+    if page == PropertiesPage::Tags {
+        let states = model
+            .capabilities()
+            .iter()
+            .map(|matrix| capability_state_label(matrix.get(CapabilityKind::Tags)))
+            .collect::<Vec<_>>();
+        return format!(
+            "Tags is unavailable for this provider target: {}",
+            aggregate_strings(&states)
+        )
+        .into();
+    }
+    format!(
+        "{} is unavailable for this provider target",
+        page_label(page)
+    )
+    .into()
 }
 
 pub struct PropertiesWindowData {

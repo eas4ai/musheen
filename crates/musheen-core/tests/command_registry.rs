@@ -373,6 +373,40 @@ fn command_enablement_is_deterministic_and_explains_capability_refusal() {
 }
 
 #[test]
+fn tag_management_requires_the_provider_tags_capability() {
+    let registry = CommandRegistry::built_in();
+    let command = registry.get("item.tags").unwrap();
+    let unsupported = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::File,
+        capabilities: CapabilityMatrix::new(|kind| {
+            if kind == CapabilityKind::Tags {
+                CapabilityState::Unsupported(
+                    CapabilityReason::new("this provider does not support tags").unwrap(),
+                )
+            } else {
+                CapabilityState::Supported
+            }
+        }),
+        ..CommandContext::default()
+    };
+
+    assert!(!command.state(&unsupported).is_enabled());
+    assert_eq!(
+        command.state(&unsupported).disabled_reason(),
+        Some("this provider does not support tags")
+    );
+    assert!(
+        command
+            .state(&CommandContext {
+                capabilities: CapabilityMatrix::new(|_| CapabilityState::Supported),
+                ..unsupported
+            })
+            .is_enabled()
+    );
+}
+
+#[test]
 fn selection_and_destination_rules_are_enforced_before_dispatch() {
     let registry = CommandRegistry::built_in();
     let mut context = CommandContext {

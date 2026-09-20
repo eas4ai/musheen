@@ -1,6 +1,7 @@
 pub use musheen_local::{
     DropAction, DropError, FileDragPayload, LocalFailureDisposition, LocalOperationFailure,
-    LocalOperationOutcome, LocalOperationQueue, LocalStore, ReadyLocalOperation, TransferOutcome,
+    LocalOperationOutcome, LocalOperationQueue, LocalStore, ProviderTransferRoute,
+    ReadyLocalOperation, TransferOutcome,
 };
 
 use crate::{RecoveryAction, StatusCenterError, StatusCenterModel};
@@ -25,6 +26,17 @@ pub struct OperationHub {
 }
 
 impl OperationHub {
+    pub fn register_provider_transfer_route(
+        &self,
+        route: Arc<dyn ProviderTransferRoute>,
+    ) -> Result<(), OperationHubError> {
+        self.queue
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?
+            .register_provider_transfer_route(route);
+        Ok(())
+    }
+
     pub(crate) fn submit_custom_action(
         &self,
         context: crate::status_center::custom_actions::CustomActionContext,
