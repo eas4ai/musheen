@@ -20,16 +20,16 @@ UIV-020, UIV-022.
 `crates/musheen-core/src/context.rs`; create
 `crates/musheen-core/tests/command_registry.rs`.
 
-- [ ] Test uniqueness of IDs/shortcuts, deterministic enablement, capability
+- [x] Test uniqueness of IDs/shortcuts, deterministic enablement, capability
   refusal reasons, selection cardinality, writable destination rules, checked
   states, dangerous-action classification, and localization/icon completeness.
-- [ ] Run `cargo test -p musheen-core --test command_registry`; expect failure.
-- [ ] Add `CommandContext`, `CommandState`, `DangerLevel`, and typed parameters.
+- [x] Run `cargo test -p musheen-core --test command_registry`; expect failure.
+- [x] Add `CommandContext`, `CommandState`, `DangerLevel`, and typed parameters.
   A command handler receives validated IDs/paths, never display strings.
-- [ ] Register every action specified in CUSTOM-016–028 and prove each appears
+- [x] Register every action specified in CUSTOM-016–028 and prove each appears
   in exactly one registry entry.
-- [ ] Run the registry audit and snapshot its stable public IDs.
-- [ ] Commit with `feat(commands): centralize all user actions`.
+- [x] Run the registry audit and snapshot its stable public IDs.
+- [x] Commit with `feat(commands): centralize all user actions`.
 
 ### Task 2: Compose complete context menus
 
