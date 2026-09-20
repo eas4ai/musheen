@@ -1071,6 +1071,24 @@ impl CommandDefinition {
         self.predicate
             .evaluate(context)
             .with_checked(match self.action() {
+                CommandAction::ViewDetails => {
+                    matches!(context.active_layout, crate::ActiveLayout::Details)
+                }
+                CommandAction::ViewList => {
+                    matches!(context.active_layout, crate::ActiveLayout::List)
+                }
+                CommandAction::ViewCards => {
+                    matches!(context.active_layout, crate::ActiveLayout::Cards)
+                }
+                CommandAction::ViewGrid => {
+                    matches!(context.active_layout, crate::ActiveLayout::Grid)
+                }
+                CommandAction::ViewColumns => {
+                    matches!(context.active_layout, crate::ActiveLayout::Columns)
+                }
+                CommandAction::ViewAdaptive => {
+                    matches!(context.active_layout, crate::ActiveLayout::Adaptive)
+                }
                 CommandAction::ToggleHidden => context.show_hidden,
                 CommandAction::ToggleDirectoriesFirst => context.directories_first,
                 CommandAction::ToggleSidebar => context.sidebar_visible,

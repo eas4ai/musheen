@@ -10,6 +10,9 @@ pub enum Locale {
     #[default]
     EnUs,
     EnXa,
+    /// Right-to-left system locale. English catalog fallback keeps every
+    /// command available while translations are supplied by the system.
+    Ar,
 }
 
 impl Locale {
@@ -18,6 +21,7 @@ impl Locale {
         match self {
             Self::EnUs => "en-US",
             Self::EnXa => "en-XA",
+            Self::Ar => "ar",
         }
     }
 
@@ -35,6 +39,8 @@ impl Locale {
             let tag = candidate.split(['.', '@']).next()?;
             if tag.eq_ignore_ascii_case("en-XA") || tag.eq_ignore_ascii_case("en_XA") {
                 Some(Self::EnXa)
+            } else if tag.eq_ignore_ascii_case("ar") || tag.starts_with("ar_") {
+                Some(Self::Ar)
             } else if tag.eq_ignore_ascii_case("en-US") || tag.eq_ignore_ascii_case("en_US") {
                 Some(Self::EnUs)
             } else {
@@ -55,6 +61,7 @@ impl Catalog {
         let source = match locale {
             Locale::EnUs => EN_US,
             Locale::EnXa => EN_XA,
+            Locale::Ar => EN_US,
         };
         Ok(Self {
             locale,

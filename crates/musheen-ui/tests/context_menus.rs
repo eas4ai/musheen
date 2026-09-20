@@ -6,8 +6,9 @@ use musheen_core::{
 };
 use musheen_ui::{
     AppearanceMode, ContextMenuDestinationResolver, ContextMenuRequest, ContextMenuSource,
-    ContextMenuSurface, MenuDirection, MenuEntryKind, MenuFocus, MenuInvocation, MenuKeyRoute,
-    MenuPresentation, MenuTarget, OpenWithApplication, SendToDestination, ShellModel, ThemeProfile,
+    ContextMenuSurface, Locale, MenuDirection, MenuEntryKind, MenuFocus, MenuInvocation,
+    MenuKeyRoute, MenuPresentation, MenuTarget, OpenWithApplication, SendToDestination, ShellModel,
+    ThemeProfile,
 };
 
 fn path(value: &str) -> StorePath {
@@ -328,6 +329,21 @@ fn presentation_has_compact_theme_tokens_shortcuts_checked_state_and_rtl_directi
 }
 
 #[test]
+fn rtl_locale_mirrors_directional_menu_chrome_but_not_path_direction() {
+    let menu = ContextMenuSurface::new(CommandRegistry::built_in())
+        .with_locale(Locale::Ar)
+        .compose(request(
+            supported_context(CommandTarget::Background, 0),
+            MenuTarget::Background,
+            vec![],
+        ));
+    assert_eq!(menu.locale_direction(), MenuDirection::RightToLeft);
+    let chrome = menu.direction(menu.locale_direction());
+    assert_eq!(chrome.submenu_arrow(), "←");
+    assert_eq!(chrome.path_direction(), MenuDirection::LeftToRight);
+}
+
+#[test]
 fn chooser_resolution_rechecks_destination_policy_and_cancellation_never_dispatches() {
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
     let menu = surface.compose(request(
@@ -577,6 +593,20 @@ fn menu_accessibility_and_keyboard_follow_modal_focus_and_pseudo_locale_rules() 
         MenuTarget::Background,
         vec![],
     ));
+    assert!(
+        layout_menu
+            .entry("view.list")
+            .expect("active layout is present")
+            .state()
+            .is_checked()
+    );
+    assert!(
+        !layout_menu
+            .entry("view.details")
+            .expect("inactive layout is present")
+            .state()
+            .is_checked()
+    );
     assert!(layout_menu.accessibility_tree().iter().any(|node| {
         matches!(node.role(), musheen_ui::MenuAccessibleRole::Radio) && node.name().starts_with('⟦')
     }));

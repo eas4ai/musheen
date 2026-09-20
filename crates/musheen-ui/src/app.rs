@@ -42,12 +42,12 @@ use gpui_kit::{
     WindowOptions, div, img, px, size, uniform_list,
 };
 use musheen_core::{
-    CancellationToken, CapabilityReason, CapabilityState, CommandAction, CommandContext,
-    CommandDispatchError, CommandDispatcher, CommandParameters, CommandTarget, CommandTargetRef,
-    DirectoryWatch, DisplayPath, ItemId, ItemKind, Page, ProviderActionMatrix, ProviderId,
-    ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch, SearchCompletion,
-    SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath,
-    WatchEvent,
+    ActiveLayout, CancellationToken, CapabilityReason, CapabilityState, CommandAction,
+    CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters, CommandTarget,
+    CommandTargetRef, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page, ProviderActionMatrix,
+    ProviderId, ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch,
+    SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem,
+    StorePath, WatchEvent,
 };
 use musheen_desktop::{
     ConflictDecisionStore, MimeDetector, PreviewDocument, SessionStore, ThumbnailCache,
@@ -73,9 +73,13 @@ gpui_kit::assets::icon_assets!(
         ArrowLeft,
         ArrowRight,
         ArrowUp,
+        Copy,
         Columns2,
         Download,
+        Eye,
+        EyeOff,
         File,
+        FileSymlink,
         Folder,
         Grid2x2,
         HardDrive,
@@ -83,13 +87,24 @@ gpui_kit::assets::icon_assets!(
         Info,
         List,
         ListChecks,
+        Link2,
+        MapPin,
         Network,
         PanelRight,
+        Pin,
+        PinOff,
         Plus,
         Puzzle,
         RefreshCw,
+        RotateCcw,
+        Scissors,
         Search,
         Settings,
+        Shield,
+        ShieldCheck,
+        Star,
+        Tag,
+        Terminal,
         TextCursorInput,
         Trash,
         X,
@@ -189,6 +204,7 @@ struct ItemRenderSpec {
     columns: Vec<(ColumnKey, u16)>,
     layout: Layout,
     selected: bool,
+    focused: bool,
 }
 
 struct FileDragPreview {
@@ -318,6 +334,7 @@ struct ContextDialogWindow {
     id: WindowId,
     origin_tab: TabId,
     focused_item: Option<ItemId>,
+    restore_focus: FocusHandle,
 }
 
 #[derive(Clone)]
@@ -898,6 +915,7 @@ struct MusheenApp {
     pending_omnibar_value: Option<String>,
     content_focus: FocusHandle,
     pending_content_focus: bool,
+    pending_restored_focus: Option<FocusHandle>,
     session_binding: Option<SessionBinding>,
     session_save_generation: u64,
     watch_directories: bool,
@@ -1025,6 +1043,7 @@ impl MusheenApp {
             pending_omnibar_value: None,
             content_focus: cx.focus_handle(),
             pending_content_focus: true,
+            pending_restored_focus: None,
             session_binding,
             session_save_generation: 0,
             watch_directories,
@@ -1358,6 +1377,9 @@ impl MusheenApp {
     }
 
     fn focus_pane(&mut self, id: PaneId, cx: &mut Context<Self>) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
         let previous = self.navigation.focused_tab().id();
         if self.navigation.focus_pane(id).is_ok() {
             let focused = self.navigation.focused_tab().id();
@@ -1413,15 +1435,56 @@ impl MusheenApp {
             // reach a background pane while an immutable decision is open.
             return;
         }
-        let Some(action) = self
-            .shell
-            .commands()
-            .get(command_id)
-            .map(|command| command.action())
-        else {
+        let Some(command) = self.shell.commands().get(command_id) else {
             return;
         };
+        let action = command.action();
+        let tab_id = self.navigation.focused_tab().id();
+        let selection = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| {
+                let view = directory.view();
+                view.selected_ids()
+                    .iter()
+                    .filter_map(|id| view.item(id))
+                    .filter_map(|item| {
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let target = if selection.is_empty() {
+            MenuTarget::Background
+        } else {
+            MenuTarget::Item
+        };
+        let menu = self.compose_context_menu(tab_id, target, selection);
+        if let Some(entry) = Self::menu_entry_by_id(&menu, command_id) {
+            // Toolbar and browser shortcuts invoke the very same registry
+            // projection as a context row, including parameter construction,
+            // backend state and confirmation/chooser routing.
+            self.dispatch_context_entry(entry.clone(), cx);
+            return;
+        }
+        if is_contextual_command(action) {
+            // An absent contextual command is inapplicable. Never use the
+            // generic action switch as a back door around registry policy.
+            return;
+        }
         self.dispatch_action(action, cx);
+    }
+
+    fn menu_entry_by_id<'a>(menu: &'a ContextMenu, command_id: &str) -> Option<&'a MenuEntry> {
+        menu.entries().iter().find_map(|entry| {
+            (entry.command_id() == Some(command_id))
+                .then_some(entry)
+                .or_else(|| {
+                    entry
+                        .submenu()
+                        .and_then(|submenu| Self::menu_entry_by_id(submenu, command_id))
+                })
+        })
     }
 
     fn open_selected_properties_page(&mut self, page: PropertiesPage, cx: &mut Context<Self>) {
@@ -1794,6 +1857,9 @@ impl MusheenApp {
     }
 
     fn select_item(&mut self, tab_id: TabId, id: ItemId, cx: &mut Context<Self>) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
         let selected = {
             let Some(directory) = self.directories.get_mut(&tab_id) else {
                 return;
@@ -1810,6 +1876,9 @@ impl MusheenApp {
     }
 
     fn focus_directory_item(&mut self, tab_id: TabId, id: Option<ItemId>, cx: &mut Context<Self>) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
         if let Some(directory) = self.directories.get_mut(&tab_id) {
             directory.view_mut().focus_item(id);
             cx.notify();
@@ -1817,6 +1886,9 @@ impl MusheenApp {
     }
 
     fn move_directory_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
         let tab_id = self.navigation.focused_tab().id();
         let Some(directory) = self.directories.get_mut(&tab_id) else {
             return;
@@ -1935,7 +2007,18 @@ impl MusheenApp {
         target: MenuTarget,
         location: StorePath,
     ) -> ContextMenu {
-        self.compose_context_menu_at(tab_id, target, location, Vec::new())
+        // A sidebar/mount row is a concrete provider location, not a generic
+        // background. Capture its current identity when the provider exposes
+        // one so later invocation cannot be redirected by a pane change.
+        let selection = self
+            .store
+            .resolve_item(&location)
+            .ok()
+            .flatten()
+            .and_then(|item| CommandTargetRef::new(item.id().clone(), item.path().clone()).ok())
+            .into_iter()
+            .collect();
+        self.compose_context_menu_at(tab_id, target, location, selection)
     }
 
     fn compose_context_menu(
@@ -1949,6 +2032,11 @@ impl MusheenApp {
             .tab(tab_id)
             .map(|tab| tab.location().clone())
             .unwrap_or_else(|| self.navigation.focused_tab().location().clone());
+        let target = if target == MenuTarget::Background && is_trash_location(&location) {
+            MenuTarget::TrashBackground
+        } else {
+            target
+        };
         self.compose_context_menu_at(tab_id, target, location, selection)
     }
 
@@ -1959,6 +2047,24 @@ impl MusheenApp {
         location: StorePath,
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
+        let context = self.context_for_menu(tab_id, target, &location, &selection);
+        self.shell
+            .context_menus()
+            .clone()
+            .with_locale(self.catalog.locale())
+            .compose(
+                crate::ContextMenuRequest::new(context, target, location, selection)
+                    .with_origin_tab(tab_id),
+            )
+    }
+
+    fn context_for_menu(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: &StorePath,
+        selection: &[CommandTargetRef],
+    ) -> CommandContext {
         let item_count = self
             .directories
             .get(&tab_id)
@@ -1968,14 +2074,21 @@ impl MusheenApp {
                 .get(&tab_id)
                 .and_then(|directory| directory.view().item(target.id()))
         });
+        let executable_state = selected_item.and_then(|item| {
+            (item.kind() == ItemKind::RegularFile)
+                .then(|| self.store.executable_state(item.path()).ok())
+                .flatten()
+        });
         let item_target = if target == MenuTarget::Mount {
             CommandTarget::Mount
+        } else if target == MenuTarget::SidebarLocation {
+            CommandTarget::Sidebar
         } else if target == MenuTarget::Tag {
             CommandTarget::Tag
         } else if target == MenuTarget::TrashItem {
             CommandTarget::TrashItem
         } else if target == MenuTarget::TrashBackground
-            || is_trash_location(&location) && selection.is_empty()
+            || is_trash_location(location) && selection.is_empty()
         {
             CommandTarget::TrashBackground
         } else if selection.len() > 1 {
@@ -1983,6 +2096,11 @@ impl MusheenApp {
         } else if let Some(item) = selected_item {
             match item.kind() {
                 ItemKind::Directory => CommandTarget::Directory,
+                ItemKind::RegularFile
+                    if matches!(executable_state, Some(CapabilityState::Supported)) =>
+                {
+                    CommandTarget::ExecutableFile
+                }
                 _ if is_archive_path(item.path()) => CommandTarget::Archive,
                 _ => CommandTarget::File,
             }
@@ -2020,7 +2138,7 @@ impl MusheenApp {
             CapabilityReason::new("the active provider has no desktop action backend")
                 .expect("the provider-action reason is valid"),
         );
-        let context = CommandContext {
+        CommandContext {
             target: item_target,
             item_count,
             selection_count: selection.len(),
@@ -2038,7 +2156,7 @@ impl MusheenApp {
             is_local,
             has_dot_name_semantics: is_local,
             target_is_hidden: selected_item.is_some_and(|item| is_hidden_path(item.path())),
-            executable_run_enabled: false,
+            executable_run_enabled: matches!(executable_state, Some(CapabilityState::Supported)),
             capabilities,
             provider_actions: ProviderActionMatrix::from_states(
                 unsupported_provider_action.clone(),
@@ -2056,6 +2174,18 @@ impl MusheenApp {
                 .is_some_and(|directory| directory.view().preferences().directories_first),
             sidebar_visible: self.sidebar_visible,
             info_visible: self.shell.info_visible(),
+            active_layout: self
+                .directories
+                .get(&tab_id)
+                .map(|directory| match directory.view().preferences().layout {
+                    Layout::Details => ActiveLayout::Details,
+                    Layout::List => ActiveLayout::List,
+                    Layout::Cards => ActiveLayout::Cards,
+                    Layout::Grid => ActiveLayout::Grid,
+                    Layout::Columns => ActiveLayout::Columns,
+                    Layout::Adaptive => ActiveLayout::Adaptive,
+                })
+                .unwrap_or_default(),
             backend_actions: Some(
                 CommandAction::ALL
                     .iter()
@@ -2064,15 +2194,7 @@ impl MusheenApp {
                     .collect(),
             ),
             ..CommandContext::default()
-        };
-        self.shell
-            .context_menus()
-            .clone()
-            .with_locale(self.catalog.locale())
-            .compose(
-                crate::ContextMenuRequest::new(context, target, location, selection)
-                    .with_origin_tab(tab_id),
-            )
+        }
     }
 
     fn populate_context_popup(
@@ -2083,12 +2205,16 @@ impl MusheenApp {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
+        let chrome = menu.direction(menu.locale_direction());
+        let theme_tokens = menu.theme_tokens();
         for (index, entry) in menu.entries().iter().cloned().enumerate() {
             let row_path = format!("{path}-{index}");
             match entry.kind() {
                 MenuEntryKind::Separator => popup = popup.separator(),
                 MenuEntryKind::Submenu => {
-                    let label = entry.label().to_owned();
+                    // Only directional chrome mirrors. The entry's label
+                    // remains lossless text (including paths and names).
+                    let label = format!("{} {}", entry.label(), chrome.submenu_arrow());
                     let disabled = !entry.state().is_enabled();
                     let Some(submenu) = entry.submenu().cloned() else {
                         continue;
@@ -2101,7 +2227,12 @@ impl MusheenApp {
                     popup = popup.item(PopupMenuItem::submenu(label, submenu).disabled(disabled));
                 }
                 MenuEntryKind::Command | MenuEntryKind::Overflow => {
-                    popup = popup.item(Self::context_popup_item(entry, app.clone(), row_path));
+                    popup = popup.item(Self::context_popup_item(
+                        entry,
+                        app.clone(),
+                        row_path,
+                        theme_tokens,
+                    ));
                 }
             }
         }
@@ -2112,12 +2243,22 @@ impl MusheenApp {
         entry: MenuEntry,
         app: gpui_kit::WeakEntity<Self>,
         id: String,
+        theme_tokens: crate::MenuThemeTokens,
     ) -> PopupMenuItem {
         let label = entry.label().to_owned();
+        let icon_key = entry.icon_key().map(str::to_owned);
+        let icon = menu_icon(icon_key.as_deref());
+        let icon_id = format!("context-menu-icon-{id}");
         let shortcut = entry.shortcut().map(str::to_owned);
         let disabled_reason = entry.accessible_disabled_reason().map(str::to_owned);
         let enabled = entry.state().is_enabled();
         let checked = entry.state().is_checked();
+        let destructive = entry.danger_level() != musheen_core::DangerLevel::None;
+        let display_label = if checked {
+            format!("✓ {label}")
+        } else {
+            label.clone()
+        };
         let role = match entry.accessible_role() {
             crate::MenuAccessibleRole::Checkbox => Role::MenuItemCheckBox,
             crate::MenuAccessibleRole::Radio => Role::MenuItemRadio,
@@ -2125,7 +2266,8 @@ impl MusheenApp {
                 Role::MenuItem
             }
         };
-        PopupMenuItem::element(move |_, _| {
+        PopupMenuItem::element(move |_, cx| {
+            let colors = cx.theme().colors;
             div()
                 .id(SharedString::from(format!("context-menu-row-{id}")))
                 .test_support()
@@ -2144,11 +2286,29 @@ impl MusheenApp {
                 .flex()
                 .justify_between()
                 .gap_4()
-                .child(if checked {
-                    format!("✓ {label}")
-                } else {
-                    label.clone()
+                .when(theme_tokens.strong_boundaries(), |row| {
+                    row.border_b_1().border_color(colors.border)
                 })
+                .when(destructive, |row| row.text_color(colors.danger))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id(SharedString::from(icon_id.clone()))
+                                .test_support()
+                                .role(Role::Image)
+                                .aria_label(
+                                    icon_key
+                                        .clone()
+                                        .unwrap_or_else(|| "extension action".to_owned()),
+                                )
+                                .child(Icon::new(icon).small()),
+                        )
+                        .child(display_label.clone()),
+                )
                 .when_some(shortcut.clone(), |row, shortcut| {
                     row.child(div().text_xs().child(shortcut))
                 })
@@ -2171,7 +2331,13 @@ impl MusheenApp {
         match surface.invoke(&entry, &mut dispatcher) {
             crate::MenuInvocation::Dispatched => {
                 if let Some((action, parameters)) = dispatcher.dispatched {
-                    self.dispatch_typed_context_command(action, parameters, entry.origin_tab(), cx);
+                    self.dispatch_typed_context_command(
+                        action,
+                        parameters,
+                        entry.origin_tab(),
+                        Some(entry.captured_targets()),
+                        cx,
+                    );
                 }
             }
             MenuInvocation::NeedsConfirmation(pending) => {
@@ -2221,10 +2387,17 @@ impl MusheenApp {
         let surface = self.shell.context_menus().clone();
         let mut dispatcher = AppMenuDispatcher::default();
         let origin_tab = pending.origin_tab();
+        let captured_targets = pending.selection().to_vec();
         match surface.resolve_destination(pending, destination, &resolver, &mut dispatcher) {
             MenuInvocation::Dispatched => {
                 if let Some((action, parameters)) = dispatcher.dispatched {
-                    self.dispatch_typed_context_command(action, parameters, origin_tab, cx);
+                    self.dispatch_typed_context_command(
+                        action,
+                        parameters,
+                        origin_tab,
+                        Some(&captured_targets),
+                        cx,
+                    );
                 }
             }
             MenuInvocation::NeedsConfirmation(pending) => {
@@ -2259,6 +2432,7 @@ impl MusheenApp {
             id: window_id,
             origin_tab,
             focused_item,
+            restore_focus: self.content_focus.clone(),
         });
         if self.context_dialog_close_subscription.is_some() {
             return;
@@ -2274,8 +2448,10 @@ impl MusheenApp {
                     let dialog = this.context_dialog_windows.remove(index);
                     // A window-manager close is exactly a cancellation. It
                     // does not retain a mutable pending command or dispatch.
-                    this.pending_content_focus = true;
-                    this.focus_directory_item(dialog.origin_tab, dialog.focused_item, cx);
+                    if this.context_dialog_windows.is_empty() {
+                        this.pending_restored_focus = Some(dialog.restore_focus);
+                        this.focus_directory_item(dialog.origin_tab, dialog.focused_item, cx);
+                    }
                     cx.notify();
                 }
             });
@@ -2395,10 +2571,23 @@ impl MusheenApp {
             MenuInvocation::NeedsConfirmation(pending) => pending.origin_tab(),
             _ => None,
         };
+        // The review consumes its invocation while constructing the dispatch.
+        // Retain the immutable capture so a reviewed directory action cannot
+        // fall back to whatever happens to be focused when it is confirmed.
+        let captured_targets = match &invocation {
+            MenuInvocation::NeedsConfirmation(pending) => Some(pending.selection().to_vec()),
+            _ => None,
+        };
         match surface.confirm(invocation, &mut dispatcher) {
             Ok(()) => {
                 if let Some((action, parameters)) = dispatcher.dispatched {
-                    self.dispatch_typed_context_command(action, parameters, origin_tab, cx);
+                    self.dispatch_typed_context_command(
+                        action,
+                        parameters,
+                        origin_tab,
+                        captured_targets.as_deref(),
+                        cx,
+                    );
                 }
             }
             Err(error) => {
@@ -2413,6 +2602,7 @@ impl MusheenApp {
         action: CommandAction,
         parameters: CommandParameters,
         origin_tab: Option<TabId>,
+        captured_targets: Option<&[CommandTargetRef]>,
         cx: &mut Context<Self>,
     ) {
         match (&action, &parameters) {
@@ -2462,6 +2652,13 @@ impl MusheenApp {
                 self.open_properties_targets(targets, PropertiesPage::Permissions, cx);
             }
             (CommandAction::DirectoryProperties, CommandParameters::Location(location)) => {
+                if let Some(targets) = captured_targets
+                    && let Err(error) = self.revalidate_context_targets(origin_tab, targets)
+                {
+                    self.operation_error = Some(error);
+                    cx.notify();
+                    return;
+                }
                 self.open_properties_paths(
                     location
                         .as_unix_path()
@@ -2598,6 +2795,9 @@ impl MusheenApp {
         target: StorePath,
         cx: &mut Context<Self>,
     ) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
         let conflicts = match self.operation_hub.conflicts_for_drop(&payload, &target) {
             Ok(conflicts) => conflicts,
             Err(error) => {
@@ -3910,6 +4110,9 @@ impl MusheenApp {
                                         .on_mouse_down(
                                             MouseButton::Right,
                                             cx.listener(move |this, _, _, _| {
+                                                if !this.context_dialog_windows.is_empty() {
+                                                    return;
+                                                }
                                                 this.pending_context_menu =
                                                     Some(this.sidebar_location_context_menu(
                                                         sidebar_tab,
@@ -4122,14 +4325,17 @@ impl MusheenApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| {
-                    this.focus_directory_item(tab_id, None, cx);
-                    if this.pending_context_menu.is_none() {
-                        this.pending_context_menu = Some(this.compose_context_menu(
-                            tab_id,
-                            MenuTarget::Background,
-                            Vec::new(),
-                        ));
+                    // Item context events bubble through the content surface.
+                    // Their item handler has already captured a menu; only an
+                    // unclaimed event is a genuine background invocation.
+                    if !this.context_dialog_windows.is_empty()
+                        || this.pending_context_menu.is_some()
+                    {
+                        return;
                     }
+                    this.focus_directory_item(tab_id, None, cx);
+                    this.pending_context_menu =
+                        Some(this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new()));
                 }),
             )
             .context_menu(move |popup, window, popup_cx| {
@@ -5313,6 +5519,9 @@ impl MusheenApp {
             columns: view.preferences().columns.visible_columns_with_widths(),
             layout,
             selected: view.selected_ids().contains(item.id()),
+            focused: view
+                .focused_item_id()
+                .is_some_and(|focused| focused == item.id()),
         })
     }
 
@@ -5336,6 +5545,7 @@ impl MusheenApp {
             |source| img(source).size(px(42.)).into_any_element(),
         );
         let colors = cx.theme().colors;
+        let focused_unselected = spec.focused && !spec.selected;
         let item_id =
             SharedString::from(format!("directory-item-{}-{}", spec.pane_index, spec.index));
         let tab_id = spec.tab_id;
@@ -5463,6 +5673,15 @@ impl MusheenApp {
                     .children(cells)
             }
         };
+        let item = div()
+            .id(SharedString::from(format!(
+                "directory-item-focus-{}-{}",
+                spec.pane_index, spec.index
+            )))
+            .when(focused_unselected, |item| {
+                item.border_1().border_color(colors.ring)
+            })
+            .child(item);
         item.on_click(cx.listener(move |this, _, _, cx| {
             this.select_item(tab_id, stable_id.clone(), cx);
             this.focus_directory_item(tab_id, Some(focused_id.clone()), cx);
@@ -5470,6 +5689,9 @@ impl MusheenApp {
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| {
+                if !this.context_dialog_windows.is_empty() {
+                    return;
+                }
                 this.pending_context_menu =
                     Some(this.item_context_menu(tab_id, context_menu_id.clone(), cx));
             }),
@@ -5859,7 +6081,9 @@ impl Render for MusheenApp {
         {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
-        if self.pending_content_focus {
+        if let Some(focus) = self.pending_restored_focus.take() {
+            focus.focus(window, cx);
+        } else if self.pending_content_focus {
             self.content_focus.focus(window, cx);
             self.pending_content_focus = false;
         }
@@ -6082,6 +6306,97 @@ fn trash_store_path() -> StorePath {
 
 fn is_trash_location(path: &StorePath) -> bool {
     path == &trash_store_path()
+}
+
+fn is_contextual_command(action: CommandAction) -> bool {
+    matches!(
+        action,
+        CommandAction::Open
+            | CommandAction::OpenWith
+            | CommandAction::ChooseApplication
+            | CommandAction::SetDefaultApplication
+            | CommandAction::OpenInNewTab
+            | CommandAction::OpenInNewWindow
+            | CommandAction::OpenTerminalHere
+            | CommandAction::OpenAsAdministrator
+            | CommandAction::Run
+            | CommandAction::RunAsAdministrator
+            | CommandAction::Copy
+            | CommandAction::Cut
+            | CommandAction::PasteInto
+            | CommandAction::CopyTo
+            | CommandAction::MoveTo
+            | CommandAction::SendTo
+            | CommandAction::Rename
+            | CommandAction::Duplicate
+            | CommandAction::CreateSymbolicLink
+            | CommandAction::CreateHardLink
+            | CommandAction::Hide
+            | CommandAction::Unhide
+            | CommandAction::Compress
+            | CommandAction::Extract
+            | CommandAction::ExtractHere
+            | CommandAction::NewDirectory
+            | CommandAction::NewEmptyFile
+            | CommandAction::NewFromTemplate
+            | CommandAction::MoveToTrash
+            | CommandAction::DeletePermanently
+            | CommandAction::Restore
+            | CommandAction::EmptyTrash
+            | CommandAction::OpenProperties
+            | CommandAction::DirectoryProperties
+            | CommandAction::Permissions
+            | CommandAction::CopyLocation
+            | CommandAction::Unmount
+            | CommandAction::Eject
+            | CommandAction::PowerOff
+            | CommandAction::Pin
+            | CommandAction::Unpin
+            | CommandAction::Share
+    )
+}
+
+fn menu_icon(icon_key: Option<&str>) -> IconName {
+    use crate::icons::LucideIcon;
+    match crate::icons::lucide_icon_or_fallback(icon_key.unwrap_or("puzzle")) {
+        LucideIcon::ArrowLeft => IconName::ArrowLeft,
+        LucideIcon::ArrowRight => IconName::ArrowRight,
+        LucideIcon::ArrowUp => IconName::ArrowUp,
+        LucideIcon::RefreshCw => IconName::RefreshCw,
+        LucideIcon::Search => IconName::Search,
+        LucideIcon::ListFilter | LucideIcon::TextCursorInput => IconName::TextCursorInput,
+        LucideIcon::List => IconName::List,
+        LucideIcon::ListChecks => IconName::ListChecks,
+        LucideIcon::Grid2x2 => IconName::Grid2x2,
+        LucideIcon::Settings => IconName::Settings,
+        LucideIcon::X => IconName::X,
+        LucideIcon::Home => IconName::House,
+        LucideIcon::Folder => IconName::Folder,
+        LucideIcon::HardDrive => IconName::HardDrive,
+        LucideIcon::Network => IconName::Network,
+        LucideIcon::Trash => IconName::Trash,
+        LucideIcon::Info => IconName::Info,
+        LucideIcon::Plus => IconName::Plus,
+        LucideIcon::Copy => IconName::Copy,
+        LucideIcon::RotateCcw => IconName::RotateCcw,
+        LucideIcon::File => IconName::File,
+        LucideIcon::Puzzle => IconName::Puzzle,
+        LucideIcon::Columns2 => IconName::Columns2,
+        LucideIcon::PanelRight => IconName::PanelRight,
+        LucideIcon::Scissors => IconName::Scissors,
+        LucideIcon::Terminal => IconName::Terminal,
+        LucideIcon::Eye => IconName::Eye,
+        LucideIcon::EyeOff => IconName::EyeOff,
+        LucideIcon::FileSymlink => IconName::FileSymlink,
+        LucideIcon::Link2 => IconName::Link2,
+        LucideIcon::Tag => IconName::Tag,
+        LucideIcon::Shield => IconName::Shield,
+        LucideIcon::ShieldCheck => IconName::ShieldCheck,
+        LucideIcon::Pin => IconName::Pin,
+        LucideIcon::PinOff => IconName::PinOff,
+        LucideIcon::MapPin => IconName::MapPin,
+        LucideIcon::Star => IconName::Star,
+    }
 }
 
 fn is_hidden_path(path: &StorePath) -> bool {

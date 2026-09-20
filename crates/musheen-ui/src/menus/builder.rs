@@ -78,6 +78,7 @@ pub struct MenuAccessibilityNode {
     role: MenuAccessibleRole,
     checked: bool,
     disabled_reason: Option<Box<str>>,
+    children: Vec<MenuAccessibilityNode>,
 }
 
 impl MenuAccessibilityNode {
@@ -96,6 +97,13 @@ impl MenuAccessibilityNode {
     #[must_use]
     pub fn disabled_reason(&self) -> Option<&str> {
         self.disabled_reason.as_deref()
+    }
+
+    /// Submenu descendants are retained in the same semantic tree rather
+    /// than becoming an inaccessible flat list when a native popup opens.
+    #[must_use]
+    pub fn children(&self) -> &[MenuAccessibilityNode] {
+        &self.children
     }
 }
 
@@ -130,6 +138,7 @@ pub struct ContextMenu {
     entries: Vec<MenuEntry>,
     presentation: MenuPresentation,
     theme_tokens: MenuThemeTokens,
+    direction: MenuDirection,
 }
 
 impl ContextMenu {
@@ -158,6 +167,10 @@ impl ContextMenu {
                 role: entry.accessible_role(),
                 checked: entry.state.is_checked(),
                 disabled_reason: entry.state.disabled_reason().map(Into::into),
+                children: entry
+                    .submenu
+                    .as_deref()
+                    .map_or_else(Vec::new, ContextMenu::accessibility_tree),
             })
             .collect()
     }
@@ -218,6 +231,11 @@ impl ContextMenu {
     pub const fn direction(&self, direction: MenuDirection) -> MenuChrome {
         MenuChrome { direction }
     }
+
+    #[must_use]
+    pub const fn locale_direction(&self) -> MenuDirection {
+        self.direction
+    }
 }
 
 fn is_layout_choice(command_id: Option<&str>) -> bool {
@@ -234,6 +252,14 @@ fn is_layout_choice(command_id: Option<&str>) -> bool {
     )
 }
 
+const fn locale_direction(locale: Locale) -> MenuDirection {
+    if matches!(locale, Locale::Ar) {
+        MenuDirection::RightToLeft
+    } else {
+        MenuDirection::LeftToRight
+    }
+}
+
 fn is_toggle_command(command_id: Option<&str>) -> bool {
     matches!(
         command_id,
@@ -246,6 +272,7 @@ pub struct MenuEntry {
     kind: MenuEntryKind,
     command_id: Option<CommandId>,
     label: Box<str>,
+    icon_key: Option<Box<str>>,
     state: CommandState,
     shortcut: Option<Box<str>>,
     group: Option<CommandGroup>,
@@ -270,6 +297,11 @@ impl MenuEntry {
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    #[must_use]
+    pub fn icon_key(&self) -> Option<&str> {
+        self.icon_key.as_deref()
     }
 
     #[must_use]
@@ -333,6 +365,14 @@ impl MenuEntry {
         self.invocation
             .as_ref()
             .and_then(|invocation| invocation.origin_tab)
+    }
+
+    #[must_use]
+    pub(crate) fn captured_targets(&self) -> &[CommandTargetRef] {
+        self.invocation
+            .as_ref()
+            .map(|invocation| invocation.selection.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -409,6 +449,7 @@ pub(crate) fn compose(
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
+        direction: locale_direction(locale),
     }
 }
 
@@ -533,6 +574,7 @@ fn plain_command_entry(
         kind: MenuEntryKind::Command,
         command_id: Some(command.id().clone()),
         label,
+        icon_key: Some(command.icon_key().into()),
         state: command.state(context),
         shortcut: command
             .shortcuts()
@@ -634,6 +676,7 @@ fn add_open_with_submenu(
             entries: defaults,
             presentation: MenuPresentation::CompactNativeTheme,
             theme_tokens: MenuThemeTokens::from_profile(theme),
+            direction: MenuDirection::LeftToRight,
         }));
         entries.push(default_entry);
     }
@@ -642,6 +685,7 @@ fn add_open_with_submenu(
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
+        direction: MenuDirection::LeftToRight,
     }));
 }
 
@@ -689,6 +733,7 @@ fn add_send_to_submenu(
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
+        direction: MenuDirection::LeftToRight,
     }));
 }
 
@@ -734,6 +779,7 @@ fn add_contribution_submenu(
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
+        direction: MenuDirection::LeftToRight,
     }));
 }
 
@@ -752,6 +798,7 @@ fn append_overflow_submenu(
         kind: MenuEntryKind::Submenu,
         command_id: None,
         label: more_label.into(),
+        icon_key: None,
         state: CommandRegistry::built_in()
             .get("navigation.refresh")
             .expect("built-in command exists")
@@ -763,6 +810,7 @@ fn append_overflow_submenu(
             entries: remaining,
             presentation: MenuPresentation::CompactNativeTheme,
             theme_tokens: MenuThemeTokens::from_profile(theme),
+            direction: MenuDirection::LeftToRight,
         })),
         application: None,
         destination: None,
@@ -779,6 +827,7 @@ fn separator() -> MenuEntry {
         kind: MenuEntryKind::Separator,
         command_id: None,
         label: Box::default(),
+        icon_key: None,
         state: CommandRegistry::built_in()
             .get("navigation.refresh")
             .expect("built-in command exists")

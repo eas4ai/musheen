@@ -17,8 +17,8 @@ pub use cancel::CancellationToken;
 pub use capability::{CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState};
 pub use command::*;
 pub use context::{
-    CommandContext, CommandParameterError, CommandParameters, CommandTarget, CommandTargetRef,
-    DesktopApplicationId, OpenWithIntent, ProviderAction, ProviderActionMatrix,
+    ActiveLayout, CommandContext, CommandParameterError, CommandParameters, CommandTarget,
+    CommandTargetRef, DesktopApplicationId, OpenWithIntent, ProviderAction, ProviderActionMatrix,
     ResolvedDestination,
 };
 pub use error::CoreError;

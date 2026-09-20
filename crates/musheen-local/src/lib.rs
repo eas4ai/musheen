@@ -17,6 +17,7 @@ use musheen_core::{
     SearchQuery, SearchStream, Store, StoreError, StoreItem, StorePath,
 };
 use musheen_ops::{MetadataKind, SourceMetadata};
+use posix_acl::{ACL_EXECUTE, ACL_WRITE, PosixACL, Qualifier};
 use std::path::PathBuf;
 
 pub use mutation::LocalTrashEntry;
@@ -114,10 +115,9 @@ impl Store for LocalStore {
             path: Some(StorePath::from_unix_path(path.as_os_str())),
             message: error.to_string().into(),
         })?;
-        use std::os::unix::fs::PermissionsExt;
-        if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o222 == 0 {
+        if !metadata.file_type().is_dir() {
             return Ok(CapabilityState::Unsupported(
-                CapabilityReason::new("the destination directory is not writable")
+                CapabilityReason::new("the destination is not a directory")
                     .expect("the writable-location reason is valid"),
             ));
         }
@@ -130,7 +130,43 @@ impl Store for LocalStore {
                     .expect("the writable-location reason is valid"),
             ));
         }
+        match directory_allows_current_user(path, &metadata) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(CapabilityState::Unsupported(
+                    CapabilityReason::new(
+                        "the current user lacks write and search permission for the destination directory",
+                    )
+                    .expect("the writable-location reason is valid"),
+                ));
+            }
+            Err(reason) => return Ok(CapabilityState::Unknown(reason)),
+        }
         Ok(CapabilityState::Supported)
+    }
+
+    fn executable_state(&self, path: &StorePath) -> Result<CapabilityState, StoreError> {
+        let Some(path) = path.as_unix_path() else {
+            return Ok(CapabilityState::Unknown(
+                CapabilityReason::new("this local provider path is not a Unix file")
+                    .expect("the executable-state reason is valid"),
+            ));
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path).map_err(|error| StoreError::Io {
+            operation: "read executable metadata",
+            kind: error.kind(),
+            path: Some(StorePath::from_unix_path(path.as_os_str())),
+            message: error.to_string().into(),
+        })?;
+        if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            Ok(CapabilityState::Supported)
+        } else {
+            Ok(CapabilityState::Unsupported(
+                CapabilityReason::new("the item is not marked executable by its provider metadata")
+                    .expect("the executable-state reason is valid"),
+            ))
+        }
     }
 
     fn search_capabilities(&self, _location: &StorePath) -> SearchCapabilities {
@@ -188,4 +224,67 @@ impl Store for LocalStore {
             .and_then(|()| self.validate_mutation(&request));
         Box::pin(async move { validation })
     }
+}
+
+/// POSIX directory mutation needs both write and search (`x`) access.  This
+/// evaluates the effective uid, supplementary groups and access ACL instead
+/// of treating any of the three write mode bits as the current user's access.
+/// An unreadable ACL is deliberately Unknown: presenting a mutating command
+/// as enabled would be less safe than an explanatory disabled row.
+fn directory_allows_current_user(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> Result<bool, CapabilityReason> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = rustix::process::geteuid().as_raw();
+    if uid == 0 {
+        return Ok(true);
+    }
+    let mut groups = rustix::process::getgroups().map_err(|error| {
+        CapabilityReason::new(format!(
+            "the provider could not read the current groups: {error}"
+        ))
+        .expect("the group lookup reason is valid")
+    })?;
+    let effective_group = rustix::process::getegid();
+    if !groups.contains(&effective_group) {
+        groups.push(effective_group);
+    }
+    let group_ids = groups
+        .into_iter()
+        .map(|group| group.as_raw())
+        .collect::<Vec<_>>();
+    let acl = PosixACL::read_acl(path).map_err(|error| {
+        CapabilityReason::new(format!(
+            "the provider could not verify access ACLs: {error}"
+        ))
+        .expect("the ACL lookup reason is valid")
+    })?;
+    let required = ACL_WRITE | ACL_EXECUTE;
+    let permitted = if metadata.uid() == uid {
+        acl.get(Qualifier::UserObj).unwrap_or_default()
+    } else if let Some(named_user) = acl.get(Qualifier::User(uid)) {
+        apply_acl_mask(named_user, &acl)
+    } else {
+        let group_permission = acl
+            .entries()
+            .into_iter()
+            .filter_map(|entry| match entry.qual {
+                Qualifier::GroupObj if group_ids.contains(&metadata.gid()) => Some(entry.perm),
+                Qualifier::Group(group) if group_ids.contains(&group) => Some(entry.perm),
+                _ => None,
+            })
+            .fold(0, |permissions, entry| permissions | entry);
+        if group_permission != 0 {
+            apply_acl_mask(group_permission, &acl)
+        } else {
+            acl.get(Qualifier::Other).unwrap_or_default()
+        }
+    };
+    Ok(permitted & required == required)
+}
+
+fn apply_acl_mask(permissions: u32, acl: &PosixACL) -> u32 {
+    permissions & acl.get(Qualifier::Mask).unwrap_or(u32::MAX)
 }

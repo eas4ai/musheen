@@ -21,6 +21,19 @@ pub enum CommandTarget {
     Sidebar,
 }
 
+/// The active presentation layout, kept in the command context so radio menu
+/// state is a registry projection rather than renderer-local policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ActiveLayout {
+    Details,
+    #[default]
+    List,
+    Cards,
+    Grid,
+    Columns,
+    Adaptive,
+}
+
 /// Provider operations whose availability is outside the portable filesystem
 /// capability matrix, such as UDisks2 hardware controls and provider sharing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +94,7 @@ pub struct CommandContext {
     pub directories_first: bool,
     pub sidebar_visible: bool,
     pub info_visible: bool,
+    pub active_layout: ActiveLayout,
     /// Optional desktop-boundary state. When supplied, every command surface
     /// receives the same unavailable reason from the registry definition.
     pub backend_actions: Option<Vec<(CommandAction, CapabilityState)>>,
@@ -122,6 +136,7 @@ impl Default for CommandContext {
             directories_first: false,
             sidebar_visible: false,
             info_visible: false,
+            active_layout: ActiveLayout::default(),
             backend_actions: None,
         }
     }

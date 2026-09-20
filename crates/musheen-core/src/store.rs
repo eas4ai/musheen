@@ -276,6 +276,15 @@ pub trait Store: Send + Sync {
         ))
     }
 
+    /// Whether an item can be run by the current user. Providers that cannot
+    /// supply executable metadata keep Run absent rather than guessing.
+    fn executable_state(&self, _path: &StorePath) -> Result<CapabilityState, StoreError> {
+        Ok(CapabilityState::Unknown(
+            CapabilityReason::new("the provider did not report executable metadata")
+                .expect("the default executable-state reason is valid"),
+        ))
+    }
+
     fn search_capabilities(&self, _location: &StorePath) -> SearchCapabilities {
         SearchCapabilities::default()
     }
