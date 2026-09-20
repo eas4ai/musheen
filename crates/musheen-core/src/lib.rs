@@ -16,7 +16,10 @@ mod watch;
 pub use cancel::CancellationToken;
 pub use capability::{CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState};
 pub use command::*;
-pub use context::{CommandContext, CommandParameters, CommandTarget, CommandTargetRef};
+pub use context::{
+    CommandContext, CommandParameterError, CommandParameters, CommandTarget, CommandTargetRef,
+    ProviderAction, ProviderActionMatrix,
+};
 pub use error::CoreError;
 pub use item::{ItemId, ItemKind, StoreItem};
 pub use limits::{ResourceLimitConfig, ResourceLimits};

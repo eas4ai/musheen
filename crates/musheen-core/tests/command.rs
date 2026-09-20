@@ -1,5 +1,5 @@
 mod command {
-    use musheen_core::{CommandContext, CommandPresentation, CommandRegistry};
+    use musheen_core::{CommandContext, CommandPresentation, CommandRegistry, CommandTarget};
     use std::collections::HashSet;
 
     #[test]
@@ -71,6 +71,7 @@ mod command {
             has_parent: true,
             item_count: 4,
             selection_count: 1,
+            target: CommandTarget::File,
             ..CommandContext::default()
         };
 

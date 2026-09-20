@@ -49,6 +49,7 @@ command-create-symbolic-link = Create symbolic link
 command-create-hard-link = Create hard link
 command-compress = Compress
 command-extract = Extract
+command-extract-here = Extract here
 command-hide = Hide
 command-unhide = Unhide
 command-move-to-trash = Move to Trash

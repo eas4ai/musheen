@@ -49,6 +49,7 @@ command-create-symbolic-link = ⟦Ƈřḗȧŧḗ şẏḿƀǿŀīƈ ŀīƞķ··
 command-create-hard-link = ⟦Ƈřḗȧŧḗ ħȧřḓ ŀīƞķ··⟧
 command-compress = ⟦Ƈǿḿƥřḗşş··⟧
 command-extract = ⟦Ḗẋŧřȧƈŧ··⟧
+command-extract-here = ⟦Ḗẋŧřȧƈŧ ħḗřḗ··⟧
 command-hide = ⟦Ħīḓḗ··⟧
 command-unhide = ⟦Ŭƞħīḓḗ··⟧
 command-move-to-trash = ⟦Ḿǿṽḗ ŧǿ Ŧřȧşħ··⟧

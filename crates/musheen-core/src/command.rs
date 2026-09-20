@@ -1,4 +1,7 @@
-use crate::{CapabilityKind, CapabilityState, CommandContext, CommandParameters, CommandTarget};
+use crate::{
+    CapabilityKind, CapabilityState, CommandContext, CommandParameters, CommandTarget,
+    ProviderAction,
+};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -21,6 +24,203 @@ impl CommandId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+fn writable_location_state(context: &CommandContext) -> CommandState {
+    if !context.location_is_writable {
+        return CommandState::disabled("the current location is read-only");
+    }
+    if !context.mutation_is_supported {
+        return CommandState::disabled(
+            context
+                .mutation_reason
+                .as_deref()
+                .unwrap_or("the provider does not support this mutation"),
+        );
+    }
+    CommandState::enabled()
+}
+
+fn writable_destination_state(context: &CommandContext) -> CommandState {
+    if !context.has_target_selection() {
+        return CommandState::disabled("no items are selected");
+    }
+    if !context.destination_is_writable {
+        return CommandState::disabled(
+            context
+                .destination_reason
+                .as_deref()
+                .unwrap_or("the destination is read-only"),
+        );
+    }
+    if !context.mutation_is_supported {
+        return CommandState::disabled(
+            context
+                .mutation_reason
+                .as_deref()
+                .unwrap_or("the provider does not support this mutation"),
+        );
+    }
+    CommandState::enabled()
+}
+
+fn writable_selection_state(context: &CommandContext) -> CommandState {
+    if context.target == CommandTarget::Background && context.selection_count > 0 {
+        return CommandState::disabled("background commands do not use a selection");
+    }
+    if !context.has_target_selection() {
+        return CommandState::disabled("no items are selected");
+    }
+    if !context.location_is_writable {
+        return CommandState::disabled("the current location is read-only");
+    }
+    if !context.mutation_is_supported {
+        return CommandState::disabled(
+            context
+                .mutation_reason
+                .as_deref()
+                .unwrap_or("the provider does not support this mutation"),
+        );
+    }
+    CommandState::enabled()
+}
+
+fn writable_exactly_one_selection_state(context: &CommandContext) -> CommandState {
+    if context.target == CommandTarget::Background && context.selection_count > 0 {
+        return CommandState::disabled("background commands do not use a selection");
+    }
+    if context.selection_count != 1 {
+        return CommandState::disabled("select exactly one item");
+    }
+    writable_location_state(context)
+}
+
+fn hide_state(context: &CommandContext, target_is_hidden: bool) -> CommandState {
+    let state = writable_selection_state(context);
+    if !state.is_enabled() {
+        return state;
+    }
+    if !context.has_dot_name_semantics {
+        return CommandState::disabled("the provider does not support dot-name semantics");
+    }
+    if context.target_is_hidden != target_is_hidden {
+        return CommandState::disabled(if context.target_is_hidden {
+            "the selected item is already hidden"
+        } else {
+            "the selected item is not hidden"
+        });
+    }
+    CommandState::enabled()
+}
+
+fn archive_mutation_state(context: &CommandContext) -> CommandState {
+    if context.selection_count != 1 || context.target != CommandTarget::Archive {
+        return CommandState::disabled("exactly one archive must be selected");
+    }
+    writable_selection_state(context)
+}
+
+fn non_archive_mutation_state(context: &CommandContext) -> CommandState {
+    let state = writable_selection_state(context);
+    if !state.is_enabled() {
+        return state;
+    }
+    if context.target == CommandTarget::Archive {
+        return CommandState::disabled("archive items must be extracted instead");
+    }
+    CommandState::enabled()
+}
+
+fn paste_state(context: &CommandContext) -> CommandState {
+    if !matches!(
+        context.target,
+        CommandTarget::Background | CommandTarget::Directory
+    ) {
+        return CommandState::disabled("paste requires a directory or directory background");
+    }
+    if !context.clipboard_has_contents {
+        return CommandState::disabled("the clipboard has no pasteable items");
+    }
+    if !context.destination_is_writable {
+        return CommandState::disabled(
+            context
+                .destination_reason
+                .as_deref()
+                .unwrap_or("the destination is read-only"),
+        );
+    }
+    if !context.mutation_is_supported {
+        return CommandState::disabled(
+            context
+                .mutation_reason
+                .as_deref()
+                .unwrap_or("the provider does not support this mutation"),
+        );
+    }
+    CommandState::enabled()
+}
+
+fn provider_action_state(context: &CommandContext, action: ProviderAction) -> CommandState {
+    let expected_target = match action {
+        ProviderAction::Share => CommandTarget::Directory,
+        ProviderAction::Unmount | ProviderAction::Eject | ProviderAction::PowerOff => {
+            CommandTarget::Mount
+        }
+    };
+    if context.selection_count != 1 || context.target != expected_target {
+        return CommandState::disabled(match action {
+            ProviderAction::Share => "exactly one directory must be selected",
+            ProviderAction::Unmount | ProviderAction::Eject | ProviderAction::PowerOff => {
+                "exactly one mount must be selected"
+            }
+        });
+    }
+    match context.provider_action(action) {
+        CapabilityState::Supported => CommandState::enabled(),
+        CapabilityState::Unsupported(reason) | CapabilityState::Unknown(reason) => {
+            CommandState::disabled(reason.as_str())
+        }
+    }
+}
+
+fn pin_state(context: &CommandContext, target_is_pinned: bool) -> CommandState {
+    if context.selection_count != 1 || context.target != CommandTarget::Directory {
+        return CommandState::disabled("exactly one directory must be selected");
+    }
+    if context.target_is_pinned != target_is_pinned {
+        return CommandState::disabled(if context.target_is_pinned {
+            "the selected directory is already pinned"
+        } else {
+            "the selected directory is not pinned"
+        });
+    }
+    CommandState::enabled()
+}
+
+fn executable_run_state(context: &CommandContext) -> CommandState {
+    if context.selection_count != 1
+        || !context.is_local
+        || context.target != CommandTarget::ExecutableFile
+    {
+        return CommandState::disabled("only local executable files can run");
+    }
+    if !context.executable_run_enabled {
+        return CommandState::disabled("the executable run preference is disabled");
+    }
+    CommandState::enabled()
+}
+
+fn directory_or_mount_state(context: &CommandContext) -> CommandState {
+    if context.selection_count == 1
+        && matches!(
+            context.target,
+            CommandTarget::Directory | CommandTarget::Mount
+        )
+    {
+        CommandState::enabled()
+    } else {
+        CommandState::disabled("exactly one directory or mount must be selected")
     }
 }
 impl Borrow<str> for CommandId {
@@ -139,9 +339,10 @@ pub enum CommandAction {
     Restore,
     EmptyTrash,
     CustomAction,
+    ExtractHere,
 }
 impl CommandAction {
-    pub const ALL: [Self; 79] = [
+    pub const ALL: [Self; 80] = [
         Self::NavigateBack,
         Self::NavigateForward,
         Self::NavigateParent,
@@ -221,6 +422,7 @@ impl CommandAction {
         Self::Restore,
         Self::EmptyTrash,
         Self::CustomAction,
+        Self::ExtractHere,
     ];
 }
 
@@ -241,6 +443,20 @@ pub enum DangerLevel {
     Review,
     Destructive,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandSubmenu {
+    OpenWith,
+    SendTo,
+    Tags,
+    Actions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandContributionPolicy {
+    Fixed,
+    Variable(CommandSubmenu),
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandHandler(CommandAction);
 impl CommandHandler {
@@ -253,6 +469,7 @@ impl CommandHandler {
         dispatcher: &mut dyn CommandDispatcher,
         parameters: CommandParameters,
     ) -> Result<(), CommandDispatchError> {
+        validate_parameters(self.0, &parameters)?;
         dispatcher.dispatch(self.0, parameters)
     }
 }
@@ -279,6 +496,83 @@ impl fmt::Display for CommandDispatchError {
 impl Error for CommandDispatchError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParameterShape {
+    None,
+    Targets,
+    Destination,
+    Location,
+    CustomAction,
+}
+
+fn validate_parameters(
+    action: CommandAction,
+    parameters: &CommandParameters,
+) -> Result<(), CommandDispatchError> {
+    let shape = match action {
+        CommandAction::NavigateBack
+        | CommandAction::NavigateForward
+        | CommandAction::NavigateParent
+        | CommandAction::Refresh
+        | CommandAction::FocusLocation
+        | CommandAction::Search
+        | CommandAction::Filter
+        | CommandAction::FocusCommand
+        | CommandAction::ViewDetails
+        | CommandAction::ViewList
+        | CommandAction::ViewCards
+        | CommandAction::ViewGrid
+        | CommandAction::ViewColumns
+        | CommandAction::ViewAdaptive
+        | CommandAction::CycleSort
+        | CommandAction::CycleGroup
+        | CommandAction::ToggleDirectoriesFirst
+        | CommandAction::ToggleHidden
+        | CommandAction::ToggleSidebar
+        | CommandAction::ToggleInfo
+        | CommandAction::NewTab
+        | CommandAction::CloseTab
+        | CommandAction::DuplicateTab
+        | CommandAction::ReopenClosedTab
+        | CommandAction::MoveTabOtherPane
+        | CommandAction::MoveTabLeft
+        | CommandAction::MoveTabRight
+        | CommandAction::TearOutTab
+        | CommandAction::SplitPane
+        | CommandAction::FocusNextPane
+        | CommandAction::SelectAll
+        | CommandAction::ClearSelection
+        | CommandAction::OpenSettings => ParameterShape::None,
+        CommandAction::NewDirectory
+        | CommandAction::NewEmptyFile
+        | CommandAction::NewFromTemplate
+        | CommandAction::OpenTerminalHere
+        | CommandAction::PasteInto => ParameterShape::Location,
+        CommandAction::SendTo
+        | CommandAction::CopyTo
+        | CommandAction::MoveTo
+        | CommandAction::Extract => ParameterShape::Destination,
+        CommandAction::ExtractHere => ParameterShape::Targets,
+        CommandAction::CustomAction => ParameterShape::CustomAction,
+        _ => ParameterShape::Targets,
+    };
+    let valid = match (shape, parameters) {
+        (ParameterShape::None, CommandParameters::None)
+        | (ParameterShape::Location, CommandParameters::Location(_)) => true,
+        (ParameterShape::Targets, CommandParameters::Targets(targets)) => !targets.is_empty(),
+        (ParameterShape::Destination, CommandParameters::Destination { targets, .. }) => {
+            !targets.is_empty()
+        }
+        (ParameterShape::CustomAction, CommandParameters::CustomAction { targets, .. }) => {
+            !targets.is_empty()
+        }
+        _ => false,
+    };
+    valid.then_some(()).ok_or_else(|| {
+        CommandDispatchError::new(format!("invalid parameters for command action {action:?}"))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandPredicate {
     Always,
     CanGoBack,
@@ -302,17 +596,37 @@ pub enum CommandPredicate {
     TrashItem,
     TrashBackground,
     CustomActionSupportsRemote,
+    WritableSelection,
+    WritableExactlyOneSelection,
+    WritableSelectionCapability(CapabilityKind),
+    Hide,
+    Unhide,
+    WritableArchive,
+    WritableNonArchive,
+    PasteInto,
+    ProviderAction(ProviderAction),
+    PinnedDirectory,
+    UnpinnedDirectory,
+    ExecutableRun,
+    DirectoryOrMount,
 }
 impl CommandPredicate {
     fn evaluate(self, context: &CommandContext) -> CommandState {
+        if let Some(state) = self.policy_state(context) {
+            return state;
+        }
         match self {
             Self::Always => CommandState::enabled(),
             Self::CanGoBack if context.can_go_back => CommandState::enabled(),
             Self::CanGoForward if context.can_go_forward => CommandState::enabled(),
             Self::HasParent if context.has_parent => CommandState::enabled(),
             Self::HasItems if context.item_count > 0 => CommandState::enabled(),
-            Self::HasSelection if context.selection_count > 0 => CommandState::enabled(),
-            Self::ExactlyOneSelection if context.selection_count == 1 => CommandState::enabled(),
+            Self::HasSelection if context.has_target_selection() => CommandState::enabled(),
+            Self::ExactlyOneSelection
+                if context.selection_count == 1 && context.target != CommandTarget::Background =>
+            {
+                CommandState::enabled()
+            }
             Self::ExactlyOneDirectory
                 if context.selection_count == 1 && context.target == CommandTarget::Directory =>
             {
@@ -338,19 +652,20 @@ impl CommandPredicate {
             }
             Self::WritableLocation if context.location_is_writable => CommandState::enabled(),
             Self::WritableDestination
-                if context.selection_count > 0 && context.destination_is_writable =>
+                if context.has_target_selection() && context.destination_is_writable =>
             {
                 CommandState::enabled()
             }
-            Self::Capability(kind) if context.selection_count > 0 => match context.capability(kind)
-            {
-                CapabilityState::Supported => CommandState::enabled(),
-                CapabilityState::Unsupported(reason) | CapabilityState::Unknown(reason) => {
-                    CommandState::disabled(reason.as_str())
+            Self::Capability(kind) if context.has_target_selection() => {
+                match context.capability(kind) {
+                    CapabilityState::Supported => CommandState::enabled(),
+                    CapabilityState::Unsupported(reason) | CapabilityState::Unknown(reason) => {
+                        CommandState::disabled(reason.as_str())
+                    }
                 }
-            },
+            }
             Self::DotNameSemantics
-                if context.selection_count > 0 && context.has_dot_name_semantics =>
+                if context.has_target_selection() && context.has_dot_name_semantics =>
             {
                 CommandState::enabled()
             }
@@ -392,7 +707,7 @@ impl CommandPredicate {
                 CommandState::enabled()
             }
             Self::CustomActionSupportsRemote
-                if context.selection_count > 0
+                if context.has_target_selection()
                     && (context.is_local || context.supports_provider_uris) =>
             {
                 CommandState::enabled()
@@ -437,6 +752,32 @@ impl CommandPredicate {
             Self::CustomActionSupportsRemote => {
                 CommandState::disabled("the action does not support provider URIs")
             }
+            _ => unreachable!("policy predicates return before this match"),
+        }
+    }
+
+    fn policy_state(self, context: &CommandContext) -> Option<CommandState> {
+        match self {
+            Self::WritableLocation => Some(writable_location_state(context)),
+            Self::WritableDestination => Some(writable_destination_state(context)),
+            Self::WritableSelection => Some(writable_selection_state(context)),
+            Self::WritableExactlyOneSelection => {
+                Some(writable_exactly_one_selection_state(context))
+            }
+            Self::WritableSelectionCapability(capability) => Some(
+                writable_selection_state(context).and_capability(context.capability(capability)),
+            ),
+            Self::Hide => Some(hide_state(context, false)),
+            Self::Unhide => Some(hide_state(context, true)),
+            Self::WritableArchive => Some(archive_mutation_state(context)),
+            Self::WritableNonArchive => Some(non_archive_mutation_state(context)),
+            Self::PasteInto => Some(paste_state(context)),
+            Self::ProviderAction(action) => Some(provider_action_state(context, action)),
+            Self::PinnedDirectory => Some(pin_state(context, true)),
+            Self::UnpinnedDirectory => Some(pin_state(context, false)),
+            Self::ExecutableRun => Some(executable_run_state(context)),
+            Self::DirectoryOrMount => Some(directory_or_mount_state(context)),
+            _ => None,
         }
     }
 }
@@ -465,6 +806,17 @@ impl CommandState {
         self.checked = checked;
         self
     }
+    fn and_capability(self, capability: &CapabilityState) -> Self {
+        if !self.is_enabled() {
+            return self;
+        }
+        match capability {
+            CapabilityState::Supported => self,
+            CapabilityState::Unsupported(reason) | CapabilityState::Unknown(reason) => {
+                Self::disabled(reason.as_str())
+            }
+        }
+    }
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
@@ -489,6 +841,7 @@ pub struct CommandDefinition {
     handler: CommandHandler,
     group: CommandGroup,
     danger: DangerLevel,
+    contribution_policy: CommandContributionPolicy,
 }
 impl CommandDefinition {
     #[must_use]
@@ -526,6 +879,17 @@ impl CommandDefinition {
     #[must_use]
     pub fn danger_level(&self) -> DangerLevel {
         self.danger
+    }
+    #[must_use]
+    pub fn contribution_policy(&self) -> CommandContributionPolicy {
+        self.contribution_policy
+    }
+    #[must_use]
+    pub fn submenu(&self) -> Option<CommandSubmenu> {
+        match self.contribution_policy {
+            CommandContributionPolicy::Fixed => None,
+            CommandContributionPolicy::Variable(submenu) => Some(submenu),
+        }
     }
     #[must_use]
     pub fn state(&self, context: &CommandContext) -> CommandState {
@@ -1120,7 +1484,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.paste-into",
             "clipboard-paste",
             &[("Ctrl+V", Browser)],
-            P::WritableLocation,
+            P::PasteInto,
             A::PasteInto,
             G::Clipboard,
             D::None,
@@ -1130,7 +1494,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.rename",
             "pencil",
             &[("F2", Browser)],
-            P::ExactlyOneSelection,
+            P::WritableExactlyOneSelection,
             A::Rename,
             G::Organization,
             D::Review,
@@ -1140,7 +1504,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.duplicate",
             "copy-plus",
             &[],
-            P::HasSelection,
+            P::WritableSelection,
             A::Duplicate,
             G::Organization,
             D::None,
@@ -1150,7 +1514,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.create-symbolic-link",
             "link",
             &[],
-            P::Capability(CapabilityKind::SymbolicLinks),
+            P::WritableSelectionCapability(CapabilityKind::SymbolicLinks),
             A::CreateSymbolicLink,
             G::Organization,
             D::None,
@@ -1160,7 +1524,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.create-hard-link",
             "link",
             &[],
-            P::Capability(CapabilityKind::HardLinks),
+            P::WritableSelectionCapability(CapabilityKind::HardLinks),
             A::CreateHardLink,
             G::Organization,
             D::None,
@@ -1170,7 +1534,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.compress",
             "archive",
             &[],
-            P::NonArchive,
+            P::WritableNonArchive,
             A::Compress,
             G::FileType,
             D::None,
@@ -1180,8 +1544,18 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.extract",
             "archive-restore",
             &[],
-            P::Archive,
+            P::WritableArchive,
             A::Extract,
+            G::FileType,
+            D::None,
+        ),
+        command(
+            "archive.extract_here",
+            "command.extract-here",
+            "archive-restore",
+            &[],
+            P::WritableArchive,
+            A::ExtractHere,
             G::FileType,
             D::None,
         ),
@@ -1190,7 +1564,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.hide",
             "eye-off",
             &[],
-            P::DotNameSemantics,
+            P::Hide,
             A::Hide,
             G::Organization,
             D::Review,
@@ -1200,7 +1574,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.unhide",
             "eye",
             &[],
-            P::DotNameSemantics,
+            P::Unhide,
             A::Unhide,
             G::Organization,
             D::Review,
@@ -1210,7 +1584,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.move-to-trash",
             "trash-2",
             &[],
-            P::Capability(CapabilityKind::Trash),
+            P::WritableSelectionCapability(CapabilityKind::Trash),
             A::MoveToTrash,
             G::Destructive,
             D::Review,
@@ -1220,7 +1594,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.delete-permanently",
             "trash",
             &[("Shift+Delete", Browser)],
-            P::HasSelection,
+            P::WritableSelection,
             A::DeletePermanently,
             G::Destructive,
             D::Destructive,
@@ -1310,7 +1684,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.open-new-tab",
             "plus",
             &[],
-            P::ExactlyOneDirectory,
+            P::DirectoryOrMount,
             A::OpenInNewTab,
             G::Open,
             D::None,
@@ -1320,7 +1694,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.open-new-window",
             "app-window",
             &[],
-            P::ExactlyOneDirectory,
+            P::DirectoryOrMount,
             A::OpenInNewWindow,
             G::Open,
             D::None,
@@ -1340,7 +1714,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.pin",
             "pin",
             &[],
-            P::ExactlyOneDirectory,
+            P::UnpinnedDirectory,
             A::Pin,
             G::Organization,
             D::None,
@@ -1350,7 +1724,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.unpin",
             "pin-off",
             &[],
-            P::ExactlyOneDirectory,
+            P::PinnedDirectory,
             A::Unpin,
             G::Organization,
             D::None,
@@ -1380,7 +1754,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.share",
             "share-2",
             &[],
-            P::ExactlyOneDirectory,
+            P::ProviderAction(ProviderAction::Share),
             A::Share,
             G::Organization,
             D::Review,
@@ -1410,7 +1784,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.run",
             "play",
             &[],
-            P::LocalExecutable,
+            P::ExecutableRun,
             A::Run,
             G::Open,
             D::Review,
@@ -1420,7 +1794,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.unmount",
             "eject",
             &[],
-            P::Mount,
+            P::ProviderAction(ProviderAction::Unmount),
             A::Unmount,
             G::Destructive,
             D::Review,
@@ -1430,7 +1804,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.eject",
             "eject",
             &[],
-            P::Mount,
+            P::ProviderAction(ProviderAction::Eject),
             A::Eject,
             G::Destructive,
             D::Review,
@@ -1440,7 +1814,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.power-off",
             "power",
             &[],
-            P::Mount,
+            P::ProviderAction(ProviderAction::PowerOff),
             A::PowerOff,
             G::Destructive,
             D::Review,
@@ -1501,5 +1875,16 @@ fn command(
         handler: CommandHandler(action),
         group,
         danger,
+        contribution_policy: contribution_policy(action),
+    }
+}
+
+const fn contribution_policy(action: CommandAction) -> CommandContributionPolicy {
+    match action {
+        CommandAction::OpenWith => CommandContributionPolicy::Variable(CommandSubmenu::OpenWith),
+        CommandAction::SendTo => CommandContributionPolicy::Variable(CommandSubmenu::SendTo),
+        CommandAction::ManageTags => CommandContributionPolicy::Variable(CommandSubmenu::Tags),
+        CommandAction::CustomAction => CommandContributionPolicy::Variable(CommandSubmenu::Actions),
+        _ => CommandContributionPolicy::Fixed,
     }
 }

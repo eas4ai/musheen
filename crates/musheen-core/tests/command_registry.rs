@@ -1,6 +1,8 @@
 use musheen_core::{
     CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, CommandAction,
-    CommandContext, CommandRegistry, CommandTarget, DangerLevel,
+    CommandContext, CommandContributionPolicy, CommandDispatchError, CommandDispatcher,
+    CommandParameters, CommandRegistry, CommandSubmenu, CommandTarget, CommandTargetRef,
+    DangerLevel, ItemId, ProviderAction, ProviderActionMatrix, ProviderId, StorePath,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -136,6 +138,7 @@ fn registry_audit_snapshots_stable_public_ids() {
         "file.create_hard_link",
         "file.compress",
         "archive.extract",
+        "archive.extract_here",
         "file.hide",
         "file.unhide",
         "file.move_to_trash",
@@ -176,6 +179,9 @@ fn command_enablement_is_deterministic_and_explains_capability_refusal() {
     let reason = CapabilityReason::new("symbolic links are disabled by this provider").unwrap();
     let context = CommandContext {
         selection_count: 1,
+        target: CommandTarget::File,
+        location_is_writable: true,
+        mutation_is_supported: true,
         capabilities: CapabilityMatrix::new(|kind| match kind {
             CapabilityKind::SymbolicLinks => CapabilityState::Unsupported(reason.clone()),
             _ => CapabilityState::Supported,
@@ -195,7 +201,10 @@ fn command_enablement_is_deterministic_and_explains_capability_refusal() {
 #[test]
 fn selection_and_destination_rules_are_enforced_before_dispatch() {
     let registry = CommandRegistry::built_in();
-    let mut context = CommandContext::default();
+    let mut context = CommandContext {
+        target: CommandTarget::File,
+        ..CommandContext::default()
+    };
     let rename = registry.get("file.rename").unwrap();
     let send_to = registry.get("clipboard.send_to").unwrap();
 
@@ -203,6 +212,13 @@ fn selection_and_destination_rules_are_enforced_before_dispatch() {
     context.selection_count = 2;
     assert!(!rename.state(&context).is_enabled());
     context.selection_count = 1;
+    assert!(!rename.state(&context).is_enabled());
+    assert_eq!(
+        rename.state(&context).disabled_reason(),
+        Some("the current location is read-only")
+    );
+    context.location_is_writable = true;
+    context.mutation_is_supported = true;
     assert!(rename.state(&context).is_enabled());
     assert!(!send_to.state(&context).is_enabled());
     assert_eq!(
@@ -325,4 +341,421 @@ fn localization_and_icon_metadata_are_complete_for_every_command() {
             "missing pseudo-locale {localization_key}"
         );
     }
+}
+
+#[test]
+fn provider_actions_expose_supported_unsupported_and_unknown_states() {
+    let registry = CommandRegistry::built_in();
+    let unsupported = CapabilityReason::new("the device does not support ejection").unwrap();
+    let unknown = CapabilityReason::new("the provider did not report power state").unwrap();
+
+    for (action, id, target) in [
+        (
+            ProviderAction::Share,
+            "directory.share",
+            CommandTarget::Directory,
+        ),
+        (
+            ProviderAction::Unmount,
+            "mount.unmount",
+            CommandTarget::Mount,
+        ),
+        (ProviderAction::Eject, "mount.eject", CommandTarget::Mount),
+        (
+            ProviderAction::PowerOff,
+            "mount.power_off",
+            CommandTarget::Mount,
+        ),
+    ] {
+        let supported = CommandContext {
+            selection_count: 1,
+            target,
+            provider_actions: provider_actions(ProviderAction::Share, CapabilityState::Supported),
+            ..CommandContext::default()
+        };
+        assert!(
+            registry.get(id).unwrap().state(&supported).is_enabled(),
+            "{id}"
+        );
+
+        let refused = CommandContext {
+            provider_actions: provider_actions(
+                action,
+                CapabilityState::Unsupported(unsupported.clone()),
+            ),
+            ..supported.clone()
+        };
+        assert_eq!(
+            registry.get(id).unwrap().state(&refused).disabled_reason(),
+            Some(unsupported.as_str())
+        );
+
+        let unresolved = CommandContext {
+            provider_actions: provider_actions(action, CapabilityState::Unknown(unknown.clone())),
+            ..supported
+        };
+        assert_eq!(
+            registry
+                .get(id)
+                .unwrap()
+                .state(&unresolved)
+                .disabled_reason(),
+            Some(unknown.as_str())
+        );
+    }
+}
+
+fn provider_actions(action: ProviderAction, state: CapabilityState) -> ProviderActionMatrix {
+    let mut states: [CapabilityState; 4] = std::array::from_fn(|_| CapabilityState::Supported);
+    states[action as usize] = state;
+    ProviderActionMatrix::from_states(
+        states[0].clone(),
+        states[1].clone(),
+        states[2].clone(),
+        states[3].clone(),
+    )
+}
+
+#[test]
+fn mutation_commands_refuse_read_only_and_stale_selection_contexts() {
+    let registry = CommandRegistry::built_in();
+    let read_only = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::File,
+        ..CommandContext::default()
+    };
+
+    for id in [
+        "file.rename",
+        "file.duplicate",
+        "file.delete_permanently",
+        "file.create_symbolic_link",
+        "file.create_hard_link",
+        "file.compress",
+        "file.hide",
+        "file.unhide",
+    ] {
+        assert_eq!(
+            registry
+                .get(id)
+                .unwrap()
+                .state(&read_only)
+                .disabled_reason(),
+            Some("the current location is read-only"),
+            "{id}"
+        );
+    }
+
+    let stale_background = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::Background,
+        location_is_writable: true,
+        mutation_is_supported: true,
+        ..CommandContext::default()
+    };
+    assert!(
+        !registry
+            .get("clipboard.cut")
+            .unwrap()
+            .state(&stale_background)
+            .is_enabled()
+    );
+    assert_eq!(
+        registry
+            .get("file.rename")
+            .unwrap()
+            .state(&stale_background)
+            .disabled_reason(),
+        Some("background commands do not use a selection")
+    );
+}
+
+#[test]
+fn target_and_saved_state_policies_are_mutually_exclusive() {
+    let registry = CommandRegistry::built_in();
+    let writable_file = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::File,
+        location_is_writable: true,
+        mutation_is_supported: true,
+        has_dot_name_semantics: true,
+        ..CommandContext::default()
+    };
+    assert!(
+        registry
+            .get("file.hide")
+            .unwrap()
+            .state(&writable_file)
+            .is_enabled()
+    );
+    assert!(
+        !registry
+            .get("file.unhide")
+            .unwrap()
+            .state(&writable_file)
+            .is_enabled()
+    );
+    let hidden = CommandContext {
+        target_is_hidden: true,
+        ..writable_file
+    };
+    assert!(
+        !registry
+            .get("file.hide")
+            .unwrap()
+            .state(&hidden)
+            .is_enabled()
+    );
+    assert!(
+        registry
+            .get("file.unhide")
+            .unwrap()
+            .state(&hidden)
+            .is_enabled()
+    );
+
+    let directory = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::Directory,
+        ..CommandContext::default()
+    };
+    assert!(
+        registry
+            .get("directory.pin")
+            .unwrap()
+            .state(&directory)
+            .is_enabled()
+    );
+    assert!(
+        !registry
+            .get("directory.unpin")
+            .unwrap()
+            .state(&directory)
+            .is_enabled()
+    );
+    let pinned = CommandContext {
+        target_is_pinned: true,
+        ..directory
+    };
+    assert!(
+        !registry
+            .get("directory.pin")
+            .unwrap()
+            .state(&pinned)
+            .is_enabled()
+    );
+    assert!(
+        registry
+            .get("directory.unpin")
+            .unwrap()
+            .state(&pinned)
+            .is_enabled()
+    );
+
+    let executable = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::ExecutableFile,
+        is_local: true,
+        ..CommandContext::default()
+    };
+    assert!(
+        !registry
+            .get("file.run")
+            .unwrap()
+            .state(&executable)
+            .is_enabled()
+    );
+    assert!(
+        registry
+            .get("file.run")
+            .unwrap()
+            .state(&CommandContext {
+                executable_run_enabled: true,
+                ..executable
+            })
+            .is_enabled()
+    );
+}
+
+#[test]
+fn paste_and_mount_navigation_require_their_exact_targets() {
+    let registry = CommandRegistry::built_in();
+    let paste = CommandContext {
+        target: CommandTarget::Directory,
+        clipboard_has_contents: true,
+        destination_is_writable: true,
+        mutation_is_supported: true,
+        ..CommandContext::default()
+    };
+    assert!(
+        registry
+            .get("clipboard.paste_into")
+            .unwrap()
+            .state(&paste)
+            .is_enabled()
+    );
+    assert!(
+        !registry
+            .get("clipboard.paste_into")
+            .unwrap()
+            .state(&CommandContext {
+                target: CommandTarget::File,
+                ..paste.clone()
+            })
+            .is_enabled()
+    );
+    assert!(
+        !registry
+            .get("clipboard.paste_into")
+            .unwrap()
+            .state(&CommandContext {
+                clipboard_has_contents: false,
+                ..paste
+            })
+            .is_enabled()
+    );
+
+    let mount = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::Mount,
+        ..CommandContext::default()
+    };
+    assert!(
+        registry
+            .get("file.open")
+            .unwrap()
+            .state(&mount)
+            .is_enabled()
+    );
+    assert!(
+        registry
+            .get("directory.open_new_tab")
+            .unwrap()
+            .state(&mount)
+            .is_enabled()
+    );
+    assert!(
+        registry
+            .get("directory.open_new_window")
+            .unwrap()
+            .state(&mount)
+            .is_enabled()
+    );
+}
+
+#[test]
+fn registry_owns_variable_submenu_contributions() {
+    let registry = CommandRegistry::built_in();
+    for (id, submenu) in [
+        ("file.open_with", CommandSubmenu::OpenWith),
+        ("clipboard.send_to", CommandSubmenu::SendTo),
+        ("item.tags", CommandSubmenu::Tags),
+        ("actions.custom", CommandSubmenu::Actions),
+    ] {
+        let command = registry.get(id).unwrap();
+        assert_eq!(command.submenu(), Some(submenu));
+        assert_eq!(
+            command.contribution_policy(),
+            CommandContributionPolicy::Variable(submenu)
+        );
+    }
+}
+
+#[test]
+fn handlers_reject_invalid_parameter_shapes_before_dispatch() {
+    let registry = CommandRegistry::built_in();
+    let mut dispatcher = RecordingDispatcher::default();
+    let rename = registry.get("file.rename").unwrap().handler();
+
+    assert!(
+        rename
+            .invoke(&mut dispatcher, CommandParameters::None)
+            .is_err()
+    );
+    assert!(
+        rename
+            .invoke(&mut dispatcher, CommandParameters::targets(Vec::new()))
+            .is_err()
+    );
+    assert!(dispatcher.actions.is_empty());
+    rename
+        .invoke(
+            &mut dispatcher,
+            CommandParameters::targets(vec![local_target()]),
+        )
+        .unwrap();
+    assert_eq!(dispatcher.actions, vec![CommandAction::Rename]);
+
+    let paste = registry.get("clipboard.paste_into").unwrap().handler();
+    assert!(
+        paste
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::targets(vec![local_target()])
+            )
+            .is_err()
+    );
+    paste
+        .invoke(
+            &mut dispatcher,
+            CommandParameters::Location(StorePath::from_unix_path("/tmp")),
+        )
+        .unwrap();
+    assert_eq!(
+        dispatcher.actions,
+        vec![CommandAction::Rename, CommandAction::PasteInto]
+    );
+
+    let extract_here = registry.get("archive.extract_here").unwrap().handler();
+    extract_here
+        .invoke(
+            &mut dispatcher,
+            CommandParameters::targets(vec![local_target()]),
+        )
+        .unwrap();
+    assert!(
+        extract_here
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::destination(
+                    vec![local_target()],
+                    StorePath::from_unix_path("/tmp")
+                )
+            )
+            .is_err()
+    );
+    assert_eq!(
+        dispatcher.actions,
+        vec![
+            CommandAction::Rename,
+            CommandAction::PasteInto,
+            CommandAction::ExtractHere
+        ]
+    );
+
+    let remote = ProviderId::new("remote").unwrap();
+    let remote_id = ItemId::new(remote, b"entry".to_vec()).unwrap();
+    assert!(CommandTargetRef::new(remote_id, StorePath::from_unix_path("/tmp")).is_err());
+}
+
+#[derive(Default)]
+struct RecordingDispatcher {
+    actions: Vec<CommandAction>,
+}
+
+impl CommandDispatcher for RecordingDispatcher {
+    fn dispatch(
+        &mut self,
+        action: CommandAction,
+        _: CommandParameters,
+    ) -> Result<(), CommandDispatchError> {
+        self.actions.push(action);
+        Ok(())
+    }
+}
+
+fn local_target() -> CommandTargetRef {
+    let local = ProviderId::new("local").unwrap();
+    let id = ItemId::new(local, b"entry".to_vec()).unwrap();
+    CommandTargetRef::new(id, StorePath::from_unix_path("/tmp/entry")).unwrap()
 }
