@@ -4,11 +4,16 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 1;
+mod document;
+mod migrate;
+mod validate;
+pub use document::*;
+
+pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const SETTINGS_FILE_NAME: &str = "settings.conf";
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
@@ -17,6 +22,7 @@ pub struct SettingsDocument {
     schema_version: u32,
     resource_limits: ResourceLimitConfig,
     unknown: BTreeMap<Box<str>, Box<str>>,
+    values: BTreeMap<Box<str>, Box<str>>,
 }
 
 impl SettingsDocument {
@@ -39,6 +45,16 @@ impl SettingsDocument {
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
+        for spec in settings_schema() {
+            validate::validate_value(
+                spec,
+                &self
+                    .value(spec.key)
+                    .ok_or_else(|| SettingsError::InvalidValue {
+                        key: spec.key.into(),
+                    })?,
+            )?;
+        }
         self.resource_limits_snapshot()
             .map(|_| ())
             .map_err(SettingsError::InvalidLimits)
@@ -51,6 +67,13 @@ impl Default for SettingsDocument {
             schema_version: SETTINGS_SCHEMA_VERSION,
             resource_limits: ResourceLimitConfig::default(),
             unknown: BTreeMap::new(),
+            values: settings_schema()
+                .iter()
+                .filter(|spec| {
+                    !spec.key.starts_with("directory_") && !spec.key.starts_with("operation_")
+                })
+                .map(|spec| (spec.key.into(), spec.default.into()))
+                .collect(),
         }
     }
 }
@@ -148,11 +171,24 @@ pub enum SettingsError {
         message: Box<str>,
     },
     InvalidLimits(CoreError),
+    InvalidValue {
+        key: Box<str>,
+    },
+    UnsupportedVersion {
+        path: PathBuf,
+        version: u32,
+    },
 }
 
 impl fmt::Display for SettingsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidValue { key } => write!(formatter, "invalid setting: {key}"),
+            Self::UnsupportedVersion { path, version } => write!(
+                formatter,
+                "unsupported settings schema {version} at {}",
+                path.display()
+            ),
             Self::Io {
                 operation,
                 path,
@@ -179,7 +215,9 @@ impl Error for SettingsError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::InvalidLimits(source) => Some(source),
-            Self::Corrupt { .. } => None,
+            Self::Corrupt { .. } | Self::InvalidValue { .. } | Self::UnsupportedVersion { .. } => {
+                None
+            }
         }
     }
 }
@@ -246,19 +284,27 @@ fn parse_document(path: &Path, text: &str) -> Result<SettingsDocument, SettingsE
                 SettingsFailure::Corrupt(format!("schema_version is invalid: {error}").into()),
             )
         })?;
-    if version != SETTINGS_SCHEMA_VERSION {
-        return Err(settings_error(
-            path,
-            SettingsFailure::Corrupt(format!("unsupported schema version {version}").into()),
-        ));
-    }
+    let version = migrate::migrate_version(path, version)?;
 
     let resource_limits = parse_resource_limits(&mut entries);
+    let mut values = SettingsDocument::default().values;
+    for spec in settings_schema()
+        .iter()
+        .filter(|spec| values.contains_key(spec.key))
+        .collect::<Vec<_>>()
+    {
+        if let Some(value) = entries.remove(spec.key)
+            && validate::validate_value(spec, &value).is_ok()
+        {
+            values.insert(spec.key.into(), value);
+        }
+    }
 
     Ok(SettingsDocument {
         schema_version: version,
         resource_limits,
         unknown: entries,
+        values,
     })
 }
 
@@ -336,7 +382,7 @@ fn serialize(document: &SettingsDocument) -> String {
         limits.operation_metadata_jobs,
         limits.operation_hash_preview_jobs,
     );
-    for (key, value) in &document.unknown {
+    for (key, value) in document.values.iter().chain(&document.unknown) {
         output.push_str(key);
         output.push('=');
         output.push_str(value);
@@ -411,15 +457,19 @@ pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), SettingsEr
 
 fn ensure_parent(path: &Path) -> Result<(), SettingsError> {
     let parent = parent_directory(path);
-    fs::create_dir_all(parent).map_err(|source| {
-        settings_error(
-            parent,
-            SettingsFailure::Io {
-                operation: "create settings directory",
-                source,
-            },
-        )
-    })
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .map_err(|source| {
+            settings_error(
+                parent,
+                SettingsFailure::Io {
+                    operation: "create settings directory",
+                    source,
+                },
+            )
+        })
 }
 
 fn parent_directory(path: &Path) -> &Path {

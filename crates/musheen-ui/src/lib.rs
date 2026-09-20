@@ -10,6 +10,7 @@ pub mod menus;
 pub mod navigation;
 mod operations;
 pub mod search;
+pub mod settings;
 mod shell;
 pub mod sidebar;
 mod status_bar;

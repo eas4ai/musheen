@@ -664,6 +664,19 @@ pub fn run(initial_path: PathBuf) {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
             install_native_theme(cx);
+            let settings = musheen_desktop::SettingsStore::for_current_user()
+                .load()
+                .unwrap_or_else(|error| {
+                    eprintln!("Musheen could not load settings: {error}");
+                    musheen_desktop::SettingsDocument::default()
+                });
+            if std::env::var_os("MUSHEEN_THEME_PREVIEW").is_none() {
+                crate::settings::apply_appearance(&settings, cx);
+            }
+            let limits = settings
+                .resource_limits_snapshot()
+                .expect("loaded settings limits are validated");
+            cx.set_global(crate::settings::RuntimeSettings(settings.clone()));
             let width = preview_window_width(
                 std::env::var("MUSHEEN_PREVIEW_WINDOW_WIDTH")
                     .ok()
@@ -676,11 +689,17 @@ pub fn run(initial_path: PathBuf) {
             );
             let fallback = StorePath::from_unix_path(initial_path.into_os_string());
             let store = SessionStore::for_current_user();
-            let application = restore_application_session(
-                &store,
-                fallback.clone(),
-                LocalStore::session_location_exists,
-            )
+            let application = (settings.value("general.restore_session").as_deref()
+                != Some("false")
+                && settings.value("general.startup").as_deref() == Some("last-session"))
+            .then(|| {
+                restore_application_session(
+                    &store,
+                    fallback.clone(),
+                    LocalStore::session_location_exists,
+                )
+            })
+            .flatten()
             .unwrap_or_else(|| {
                 ApplicationSession::new(vec![WindowSession::new(fallback)])
                     .expect("a single fallback window is a valid application session")
@@ -689,7 +708,7 @@ pub fn run(initial_path: PathBuf) {
                 store,
                 application.windows().to_vec(),
             )));
-            let operation_hub = OperationHub::for_current_user(&ResourceLimits::default());
+            let operation_hub = OperationHub::for_current_user(&limits);
             let windows = coordinator
                 .lock()
                 .expect("session coordinator lock is not poisoned")
@@ -709,12 +728,13 @@ pub fn run(initial_path: PathBuf) {
                 .collect::<Vec<_>>();
             cx.spawn(async move |cx| {
                 for (window_options, navigation, binding) in windows {
+                    let limits = limits.clone();
                     cx.open_window(window_options, move |window, cx| {
                         let view = cx.new(|cx| {
                             MusheenApp::new_with_navigation(
                                 navigation,
                                 Some(binding),
-                                ResourceLimits::default(),
+                                limits.clone(),
                                 true,
                                 cx,
                             )
@@ -1099,12 +1119,18 @@ impl MusheenApp {
     }
 
     fn new_with_navigation(
-        navigation: WindowSession,
+        mut navigation: WindowSession,
         session_binding: Option<SessionBinding>,
         limits: ResourceLimits,
         watch_directories: bool,
         cx: &mut Context<Self>,
     ) -> Self {
+        let settings = cx
+            .try_global::<crate::settings::RuntimeSettings>()
+            .map(|runtime| runtime.0.clone());
+        if let Some(settings) = &settings {
+            crate::settings::general::configure_navigation(&mut navigation, settings);
+        }
         let location = navigation.focused_tab().location().clone();
         let focused_tab = navigation.focused_tab().id();
         let pins = PinStore::default();
@@ -1129,7 +1155,9 @@ impl MusheenApp {
             pins,
             limits,
             store: Arc::new(LocalStore::new()),
-            shell: crate::ShellModel::default(),
+            shell: crate::ShellModel::new(settings.as_ref().is_some_and(|settings| {
+                settings.value("layout.info_pane").as_deref() == Some("true")
+            })),
             navigation,
             omnibar: OmnibarState::default(),
             omnibar_input: None,
@@ -1144,7 +1172,9 @@ impl MusheenApp {
             session_binding,
             session_save_generation: 0,
             watch_directories,
-            sidebar_visible: true,
+            sidebar_visible: settings.as_ref().is_none_or(|settings| {
+                settings.value("layout.sidebar").as_deref() != Some("false")
+            }),
             icon_cache: HashMap::new(),
             info_panes: HashMap::new(),
             catalog: Catalog::system().expect("the built-in locale catalogs are valid"),
@@ -1657,6 +1687,7 @@ impl MusheenApp {
 
     fn dispatch_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
         match action {
+            CommandAction::OpenSettings => crate::settings::open_settings_window(cx),
             CommandAction::NavigateBack
             | CommandAction::NavigateForward
             | CommandAction::NavigateParent
@@ -2950,7 +2981,8 @@ impl MusheenApp {
     fn backend_action_state(action: CommandAction) -> CapabilityState {
         if matches!(
             action,
-            CommandAction::NavigateBack
+            CommandAction::OpenSettings
+                | CommandAction::NavigateBack
                 | CommandAction::NavigateForward
                 | CommandAction::NavigateParent
                 | CommandAction::Refresh
@@ -7526,7 +7558,7 @@ mod tests {
             assert_eq!(window.find("view.info").checked(), Some(false));
             assert_eq!(window.find("pane.split").checked(), Some(false));
             assert!(
-                !app.read(cx)
+                app.read(cx)
                     .shell
                     .commands()
                     .get("app.settings")
@@ -7536,11 +7568,6 @@ mod tests {
                             .active_command_context(CommandAction::OpenSettings)
                     )
                     .is_enabled()
-            );
-            window.click("app.settings", cx);
-            assert!(
-                app.read(cx).operation_error.is_none(),
-                "disabled toolbar command must not dispatch"
             );
 
             app.update(cx, |state, cx| {

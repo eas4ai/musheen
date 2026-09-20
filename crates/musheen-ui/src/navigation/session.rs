@@ -157,6 +157,16 @@ impl WindowSession {
         self.view_preferences.set(path, preferences);
     }
 
+    /// Applies startup defaults while retaining explicit per-directory choices.
+    pub(crate) fn set_default_preferences(&mut self, preferences: ViewPreferences) {
+        self.view_preferences.set_defaults(preferences);
+        for pane in &mut self.panes {
+            for tab in pane.tabs_mut() {
+                tab.set_view_preferences(self.view_preferences.for_path(tab.location()).clone());
+            }
+        }
+    }
+
     #[must_use]
     pub fn focused_tab(&self) -> &TabState {
         self.focused_pane().active_tab()

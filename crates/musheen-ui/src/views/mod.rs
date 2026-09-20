@@ -108,6 +108,10 @@ impl ViewPreferenceStore {
     pub const fn defaults(&self) -> &ViewPreferences {
         &self.defaults
     }
+
+    pub(crate) fn set_defaults(&mut self, preferences: ViewPreferences) {
+        self.defaults = preferences;
+    }
 }
 
 impl Default for ViewPreferenceStore {

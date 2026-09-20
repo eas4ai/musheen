@@ -18,6 +18,9 @@ pub struct ThemeProfile {
 }
 
 impl ThemeProfile {
+    pub const fn mode(self) -> AppearanceMode {
+        self.mode
+    }
     #[must_use]
     pub const fn new(mode: AppearanceMode, reduce_motion: bool) -> Self {
         Self {
