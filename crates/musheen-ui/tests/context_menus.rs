@@ -457,8 +457,13 @@ fn context_menu_shape_rules_keep_file_and_directory_actions_exact() {
 #[test]
 fn selected_directory_location_actions_use_the_directory_not_its_view() {
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let mut context = supported_context(CommandTarget::Directory, 1);
+    context.clipboard_has_contents = true;
+    context.resolved_destination = Some(musheen_core::ResolvedDestination::writable(path(
+        "/work/selected",
+    )));
     let menu = surface.compose(request(
-        supported_context(CommandTarget::Directory, 1),
+        context,
         MenuTarget::Item,
         vec![target(b"directory", "/work/selected")],
     ));
@@ -469,6 +474,17 @@ fn selected_directory_location_actions_use_the_directory_not_its_view() {
                 menu.entry("directory.open_terminal").unwrap(),
                 &mut dispatcher
             )
+            .is_dispatched()
+    );
+    assert!(matches!(
+        &dispatcher.calls[0].1,
+        CommandParameters::Location(location) if location == &path("/work/selected")
+    ));
+
+    let mut dispatcher = RecordingDispatcher::default();
+    assert!(
+        surface
+            .invoke(menu.entry("clipboard.paste_into").unwrap(), &mut dispatcher)
             .is_dispatched()
     );
     assert!(matches!(
@@ -555,6 +571,15 @@ fn menu_accessibility_and_keyboard_follow_modal_focus_and_pseudo_locale_rules() 
             .theme_tokens()
             .strong_boundaries()
     );
+
+    let layout_menu = surface.compose(request(
+        supported_context(CommandTarget::Background, 0),
+        MenuTarget::Background,
+        vec![],
+    ));
+    assert!(layout_menu.accessibility_tree().iter().any(|node| {
+        matches!(node.role(), musheen_ui::MenuAccessibleRole::Radio) && node.name().starts_with('⟦')
+    }));
 }
 
 #[test]

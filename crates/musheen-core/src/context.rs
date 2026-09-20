@@ -1,5 +1,6 @@
 use crate::{
-    CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, ItemId, StorePath,
+    CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, CommandAction, ItemId,
+    StorePath,
 };
 
 /// The exact target for a command projection. Context menus set this from the
@@ -80,6 +81,9 @@ pub struct CommandContext {
     pub directories_first: bool,
     pub sidebar_visible: bool,
     pub info_visible: bool,
+    /// Optional desktop-boundary state. When supplied, every command surface
+    /// receives the same unavailable reason from the registry definition.
+    pub backend_actions: Option<Vec<(CommandAction, CapabilityState)>>,
 }
 
 impl Default for CommandContext {
@@ -118,7 +122,20 @@ impl Default for CommandContext {
             directories_first: false,
             sidebar_visible: false,
             info_visible: false,
+            backend_actions: None,
         }
+    }
+}
+
+impl CommandContext {
+    #[must_use]
+    pub fn backend_action_state(&self, action: CommandAction) -> Option<&CapabilityState> {
+        self.backend_actions.as_ref().and_then(|actions| {
+            actions
+                .iter()
+                .find(|(candidate, _)| *candidate == action)
+                .map(|(_, state)| state)
+        })
     }
 }
 

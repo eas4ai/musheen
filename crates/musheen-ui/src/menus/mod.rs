@@ -238,6 +238,7 @@ pub struct PendingInvocation {
     context: musheen_core::CommandContext,
     selection: Vec<musheen_core::CommandTargetRef>,
     parameters: CommandParameters,
+    origin_tab: Option<crate::navigation::TabId>,
 }
 
 impl PendingInvocation {
@@ -250,6 +251,11 @@ impl PendingInvocation {
     pub fn selection(&self) -> &[musheen_core::CommandTargetRef] {
         &self.selection
     }
+
+    #[must_use]
+    pub(crate) const fn origin_tab(&self) -> Option<crate::navigation::TabId> {
+        self.origin_tab
+    }
 }
 
 impl From<&InvocationData> for PendingInvocation {
@@ -259,6 +265,7 @@ impl From<&InvocationData> for PendingInvocation {
             context: value.context.clone(),
             selection: value.selection.clone(),
             parameters: CommandParameters::None,
+            origin_tab: value.origin_tab,
         }
     }
 }
@@ -305,6 +312,7 @@ fn pending_with_parameters(
         context: data.context,
         selection: data.selection,
         parameters,
+        origin_tab: data.origin_tab,
     })
 }
 

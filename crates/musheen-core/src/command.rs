@@ -801,6 +801,7 @@ impl CommandPredicate {
             }
             Self::DirectoryMountOrBackground
                 if context.target == CommandTarget::Background
+                    || context.target == CommandTarget::Mount
                     || (context.selection_count == 1
                         && matches!(
                             context.target,
@@ -1058,6 +1059,15 @@ impl CommandDefinition {
     }
     #[must_use]
     pub fn state(&self, context: &CommandContext) -> CommandState {
+        if let Some(state) = context.backend_action_state(self.action())
+            && !matches!(state, CapabilityState::Supported)
+        {
+            return CommandState::disabled(
+                state
+                    .reason()
+                    .unwrap_or("the desktop backend cannot run this command"),
+            );
+        }
         self.predicate
             .evaluate(context)
             .with_checked(match self.action() {

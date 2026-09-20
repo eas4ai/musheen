@@ -27,6 +27,7 @@ pub struct ContextMenuRequest {
     location: StorePath,
     selection: Vec<CommandTargetRef>,
     source: ContextMenuSource,
+    origin_tab: Option<crate::navigation::TabId>,
     pub(crate) open_with: Vec<crate::menus::OpenWithApplication>,
     pub(crate) send_to: Vec<crate::menus::SendToDestination>,
     pub(crate) tags: Vec<crate::menus::MenuContribution>,
@@ -56,6 +57,7 @@ impl ContextMenuRequest {
             location,
             selection,
             source: ContextMenuSource::Pointer,
+            origin_tab: None,
             open_with: Vec::new(),
             send_to: Vec::new(),
             tags: Vec::new(),
@@ -110,6 +112,19 @@ impl ContextMenuRequest {
     #[must_use]
     pub const fn source(&self) -> ContextMenuSource {
         self.source
+    }
+
+    /// Binds all menu rows to the originating tab instead of whichever pane
+    /// happens to be focused when a delayed menu item is activated.
+    #[must_use]
+    pub const fn with_origin_tab(mut self, tab: crate::navigation::TabId) -> Self {
+        self.origin_tab = Some(tab);
+        self
+    }
+
+    #[must_use]
+    pub const fn origin_tab(&self) -> Option<crate::navigation::TabId> {
+        self.origin_tab
     }
 
     pub(crate) fn context_with_destination(

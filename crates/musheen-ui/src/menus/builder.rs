@@ -68,6 +68,7 @@ pub enum MenuKeyRoute {
 pub enum MenuAccessibleRole {
     MenuItem,
     Checkbox,
+    Radio,
     Submenu,
 }
 
@@ -154,13 +155,7 @@ impl ContextMenu {
             .filter(|entry| !matches!(entry.kind, MenuEntryKind::Separator))
             .map(|entry| MenuAccessibilityNode {
                 name: entry.label.clone(),
-                role: if entry.kind == MenuEntryKind::Submenu {
-                    MenuAccessibleRole::Submenu
-                } else if entry.state.is_checked() {
-                    MenuAccessibleRole::Checkbox
-                } else {
-                    MenuAccessibleRole::MenuItem
-                },
+                role: entry.accessible_role(),
                 checked: entry.state.is_checked(),
                 disabled_reason: entry.state.disabled_reason().map(Into::into),
             })
@@ -225,6 +220,20 @@ impl ContextMenu {
     }
 }
 
+fn is_layout_choice(command_id: Option<&str>) -> bool {
+    matches!(
+        command_id,
+        Some(
+            "view.details"
+                | "view.list"
+                | "view.cards"
+                | "view.grid"
+                | "view.columns"
+                | "view.adaptive"
+        )
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct MenuEntry {
     kind: MenuEntryKind,
@@ -271,6 +280,22 @@ impl MenuEntry {
         self.state.disabled_reason()
     }
 
+    /// Role and checked state are derived from the same registry projection
+    /// that feeds the native popup, so assistive technology cannot observe a
+    /// different command policy than keyboard and pointer users.
+    #[must_use]
+    pub fn accessible_role(&self) -> MenuAccessibleRole {
+        if self.kind == MenuEntryKind::Submenu {
+            MenuAccessibleRole::Submenu
+        } else if is_layout_choice(self.command_id()) {
+            MenuAccessibleRole::Radio
+        } else if self.state.is_checked() {
+            MenuAccessibleRole::Checkbox
+        } else {
+            MenuAccessibleRole::MenuItem
+        }
+    }
+
     #[must_use]
     pub const fn danger_level(&self) -> DangerLevel {
         self.danger
@@ -294,6 +319,13 @@ impl MenuEntry {
     #[must_use]
     pub fn copy_only(&self) -> bool {
         self.command_id() == Some("clipboard.send_to") && self.destination.is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn origin_tab(&self) -> Option<crate::navigation::TabId> {
+        self.invocation
+            .as_ref()
+            .and_then(|invocation| invocation.origin_tab)
     }
 }
 
@@ -328,6 +360,7 @@ pub(crate) struct InvocationData {
     pub(crate) selection: Vec<CommandTargetRef>,
     pub(crate) location: StorePath,
     pub(crate) destination: Option<StorePath>,
+    pub(crate) origin_tab: Option<crate::navigation::TabId>,
 }
 
 pub(crate) fn compose(
@@ -510,6 +543,7 @@ fn plain_command_entry(
             selection: request.selection().to_vec(),
             location: selected_directory_location(command.action(), context, request),
             destination: None,
+            origin_tab: request.origin_tab(),
         }),
     }
 }
@@ -521,7 +555,9 @@ fn selected_directory_location(
 ) -> StorePath {
     if matches!(
         action,
-        CommandAction::OpenTerminalHere | CommandAction::DirectoryProperties
+        CommandAction::OpenTerminalHere
+            | CommandAction::DirectoryProperties
+            | CommandAction::PasteInto
     ) && matches!(
         context.target,
         CommandTarget::Directory | CommandTarget::Mount
@@ -560,7 +596,7 @@ fn add_open_with_submenu(
         .collect::<Vec<_>>();
     let overflow = app_entries.split_off(app_entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
     let mut entries = app_entries;
-    append_overflow_submenu(&mut entries, overflow, theme);
+    append_overflow_submenu(&mut entries, overflow, theme, menu_more_label(catalog));
     if let Some(command) = registry.get("file.choose_application") {
         entries.push(command_entry(
             registry,
@@ -583,7 +619,7 @@ fn add_open_with_submenu(
             })
             .collect::<Vec<_>>();
         let overflow = defaults.split_off(defaults.len().min(MAX_VARIABLE_CONTRIBUTIONS));
-        append_overflow_submenu(&mut defaults, overflow, theme);
+        append_overflow_submenu(&mut defaults, overflow, theme, menu_more_label(catalog));
         let mut default_entry =
             plain_command_entry(set_default, catalog, request, request.context());
         default_entry.kind = MenuEntryKind::Submenu;
@@ -632,7 +668,7 @@ fn add_send_to_submenu(
     let overflow =
         destination_entries.split_off(destination_entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
     let mut entries = destination_entries;
-    append_overflow_submenu(&mut entries, overflow, theme);
+    append_overflow_submenu(&mut entries, overflow, theme, menu_more_label(catalog));
     if let Some(destination) = request
         .send_to
         .iter()
@@ -676,7 +712,6 @@ fn add_contribution_submenu(
             registry
                 .get(contribution.command_id())
                 .filter(|command| command.submenu() == Some(expected_submenu))
-                .filter(|command| command.danger_level() == DangerLevel::None)
                 .map(|command| (contribution, command))
         })
         .map(|(contribution, command)| {
@@ -686,7 +721,7 @@ fn add_contribution_submenu(
         })
         .collect::<Vec<_>>();
     let overflow = entries.split_off(entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
-    append_overflow_submenu(&mut entries, overflow, theme);
+    append_overflow_submenu(&mut entries, overflow, theme, menu_more_label(catalog));
     entry.kind = MenuEntryKind::Submenu;
     entry.submenu = Some(Box::new(ContextMenu {
         entries,
@@ -699,16 +734,17 @@ fn append_overflow_submenu(
     entries: &mut Vec<MenuEntry>,
     mut remaining: Vec<MenuEntry>,
     theme: crate::ThemeProfile,
+    more_label: &str,
 ) {
     if remaining.is_empty() {
         return;
     }
     let tail = remaining.split_off(remaining.len().min(MAX_VARIABLE_CONTRIBUTIONS));
-    append_overflow_submenu(&mut remaining, tail, theme);
+    append_overflow_submenu(&mut remaining, tail, theme, more_label);
     entries.push(MenuEntry {
         kind: MenuEntryKind::Submenu,
         command_id: None,
-        label: "More…".into(),
+        label: more_label.into(),
         state: CommandRegistry::built_in()
             .get("navigation.refresh")
             .expect("built-in command exists")
@@ -725,6 +761,10 @@ fn append_overflow_submenu(
         destination: None,
         invocation: None,
     });
+}
+
+fn menu_more_label(catalog: &Catalog) -> &str {
+    catalog.message("menu-more").unwrap_or("More…")
 }
 
 fn separator() -> MenuEntry {

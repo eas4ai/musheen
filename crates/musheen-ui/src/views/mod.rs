@@ -140,6 +140,7 @@ pub struct DirectoryViewModel {
     items: Vec<StoreItem>,
     preferences: ViewPreferences,
     selection: selection::SelectionModel,
+    focused_item: Option<ItemId>,
     editing: Option<ItemId>,
     scroll_anchor: Option<ScrollAnchor>,
     complete: bool,
@@ -153,6 +154,7 @@ impl DirectoryViewModel {
             items: Vec::new(),
             preferences: ViewPreferences::default(),
             selection: selection::SelectionModel::default(),
+            focused_item: None,
             editing: None,
             scroll_anchor: None,
             complete: false,
@@ -260,9 +262,19 @@ impl DirectoryViewModel {
 
     pub fn select_item(&mut self, id: ItemId, mode: SelectionMode) {
         if self.item(&id).is_some() {
-            self.selection.apply(vec![id], mode);
+            self.selection.apply(vec![id.clone()], mode);
+            self.focused_item = Some(id);
             self.trim_unpinned();
         }
+    }
+
+    #[must_use]
+    pub fn focused_item_id(&self) -> Option<&ItemId> {
+        self.focused_item.as_ref()
+    }
+
+    pub fn focus_item(&mut self, id: Option<ItemId>) {
+        self.focused_item = id.filter(|id| self.item(id).is_some());
     }
 
     pub fn select_all_visible(&mut self) {
@@ -363,6 +375,9 @@ impl DirectoryViewModel {
         self.selection.remove(id);
         if self.editing.as_ref() == Some(id) {
             self.editing = None;
+        }
+        if self.focused_item.as_ref() == Some(id) {
+            self.focused_item = self.items.first().map(|item| item.id().clone());
         }
         if self.scroll_anchor.as_ref().map(ScrollAnchor::item) == Some(id) {
             let replacement = removed.and_then(|index| {

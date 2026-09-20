@@ -133,7 +133,7 @@ impl Error for CatalogError {}
 
 #[cfg(test)]
 mod tests {
-    use super::Locale;
+    use super::{Catalog, Locale};
 
     #[test]
     fn locale_preferences_accept_posix_and_language_list_forms() {
@@ -146,5 +146,27 @@ mod tests {
             Some(Locale::EnUs)
         );
         assert_eq!(Locale::from_preferences("fr_FR.UTF-8"), None);
+    }
+
+    #[test]
+    fn pseudo_locale_covers_context_menu_dialog_chrome() {
+        let catalog = Catalog::load(Locale::EnXa).expect("pseudo catalog loads");
+        for key in [
+            "menu-more",
+            "dialog-choose-destination",
+            "dialog-destination-explanation",
+            "dialog-cancel",
+            "dialog-review-operation",
+            "dialog-continue",
+            "dialog-authorization-unavailable",
+        ] {
+            assert!(
+                catalog
+                    .message(key)
+                    .expect("context menu dialog key exists")
+                    .starts_with('⟦'),
+                "{key} is pseudo-localized"
+            );
+        }
     }
 }
