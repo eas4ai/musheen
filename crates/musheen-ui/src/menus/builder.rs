@@ -389,6 +389,19 @@ fn effective_target(request: &ContextMenuRequest) -> MenuTarget {
 fn is_presentable(command: &CommandDefinition, request: &ContextMenuRequest) -> bool {
     let target = request.context().target;
     match command.id().as_str() {
+        // These are target-shape applicability rules, not capability policy.
+        // The registry remains the authority for all capability-limited states.
+        "clipboard.paste_into"
+            if matches!(
+                target,
+                CommandTarget::File | CommandTarget::Archive | CommandTarget::ExecutableFile
+            ) =>
+        {
+            return false;
+        }
+        "file.create_hard_link" if target == CommandTarget::Directory => return false,
+        "file.hide" if request.context().target_is_hidden => return false,
+        "file.unhide" if !request.context().target_is_hidden => return false,
         "archive.browse" | "archive.extract" | "archive.extract_here"
             if target != CommandTarget::Archive =>
         {
@@ -495,10 +508,30 @@ fn plain_command_entry(
             action: command.action(),
             context: context.clone(),
             selection: request.selection().to_vec(),
-            location: request.location().clone(),
+            location: selected_directory_location(command.action(), context, request),
             destination: None,
         }),
     }
+}
+
+fn selected_directory_location(
+    action: CommandAction,
+    context: &CommandContext,
+    request: &ContextMenuRequest,
+) -> StorePath {
+    if matches!(
+        action,
+        CommandAction::OpenTerminalHere | CommandAction::DirectoryProperties
+    ) && matches!(
+        context.target,
+        CommandTarget::Directory | CommandTarget::Mount
+    ) {
+        return request.selection().first().map_or_else(
+            || request.location().clone(),
+            |target| target.path().clone(),
+        );
+    }
+    request.location().clone()
 }
 
 fn add_open_with_submenu(
@@ -511,30 +544,55 @@ fn add_open_with_submenu(
     let Some(open_with) = registry.get("file.open_with") else {
         return;
     };
-    let mut entries = request
+    let compatible = request
         .open_with
         .iter()
         .filter(|application| application.is_compatible())
-        .take(MAX_VARIABLE_CONTRIBUTIONS)
+        .collect::<Vec<_>>();
+    let mut app_entries = compatible
+        .iter()
         .map(|application| {
             let mut child = plain_command_entry(open_with, catalog, request, request.context());
             child.label = application.label().into();
-            child.application = Some(application.clone());
+            child.application = Some((*application).clone());
             child
         })
         .collect::<Vec<_>>();
-    append_overflow(&mut entries, request.open_with.len());
-    for id in ["file.choose_application", "file.set_default_application"] {
-        if let Some(command) = registry.get(id) {
-            entries.push(command_entry(
-                registry,
-                command,
-                catalog,
-                request,
-                request.context(),
-                theme,
-            ));
-        }
+    let overflow = app_entries.split_off(app_entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
+    let mut entries = app_entries;
+    append_overflow_submenu(&mut entries, overflow, theme);
+    if let Some(command) = registry.get("file.choose_application") {
+        entries.push(command_entry(
+            registry,
+            command,
+            catalog,
+            request,
+            request.context(),
+            theme,
+        ));
+    }
+    if let Some(set_default) = registry.get("file.set_default_application") {
+        let mut defaults = compatible
+            .iter()
+            .map(|application| {
+                let mut child =
+                    plain_command_entry(set_default, catalog, request, request.context());
+                child.label = application.label().into();
+                child.application = Some((*application).clone());
+                child
+            })
+            .collect::<Vec<_>>();
+        let overflow = defaults.split_off(defaults.len().min(MAX_VARIABLE_CONTRIBUTIONS));
+        append_overflow_submenu(&mut defaults, overflow, theme);
+        let mut default_entry =
+            plain_command_entry(set_default, catalog, request, request.context());
+        default_entry.kind = MenuEntryKind::Submenu;
+        default_entry.submenu = Some(Box::new(ContextMenu {
+            entries: defaults,
+            presentation: MenuPresentation::CompactNativeTheme,
+            theme_tokens: MenuThemeTokens::from_profile(theme),
+        }));
+        entries.push(default_entry);
     }
     entry.kind = MenuEntryKind::Submenu;
     entry.submenu = Some(Box::new(ContextMenu {
@@ -554,10 +612,9 @@ fn add_send_to_submenu(
     let Some(send_to) = registry.get("clipboard.send_to") else {
         return;
     };
-    let mut entries = request
+    let mut destination_entries = request
         .send_to
         .iter()
-        .take(MAX_VARIABLE_CONTRIBUTIONS)
         .map(|destination| {
             let context = request
                 .context_with_destination(destination.path().clone(), destination.writable());
@@ -572,7 +629,10 @@ fn add_send_to_submenu(
             child
         })
         .collect::<Vec<_>>();
-    append_overflow(&mut entries, request.send_to.len());
+    let overflow =
+        destination_entries.split_off(destination_entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
+    let mut entries = destination_entries;
+    append_overflow_submenu(&mut entries, overflow, theme);
     if let Some(destination) = request
         .send_to
         .iter()
@@ -605,12 +665,18 @@ fn add_contribution_submenu(
     if contributions.is_empty() {
         return;
     }
+    let expected_submenu = if tags {
+        musheen_core::CommandSubmenu::Tags
+    } else {
+        musheen_core::CommandSubmenu::Actions
+    };
     let mut entries = contributions
         .iter()
-        .take(MAX_VARIABLE_CONTRIBUTIONS)
         .filter_map(|contribution| {
             registry
                 .get(contribution.command_id())
+                .filter(|command| command.submenu() == Some(expected_submenu))
+                .filter(|command| command.danger_level() == DangerLevel::None)
                 .map(|command| (contribution, command))
         })
         .map(|(contribution, command)| {
@@ -619,7 +685,8 @@ fn add_contribution_submenu(
             child
         })
         .collect::<Vec<_>>();
-    append_overflow(&mut entries, contributions.len());
+    let overflow = entries.split_off(entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
+    append_overflow_submenu(&mut entries, overflow, theme);
     entry.kind = MenuEntryKind::Submenu;
     entry.submenu = Some(Box::new(ContextMenu {
         entries,
@@ -628,12 +695,18 @@ fn add_contribution_submenu(
     }));
 }
 
-fn append_overflow(entries: &mut Vec<MenuEntry>, total: usize) {
-    if total <= MAX_VARIABLE_CONTRIBUTIONS {
+fn append_overflow_submenu(
+    entries: &mut Vec<MenuEntry>,
+    mut remaining: Vec<MenuEntry>,
+    theme: crate::ThemeProfile,
+) {
+    if remaining.is_empty() {
         return;
     }
+    let tail = remaining.split_off(remaining.len().min(MAX_VARIABLE_CONTRIBUTIONS));
+    append_overflow_submenu(&mut remaining, tail, theme);
     entries.push(MenuEntry {
-        kind: MenuEntryKind::Overflow,
+        kind: MenuEntryKind::Submenu,
         command_id: None,
         label: "More…".into(),
         state: CommandRegistry::built_in()
@@ -643,7 +716,11 @@ fn append_overflow(entries: &mut Vec<MenuEntry>, total: usize) {
         shortcut: None,
         group: None,
         danger: DangerLevel::None,
-        submenu: None,
+        submenu: Some(Box::new(ContextMenu {
+            entries: remaining,
+            presentation: MenuPresentation::CompactNativeTheme,
+            theme_tokens: MenuThemeTokens::from_profile(theme),
+        })),
         application: None,
         destination: None,
         invocation: None,
@@ -702,8 +779,15 @@ const BACKGROUND: &[&str] = &[
     "create.from_template",
     "directory.open_terminal",
     "view.hidden",
+    "view.details",
+    "view.list",
+    "view.cards",
+    "view.grid",
+    "view.columns",
+    "view.adaptive",
     "view.sort",
     "view.group",
+    "view.directories_first",
     "directory.properties",
 ];
 const ITEM: &[&str] = &[

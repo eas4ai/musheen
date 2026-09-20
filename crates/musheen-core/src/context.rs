@@ -212,11 +212,17 @@ impl CommandTargetRef {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandParameterError {
     ProviderMismatch,
+    InvalidApplicationId,
 }
 
 impl std::fmt::Display for CommandParameterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("command target item and path providers differ")
+        match self {
+            Self::ProviderMismatch => {
+                formatter.write_str("command target item and path providers differ")
+            }
+            Self::InvalidApplicationId => formatter.write_str("desktop application ID is invalid"),
+        }
     }
 }
 
@@ -238,6 +244,11 @@ pub enum CommandParameters {
         targets: Vec<CommandTargetRef>,
         supports_provider_uris: bool,
     },
+    OpenWith {
+        targets: Vec<CommandTargetRef>,
+        application: DesktopApplicationId,
+        intent: OpenWithIntent,
+    },
 }
 
 impl CommandParameters {
@@ -258,4 +269,47 @@ impl CommandParameters {
     pub fn destination_request(targets: Vec<CommandTargetRef>) -> Self {
         Self::DestinationRequest(targets)
     }
+
+    #[must_use]
+    pub fn open_with(
+        targets: Vec<CommandTargetRef>,
+        application: DesktopApplicationId,
+        intent: OpenWithIntent,
+    ) -> Self {
+        Self::OpenWith {
+            targets,
+            application,
+            intent,
+        }
+    }
+}
+
+/// A validated freedesktop desktop-file identity. It is never a display label.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct DesktopApplicationId(Box<str>);
+
+impl DesktopApplicationId {
+    pub fn new(value: impl Into<Box<str>>) -> Result<Self, CommandParameterError> {
+        let value = value.into();
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            return Err(CommandParameterError::InvalidApplicationId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Association changes are explicit; a one-time launch cannot alter defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenWithIntent {
+    OpenOnce,
+    SetAsDefault,
 }

@@ -8,6 +8,58 @@ use musheen_core::{
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn open_with_dispatches_a_validated_application_identity_and_explicit_intent() {
+    let registry = CommandRegistry::built_in();
+    let target = local_target();
+    let editor = musheen_core::DesktopApplicationId::new("org.example.Editor").unwrap();
+    let viewer = musheen_core::DesktopApplicationId::new("org.example.Viewer").unwrap();
+    let mut dispatcher = RecordingDispatcher::default();
+
+    registry
+        .get("file.open_with")
+        .unwrap()
+        .handler()
+        .invoke(
+            &mut dispatcher,
+            CommandParameters::open_with(
+                vec![target.clone()],
+                editor.clone(),
+                musheen_core::OpenWithIntent::OpenOnce,
+            ),
+        )
+        .unwrap();
+    registry
+        .get("file.set_default_application")
+        .unwrap()
+        .handler()
+        .invoke(
+            &mut dispatcher,
+            CommandParameters::open_with(
+                vec![target],
+                viewer.clone(),
+                musheen_core::OpenWithIntent::SetAsDefault,
+            ),
+        )
+        .unwrap();
+
+    assert_ne!(editor, viewer);
+    assert!(matches!(
+        dispatcher.parameters[0],
+        CommandParameters::OpenWith {
+            intent: musheen_core::OpenWithIntent::OpenOnce,
+            ..
+        }
+    ));
+    assert!(matches!(
+        dispatcher.parameters[1],
+        CommandParameters::OpenWith {
+            intent: musheen_core::OpenWithIntent::SetAsDefault,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn registry_contains_the_mutation_actions_that_context_menus_project() {
     let registry = CommandRegistry::built_in();
 
@@ -1020,15 +1072,17 @@ fn every_single_target_contract_rejects_multiple_targets_before_dispatch() {
 #[derive(Default)]
 struct RecordingDispatcher {
     actions: Vec<CommandAction>,
+    parameters: Vec<CommandParameters>,
 }
 
 impl CommandDispatcher for RecordingDispatcher {
     fn dispatch(
         &mut self,
         action: CommandAction,
-        _: CommandParameters,
+        parameters: CommandParameters,
     ) -> Result<(), CommandDispatchError> {
         self.actions.push(action);
+        self.parameters.push(parameters);
         Ok(())
     }
 }

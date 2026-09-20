@@ -1,6 +1,6 @@
 use crate::{
     CapabilityKind, CapabilityState, CommandContext, CommandParameters, CommandTarget,
-    ProviderAction,
+    OpenWithIntent, ProviderAction,
 };
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -578,6 +578,7 @@ pub enum CommandParameterContract {
     DestinationWorkflow(TargetCardinality),
     Location,
     CustomAction(TargetCardinality),
+    OpenWith(TargetCardinality),
 }
 
 impl CommandAction {
@@ -633,6 +634,9 @@ impl CommandAction {
             CommandAction::Extract => {
                 CommandParameterContract::DestinationWorkflow(TargetCardinality::ExactlyOne)
             }
+            CommandAction::OpenWith | CommandAction::SetDefaultApplication => {
+                CommandParameterContract::OpenWith(TargetCardinality::ExactlyOne)
+            }
             CommandAction::CustomAction => {
                 CommandParameterContract::CustomAction(TargetCardinality::OneOrMore)
             }
@@ -681,6 +685,22 @@ fn validate_parameters(
             CommandParameterContract::CustomAction(cardinality),
             CommandParameters::CustomAction { targets, .. },
         ) => cardinality_matches(cardinality, targets.len()),
+        (
+            CommandParameterContract::OpenWith(cardinality),
+            CommandParameters::OpenWith {
+                targets, intent, ..
+            },
+        ) => {
+            cardinality_matches(cardinality, targets.len())
+                && matches!(
+                    (action, intent),
+                    (CommandAction::OpenWith, OpenWithIntent::OpenOnce)
+                        | (
+                            CommandAction::SetDefaultApplication,
+                            OpenWithIntent::SetAsDefault
+                        )
+                )
+        }
         _ => false,
     };
     valid.then_some(()).ok_or_else(|| {
@@ -707,6 +727,7 @@ pub enum CommandPredicate {
     ExactlyOneDirectory,
     ExactlyOneFile,
     DirectoryOrBackground,
+    DirectoryMountOrBackground,
     WritableLocation,
     WritableDestination,
     Capability(CapabilityKind),
@@ -775,6 +796,16 @@ impl CommandPredicate {
                 if context.target == CommandTarget::Background
                     || (context.selection_count == 1
                         && context.target == CommandTarget::Directory) =>
+            {
+                CommandState::enabled()
+            }
+            Self::DirectoryMountOrBackground
+                if context.target == CommandTarget::Background
+                    || (context.selection_count == 1
+                        && matches!(
+                            context.target,
+                            CommandTarget::Directory | CommandTarget::Mount
+                        )) =>
             {
                 CommandState::enabled()
             }
@@ -849,6 +880,9 @@ impl CommandPredicate {
             Self::ExactlyOneFile => CommandState::disabled("exactly one file must be selected"),
             Self::DirectoryOrBackground => {
                 CommandState::disabled("a directory or its background must be targeted")
+            }
+            Self::DirectoryMountOrBackground => {
+                CommandState::disabled("a directory, mount, or its background must be targeted")
             }
             Self::WritableLocation => CommandState::disabled("the current location is read-only"),
             Self::WritableDestination => CommandState::disabled("choose a destination first"),
@@ -1805,7 +1839,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.directory-properties",
             "info",
             &[],
-            P::DirectoryOrBackground,
+            P::DirectoryMountOrBackground,
             A::DirectoryProperties,
             G::Details,
             D::None,

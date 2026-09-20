@@ -512,6 +512,21 @@ impl PropertiesWindow {
         this
     }
 
+    /// Opens a real properties surface on a non-mutating requested page.
+    /// Invalid pages remain on General; capability-bearing pages are still
+    /// gated by the loaded snapshot rather than being forced into existence.
+    pub(crate) fn with_hub_page(
+        data: PropertiesWindowData,
+        operation_hub: OperationHub,
+        initial_page: PropertiesPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::with_hub(data, operation_hub, window, cx);
+        let _ = this.model.select_page(initial_page);
+        this
+    }
+
     fn subscribe_permission_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let owner = self.permission_inputs.owner.clone();
         self.permission_subscriptions.push(cx.subscribe_in(

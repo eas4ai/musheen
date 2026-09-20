@@ -1,6 +1,6 @@
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
-    PropertiesWindow, PropertiesWindowData, conflict_window_options,
+    PropertiesPage, PropertiesWindow, PropertiesWindowData, conflict_window_options,
     install_properties_key_bindings, properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
@@ -23,23 +23,30 @@ use crate::toolbar::COMMAND_IDS;
 use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
 };
+use crate::{
+    ContextMenu, ContextMenuDestinationResolver, MenuEntry, MenuEntryKind, MenuInvocation,
+    MenuTarget, PendingInvocation,
+};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Root, Selectable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, ImageSource, IntoElement,
-    KeyBinding, Pixels, Point, Render, Role, SharedString, Subscription, TestSupportExt,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, img, px, size, uniform_list,
+    AnyElement, App, AppContext, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, ImageSource, IntoElement, KeyBinding, MouseButton, Pixels, Point, Render, Role,
+    SharedString, Subscription, TestSupportExt, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, div, img, px, size, uniform_list,
 };
 use musheen_core::{
-    CancellationToken, CommandAction, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page,
-    ProviderId, ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch,
-    SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem,
-    StorePath, WatchEvent,
+    CancellationToken, CapabilityMatrix, CapabilityState, CommandAction, CommandContext,
+    CommandDispatchError, CommandDispatcher, CommandParameters, CommandTarget, CommandTargetRef,
+    DirectoryWatch, DisplayPath, ItemId, ItemKind, Page, ProviderActionMatrix, ProviderId,
+    ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch, SearchCompletion,
+    SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath,
+    WatchEvent,
 };
 use musheen_desktop::{
     ConflictDecisionStore, MimeDetector, PreviewDocument, SessionStore, ThumbnailCache,
@@ -121,6 +128,7 @@ gpui_kit::actions!(
         ViewAdaptiveShortcut,
         ToggleSidebarShortcut,
         OpenPropertiesShortcut,
+        OpenContextMenuShortcut,
     ]
 );
 
@@ -151,6 +159,8 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-6", ViewAdaptiveShortcut, None),
         KeyBinding::new("ctrl-b", ToggleSidebarShortcut, None),
         KeyBinding::new("alt-enter", OpenPropertiesShortcut, None),
+        KeyBinding::new("shift-f10", OpenContextMenuShortcut, None),
+        KeyBinding::new("menu", OpenContextMenuShortcut, None),
     ]);
 }
 
@@ -179,6 +189,22 @@ struct ItemRenderSpec {
 struct FileDragPreview {
     label: String,
     position: Point<Pixels>,
+}
+
+#[derive(Default)]
+struct AppMenuDispatcher {
+    dispatched: Option<(CommandAction, CommandParameters)>,
+}
+
+impl CommandDispatcher for AppMenuDispatcher {
+    fn dispatch(
+        &mut self,
+        action: CommandAction,
+        parameters: CommandParameters,
+    ) -> Result<(), CommandDispatchError> {
+        self.dispatched = Some((action, parameters));
+        Ok(())
+    }
 }
 
 impl Render for FileDragPreview {
@@ -274,6 +300,186 @@ struct PendingDrop {
     decisions: Vec<ConflictDecision>,
     policies: ConflictPolicies,
     automatic_scope: bool,
+}
+
+#[derive(Clone)]
+struct ContextDestinationChoice {
+    label: String,
+    location: StorePath,
+}
+
+#[derive(Clone)]
+enum ContextDestinationEvent {
+    Chosen(StorePath),
+    Cancelled,
+}
+
+struct ContextDestinationDialog {
+    choices: Vec<ContextDestinationChoice>,
+    focus: FocusHandle,
+    pending_focus: bool,
+}
+
+impl EventEmitter<ContextDestinationEvent> for ContextDestinationDialog {}
+
+impl ContextDestinationDialog {
+    fn new(choices: Vec<ContextDestinationChoice>, cx: &mut Context<Self>) -> Self {
+        Self {
+            choices,
+            focus: cx.focus_handle(),
+            pending_focus: true,
+        }
+    }
+}
+
+impl Render for ContextDestinationDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.focus.focus(window, cx);
+            self.pending_focus = false;
+        }
+        let choices = self
+            .choices
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                let location = choice.location.clone();
+                Button::new(SharedString::from(format!("context-destination-{index}")))
+                    .label(choice.label)
+                    .w_full()
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        cx.emit(ContextDestinationEvent::Chosen(location.clone()));
+                        window.remove_window();
+                    }))
+            });
+        div()
+            .id("context-destination-dialog")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label("Choose destination")
+            .track_focus(&self.focus)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .child(div().text_lg().child("Choose destination"))
+            .child("The operation queue will preflight the selected provider before copying or moving.")
+            .children(choices)
+            .child(
+                Button::new("context-destination-cancel")
+                    .label("Cancel")
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        cx.emit(ContextDestinationEvent::Cancelled);
+                        window.remove_window();
+                    })),
+            )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ContextReviewEvent {
+    Confirmed,
+    Cancelled,
+}
+
+struct ContextReviewDialog {
+    command: String,
+    targets: Vec<String>,
+    focus: FocusHandle,
+    pending_focus: bool,
+}
+
+impl EventEmitter<ContextReviewEvent> for ContextReviewDialog {}
+
+impl ContextReviewDialog {
+    fn new(command: String, targets: Vec<String>, cx: &mut Context<Self>) -> Self {
+        Self {
+            command,
+            targets,
+            focus: cx.focus_handle(),
+            pending_focus: true,
+        }
+    }
+}
+
+impl Render for ContextReviewDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.focus.focus(window, cx);
+            self.pending_focus = false;
+        }
+        let command = self.command.clone();
+        let reversible = if command == "clipboard.move_to" {
+            "Move is routed through the operation history and conflict workflow."
+        } else {
+            "Review this operation before it is sent to the desktop backend."
+        };
+        div()
+            .id("context-command-review")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label(format!("Review {command}"))
+            .track_focus(&self.focus)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .child(div().text_lg().child("Review operation"))
+            .child(format!("Command: {command}"))
+            .child(format!("Targets: {}", self.targets.join(", ")))
+            .child(reversible)
+            .child("Authorization backend: none (privileged commands remain unavailable).")
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("context-review-cancel")
+                            .label("Cancel")
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                cx.emit(ContextReviewEvent::Cancelled);
+                                window.remove_window();
+                            })),
+                    )
+                    .child(
+                        Button::new("context-review-confirm")
+                            .label("Continue")
+                            .primary()
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                cx.emit(ContextReviewEvent::Confirmed);
+                                window.remove_window();
+                            })),
+                    ),
+            )
+    }
+}
+
+/// The menu layer asks this adapter for a provider-backed destination result;
+/// it deliberately delegates the decision to the operation queue instead of
+/// accepting a UI-provided writable flag.
+struct ContextTransferDestinationResolver<'a> {
+    operation_hub: &'a OperationHub,
+    payload: &'a FileDragPayload,
+}
+
+impl ContextMenuDestinationResolver for ContextTransferDestinationResolver<'_> {
+    fn resolve_context_menu_destination(
+        &self,
+        destination: &StorePath,
+    ) -> musheen_core::ResolvedDestination {
+        if self
+            .operation_hub
+            .can_accept_drop(self.payload, destination)
+        {
+            musheen_core::ResolvedDestination::writable(destination.clone())
+        } else {
+            musheen_core::ResolvedDestination::read_only(
+                destination.clone(),
+                "the destination provider refused this operation",
+            )
+        }
+    }
 }
 
 pub fn run(initial_path: PathBuf) {
@@ -638,6 +844,10 @@ struct MusheenApp {
     trash_states: HashMap<TabId, TrashState>,
     pending_empty_trash: Option<Vec<musheen_ops::TrashReceipt>>,
     pending_drop: Option<PendingDrop>,
+    pending_context_menu: Option<ContextMenu>,
+    pending_context_destination: Option<PendingInvocation>,
+    pending_context_review: Option<MenuInvocation>,
+    keyboard_context_popup: Option<Entity<PopupMenu>>,
     conflict_subscriptions: Vec<Subscription>,
 }
 
@@ -758,6 +968,10 @@ impl MusheenApp {
             trash_states: HashMap::new(),
             pending_empty_trash: None,
             pending_drop: None,
+            pending_context_menu: None,
+            pending_context_destination: None,
+            pending_context_review: None,
+            keyboard_context_popup: None,
             conflict_subscriptions: Vec::new(),
         };
         this.start_load(location, cx);
@@ -1134,7 +1348,7 @@ impl MusheenApp {
         self.dispatch_action(action, cx);
     }
 
-    fn open_selected_properties(&mut self, cx: &mut Context<Self>) {
+    fn open_selected_properties_page(&mut self, page: PropertiesPage, cx: &mut Context<Self>) {
         let view = self.focused_directory().view();
         let selected = view
             .selected_ids()
@@ -1165,8 +1379,9 @@ impl MusheenApp {
             let result = work.await;
             cx.open_window(options, move |window, cx| match result {
                 Ok(data) => {
-                    let view =
-                        cx.new(|cx| PropertiesWindow::with_hub(data, operation_hub, window, cx));
+                    let view = cx.new(|cx| {
+                        PropertiesWindow::with_hub_page(data, operation_hub, page, window, cx)
+                    });
                     cx.new(|cx| Root::new(view, window, cx))
                 }
                 Err(error) => {
@@ -1177,6 +1392,10 @@ impl MusheenApp {
             .expect("Musheen could not open a Properties window");
         })
         .detach();
+    }
+
+    fn open_selected_properties(&mut self, cx: &mut Context<Self>) {
+        self.open_selected_properties_page(PropertiesPage::General, cx);
     }
 
     fn dispatch_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
@@ -1216,8 +1435,14 @@ impl MusheenApp {
                 self.dispatch_selection_action(action, cx);
             }
             CommandAction::OpenProperties => self.open_selected_properties(cx),
-            CommandAction::OpenSettings => {}
-            _ => {}
+            CommandAction::Permissions => {
+                self.open_selected_properties_page(PropertiesPage::Permissions, cx);
+            }
+            action => {
+                self.operation_error =
+                    Some(format!("No desktop dispatcher is registered for {action:?}").into());
+                cx.notify();
+            }
         }
     }
 
@@ -1399,6 +1624,570 @@ impl MusheenApp {
         self.refresh_info_pane(tab_id, cx);
         self.schedule_session_save(cx);
         cx.notify();
+    }
+
+    /// Builds a menu request from the pane that received the pointer event.
+    /// Capturing the pane's tab id here prevents the other pane's selection
+    /// from becoming an accidental target after focus changes.
+    fn item_context_menu(
+        &mut self,
+        tab_id: TabId,
+        clicked: ItemId,
+        cx: &mut Context<Self>,
+    ) -> ContextMenu {
+        let (clicked_target, selected) = {
+            let Some(directory) = self.directories.get(&tab_id) else {
+                return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+            };
+            let view = directory.view();
+            let Some(item) = view.item(&clicked) else {
+                return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+            };
+            let clicked_target = CommandTargetRef::new(item.id().clone(), item.path().clone())
+                .expect("directory items have stable command targets");
+            let selected = view
+                .selected_ids()
+                .iter()
+                .filter_map(|id| view.item(id))
+                .filter_map(|item| {
+                    CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                })
+                .collect::<Vec<_>>();
+            (clicked_target, selected)
+        };
+        let prepared = self
+            .shell
+            .context_menus()
+            .prepare_pointer_target(&selected, &clicked_target);
+        if !selected
+            .iter()
+            .any(|target| target.id() == clicked_target.id())
+        {
+            self.select_item(tab_id, clicked, cx);
+        }
+        self.compose_context_menu(tab_id, MenuTarget::Item, prepared.selection().to_vec())
+    }
+
+    fn sidebar_context_menu(&self, tab_id: TabId) -> ContextMenu {
+        self.compose_context_menu(tab_id, MenuTarget::SidebarLocation, Vec::new())
+    }
+
+    fn open_keyboard_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        let selection = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| {
+                directory
+                    .view()
+                    .selected_ids()
+                    .iter()
+                    .filter_map(|id| directory.view().item(id))
+                    .filter_map(|item| {
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let prepared = self
+            .shell
+            .context_menus()
+            .prepare_keyboard_target(selection.first().cloned());
+        let menu_target = if prepared.selection().is_empty() {
+            MenuTarget::Background
+        } else {
+            MenuTarget::Item
+        };
+        let menu = self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec());
+        let app = cx.entity().downgrade();
+        let popup = PopupMenu::build(window, cx, move |popup, window, popup_cx| {
+            Self::populate_context_popup(
+                popup,
+                menu,
+                app.clone(),
+                format!("keyboard-{tab_id:?}"),
+                window,
+                popup_cx,
+            )
+        });
+        let popup_for_focus = popup.clone();
+        popup.update(cx, |popup, cx| {
+            popup.focus_handle(cx).focus(window, cx);
+        });
+        let subscription = cx.subscribe(&popup_for_focus, move |this, _, _: &DismissEvent, cx| {
+            this.keyboard_context_popup = None;
+            this.pending_content_focus = true;
+            cx.notify();
+        });
+        self.conflict_subscriptions.push(subscription);
+        self.keyboard_context_popup = Some(popup);
+        cx.notify();
+    }
+
+    fn sidebar_location_context_menu(&self, tab_id: TabId, location: StorePath) -> ContextMenu {
+        self.compose_context_menu_at(tab_id, MenuTarget::SidebarLocation, location, Vec::new())
+    }
+
+    fn compose_context_menu(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        selection: Vec<CommandTargetRef>,
+    ) -> ContextMenu {
+        let location = self
+            .navigation
+            .tab(tab_id)
+            .map(|tab| tab.location().clone())
+            .unwrap_or_else(|| self.navigation.focused_tab().location().clone());
+        self.compose_context_menu_at(tab_id, target, location, selection)
+    }
+
+    fn compose_context_menu_at(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        selection: Vec<CommandTargetRef>,
+    ) -> ContextMenu {
+        let item_count = self
+            .directories
+            .get(&tab_id)
+            .map_or(0, |directory| directory.view().items().len());
+        let item_target = if selection.len() > 1 {
+            CommandTarget::MultiSelection
+        } else if let Some(item) = selection.first().and_then(|target| {
+            self.directories
+                .get(&tab_id)
+                .and_then(|directory| directory.view().item(target.id()))
+        }) {
+            match item.kind() {
+                ItemKind::Directory => CommandTarget::Directory,
+                _ => CommandTarget::File,
+            }
+        } else {
+            CommandTarget::Background
+        };
+        // A destination workflow is enabled to let the user choose a concrete
+        // provider location. `ContextTransferDestinationResolver` immediately
+        // asks OperationHub to preflight that choice before dispatching; this
+        // is not a UI claim that either the source or destination is writable.
+        let writable = true;
+        let context = CommandContext {
+            target: item_target,
+            item_count,
+            selection_count: selection.len(),
+            location_is_writable: writable,
+            mutation_is_supported: true,
+            is_local: true,
+            has_dot_name_semantics: true,
+            executable_run_enabled: false,
+            capabilities: CapabilityMatrix::new(|_| CapabilityState::Supported),
+            provider_actions: ProviderActionMatrix::from_states(
+                CapabilityState::Supported,
+                CapabilityState::Supported,
+                CapabilityState::Supported,
+                CapabilityState::Supported,
+            ),
+            ..CommandContext::default()
+        };
+        self.shell
+            .context_menus()
+            .compose(crate::ContextMenuRequest::new(
+                context, target, location, selection,
+            ))
+    }
+
+    fn populate_context_popup(
+        mut popup: PopupMenu,
+        menu: ContextMenu,
+        app: gpui_kit::WeakEntity<Self>,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        for (index, entry) in menu.entries().iter().cloned().enumerate() {
+            let row_path = format!("{path}-{index}");
+            match entry.kind() {
+                MenuEntryKind::Separator => popup = popup.separator(),
+                MenuEntryKind::Submenu => {
+                    let label = entry.label().to_owned();
+                    let disabled = !entry.state().is_enabled();
+                    let Some(submenu) = entry.submenu().cloned() else {
+                        continue;
+                    };
+                    let app = app.clone();
+                    let child_path = row_path.clone();
+                    let submenu = PopupMenu::build(window, cx, move |popup, window, cx| {
+                        Self::populate_context_popup(popup, submenu, app, child_path, window, cx)
+                    });
+                    popup = popup.item(PopupMenuItem::submenu(label, submenu).disabled(disabled));
+                }
+                MenuEntryKind::Command | MenuEntryKind::Overflow => {
+                    popup = popup.item(Self::context_popup_item(entry, app.clone(), row_path));
+                }
+            }
+        }
+        popup
+    }
+
+    fn context_popup_item(
+        entry: MenuEntry,
+        app: gpui_kit::WeakEntity<Self>,
+        id: String,
+    ) -> PopupMenuItem {
+        let label = entry.label().to_owned();
+        let shortcut = entry.shortcut().map(str::to_owned);
+        let command_id = entry.command_id().map(str::to_owned);
+        let routable = command_id
+            .as_deref()
+            .is_some_and(Self::context_command_is_routable);
+        let disabled_reason = entry.accessible_disabled_reason().map_or_else(
+            || {
+                command_id
+                    .as_deref()
+                    .filter(|_| !routable)
+                    .map(Self::context_unavailable_reason)
+            },
+            |reason| Some(reason.to_owned()),
+        );
+        let enabled = entry.state().is_enabled() && routable;
+        let checked = entry.state().is_checked();
+        PopupMenuItem::element(move |_, _| {
+            div()
+                .id(SharedString::from(format!("context-menu-row-{id}")))
+                .test_support()
+                .role(Role::MenuItem)
+                .aria_label(
+                    disabled_reason
+                        .as_ref()
+                        .map_or_else(|| label.clone(), |reason| format!("{label}: {reason}")),
+                )
+                .aria_selected(checked)
+                .w_full()
+                .flex()
+                .justify_between()
+                .gap_4()
+                .child(if checked {
+                    format!("✓ {label}")
+                } else {
+                    label.clone()
+                })
+                .when_some(shortcut.clone(), |row, shortcut| {
+                    row.child(div().text_xs().child(shortcut))
+                })
+        })
+        .checked(checked)
+        .disabled(!enabled)
+        .on_click(move |_, _, cx| {
+            let _ = app.update(cx, |this, cx| {
+                this.dispatch_context_entry(entry.clone(), cx)
+            });
+        })
+    }
+
+    fn dispatch_context_entry(&mut self, entry: MenuEntry, cx: &mut Context<Self>) {
+        let Some(command_id) = entry.command_id().map(str::to_owned) else {
+            return;
+        };
+        if !Self::context_command_is_routable(&command_id) {
+            self.operation_error =
+                Some("The selected context command has no safe desktop backend".into());
+            cx.notify();
+            return;
+        }
+        let surface = self.shell.context_menus().clone();
+        let mut dispatcher = AppMenuDispatcher::default();
+        match surface.invoke(&entry, &mut dispatcher) {
+            crate::MenuInvocation::Dispatched => {
+                if let Some((action, parameters)) = dispatcher.dispatched {
+                    self.dispatch_typed_context_command(action, parameters, cx);
+                }
+            }
+            MenuInvocation::NeedsConfirmation(pending) => {
+                self.pending_context_review = Some(MenuInvocation::NeedsConfirmation(pending));
+                self.open_context_review(cx);
+            }
+            MenuInvocation::NeedsDestinationChooser(pending) => {
+                self.pending_context_destination = Some(pending);
+                self.open_context_destination_chooser(cx);
+            }
+            MenuInvocation::Cancelled | MenuInvocation::Rejected(_) => {}
+        }
+    }
+
+    fn resolve_context_destination(&mut self, destination: StorePath, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_context_destination.take() else {
+            return;
+        };
+        let action = match pending.command_id() {
+            "clipboard.copy_to" => DropAction::Copy,
+            "clipboard.move_to" => DropAction::Move,
+            unsupported => {
+                self.operation_error = Some(
+                    format!("The destination workflow for {unsupported} is unavailable").into(),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let sources = pending
+            .selection()
+            .iter()
+            .map(|target| target.path().clone())
+            .collect();
+        let payload = match FileDragPayload::new(sources, action) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let resolver = ContextTransferDestinationResolver {
+            operation_hub: &self.operation_hub,
+            payload: &payload,
+        };
+        let surface = self.shell.context_menus().clone();
+        let mut dispatcher = AppMenuDispatcher::default();
+        match surface.resolve_destination(pending, destination, &resolver, &mut dispatcher) {
+            MenuInvocation::Dispatched => {
+                if let Some((action, parameters)) = dispatcher.dispatched {
+                    self.dispatch_typed_context_command(action, parameters, cx);
+                }
+            }
+            MenuInvocation::NeedsConfirmation(pending) => {
+                self.pending_context_review = Some(MenuInvocation::NeedsConfirmation(pending));
+                self.open_context_review(cx);
+            }
+            MenuInvocation::Rejected(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+            }
+            MenuInvocation::Cancelled | MenuInvocation::NeedsDestinationChooser(_) => {}
+        }
+    }
+
+    fn cancel_context_destination(&mut self, cx: &mut Context<Self>) {
+        self.pending_context_destination = None;
+        self.pending_content_focus = true;
+        cx.notify();
+    }
+
+    fn context_destination_choices(&self) -> Vec<ContextDestinationChoice> {
+        let tab_id = self.navigation.focused_tab().id();
+        self.sidebars
+            .get(&tab_id)
+            .map(|sidebar| {
+                sidebar
+                    .sections()
+                    .into_iter()
+                    .flat_map(|section| section.items().to_vec())
+                    .map(|entry| ContextDestinationChoice {
+                        label: entry.label().to_owned(),
+                        location: entry.location().clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn open_context_destination_chooser(&mut self, cx: &mut Context<Self>) {
+        let choices = self.context_destination_choices();
+        if choices.is_empty() {
+            self.pending_context_destination = None;
+            self.operation_error = Some("No writable destination locations are available".into());
+            cx.notify();
+            return;
+        }
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(520.), px(420.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from("Choose destination")),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(440.), px(300.))),
+            ..WindowOptions::default()
+        };
+        let mut dialog = None;
+        cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ContextDestinationDialog::new(choices, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .expect("Musheen could not open a context destination dialog");
+        let dialog = dialog.expect("the destination dialog constructs its view");
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
+            ContextDestinationEvent::Chosen(destination) => {
+                this.resolve_context_destination(destination.clone(), cx);
+            }
+            ContextDestinationEvent::Cancelled => this.cancel_context_destination(cx),
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    fn open_context_review(&mut self, cx: &mut Context<Self>) {
+        let Some(MenuInvocation::NeedsConfirmation(pending)) = self.pending_context_review.as_ref()
+        else {
+            return;
+        };
+        let command = pending.command_id().to_owned();
+        let targets = pending
+            .selection()
+            .iter()
+            .map(|target| {
+                DisplayPath::from_store_path(target.path())
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(580.), px(360.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from("Review operation")),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(480.), px(280.))),
+            ..WindowOptions::default()
+        };
+        let mut dialog = None;
+        cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ContextReviewDialog::new(command, targets, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .expect("Musheen could not open a context review dialog");
+        let dialog = dialog.expect("the context review dialog constructs its view");
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
+            ContextReviewEvent::Confirmed => this.confirm_context_review(cx),
+            ContextReviewEvent::Cancelled => {
+                this.pending_context_review = None;
+                this.pending_content_focus = true;
+                cx.notify();
+            }
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    fn confirm_context_review(&mut self, cx: &mut Context<Self>) {
+        let Some(invocation) = self.pending_context_review.take() else {
+            return;
+        };
+        self.pending_content_focus = true;
+        let surface = self.shell.context_menus().clone();
+        let mut dispatcher = AppMenuDispatcher::default();
+        match surface.confirm(invocation, &mut dispatcher) {
+            Ok(()) => {
+                if let Some((action, parameters)) = dispatcher.dispatched {
+                    self.dispatch_typed_context_command(action, parameters, cx);
+                }
+            }
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn dispatch_typed_context_command(
+        &mut self,
+        action: CommandAction,
+        parameters: CommandParameters,
+        cx: &mut Context<Self>,
+    ) {
+        match (&action, &parameters) {
+            (
+                CommandAction::CopyTo | CommandAction::MoveTo,
+                CommandParameters::Destination {
+                    targets,
+                    destination,
+                },
+            ) => {
+                let drop_action = if action == CommandAction::CopyTo {
+                    DropAction::Copy
+                } else {
+                    DropAction::Move
+                };
+                match FileDragPayload::new(
+                    targets.iter().map(|target| target.path().clone()).collect(),
+                    drop_action,
+                ) {
+                    Ok(payload) => self.submit_file_drop(payload, destination.clone(), cx),
+                    Err(error) => {
+                        self.operation_error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                }
+            }
+            (
+                CommandAction::OpenProperties | CommandAction::Permissions,
+                CommandParameters::Targets(_),
+            )
+            | (CommandAction::SelectAll, CommandParameters::None)
+            | (
+                CommandAction::ViewDetails
+                | CommandAction::ViewList
+                | CommandAction::ViewCards
+                | CommandAction::ViewGrid
+                | CommandAction::ViewColumns
+                | CommandAction::ViewAdaptive
+                | CommandAction::CycleSort
+                | CommandAction::CycleGroup
+                | CommandAction::ToggleDirectoriesFirst
+                | CommandAction::ToggleHidden
+                | CommandAction::ToggleSidebar
+                | CommandAction::ToggleInfo,
+                CommandParameters::None,
+            ) => self.dispatch_action(action, cx),
+            _ => {
+                self.operation_error = Some(
+                    "The context command parameters cannot be handled by this desktop backend"
+                        .into(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    fn context_command_is_routable(command_id: &str) -> bool {
+        matches!(
+            command_id,
+            "selection.select_all"
+                | "view.details"
+                | "view.list"
+                | "view.cards"
+                | "view.grid"
+                | "view.columns"
+                | "view.adaptive"
+                | "view.sort"
+                | "view.group"
+                | "view.directories_first"
+                | "view.hidden"
+                | "view.sidebar"
+                | "view.info"
+                | "item.properties"
+                | "item.permissions"
+                | "directory.properties"
+                | "clipboard.copy_to"
+                | "clipboard.move_to"
+        )
+    }
+
+    fn context_unavailable_reason(command_id: &str) -> String {
+        match command_id {
+            "archive.extract" | "archive.extract_here" => {
+                "Archive extraction is unavailable because no archive operation provider is installed"
+                    .to_owned()
+            }
+            "file.open_as_administrator" | "file.run_as_administrator" => {
+                "Privilege elevation is unavailable because no authorization broker is installed"
+                    .to_owned()
+            }
+            "file.open_with" | "file.choose_application" | "file.set_default_application" => {
+                "Desktop application association is unavailable because no association backend is installed"
+                    .to_owned()
+            }
+            _ => "This command is not available in the current desktop backend".to_owned(),
+        }
     }
 
     fn drag_payload(&self, spec: &ItemRenderSpec) -> Option<FileDragPayload> {
@@ -2142,7 +2931,10 @@ impl MusheenApp {
     }
 
     fn handle_escape(&mut self, cx: &mut Context<Self>) {
-        if self.omnibar.mode() != OmnibarMode::Path {
+        if self.keyboard_context_popup.take().is_some() {
+            self.pending_content_focus = true;
+            cx.notify();
+        } else if self.omnibar.mode() != OmnibarMode::Path {
             self.cancel_omnibar(cx);
         } else if !self.focused_directory().view().selected_ids().is_empty() {
             self.dispatch_selection_action(CommandAction::ClearSelection, cx);
@@ -2666,6 +3458,8 @@ impl MusheenApp {
             colors.sidebar_border
         };
         let current = self.focused_directory().location().cloned();
+        let context_menu_host = cx.entity().downgrade();
+        let sidebar_tab = self.navigation.focused_tab().id();
         let sections =
             self.sidebars
                 .get(&self.navigation.focused_tab().id())
@@ -2686,6 +3480,7 @@ impl MusheenApp {
                                     let navigation_location = location.clone();
                                     let can_drop_location = location.clone();
                                     let drop_location = location.clone();
+                                    let context_location = location.clone();
                                     let operation_hub = self.operation_hub.clone();
                                     let selected = current.as_ref() == Some(&location);
                                     let label = entry.label().to_owned();
@@ -2724,6 +3519,16 @@ impl MusheenApp {
                                                 );
                                             },
                                         ))
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(move |this, _, _, _| {
+                                                this.pending_context_menu =
+                                                    Some(this.sidebar_location_context_menu(
+                                                        sidebar_tab,
+                                                        context_location.clone(),
+                                                    ));
+                                            }),
+                                        )
                                         .child(
                                             Button::new(SharedString::from(format!(
                                                 "sidebar-{section_index}-{entry_index}"
@@ -2791,6 +3596,26 @@ impl MusheenApp {
             .border_r_1()
             .border_color(boundary)
             .children(sections)
+            .context_menu(move |popup, window, popup_cx| {
+                let Some(menu) = context_menu_host
+                    .update(popup_cx, |this, _| {
+                        this.pending_context_menu
+                            .take()
+                            .unwrap_or_else(|| this.sidebar_context_menu(sidebar_tab))
+                    })
+                    .ok()
+                else {
+                    return popup;
+                };
+                Self::populate_context_popup(
+                    popup,
+                    menu,
+                    context_menu_host.clone(),
+                    format!("sidebar-{sidebar_tab:?}"),
+                    window,
+                    popup_cx,
+                )
+            })
     }
 
     fn toggle_sidebar_section(&mut self, kind: SidebarSectionKind, cx: &mut Context<Self>) {
@@ -2879,7 +3704,8 @@ impl MusheenApp {
         } else {
             SharedString::from(format!("directory-content-{}", spec.pane_index))
         };
-
+        let context_menu_host = cx.entity().downgrade();
+        let tab_id = spec.tab_id;
         div()
             .id(content_id)
             .test_support()
@@ -2899,6 +3725,38 @@ impl MusheenApp {
             .focus(|style| style.border_color(colors.ring))
             .bg(colors.background)
             .child(body)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, _| {
+                    if this.pending_context_menu.is_none() {
+                        this.pending_context_menu = Some(this.compose_context_menu(
+                            tab_id,
+                            MenuTarget::Background,
+                            Vec::new(),
+                        ));
+                    }
+                }),
+            )
+            .context_menu(move |popup, window, popup_cx| {
+                let Some(menu) = context_menu_host
+                    .update(popup_cx, |this, _| {
+                        this.pending_context_menu.take().unwrap_or_else(|| {
+                            this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new())
+                        })
+                    })
+                    .ok()
+                else {
+                    return popup;
+                };
+                Self::populate_context_popup(
+                    popup,
+                    menu,
+                    context_menu_host.clone(),
+                    format!("pane-{tab_id:?}"),
+                    window,
+                    popup_cx,
+                )
+            })
             .into_any_element()
     }
 
@@ -4087,6 +4945,7 @@ impl MusheenApp {
             SharedString::from(format!("directory-item-{}-{}", spec.pane_index, spec.index));
         let tab_id = spec.tab_id;
         let stable_id = spec.id.clone();
+        let context_menu_id = spec.id.clone();
         let drag_payload = self.drag_payload(&spec);
         let is_drop_target = spec.kind == ItemKind::Directory;
         let drop_target = spec.path.clone();
@@ -4211,6 +5070,13 @@ impl MusheenApp {
         item.on_click(cx.listener(move |this, _, _, cx| {
             this.select_item(tab_id, stable_id.clone(), cx);
         }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, _, _, cx| {
+                this.pending_context_menu =
+                    Some(this.item_context_menu(tab_id, context_menu_id.clone(), cx));
+            }),
+        )
         .when_some(drag_payload, |item, payload| {
             item.cursor_move()
                 .on_drag(payload, |payload, position, _, cx| {
@@ -4700,6 +5566,11 @@ impl Render for MusheenApp {
             .on_action(cx.listener(|this, _: &OpenPropertiesShortcut, _, cx| {
                 this.dispatch_command("item.properties", cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &OpenContextMenuShortcut, window, cx| {
+                    this.open_keyboard_context_menu(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &Escape, _, cx| {
                 this.handle_escape(cx);
             }))
@@ -4734,6 +5605,17 @@ impl Render for MusheenApp {
             )
             .when(self.status_center_open, |shell| {
                 shell.child(self.render_operation_status_center(cx))
+            })
+            .when_some(self.keyboard_context_popup.clone(), |shell, popup| {
+                shell.child(
+                    div()
+                        .id("keyboard-context-menu")
+                        .test_support()
+                        .absolute()
+                        .top(px(72.))
+                        .right(px(16.))
+                        .child(popup),
+                )
             })
             .child(
                 div()
@@ -5106,6 +5988,63 @@ mod tests {
     }
 
     #[test]
+    fn context_transfer_preflight_uses_the_operation_queue_for_copy_move_and_refusal() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let source = temporary.path().join("source.txt");
+        let destination = temporary.path().join("destination");
+        filesystem::write(&source, b"source").expect("source writes");
+        filesystem::create_dir(&destination).expect("destination creates");
+        let source = StorePath::from_unix_path(source.into_os_string());
+        let destination = StorePath::from_unix_path(destination.into_os_string());
+        let hub = OperationHub::new(&ResourceLimits::default());
+
+        for action in [DropAction::Copy, DropAction::Move] {
+            let payload = FileDragPayload::new(vec![source.clone()], action)
+                .expect("one source is a valid transfer payload");
+            let resolver = ContextTransferDestinationResolver {
+                operation_hub: &hub,
+                payload: &payload,
+            };
+            assert!(
+                resolver
+                    .resolve_context_menu_destination(&destination)
+                    .is_writable
+            );
+        }
+
+        let payload = FileDragPayload::new(vec![source], DropAction::Copy)
+            .expect("one source is a valid transfer payload");
+        let resolver = ContextTransferDestinationResolver {
+            operation_hub: &hub,
+            payload: &payload,
+        };
+        let refusal = resolver.resolve_context_menu_destination(&StorePath::from_unix_path(
+            temporary.path().join("missing").into_os_string(),
+        ));
+        assert!(!refusal.is_writable);
+        assert_eq!(
+            refusal.refusal_reason.as_deref(),
+            Some("the destination provider refused this operation")
+        );
+    }
+
+    #[test]
+    fn unavailable_context_actions_name_the_missing_production_capability() {
+        assert!(
+            MusheenApp::context_unavailable_reason("archive.extract")
+                .contains("archive operation provider")
+        );
+        assert!(
+            MusheenApp::context_unavailable_reason("file.open_as_administrator")
+                .contains("authorization broker")
+        );
+        assert!(
+            MusheenApp::context_unavailable_reason("file.open_with")
+                .contains("association backend")
+        );
+    }
+
+    #[test]
     fn session_restore_falls_back_to_the_last_valid_document() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let store = SessionStore::at(temporary.path().join("session.json"));
@@ -5458,6 +6397,39 @@ mod tests {
             assert!(window.find("info-pane").visible());
             window.click("view.info", cx);
             assert!(window.try_find("info-pane").is_none());
+        })
+        .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn keyboard_context_menu_uses_the_focused_pane_target(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("shift-f10", cx);
+            window.render_frame(cx);
+            assert!(window.find("keyboard-context-menu").visible());
+            assert!(window.find("popup-menu").visible());
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("keyboard-context-menu").is_none());
+            assert_eq!(window.find("directory-content").focused(), Some(true));
         })
         .expect("test window remains open");
     }

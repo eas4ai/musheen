@@ -1,12 +1,13 @@
 use musheen_core::{
     CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, CommandAction,
     CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters, CommandRegistry,
-    CommandTarget, CommandTargetRef, ItemId, ProviderActionMatrix, ProviderId, StorePath,
+    CommandTarget, CommandTargetRef, ItemId, OpenWithIntent, ProviderActionMatrix, ProviderId,
+    StorePath,
 };
 use musheen_ui::{
-    AppearanceMode, ContextMenuRequest, ContextMenuSource, ContextMenuSurface, MenuDirection,
-    MenuEntryKind, MenuFocus, MenuInvocation, MenuKeyRoute, MenuPresentation, MenuTarget,
-    OpenWithApplication, SendToDestination, ShellModel, ThemeProfile,
+    AppearanceMode, ContextMenuDestinationResolver, ContextMenuRequest, ContextMenuSource,
+    ContextMenuSurface, MenuDirection, MenuEntryKind, MenuFocus, MenuInvocation, MenuKeyRoute,
+    MenuPresentation, MenuTarget, OpenWithApplication, SendToDestination, ShellModel, ThemeProfile,
 };
 
 fn path(value: &str) -> StorePath {
@@ -137,8 +138,8 @@ fn right_click_and_keyboard_target_the_current_pane_without_stale_selection() {
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
     let selected = target(b"selected", "/left/selected");
     let clicked = target(b"clicked", "/left/clicked");
-    let result = surface.prepare_pointer_target(&[selected.clone()], &clicked);
-    assert_eq!(result.selection(), &[clicked.clone()]);
+    let result = surface.prepare_pointer_target(std::slice::from_ref(&selected), &clicked);
+    assert_eq!(result.selection(), std::slice::from_ref(&clicked));
 
     let preserved = surface.prepare_pointer_target(&[selected.clone(), clicked.clone()], &clicked);
     assert_eq!(preserved.selection(), &[selected, clicked]);
@@ -228,6 +229,56 @@ fn open_with_and_send_to_keep_one_time_association_and_copy_only_destinations_se
 }
 
 #[test]
+fn open_with_rows_dispatch_validated_application_identity_and_default_intent() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let apps = [
+        OpenWithApplication::compatible("Editor", "org.example.Editor"),
+        OpenWithApplication::compatible("Viewer", "org.example.Viewer"),
+    ];
+    let menu = surface.compose(
+        request(
+            supported_context(CommandTarget::File, 1),
+            MenuTarget::Item,
+            vec![target(b"open-with", "/work/document.txt")],
+        )
+        .with_open_with(&apps),
+    );
+    let open_with = menu.entry("file.open_with").unwrap().submenu().unwrap();
+    let defaults = open_with
+        .entry("file.set_default_application")
+        .unwrap()
+        .submenu()
+        .expect("set default is an application chooser");
+    let mut dispatcher = RecordingDispatcher::default();
+
+    assert!(
+        surface
+            .invoke(
+                open_with.application("org.example.Editor").unwrap(),
+                &mut dispatcher
+            )
+            .is_dispatched()
+    );
+    let set_default = surface.invoke(
+        defaults.application("org.example.Viewer").unwrap(),
+        &mut dispatcher,
+    );
+    assert!(set_default.needs_confirmation());
+    surface.confirm(set_default, &mut dispatcher).unwrap();
+
+    assert!(matches!(
+        &dispatcher.calls[0].1,
+        CommandParameters::OpenWith { application, intent: OpenWithIntent::OpenOnce, .. }
+            if application.as_str() == "org.example.Editor"
+    ));
+    assert!(matches!(
+        &dispatcher.calls[1].1,
+        CommandParameters::OpenWith { application, intent: OpenWithIntent::SetAsDefault, .. }
+            if application.as_str() == "org.example.Viewer"
+    ));
+}
+
+#[test]
 fn invocation_preserves_command_id_contracts_and_confirmation_routes() {
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
     let request = request(
@@ -294,7 +345,12 @@ fn chooser_resolution_rechecks_destination_policy_and_cancellation_never_dispatc
     };
     assert!(
         surface
-            .resolve_destination(pending, path("/read-only"), false, &mut dispatcher)
+            .resolve_destination(
+                pending,
+                path("/read-only"),
+                &DestinationResolver { writable: false },
+                &mut dispatcher,
+            )
             .is_rejected()
     );
     assert!(dispatcher.calls.is_empty());
@@ -306,7 +362,12 @@ fn chooser_resolution_rechecks_destination_policy_and_cancellation_never_dispatc
     };
     assert!(
         surface
-            .resolve_destination(pending, path("/copy-target"), true, &mut dispatcher)
+            .resolve_destination(
+                pending,
+                path("/copy-target"),
+                &DestinationResolver { writable: true },
+                &mut dispatcher,
+            )
             .is_dispatched()
     );
     assert_eq!(dispatcher.calls[0].0, CommandAction::CopyTo);
@@ -347,6 +408,114 @@ fn sidebar_mount_tag_and_trash_background_project_their_exact_target_sets() {
         ));
         assert!(menu.entry(expected).is_some(), "{target_kind:?}");
     }
+}
+
+#[test]
+fn context_menu_shape_rules_keep_file_and_directory_actions_exact() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let file = surface.compose(request(
+        supported_context(CommandTarget::File, 1),
+        MenuTarget::Item,
+        vec![target(b"file", "/work/file")],
+    ));
+    assert!(file.entry("clipboard.paste_into").is_none());
+    assert!(file.entry("file.unhide").is_none());
+
+    let directory = surface.compose(request(
+        supported_context(CommandTarget::Directory, 1),
+        MenuTarget::Item,
+        vec![target(b"directory", "/work/directory")],
+    ));
+    assert!(directory.entry("clipboard.paste_into").is_some());
+    assert!(directory.entry("file.create_hard_link").is_none());
+    assert!(directory.entry("file.hide").is_some());
+
+    let mut hidden = supported_context(CommandTarget::File, 1);
+    hidden.target_is_hidden = true;
+    let hidden = surface.compose(request(
+        hidden,
+        MenuTarget::Item,
+        vec![target(b"hidden", "/work/.hidden")],
+    ));
+    assert!(hidden.entry("file.hide").is_none());
+    assert!(hidden.entry("file.unhide").is_some());
+
+    let mount = surface.compose(request(
+        supported_context(CommandTarget::Mount, 1),
+        MenuTarget::Mount,
+        vec![target(b"mount", "/mnt/drive")],
+    ));
+    assert!(
+        mount
+            .entry("directory.properties")
+            .unwrap()
+            .state()
+            .is_enabled()
+    );
+}
+
+#[test]
+fn selected_directory_location_actions_use_the_directory_not_its_view() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let menu = surface.compose(request(
+        supported_context(CommandTarget::Directory, 1),
+        MenuTarget::Item,
+        vec![target(b"directory", "/work/selected")],
+    ));
+    let mut dispatcher = RecordingDispatcher::default();
+    assert!(
+        surface
+            .invoke(
+                menu.entry("directory.open_terminal").unwrap(),
+                &mut dispatcher
+            )
+            .is_dispatched()
+    );
+    assert!(matches!(
+        &dispatcher.calls[0].1,
+        CommandParameters::Location(location) if location == &path("/work/selected")
+    ));
+}
+
+#[test]
+fn compatible_open_with_overflow_retains_remaining_apps_as_a_keyboard_submenu() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let apps = (0..=musheen_ui::MAX_VARIABLE_CONTRIBUTIONS)
+        .map(|index| {
+            OpenWithApplication::compatible(
+                format!("Editor {index}"),
+                format!("org.example.Editor{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let menu = surface.compose(
+        request(
+            supported_context(CommandTarget::File, 1),
+            MenuTarget::Item,
+            vec![target(b"overflow", "/work/document")],
+        )
+        .with_open_with(&apps),
+    );
+    let submenu = menu.entry("file.open_with").unwrap().submenu().unwrap();
+    let more = submenu
+        .entries()
+        .iter()
+        .find(|entry| entry.label().contains("More"))
+        .expect("remaining compatible applications are reachable");
+    assert_eq!(more.kind(), MenuEntryKind::Submenu);
+    assert!(
+        more.submenu()
+            .unwrap()
+            .application("org.example.Editor8")
+            .is_some()
+    );
+    assert!(
+        submenu
+            .accessibility_tree()
+            .iter()
+            .any(|node| node.name().contains("More")
+                && matches!(node.role(), musheen_ui::MenuAccessibleRole::Submenu))
+    );
 }
 
 #[test]
@@ -403,6 +572,26 @@ fn shell_owns_the_context_menu_surface_used_by_the_application() {
 #[derive(Default)]
 struct RecordingDispatcher {
     calls: Vec<(CommandAction, CommandParameters)>,
+}
+
+struct DestinationResolver {
+    writable: bool,
+}
+
+impl ContextMenuDestinationResolver for DestinationResolver {
+    fn resolve_context_menu_destination(
+        &self,
+        destination: &StorePath,
+    ) -> musheen_core::ResolvedDestination {
+        if self.writable {
+            musheen_core::ResolvedDestination::writable(destination.clone())
+        } else {
+            musheen_core::ResolvedDestination::read_only(
+                destination.clone(),
+                "the destination is read-only",
+            )
+        }
+    }
 }
 
 impl CommandDispatcher for RecordingDispatcher {

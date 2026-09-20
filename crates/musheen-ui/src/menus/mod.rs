@@ -20,7 +20,7 @@ pub use send_to::{SendToDestination, SendToDestinationKind};
 use builder::InvocationData;
 use musheen_core::{
     CommandDispatchError, CommandDispatcher, CommandParameterContract, CommandParameters,
-    CommandRegistry, DangerLevel, StorePath,
+    CommandRegistry, DangerLevel, ResolvedDestination, StorePath,
 };
 use std::error::Error;
 use std::fmt;
@@ -58,6 +58,13 @@ pub struct ContextMenuSurface {
     registry: CommandRegistry,
     locale: crate::Locale,
     theme: crate::ThemeProfile,
+}
+
+/// Production boundary for destination capability lookup. Menu callers never
+/// decide writability: the provider/operation layer resolves the concrete
+/// destination identity and refusal reason immediately before dispatch.
+pub trait ContextMenuDestinationResolver {
+    fn resolve_context_menu_destination(&self, destination: &StorePath) -> ResolvedDestination;
 }
 
 impl ContextMenuSurface {
@@ -135,7 +142,7 @@ impl ContextMenuSurface {
         ) {
             return MenuInvocation::NeedsDestinationChooser(PendingInvocation::from(data));
         }
-        let pending = match pending_with_parameters(data.clone()) {
+        let pending = match pending_with_parameters(data.clone(), entry.application()) {
             Ok(pending) => pending,
             Err(error) => return MenuInvocation::Rejected(error),
         };
@@ -155,7 +162,7 @@ impl ContextMenuSurface {
         &self,
         pending: PendingInvocation,
         destination: StorePath,
-        writable: bool,
+        resolver: &dyn ContextMenuDestinationResolver,
         dispatcher: &mut dyn CommandDispatcher,
     ) -> MenuInvocation {
         let Some(command) = self.registry.get(pending.id.as_str()) else {
@@ -164,14 +171,8 @@ impl ContextMenuSurface {
             ));
         };
         let mut context = pending.context.clone();
-        context.resolved_destination = Some(if writable {
-            musheen_core::ResolvedDestination::writable(destination.clone())
-        } else {
-            musheen_core::ResolvedDestination::read_only(
-                destination.clone(),
-                "the destination is read-only",
-            )
-        });
+        context.resolved_destination =
+            Some(resolver.resolve_context_menu_destination(&destination));
         let state = command.state(&context);
         if !state.is_enabled() {
             return MenuInvocation::Rejected(MenuInvocationError::Disabled(
@@ -239,6 +240,18 @@ pub struct PendingInvocation {
     parameters: CommandParameters,
 }
 
+impl PendingInvocation {
+    #[must_use]
+    pub fn command_id(&self) -> &str {
+        self.id.as_str()
+    }
+
+    #[must_use]
+    pub fn selection(&self) -> &[musheen_core::CommandTargetRef] {
+        &self.selection
+    }
+}
+
 impl From<&InvocationData> for PendingInvocation {
     fn from(value: &InvocationData) -> Self {
         Self {
@@ -250,7 +263,10 @@ impl From<&InvocationData> for PendingInvocation {
     }
 }
 
-fn pending_with_parameters(data: InvocationData) -> Result<PendingInvocation, MenuInvocationError> {
+fn pending_with_parameters(
+    data: InvocationData,
+    application: Option<&OpenWithApplication>,
+) -> Result<PendingInvocation, MenuInvocationError> {
     let parameters = match data.action.parameter_contract() {
         CommandParameterContract::None => CommandParameters::None,
         CommandParameterContract::Location => CommandParameters::Location(data.location.clone()),
@@ -268,6 +284,21 @@ fn pending_with_parameters(data: InvocationData) -> Result<PendingInvocation, Me
             targets: data.selection.clone(),
             supports_provider_uris: data.context.supports_provider_uris,
         },
+        CommandParameterContract::OpenWith(_) => {
+            let application = application.ok_or(MenuInvocationError::ApplicationRequired)?;
+            let application = musheen_core::DesktopApplicationId::new(application.desktop_id())
+                .map_err(|_| {
+                    MenuInvocationError::InvalidApplication(application.desktop_id().into())
+                })?;
+            let intent = match data.action {
+                musheen_core::CommandAction::OpenWith => musheen_core::OpenWithIntent::OpenOnce,
+                musheen_core::CommandAction::SetDefaultApplication => {
+                    musheen_core::OpenWithIntent::SetAsDefault
+                }
+                _ => return Err(MenuInvocationError::ApplicationRequired),
+            };
+            CommandParameters::open_with(data.selection.clone(), application, intent)
+        }
     };
     Ok(PendingInvocation {
         id: data.id,
@@ -314,6 +345,8 @@ pub enum MenuInvocationError {
     NotInvokable,
     Disabled(Box<str>),
     DestinationRequired,
+    ApplicationRequired,
+    InvalidApplication(Box<str>),
     ConfirmationRequired,
     MissingCommand(Box<str>),
     Dispatch(CommandDispatchError),
@@ -325,6 +358,8 @@ impl fmt::Display for MenuInvocationError {
             Self::NotInvokable => formatter.write_str("this menu row is not invokable"),
             Self::Disabled(reason) => formatter.write_str(reason),
             Self::DestinationRequired => formatter.write_str("choose a destination first"),
+            Self::ApplicationRequired => formatter.write_str("choose an application first"),
+            Self::InvalidApplication(id) => write!(formatter, "invalid application {id}"),
             Self::ConfirmationRequired => formatter.write_str("the command requires confirmation"),
             Self::MissingCommand(id) => write!(formatter, "missing command {id}"),
             Self::Dispatch(error) => error.fmt(formatter),
