@@ -1544,31 +1544,12 @@ impl MusheenApp {
         let Some(command) = self.shell.commands().get(command_id) else {
             return;
         };
-        if !command.state(&self.active_command_context()).is_enabled() {
+        let request = self.active_command_request(command.action());
+        if !command.state(request.context()).is_enabled() {
             return;
         }
         let action = command.action();
-        let tab_id = self.navigation.focused_tab().id();
-        let selection = self
-            .directories
-            .get(&tab_id)
-            .map(|directory| {
-                let view = directory.view();
-                view.selected_ids()
-                    .iter()
-                    .filter_map(|id| view.item(id))
-                    .filter_map(|item| {
-                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let target = if selection.is_empty() {
-            MenuTarget::Background
-        } else {
-            MenuTarget::Item
-        };
-        let menu = self.compose_context_menu(tab_id, target, selection);
+        let menu = self.compose_context_request(request);
         if let Some(entry) = Self::menu_entry_by_id(&menu, command_id) {
             // Toolbar and browser shortcuts invoke the very same registry
             // projection as a context row, including parameter construction,
@@ -2186,6 +2167,16 @@ impl MusheenApp {
             .tab(tab_id)
             .map(|tab| tab.location().clone())
             .unwrap_or_else(|| self.navigation.focused_tab().location().clone());
+        self.compose_context_menu_at(tab_id, target, location, selection)
+    }
+
+    fn context_menu_request(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        selection: Vec<CommandTargetRef>,
+    ) -> crate::ContextMenuRequest {
         let target = if target == MenuTarget::Background && is_trash_location(&location) {
             MenuTarget::TrashBackground
         } else {
@@ -2201,7 +2192,15 @@ impl MusheenApp {
         } else {
             selection
         };
-        self.compose_context_menu_at(tab_id, target, location, selection)
+        let context = self.context_for_menu(tab_id, target, &location, &selection);
+        let trash_contents = if target == MenuTarget::TrashBackground {
+            selection.clone()
+        } else {
+            Vec::new()
+        };
+        crate::ContextMenuRequest::new(context, target, location, selection)
+            .with_trash_contents(trash_contents)
+            .with_origin_tab(tab_id)
     }
 
     fn compose_context_menu_at(
@@ -2211,22 +2210,16 @@ impl MusheenApp {
         location: StorePath,
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
-        let context = self.context_for_menu(tab_id, target, &location, &selection);
-        let trash_contents = if target == MenuTarget::TrashBackground {
-            selection.clone()
-        } else {
-            Vec::new()
-        };
+        self.compose_context_request(self.context_menu_request(tab_id, target, location, selection))
+    }
+
+    fn compose_context_request(&self, request: crate::ContextMenuRequest) -> ContextMenu {
         self.shell
             .context_menus()
             .clone()
             .with_locale(self.catalog.locale())
             .with_theme_profile(self.context_menu_theme)
-            .compose(
-                crate::ContextMenuRequest::new(context, target, location, selection)
-                    .with_trash_contents(trash_contents)
-                    .with_origin_tab(tab_id),
-            )
+            .compose(request)
     }
 
     fn context_for_menu(
@@ -3906,7 +3899,7 @@ impl MusheenApp {
             .get(id)
             .expect("toolbar command is registered");
         let state = command
-            .state(&self.active_command_context())
+            .state(&self.active_command_context(command.action()))
             .map_disabled_reason(|reason| self.catalog.localize_reason(reason));
         let label = self
             .catalog
@@ -3947,8 +3940,29 @@ impl MusheenApp {
             }))
     }
 
-    fn active_command_context(&self) -> CommandContext {
+    fn active_command_context(&self, action: CommandAction) -> CommandContext {
+        self.active_command_request(action).context().clone()
+    }
+
+    fn active_command_request(&self, action: CommandAction) -> crate::ContextMenuRequest {
         let tab = self.navigation.focused_tab();
+        if is_trash_location(tab.location()) {
+            let target = if action == CommandAction::EmptyTrash || tab.selection().is_empty() {
+                MenuTarget::TrashBackground
+            } else {
+                MenuTarget::TrashItem
+            };
+            let selection = match self.trash_states.get(&tab.id()) {
+                Some(TrashState::Ready(surface)) => surface
+                    .items()
+                    .iter()
+                    .map(trash_command_target)
+                    .filter(|target| tab.selection().contains(target.id()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            return self.context_menu_request(tab.id(), target, tab.location().clone(), selection);
+        }
         let selection = self
             .directories
             .get(&tab.id())
@@ -3964,15 +3978,15 @@ impl MusheenApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        self.context_for_menu(
+        self.context_menu_request(
             tab.id(),
             if selection.is_empty() {
                 MenuTarget::Background
             } else {
                 MenuTarget::Item
             },
-            tab.location(),
-            &selection,
+            tab.location().clone(),
+            selection,
         )
     }
 
@@ -4254,7 +4268,8 @@ impl MusheenApp {
 
     fn render_view_overflow(&self, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
-        let context = self.active_command_context();
+        // Every view command uses the same selection context.
+        let context = self.active_command_context(CommandAction::ViewDetails);
         let items = [
             "view.details",
             "view.list",
@@ -7516,7 +7531,10 @@ mod tests {
                     .commands()
                     .get("app.settings")
                     .unwrap()
-                    .state(&app.read(cx).active_command_context())
+                    .state(
+                        &app.read(cx)
+                            .active_command_context(CommandAction::OpenSettings)
+                    )
                     .is_enabled()
             );
             window.click("app.settings", cx);
@@ -8535,6 +8553,161 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    async fn trash_toolbar_and_keyboard_commands_match_context_menu_receipts_and_state(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("ordinary.txt"), b"ordinary file").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let tab_id = state.navigation.focused_tab().id();
+            let ordinary = state.focused_directory().view().items()[0].id().clone();
+            state.select_item(tab_id, ordinary, cx);
+            state.navigation.navigate_focused(trash_store_path());
+            let items: Vec<_> = ["first", "second"]
+                .into_iter()
+                .map(|name| {
+                    TrashItem::new(
+                        musheen_ops::TrashReceipt::new(
+                            StorePath::from_unix_path(temporary.path().join(name)),
+                            name.as_bytes().to_vec(),
+                        ),
+                        1,
+                    )
+                })
+                .collect();
+            let targets: Vec<_> = items.iter().map(trash_command_target).collect();
+            for trash_state in [
+                TrashState::Loading,
+                TrashState::Error("unavailable".into()),
+                TrashState::Ready(TrashSurfaceModel::new(Vec::new())),
+                TrashState::Ready(TrashSurfaceModel::new(items)),
+            ] {
+                let available = matches!(
+                    &trash_state,
+                    TrashState::Ready(surface) if !surface.items().is_empty()
+                );
+                state.trash_states.insert(tab_id, trash_state);
+                for selected_count in 0..=2 {
+                    state.navigation.tab_mut(tab_id).unwrap().set_selection(
+                        targets[..selected_count]
+                            .iter()
+                            .map(|target| target.id().clone()),
+                    );
+                    for (action, id) in [
+                        (CommandAction::Restore, "trash.restore"),
+                        (CommandAction::EmptyTrash, "trash.empty"),
+                    ] {
+                        let request = state.active_command_request(action);
+                        let menu_target =
+                            if action == CommandAction::EmptyTrash || selected_count == 0 {
+                                MenuTarget::TrashBackground
+                            } else {
+                                MenuTarget::TrashItem
+                            };
+                        let selected = if available {
+                            targets[..selected_count].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        let menu = state.compose_context_menu(tab_id, menu_target, selected);
+                        let command_state = state
+                            .shell
+                            .commands()
+                            .get(id)
+                            .unwrap()
+                            .state(&state.active_command_context(action))
+                            .map_disabled_reason(|reason| state.catalog.localize_reason(reason));
+                        assert_eq!(
+                            command_state.is_enabled(),
+                            available
+                                && (action == CommandAction::EmptyTrash || selected_count == 1)
+                        );
+                        assert_eq!(request.target(), menu_target);
+                        if action == CommandAction::EmptyTrash {
+                            assert_eq!(request.context().target, CommandTarget::TrashBackground);
+                            assert_eq!(request.context().selection_count, 0);
+                        }
+                        if let Some(entry) = MusheenApp::menu_entry_by_id(&menu, id) {
+                            assert_eq!(
+                                &command_state,
+                                entry.state(),
+                                "{id}: {selected_count} selected"
+                            );
+                            assert_eq!(request.captured_targets(), entry.captured_targets());
+                            if command_state.is_enabled() {
+                                let shared_menu = state.compose_context_request(request);
+                                let shared_entry =
+                                    MusheenApp::menu_entry_by_id(&shared_menu, id).unwrap();
+                                let mut dispatcher = AppMenuDispatcher::default();
+                                let invocation = state
+                                    .shell
+                                    .context_menus()
+                                    .invoke(shared_entry, &mut dispatcher);
+                                if action == CommandAction::Restore {
+                                    assert!(matches!(invocation, MenuInvocation::Dispatched));
+                                    assert_eq!(
+                                        dispatcher.dispatched,
+                                        Some((
+                                            action,
+                                            CommandParameters::Targets(vec![targets[0].clone()])
+                                        ))
+                                    );
+                                } else {
+                                    assert!(matches!(
+                                        invocation,
+                                        MenuInvocation::NeedsConfirmation(pending)
+                                            if pending.selection() == targets
+                                    ));
+                                }
+                            }
+                        } else {
+                            assert!(!command_state.is_enabled());
+                        }
+                    }
+                }
+            }
+            state
+                .navigation
+                .tab_mut(tab_id)
+                .unwrap()
+                .set_selection(vec![targets[0].id().clone()]);
+            state.dispatch_command("trash.empty", cx);
+            assert!(matches!(
+                &state.pending_empty_trash,
+                Some(MenuInvocation::NeedsConfirmation(pending)) if pending.selection() == targets
+            ));
+            state.pending_empty_trash = None;
+            // The synthetic receipt cannot restore a real file. A backend error
+            // proves shared dispatch reached Restore rather than silently refusing it.
+            state.dispatch_command("trash.restore", cx);
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).operation_error.is_some()
+        })
+        .await;
+        app.update(cx, |state, _| {
+            assert_ne!(
+                state.operation_error.as_deref(),
+                Some(state.catalog.message("context.target-changed").unwrap())
+            );
+        });
+    }
+
+    #[gpui_kit::test]
     async fn trash_view_commands_are_disabled_by_the_live_registry(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8588,7 +8761,9 @@ mod tests {
                 ] {
                     let command = state.shell.commands().get(id).unwrap();
                     assert!(
-                        !command.state(&state.active_command_context()).is_enabled(),
+                        !command
+                            .state(&state.active_command_context(command.action()))
+                            .is_enabled(),
                         "{id}"
                     );
                     state.dispatch_command(id, cx);
