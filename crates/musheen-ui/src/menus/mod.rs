@@ -6,6 +6,7 @@
 mod builder;
 mod context;
 mod open_with;
+mod render;
 mod send_to;
 
 pub use builder::{
@@ -15,6 +16,7 @@ pub use builder::{
 };
 pub use context::{ContextMenuRequest, ContextMenuSource, MenuTarget, PreparedContextTarget};
 pub use open_with::OpenWithApplication;
+pub use render::ContextMenuRenderer;
 pub use send_to::{SendToDestination, SendToDestinationKind};
 
 use builder::InvocationData;

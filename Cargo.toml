@@ -16,6 +16,7 @@ members = [
     "crates/musheen-ui",
 ]
 resolver = "3"
+exclude = ["vendor/gpui-component", "vendor/gpui-pre", "vendor/native-theme-gpui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -68,4 +69,6 @@ musheen-ui = { path = "crates/musheen-ui" }
 workspace = true
 
 [patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
+gpui-pre = { path = "vendor/gpui-pre" }
 native-theme-gpui = { path = "vendor/native-theme-gpui" }

@@ -417,6 +417,7 @@ pub(crate) fn compose(
     request: ContextMenuRequest,
 ) -> ContextMenu {
     let catalog = Catalog::load(locale).expect("built-in menu locale is valid");
+    let direction = locale_direction(locale);
     let mut candidates = command_ids_for(effective_target(&request))
         .iter()
         .enumerate()
@@ -443,13 +444,14 @@ pub(crate) fn compose(
             &request,
             request.context(),
             theme,
+            direction,
         ));
     }
     ContextMenu {
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
-        direction: locale_direction(locale),
+        direction,
     }
 }
 
@@ -515,6 +517,15 @@ fn is_presentable(command: &CommandDefinition, request: &ContextMenuRequest) -> 
     if command.state(request.context()).is_enabled() {
         return true;
     }
+    // A desktop/backend refusal does not make an otherwise applicable action
+    // disappear. Keep its disabled row so the provider's explanation reaches
+    // the user instead of looking like Musheen has no Restore/Empty Trash
+    // action at all.
+    let mut without_backend_refusal = request.context().clone();
+    without_backend_refusal.backend_actions = None;
+    if command.state(&without_backend_refusal).is_enabled() {
+        return true;
+    }
     match command.predicate() {
         CommandPredicate::Capability(_)
         | CommandPredicate::WritableLocation
@@ -544,17 +555,22 @@ fn command_entry(
     request: &ContextMenuRequest,
     context: &CommandContext,
     theme: crate::ThemeProfile,
+    direction: MenuDirection,
 ) -> MenuEntry {
     let mut entry = plain_command_entry(command, catalog, request, context);
     match command.id().as_str() {
-        "file.open_with" => add_open_with_submenu(registry, catalog, request, &mut entry, theme),
-        "clipboard.send_to" => add_send_to_submenu(registry, catalog, request, &mut entry, theme),
-        "item.tags" => {
-            add_contribution_submenu(registry, catalog, request, &mut entry, true, theme)
+        "file.open_with" => {
+            add_open_with_submenu(registry, catalog, request, &mut entry, theme, direction)
         }
-        "actions.custom" => {
-            add_contribution_submenu(registry, catalog, request, &mut entry, false, theme)
+        "clipboard.send_to" => {
+            add_send_to_submenu(registry, catalog, request, &mut entry, theme, direction)
         }
+        "item.tags" => add_contribution_submenu(
+            registry, catalog, request, &mut entry, true, theme, direction,
+        ),
+        "actions.custom" => add_contribution_submenu(
+            registry, catalog, request, &mut entry, false, theme, direction,
+        ),
         _ => {}
     }
     entry
@@ -575,7 +591,9 @@ fn plain_command_entry(
         command_id: Some(command.id().clone()),
         label,
         icon_key: Some(command.icon_key().into()),
-        state: command.state(context),
+        state: command
+            .state(context)
+            .map_disabled_reason(|reason| catalog.localize_reason(reason)),
         shortcut: command
             .shortcuts()
             .first()
@@ -625,6 +643,7 @@ fn add_open_with_submenu(
     request: &ContextMenuRequest,
     entry: &mut MenuEntry,
     theme: crate::ThemeProfile,
+    direction: MenuDirection,
 ) {
     let Some(open_with) = registry.get("file.open_with") else {
         return;
@@ -645,7 +664,13 @@ fn add_open_with_submenu(
         .collect::<Vec<_>>();
     let overflow = app_entries.split_off(app_entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
     let mut entries = app_entries;
-    append_overflow_submenu(&mut entries, overflow, theme, menu_more_label(catalog));
+    append_overflow_submenu(
+        &mut entries,
+        overflow,
+        theme,
+        direction,
+        menu_more_label(catalog),
+    );
     if let Some(command) = registry.get("file.choose_application") {
         entries.push(command_entry(
             registry,
@@ -654,6 +679,7 @@ fn add_open_with_submenu(
             request,
             request.context(),
             theme,
+            direction,
         ));
     }
     if let Some(set_default) = registry.get("file.set_default_application") {
@@ -668,7 +694,13 @@ fn add_open_with_submenu(
             })
             .collect::<Vec<_>>();
         let overflow = defaults.split_off(defaults.len().min(MAX_VARIABLE_CONTRIBUTIONS));
-        append_overflow_submenu(&mut defaults, overflow, theme, menu_more_label(catalog));
+        append_overflow_submenu(
+            &mut defaults,
+            overflow,
+            theme,
+            direction,
+            menu_more_label(catalog),
+        );
         let mut default_entry =
             plain_command_entry(set_default, catalog, request, request.context());
         default_entry.kind = MenuEntryKind::Submenu;
@@ -676,7 +708,7 @@ fn add_open_with_submenu(
             entries: defaults,
             presentation: MenuPresentation::CompactNativeTheme,
             theme_tokens: MenuThemeTokens::from_profile(theme),
-            direction: MenuDirection::LeftToRight,
+            direction,
         }));
         entries.push(default_entry);
     }
@@ -685,7 +717,7 @@ fn add_open_with_submenu(
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
-        direction: MenuDirection::LeftToRight,
+        direction,
     }));
 }
 
@@ -695,6 +727,7 @@ fn add_send_to_submenu(
     request: &ContextMenuRequest,
     entry: &mut MenuEntry,
     theme: crate::ThemeProfile,
+    direction: MenuDirection,
 ) {
     let Some(send_to) = registry.get("clipboard.send_to") else {
         return;
@@ -719,7 +752,13 @@ fn add_send_to_submenu(
     let overflow =
         destination_entries.split_off(destination_entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
     let mut entries = destination_entries;
-    append_overflow_submenu(&mut entries, overflow, theme, menu_more_label(catalog));
+    append_overflow_submenu(
+        &mut entries,
+        overflow,
+        theme,
+        direction,
+        menu_more_label(catalog),
+    );
     if let Some(destination) = request
         .send_to
         .iter()
@@ -733,7 +772,7 @@ fn add_send_to_submenu(
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
-        direction: MenuDirection::LeftToRight,
+        direction,
     }));
 }
 
@@ -744,6 +783,7 @@ fn add_contribution_submenu(
     entry: &mut MenuEntry,
     tags: bool,
     theme: crate::ThemeProfile,
+    direction: MenuDirection,
 ) {
     let contributions = if tags {
         &request.tags
@@ -773,13 +813,19 @@ fn add_contribution_submenu(
         })
         .collect::<Vec<_>>();
     let overflow = entries.split_off(entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
-    append_overflow_submenu(&mut entries, overflow, theme, menu_more_label(catalog));
+    append_overflow_submenu(
+        &mut entries,
+        overflow,
+        theme,
+        direction,
+        menu_more_label(catalog),
+    );
     entry.kind = MenuEntryKind::Submenu;
     entry.submenu = Some(Box::new(ContextMenu {
         entries,
         presentation: MenuPresentation::CompactNativeTheme,
         theme_tokens: MenuThemeTokens::from_profile(theme),
-        direction: MenuDirection::LeftToRight,
+        direction,
     }));
 }
 
@@ -787,13 +833,14 @@ fn append_overflow_submenu(
     entries: &mut Vec<MenuEntry>,
     mut remaining: Vec<MenuEntry>,
     theme: crate::ThemeProfile,
+    direction: MenuDirection,
     more_label: &str,
 ) {
     if remaining.is_empty() {
         return;
     }
     let tail = remaining.split_off(remaining.len().min(MAX_VARIABLE_CONTRIBUTIONS));
-    append_overflow_submenu(&mut remaining, tail, theme, more_label);
+    append_overflow_submenu(&mut remaining, tail, theme, direction, more_label);
     entries.push(MenuEntry {
         kind: MenuEntryKind::Submenu,
         command_id: None,
@@ -810,7 +857,7 @@ fn append_overflow_submenu(
             entries: remaining,
             presentation: MenuPresentation::CompactNativeTheme,
             theme_tokens: MenuThemeTokens::from_profile(theme),
-            direction: MenuDirection::LeftToRight,
+            direction,
         })),
         application: None,
         destination: None,

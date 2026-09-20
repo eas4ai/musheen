@@ -181,6 +181,28 @@ fn disabled_provider_limits_remain_accessible_but_inapplicable_actions_are_absen
 }
 
 #[test]
+fn applicable_backend_actions_remain_visible_with_their_refusal_reason() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let context = CommandContext {
+        backend_actions: Some(vec![(
+            CommandAction::Restore,
+            CapabilityState::Unsupported(
+                CapabilityReason::new("the trash backend is unavailable").unwrap(),
+            ),
+        )]),
+        ..supported_context(CommandTarget::TrashItem, 1)
+    };
+    let menu = surface.compose(request(
+        context,
+        MenuTarget::TrashItem,
+        vec![target(b"trash-disabled", "/trash/document")],
+    ));
+    let restore = menu.entry("trash.restore").expect("applicable restore row");
+    assert!(!restore.state().is_enabled());
+    assert!(restore.accessible_disabled_reason().is_some());
+}
+
+#[test]
 fn open_with_and_send_to_keep_one_time_association_and_copy_only_destinations_separate() {
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
     let apps = [
@@ -341,6 +363,35 @@ fn rtl_locale_mirrors_directional_menu_chrome_but_not_path_direction() {
     let chrome = menu.direction(menu.locale_direction());
     assert_eq!(chrome.submenu_arrow(), "←");
     assert_eq!(chrome.path_direction(), MenuDirection::LeftToRight);
+}
+
+#[test]
+fn rtl_locale_propagates_into_nested_submenus() {
+    let menu = ContextMenuSurface::new(CommandRegistry::built_in())
+        .with_locale(Locale::Ar)
+        .compose(
+            request(
+                supported_context(CommandTarget::File, 1),
+                MenuTarget::Item,
+                vec![target(b"rtl-submenu", "/work/document")],
+            )
+            .with_open_with(&[OpenWithApplication::compatible(
+                "Editor",
+                "org.example.Editor",
+            )]),
+        );
+    let submenu = menu
+        .entry("file.open_with")
+        .expect("open-with row")
+        .submenu()
+        .expect("open-with submenu");
+    assert_eq!(submenu.locale_direction(), MenuDirection::RightToLeft);
+    assert_eq!(
+        submenu
+            .direction(submenu.locale_direction())
+            .submenu_arrow(),
+        "←"
+    );
 }
 
 #[test]

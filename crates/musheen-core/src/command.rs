@@ -991,6 +991,15 @@ impl CommandState {
     pub fn is_checked(&self) -> bool {
         self.checked
     }
+
+    /// A projection may translate the refusal without changing command policy.
+    #[must_use]
+    pub fn map_disabled_reason(mut self, translate: impl FnOnce(&str) -> String) -> Self {
+        if let Some(reason) = self.disabled_reason.as_ref() {
+            self.disabled_reason = Some(translate(reason).into());
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

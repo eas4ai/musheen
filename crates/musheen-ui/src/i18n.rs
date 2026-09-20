@@ -4,6 +4,7 @@ use std::fmt;
 
 const EN_US: &str = include_str!("../../../locales/en-US.ftl");
 const EN_XA: &str = include_str!("../../../locales/en-XA.ftl");
+const AR: &str = include_str!("../../../locales/ar.ftl");
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Locale {
@@ -63,10 +64,11 @@ impl Catalog {
             Locale::EnXa => EN_XA,
             Locale::Ar => EN_US,
         };
-        Ok(Self {
-            locale,
-            messages: parse_catalog(source)?,
-        })
+        let mut messages = parse_catalog(source)?;
+        if locale == Locale::Ar {
+            messages.extend(parse_catalog(AR)?);
+        }
+        Ok(Self { locale, messages })
     }
 
     pub fn system() -> Result<Self, CatalogError> {
@@ -89,6 +91,19 @@ impl Catalog {
     #[must_use]
     pub fn message_ids(&self) -> Vec<&str> {
         self.messages.keys().map(AsRef::as_ref).collect()
+    }
+
+    /// Translate owned domain refusals without changing provider error detail.
+    #[must_use]
+    pub fn localize_reason(&self, reason: &str) -> String {
+        static ENGLISH: std::sync::LazyLock<BTreeMap<Box<str>, Box<str>>> =
+            std::sync::LazyLock::new(|| parse_catalog(EN_US).expect("English catalog is valid"));
+        ENGLISH
+            .iter()
+            .find(|(_, value)| value.as_ref() == reason)
+            .and_then(|(id, _)| self.message(id).ok())
+            .unwrap_or(reason)
+            .to_owned()
     }
 }
 
@@ -166,6 +181,12 @@ mod tests {
             "dialog-review-operation",
             "dialog-continue",
             "dialog-authorization-unavailable",
+            "dialog-command",
+            "dialog-targets",
+            "dialog-move-review",
+            "dialog-operation-review",
+            "context-backend-unavailable",
+            "context-target-changed",
         ] {
             assert!(
                 catalog

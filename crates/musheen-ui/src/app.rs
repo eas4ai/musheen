@@ -24,10 +24,9 @@ use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
 };
 use crate::{
-    ContextMenu, ContextMenuDestinationResolver, MenuEntry, MenuEntryKind, MenuInvocation,
-    MenuTarget, PendingInvocation,
+    ContextMenu, ContextMenuDestinationResolver, MenuEntry, MenuInvocation, MenuTarget,
+    PendingInvocation,
 };
-use gpui_kit::accesskit::Toggled;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
@@ -345,6 +344,10 @@ struct ContextDialogStrings {
     review_operation: String,
     continue_action: String,
     authorization_unavailable: String,
+    command: String,
+    targets: String,
+    move_review: String,
+    operation_review: String,
 }
 
 impl ContextDialogStrings {
@@ -362,6 +365,10 @@ impl ContextDialogStrings {
             review_operation: message("dialog.review-operation"),
             continue_action: message("dialog.continue"),
             authorization_unavailable: message("dialog.authorization-unavailable"),
+            command: message("dialog.command"),
+            targets: message("dialog.targets"),
+            move_review: message("dialog.move-review"),
+            operation_review: message("dialog.operation-review"),
         }
     }
 }
@@ -414,7 +421,7 @@ impl Render for ContextDestinationDialog {
                     .w_full()
                     .on_click(cx.listener(move |_, _, window, cx| {
                         cx.emit(ContextDestinationEvent::Chosen(location.clone()));
-                        window.remove_window();
+                        window.defer(cx, |window, _| window.remove_window());
                     }))
             });
         div()
@@ -430,7 +437,7 @@ impl Render for ContextDestinationDialog {
             .p_4()
             .on_action(cx.listener(|_, _: &Escape, window, cx| {
                 cx.emit(ContextDestinationEvent::Cancelled);
-                window.remove_window();
+                window.defer(cx, |window, _| window.remove_window());
             }))
             .child(
                 div()
@@ -444,7 +451,7 @@ impl Render for ContextDestinationDialog {
                     .label(self.strings.cancel.clone())
                     .on_click(cx.listener(|_, _, window, cx| {
                         cx.emit(ContextDestinationEvent::Cancelled);
-                        window.remove_window();
+                        window.defer(cx, |window, _| window.remove_window());
                     })),
             )
     }
@@ -458,6 +465,7 @@ enum ContextReviewEvent {
 
 struct ContextReviewDialog {
     command: String,
+    move_operation: bool,
     targets: Vec<String>,
     strings: ContextDialogStrings,
     focus: FocusHandle,
@@ -469,12 +477,14 @@ impl EventEmitter<ContextReviewEvent> for ContextReviewDialog {}
 impl ContextReviewDialog {
     fn new(
         command: String,
+        move_operation: bool,
         targets: Vec<String>,
         strings: ContextDialogStrings,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             command,
+            move_operation,
             targets,
             strings,
             focus: cx.focus_handle(),
@@ -490,17 +500,17 @@ impl Render for ContextReviewDialog {
             self.pending_focus = false;
         }
         let command = self.command.clone();
-        let reversible = if command == "clipboard.move_to" {
-            "Move is routed through the operation history and conflict workflow."
+        let reversible = if self.move_operation {
+            self.strings.move_review.clone()
         } else {
-            "Review this operation before it is sent to the desktop backend."
+            self.strings.operation_review.clone()
         };
         div()
             .id("context-command-review")
             .test_support()
             .key_context("ContextReviewDialog")
             .role(Role::Dialog)
-            .aria_label(format!("Review {command}"))
+            .aria_label(self.strings.review_operation.clone())
             .track_focus(&self.focus)
             .flex()
             .flex_col()
@@ -508,12 +518,41 @@ impl Render for ContextReviewDialog {
             .p_4()
             .on_action(cx.listener(|_, _: &Escape, window, cx| {
                 cx.emit(ContextReviewEvent::Cancelled);
-                window.remove_window();
+                window.defer(cx, |window, _| window.remove_window());
             }))
             .child(div().text_lg().child(self.strings.review_operation.clone()))
-            .child(format!("Command: {command}"))
-            .child(format!("Targets: {}", self.targets.join(", ")))
-            .child(reversible)
+            .child(
+                div()
+                    .id("context-review-command")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(format!("{}: {command}", self.strings.command))
+                    .child(format!("{}: {command}", self.strings.command)),
+            )
+            .child(
+                div()
+                    .id("context-review-targets")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(format!(
+                        "{}: {}",
+                        self.strings.targets,
+                        self.targets.join(", ")
+                    ))
+                    .child(format!(
+                        "{}: {}",
+                        self.strings.targets,
+                        self.targets.join(", ")
+                    )),
+            )
+            .child(
+                div()
+                    .id("context-review-explanation")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(reversible.clone())
+                    .child(reversible),
+            )
             .child(self.strings.authorization_unavailable.clone())
             .child(
                 div()
@@ -524,7 +563,7 @@ impl Render for ContextReviewDialog {
                             .label(self.strings.cancel.clone())
                             .on_click(cx.listener(|_, _, window, cx| {
                                 cx.emit(ContextReviewEvent::Cancelled);
-                                window.remove_window();
+                                window.defer(cx, |window, _| window.remove_window());
                             })),
                     )
                     .child(
@@ -533,7 +572,7 @@ impl Render for ContextReviewDialog {
                             .primary()
                             .on_click(cx.listener(|_, _, window, cx| {
                                 cx.emit(ContextReviewEvent::Confirmed);
-                                window.remove_window();
+                                window.defer(cx, |window, _| window.remove_window());
                             })),
                     ),
             )
@@ -546,6 +585,7 @@ impl Render for ContextReviewDialog {
 struct ContextTransferDestinationResolver<'a> {
     operation_hub: &'a OperationHub,
     payload: &'a FileDragPayload,
+    catalog: &'a Catalog,
 }
 
 impl ContextMenuDestinationResolver for ContextTransferDestinationResolver<'_> {
@@ -561,7 +601,9 @@ impl ContextMenuDestinationResolver for ContextTransferDestinationResolver<'_> {
         } else {
             musheen_core::ResolvedDestination::read_only(
                 destination.clone(),
-                "the destination provider refused this operation",
+                self.catalog
+                    .message("context.destination-refused")
+                    .expect("destination refusal is localized"),
             )
         }
     }
@@ -916,6 +958,8 @@ struct MusheenApp {
     content_focus: FocusHandle,
     pending_content_focus: bool,
     pending_restored_focus: Option<FocusHandle>,
+    browser_focus: Option<FocusHandle>,
+    context_menu_focus: Option<FocusHandle>,
     session_binding: Option<SessionBinding>,
     session_save_generation: u64,
     watch_directories: bool,
@@ -923,11 +967,13 @@ struct MusheenApp {
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
     info_panes: HashMap<TabId, InfoPaneModel>,
     catalog: Catalog,
+    context_menu_theme: crate::ThemeProfile,
     operation_hub: OperationHub,
     operation_status_revision: u64,
     operation_error: Option<Box<str>>,
     status_center_open: bool,
     trash_states: HashMap<TabId, TrashState>,
+    trash_focus: HashMap<TabId, CommandTargetRef>,
     pending_empty_trash: Option<Vec<musheen_ops::TrashReceipt>>,
     pending_drop: Option<PendingDrop>,
     pending_context_menu: Option<ContextMenu>,
@@ -1044,6 +1090,8 @@ impl MusheenApp {
             content_focus: cx.focus_handle(),
             pending_content_focus: true,
             pending_restored_focus: None,
+            browser_focus: None,
+            context_menu_focus: None,
             session_binding,
             session_save_generation: 0,
             watch_directories,
@@ -1051,11 +1099,13 @@ impl MusheenApp {
             icon_cache: HashMap::new(),
             info_panes: HashMap::new(),
             catalog: Catalog::system().expect("the built-in locale catalogs are valid"),
+            context_menu_theme: crate::ThemeProfile::new(crate::AppearanceMode::Light, false),
             operation_hub,
             operation_status_revision,
             operation_error,
             status_center_open: false,
             trash_states: HashMap::new(),
+            trash_focus: HashMap::new(),
             pending_empty_trash: None,
             pending_drop: None,
             pending_context_menu: None,
@@ -1270,6 +1320,9 @@ impl MusheenApp {
     }
 
     fn navigate(&mut self, location: StorePath, remember: bool, cx: &mut Context<Self>) {
+        if self.browser_input_blocked() {
+            return;
+        }
         let tab_id = self.navigation.focused_tab().id();
         self.cancel_search(tab_id);
         self.info_panes.entry(tab_id).or_default().clear();
@@ -1366,6 +1419,9 @@ impl MusheenApp {
     }
 
     fn activate_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+        if self.browser_input_blocked() {
+            return;
+        }
         let previous = self.navigation.focused_tab().id();
         if self.navigation.focused_pane_mut().activate_tab(id).is_ok() {
             if previous != id {
@@ -1438,6 +1494,9 @@ impl MusheenApp {
         let Some(command) = self.shell.commands().get(command_id) else {
             return;
         };
+        if !command.state(&self.active_command_context()).is_enabled() {
+            return;
+        }
         let action = command.action();
         let tab_id = self.navigation.focused_tab().id();
         let selection = self
@@ -1606,8 +1665,15 @@ impl MusheenApp {
                 self.open_selected_properties_page(PropertiesPage::Permissions, cx);
             }
             action => {
-                self.operation_error =
-                    Some(format!("No desktop dispatcher is registered for {action:?}").into());
+                self.operation_error = Some(
+                    format!(
+                        "{}: {action:?}",
+                        self.catalog
+                            .message("context.dispatch-unavailable")
+                            .expect("dispatcher refusal is localized")
+                    )
+                    .into(),
+                );
                 cx.notify();
             }
         }
@@ -1879,6 +1945,9 @@ impl MusheenApp {
         if !self.context_dialog_windows.is_empty() {
             return;
         }
+        if id.is_none() {
+            self.trash_focus.remove(&tab_id);
+        }
         if let Some(directory) = self.directories.get_mut(&tab_id) {
             directory.view_mut().focus_item(id);
             cx.notify();
@@ -1890,6 +1959,29 @@ impl MusheenApp {
             return;
         }
         let tab_id = self.navigation.focused_tab().id();
+        if is_trash_location(self.navigation.focused_tab().location()) {
+            let Some(TrashState::Ready(surface)) = self.trash_states.get(&tab_id) else {
+                return;
+            };
+            let targets = surface
+                .items()
+                .iter()
+                .map(trash_command_target)
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                return;
+            }
+            let current = self
+                .trash_focus
+                .get(&tab_id)
+                .and_then(|focused| targets.iter().position(|target| target == focused));
+            let index = current
+                .map(|index| (index as isize + delta).clamp(0, targets.len() as isize - 1) as usize)
+                .unwrap_or_else(|| if delta < 0 { targets.len() - 1 } else { 0 });
+            self.trash_focus.insert(tab_id, targets[index].clone());
+            cx.notify();
+            return;
+        }
         let Some(directory) = self.directories.get_mut(&tab_id) else {
             return;
         };
@@ -1961,17 +2053,27 @@ impl MusheenApp {
         if !self.context_dialog_windows.is_empty() {
             return;
         }
+        self.remember_context_invocation_focus(window, cx);
         let tab_id = self.navigation.focused_tab().id();
-        let focused = self.directories.get(&tab_id).and_then(|directory| {
-            directory
-                .view()
-                .focused_item_id()
-                .and_then(|id| directory.view().item(id))
-                .and_then(|item| CommandTargetRef::new(item.id().clone(), item.path().clone()).ok())
-        });
+        let trash = is_trash_location(self.navigation.focused_tab().location());
+        let focused = if trash {
+            self.trash_focus.get(&tab_id).cloned()
+        } else {
+            self.directories.get(&tab_id).and_then(|directory| {
+                directory
+                    .view()
+                    .focused_item_id()
+                    .and_then(|id| directory.view().item(id))
+                    .and_then(|item| {
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                    })
+            })
+        };
         let prepared = self.shell.context_menus().prepare_keyboard_target(focused);
         let menu_target = if prepared.selection().is_empty() {
             MenuTarget::Background
+        } else if trash {
+            MenuTarget::TrashItem
         } else {
             MenuTarget::Item
         };
@@ -1993,7 +2095,9 @@ impl MusheenApp {
         });
         let subscription = cx.subscribe(&popup_for_focus, move |this, _, _: &DismissEvent, cx| {
             this.keyboard_context_popup = None;
-            this.pending_content_focus = true;
+            if !this.browser_input_blocked() {
+                this.pending_restored_focus = this.browser_focus.clone();
+            }
             cx.notify();
         });
         self.conflict_subscriptions.push(subscription);
@@ -2052,6 +2156,7 @@ impl MusheenApp {
             .context_menus()
             .clone()
             .with_locale(self.catalog.locale())
+            .with_theme_profile(self.context_menu_theme)
             .compose(
                 crate::ContextMenuRequest::new(context, target, location, selection)
                     .with_origin_tab(tab_id),
@@ -2125,20 +2230,38 @@ impl MusheenApp {
             .unwrap_or_else(|error| {
                 CapabilityState::Unknown(
                     CapabilityReason::new(format!(
-                        "the provider could not verify directory access: {error}"
+                        "{}: {error}",
+                        self.catalog
+                            .message("context.directory-verification")
+                            .expect("directory refusal is localized")
                     ))
                     .expect("the writable-location failure is visible"),
                 )
             });
         let writable = matches!(writable_state, CapabilityState::Supported);
-        let writable_reason = writable_state
-            .reason()
-            .unwrap_or("the provider did not report whether this location is writable");
+        let writable_reason = writable_state.reason().unwrap_or(
+            self.catalog
+                .message("context.write-unknown")
+                .expect("write refusal is localized"),
+        );
         let unsupported_provider_action = CapabilityState::Unsupported(
-            CapabilityReason::new("the active provider has no desktop action backend")
-                .expect("the provider-action reason is valid"),
+            CapabilityReason::new(
+                self.catalog
+                    .message("context.provider-unavailable")
+                    .expect("provider refusal is localized"),
+            )
+            .expect("the provider-action reason is valid"),
         );
         CommandContext {
+            can_go_back: self
+                .navigation
+                .tab(tab_id)
+                .is_some_and(|tab| tab.history().can_go_back()),
+            can_go_forward: self
+                .navigation
+                .tab(tab_id)
+                .is_some_and(|tab| tab.history().can_go_forward()),
+            has_parent: location.as_unix_path().and_then(Path::parent).is_some(),
             target: item_target,
             item_count,
             selection_count: selection.len(),
@@ -2190,7 +2313,7 @@ impl MusheenApp {
                 CommandAction::ALL
                     .iter()
                     .copied()
-                    .map(|action| (action, Self::backend_action_state(action)))
+                    .map(|action| (action, self.localized_backend_action_state(action)))
                     .collect(),
             ),
             ..CommandContext::default()
@@ -2198,131 +2321,29 @@ impl MusheenApp {
     }
 
     fn populate_context_popup(
-        mut popup: PopupMenu,
+        popup: PopupMenu,
         menu: ContextMenu,
         app: gpui_kit::WeakEntity<Self>,
         path: String,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        let chrome = menu.direction(menu.locale_direction());
-        let theme_tokens = menu.theme_tokens();
-        for (index, entry) in menu.entries().iter().cloned().enumerate() {
-            let row_path = format!("{path}-{index}");
-            match entry.kind() {
-                MenuEntryKind::Separator => popup = popup.separator(),
-                MenuEntryKind::Submenu => {
-                    // Only directional chrome mirrors. The entry's label
-                    // remains lossless text (including paths and names).
-                    let label = format!("{} {}", entry.label(), chrome.submenu_arrow());
-                    let disabled = !entry.state().is_enabled();
-                    let Some(submenu) = entry.submenu().cloned() else {
-                        continue;
-                    };
-                    let app = app.clone();
-                    let child_path = row_path.clone();
-                    let submenu = PopupMenu::build(window, cx, move |popup, window, cx| {
-                        Self::populate_context_popup(popup, submenu, app, child_path, window, cx)
-                    });
-                    popup = popup.item(PopupMenuItem::submenu(label, submenu).disabled(disabled));
-                }
-                MenuEntryKind::Command | MenuEntryKind::Overflow => {
-                    popup = popup.item(Self::context_popup_item(
-                        entry,
-                        app.clone(),
-                        row_path,
-                        theme_tokens,
-                    ));
-                }
-            }
-        }
-        popup
-    }
-
-    fn context_popup_item(
-        entry: MenuEntry,
-        app: gpui_kit::WeakEntity<Self>,
-        id: String,
-        theme_tokens: crate::MenuThemeTokens,
-    ) -> PopupMenuItem {
-        let label = entry.label().to_owned();
-        let icon_key = entry.icon_key().map(str::to_owned);
-        let icon = menu_icon(icon_key.as_deref());
-        let icon_id = format!("context-menu-icon-{id}");
-        let shortcut = entry.shortcut().map(str::to_owned);
-        let disabled_reason = entry.accessible_disabled_reason().map(str::to_owned);
-        let enabled = entry.state().is_enabled();
-        let checked = entry.state().is_checked();
-        let destructive = entry.danger_level() != musheen_core::DangerLevel::None;
-        let display_label = if checked {
-            format!("✓ {label}")
-        } else {
-            label.clone()
-        };
-        let role = match entry.accessible_role() {
-            crate::MenuAccessibleRole::Checkbox => Role::MenuItemCheckBox,
-            crate::MenuAccessibleRole::Radio => Role::MenuItemRadio,
-            crate::MenuAccessibleRole::MenuItem | crate::MenuAccessibleRole::Submenu => {
-                Role::MenuItem
-            }
-        };
-        PopupMenuItem::element(move |_, cx| {
-            let colors = cx.theme().colors;
-            div()
-                .id(SharedString::from(format!("context-menu-row-{id}")))
-                .test_support()
-                .role(role)
-                .aria_label(
-                    disabled_reason
-                        .as_ref()
-                        .map_or_else(|| label.clone(), |reason| format!("{label}: {reason}")),
-                )
-                .aria_toggled(if checked {
-                    Toggled::True
-                } else {
-                    Toggled::False
-                })
-                .w_full()
-                .flex()
-                .justify_between()
-                .gap_4()
-                .when(theme_tokens.strong_boundaries(), |row| {
-                    row.border_b_1().border_color(colors.border)
-                })
-                .when(destructive, |row| row.text_color(colors.danger))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .id(SharedString::from(icon_id.clone()))
-                                .test_support()
-                                .role(Role::Image)
-                                .aria_label(
-                                    icon_key
-                                        .clone()
-                                        .unwrap_or_else(|| "extension action".to_owned()),
-                                )
-                                .child(Icon::new(icon).small()),
-                        )
-                        .child(display_label.clone()),
-                )
-                .when_some(shortcut.clone(), |row, shortcut| {
-                    row.child(div().text_xs().child(shortcut))
-                })
-        })
-        .checked(checked)
-        .disabled(!enabled)
-        .on_click(move |_, _, cx| {
-            let _ = app.update(cx, |this, cx| {
-                this.dispatch_context_entry(entry.clone(), cx)
-            });
-        })
+        crate::menus::ContextMenuRenderer::populate(
+            popup,
+            menu,
+            path,
+            window,
+            cx,
+            move |entry, _, cx| {
+                let _ = app.update(cx, |this, cx| this.dispatch_context_entry(entry, cx));
+            },
+        )
     }
 
     fn dispatch_context_entry(&mut self, entry: MenuEntry, cx: &mut Context<Self>) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
         if entry.command_id().is_none() {
             return;
         }
@@ -2361,7 +2382,13 @@ impl MusheenApp {
             "clipboard.move_to" => DropAction::Move,
             unsupported => {
                 self.operation_error = Some(
-                    format!("The destination workflow for {unsupported} is unavailable").into(),
+                    format!(
+                        "{}: {unsupported}",
+                        self.catalog
+                            .message("context.workflow-unavailable")
+                            .expect("workflow refusal is localized")
+                    )
+                    .into(),
                 );
                 cx.notify();
                 return;
@@ -2383,6 +2410,7 @@ impl MusheenApp {
         let resolver = ContextTransferDestinationResolver {
             operation_hub: &self.operation_hub,
             payload: &payload,
+            catalog: &self.catalog,
         };
         let surface = self.shell.context_menus().clone();
         let mut dispatcher = AppMenuDispatcher::default();
@@ -2412,8 +2440,35 @@ impl MusheenApp {
     }
 
     fn cancel_context_destination(&mut self, cx: &mut Context<Self>) {
-        self.pending_content_focus = true;
         cx.notify();
+    }
+
+    fn browser_input_blocked(&self) -> bool {
+        !self.context_dialog_windows.is_empty()
+    }
+
+    fn activate_context_dialog(&self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.context_dialog_windows.last()
+            && let Some(handle) = cx
+                .windows()
+                .into_iter()
+                .find(|window| window.window_id() == dialog.id)
+        {
+            // The close observer may have been queued between the input and
+            // this update; in that case the browser is about to be unblocked.
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+        }
+    }
+
+    fn remember_browser_focus(&mut self, window: &Window, cx: &App) {
+        if !self.browser_input_blocked() {
+            self.browser_focus = window.focused(cx);
+        }
+    }
+
+    fn remember_context_invocation_focus(&mut self, window: &Window, cx: &App) {
+        self.remember_browser_focus(window, cx);
+        self.context_menu_focus = self.browser_focus.clone();
     }
 
     fn track_context_dialog_window(
@@ -2432,7 +2487,13 @@ impl MusheenApp {
             id: window_id,
             origin_tab,
             focused_item,
-            restore_focus: self.content_focus.clone(),
+            restore_focus: self
+                .context_dialog_windows
+                .first()
+                .map(|dialog| dialog.restore_focus.clone())
+                .or_else(|| self.context_menu_focus.take())
+                .or_else(|| self.browser_focus.clone())
+                .unwrap_or_else(|| self.content_focus.clone()),
         });
         if self.context_dialog_close_subscription.is_some() {
             return;
@@ -2449,6 +2510,7 @@ impl MusheenApp {
                     // A window-manager close is exactly a cancellation. It
                     // does not retain a mutable pending command or dispatch.
                     if this.context_dialog_windows.is_empty() {
+                        this.pending_content_focus = false;
                         this.pending_restored_focus = Some(dialog.restore_focus);
                         this.focus_directory_item(dialog.origin_tab, dialog.focused_item, cx);
                     }
@@ -2486,7 +2548,12 @@ impl MusheenApp {
             .unwrap_or_else(|| self.navigation.focused_tab().id());
         let choices = self.context_destination_choices(tab_id);
         if choices.is_empty() {
-            self.operation_error = Some("No writable destination locations are available".into());
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.no-destinations")
+                    .expect("destination message is localized")
+                    .into(),
+            );
             cx.notify();
             return;
         }
@@ -2523,7 +2590,14 @@ impl MusheenApp {
         let MenuInvocation::NeedsConfirmation(pending) = &invocation else {
             return;
         };
-        let command = pending.command_id().to_owned();
+        let move_operation = pending.command_id() == "clipboard.move_to";
+        let command = self
+            .shell
+            .commands()
+            .get(pending.command_id())
+            .and_then(|command| self.catalog.message(command.label_key()).ok())
+            .unwrap_or(pending.command_id())
+            .to_owned();
         let targets = pending
             .selection()
             .iter()
@@ -2546,7 +2620,9 @@ impl MusheenApp {
         let mut dialog = None;
         let dialog_window = cx
             .open_window(options, |window, cx| {
-                let view = cx.new(|cx| ContextReviewDialog::new(command, targets, strings, cx));
+                let view = cx.new(|cx| {
+                    ContextReviewDialog::new(command, move_operation, targets, strings, cx)
+                });
                 dialog = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             })
@@ -2556,7 +2632,6 @@ impl MusheenApp {
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
             ContextReviewEvent::Confirmed => this.confirm_context_review(invocation.clone(), cx),
             ContextReviewEvent::Cancelled => {
-                this.pending_content_focus = true;
                 cx.notify();
             }
         });
@@ -2564,7 +2639,6 @@ impl MusheenApp {
     }
 
     fn confirm_context_review(&mut self, invocation: MenuInvocation, cx: &mut Context<Self>) {
-        self.pending_content_focus = true;
         let surface = self.shell.context_menus().clone();
         let mut dispatcher = AppMenuDispatcher::default();
         let origin_tab = match &invocation {
@@ -2628,7 +2702,7 @@ impl MusheenApp {
                     targets.iter().map(|target| target.id().clone()).collect(),
                     drop_action,
                 ) {
-                    Ok(payload) => self.submit_file_drop(payload, destination.clone(), cx),
+                    Ok(payload) => self.submit_reviewed_transfer(payload, destination.clone(), cx),
                     Err(error) => {
                         self.operation_error = Some(error.to_string().into());
                         cx.notify();
@@ -2689,7 +2763,9 @@ impl MusheenApp {
             ) => self.dispatch_context_view_action(origin_tab, action, cx),
             _ => {
                 self.operation_error = Some(
-                    "The context command parameters cannot be handled by this desktop backend"
+                    self.catalog
+                        .message("context.backend-unavailable")
+                        .expect("backend refusal is localized")
                         .into(),
                 );
                 cx.notify();
@@ -2706,28 +2782,36 @@ impl MusheenApp {
             return Ok(());
         };
         let Some(directory) = self.directories.get(&tab_id) else {
-            return Err("the originating pane is no longer available".into());
+            return Err(self
+                .catalog
+                .message("context.origin-unavailable")
+                .expect("origin refusal is localized")
+                .into());
         };
         targets.iter().try_for_each(|target| {
-            let cached = directory
-                .view()
-                .item(target.id())
-                .filter(|item| item.path() == target.path())
-                .ok_or_else(|| {
-                    Box::<str>::from(
-                        "the selected item changed or no longer exists; reopen the context menu",
-                    )
-                })?;
+            let cached = directory.view().item(target.id());
+            if cached.is_some_and(|item| item.path() != target.path()) {
+                return Err(self
+                    .catalog
+                    .message("context.target-changed")
+                    .expect("target refusal is localized")
+                    .into());
+            }
             let current = self.store.resolve_item(target.path()).map_err(|error| {
                 Box::<str>::from(format!(
-                    "the provider could not verify the selected item before this operation: {error}"
+                    "{}: {error}",
+                    self.catalog
+                        .message("context.target-verification")
+                        .expect("verification refusal is localized")
                 ))
             })?;
             match current {
-                Some(item) if item.id() == cached.id() && item.path() == target.path() => Ok(()),
-                _ => Err(Box::<str>::from(
-                    "the selected item changed or no longer exists; reopen the context menu",
-                )),
+                Some(item) if item.id() == target.id() && item.path() == target.path() => Ok(()),
+                _ => Err(self
+                    .catalog
+                    .message("context.target-changed")
+                    .expect("target refusal is localized")
+                    .into()),
             }
         })
     }
@@ -2735,7 +2819,26 @@ impl MusheenApp {
     fn backend_action_state(action: CommandAction) -> CapabilityState {
         if matches!(
             action,
-            CommandAction::SelectAll
+            CommandAction::NavigateBack
+                | CommandAction::NavigateForward
+                | CommandAction::NavigateParent
+                | CommandAction::Refresh
+                | CommandAction::FocusLocation
+                | CommandAction::Search
+                | CommandAction::Filter
+                | CommandAction::FocusCommand
+                | CommandAction::NewTab
+                | CommandAction::CloseTab
+                | CommandAction::DuplicateTab
+                | CommandAction::ReopenClosedTab
+                | CommandAction::MoveTabOtherPane
+                | CommandAction::MoveTabLeft
+                | CommandAction::MoveTabRight
+                | CommandAction::TearOutTab
+                | CommandAction::SplitPane
+                | CommandAction::FocusNextPane
+                | CommandAction::ClearSelection
+                | CommandAction::SelectAll
                 | CommandAction::ViewDetails
                 | CommandAction::ViewList
                 | CommandAction::ViewCards
@@ -2775,7 +2878,22 @@ impl MusheenApp {
         )
     }
 
+    fn localized_backend_action_state(&self, action: CommandAction) -> CapabilityState {
+        match Self::backend_action_state(action) {
+            CapabilityState::Supported => CapabilityState::Supported,
+            CapabilityState::Unsupported(reason) | CapabilityState::Unknown(reason) => {
+                CapabilityState::Unsupported(
+                    CapabilityReason::new(self.catalog.localize_reason(reason.as_str()))
+                        .expect("localized refusal is nonempty"),
+                )
+            }
+        }
+    }
+
     fn drag_payload(&self, spec: &ItemRenderSpec) -> Option<FileDragPayload> {
+        if self.browser_input_blocked() {
+            return None;
+        }
         let view = self.directories.get(&spec.tab_id)?.view();
         let sources = if spec.selected {
             view.selected_ids()
@@ -2798,6 +2916,15 @@ impl MusheenApp {
         if !self.context_dialog_windows.is_empty() {
             return;
         }
+        self.submit_reviewed_transfer(payload, target, cx);
+    }
+
+    fn submit_reviewed_transfer(
+        &mut self,
+        payload: FileDragPayload,
+        target: StorePath,
+        cx: &mut Context<Self>,
+    ) {
         let conflicts = match self.operation_hub.conflicts_for_drop(&payload, &target) {
             Ok(conflicts) => conflicts,
             Err(error) => {
@@ -2974,7 +3101,11 @@ impl MusheenApp {
                     state.operation_error = Some(error);
                 }
                 if succeeded {
+                    // A background completion refreshes the current tab; it
+                    // must not steal focus restored when a review closes.
+                    let pending_content_focus = state.pending_content_focus;
                     state.load_focused_tab(cx);
+                    state.pending_content_focus = pending_content_focus;
                 }
                 state.pump_operation_queue(cx);
                 cx.notify();
@@ -3539,35 +3670,81 @@ impl MusheenApp {
             .unwrap_or_else(|| SharedString::from("Musheen"))
     }
 
-    fn toolbar_button(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        icon: IconName,
-        disabled: bool,
-        toggled: Option<bool>,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        let label = self
+    fn toolbar_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
+        let command = self
             .shell
             .commands()
             .get(id)
-            .and_then(|command| self.catalog.message(command.label_key()).ok())
-            .unwrap_or(label)
+            .expect("toolbar command is registered");
+        let state = command
+            .state(&self.active_command_context())
+            .map_disabled_reason(|reason| self.catalog.localize_reason(reason));
+        let label = self
+            .catalog
+            .message(command.label_key())
+            .expect("toolbar label is localized")
             .to_owned();
+        let tooltip = state
+            .disabled_reason()
+            .map_or_else(|| label.clone(), |reason| format!("{label}: {reason}"));
+        let toggled = matches!(
+            command.action(),
+            CommandAction::ToggleHidden
+                | CommandAction::ToggleDirectoriesFirst
+                | CommandAction::ToggleSidebar
+                | CommandAction::ToggleInfo
+                | CommandAction::SplitPane
+                | CommandAction::ViewDetails
+                | CommandAction::ViewList
+                | CommandAction::ViewCards
+                | CommandAction::ViewGrid
+                | CommandAction::ViewColumns
+                | CommandAction::ViewAdaptive
+        )
+        .then_some(state.is_checked());
         Button::new(id)
-            .icon(icon)
+            .icon(menu_icon(Some(command.icon_key())))
             .accessibility_label(label.clone())
-            .tooltip(label)
+            .tooltip(tooltip)
             .ghost()
             .small()
             .compact()
-            .disabled(disabled)
+            .disabled(!state.is_enabled())
             .selected(toggled.unwrap_or(false))
             .when_some(toggled, |button, toggled| button.toggled(toggled))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.remember_context_invocation_focus(window, cx);
                 this.dispatch_command(id, cx);
             }))
+    }
+
+    fn active_command_context(&self) -> CommandContext {
+        let tab = self.navigation.focused_tab();
+        let selection = self
+            .directories
+            .get(&tab.id())
+            .map(|directory| {
+                directory
+                    .view()
+                    .selected_ids()
+                    .iter()
+                    .filter_map(|id| directory.view().item(id))
+                    .filter_map(|item| {
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.context_for_menu(
+            tab.id(),
+            if selection.is_empty() {
+                MenuTarget::Background
+            } else {
+                MenuTarget::Item
+            },
+            tab.location(),
+            &selection,
+        )
     }
 
     fn render_omnibar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3795,12 +3972,6 @@ impl MusheenApp {
         };
         debug_assert_eq!(COMMAND_IDS.len(), 21);
         let compact = window.viewport_size().width.as_f32() < 960.0;
-        let no_parent = self
-            .focused_directory()
-            .location()
-            .and_then(StorePath::as_unix_path)
-            .and_then(Path::parent)
-            .is_none();
 
         div()
             .id("navigation-toolbar")
@@ -3815,222 +3986,103 @@ impl MusheenApp {
             .bg(colors.background)
             .border_b_1()
             .border_color(boundary)
-            .child(self.toolbar_button(
-                "navigation.back",
-                "Back",
-                IconName::ArrowLeft,
-                !self.navigation.focused_tab().history().can_go_back(),
-                None,
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "navigation.forward",
-                "Forward",
-                IconName::ArrowRight,
-                !self.navigation.focused_tab().history().can_go_forward(),
-                None,
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "navigation.parent",
-                "Parent folder",
-                IconName::ArrowUp,
-                no_parent,
-                None,
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "navigation.refresh",
-                "Refresh",
-                IconName::RefreshCw,
-                false,
-                None,
-                cx,
-            ))
+            .child(self.toolbar_button("navigation.back", cx))
+            .child(self.toolbar_button("navigation.forward", cx))
+            .child(self.toolbar_button("navigation.parent", cx))
+            .child(self.toolbar_button("navigation.refresh", cx))
             .child(self.render_omnibar(cx))
-            .child(self.toolbar_button("view.search", "Search", IconName::Search, false, None, cx))
+            .child(self.toolbar_button("view.search", cx))
             .when(compact, |toolbar| {
                 toolbar.child(self.render_view_overflow(cx))
             })
             .when(!compact, |toolbar| {
                 toolbar.child(self.render_view_controls(cx))
             })
-            .child(self.toolbar_button(
-                "view.sidebar",
-                "Sidebar",
-                IconName::PanelRight,
-                false,
-                Some(self.sidebar_visible),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.info",
-                "Information pane",
-                IconName::Info,
-                false,
-                Some(self.shell.info_visible()),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "pane.split",
-                "Split pane",
-                IconName::Columns2,
-                self.navigation.panes().len() >= 2,
-                Some(self.navigation.panes().len() == 2),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "pane.focus_next",
-                "Switch pane",
-                IconName::PanelRight,
-                self.navigation.panes().len() < 2,
-                None,
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "app.settings",
-                "Settings",
-                IconName::Settings,
-                false,
-                None,
-                cx,
-            ))
+            .child(self.toolbar_button("view.sidebar", cx))
+            .child(self.toolbar_button("view.info", cx))
+            .child(self.toolbar_button("pane.split", cx))
+            .child(self.toolbar_button("pane.focus_next", cx))
+            .child(self.toolbar_button("app.settings", cx))
     }
 
     fn render_view_controls(&self, cx: &mut Context<Self>) -> AnyElement {
-        let preferences = self.focused_directory().view().preferences();
         div()
             .flex()
             .items_center()
             .gap_1()
-            .child(self.toolbar_button(
-                "view.details",
-                "Details view",
-                IconName::ListChecks,
-                false,
-                Some(preferences.layout == Layout::Details),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.list",
-                "List view",
-                IconName::List,
-                false,
-                Some(preferences.layout == Layout::List),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.cards",
-                "Cards view",
-                IconName::Grid2x2,
-                false,
-                Some(preferences.layout == Layout::Cards),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.grid",
-                "Grid view",
-                IconName::Grid2x2,
-                false,
-                Some(preferences.layout == Layout::Grid),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.columns",
-                "Columns view",
-                IconName::Columns2,
-                false,
-                Some(preferences.layout == Layout::Columns),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.adaptive",
-                "Adaptive view",
-                IconName::PanelRight,
-                false,
-                Some(preferences.layout == Layout::Adaptive),
-                cx,
-            ))
-            .child(self.toolbar_button("view.sort", "Change sort", IconName::List, false, None, cx))
-            .child(self.toolbar_button(
-                "view.group",
-                "Change grouping",
-                IconName::ListChecks,
-                false,
-                Some(preferences.group != GroupKey::None),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.directories_first",
-                "Show folders first",
-                IconName::Folder,
-                false,
-                Some(preferences.directories_first),
-                cx,
-            ))
-            .child(self.toolbar_button(
-                "view.hidden",
-                "Show hidden items",
-                IconName::TextCursorInput,
-                false,
-                Some(preferences.show_hidden),
-                cx,
-            ))
+            .child(self.toolbar_button("view.details", cx))
+            .child(self.toolbar_button("view.list", cx))
+            .child(self.toolbar_button("view.cards", cx))
+            .child(self.toolbar_button("view.grid", cx))
+            .child(self.toolbar_button("view.columns", cx))
+            .child(self.toolbar_button("view.adaptive", cx))
+            .child(self.toolbar_button("view.sort", cx))
+            .child(self.toolbar_button("view.group", cx))
+            .child(self.toolbar_button("view.directories_first", cx))
+            .child(self.toolbar_button("view.hidden", cx))
             .into_any_element()
     }
 
     fn render_view_overflow(&self, cx: &mut Context<Self>) -> AnyElement {
-        let preferences = self.focused_directory().view().preferences().clone();
         let view = cx.entity();
+        let context = self.active_command_context();
         let items = [
+            "view.details",
+            "view.list",
+            "view.cards",
+            "view.grid",
+            "view.columns",
+            "view.adaptive",
+            "view.sort",
+            "view.group",
+            "view.directories_first",
+            "view.hidden",
+        ]
+        .map(|id| {
+            let command = self
+                .shell
+                .commands()
+                .get(id)
+                .expect("overflow command is registered");
+            let label = self
+                .catalog
+                .message(command.label_key())
+                .expect("overflow label is localized")
+                .to_owned();
             (
-                "view.details",
-                "Details",
-                preferences.layout == Layout::Details,
-            ),
-            ("view.list", "List", preferences.layout == Layout::List),
-            ("view.cards", "Cards", preferences.layout == Layout::Cards),
-            ("view.grid", "Grid", preferences.layout == Layout::Grid),
-            (
-                "view.columns",
-                "Columns",
-                preferences.layout == Layout::Columns,
-            ),
-            (
-                "view.adaptive",
-                "Adaptive",
-                preferences.layout == Layout::Adaptive,
-            ),
-            ("view.sort", "Change sort", false),
-            (
-                "view.group",
-                "Change grouping",
-                preferences.group != GroupKey::None,
-            ),
-            (
-                "view.directories_first",
-                "Folders first",
-                preferences.directories_first,
-            ),
-            ("view.hidden", "Show hidden", preferences.show_hidden),
-        ];
+                id,
+                label,
+                menu_icon(Some(command.icon_key())),
+                command.state(&context),
+            )
+        });
+        let label = self
+            .catalog
+            .message("view-options")
+            .expect("view options label is localized")
+            .to_owned();
         Button::new("view.overflow")
             .icon(IconName::ListChecks)
-            .accessibility_label("View options")
-            .tooltip("View options")
+            .accessibility_label(label.clone())
+            .tooltip(label)
             .ghost()
             .small()
             .compact()
             .dropdown_menu(move |mut menu, _, _| {
-                for (command_id, label, checked) in items {
+                for (command_id, label, icon, state) in items.iter().cloned() {
                     let view = view.clone();
-                    menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
-                        move |_, _, cx| {
-                            view.update(cx, |this, cx| {
-                                this.dispatch_command(command_id, cx);
-                            });
-                        },
-                    ));
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .icon(icon)
+                            .disabled(!state.is_enabled())
+                            .checked(state.is_checked())
+                            .on_click(move |_, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.remember_context_invocation_focus(window, cx);
+                                    this.dispatch_command(command_id, cx);
+                                });
+                            }),
+                    );
                 }
                 menu
             })
@@ -4194,12 +4246,20 @@ impl MusheenApp {
             .children(sections)
             .context_menu(move |popup, window, popup_cx| {
                 let Some(menu) = context_menu_host
-                    .update(popup_cx, |this, _| {
-                        this.pending_context_menu
-                            .take()
-                            .unwrap_or_else(|| this.sidebar_context_menu(sidebar_tab))
+                    .update(popup_cx, |this, cx| {
+                        if this.browser_input_blocked() {
+                            this.pending_context_menu = None;
+                            return None;
+                        }
+                        this.remember_context_invocation_focus(window, cx);
+                        Some(
+                            this.pending_context_menu
+                                .take()
+                                .unwrap_or_else(|| this.sidebar_context_menu(sidebar_tab)),
+                        )
                     })
                     .ok()
+                    .flatten()
                 else {
                     return popup;
                 };
@@ -4340,12 +4400,18 @@ impl MusheenApp {
             )
             .context_menu(move |popup, window, popup_cx| {
                 let Some(menu) = context_menu_host
-                    .update(popup_cx, |this, _| {
-                        this.pending_context_menu.take().unwrap_or_else(|| {
+                    .update(popup_cx, |this, cx| {
+                        if this.browser_input_blocked() {
+                            this.pending_context_menu = None;
+                            return None;
+                        }
+                        this.remember_context_invocation_focus(window, cx);
+                        Some(this.pending_context_menu.take().unwrap_or_else(|| {
                             this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new())
-                        })
+                        }))
                     })
                     .ok()
+                    .flatten()
                 else {
                     return popup;
                 };
@@ -4376,6 +4442,8 @@ impl MusheenApp {
                 let rows = items.iter().cloned().enumerate().map(|(index, item)| {
                     let receipt = item.receipt().clone();
                     let kind = item.kind();
+                    let target = trash_command_target(&item);
+                    let pointer_target = target.clone();
                     let original = DisplayPath::from_store_path(receipt.original_path())
                         .as_str()
                         .to_owned();
@@ -4391,6 +4459,61 @@ impl MusheenApp {
                         .py_3()
                         .border_b_1()
                         .border_color(colors.border)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                if this.browser_input_blocked() {
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                this.trash_focus.insert(tab_id, target.clone());
+                                if let Some(tab) = this.navigation.tab_mut(tab_id) {
+                                    tab.set_selection(vec![target.id().clone()]);
+                                }
+                                this.content_focus.focus(window, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _, _, cx| {
+                                if this.browser_input_blocked() {
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                this.trash_focus.insert(tab_id, pointer_target.clone());
+                                if let Some(tab) = this.navigation.tab_mut(tab_id)
+                                    && !tab.selection().contains(pointer_target.id())
+                                {
+                                    tab.set_selection(vec![pointer_target.id().clone()]);
+                                }
+                                let selection = this
+                                    .trash_states
+                                    .get(&tab_id)
+                                    .and_then(|state| match state {
+                                        TrashState::Ready(surface) => Some(
+                                            surface
+                                                .items()
+                                                .iter()
+                                                .map(trash_command_target)
+                                                .filter(|target| {
+                                                    this.navigation.tab(tab_id).is_some_and(|tab| {
+                                                        tab.selection().contains(target.id())
+                                                    })
+                                                })
+                                                .collect(),
+                                        ),
+                                        _ => None,
+                                    })
+                                    .unwrap_or_else(|| vec![pointer_target.clone()]);
+                                this.pending_context_menu = Some(this.compose_context_menu(
+                                    tab_id,
+                                    MenuTarget::TrashItem,
+                                    selection,
+                                ));
+                                cx.notify();
+                            }),
+                        )
                         .child(
                             div()
                                 .flex_grow(1.0)
@@ -6083,9 +6206,13 @@ impl Render for MusheenApp {
         }
         if let Some(focus) = self.pending_restored_focus.take() {
             focus.focus(window, cx);
+            self.pending_content_focus = false;
         } else if self.pending_content_focus {
             self.content_focus.focus(window, cx);
             self.pending_content_focus = false;
+        }
+        if self.keyboard_context_popup.is_none() {
+            self.remember_browser_focus(window, cx);
         }
         let colors = cx.theme().colors;
         let status = self.focused_status_text();
@@ -6093,6 +6220,12 @@ impl Render for MusheenApp {
         let info_visible = self.shell.info_visible();
         let wide = window.viewport_size().width.as_f32() >= 960.0;
         let high_contrast = Self::high_contrast(cx);
+        self.context_menu_theme = crate::ThemeProfile::from_active_native(
+            cx.theme().mode.is_dark(),
+            high_contrast,
+            cx.try_global::<NativeTheme>()
+                .is_some_and(|theme| theme.accessibility().reduce_motion),
+        );
         let boundary = if high_contrast {
             colors.foreground
         } else {
@@ -6111,6 +6244,31 @@ impl Render for MusheenApp {
         div()
             .id("musheen-shell")
             .test_support()
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                if this.browser_input_blocked() {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    this.activate_context_dialog(cx);
+                } else {
+                    this.remember_browser_focus(window, cx);
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(|this, _, window, cx| {
+                if this.browser_input_blocked() {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    this.activate_context_dialog(cx);
+                }
+            }))
+            .capture_key_down(cx.listener(|this, _, window, cx| {
+                if this.browser_input_blocked() {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    this.activate_context_dialog(cx);
+                } else if this.keyboard_context_popup.is_none() {
+                    this.remember_browser_focus(window, cx);
+                }
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -6302,6 +6460,16 @@ fn trash_store_path() -> StorePath {
         b"root".to_vec(),
     )
     .expect("the built-in Trash path is valid")
+}
+
+fn trash_command_target(item: &TrashItem) -> CommandTargetRef {
+    let provider = ProviderId::new("musheen.trash").expect("Trash provider ID is valid");
+    let key = item.receipt().provider_reference().to_vec();
+    CommandTargetRef::new(
+        ItemId::new(provider.clone(), key.clone()).expect("Trash receipt identity is valid"),
+        StorePath::from_provider_key(provider, key).expect("Trash receipt path is valid"),
+    )
+    .expect("Trash item and path share their provider")
 }
 
 fn is_trash_location(path: &StorePath) -> bool {
@@ -6744,6 +6912,7 @@ mod tests {
             let resolver = ContextTransferDestinationResolver {
                 operation_hub: &hub,
                 payload: &payload,
+                catalog: &Catalog::load(Locale::EnUs).unwrap(),
             };
             assert!(
                 resolver
@@ -6757,6 +6926,7 @@ mod tests {
         let resolver = ContextTransferDestinationResolver {
             operation_hub: &hub,
             payload: &payload,
+            catalog: &Catalog::load(Locale::EnUs).unwrap(),
         };
         let refusal = resolver.resolve_context_menu_destination(&StorePath::from_unix_path(
             temporary.path().join("missing").into_os_string(),
@@ -7029,6 +7199,20 @@ mod tests {
             assert_eq!(window.find("view.sidebar").checked(), Some(true));
             assert_eq!(window.find("view.info").checked(), Some(false));
             assert_eq!(window.find("pane.split").checked(), Some(false));
+            assert!(
+                !app.read(cx)
+                    .shell
+                    .commands()
+                    .get("app.settings")
+                    .unwrap()
+                    .state(&app.read(cx).active_command_context())
+                    .is_enabled()
+            );
+            window.click("app.settings", cx);
+            assert!(
+                app.read(cx).operation_error.is_none(),
+                "disabled toolbar command must not dispatch"
+            );
 
             app.update(cx, |state, cx| {
                 state.dispatch_command("view.details", cx);
@@ -7145,6 +7329,235 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    async fn context_move_chooser_review_keeps_origin_focus_and_runs_the_queue(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.txt");
+        let destination = temporary.path().join("destination");
+        filesystem::write(&source, b"reviewed transfer").unwrap();
+        filesystem::create_dir(&destination).unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let (prior_focus, choice) = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.press("ctrl-l", cx);
+                let focus = window.focused(cx).unwrap();
+                let choice = app.update(cx, |state, cx| {
+                    state.catalog = Catalog::load(Locale::EnXa).unwrap();
+                    state.pins.replace([SidebarEntry::new(
+                        "Destination",
+                        StorePath::from_unix_path(destination.as_os_str()),
+                    )]);
+                    let tab = state.navigation.focused_tab().id();
+                    let item = state
+                        .focused_directory()
+                        .view()
+                        .items()
+                        .iter()
+                        .find(|item| item.path().as_unix_path() == Some(source.as_path()))
+                        .unwrap()
+                        .clone();
+                    state.select_item(tab, item.id().clone(), cx);
+                    let menu = state.compose_context_menu(
+                        tab,
+                        MenuTarget::Item,
+                        vec![
+                            CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap(),
+                        ],
+                    );
+                    let entry = MusheenApp::menu_entry_by_id(&menu, "clipboard.move_to")
+                        .unwrap()
+                        .clone();
+                    let choice = state
+                        .context_destination_choices(tab)
+                        .iter()
+                        .position(|choice| {
+                            choice.location.as_unix_path() == Some(destination.as_path())
+                        })
+                        .unwrap();
+                    state.remember_context_invocation_focus(window, cx);
+                    state.dispatch_context_entry(entry, cx);
+                    choice
+                });
+                (focus, choice)
+            })
+            .unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        let chooser = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.update(|cx| {
+            assert_eq!(
+                app.read(cx).context_dialog_windows[0].restore_focus,
+                prior_focus
+            )
+        });
+        cx.update_window(chooser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("context-destination-dialog")
+                    .label()
+                    .unwrap()
+                    .starts_with('⟦')
+            );
+            assert!(
+                window
+                    .find(format!("context-destination-{choice}"))
+                    .bounds()
+                    .bottom_right()
+                    .y
+                    <= window.viewport_size().height,
+                "destination choice {choice} must fit in chooser"
+            );
+            window.click(format!("context-destination-{choice}"), cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                app.read(cx).operation_error.is_none(),
+                "{:?}",
+                app.read(cx).operation_error
+            )
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.windows()
+                .iter()
+                .any(|window| *window != browser && *window != chooser)
+        })
+        .await;
+        let review = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.update(|cx| {
+            assert_eq!(
+                app.read(cx).context_dialog_windows[0].restore_focus,
+                prior_focus
+            )
+        });
+        cx.update_window(review, |_, window, cx| {
+            window.render_frame(cx);
+            for id in [
+                "context-command-review",
+                "context-review-command",
+                "context-review-targets",
+                "context-review-explanation",
+            ] {
+                assert!(window.find(id).label().unwrap().starts_with('⟦'));
+            }
+            assert!(
+                source.exists(),
+                "chooser must not perform the reviewed move"
+            );
+            window.click("context-review-confirm", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            destination.join("source.txt").exists()
+        })
+        .await;
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            !app.read(cx)
+                .operation_hub
+                .status()
+                .lock()
+                .unwrap()
+                .history()
+                .is_empty()
+        })
+        .await;
+        cx.run_until_parked();
+        assert!(!source.exists());
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(app.read(cx).context_dialog_windows.is_empty());
+            assert!(prior_focus.is_focused(window));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn sidebar_identity_is_resolved_outside_the_directory_cache_and_revalidated(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let current = temporary.path().join("current");
+        let external = temporary.path().join("external");
+        filesystem::create_dir(&current).unwrap();
+        filesystem::create_dir(&external).unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(current, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Empty
+        })
+        .await;
+        app.update(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
+            for target in [MenuTarget::SidebarLocation, MenuTarget::Mount] {
+                let menu = state.sidebar_location_context_menu(
+                    tab,
+                    target,
+                    StorePath::from_unix_path(external.as_os_str()),
+                );
+                let entry = MusheenApp::menu_entry_by_id(&menu, "directory.properties").unwrap();
+                assert_eq!(entry.captured_targets().len(), 1);
+                assert!(
+                    state
+                        .revalidate_context_targets(Some(tab), entry.captured_targets())
+                        .is_ok()
+                );
+                filesystem::rename(&external, temporary.path().join("old")).unwrap();
+                filesystem::create_dir(&external).unwrap();
+                assert!(
+                    state
+                        .revalidate_context_targets(Some(tab), entry.captured_targets())
+                        .is_err()
+                );
+                filesystem::remove_dir(temporary.path().join("old")).unwrap();
+            }
+            state.store = Arc::new(ImmediateSearchStore::new());
+            let menu = state.sidebar_location_context_menu(
+                tab,
+                MenuTarget::SidebarLocation,
+                StorePath::from_unix_path(external.as_os_str()),
+            );
+            assert!(
+                menu.entries()
+                    .iter()
+                    .all(|entry| entry.captured_targets().is_empty()),
+                "an unresolved provider target must never acquire a fabricated local identity"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
     async fn keyboard_context_menu_uses_the_focused_pane_target(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -7219,6 +7632,13 @@ mod tests {
         })
         .await;
         let mut dialog_handle: Option<AnyWindowHandle> = None;
+        let prior_focus = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.press("ctrl-l", cx);
+                window.focused(cx).expect("location editor is focused")
+            })
+            .unwrap();
         cx.update(|cx| {
             let strings = ContextDialogStrings::from_catalog(
                 &Catalog::load(Locale::EnUs).expect("English catalog loads"),
@@ -7236,6 +7656,17 @@ mod tests {
             });
         });
         let dialog_handle = dialog_handle.expect("dialog handle is retained");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("omnibar-search", cx);
+            assert_eq!(app.read(cx).omnibar.mode(), OmnibarMode::Path);
+            assert!(prior_focus.is_focused(window));
+            window.right_click("directory-content", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("popup-menu").is_none());
+            assert!(app.read(cx).pending_context_menu.is_none());
+        })
+        .unwrap();
         cx.update(|cx| {
             app.update(cx, |state, cx| {
                 let before = state.focused_directory().view().preferences().layout;
@@ -7244,6 +7675,9 @@ mod tests {
                     state.focused_directory().view().preferences().layout,
                     before
                 );
+                let location = state.navigation.focused_tab().location().clone();
+                state.navigate(StorePath::from_unix_path("/tmp"), true, cx);
+                assert_eq!(state.navigation.focused_tab().location(), &location);
             });
         });
         cx.update(|cx| {
@@ -7254,7 +7688,7 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(app.read(cx).context_dialog_windows.is_empty());
-            assert_eq!(window.find("directory-content").focused(), Some(true));
+            assert!(prior_focus.is_focused(window));
         })
         .expect("main window remains open");
     }
@@ -7427,6 +7861,49 @@ mod tests {
             assert!(window.find("trash-surface").visible());
             assert!(window.find("trash-item-0").visible());
             assert!(window.find("trash-restore-0").visible());
+            window.press("down", cx);
+            window.press("shift-f10", cx);
+            window.render_frame(cx);
+            assert!(
+                gpui_kit::base::test_support::snapshots(window)
+                    .iter()
+                    .any(|node| {
+                        node.label()
+                            .is_some_and(|label| label.starts_with("Restore"))
+                            && node.role() == Some(Role::MenuItem)
+                    }),
+                "focused Trash rows must offer Restore rather than Empty Trash: {:?}",
+                gpui_kit::base::test_support::snapshots(window)
+                    .iter()
+                    .map(|node| (node.role(), node.label().map(str::to_owned)))
+                    .collect::<Vec<_>>()
+            );
+            window.press("escape", cx);
+            assert!(app.read(cx).navigation.focused_tab().selection().is_empty());
+            window.right_click("trash-item-0", cx);
+        })
+        .expect("test window remains open");
+        cx.wait_for(handle.into(), Duration::from_secs(2), |window, _| {
+            gpui_kit::base::test_support::snapshots(window)
+                .iter()
+                .any(|node| node.label() == Some("Restore") && node.role() == Some(Role::MenuItem))
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let selection = app.read(cx).navigation.focused_tab().selection();
+            assert_eq!(selection.len(), 1);
+            assert_eq!(selection[0].provider().as_str(), "musheen.trash");
+            assert!(
+                gpui_kit::base::test_support::snapshots(window)
+                    .iter()
+                    .any(|node| {
+                        node.label()
+                            .is_some_and(|label| label.starts_with("Restore"))
+                            && node.role() == Some(Role::MenuItem)
+                    })
+            );
+            window.press("escape", cx);
             window.click("trash-empty", cx);
             window.render_frame(cx);
             assert!(window.find("trash-empty-confirmation").visible());
@@ -7436,6 +7913,12 @@ mod tests {
             );
         })
         .expect("test window remains open");
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("popup-menu").is_none());
+        })
+        .expect("dismissed Trash popup is removed before teardown");
     }
 
     #[gpui_kit::test]

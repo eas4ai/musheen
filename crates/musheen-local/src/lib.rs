@@ -261,30 +261,81 @@ fn directory_allows_current_user(
         ))
         .expect("the ACL lookup reason is valid")
     })?;
+    Ok(acl_allows_directory_mutation(
+        &acl,
+        uid,
+        metadata.uid(),
+        metadata.gid(),
+        &group_ids,
+    ))
+}
+
+fn acl_allows_directory_mutation(
+    acl: &PosixACL,
+    uid: u32,
+    owner: u32,
+    owning_group: u32,
+    group_ids: &[u32],
+) -> bool {
     let required = ACL_WRITE | ACL_EXECUTE;
-    let permitted = if metadata.uid() == uid {
+    let permitted = if owner == uid {
         acl.get(Qualifier::UserObj).unwrap_or_default()
     } else if let Some(named_user) = acl.get(Qualifier::User(uid)) {
-        apply_acl_mask(named_user, &acl)
+        apply_acl_mask(named_user, acl)
     } else {
-        let group_permission = acl
-            .entries()
-            .into_iter()
-            .filter_map(|entry| match entry.qual {
-                Qualifier::GroupObj if group_ids.contains(&metadata.gid()) => Some(entry.perm),
-                Qualifier::Group(group) if group_ids.contains(&group) => Some(entry.perm),
-                _ => None,
-            })
-            .fold(0, |permissions, entry| permissions | entry);
-        if group_permission != 0 {
-            apply_acl_mask(group_permission, &acl)
+        let (group_matched, group_permission) =
+            acl.entries()
+                .into_iter()
+                .fold((false, 0), |(matched, permissions), entry| {
+                    match entry.qual {
+                        Qualifier::GroupObj if group_ids.contains(&owning_group) => {
+                            (true, permissions | entry.perm)
+                        }
+                        Qualifier::Group(group) if group_ids.contains(&group) => {
+                            (true, permissions | entry.perm)
+                        }
+                        _ => (matched, permissions),
+                    }
+                });
+        if group_matched {
+            apply_acl_mask(group_permission, acl)
         } else {
             acl.get(Qualifier::Other).unwrap_or_default()
         }
     };
-    Ok(permitted & required == required)
+    permitted & required == required
 }
 
 fn apply_acl_mask(permissions: u32, acl: &PosixACL) -> u32 {
     permissions & acl.get(Qualifier::Mask).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+
+    #[test]
+    fn matching_zero_permission_group_does_not_fall_through_to_other() {
+        let acl = PosixACL::new(0o703);
+        assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[7]));
+        assert!(acl_allows_directory_mutation(&acl, 42, 1, 7, &[8]));
+        let mut acl = acl;
+        acl.set(Qualifier::Group(8), 0);
+        acl.set(Qualifier::Mask, ACL_WRITE | ACL_EXECUTE);
+        assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[8]));
+    }
+
+    #[test]
+    fn matching_acl_groups_union_before_mask_and_named_user_takes_precedence() {
+        let mut acl = PosixACL::new(0o703);
+        acl.set(Qualifier::Group(8), ACL_WRITE);
+        acl.set(Qualifier::Group(9), ACL_EXECUTE);
+        acl.set(Qualifier::Mask, ACL_WRITE | ACL_EXECUTE);
+        assert!(acl_allows_directory_mutation(&acl, 42, 1, 7, &[8, 9]));
+        acl.set(Qualifier::Mask, ACL_WRITE);
+        assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[8, 9]));
+        acl.set(Qualifier::Mask, ACL_WRITE | ACL_EXECUTE);
+        acl.set(Qualifier::User(42), 0);
+        assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[8, 9]));
+    }
 }
