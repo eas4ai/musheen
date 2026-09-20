@@ -64,8 +64,7 @@ pub struct CommandContext {
     pub selection_count: usize,
     pub target: CommandTarget,
     pub location_is_writable: bool,
-    pub destination_is_writable: bool,
-    pub destination_reason: Option<Box<str>>,
+    pub resolved_destination: Option<ResolvedDestination>,
     pub clipboard_has_contents: bool,
     pub mutation_is_supported: bool,
     pub mutation_reason: Option<Box<str>>,
@@ -93,8 +92,7 @@ impl Default for CommandContext {
             selection_count: 0,
             target: CommandTarget::Background,
             location_is_writable: false,
-            destination_is_writable: false,
-            destination_reason: None,
+            resolved_destination: None,
             clipboard_has_contents: false,
             mutation_is_supported: false,
             mutation_reason: None,
@@ -144,7 +142,40 @@ impl CommandContext {
 
     #[must_use]
     pub fn has_target_selection(&self) -> bool {
-        self.selection_count > 0 && self.target != CommandTarget::Background
+        self.selection_count > 0
+            && !matches!(
+                self.target,
+                CommandTarget::Background | CommandTarget::TrashBackground
+            )
+    }
+}
+
+/// A destination chosen by the user and resolved by a provider before an
+/// operation is allowed to mutate it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedDestination {
+    pub path: StorePath,
+    pub is_writable: bool,
+    pub refusal_reason: Option<Box<str>>,
+}
+
+impl ResolvedDestination {
+    #[must_use]
+    pub fn writable(path: StorePath) -> Self {
+        Self {
+            path,
+            is_writable: true,
+            refusal_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn read_only(path: StorePath, reason: impl Into<Box<str>>) -> Self {
+        Self {
+            path,
+            is_writable: false,
+            refusal_reason: Some(reason.into()),
+        }
     }
 }
 

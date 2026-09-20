@@ -18,7 +18,7 @@ pub use capability::{CapabilityKind, CapabilityMatrix, CapabilityReason, Capabil
 pub use command::*;
 pub use context::{
     CommandContext, CommandParameterError, CommandParameters, CommandTarget, CommandTargetRef,
-    ProviderAction, ProviderActionMatrix,
+    ProviderAction, ProviderActionMatrix, ResolvedDestination,
 };
 pub use error::CoreError;
 pub use item::{ItemId, ItemKind, StoreItem};

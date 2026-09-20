@@ -43,16 +43,13 @@ fn writable_location_state(context: &CommandContext) -> CommandState {
 }
 
 fn writable_destination_state(context: &CommandContext) -> CommandState {
-    if !context.has_target_selection() {
-        return CommandState::disabled("no items are selected");
+    let state = selection_state(context);
+    if !state.is_enabled() {
+        return state;
     }
-    if !context.destination_is_writable {
-        return CommandState::disabled(
-            context
-                .destination_reason
-                .as_deref()
-                .unwrap_or("the destination is read-only"),
-        );
+    let state = resolved_destination_state(context);
+    if !state.is_enabled() {
+        return state;
     }
     if !context.mutation_is_supported {
         return CommandState::disabled(
@@ -65,12 +62,54 @@ fn writable_destination_state(context: &CommandContext) -> CommandState {
     CommandState::enabled()
 }
 
-fn writable_selection_state(context: &CommandContext) -> CommandState {
-    if context.target == CommandTarget::Background && context.selection_count > 0 {
-        return CommandState::disabled("background commands do not use a selection");
-    }
+fn selection_state(context: &CommandContext) -> CommandState {
     if !context.has_target_selection() {
-        return CommandState::disabled("no items are selected");
+        return CommandState::disabled(if context.selection_count > 0 {
+            "background commands do not use a selection"
+        } else {
+            "no items are selected"
+        });
+    }
+    CommandState::enabled()
+}
+
+fn resolved_destination_state(context: &CommandContext) -> CommandState {
+    match &context.resolved_destination {
+        None => CommandState::disabled("choose a destination first"),
+        Some(destination) if destination.is_writable => CommandState::enabled(),
+        Some(destination) => CommandState::disabled(
+            destination
+                .refusal_reason
+                .as_deref()
+                .unwrap_or("the destination is read-only"),
+        ),
+    }
+}
+
+fn destination_operation_state(
+    context: &CommandContext,
+    requires_source_mutation: bool,
+) -> CommandState {
+    let state = selection_state(context);
+    if !state.is_enabled() {
+        return state;
+    }
+    if requires_source_mutation {
+        let state = writable_location_state(context);
+        if !state.is_enabled() {
+            return state;
+        }
+    }
+    match context.resolved_destination {
+        None => CommandState::enabled(),
+        Some(_) => resolved_destination_state(context),
+    }
+}
+
+fn writable_selection_state(context: &CommandContext) -> CommandState {
+    let state = selection_state(context);
+    if !state.is_enabled() {
+        return state;
     }
     if !context.location_is_writable {
         return CommandState::disabled("the current location is read-only");
@@ -87,13 +126,35 @@ fn writable_selection_state(context: &CommandContext) -> CommandState {
 }
 
 fn writable_exactly_one_selection_state(context: &CommandContext) -> CommandState {
-    if context.target == CommandTarget::Background && context.selection_count > 0 {
+    if !context.has_target_selection() && context.selection_count > 0 {
         return CommandState::disabled("background commands do not use a selection");
     }
     if context.selection_count != 1 {
         return CommandState::disabled("select exactly one item");
     }
     writable_location_state(context)
+}
+
+fn writable_exactly_one_file_capability_state(
+    context: &CommandContext,
+    capability: CapabilityKind,
+) -> CommandState {
+    if context.selection_count != 1
+        || !matches!(
+            context.target,
+            CommandTarget::File | CommandTarget::Archive | CommandTarget::ExecutableFile
+        )
+    {
+        return CommandState::disabled("exactly one file must be selected");
+    }
+    writable_location_state(context).and_capability(context.capability(capability))
+}
+
+fn writable_exactly_one_selection_capability_state(
+    context: &CommandContext,
+    capability: CapabilityKind,
+) -> CommandState {
+    writable_exactly_one_selection_state(context).and_capability(context.capability(capability))
 }
 
 fn hide_state(context: &CommandContext, target_is_hidden: bool) -> CommandState {
@@ -121,6 +182,13 @@ fn archive_mutation_state(context: &CommandContext) -> CommandState {
     writable_selection_state(context)
 }
 
+fn archive_destination_state(context: &CommandContext) -> CommandState {
+    if context.selection_count != 1 || context.target != CommandTarget::Archive {
+        return CommandState::disabled("exactly one archive must be selected");
+    }
+    destination_operation_state(context, false)
+}
+
 fn non_archive_mutation_state(context: &CommandContext) -> CommandState {
     let state = writable_selection_state(context);
     if !state.is_enabled() {
@@ -133,22 +201,23 @@ fn non_archive_mutation_state(context: &CommandContext) -> CommandState {
 }
 
 fn paste_state(context: &CommandContext) -> CommandState {
-    if !matches!(
-        context.target,
-        CommandTarget::Background | CommandTarget::Directory
-    ) {
-        return CommandState::disabled("paste requires a directory or directory background");
+    match context.target {
+        CommandTarget::Background if context.selection_count == 0 => {}
+        CommandTarget::Directory if context.selection_count == 1 => {}
+        CommandTarget::Background => {
+            return CommandState::disabled("background commands do not use a selection");
+        }
+        CommandTarget::Directory => {
+            return CommandState::disabled("exactly one directory must be selected");
+        }
+        _ => return CommandState::disabled("paste requires a directory or directory background"),
     }
     if !context.clipboard_has_contents {
         return CommandState::disabled("the clipboard has no pasteable items");
     }
-    if !context.destination_is_writable {
-        return CommandState::disabled(
-            context
-                .destination_reason
-                .as_deref()
-                .unwrap_or("the destination is read-only"),
-        );
+    let state = resolved_destination_state(context);
+    if !state.is_enabled() {
+        return state;
     }
     if !context.mutation_is_supported {
         return CommandState::disabled(
@@ -496,80 +565,122 @@ impl fmt::Display for CommandDispatchError {
 impl Error for CommandDispatchError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ParameterShape {
+pub enum TargetCardinality {
+    ExactlyOne,
+    OneOrMore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandParameterContract {
     None,
-    Targets,
-    Destination,
+    Targets(TargetCardinality),
+    Destination(TargetCardinality),
     Location,
-    CustomAction,
+    CustomAction(TargetCardinality),
+}
+
+impl CommandAction {
+    #[must_use]
+    pub const fn parameter_contract(self) -> CommandParameterContract {
+        match self {
+            CommandAction::NavigateBack
+            | CommandAction::NavigateForward
+            | CommandAction::NavigateParent
+            | CommandAction::Refresh
+            | CommandAction::FocusLocation
+            | CommandAction::Search
+            | CommandAction::Filter
+            | CommandAction::FocusCommand
+            | CommandAction::ViewDetails
+            | CommandAction::ViewList
+            | CommandAction::ViewCards
+            | CommandAction::ViewGrid
+            | CommandAction::ViewColumns
+            | CommandAction::ViewAdaptive
+            | CommandAction::CycleSort
+            | CommandAction::CycleGroup
+            | CommandAction::ToggleDirectoriesFirst
+            | CommandAction::ToggleHidden
+            | CommandAction::ToggleSidebar
+            | CommandAction::ToggleInfo
+            | CommandAction::NewTab
+            | CommandAction::CloseTab
+            | CommandAction::DuplicateTab
+            | CommandAction::ReopenClosedTab
+            | CommandAction::MoveTabOtherPane
+            | CommandAction::MoveTabLeft
+            | CommandAction::MoveTabRight
+            | CommandAction::TearOutTab
+            | CommandAction::SplitPane
+            | CommandAction::FocusNextPane
+            | CommandAction::SelectAll
+            | CommandAction::ClearSelection
+            | CommandAction::OpenSettings => CommandParameterContract::None,
+            CommandAction::NewDirectory
+            | CommandAction::NewEmptyFile
+            | CommandAction::NewFromTemplate
+            | CommandAction::OpenTerminalHere
+            | CommandAction::PasteInto
+            | CommandAction::DirectoryProperties
+            | CommandAction::EmptyTrash => CommandParameterContract::Location,
+            CommandAction::SendTo | CommandAction::CopyTo | CommandAction::MoveTo => {
+                CommandParameterContract::Destination(TargetCardinality::OneOrMore)
+            }
+            CommandAction::Extract => {
+                CommandParameterContract::Destination(TargetCardinality::ExactlyOne)
+            }
+            CommandAction::CustomAction => {
+                CommandParameterContract::CustomAction(TargetCardinality::OneOrMore)
+            }
+            CommandAction::Cut
+            | CommandAction::Copy
+            | CommandAction::Duplicate
+            | CommandAction::Compress
+            | CommandAction::Hide
+            | CommandAction::Unhide
+            | CommandAction::MoveToTrash
+            | CommandAction::DeletePermanently
+            | CommandAction::OpenProperties
+            | CommandAction::Permissions
+            | CommandAction::ManageTags => {
+                CommandParameterContract::Targets(TargetCardinality::OneOrMore)
+            }
+            _ => CommandParameterContract::Targets(TargetCardinality::ExactlyOne),
+        }
+    }
 }
 
 fn validate_parameters(
     action: CommandAction,
     parameters: &CommandParameters,
 ) -> Result<(), CommandDispatchError> {
-    let shape = match action {
-        CommandAction::NavigateBack
-        | CommandAction::NavigateForward
-        | CommandAction::NavigateParent
-        | CommandAction::Refresh
-        | CommandAction::FocusLocation
-        | CommandAction::Search
-        | CommandAction::Filter
-        | CommandAction::FocusCommand
-        | CommandAction::ViewDetails
-        | CommandAction::ViewList
-        | CommandAction::ViewCards
-        | CommandAction::ViewGrid
-        | CommandAction::ViewColumns
-        | CommandAction::ViewAdaptive
-        | CommandAction::CycleSort
-        | CommandAction::CycleGroup
-        | CommandAction::ToggleDirectoriesFirst
-        | CommandAction::ToggleHidden
-        | CommandAction::ToggleSidebar
-        | CommandAction::ToggleInfo
-        | CommandAction::NewTab
-        | CommandAction::CloseTab
-        | CommandAction::DuplicateTab
-        | CommandAction::ReopenClosedTab
-        | CommandAction::MoveTabOtherPane
-        | CommandAction::MoveTabLeft
-        | CommandAction::MoveTabRight
-        | CommandAction::TearOutTab
-        | CommandAction::SplitPane
-        | CommandAction::FocusNextPane
-        | CommandAction::SelectAll
-        | CommandAction::ClearSelection
-        | CommandAction::OpenSettings => ParameterShape::None,
-        CommandAction::NewDirectory
-        | CommandAction::NewEmptyFile
-        | CommandAction::NewFromTemplate
-        | CommandAction::OpenTerminalHere
-        | CommandAction::PasteInto => ParameterShape::Location,
-        CommandAction::SendTo
-        | CommandAction::CopyTo
-        | CommandAction::MoveTo
-        | CommandAction::Extract => ParameterShape::Destination,
-        CommandAction::ExtractHere => ParameterShape::Targets,
-        CommandAction::CustomAction => ParameterShape::CustomAction,
-        _ => ParameterShape::Targets,
-    };
-    let valid = match (shape, parameters) {
-        (ParameterShape::None, CommandParameters::None)
-        | (ParameterShape::Location, CommandParameters::Location(_)) => true,
-        (ParameterShape::Targets, CommandParameters::Targets(targets)) => !targets.is_empty(),
-        (ParameterShape::Destination, CommandParameters::Destination { targets, .. }) => {
-            !targets.is_empty()
+    let contract = action.parameter_contract();
+    let valid = match (contract, parameters) {
+        (CommandParameterContract::None, CommandParameters::None)
+        | (CommandParameterContract::Location, CommandParameters::Location(_)) => true,
+        (CommandParameterContract::Targets(cardinality), CommandParameters::Targets(targets)) => {
+            cardinality_matches(cardinality, targets.len())
         }
-        (ParameterShape::CustomAction, CommandParameters::CustomAction { targets, .. }) => {
-            !targets.is_empty()
-        }
+        (
+            CommandParameterContract::Destination(cardinality),
+            CommandParameters::Destination { targets, .. },
+        ) => cardinality_matches(cardinality, targets.len()),
+        (
+            CommandParameterContract::CustomAction(cardinality),
+            CommandParameters::CustomAction { targets, .. },
+        ) => cardinality_matches(cardinality, targets.len()),
         _ => false,
     };
     valid.then_some(()).ok_or_else(|| {
         CommandDispatchError::new(format!("invalid parameters for command action {action:?}"))
     })
+}
+
+const fn cardinality_matches(cardinality: TargetCardinality, count: usize) -> bool {
+    match cardinality {
+        TargetCardinality::ExactlyOne => count == 1,
+        TargetCardinality::OneOrMore => count > 0,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -599,11 +710,16 @@ pub enum CommandPredicate {
     WritableSelection,
     WritableExactlyOneSelection,
     WritableSelectionCapability(CapabilityKind),
+    WritableExactlyOneSelectionCapability(CapabilityKind),
+    WritableExactlyOneFileCapability(CapabilityKind),
     Hide,
     Unhide,
     WritableArchive,
     WritableNonArchive,
     PasteInto,
+    DestinationCopy,
+    DestinationMove,
+    DestinationExtract,
     ProviderAction(ProviderAction),
     PinnedDirectory,
     UnpinnedDirectory,
@@ -623,7 +739,7 @@ impl CommandPredicate {
             Self::HasItems if context.item_count > 0 => CommandState::enabled(),
             Self::HasSelection if context.has_target_selection() => CommandState::enabled(),
             Self::ExactlyOneSelection
-                if context.selection_count == 1 && context.target != CommandTarget::Background =>
+                if context.selection_count == 1 && context.has_target_selection() =>
             {
                 CommandState::enabled()
             }
@@ -651,11 +767,6 @@ impl CommandPredicate {
                 CommandState::enabled()
             }
             Self::WritableLocation if context.location_is_writable => CommandState::enabled(),
-            Self::WritableDestination
-                if context.has_target_selection() && context.destination_is_writable =>
-            {
-                CommandState::enabled()
-            }
             Self::Capability(kind) if context.has_target_selection() => {
                 match context.capability(kind) {
                     CapabilityState::Supported => CommandState::enabled(),
@@ -728,12 +839,7 @@ impl CommandPredicate {
                 CommandState::disabled("a directory or its background must be targeted")
             }
             Self::WritableLocation => CommandState::disabled("the current location is read-only"),
-            Self::WritableDestination => CommandState::disabled(
-                context
-                    .destination_reason
-                    .as_deref()
-                    .unwrap_or("the destination is read-only"),
-            ),
+            Self::WritableDestination => CommandState::disabled("choose a destination first"),
             Self::Capability(_) => CommandState::disabled("no items are selected"),
             Self::DotNameSemantics => {
                 CommandState::disabled("the provider does not support dot-name semantics")
@@ -767,11 +873,20 @@ impl CommandPredicate {
             Self::WritableSelectionCapability(capability) => Some(
                 writable_selection_state(context).and_capability(context.capability(capability)),
             ),
+            Self::WritableExactlyOneSelectionCapability(capability) => Some(
+                writable_exactly_one_selection_capability_state(context, capability),
+            ),
+            Self::WritableExactlyOneFileCapability(capability) => Some(
+                writable_exactly_one_file_capability_state(context, capability),
+            ),
             Self::Hide => Some(hide_state(context, false)),
             Self::Unhide => Some(hide_state(context, true)),
             Self::WritableArchive => Some(archive_mutation_state(context)),
             Self::WritableNonArchive => Some(non_archive_mutation_state(context)),
             Self::PasteInto => Some(paste_state(context)),
+            Self::DestinationCopy => Some(destination_operation_state(context, false)),
+            Self::DestinationMove => Some(destination_operation_state(context, true)),
+            Self::DestinationExtract => Some(archive_destination_state(context)),
             Self::ProviderAction(action) => Some(provider_action_state(context, action)),
             Self::PinnedDirectory => Some(pin_state(context, true)),
             Self::UnpinnedDirectory => Some(pin_state(context, false)),
@@ -867,6 +982,10 @@ impl CommandDefinition {
     #[must_use]
     pub fn handler(&self) -> CommandHandler {
         self.handler
+    }
+    #[must_use]
+    pub fn parameter_contract(&self) -> CommandParameterContract {
+        self.handler.action().parameter_contract()
     }
     #[must_use]
     pub fn action(&self) -> CommandAction {
@@ -1464,7 +1583,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.copy-to",
             "copy",
             &[],
-            P::HasSelection,
+            P::DestinationCopy,
             A::CopyTo,
             G::Clipboard,
             D::None,
@@ -1474,7 +1593,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.move-to",
             "arrow-right",
             &[],
-            P::HasSelection,
+            P::DestinationMove,
             A::MoveTo,
             G::Clipboard,
             D::Review,
@@ -1514,7 +1633,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.create-symbolic-link",
             "link",
             &[],
-            P::WritableSelectionCapability(CapabilityKind::SymbolicLinks),
+            P::WritableExactlyOneSelectionCapability(CapabilityKind::SymbolicLinks),
             A::CreateSymbolicLink,
             G::Organization,
             D::None,
@@ -1524,7 +1643,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.create-hard-link",
             "link",
             &[],
-            P::WritableSelectionCapability(CapabilityKind::HardLinks),
+            P::WritableExactlyOneFileCapability(CapabilityKind::HardLinks),
             A::CreateHardLink,
             G::Organization,
             D::None,
@@ -1544,7 +1663,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.extract",
             "archive-restore",
             &[],
-            P::WritableArchive,
+            P::DestinationExtract,
             A::Extract,
             G::FileType,
             D::None,

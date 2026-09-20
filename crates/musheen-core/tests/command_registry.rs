@@ -1,8 +1,9 @@
 use musheen_core::{
     CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, CommandAction,
     CommandContext, CommandContributionPolicy, CommandDispatchError, CommandDispatcher,
-    CommandParameters, CommandRegistry, CommandSubmenu, CommandTarget, CommandTargetRef,
-    DangerLevel, ItemId, ProviderAction, ProviderActionMatrix, ProviderId, StorePath,
+    CommandParameterContract, CommandParameters, CommandRegistry, CommandSubmenu, CommandTarget,
+    CommandTargetRef, DangerLevel, ItemId, ProviderAction, ProviderActionMatrix, ProviderId,
+    ResolvedDestination, StorePath, TargetCardinality,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -223,9 +224,9 @@ fn selection_and_destination_rules_are_enforced_before_dispatch() {
     assert!(!send_to.state(&context).is_enabled());
     assert_eq!(
         send_to.state(&context).disabled_reason(),
-        Some("the destination is read-only")
+        Some("choose a destination first")
     );
-    context.destination_is_writable = true;
+    context.resolved_destination = Some(writable_destination());
     assert!(send_to.state(&context).is_enabled());
 }
 
@@ -581,9 +582,10 @@ fn target_and_saved_state_policies_are_mutually_exclusive() {
 fn paste_and_mount_navigation_require_their_exact_targets() {
     let registry = CommandRegistry::built_in();
     let paste = CommandContext {
+        selection_count: 1,
         target: CommandTarget::Directory,
         clipboard_has_contents: true,
-        destination_is_writable: true,
+        resolved_destination: Some(writable_destination()),
         mutation_is_supported: true,
         ..CommandContext::default()
     };
@@ -678,6 +680,14 @@ fn handlers_reject_invalid_parameter_shapes_before_dispatch() {
             .is_err()
     );
     assert!(dispatcher.actions.is_empty());
+    assert!(
+        rename
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::targets(vec![local_target(), local_target()]),
+            )
+            .is_err()
+    );
     rename
         .invoke(
             &mut dispatcher,
@@ -706,6 +716,38 @@ fn handlers_reject_invalid_parameter_shapes_before_dispatch() {
         vec![CommandAction::Rename, CommandAction::PasteInto]
     );
 
+    let directory_properties = registry.get("directory.properties").unwrap().handler();
+    directory_properties
+        .invoke(
+            &mut dispatcher,
+            CommandParameters::Location(StorePath::from_unix_path("/tmp")),
+        )
+        .unwrap();
+    assert!(
+        directory_properties
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::targets(vec![local_target()])
+            )
+            .is_err()
+    );
+
+    let empty_trash = registry.get("trash.empty").unwrap().handler();
+    empty_trash
+        .invoke(
+            &mut dispatcher,
+            CommandParameters::Location(StorePath::from_unix_path("/trash")),
+        )
+        .unwrap();
+    assert!(
+        empty_trash
+            .invoke(
+                &mut dispatcher,
+                CommandParameters::targets(vec![local_target()])
+            )
+            .is_err()
+    );
+
     let extract_here = registry.get("archive.extract_here").unwrap().handler();
     extract_here
         .invoke(
@@ -729,6 +771,8 @@ fn handlers_reject_invalid_parameter_shapes_before_dispatch() {
         vec![
             CommandAction::Rename,
             CommandAction::PasteInto,
+            CommandAction::DirectoryProperties,
+            CommandAction::EmptyTrash,
             CommandAction::ExtractHere
         ]
     );
@@ -736,6 +780,161 @@ fn handlers_reject_invalid_parameter_shapes_before_dispatch() {
     let remote = ProviderId::new("remote").unwrap();
     let remote_id = ItemId::new(remote, b"entry".to_vec()).unwrap();
     assert!(CommandTargetRef::new(remote_id, StorePath::from_unix_path("/tmp")).is_err());
+}
+
+#[test]
+fn destination_and_source_policies_distinguish_choosing_from_executing() {
+    let registry = CommandRegistry::built_in();
+    let copy_to = registry.get("clipboard.copy_to").unwrap();
+    let move_to = registry.get("clipboard.move_to").unwrap();
+    let extract = registry.get("archive.extract").unwrap();
+    let extract_here = registry.get("archive.extract_here").unwrap();
+
+    let mut file = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::File,
+        location_is_writable: false,
+        mutation_is_supported: true,
+        resolved_destination: Some(writable_destination()),
+        ..CommandContext::default()
+    };
+    let chooser = CommandContext {
+        resolved_destination: None,
+        ..file.clone()
+    };
+    assert!(copy_to.state(&chooser).is_enabled());
+    assert!(!move_to.state(&chooser).is_enabled());
+    assert!(copy_to.state(&file).is_enabled());
+    assert!(!move_to.state(&file).is_enabled());
+    file.location_is_writable = true;
+    file.resolved_destination = Some(ResolvedDestination::read_only(
+        StorePath::from_unix_path("/read-only"),
+        "the destination is read-only",
+    ));
+    assert!(!copy_to.state(&file).is_enabled());
+    assert!(!move_to.state(&file).is_enabled());
+
+    let mut archive = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::Archive,
+        location_is_writable: false,
+        mutation_is_supported: true,
+        resolved_destination: Some(writable_destination()),
+        ..CommandContext::default()
+    };
+    let extract_chooser = CommandContext {
+        resolved_destination: None,
+        ..archive.clone()
+    };
+    assert!(extract.state(&extract_chooser).is_enabled());
+    assert!(extract.state(&archive).is_enabled());
+    assert!(!extract_here.state(&archive).is_enabled());
+    archive.location_is_writable = true;
+    archive.resolved_destination = Some(ResolvedDestination::read_only(
+        StorePath::from_unix_path("/read-only"),
+        "the destination is read-only",
+    ));
+    assert!(!extract.state(&archive).is_enabled());
+    assert!(extract_here.state(&archive).is_enabled());
+}
+
+#[test]
+fn selection_targets_and_paste_destinations_reject_stale_or_inexact_contexts() {
+    let registry = CommandRegistry::built_in();
+    let copy = registry.get("clipboard.copy").unwrap();
+    let open = registry.get("file.open").unwrap();
+    let hard_link = registry.get("file.create_hard_link").unwrap();
+    let paste = registry.get("clipboard.paste_into").unwrap();
+
+    let stale_trash_background = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::TrashBackground,
+        ..CommandContext::default()
+    };
+    assert!(!copy.state(&stale_trash_background).is_enabled());
+    assert!(!open.state(&stale_trash_background).is_enabled());
+
+    let directory = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::Directory,
+        location_is_writable: true,
+        mutation_is_supported: true,
+        capabilities: CapabilityMatrix::new(|kind| match kind {
+            CapabilityKind::HardLinks => CapabilityState::Supported,
+            _ => CapabilityState::Unknown(CapabilityReason::new("not applicable").unwrap()),
+        }),
+        ..CommandContext::default()
+    };
+    assert!(!hard_link.state(&directory).is_enabled());
+    assert!(
+        hard_link
+            .state(&CommandContext {
+                target: CommandTarget::File,
+                ..directory.clone()
+            })
+            .is_enabled()
+    );
+    assert!(
+        !hard_link
+            .state(&CommandContext {
+                target: CommandTarget::File,
+                capabilities: CapabilityMatrix::new(|_| {
+                    CapabilityState::Unsupported(
+                        CapabilityReason::new("hard links are unavailable").unwrap(),
+                    )
+                }),
+                ..directory
+            })
+            .is_enabled()
+    );
+
+    let ready_to_paste = CommandContext {
+        clipboard_has_contents: true,
+        resolved_destination: Some(writable_destination()),
+        mutation_is_supported: true,
+        ..CommandContext::default()
+    };
+    assert!(paste.state(&ready_to_paste).is_enabled());
+    let directory_without_item = CommandContext {
+        target: CommandTarget::Directory,
+        ..ready_to_paste.clone()
+    };
+    assert!(!paste.state(&directory_without_item).is_enabled());
+    let background_with_stale_selection = CommandContext {
+        selection_count: 1,
+        ..ready_to_paste
+    };
+    assert!(!paste.state(&background_with_stale_selection).is_enabled());
+}
+
+#[test]
+fn every_single_target_contract_rejects_multiple_targets_before_dispatch() {
+    let registry = CommandRegistry::built_in();
+    let mut dispatcher = RecordingDispatcher::default();
+
+    for command in registry.commands() {
+        let parameters = match command.parameter_contract() {
+            CommandParameterContract::Targets(TargetCardinality::ExactlyOne) => {
+                CommandParameters::targets(vec![local_target(), local_target()])
+            }
+            CommandParameterContract::Destination(TargetCardinality::ExactlyOne) => {
+                CommandParameters::destination(
+                    vec![local_target(), local_target()],
+                    StorePath::from_unix_path("/destination"),
+                )
+            }
+            _ => continue,
+        };
+        assert!(
+            command
+                .handler()
+                .invoke(&mut dispatcher, parameters)
+                .is_err(),
+            "{} accepted multiple targets",
+            command.id().as_str()
+        );
+    }
+    assert!(dispatcher.actions.is_empty());
 }
 
 #[derive(Default)]
@@ -758,4 +957,8 @@ fn local_target() -> CommandTargetRef {
     let local = ProviderId::new("local").unwrap();
     let id = ItemId::new(local, b"entry".to_vec()).unwrap();
     CommandTargetRef::new(id, StorePath::from_unix_path("/tmp/entry")).unwrap()
+}
+
+fn writable_destination() -> ResolvedDestination {
+    ResolvedDestination::writable(StorePath::from_unix_path("/destination"))
 }
