@@ -268,4 +268,19 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn status_documents_from_before_custom_actions_remain_compatible() {
+        let model = StatusCenterModel::default();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&model.to_json().unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("status document is an object")
+            .remove("custom_actions");
+
+        let restored = StatusCenterModel::from_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert!(restored.custom_actions().is_empty());
+    }
 }
