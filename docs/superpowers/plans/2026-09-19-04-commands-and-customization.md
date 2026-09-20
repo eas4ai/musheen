@@ -36,22 +36,22 @@ UIV-020, UIV-022.
 **Files:** Create `crates/musheen-ui/src/menus/{mod,builder,context,open_with,send_to}.rs`;
 create `crates/musheen-ui/tests/context_menus.rs`.
 
-- [ ] Add table-driven tests for empty space, one file, one folder, mixed
+- [x] Add table-driven tests for empty space, one file, one folder, mixed
   selection, archive, executable, hidden item, read-only provider, trash,
   clipboard state, privileged location, right-click selection preservation,
   and keyboard targeting of the focused item or view background.
-- [ ] Assert coverage for Open, Open With and association selection, Send To,
+- [x] Assert coverage for Open, Open With and association selection, Send To,
   Cut, Copy, Copy To, Move To, Paste, Rename, Duplicate, soft link, hard link,
   Compress, Extract, Hide, Unhide, Trash, permanent delete, Properties,
   permissions, Run as Administrator, and Open as Administrator.
-- [ ] Test Copy To and Move To chooser cancellation, destination preflight,
+- [x] Test Copy To and Move To chooser cancellation, destination preflight,
   provider capability refusal, conflict routing, and command identity.
-- [ ] Run `cargo test -p musheen-ui --test context_menus`; expect failure.
-- [ ] Implement policy-driven sections, stable ordering, native-theme styling,
+- [x] Run `cargo test -p musheen-ui --test context_menus`; expect failure.
+- [x] Implement policy-driven sections, stable ordering, native-theme styling,
   submenu overflow, disabled explanations, and destructive confirmations.
   Unsupported actions are disabled or omitted before invocation.
-- [ ] Run keyboard navigation, screen-reader tree, RTL, and pseudo-locale tests.
-- [ ] Commit with `feat(ui): add capability-aware context menus`.
+- [x] Run keyboard navigation, screen-reader tree, RTL, and pseudo-locale tests.
+- [x] Commit with `feat(ui): add capability-aware context menus`.
 
 ### Task 3: Build the Settings window and migrations
 
