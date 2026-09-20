@@ -157,7 +157,7 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("alt-up", GoParent, None),
         KeyBinding::new("f5", Reload, None),
         KeyBinding::new("ctrl-l", EditLocation, None),
-        KeyBinding::new("ctrl-f", SearchLocation, None),
+        KeyBinding::new("ctrl-f", SearchLocation, Some("!Input")),
         KeyBinding::new("ctrl-shift-f", FilterLocation, None),
         KeyBinding::new("ctrl-shift-p", OpenCommandMode, None),
         KeyBinding::new("ctrl-t", NewTabShortcut, None),
@@ -165,9 +165,9 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-t", ReopenClosedTabShortcut, None),
         KeyBinding::new("f3", SplitPaneShortcut, None),
         KeyBinding::new("f6", FocusNextPaneShortcut, None),
-        KeyBinding::new("ctrl-a", SelectAllShortcut, None),
+        KeyBinding::new("ctrl-a", SelectAllShortcut, Some("!Input")),
         KeyBinding::new("escape", Escape, None),
-        KeyBinding::new("ctrl-h", ToggleHiddenShortcut, None),
+        KeyBinding::new("ctrl-h", ToggleHiddenShortcut, Some("!Input")),
         KeyBinding::new("ctrl-1", ViewDetailsShortcut, None),
         KeyBinding::new("ctrl-2", ViewListShortcut, None),
         KeyBinding::new("ctrl-3", ViewCardsShortcut, None),
@@ -2357,12 +2357,26 @@ impl MusheenApp {
                 .is_some_and(|tab| tab.history().can_go_forward()),
             has_parent: location.as_unix_path().and_then(Path::parent).is_some(),
             can_close_tab: pane.tabs().len() > 1,
-            can_reopen_closed_tab: pane.has_closed_tabs(),
+            can_reopen_closed_tab: pane.has_closed_tabs() && pane.has_tab_capacity(),
             can_move_tab_left: pane
                 .tabs()
                 .first()
                 .is_some_and(|tab| tab.id() != active_tab),
             can_move_tab_right: pane.tabs().last().is_some_and(|tab| tab.id() != active_tab),
+            can_create_tab: pane.has_tab_capacity(),
+            can_move_tab_other_pane: pane.tabs().len() > 1
+                && self
+                    .navigation
+                    .panes()
+                    .iter()
+                    .any(|other| other.id() != pane.id() && other.has_tab_capacity()),
+            can_tear_out_tab: pane.tabs().len() > 1
+                && self
+                    .session_binding
+                    .as_ref()
+                    .is_some_and(SessionBinding::can_append_window),
+            can_split_pane: self.navigation.can_split(),
+            can_focus_next_pane: self.navigation.panes().len() > 1,
             target: item_target,
             item_count,
             selection_count: selection.len(),
@@ -4446,6 +4460,16 @@ impl MusheenApp {
         } else {
             musheen_core::ShortcutScope::Browser
         };
+        if scope == musheen_core::ShortcutScope::Global
+            && cx
+                .all_bindings_for_input(std::slice::from_ref(key))
+                .iter()
+                .any(|binding| binding.action().name().starts_with("input::"))
+        {
+            // The focused native input owns its editing actions. Consult its
+            // installed bindings, rather than duplicating a list of editing keys.
+            return;
+        }
         if let Some(id) = map.resolve(&chord, scope, self.shell.commands()) {
             cx.stop_propagation();
             window.prevent_default();
@@ -7417,6 +7441,75 @@ mod tests {
                 &child,
                 "reassigned Alt+Left must not navigate through omnibar focus"
             );
+            let input = app.read(cx).omnibar_input.as_ref().unwrap().clone();
+            for rebind in [false, true] {
+                let mut shortcuts = musheen_core::ShortcutMap::default();
+                for (id, key) in [
+                    ("selection.select_all", "ctrl-alt-a"),
+                    ("clipboard.copy", "ctrl-alt-c"),
+                    ("clipboard.cut", "ctrl-alt-x"),
+                    ("clipboard.paste_into", "ctrl-alt-v"),
+                ] {
+                    if rebind {
+                        shortcuts
+                            .assign(id, musheen_core::ShortcutScope::Browser, key, &registry)
+                            .unwrap();
+                    } else {
+                        shortcuts
+                            .clear(id, musheen_core::ShortcutScope::Browser, &registry)
+                            .unwrap();
+                    }
+                }
+                let mut document = musheen_desktop::SettingsDocument::default();
+                shortcuts
+                    .assign(
+                        "view.sidebar",
+                        musheen_core::ShortcutScope::Global,
+                        "ctrl-a",
+                        &registry,
+                    )
+                    .unwrap();
+                document
+                    .set_value("shortcuts.bindings", &shortcuts.export())
+                    .unwrap();
+                cx.set_global(crate::settings::RuntimeSettings(document));
+                input.update(cx, |input, cx| input.set_value("alpha beta", window, cx));
+                window.render_frame(cx);
+                window.press("end", cx);
+                window.press("ctrl-a", cx);
+                assert_eq!(
+                    input.read(cx).selected_range(),
+                    0..10,
+                    "native select all, rebind={rebind}"
+                );
+                assert!(
+                    app.read(cx).sidebar_visible,
+                    "native editing wins over a custom global binding"
+                );
+                window.press("ctrl-c", cx);
+                assert_eq!(
+                    cx.read_from_clipboard().and_then(|item| item.text()),
+                    Some("alpha beta".into())
+                );
+                window.press("ctrl-x", cx);
+                assert_eq!(
+                    input.read(cx).value().as_str(),
+                    "",
+                    "native cut, rebind={rebind}"
+                );
+                window.press("ctrl-v", cx);
+                assert_eq!(
+                    input.read(cx).value().as_str(),
+                    "alpha beta",
+                    "native paste, rebind={rebind}"
+                );
+                window.press("home", cx);
+                assert_eq!(input.read(cx).selected_range(), 0..0);
+                window.press("shift-end", cx);
+                assert_eq!(input.read(cx).selected_range(), 0..10);
+                window.press("backspace", cx);
+                assert_eq!(input.read(cx).value().as_str(), "");
+            }
             // Reset restores the static default while the omnibar remains focused.
             cx.set_global(crate::settings::RuntimeSettings(
                 musheen_desktop::SettingsDocument::default(),
@@ -7488,6 +7581,158 @@ mod tests {
             }
             window.remove_window();
         }).unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn customization_tab_and_pane_capacity_matches_toolbar_and_shortcuts(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        let location = StorePath::from_unix_path(temporary.path().as_os_str());
+        let mut app = None;
+        let handle = cx.open_window(size(px(1200.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(
+                    temporary.path().to_path_buf(),
+                    Some(SessionStore::at(temporary.path().join("session.json"))),
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let binding = app.read(cx).session_binding.clone().unwrap();
+            let commands = [
+                "tab.new",
+                "tab.duplicate",
+                "tab.reopen_closed",
+                "tab.move_other_pane",
+                "tab.tear_out",
+                "pane.split",
+                "pane.focus_next",
+            ];
+            let registry = musheen_core::CommandRegistry::built_in();
+            let mut shortcuts = musheen_core::ShortcutMap::default();
+            for (index, id) in commands.iter().enumerate() {
+                shortcuts
+                    .assign(
+                        id,
+                        musheen_core::ShortcutScope::Browser,
+                        &format!("ctrl-shift-{}", index + 1),
+                        &registry,
+                    )
+                    .unwrap();
+            }
+            let mut document = musheen_desktop::SettingsDocument::default();
+            document
+                .set_value(
+                    "layout.toolbar",
+                    &format!("v1;navigation.location;{}", commands.join(";")),
+                )
+                .unwrap();
+            document
+                .set_value("shortcuts.bindings", &shortcuts.export())
+                .unwrap();
+            cx.set_global(crate::settings::RuntimeSettings(document));
+            // source tabs, destination tabs (zero = no other pane), windows, expected states
+            for (source_tabs, destination_tabs, windows, expected) in [
+                (1, 0, 1, [true, true, true, false, false, true, false]),
+                (2, 0, 1, [true, true, true, false, true, true, false]),
+                (128, 0, 1, [false, false, false, false, true, true, false]),
+                (1, 1, 1, [true, true, true, false, false, false, true]),
+                (2, 1, 1, [true, true, true, true, true, false, true]),
+                (2, 128, 1, [true, true, true, false, true, false, true]),
+                (
+                    2,
+                    0,
+                    MAX_WINDOWS,
+                    [true, true, true, false, false, true, false],
+                ),
+                (2, 0, 0, [true, true, true, false, false, true, false]),
+            ] {
+                let mut navigation = WindowSession::new(location.clone());
+                navigation.new_tab(location.clone()).unwrap();
+                navigation.close_active_tab().unwrap();
+                for _ in 1..source_tabs {
+                    navigation.new_tab(location.clone()).unwrap();
+                }
+                let source = navigation.focused_pane_id();
+                if destination_tabs > 0 {
+                    navigation.split_focused(location.clone()).unwrap();
+                    for _ in 1..destination_tabs {
+                        navigation.new_tab(location.clone()).unwrap();
+                    }
+                    navigation.focus_pane(source).unwrap();
+                }
+                binding.coordinator.lock().unwrap().windows = (1..=windows)
+                    .map(|id| (id as u64, navigation.clone()))
+                    .collect();
+                app.update(cx, |state, cx| {
+                    state.navigation = navigation;
+                    state.session_binding = (windows > 0).then(|| binding.clone());
+                    state.load_focused_tab(cx);
+                });
+                window.render_frame(cx);
+                for (index, (id, enabled)) in commands.iter().zip(expected).enumerate() {
+                    let state = app.read(cx);
+                    let command = state.shell.commands().get(id).unwrap();
+                    let command_state =
+                        command.state(&state.active_command_context(command.action()));
+                    assert_eq!(
+                        command_state.is_enabled(),
+                        enabled,
+                        "{id}: tabs={source_tabs}, other={destination_tabs}, windows={windows}"
+                    );
+                    assert_eq!(command_state.disabled_reason().is_some(), !enabled);
+                    assert!(window.find(format!("custom-toolbar-{id}")).visible());
+                    if !enabled {
+                        let before = state.navigation.clone();
+                        window.click(format!("custom-toolbar-{id}"), cx);
+                        window.press(&format!("ctrl-shift-{}", index + 1), cx);
+                        assert!(
+                            app.read(cx).navigation == before,
+                            "disabled {id} changed navigation"
+                        );
+                        assert_eq!(binding.coordinator.lock().unwrap().windows.len(), windows);
+                    }
+                }
+            }
+            let navigation = WindowSession::new(location.clone());
+            binding.coordinator.lock().unwrap().windows = vec![(1, navigation.clone())];
+            app.update(cx, |state, cx| {
+                state.navigation = navigation;
+                state.session_binding = Some(binding.clone());
+                state.load_focused_tab(cx);
+            });
+            window.render_frame(cx);
+            window.click("custom-toolbar-tab.new", cx);
+            assert_eq!(app.read(cx).navigation.focused_pane().tabs().len(), 2);
+            window.press("ctrl-shift-2", cx);
+            assert_eq!(app.read(cx).navigation.focused_pane().tabs().len(), 3);
+            window.click("custom-toolbar-pane.split", cx);
+            assert_eq!(app.read(cx).navigation.panes().len(), 2);
+            window.press("ctrl-shift-7", cx);
+            assert_eq!(app.read(cx).navigation.focused_pane().tabs().len(), 3);
+            window.render_frame(cx);
+            window.click("custom-toolbar-tab.move_other_pane", cx);
+            assert_eq!(app.read(cx).navigation.focused_pane().tabs().len(), 2);
+            window.press("ctrl-shift-4", cx);
+            assert_eq!(app.read(cx).navigation.focused_pane().tabs().len(), 1);
+            window.press("ctrl-shift-1", cx);
+            window.render_frame(cx);
+            window.click("custom-toolbar-tab.tear_out", cx);
+            assert_eq!(app.read(cx).navigation.focused_pane().tabs().len(), 1);
+            assert_eq!(binding.coordinator.lock().unwrap().windows.len(), 2);
+            window.remove_window();
+        })
+        .unwrap();
     }
 
     struct ImmediateSearchStream(Option<SearchBatch>);

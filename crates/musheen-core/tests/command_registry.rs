@@ -15,6 +15,12 @@ fn tab_commands_refuse_unavailable_navigation_transitions() {
         "tab.reopen_closed",
         "tab.move_left",
         "tab.move_right",
+        "tab.new",
+        "tab.duplicate",
+        "tab.move_other_pane",
+        "tab.tear_out",
+        "pane.split",
+        "pane.focus_next",
     ] {
         let state = registry.get(id).unwrap().state(&CommandContext::default());
         assert!(!state.is_enabled(), "{id} must require live tab facts");

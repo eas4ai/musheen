@@ -20,6 +20,37 @@ fn item(key: &[u8]) -> ItemId {
 }
 
 #[test]
+fn moving_to_a_full_pane_preserves_the_source_tab_and_both_panes() {
+    let mut window = WindowSession::new(path("/source"));
+    window.new_tab(path("/source/selected")).unwrap();
+    let source = window.focused_pane_id();
+    let destination = window.split_focused(path("/destination")).unwrap();
+    for _ in 1..128 {
+        window.new_tab(path("/destination")).unwrap();
+    }
+    window.focus_pane(source).unwrap();
+    let before = window.clone();
+    assert!(window.move_active_tab_to(destination).is_err());
+    assert_eq!(
+        window, before,
+        "failed transfer must not remove the source tab"
+    );
+}
+
+#[test]
+fn reopening_at_tab_capacity_preserves_closed_history() {
+    let mut window = WindowSession::new(path("/source"));
+    window.new_tab(path("/closed")).unwrap();
+    window.close_active_tab().unwrap();
+    for _ in 1..128 {
+        window.new_tab(path("/source")).unwrap();
+    }
+    let before = window.clone();
+    assert!(window.reopen_closed_tab().is_err());
+    assert_eq!(window, before);
+}
+
+#[test]
 fn pane_histories_and_selections_remain_independent() {
     let mut window = WindowSession::new(path("/left"));
     let left = window.focused_pane_id();

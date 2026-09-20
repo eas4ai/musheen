@@ -200,7 +200,7 @@ impl WindowSession {
     }
 
     pub fn split_focused(&mut self, initial: StorePath) -> Result<PaneId, NavigationError> {
-        if self.panes.len() >= MAX_PANES {
+        if !self.can_split() {
             return Err(NavigationError::LimitReached("panes per window"));
         }
         let id = PaneId::new(self.next_pane_id);
@@ -208,6 +208,11 @@ impl WindowSession {
         self.panes.push(PaneState::new(id, initial));
         self.focused_pane = self.panes.len() - 1;
         Ok(id)
+    }
+
+    #[must_use]
+    pub fn can_split(&self) -> bool {
+        self.panes.len() < MAX_PANES
     }
 
     pub fn duplicate_active_tab(&mut self) -> Result<TabId, NavigationError> {
@@ -237,6 +242,10 @@ impl WindowSession {
         };
         if destination_index == self.focused_pane {
             return Err(NavigationError::SamePane);
+        }
+        // Validate the destination before taking ownership from the source.
+        if !self.panes[destination_index].has_tab_capacity() {
+            return Err(NavigationError::LimitReached("tabs per pane"));
         }
         let tab = self.focused_pane_mut().take_active_tab()?;
         self.panes[destination_index].insert_tab(tab)

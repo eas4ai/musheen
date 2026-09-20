@@ -609,7 +609,9 @@ pub(crate) fn apply_appearance(document: &SettingsDocument, cx: &mut App) {
     if !cx.has_global::<DesktopAppearance>() {
         cx.set_global(DesktopAppearance(AppearanceSnapshot::capture(cx)));
     }
-    let preferences = native_theme::AccessibilityPreferences::from_system();
+    // Startup resolves desktop preferences through the native bridge. Reuse that
+    // snapshot: preview must not block on the portal or inherit a prior override.
+    let preferences = cx.global::<DesktopAppearance>().0.preferences.clone();
     if document.value("appearance.mode").as_deref() == Some("system") {
         let desktop = cx.global::<DesktopAppearance>().0.clone();
         desktop.restore(cx);
@@ -918,6 +920,37 @@ mod tests {
             window.remove_window();
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn appearance_override_keeps_captured_native_accessibility(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let preferences = native_theme::AccessibilityPreferences {
+                reduce_motion: true,
+                reduce_transparency: true,
+                ..Default::default()
+            };
+            let (theme, resolved) =
+                native_theme_gpui::from_preset("kde-breeze", false, &preferences).unwrap();
+            native_theme_gpui::apply(theme, &resolved, &preferences, cx);
+            let mut document = SettingsDocument::default();
+            for mode in ["dark", "light", "system"] {
+                document.set_value("appearance.mode", mode).unwrap();
+                apply_appearance(&document, cx);
+                let actual = cx
+                    .global::<native_theme_gpui::NativeTheme>()
+                    .accessibility();
+                assert!(
+                    actual.reduce_motion,
+                    "desktop motion preference lost in {mode}"
+                );
+                assert!(
+                    actual.reduce_transparency,
+                    "desktop transparency preference lost in {mode}"
+                );
+            }
+        });
     }
 
     #[gpui_kit::test]

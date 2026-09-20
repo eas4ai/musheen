@@ -62,6 +62,11 @@ impl PaneState {
         !self.closed_tabs.is_empty()
     }
 
+    #[must_use]
+    pub fn has_tab_capacity(&self) -> bool {
+        self.tabs.len() < MAX_TABS_PER_PANE
+    }
+
     pub(super) fn tabs_mut(&mut self) -> &mut [TabState] {
         &mut self.tabs
     }
@@ -76,7 +81,7 @@ impl PaneState {
     }
 
     pub fn create_tab(&mut self, location: StorePath) -> Result<TabId, NavigationError> {
-        if self.tabs.len() >= MAX_TABS_PER_PANE {
+        if !self.has_tab_capacity() {
             return Err(NavigationError::LimitReached("tabs per pane"));
         }
         let id = self.allocate_tab_id();
@@ -86,7 +91,7 @@ impl PaneState {
     }
 
     pub fn duplicate_active_tab(&mut self) -> Result<TabId, NavigationError> {
-        if self.tabs.len() >= MAX_TABS_PER_PANE {
+        if !self.has_tab_capacity() {
             return Err(NavigationError::LimitReached("tabs per pane"));
         }
         let id = self.allocate_tab_id();
@@ -104,6 +109,9 @@ impl PaneState {
     }
 
     pub fn reopen_closed_tab(&mut self) -> Result<TabId, NavigationError> {
+        if !self.has_tab_capacity() {
+            return Err(NavigationError::LimitReached("tabs per pane"));
+        }
         let Some(tab) = self.closed_tabs.pop() else {
             return Err(NavigationError::NoClosedTab);
         };
@@ -147,7 +155,7 @@ impl PaneState {
     }
 
     pub(super) fn insert_tab(&mut self, tab: TabState) -> Result<TabId, NavigationError> {
-        if self.tabs.len() >= MAX_TABS_PER_PANE {
+        if !self.has_tab_capacity() {
             return Err(NavigationError::LimitReached("tabs per pane"));
         }
         let id = self.allocate_tab_id();
