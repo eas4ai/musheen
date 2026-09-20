@@ -278,32 +278,29 @@ fn acl_allows_directory_mutation(
     group_ids: &[u32],
 ) -> bool {
     let required = ACL_WRITE | ACL_EXECUTE;
-    let permitted = if owner == uid {
-        acl.get(Qualifier::UserObj).unwrap_or_default()
-    } else if let Some(named_user) = acl.get(Qualifier::User(uid)) {
-        apply_acl_mask(named_user, acl)
-    } else {
-        let (group_matched, group_permission) =
-            acl.entries()
-                .into_iter()
-                .fold((false, 0), |(matched, permissions), entry| {
-                    match entry.qual {
-                        Qualifier::GroupObj if group_ids.contains(&owning_group) => {
-                            (true, permissions | entry.perm)
-                        }
-                        Qualifier::Group(group) if group_ids.contains(&group) => {
-                            (true, permissions | entry.perm)
-                        }
-                        _ => (matched, permissions),
-                    }
-                });
-        if group_matched {
-            apply_acl_mask(group_permission, acl)
-        } else {
-            acl.get(Qualifier::Other).unwrap_or_default()
+    if owner == uid {
+        return acl.get(Qualifier::UserObj).unwrap_or_default() & required == required;
+    }
+    if let Some(named_user) = acl.get(Qualifier::User(uid)) {
+        return apply_acl_mask(named_user, acl) & required == required;
+    }
+    let mut group_matched = false;
+    for entry in acl.entries() {
+        let matches = match entry.qual {
+            Qualifier::GroupObj => group_ids.contains(&owning_group),
+            Qualifier::Group(group) => group_ids.contains(&group),
+            _ => false,
+        };
+        if matches {
+            group_matched = true;
+            // Linux checks each matching group separately. Bits from
+            // different entries cannot combine to satisfy a request.
+            if apply_acl_mask(entry.perm, acl) & required == required {
+                return true;
+            }
         }
-    };
-    permitted & required == required
+    }
+    !group_matched && acl.get(Qualifier::Other).unwrap_or_default() & required == required
 }
 
 fn apply_acl_mask(permissions: u32, acl: &PosixACL) -> u32 {
@@ -326,16 +323,37 @@ mod acl_tests {
     }
 
     #[test]
-    fn matching_acl_groups_union_before_mask_and_named_user_takes_precedence() {
+    fn one_matching_group_must_grant_both_write_and_search_after_mask() {
         let mut acl = PosixACL::new(0o703);
         acl.set(Qualifier::Group(8), ACL_WRITE);
         acl.set(Qualifier::Group(9), ACL_EXECUTE);
         acl.set(Qualifier::Mask, ACL_WRITE | ACL_EXECUTE);
+        assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[8, 9]));
+        acl.set(Qualifier::GroupObj, ACL_WRITE);
+        assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[7, 9]));
+        acl.set(Qualifier::Group(9), ACL_WRITE | ACL_EXECUTE);
         assert!(acl_allows_directory_mutation(&acl, 42, 1, 7, &[8, 9]));
+        acl.set(Qualifier::GroupObj, ACL_WRITE | ACL_EXECUTE);
+        assert!(acl_allows_directory_mutation(&acl, 42, 1, 7, &[7]));
         acl.set(Qualifier::Mask, ACL_WRITE);
         assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[8, 9]));
         acl.set(Qualifier::Mask, ACL_WRITE | ACL_EXECUTE);
         acl.set(Qualifier::User(42), 0);
         assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[8, 9]));
+    }
+
+    #[test]
+    fn owner_named_user_and_other_keep_their_precedence_and_mask_rules() {
+        let mut acl = PosixACL::new(0o303);
+        acl.set(Qualifier::User(42), ACL_WRITE | ACL_EXECUTE);
+        acl.set(Qualifier::Mask, ACL_WRITE);
+        assert!(acl_allows_directory_mutation(&acl, 1, 1, 7, &[7]));
+        assert!(!acl_allows_directory_mutation(&acl, 42, 1, 7, &[8]));
+        assert!(acl_allows_directory_mutation(&acl, 43, 1, 7, &[8]));
+        acl.set(Qualifier::Mask, ACL_WRITE | ACL_EXECUTE);
+        assert!(acl_allows_directory_mutation(&acl, 42, 1, 7, &[7]));
+        acl.set(Qualifier::UserObj, 0);
+        acl.set(Qualifier::User(1), ACL_WRITE | ACL_EXECUTE);
+        assert!(!acl_allows_directory_mutation(&acl, 1, 1, 7, &[8]));
     }
 }

@@ -313,6 +313,10 @@ enum TrashRestoreResult {
 }
 
 struct PendingDrop {
+    conflict_window: Option<WindowId>,
+    // Keep the event source alive after its window closes until the queued
+    // decision is delivered or the close observer cancels the workflow.
+    conflict_dialog: Option<Entity<ConflictDialog>>,
     payload: FileDragPayload,
     target: StorePath,
     conflicts: Vec<ConflictRecord>,
@@ -2477,12 +2481,24 @@ impl MusheenApp {
         origin_tab: Option<TabId>,
         cx: &mut Context<Self>,
     ) {
-        let origin_tab = origin_tab.unwrap_or_else(|| self.navigation.focused_tab().id());
+        let origin_tab = origin_tab
+            .or_else(|| {
+                self.context_dialog_windows
+                    .first()
+                    .map(|dialog| dialog.origin_tab)
+            })
+            .unwrap_or_else(|| self.navigation.focused_tab().id());
         let focused_item = self
-            .directories
-            .get(&origin_tab)
-            .and_then(|directory| directory.view().focused_item_id())
-            .cloned();
+            .context_dialog_windows
+            .first()
+            .filter(|dialog| dialog.origin_tab == origin_tab)
+            .map(|dialog| dialog.focused_item.clone())
+            .unwrap_or_else(|| {
+                self.directories
+                    .get(&origin_tab)
+                    .and_then(|directory| directory.view().focused_item_id())
+                    .cloned()
+            });
         self.context_dialog_windows.push(ContextDialogWindow {
             id: window_id,
             origin_tab,
@@ -2500,25 +2516,42 @@ impl MusheenApp {
         }
         let app = cx.entity().downgrade();
         let subscription = cx.on_window_closed(move |cx, closed| {
-            let _ = app.update(cx, |this, cx| {
-                if let Some(index) = this
-                    .context_dialog_windows
-                    .iter()
-                    .position(|dialog| dialog.id == closed)
-                {
-                    let dialog = this.context_dialog_windows.remove(index);
-                    // A window-manager close is exactly a cancellation. It
-                    // does not retain a mutable pending command or dispatch.
-                    if this.context_dialog_windows.is_empty() {
-                        this.pending_content_focus = false;
-                        this.pending_restored_focus = Some(dialog.restore_focus);
-                        this.focus_directory_item(dialog.origin_tab, dialog.focused_item, cx);
-                    }
-                    cx.notify();
-                }
+            let app = app.clone();
+            // A dialog emits its decision before removing its window. Let
+            // that queued event advance the workflow before cancelling a
+            // still-pending conflict as a window-manager close.
+            cx.defer(move |cx| {
+                let _ = app.update(cx, |this, cx| {
+                    this.close_context_dialog_window(closed, cx);
+                });
             });
         });
         self.context_dialog_close_subscription = Some(subscription);
+    }
+
+    fn close_context_dialog_window(&mut self, closed: WindowId, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .context_dialog_windows
+            .iter()
+            .position(|dialog| dialog.id == closed)
+        else {
+            return;
+        };
+        let dialog = self.context_dialog_windows.remove(index);
+        if self
+            .pending_drop
+            .as_ref()
+            .is_some_and(|pending| pending.conflict_window == Some(closed))
+        {
+            self.pending_drop = None;
+        }
+        // An unresolved window-manager close cancels only its own workflow.
+        if self.context_dialog_windows.is_empty() {
+            self.pending_content_focus = false;
+            self.pending_restored_focus = Some(dialog.restore_focus);
+            self.focus_directory_item(dialog.origin_tab, dialog.focused_item, cx);
+        }
+        cx.notify();
     }
 
     fn context_destination_choices(&self, tab_id: TabId) -> Vec<ContextDestinationChoice> {
@@ -2925,6 +2958,9 @@ impl MusheenApp {
         target: StorePath,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_drop.is_some() {
+            return;
+        }
         let conflicts = match self.operation_hub.conflicts_for_drop(&payload, &target) {
             Ok(conflicts) => conflicts,
             Err(error) => {
@@ -2935,6 +2971,8 @@ impl MusheenApp {
         };
         if !conflicts.is_empty() {
             self.pending_drop = Some(PendingDrop {
+                conflict_window: None,
+                conflict_dialog: None,
                 payload,
                 target,
                 conflicts,
@@ -3038,23 +3076,52 @@ impl MusheenApp {
         let options = conflict_window_options(cx);
         let model = ConflictDialogModel::new(conflict);
         let mut dialog = None;
-        cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| ConflictDialog::new(model, cx));
-            dialog = Some(view.clone());
-            cx.new(|cx| Root::new(view, window, cx))
-        })
-        .expect("Musheen could not open a conflict dialog");
+        let dialog_window = cx
+            .open_window(options, |window, cx| {
+                let view = cx.new(|cx| ConflictDialog::new(model, cx));
+                dialog = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("Musheen could not open a conflict dialog");
+        let window_id = dialog_window.window_id();
         let dialog = dialog.expect("the conflict window constructs its view");
-        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
-            ConflictDialogEvent::Resolved(choice, scope) => {
-                this.resolve_pending_drop_conflict(*choice, *scope, cx);
-            }
-            ConflictDialogEvent::Cancelled => {
-                this.pending_drop = None;
-                cx.notify();
-            }
+        let pending = self
+            .pending_drop
+            .as_mut()
+            .expect("a conflict dialog belongs to a pending drop");
+        pending.conflict_window = Some(window_id);
+        pending.conflict_dialog = Some(dialog.clone());
+        self.track_context_dialog_window(window_id, None, cx);
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| {
+            this.handle_drop_conflict_event(window_id, event, cx);
         });
         self.conflict_subscriptions.push(subscription);
+    }
+
+    fn handle_drop_conflict_event(
+        &mut self,
+        window_id: WindowId,
+        event: &ConflictDialogEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_drop.as_mut() else {
+            return;
+        };
+        if pending.conflict_window != Some(window_id) {
+            return;
+        }
+        // Closing this resolved window must not cancel the next conflict.
+        pending.conflict_window = None;
+        pending.conflict_dialog = None;
+        match event {
+            ConflictDialogEvent::Resolved(choice, scope) => {
+                self.resolve_pending_drop_conflict(*choice, *scope, cx);
+            }
+            ConflictDialogEvent::Cancelled => {
+                self.pending_drop = None;
+                cx.notify();
+            }
+        }
     }
 
     fn resolve_pending_drop_conflict(
@@ -7495,6 +7562,241 @@ mod tests {
             assert!(prior_focus.is_focused(window));
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn drop_conflicts_block_browser_input_and_clear_only_their_own_pending_drop(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source.txt");
+        let destination = temporary.path().join("destination");
+        filesystem::write(&source, b"source").unwrap();
+        filesystem::create_dir(&destination).unwrap();
+        filesystem::write(destination.join("source.txt"), b"existing").unwrap();
+        let second_source = temporary.path().join("second.txt");
+        filesystem::write(&second_source, b"second source").unwrap();
+        filesystem::write(destination.join("second.txt"), b"second existing").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let prior_focus = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                window.press("ctrl-l", cx);
+                window.focused(cx).unwrap()
+            })
+            .unwrap();
+        let mut previous_window = None;
+        for finish in ["window-manager", "cancel", "confirm"] {
+            // Exercise the real menu -> destination -> review -> collision path.
+            let choice = cx
+                .update_window(browser, |_, window, cx| {
+                    app.update(cx, |state, cx| {
+                        state.pins.replace([SidebarEntry::new(
+                            "Destination",
+                            StorePath::from_unix_path(destination.as_os_str()),
+                        )]);
+                        let tab = state.navigation.focused_tab().id();
+                        let item = state
+                            .focused_directory()
+                            .view()
+                            .items()
+                            .iter()
+                            .find(|item| item.path().as_unix_path() == Some(source.as_path()))
+                            .unwrap()
+                            .clone();
+                        state.select_item(tab, item.id().clone(), cx);
+                        let targets = state
+                            .focused_directory()
+                            .view()
+                            .items()
+                            .iter()
+                            .filter(|item| {
+                                [Some(source.as_path()), Some(second_source.as_path())]
+                                    .contains(&item.path().as_unix_path())
+                            })
+                            .map(|item| {
+                                CommandTargetRef::new(item.id().clone(), item.path().clone())
+                                    .unwrap()
+                            })
+                            .collect();
+                        let menu = state.compose_context_menu(tab, MenuTarget::Item, targets);
+                        let entry = MusheenApp::menu_entry_by_id(&menu, "clipboard.move_to")
+                            .unwrap()
+                            .clone();
+                        let choice = state
+                            .context_destination_choices(tab)
+                            .iter()
+                            .position(|choice| {
+                                choice.location.as_unix_path() == Some(destination.as_path())
+                            })
+                            .unwrap();
+                        state.remember_context_invocation_focus(window, cx);
+                        state.dispatch_context_entry(entry, cx);
+                        choice
+                    })
+                })
+                .unwrap();
+            let chooser = cx
+                .windows()
+                .into_iter()
+                .find(|window| *window != browser)
+                .unwrap();
+            cx.update_window(chooser, |_, window, cx| {
+                window.render_frame(cx);
+                window.click(format!("context-destination-{choice}"), cx);
+            })
+            .unwrap();
+            let review = cx
+                .windows()
+                .into_iter()
+                .find(|window| *window != browser)
+                .unwrap();
+            cx.update_window(review, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("context-review-confirm", cx);
+            })
+            .unwrap();
+            let conflict = cx
+                .windows()
+                .into_iter()
+                .find(|window| *window != browser)
+                .unwrap();
+            cx.update_window(conflict, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.find("conflict-dialog").visible());
+            })
+            .unwrap();
+            cx.update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(app.read(cx).browser_input_blocked());
+                assert_eq!(
+                    app.read(cx).context_dialog_windows[0].restore_focus,
+                    prior_focus
+                );
+                window.click("omnibar-search", cx);
+                assert_eq!(app.read(cx).omnibar.mode(), OmnibarMode::Path);
+                window.right_click("directory-content", cx);
+                window.render_frame(cx);
+                assert!(window.try_find("popup-menu").is_none());
+                app.update(cx, |state, cx| {
+                    let location = state.navigation.focused_tab().location().clone();
+                    state.navigate(StorePath::from_unix_path("/tmp"), true, cx);
+                    assert_eq!(state.navigation.focused_tab().location(), &location);
+                    let layout = state.focused_directory().view().preferences().layout;
+                    state.dispatch_command("view.list", cx);
+                    assert_eq!(
+                        state.focused_directory().view().preferences().layout,
+                        layout
+                    );
+                    let payload = FileDragPayload::new(
+                        vec![StorePath::from_unix_path(source.as_os_str())],
+                        DropAction::Copy,
+                    )
+                    .unwrap();
+                    state.submit_file_drop(payload.clone(), StorePath::from_unix_path("/tmp"), cx);
+                    state.submit_reviewed_transfer(payload, StorePath::from_unix_path("/tmp"), cx);
+                    if let Some(previous) = previous_window {
+                        state.handle_drop_conflict_event(
+                            previous,
+                            &ConflictDialogEvent::Cancelled,
+                            cx,
+                        );
+                        state.handle_drop_conflict_event(
+                            previous,
+                            &ConflictDialogEvent::Resolved(
+                                ConflictChoice::Skip,
+                                ApplyScope::ThisConflict,
+                            ),
+                            cx,
+                        );
+                    }
+                    let pending = state.pending_drop.as_ref().unwrap();
+                    assert_eq!(pending.conflicts.len(), 2);
+                    assert_eq!(pending.conflict_window, Some(conflict.window_id()));
+                    assert_eq!(pending.target.as_unix_path(), Some(destination.as_path()));
+                    assert_eq!(pending.next_conflict, 0);
+                });
+            })
+            .unwrap();
+            cx.update_window(conflict, |_, window, cx| {
+                window.render_frame(cx);
+                window.click("conflict-choice-Skip", cx);
+                window.click("conflict-confirm", cx);
+            })
+            .unwrap();
+            let next_conflict = cx
+                .windows()
+                .into_iter()
+                .find(|window| *window != browser)
+                .unwrap_or_else(|| {
+                    cx.update(|cx| {
+                        let state = app.read(cx);
+                        panic!(
+                            "missing next conflict: pending {}, error {:?}",
+                            state.pending_drop.is_some(),
+                            state.operation_error
+                        );
+                    })
+                });
+            assert_ne!(next_conflict, conflict);
+            cx.update(|cx| {
+                let state = app.read(cx);
+                assert!(state.browser_input_blocked());
+                let pending = state.pending_drop.as_ref().unwrap();
+                assert_eq!(pending.next_conflict, 1);
+                assert_eq!(pending.conflict_window, Some(next_conflict.window_id()));
+                assert_eq!(state.context_dialog_windows[0].restore_focus, prior_focus);
+            });
+            cx.update_window(next_conflict, |_, window, cx| {
+                window.render_frame(cx);
+                match finish {
+                    "window-manager" => window.remove_window(),
+                    "cancel" => window.click("conflict-cancel", cx),
+                    _ => {
+                        window.click("conflict-choice-Skip", cx);
+                        window.click("conflict-confirm", cx);
+                    }
+                }
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(app.read(cx).context_dialog_windows.is_empty());
+                assert!(app.read(cx).pending_drop.is_none());
+                assert!(!app.read(cx).browser_input_blocked());
+                assert!(prior_focus.is_focused(window));
+            })
+            .unwrap();
+            assert_eq!(filesystem::read(&source).unwrap(), b"source");
+            assert_eq!(filesystem::read(&second_source).unwrap(), b"second source");
+            assert_eq!(
+                filesystem::read(destination.join("second.txt")).unwrap(),
+                b"second existing"
+            );
+            assert_eq!(
+                filesystem::read(destination.join("source.txt")).unwrap(),
+                b"existing"
+            );
+            previous_window = Some(next_conflict.window_id());
+        }
     }
 
     #[gpui_kit::test]
