@@ -1,4 +1,4 @@
-use crate::toolbar::COMMAND_IDS;
+use crate::{ContextMenuSurface, toolbar::COMMAND_IDS};
 use musheen_core::CommandRegistry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,14 +82,17 @@ const INFO_FOCUS: [FocusTarget; 14] = [
 #[derive(Clone, Debug)]
 pub struct ShellModel {
     commands: CommandRegistry,
+    context_menus: ContextMenuSurface,
     info_visible: bool,
 }
 
 impl ShellModel {
     #[must_use]
     pub fn new(info_visible: bool) -> Self {
+        let commands = CommandRegistry::built_in();
         Self {
-            commands: CommandRegistry::built_in(),
+            context_menus: ContextMenuSurface::new(commands.clone()),
+            commands,
             info_visible,
         }
     }
@@ -120,6 +123,12 @@ impl ShellModel {
     #[must_use]
     pub fn commands(&self) -> &CommandRegistry {
         &self.commands
+    }
+
+    /// The shell owns the same registry-backed surface rendered for every pane.
+    #[must_use]
+    pub const fn context_menus(&self) -> &ContextMenuSurface {
+        &self.context_menus
     }
 
     #[must_use]

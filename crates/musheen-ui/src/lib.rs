@@ -6,6 +6,7 @@ mod directory;
 mod i18n;
 mod icons;
 mod info_pane;
+pub mod menus;
 pub mod navigation;
 mod operations;
 pub mod search;
@@ -28,6 +29,7 @@ pub use icons::{
     lucide_icon_or_fallback,
 };
 pub use info_pane::*;
+pub use menus::*;
 pub use operations::*;
 pub use shell::{FocusTarget, SemanticRegion, ShellModel};
 pub use status_center::{

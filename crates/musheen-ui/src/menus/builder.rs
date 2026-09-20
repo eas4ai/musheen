@@ -1,0 +1,782 @@
+use super::context::ContextMenuRequest;
+use super::{MenuTarget, OpenWithApplication, SendToDestination};
+use crate::{Catalog, Locale};
+use musheen_core::{
+    CommandAction, CommandContext, CommandDefinition, CommandGroup, CommandId, CommandPredicate,
+    CommandRegistry, CommandState, CommandTarget, CommandTargetRef, DangerLevel, StorePath,
+};
+use std::fmt;
+
+pub const MAX_VARIABLE_CONTRIBUTIONS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuPresentation {
+    CompactNativeTheme,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MenuThemeTokens {
+    compact_rows: bool,
+    strong_boundaries: bool,
+    reduced_motion: bool,
+}
+
+impl MenuThemeTokens {
+    #[must_use]
+    pub const fn from_profile(profile: crate::ThemeProfile) -> Self {
+        Self {
+            compact_rows: true,
+            strong_boundaries: profile.has_strong_boundaries(),
+            reduced_motion: matches!(profile.motion(), crate::MotionPolicy::Reduced),
+        }
+    }
+
+    #[must_use]
+    pub const fn compact_rows(self) -> bool {
+        self.compact_rows
+    }
+    #[must_use]
+    pub const fn strong_boundaries(self) -> bool {
+        self.strong_boundaries
+    }
+    #[must_use]
+    pub const fn reduced_motion(self) -> bool {
+        self.reduced_motion
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuEntryKind {
+    Command,
+    Submenu,
+    Separator,
+    Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuFocus {
+    Entry(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuKeyRoute {
+    Dialog,
+    Browser,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuAccessibleRole {
+    MenuItem,
+    Checkbox,
+    Submenu,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MenuAccessibilityNode {
+    name: Box<str>,
+    role: MenuAccessibleRole,
+    checked: bool,
+    disabled_reason: Option<Box<str>>,
+}
+
+impl MenuAccessibilityNode {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[must_use]
+    pub const fn role(&self) -> MenuAccessibleRole {
+        self.role
+    }
+    #[must_use]
+    pub const fn checked(&self) -> bool {
+        self.checked
+    }
+    #[must_use]
+    pub fn disabled_reason(&self) -> Option<&str> {
+        self.disabled_reason.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuDirection {
+    LeftToRight,
+    RightToLeft,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MenuChrome {
+    direction: MenuDirection,
+}
+
+impl MenuChrome {
+    #[must_use]
+    pub const fn submenu_arrow(self) -> &'static str {
+        match self.direction {
+            MenuDirection::LeftToRight => "→",
+            MenuDirection::RightToLeft => "←",
+        }
+    }
+
+    #[must_use]
+    pub const fn path_direction(self) -> MenuDirection {
+        MenuDirection::LeftToRight
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextMenu {
+    entries: Vec<MenuEntry>,
+    presentation: MenuPresentation,
+    theme_tokens: MenuThemeTokens,
+}
+
+impl ContextMenu {
+    #[must_use]
+    pub fn entries(&self) -> &[MenuEntry] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub const fn presentation(&self) -> MenuPresentation {
+        self.presentation
+    }
+
+    #[must_use]
+    pub const fn theme_tokens(&self) -> MenuThemeTokens {
+        self.theme_tokens
+    }
+
+    #[must_use]
+    pub fn accessibility_tree(&self) -> Vec<MenuAccessibilityNode> {
+        self.entries
+            .iter()
+            .filter(|entry| !matches!(entry.kind, MenuEntryKind::Separator))
+            .map(|entry| MenuAccessibilityNode {
+                name: entry.label.clone(),
+                role: if entry.kind == MenuEntryKind::Submenu {
+                    MenuAccessibleRole::Submenu
+                } else if entry.state.is_checked() {
+                    MenuAccessibleRole::Checkbox
+                } else {
+                    MenuAccessibleRole::MenuItem
+                },
+                checked: entry.state.is_checked(),
+                disabled_reason: entry.state.disabled_reason().map(Into::into),
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn first_keyboard_focus(&self) -> Option<MenuFocus> {
+        self.entries.iter().enumerate().find_map(|(index, entry)| {
+            matches!(entry.kind, MenuEntryKind::Command | MenuEntryKind::Submenu)
+                .then_some(MenuFocus::Entry(index))
+        })
+    }
+
+    #[must_use]
+    pub const fn key_route(&self, modal_dialog_active: bool, _key: &str) -> MenuKeyRoute {
+        if modal_dialog_active {
+            MenuKeyRoute::Dialog
+        } else {
+            MenuKeyRoute::Browser
+        }
+    }
+
+    #[must_use]
+    pub fn entry(&self, id: &str) -> Option<&MenuEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.command_id() == Some(id))
+    }
+
+    #[must_use]
+    pub fn groups_are_stable(&self) -> bool {
+        let mut previous = None;
+        for entry in &self.entries {
+            let Some(group) = entry.group else {
+                continue;
+            };
+            let rank = group_rank(group);
+            if previous.is_some_and(|previous| previous > rank) {
+                return false;
+            }
+            previous = Some(rank);
+        }
+        true
+    }
+
+    #[must_use]
+    pub fn destructive_group_is_isolated(&self) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.group == Some(CommandGroup::Destructive))
+        else {
+            return true;
+        };
+        index == 0 || self.entries[index - 1].kind == MenuEntryKind::Separator
+    }
+
+    #[must_use]
+    pub const fn direction(&self, direction: MenuDirection) -> MenuChrome {
+        MenuChrome { direction }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MenuEntry {
+    kind: MenuEntryKind,
+    command_id: Option<CommandId>,
+    label: Box<str>,
+    state: CommandState,
+    shortcut: Option<Box<str>>,
+    group: Option<CommandGroup>,
+    danger: DangerLevel,
+    submenu: Option<Box<ContextMenu>>,
+    application: Option<OpenWithApplication>,
+    destination: Option<SendToDestination>,
+    pub(crate) invocation: Option<InvocationData>,
+}
+
+impl MenuEntry {
+    #[must_use]
+    pub const fn kind(&self) -> MenuEntryKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn command_id(&self) -> Option<&str> {
+        self.command_id.as_ref().map(CommandId::as_str)
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> &CommandState {
+        &self.state
+    }
+
+    #[must_use]
+    pub fn shortcut(&self) -> Option<&str> {
+        self.shortcut.as_deref()
+    }
+
+    #[must_use]
+    pub fn accessible_disabled_reason(&self) -> Option<&str> {
+        self.state.disabled_reason()
+    }
+
+    #[must_use]
+    pub const fn danger_level(&self) -> DangerLevel {
+        self.danger
+    }
+
+    #[must_use]
+    pub fn submenu(&self) -> Option<&ContextMenu> {
+        self.submenu.as_deref()
+    }
+
+    #[must_use]
+    pub fn application(&self) -> Option<&OpenWithApplication> {
+        self.application.as_ref()
+    }
+
+    #[must_use]
+    pub fn destination(&self) -> Option<&SendToDestination> {
+        self.destination.as_ref()
+    }
+
+    #[must_use]
+    pub fn copy_only(&self) -> bool {
+        self.command_id() == Some("clipboard.send_to") && self.destination.is_some()
+    }
+}
+
+impl ContextMenu {
+    #[must_use]
+    pub fn application(&self, desktop_id: &str) -> Option<&MenuEntry> {
+        self.entries.iter().find(|entry| {
+            entry
+                .application()
+                .is_some_and(|application| application.desktop_id() == desktop_id)
+        })
+    }
+
+    #[must_use]
+    pub fn destination(&self, path: &str) -> Option<&MenuEntry> {
+        self.entries.iter().find(|entry| {
+            entry.destination().is_some_and(|destination| {
+                destination
+                    .path()
+                    .as_unix_path()
+                    .is_some_and(|candidate| candidate == std::path::Path::new(path))
+            })
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InvocationData {
+    pub(crate) id: CommandId,
+    pub(crate) action: CommandAction,
+    pub(crate) context: CommandContext,
+    pub(crate) selection: Vec<CommandTargetRef>,
+    pub(crate) location: StorePath,
+    pub(crate) destination: Option<StorePath>,
+}
+
+pub(crate) fn compose(
+    registry: &CommandRegistry,
+    locale: Locale,
+    theme: crate::ThemeProfile,
+    request: ContextMenuRequest,
+) -> ContextMenu {
+    let catalog = Catalog::load(locale).expect("built-in menu locale is valid");
+    let mut candidates = command_ids_for(effective_target(&request))
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            registry
+                .get(id)
+                .filter(|command| is_presentable(command, &request))
+                .map(|command| (index, command))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(index, command)| (group_rank(command.group()), *index));
+
+    let mut entries = Vec::new();
+    let mut previous_group = None;
+    for (_, command) in candidates {
+        if previous_group.is_some_and(|group| group != command.group()) {
+            entries.push(separator());
+        }
+        previous_group = Some(command.group());
+        entries.push(command_entry(
+            registry,
+            command,
+            &catalog,
+            &request,
+            request.context(),
+            theme,
+        ));
+    }
+    ContextMenu {
+        entries,
+        presentation: MenuPresentation::CompactNativeTheme,
+        theme_tokens: MenuThemeTokens::from_profile(theme),
+    }
+}
+
+fn effective_target(request: &ContextMenuRequest) -> MenuTarget {
+    match request.target() {
+        MenuTarget::Item => match request.context().target {
+            CommandTarget::Mount => MenuTarget::Mount,
+            CommandTarget::TrashItem => MenuTarget::TrashItem,
+            CommandTarget::TrashBackground => MenuTarget::TrashBackground,
+            CommandTarget::Tag => MenuTarget::Tag,
+            CommandTarget::Sidebar => MenuTarget::SidebarLocation,
+            _ => MenuTarget::Item,
+        },
+        target => target,
+    }
+}
+
+fn is_presentable(command: &CommandDefinition, request: &ContextMenuRequest) -> bool {
+    let target = request.context().target;
+    match command.id().as_str() {
+        "archive.browse" | "archive.extract" | "archive.extract_here"
+            if target != CommandTarget::Archive =>
+        {
+            return false;
+        }
+        "file.compress" if target == CommandTarget::Archive => return false,
+        "file.run" | "file.run_as_administrator" if target != CommandTarget::ExecutableFile => {
+            return false;
+        }
+        "directory.open_as_administrator"
+        | "directory.open_other_pane"
+        | "directory.pin"
+        | "directory.unpin"
+        | "directory.share"
+            if target != CommandTarget::Directory =>
+        {
+            return false;
+        }
+        "directory.open_new_tab" | "directory.open_new_window"
+            if !matches!(target, CommandTarget::Directory | CommandTarget::Mount) =>
+        {
+            return false;
+        }
+        "mount.unmount" | "mount.eject" | "mount.power_off" if target != CommandTarget::Mount => {
+            return false;
+        }
+        "trash.restore" if target != CommandTarget::TrashItem => return false,
+        _ => {}
+    }
+    if command.state(request.context()).is_enabled() {
+        return true;
+    }
+    match command.predicate() {
+        CommandPredicate::Capability(_)
+        | CommandPredicate::WritableLocation
+        | CommandPredicate::WritableDestination
+        | CommandPredicate::WritableSelection
+        | CommandPredicate::WritableExactlyOneSelection
+        | CommandPredicate::WritableSelectionCapability(_)
+        | CommandPredicate::WritableExactlyOneSelectionCapability(_)
+        | CommandPredicate::WritableExactlyOneFileCapability(_)
+        | CommandPredicate::Hide
+        | CommandPredicate::Unhide
+        | CommandPredicate::PasteInto
+        | CommandPredicate::DestinationCopy
+        | CommandPredicate::DestinationMove
+        | CommandPredicate::DestinationExtract
+        | CommandPredicate::ProviderAction(_) => true,
+        CommandPredicate::PinnedDirectory => request.context().target_is_pinned,
+        CommandPredicate::UnpinnedDirectory => !request.context().target_is_pinned,
+        _ => false,
+    }
+}
+
+fn command_entry(
+    registry: &CommandRegistry,
+    command: &CommandDefinition,
+    catalog: &Catalog,
+    request: &ContextMenuRequest,
+    context: &CommandContext,
+    theme: crate::ThemeProfile,
+) -> MenuEntry {
+    let mut entry = plain_command_entry(command, catalog, request, context);
+    match command.id().as_str() {
+        "file.open_with" => add_open_with_submenu(registry, catalog, request, &mut entry, theme),
+        "clipboard.send_to" => add_send_to_submenu(registry, catalog, request, &mut entry, theme),
+        "item.tags" => {
+            add_contribution_submenu(registry, catalog, request, &mut entry, true, theme)
+        }
+        "actions.custom" => {
+            add_contribution_submenu(registry, catalog, request, &mut entry, false, theme)
+        }
+        _ => {}
+    }
+    entry
+}
+
+fn plain_command_entry(
+    command: &CommandDefinition,
+    catalog: &Catalog,
+    request: &ContextMenuRequest,
+    context: &CommandContext,
+) -> MenuEntry {
+    let label = catalog
+        .message(command.label_key())
+        .unwrap_or(command.label_key())
+        .into();
+    MenuEntry {
+        kind: MenuEntryKind::Command,
+        command_id: Some(command.id().clone()),
+        label,
+        state: command.state(context),
+        shortcut: command
+            .shortcuts()
+            .first()
+            .map(|shortcut| shortcut.chord().into()),
+        group: Some(command.group()),
+        danger: command.danger_level(),
+        submenu: None,
+        application: None,
+        destination: None,
+        invocation: Some(InvocationData {
+            id: command.id().clone(),
+            action: command.action(),
+            context: context.clone(),
+            selection: request.selection().to_vec(),
+            location: request.location().clone(),
+            destination: None,
+        }),
+    }
+}
+
+fn add_open_with_submenu(
+    registry: &CommandRegistry,
+    catalog: &Catalog,
+    request: &ContextMenuRequest,
+    entry: &mut MenuEntry,
+    theme: crate::ThemeProfile,
+) {
+    let Some(open_with) = registry.get("file.open_with") else {
+        return;
+    };
+    let mut entries = request
+        .open_with
+        .iter()
+        .filter(|application| application.is_compatible())
+        .take(MAX_VARIABLE_CONTRIBUTIONS)
+        .map(|application| {
+            let mut child = plain_command_entry(open_with, catalog, request, request.context());
+            child.label = application.label().into();
+            child.application = Some(application.clone());
+            child
+        })
+        .collect::<Vec<_>>();
+    append_overflow(&mut entries, request.open_with.len());
+    for id in ["file.choose_application", "file.set_default_application"] {
+        if let Some(command) = registry.get(id) {
+            entries.push(command_entry(
+                registry,
+                command,
+                catalog,
+                request,
+                request.context(),
+                theme,
+            ));
+        }
+    }
+    entry.kind = MenuEntryKind::Submenu;
+    entry.submenu = Some(Box::new(ContextMenu {
+        entries,
+        presentation: MenuPresentation::CompactNativeTheme,
+        theme_tokens: MenuThemeTokens::from_profile(theme),
+    }));
+}
+
+fn add_send_to_submenu(
+    registry: &CommandRegistry,
+    catalog: &Catalog,
+    request: &ContextMenuRequest,
+    entry: &mut MenuEntry,
+    theme: crate::ThemeProfile,
+) {
+    let Some(send_to) = registry.get("clipboard.send_to") else {
+        return;
+    };
+    let mut entries = request
+        .send_to
+        .iter()
+        .take(MAX_VARIABLE_CONTRIBUTIONS)
+        .map(|destination| {
+            let context = request
+                .context_with_destination(destination.path().clone(), destination.writable());
+            let mut child = plain_command_entry(send_to, catalog, request, &context);
+            child.label = destination.label().into();
+            child.destination = Some(destination.clone());
+            child
+                .invocation
+                .as_mut()
+                .expect("command rows are invokable")
+                .destination = Some(destination.path().clone());
+            child
+        })
+        .collect::<Vec<_>>();
+    append_overflow(&mut entries, request.send_to.len());
+    if let Some(destination) = request
+        .send_to
+        .iter()
+        .find(|destination| destination.writable())
+    {
+        let context = request.context_with_destination(destination.path().clone(), true);
+        entry.state = send_to.state(&context);
+    }
+    entry.kind = MenuEntryKind::Submenu;
+    entry.submenu = Some(Box::new(ContextMenu {
+        entries,
+        presentation: MenuPresentation::CompactNativeTheme,
+        theme_tokens: MenuThemeTokens::from_profile(theme),
+    }));
+}
+
+fn add_contribution_submenu(
+    registry: &CommandRegistry,
+    catalog: &Catalog,
+    request: &ContextMenuRequest,
+    entry: &mut MenuEntry,
+    tags: bool,
+    theme: crate::ThemeProfile,
+) {
+    let contributions = if tags {
+        &request.tags
+    } else {
+        &request.actions
+    };
+    if contributions.is_empty() {
+        return;
+    }
+    let mut entries = contributions
+        .iter()
+        .take(MAX_VARIABLE_CONTRIBUTIONS)
+        .filter_map(|contribution| {
+            registry
+                .get(contribution.command_id())
+                .map(|command| (contribution, command))
+        })
+        .map(|(contribution, command)| {
+            let mut child = plain_command_entry(command, catalog, request, request.context());
+            child.label = contribution.label().into();
+            child
+        })
+        .collect::<Vec<_>>();
+    append_overflow(&mut entries, contributions.len());
+    entry.kind = MenuEntryKind::Submenu;
+    entry.submenu = Some(Box::new(ContextMenu {
+        entries,
+        presentation: MenuPresentation::CompactNativeTheme,
+        theme_tokens: MenuThemeTokens::from_profile(theme),
+    }));
+}
+
+fn append_overflow(entries: &mut Vec<MenuEntry>, total: usize) {
+    if total <= MAX_VARIABLE_CONTRIBUTIONS {
+        return;
+    }
+    entries.push(MenuEntry {
+        kind: MenuEntryKind::Overflow,
+        command_id: None,
+        label: "More…".into(),
+        state: CommandRegistry::built_in()
+            .get("navigation.refresh")
+            .expect("built-in command exists")
+            .state(&CommandContext::default()),
+        shortcut: None,
+        group: None,
+        danger: DangerLevel::None,
+        submenu: None,
+        application: None,
+        destination: None,
+        invocation: None,
+    });
+}
+
+fn separator() -> MenuEntry {
+    MenuEntry {
+        kind: MenuEntryKind::Separator,
+        command_id: None,
+        label: Box::default(),
+        state: CommandRegistry::built_in()
+            .get("navigation.refresh")
+            .expect("built-in command exists")
+            .state(&CommandContext::default()),
+        shortcut: None,
+        group: None,
+        danger: DangerLevel::None,
+        submenu: None,
+        application: None,
+        destination: None,
+        invocation: None,
+    }
+}
+
+const fn group_rank(group: CommandGroup) -> u8 {
+    match group {
+        CommandGroup::Open => 0,
+        CommandGroup::Navigation => 1,
+        CommandGroup::Clipboard => 2,
+        CommandGroup::Creation => 3,
+        CommandGroup::FileType => 4,
+        CommandGroup::Organization => 5,
+        CommandGroup::Destructive => 6,
+        CommandGroup::Details => 7,
+    }
+}
+
+fn command_ids_for(target: MenuTarget) -> &'static [&'static str] {
+    match target {
+        MenuTarget::Background => BACKGROUND,
+        MenuTarget::Item => ITEM,
+        MenuTarget::SidebarLocation => SIDEBAR,
+        MenuTarget::Mount => MOUNT,
+        MenuTarget::Tag => TAG,
+        MenuTarget::TrashItem => TRASH_ITEM,
+        MenuTarget::TrashBackground => TRASH_BACKGROUND,
+    }
+}
+
+const BACKGROUND: &[&str] = &[
+    "clipboard.paste_into",
+    "selection.select_all",
+    "create.directory",
+    "create.empty_file",
+    "create.from_template",
+    "directory.open_terminal",
+    "view.hidden",
+    "view.sort",
+    "view.group",
+    "directory.properties",
+];
+const ITEM: &[&str] = &[
+    "file.open",
+    "file.open_with",
+    "file.run",
+    "file.run_as_administrator",
+    "directory.open_as_administrator",
+    "directory.open_new_tab",
+    "directory.open_new_window",
+    "directory.open_other_pane",
+    "clipboard.cut",
+    "clipboard.copy",
+    "clipboard.copy_to",
+    "clipboard.move_to",
+    "clipboard.paste_into",
+    "clipboard.send_to",
+    "file.preview",
+    "archive.browse",
+    "archive.extract",
+    "archive.extract_here",
+    "file.compress",
+    "file.rename",
+    "file.duplicate",
+    "file.create_symbolic_link",
+    "file.create_hard_link",
+    "file.hide",
+    "file.unhide",
+    "directory.pin",
+    "directory.unpin",
+    "item.tags",
+    "actions.custom",
+    "directory.share",
+    "file.move_to_trash",
+    "file.delete_permanently",
+    "item.properties",
+    "item.permissions",
+    "item.copy_location",
+    "directory.open_terminal",
+    "directory.properties",
+];
+const SIDEBAR: &[&str] = &[
+    "file.open",
+    "directory.open_new_tab",
+    "directory.open_new_window",
+    "directory.pin",
+    "directory.unpin",
+    "item.copy_location",
+    "directory.properties",
+];
+const MOUNT: &[&str] = &[
+    "file.open",
+    "directory.open_new_tab",
+    "directory.open_new_window",
+    "mount.unmount",
+    "mount.eject",
+    "mount.power_off",
+    "directory.properties",
+];
+const TAG: &[&str] = &["item.tags", "item.properties"];
+const TRASH_ITEM: &[&str] = &[
+    "trash.restore",
+    "file.delete_permanently",
+    "item.properties",
+    "item.copy_location",
+];
+const TRASH_BACKGROUND: &[&str] = &["trash.empty", "view.hidden", "view.sort", "view.group"];
+
+impl fmt::Display for MenuDirection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LeftToRight => formatter.write_str("ltr"),
+            Self::RightToLeft => formatter.write_str("rtl"),
+        }
+    }
+}
