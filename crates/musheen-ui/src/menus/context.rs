@@ -26,6 +26,7 @@ pub struct ContextMenuRequest {
     target: MenuTarget,
     location: StorePath,
     selection: Vec<CommandTargetRef>,
+    trash_contents: Vec<CommandTargetRef>,
     source: ContextMenuSource,
     origin_tab: Option<crate::navigation::TabId>,
     pub(crate) open_with: Vec<crate::menus::OpenWithApplication>,
@@ -56,12 +57,30 @@ impl ContextMenuRequest {
             target,
             location,
             selection,
+            trash_contents: Vec::new(),
             source: ContextMenuSource::Pointer,
             origin_tab: None,
             open_with: Vec::new(),
             send_to: Vec::new(),
             tags: Vec::new(),
             actions: Vec::new(),
+        }
+    }
+
+    /// Empty Trash captures its contents without turning a background menu
+    /// into a selection command. Confirmation retains this exact snapshot.
+    pub(crate) fn with_trash_contents(mut self, contents: Vec<CommandTargetRef>) -> Self {
+        if self.target == MenuTarget::TrashBackground {
+            self.trash_contents = contents;
+        }
+        self
+    }
+
+    pub(crate) fn captured_targets(&self) -> &[CommandTargetRef] {
+        if self.target == MenuTarget::TrashBackground {
+            &self.trash_contents
+        } else {
+            &self.selection
         }
     }
 

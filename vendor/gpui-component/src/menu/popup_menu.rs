@@ -1037,17 +1037,16 @@ impl PopupMenu {
     }
 
     fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, Anchor::TopLeft | Anchor::BottomLeft) {
-            self._unselect_submenu(window, cx)
-        } else {
-            self._select_submenu(window, cx)
-        };
-
-        if self.parent_side(cx).is_left() {
-            self._focus_parent_menu(window, cx);
+        if matches!(
+            self.submenu_anchor.0,
+            Anchor::TopRight | Anchor::BottomRight
+        ) && self._select_submenu(window, cx)
+        {
+            return;
         }
-
-        if handled {
+        if self.parent_menu.is_some() && self.parent_side(cx).is_left() {
+            self._unselect_submenu(window, cx);
+            self._focus_parent_menu(window, cx);
             return;
         }
 
@@ -1058,17 +1057,14 @@ impl PopupMenu {
     }
 
     fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
-        let handled = if matches!(self.submenu_anchor.0, Anchor::TopLeft | Anchor::BottomLeft) {
-            self._select_submenu(window, cx)
-        } else {
-            self._unselect_submenu(window, cx)
-        };
-
-        if self.parent_side(cx).is_right() {
-            self._focus_parent_menu(window, cx);
+        if matches!(self.submenu_anchor.0, Anchor::TopLeft | Anchor::BottomLeft)
+            && self._select_submenu(window, cx)
+        {
+            return;
         }
-
-        if handled {
+        if self.parent_menu.is_some() && self.parent_side(cx).is_right() {
+            self._unselect_submenu(window, cx);
+            self._focus_parent_menu(window, cx);
             return;
         }
 
@@ -1265,18 +1261,34 @@ impl PopupMenu {
     }
 
     /// Calculate the anchor corner and left offset for child submenu
-    fn update_submenu_menu_anchor(&mut self, window: &Window) {
+    fn update_submenu_menu_anchor(&mut self, window: &Window, cx: &App) {
         let bounds = self.bounds;
-        let max_width = self.max_width();
-        let opens_left = self.direction == PopupMenuDirection::RightToLeft
-            || max_width + bounds.origin.x > window.bounds().size.width;
+        let submenu_width = self
+            .active_submenu()
+            .map(|menu| {
+                let menu = menu.read(cx);
+                if menu.bounds.size.width > px(0.) {
+                    menu.bounds.size.width
+                } else {
+                    menu.max_width()
+                }
+            })
+            .unwrap_or_else(|| self.max_width());
+        let left_space = (bounds.origin.x - px(16.)).max(px(0.));
+        let right_space = (window.viewport_size().width - bounds.right() + px(8.)).max(px(0.));
+        let prefer_left = self.direction == PopupMenuDirection::RightToLeft;
+        let opens_left = if prefer_left {
+            left_space >= submenu_width || left_space >= right_space
+        } else {
+            !(right_space >= submenu_width || right_space >= left_space)
+        };
         let (anchor, left) = if opens_left {
             (Anchor::TopRight, -px(16.))
         } else {
             (Anchor::TopLeft, bounds.size.width - px(8.))
         };
 
-        let is_bottom_pos = bounds.origin.y + bounds.size.height > window.bounds().size.height;
+        let is_bottom_pos = bounds.origin.y + bounds.size.height > window.viewport_size().height;
         self.submenu_anchor = if is_bottom_pos {
             (anchor.other_side_along(gpui::Axis::Vertical), left)
         } else {
@@ -1458,6 +1470,9 @@ impl PopupMenu {
                 .items_start()
                 .child(
                     h_flex()
+                        .when(self.direction == PopupMenuDirection::RightToLeft, |row| {
+                            row.flex_row_reverse()
+                        })
                         .min_h(item_height)
                         .size_full()
                         .items_center()
@@ -1471,21 +1486,34 @@ impl PopupMenu {
                         ))
                         .child(
                             h_flex()
+                                .when(self.direction == PopupMenuDirection::RightToLeft, |row| {
+                                    row.flex_row_reverse()
+                                })
                                 .flex_1()
                                 .gap_2()
                                 .items_center()
                                 .justify_between()
-                                .child(label.clone())
                                 .child(
-                                    Icon::new(
-                                        if self.direction == PopupMenuDirection::RightToLeft {
-                                            IconName::ChevronLeft
-                                        } else {
-                                            IconName::ChevronRight
-                                        },
-                                    )
-                                    .xsmall()
-                                    .text_color(cx.theme().muted_foreground),
+                                    div()
+                                        .id(("submenu-label", ix))
+                                        .test_support()
+                                        .child(label.clone()),
+                                )
+                                .child(
+                                    div().id(("submenu-chevron", ix)).test_support().child(
+                                        Icon::new(
+                                            if matches!(
+                                                self.submenu_anchor.0,
+                                                Anchor::TopRight | Anchor::BottomRight
+                                            ) {
+                                                IconName::ChevronLeft
+                                            } else {
+                                                IconName::ChevronRight
+                                            },
+                                        )
+                                        .xsmall()
+                                        .text_color(cx.theme().muted_foreground),
+                                    ),
                                 ),
                         ),
                 )
@@ -1533,7 +1561,7 @@ struct RenderOptions {
 
 impl Render for PopupMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_submenu_menu_anchor(window);
+        self.update_submenu_menu_anchor(window, cx);
 
         // Submenus attached via the public `item()` + `PopupMenuItem::submenu()`
         // path (from contexts that only have the menu value, e.g. a table

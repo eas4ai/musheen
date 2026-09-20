@@ -326,12 +326,11 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.activate_accessibility_for_test();
             window.render_frame(cx);
-            // The first two command rows are Open then Open With. In RTL the
-            // physical Left key is the submenu-open key.
+            // At the left viewport edge RTL falls back to opening right.
             window.press("down", cx);
             window.press("down", cx);
             window.render_frame(cx);
-            window.press("left", cx);
+            window.press("right", cx);
             window.render_frame(cx);
 
             let tree = window
@@ -355,6 +354,84 @@ mod tests {
             assert_eq!(editor["aria"]["role"], "MenuItem");
         })
         .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    fn submenu_layout_and_keyboard_follow_direction_and_available_space(cx: &mut TestAppContext) {
+        use gpui_kit::Styled;
+        use gpui_kit::component::menu::PopupMenuDirection;
+        struct PositionedPopup {
+            popup: gpui_kit::Entity<PopupMenu>,
+            x: f32,
+        }
+        impl gpui_kit::Render for PositionedPopup {
+            fn render(
+                &mut self,
+                _: &mut gpui_kit::Window,
+                _: &mut gpui_kit::Context<Self>,
+            ) -> impl gpui_kit::IntoElement {
+                div()
+                    .absolute()
+                    .left(px(self.x))
+                    .top(px(40.))
+                    .child(self.popup.clone())
+            }
+        }
+        cx.update(gpui_kit::init);
+        for (direction, x, opens_left) in [
+            (PopupMenuDirection::LeftToRight, 20., false),
+            (PopupMenuDirection::LeftToRight, 580., true),
+            (PopupMenuDirection::RightToLeft, 580., true),
+            (PopupMenuDirection::RightToLeft, 20., false),
+        ] {
+            let mut root = None;
+            let mut child = None;
+            let handle = cx.open_window(size(px(800.), px(480.)), |window, cx| {
+                let submenu = PopupMenu::build(window, cx, |popup, _, _| {
+                    popup
+                        .direction(direction)
+                        .min_w(px(180.))
+                        .max_w(px(180.))
+                        .item(PopupMenuItem::new("Child"))
+                });
+                child = Some(submenu.clone());
+                let popup = PopupMenu::build(window, cx, |popup, _, _| {
+                    popup
+                        .direction(direction)
+                        .min_w(px(180.))
+                        .max_w(px(180.))
+                        .item(PopupMenuItem::submenu("Parent", submenu))
+                });
+                popup.update(cx, |popup, cx| popup.focus_handle(cx).focus(window, cx));
+                root = Some(popup.clone());
+                Root::new(cx.new(|_| PositionedPopup { popup, x }), window, cx)
+            });
+            let root = root.unwrap();
+            let child = child.unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.press("down", cx);
+                window.render_frame(cx);
+                let label = window.find(("submenu-label", 0usize)).bounds();
+                let chevron = window.find(("submenu-chevron", 0usize)).bounds();
+                assert_eq!(
+                    chevron.origin.x < label.origin.x,
+                    direction == PopupMenuDirection::RightToLeft
+                );
+                let submenu = window.find("submenu").bounds();
+                assert!(
+                    submenu.origin.x >= px(0.) && submenu.right() <= window.viewport_size().width
+                );
+                assert_eq!(submenu.origin.x < label.origin.x, opens_left);
+                window.press(if opens_left { "left" } else { "right" }, cx);
+                window.render_frame(cx);
+                assert!(child.read(cx).focus_handle(cx).is_focused(window));
+                window.press(if opens_left { "right" } else { "left" }, cx);
+                window.render_frame(cx);
+                assert!(root.read(cx).focus_handle(cx).is_focused(window));
+            })
+            .unwrap();
+        }
     }
 
     #[gpui_kit::test]

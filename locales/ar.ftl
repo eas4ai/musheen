@@ -1,5 +1,7 @@
 dialog-choose-destination = اختر الوجهة
 dialog-destination-explanation = اختر مكانًا لنسخ العناصر أو نقلها.
+dialog-destination-path = أدخل المسار المطلق للمجلد الوجهة
+dialog-destination-path-invalid = أدخل مسار مجلد مطلقًا بدون محارف فارغة.
 dialog-cancel = إلغاء
 dialog-review-operation = مراجعة العملية
 dialog-continue = متابعة

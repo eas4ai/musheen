@@ -607,7 +607,7 @@ fn plain_command_entry(
             id: command.id().clone(),
             action: command.action(),
             context: context.clone(),
-            selection: request.selection().to_vec(),
+            selection: request.captured_targets().to_vec(),
             location: selected_directory_location(command.action(), context, request),
             destination: None,
             origin_tab: request.origin_tab(),

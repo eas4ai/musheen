@@ -326,6 +326,13 @@ struct PendingDrop {
     automatic_scope: bool,
 }
 
+struct PendingRestore {
+    tab_id: TabId,
+    receipt: musheen_ops::TrashReceipt,
+    conflict: ConflictRecord,
+    _dialog: Entity<ConflictDialog>,
+}
+
 #[derive(Clone)]
 struct ContextDestinationChoice {
     label: String,
@@ -344,6 +351,8 @@ struct ContextDialogWindow {
 struct ContextDialogStrings {
     choose_destination: String,
     destination_explanation: String,
+    destination_path: String,
+    destination_path_invalid: String,
     cancel: String,
     review_operation: String,
     continue_action: String,
@@ -365,6 +374,8 @@ impl ContextDialogStrings {
         Self {
             choose_destination: message("dialog.choose-destination"),
             destination_explanation: message("dialog.destination-explanation"),
+            destination_path: message("dialog.destination-path"),
+            destination_path_invalid: message("dialog.destination-path-invalid"),
             cancel: message("dialog.cancel"),
             review_operation: message("dialog.review-operation"),
             continue_action: message("dialog.continue"),
@@ -388,6 +399,8 @@ struct ContextDestinationDialog {
     strings: ContextDialogStrings,
     focus: FocusHandle,
     pending_focus: bool,
+    location_input: Entity<InputState>,
+    location_error: bool,
 }
 
 impl EventEmitter<ContextDestinationEvent> for ContextDestinationDialog {}
@@ -396,13 +409,17 @@ impl ContextDestinationDialog {
     fn new(
         choices: Vec<ContextDestinationChoice>,
         strings: ContextDialogStrings,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let placeholder = strings.destination_path.clone();
         Self {
             choices,
             strings,
             focus: cx.focus_handle(),
             pending_focus: true,
+            location_input: cx.new(|cx| InputState::new(window, cx).placeholder(placeholder)),
+            location_error: false,
         }
     }
 }
@@ -449,6 +466,33 @@ impl Render for ContextDestinationDialog {
                     .child(self.strings.choose_destination.clone()),
             )
             .child(self.strings.destination_explanation.clone())
+            .child(Input::new(&self.location_input).id("context-destination-path"))
+            .child(
+                Button::new("context-destination-use-path")
+                    .label(self.strings.continue_action.clone())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let path = this.location_input.read(cx).value();
+                        let path = Path::new(path.as_str());
+                        if path.is_absolute() && !path.as_os_str().as_encoded_bytes().contains(&0) {
+                            cx.emit(ContextDestinationEvent::Chosen(StorePath::from_unix_path(
+                                path,
+                            )));
+                            window.defer(cx, |window, _| window.remove_window());
+                        } else {
+                            this.location_error = true;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .when(self.location_error, |this| {
+                this.child(
+                    div()
+                        .id("context-destination-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .child(self.strings.destination_path_invalid.clone()),
+                )
+            })
             .children(choices)
             .child(
                 Button::new("context-destination-cancel")
@@ -978,7 +1022,8 @@ struct MusheenApp {
     status_center_open: bool,
     trash_states: HashMap<TabId, TrashState>,
     trash_focus: HashMap<TabId, CommandTargetRef>,
-    pending_empty_trash: Option<Vec<musheen_ops::TrashReceipt>>,
+    pending_empty_trash: Option<MenuInvocation>,
+    pending_restores: HashMap<WindowId, PendingRestore>,
     pending_drop: Option<PendingDrop>,
     pending_context_menu: Option<ContextMenu>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
@@ -1111,6 +1156,7 @@ impl MusheenApp {
             trash_states: HashMap::new(),
             trash_focus: HashMap::new(),
             pending_empty_trash: None,
+            pending_restores: HashMap::new(),
             pending_drop: None,
             pending_context_menu: None,
             keyboard_context_popup: None,
@@ -2145,6 +2191,16 @@ impl MusheenApp {
         } else {
             target
         };
+        let selection = if target == MenuTarget::TrashBackground {
+            match self.trash_states.get(&tab_id) {
+                Some(TrashState::Ready(surface)) => {
+                    surface.items().iter().map(trash_command_target).collect()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            selection
+        };
         self.compose_context_menu_at(tab_id, target, location, selection)
     }
 
@@ -2156,6 +2212,11 @@ impl MusheenApp {
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
         let context = self.context_for_menu(tab_id, target, &location, &selection);
+        let trash_contents = if target == MenuTarget::TrashBackground {
+            selection.clone()
+        } else {
+            Vec::new()
+        };
         self.shell
             .context_menus()
             .clone()
@@ -2163,6 +2224,7 @@ impl MusheenApp {
             .with_theme_profile(self.context_menu_theme)
             .compose(
                 crate::ContextMenuRequest::new(context, target, location, selection)
+                    .with_trash_contents(trash_contents)
                     .with_origin_tab(tab_id),
             )
     }
@@ -2317,7 +2379,17 @@ impl MusheenApp {
                 CommandAction::ALL
                     .iter()
                     .copied()
-                    .map(|action| (action, self.localized_backend_action_state(action)))
+                    .map(|action| {
+                        (
+                            action,
+                            self.context_backend_action_state(
+                                action,
+                                tab_id,
+                                item_target,
+                                selection,
+                            ),
+                        )
+                    })
                     .collect(),
             ),
             ..CommandContext::default()
@@ -2366,7 +2438,12 @@ impl MusheenApp {
                 }
             }
             MenuInvocation::NeedsConfirmation(pending) => {
-                self.open_context_review(MenuInvocation::NeedsConfirmation(pending), cx);
+                if pending.command_id() == "trash.empty" {
+                    self.pending_empty_trash = Some(MenuInvocation::NeedsConfirmation(pending));
+                    cx.notify();
+                } else {
+                    self.open_context_review(MenuInvocation::NeedsConfirmation(pending), cx);
+                }
             }
             MenuInvocation::NeedsDestinationChooser(pending) => {
                 self.open_context_destination_chooser(pending, cx);
@@ -2538,6 +2615,7 @@ impl MusheenApp {
             return;
         };
         let dialog = self.context_dialog_windows.remove(index);
+        self.pending_restores.remove(&closed);
         if self
             .pending_drop
             .as_ref()
@@ -2580,19 +2658,9 @@ impl MusheenApp {
             .origin_tab()
             .unwrap_or_else(|| self.navigation.focused_tab().id());
         let choices = self.context_destination_choices(tab_id);
-        if choices.is_empty() {
-            self.operation_error = Some(
-                self.catalog
-                    .message("context.no-destinations")
-                    .expect("destination message is localized")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        }
         let strings = ContextDialogStrings::from_catalog(&self.catalog);
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(520.), px(420.)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(520.), px(540.)), cx)),
             titlebar: Some(TitlebarOptions {
                 title: Some(SharedString::from(strings.choose_destination.clone())),
                 ..TitlebarOptions::default()
@@ -2603,7 +2671,7 @@ impl MusheenApp {
         let mut dialog = None;
         let dialog_window = cx
             .open_window(options, |window, cx| {
-                let view = cx.new(|cx| ContextDestinationDialog::new(choices, strings, cx));
+                let view = cx.new(|cx| ContextDestinationDialog::new(choices, strings, window, cx));
                 dialog = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             })
@@ -2713,6 +2781,43 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         match (&action, &parameters) {
+            (CommandAction::Restore, CommandParameters::Targets(targets)) => {
+                if let Some(tab_id) = origin_tab
+                    && targets.len() == 1
+                    && let Some(items) = self.trash_items_for_targets(tab_id, targets)
+                {
+                    let item = &items[0];
+                    self.restore_trash_item(tab_id, item.receipt().clone(), item.kind(), cx);
+                } else {
+                    self.operation_error = Some(
+                        self.catalog
+                            .message("context.target-changed")
+                            .expect("target refusal is localized")
+                            .into(),
+                    );
+                    cx.notify();
+                }
+            }
+            (CommandAction::EmptyTrash, CommandParameters::None) => {
+                if let Some(tab_id) = origin_tab
+                    && let Some(targets) = captured_targets
+                    && let Some(items) = self.trash_items_for_targets(tab_id, targets)
+                {
+                    self.empty_trash(
+                        tab_id,
+                        items.iter().map(|item| item.receipt().clone()).collect(),
+                        cx,
+                    );
+                } else {
+                    self.operation_error = Some(
+                        self.catalog
+                            .message("context.target-changed")
+                            .expect("target refusal is localized")
+                            .into(),
+                    );
+                    cx.notify();
+                }
+            }
             (
                 CommandAction::CopyTo | CommandAction::MoveTo,
                 CommandParameters::Destination {
@@ -2889,6 +2994,8 @@ impl MusheenApp {
                 | CommandAction::DirectoryProperties
                 | CommandAction::CopyTo
                 | CommandAction::MoveTo
+                | CommandAction::Restore
+                | CommandAction::EmptyTrash
         ) {
             return CapabilityState::Supported;
         }
@@ -2909,6 +3016,32 @@ impl MusheenApp {
         CapabilityState::Unsupported(
             CapabilityReason::new(reason).expect("the desktop-backend reason is valid"),
         )
+    }
+
+    fn context_backend_action_state(
+        &self,
+        action: CommandAction,
+        tab_id: TabId,
+        target: CommandTarget,
+        selection: &[CommandTargetRef],
+    ) -> CapabilityState {
+        let target_matches = match action {
+            CommandAction::Restore => target == CommandTarget::TrashItem && selection.len() == 1,
+            CommandAction::EmptyTrash => target == CommandTarget::TrashBackground,
+            _ => return self.localized_backend_action_state(action),
+        };
+        if target_matches && self.trash_items_for_targets(tab_id, selection).is_some() {
+            self.localized_backend_action_state(action)
+        } else {
+            CapabilityState::Unsupported(
+                CapabilityReason::new(
+                    self.catalog
+                        .message("context.target-changed")
+                        .expect("target refusal is localized"),
+                )
+                .expect("target refusal is nonempty"),
+            )
+        }
     }
 
     fn localized_backend_action_state(&self, action: CommandAction) -> CapabilityState {
@@ -4508,8 +4641,8 @@ impl MusheenApp {
                 let items = surface.items().to_vec();
                 let rows = items.iter().cloned().enumerate().map(|(index, item)| {
                     let receipt = item.receipt().clone();
-                    let kind = item.kind();
                     let target = trash_command_target(&item);
+                    let restore_target = target.clone();
                     let pointer_target = target.clone();
                     let original = DisplayPath::from_store_path(receipt.original_path())
                         .as_str()
@@ -4600,17 +4733,25 @@ impl MusheenApp {
                                 .label("Restore")
                                 .small()
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.restore_trash_item(receipt.clone(), kind, cx);
+                                    let menu = this.compose_context_menu(
+                                        tab_id,
+                                        MenuTarget::TrashItem,
+                                        vec![restore_target.clone()],
+                                    );
+                                    if let Some(entry) =
+                                        Self::menu_entry_by_id(&menu, "trash.restore")
+                                    {
+                                        this.dispatch_context_entry(entry.clone(), cx);
+                                    }
                                 })),
                         )
                 });
-                let receipts = items
-                    .iter()
-                    .map(|item| item.receipt().clone())
-                    .collect::<Vec<_>>();
-                let count = receipts.len();
+                let count = items.len();
                 let confirmation = self.pending_empty_trash.as_ref().map(|pending| {
-                    let pending_count = pending.len();
+                    let pending_count = match pending {
+                        MenuInvocation::NeedsConfirmation(pending) => pending.selection().len(),
+                        _ => 0,
+                    };
                     let label = if pending_count == 1 {
                         "Permanently delete 1 item from Trash? This cannot be undone.".to_owned()
                     } else {
@@ -4676,8 +4817,16 @@ impl MusheenApp {
                                         .label("Empty Trash")
                                         .small()
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.pending_empty_trash = Some(receipts.clone());
-                                            cx.notify();
+                                            let menu = this.compose_context_menu(
+                                                tab_id,
+                                                MenuTarget::TrashBackground,
+                                                Vec::new(),
+                                            );
+                                            if let Some(entry) =
+                                                Self::menu_entry_by_id(&menu, "trash.empty")
+                                            {
+                                                this.dispatch_context_entry(entry.clone(), cx);
+                                            }
                                         })),
                                 )
                             }),
@@ -4699,13 +4848,45 @@ impl MusheenApp {
         }
     }
 
+    fn trash_items_for_targets(
+        &self,
+        tab_id: TabId,
+        targets: &[CommandTargetRef],
+    ) -> Option<Vec<TrashItem>> {
+        if targets.is_empty()
+            || !self
+                .navigation
+                .tab(tab_id)
+                .is_some_and(|tab| is_trash_location(tab.location()))
+        {
+            return None;
+        }
+        let TrashState::Ready(surface) = self.trash_states.get(&tab_id)? else {
+            return None;
+        };
+        let available: HashMap<_, _> = surface
+            .items()
+            .iter()
+            .map(|item| (trash_command_target(item).id().clone(), item))
+            .collect();
+        targets
+            .iter()
+            .map(|target| {
+                available
+                    .get(target.id())
+                    .filter(|item| trash_command_target(item) == *target)
+                    .map(|item| (*item).clone())
+            })
+            .collect()
+    }
+
     fn restore_trash_item(
         &mut self,
+        tab_id: TabId,
         receipt: musheen_ops::TrashReceipt,
         source_kind: ConflictItemKind,
         cx: &mut Context<Self>,
     ) {
-        let tab_id = self.navigation.focused_tab().id();
         let work = cx.background_spawn(async move {
             let mut store = LocalStore::new();
             match musheen_ops::execute_restore(&mut store, &receipt) {
@@ -4779,29 +4960,51 @@ impl MusheenApp {
         let options = conflict_window_options(cx);
         let model = ConflictDialogModel::new(conflict.clone());
         let mut dialog = None;
-        cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| ConflictDialog::new(model, cx));
-            dialog = Some(view.clone());
-            cx.new(|cx| Root::new(view, window, cx))
-        })
-        .expect("Musheen could not open a conflict dialog");
+        let handle = cx
+            .open_window(options, |window, cx| {
+                let view = cx.new(|cx| ConflictDialog::new(model, cx));
+                dialog = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("Musheen could not open a conflict dialog");
         let dialog = dialog.expect("the conflict window constructs its view");
-        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
-            ConflictDialogEvent::Resolved(choice, scope) => {
-                this.apply_restore_decision(
-                    tab_id,
-                    receipt.clone(),
-                    conflict.clone(),
-                    *choice,
-                    *scope,
-                    cx,
-                );
-            }
-            ConflictDialogEvent::Cancelled => {
-                this.start_trash_load(tab_id, cx);
-            }
+        let window_id = handle.window_id();
+        self.pending_restores.insert(
+            window_id,
+            PendingRestore {
+                tab_id,
+                receipt,
+                conflict,
+                _dialog: dialog.clone(),
+            },
+        );
+        self.track_context_dialog_window(window_id, Some(tab_id), cx);
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| {
+            this.handle_restore_conflict_event(window_id, event, cx);
         });
         self.conflict_subscriptions.push(subscription);
+    }
+
+    fn handle_restore_conflict_event(
+        &mut self,
+        window_id: WindowId,
+        event: &ConflictDialogEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_restores.remove(&window_id) else {
+            return;
+        };
+        match event {
+            ConflictDialogEvent::Resolved(choice, scope) => self.apply_restore_decision(
+                pending.tab_id,
+                pending.receipt,
+                pending.conflict,
+                *choice,
+                *scope,
+                cx,
+            ),
+            ConflictDialogEvent::Cancelled => self.start_trash_load(pending.tab_id, cx),
+        }
     }
 
     fn apply_restore_decision(
@@ -4849,10 +5052,21 @@ impl MusheenApp {
     }
 
     fn confirm_empty_trash(&mut self, cx: &mut Context<Self>) {
-        let Some(receipts) = self.pending_empty_trash.take() else {
+        if self.browser_input_blocked() {
+            return;
+        }
+        let Some(invocation) = self.pending_empty_trash.take() else {
             return;
         };
-        let tab_id = self.navigation.focused_tab().id();
+        self.confirm_context_review(invocation, cx);
+    }
+
+    fn empty_trash(
+        &mut self,
+        tab_id: TabId,
+        receipts: Vec<musheen_ops::TrashReceipt>,
+        cx: &mut Context<Self>,
+    ) {
         let confirmed = self
             .trash_states
             .get(&tab_id)
@@ -7397,6 +7611,183 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn destination_path_is_typed_and_invalid_or_cancelled_input_never_dispatches(
+        cx: &mut TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        cx.update(gpui_kit::init);
+        for cancel in [false, true] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let mut subscription = None;
+            let handle = cx.open_window(size(px(520.), px(540.)), |window, cx| {
+                let strings =
+                    ContextDialogStrings::from_catalog(&Catalog::load(Locale::EnUs).unwrap());
+                let dialog =
+                    cx.new(|cx| ContextDestinationDialog::new(Vec::new(), strings, window, cx));
+                let events = events.clone();
+                subscription = Some(cx.subscribe(
+                    &dialog,
+                    move |_, _, event: &ContextDestinationEvent, _| {
+                        events.borrow_mut().push(event.clone())
+                    },
+                ));
+                Root::new(dialog, window, cx)
+            });
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.click("context-destination-path", cx);
+                window.input("relative/path", cx);
+                window.click("context-destination-use-path", cx);
+                window.render_frame(cx);
+                assert!(window.find("context-destination-error").visible());
+                assert!(events.borrow().is_empty());
+                window.click("context-destination-path", cx);
+                window.press("ctrl-a", cx);
+                window.input("/tmp/arbitrary folder", cx);
+                window.click(
+                    if cancel {
+                        "context-destination-cancel"
+                    } else {
+                        "context-destination-use-path"
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(events.borrow().len(), 1);
+            match &events.borrow()[0] {
+                ContextDestinationEvent::Chosen(path) => {
+                    assert!(!cancel);
+                    assert_eq!(path, &StorePath::from_unix_path("/tmp/arbitrary folder"));
+                }
+                ContextDestinationEvent::Cancelled => assert!(cancel),
+            }
+            drop(subscription);
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn trash_registry_requires_live_receipts_and_restore_collision_close_cancels_only_its_token(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("existing.txt");
+        filesystem::write(&destination, b"keep this file").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let prior_focus = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.press("ctrl-l", cx);
+                let focus = window.focused(cx).unwrap();
+                app.update(cx, |state, cx| {
+                    state.remember_context_invocation_focus(window, cx)
+                });
+                focus
+            })
+            .unwrap();
+        let (first, second) = app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let receipt = musheen_ops::TrashReceipt::new(StorePath::from_unix_path(&destination), b"captured-trash-receipt".to_vec());
+            let item = TrashItem::new(receipt.clone(), 1);
+            let target = trash_command_target(&item);
+            state.navigation.navigate_focused(trash_store_path());
+            for trash_state in [TrashState::Loading, TrashState::Error("unavailable".into()), TrashState::Ready(TrashSurfaceModel::new(Vec::new())), TrashState::Ready(TrashSurfaceModel::new(vec![item]))] {
+                let available = matches!(&trash_state, TrashState::Ready(surface) if !surface.items().is_empty());
+                state.trash_states.insert(tab, trash_state);
+                for (menu_target, id) in [(MenuTarget::TrashItem, "trash.restore"), (MenuTarget::TrashBackground, "trash.empty")] {
+                    let menu = state.compose_context_menu(tab, menu_target, vec![target.clone()]);
+                    let entry = MusheenApp::menu_entry_by_id(&menu, id).unwrap();
+                    assert_eq!(entry.state().is_enabled(), available);
+                    if available {
+                        assert_eq!(entry.captured_targets(), std::slice::from_ref(&target));
+                        let surface = state.shell.context_menus();
+                        let mut dispatcher = AppMenuDispatcher::default();
+                        let invocation = surface.invoke(entry, &mut dispatcher);
+                        let expected_action = if id == "trash.empty" {
+                            assert!(matches!(&invocation, MenuInvocation::NeedsConfirmation(pending) if pending.selection() == std::slice::from_ref(&target)));
+                            surface.confirm(invocation, &mut dispatcher).unwrap();
+                            CommandAction::EmptyTrash
+                        } else {
+                            assert!(matches!(invocation, MenuInvocation::Dispatched));
+                            CommandAction::Restore
+                        };
+                        assert_eq!(dispatcher.dispatched.as_ref().unwrap().0, expected_action);
+                    }
+                }
+            }
+            let wrong = CommandTargetRef::new(target.id().clone(), StorePath::from_provider_key(target.id().provider().clone(), b"different".to_vec()).unwrap()).unwrap();
+            let menu = state.compose_context_menu(tab, MenuTarget::TrashItem, vec![wrong]);
+            assert!(!MusheenApp::menu_entry_by_id(&menu, "trash.restore").unwrap().state().is_enabled());
+            let conflict = ConflictRecord::new(OperationKind::Restore, target.path().clone(), receipt.provider_reference().to_vec(), ConflictItemKind::File, receipt.original_path().clone(), b"destination-identity".to_vec(), ConflictItemKind::File).unwrap();
+            state.open_restore_conflict(tab, receipt.clone(), conflict.clone(), cx);
+            state.open_restore_conflict(tab, receipt, conflict, cx);
+            assert!(state.browser_input_blocked());
+            (state.context_dialog_windows[0].id, state.context_dialog_windows[1].id)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("omnibar-search", cx);
+            window.right_click("directory-content", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("popup-menu").is_none());
+            assert_eq!(app.read(cx).omnibar.mode(), OmnibarMode::Path);
+        })
+        .unwrap();
+        for id in [first, second] {
+            cx.update(|cx| {
+                let dialog = cx
+                    .windows()
+                    .into_iter()
+                    .find(|handle| handle.window_id() == id)
+                    .unwrap();
+                dialog
+                    .update(cx, |_, window, _| window.remove_window())
+                    .unwrap();
+            });
+            cx.run_until_parked();
+            app.update(cx, |state, cx| {
+                assert!(!state.pending_restores.contains_key(&id));
+                if id == first {
+                    assert!(state.pending_restores.contains_key(&second));
+                }
+                state.handle_restore_conflict_event(
+                    id,
+                    &ConflictDialogEvent::Resolved(
+                        ConflictChoice::Replace,
+                        ApplyScope::ThisConflict,
+                    ),
+                    cx,
+                );
+            });
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!app.read(cx).browser_input_blocked());
+            assert!(prior_focus.is_focused(window));
+        })
+        .unwrap();
+        assert_eq!(filesystem::read(&destination).unwrap(), b"keep this file");
+    }
+
+    #[gpui_kit::test]
     async fn context_move_chooser_review_keeps_origin_focus_and_runs_the_queue(
         cx: &mut TestAppContext,
     ) {
@@ -7422,17 +7813,13 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
-        let (prior_focus, choice) = cx
+        let prior_focus = cx
             .update_window(handle.into(), |_, window, cx| {
                 window.render_frame(cx);
                 window.press("ctrl-l", cx);
                 let focus = window.focused(cx).unwrap();
-                let choice = app.update(cx, |state, cx| {
+                app.update(cx, |state, cx| {
                     state.catalog = Catalog::load(Locale::EnXa).unwrap();
-                    state.pins.replace([SidebarEntry::new(
-                        "Destination",
-                        StorePath::from_unix_path(destination.as_os_str()),
-                    )]);
                     let tab = state.navigation.focused_tab().id();
                     let item = state
                         .focused_directory()
@@ -7453,18 +7840,13 @@ mod tests {
                     let entry = MusheenApp::menu_entry_by_id(&menu, "clipboard.move_to")
                         .unwrap()
                         .clone();
-                    let choice = state
-                        .context_destination_choices(tab)
-                        .iter()
-                        .position(|choice| {
-                            choice.location.as_unix_path() == Some(destination.as_path())
-                        })
-                        .unwrap();
+                    assert!(state.context_destination_choices(tab).iter().all(|choice| {
+                        choice.location.as_unix_path() != Some(destination.as_path())
+                    }));
                     state.remember_context_invocation_focus(window, cx);
                     state.dispatch_context_entry(entry, cx);
-                    choice
                 });
-                (focus, choice)
+                focus
             })
             .unwrap();
         let browser: AnyWindowHandle = handle.into();
@@ -7490,14 +7872,16 @@ mod tests {
             );
             assert!(
                 window
-                    .find(format!("context-destination-{choice}"))
+                    .find("context-destination-use-path")
                     .bounds()
                     .bottom_right()
                     .y
                     <= window.viewport_size().height,
-                "destination choice {choice} must fit in chooser"
+                "arbitrary destination control must fit in chooser"
             );
-            window.click(format!("context-destination-{choice}"), cx);
+            window.click("context-destination-path", cx);
+            window.input(destination.to_str().unwrap(), cx);
+            window.click("context-destination-use-path", cx);
         })
         .unwrap();
         cx.update(|cx| {
@@ -7948,7 +8332,8 @@ mod tests {
             );
             let dialog = cx
                 .open_window(WindowOptions::default(), |window, cx| {
-                    let view = cx.new(|cx| ContextDestinationDialog::new(Vec::new(), strings, cx));
+                    let view =
+                        cx.new(|cx| ContextDestinationDialog::new(Vec::new(), strings, window, cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 })
                 .expect("context modal opens");
