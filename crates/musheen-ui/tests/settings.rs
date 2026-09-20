@@ -14,7 +14,7 @@ fn all_settings_have_one_searchable_localized_owner() {
         for spec in settings_schema() {
             assert!(
                 state
-                    .search(&catalog.message(spec.label).unwrap(), &catalog)
+                    .search(catalog.message(spec.label).unwrap(), &catalog)
                     .iter()
                     .any(|hit| hit.key == spec.key)
             );
@@ -145,6 +145,22 @@ fn unavailable_backends_do_not_accept_edits_or_appear_in_search() {
         assert!(state.edit(key, "true").is_err());
         assert!(!state.search("", &catalog).iter().any(|hit| hit.key == key));
     }
+    for page in SettingsPage::ALL {
+        state.select_page(page);
+        for spec in state.page_controls() {
+            assert!(
+                state.available(spec),
+                "unavailable control {} rendered",
+                spec.key
+            );
+            assert!(
+                state
+                    .search("", &catalog)
+                    .iter()
+                    .any(|hit| hit.key == spec.key)
+            );
+        }
+    }
 }
 
 #[test]
@@ -225,13 +241,15 @@ fn reset_all_needs_confirmation_and_preserves_unknown_fields() {
 }
 
 #[gpui_kit::test]
-async fn settings_gallery_keeps_controls_reachable_at_double_scale(
+async fn settings_gallery_checks_rendered_controls_labels_and_confirmation_at_double_scale(
     cx: &mut gpui_kit::TestAppContext,
 ) {
     use gpui_kit::component::Root;
-    use gpui_kit::{AppContext, px, size};
+    use gpui_kit::{AppContext, Role, px, size};
+    use musheen_desktop::SettingKind;
     let root = tempfile::tempdir().unwrap();
     for locale in [Locale::EnUs, Locale::EnXa, Locale::Ar] {
+        let catalog = Catalog::load(locale).unwrap();
         for (dark, contrast) in [(false, false), (true, false), (false, true)] {
             cx.update(|cx| {
                 gpui_kit::init(cx);
@@ -248,7 +266,7 @@ async fn settings_gallery_keeps_controls_reachable_at_double_scale(
                 let settings = cx.new(|cx| {
                     musheen_ui::settings::SettingsWindow::new(
                         SettingsStore::from_config_home(root.path()),
-                        SettingsBackends::default(),
+                        SettingsBackends::all(),
                         Catalog::load(locale).unwrap(),
                         window,
                         cx,
@@ -265,6 +283,11 @@ async fn settings_gallery_keeps_controls_reachable_at_double_scale(
                     window.click(page.label(), cx);
                     window.render_frame(cx);
                     assert_eq!(view.read(cx).state().page(), page);
+                    let sidebar = window.find("settings-sidebar").bounds();
+                    let label = window.find(format!("text-{}", page.label()));
+                    assert_eq!(label.label(), Some(catalog.message(page.label()).unwrap()));
+                    assert!(label.bounds().origin.x >= sidebar.origin.x);
+                    assert!(label.bounds().bottom_right().x <= sidebar.bottom_right().x);
                     let bounds = window.find("settings-window").bounds();
                     for id in ["settings-apply", "settings-cancel", "settings-reset-all"] {
                         let control = window.find(id);
@@ -279,6 +302,124 @@ async fn settings_gallery_keeps_controls_reachable_at_double_scale(
                         );
                     }
                 }
+            })
+            .unwrap();
+            // Every schema control is reached through the real searchable sidebar.
+            // Check actual rendered labels, choice buttons, inputs and help text,
+            // not a model-only list or just the fixed footer's bounds.
+            for spec in settings_schema() {
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.click("settings-search", cx);
+                    window.press("ctrl-a", cx);
+                    window.input(spec.key, cx);
+                })
+                .unwrap();
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.render_frame(cx);
+                    let result = format!("result-{}", spec.key);
+                    let label = window.find(format!("text-{result}"));
+                    let sidebar = window.find("settings-sidebar").bounds();
+                    assert!(label.bounds().origin.x >= sidebar.origin.x);
+                    assert!(
+                        label.bounds().bottom_right().x <= sidebar.bottom_right().x,
+                        "{locale:?} {result}"
+                    );
+                    window.click(result, cx);
+                    window.render_frame(cx);
+                    assert_eq!(view.read(cx).state().page(), spec.page);
+                    assert_eq!(view.read(cx).state().focused_key(), Some(spec.key));
+                    let panel = window.find("settings-controls").bounds();
+                    let row = window.find(format!("row-{}", spec.key)).bounds();
+                    let control = window.find(spec.key);
+                    assert!(control.visible(), "{locale:?} {}", spec.key);
+                    let expected_role = match spec.kind {
+                        SettingKind::Boolean | SettingKind::Choice(_) => Role::Button,
+                        _ => Role::TextInput,
+                    };
+                    assert_eq!(control.role(), Some(expected_role), "{}", spec.key);
+                    let mut ids = vec![
+                        spec.key.to_owned(),
+                        format!("label-{}", spec.key),
+                        format!("help-{}", spec.key),
+                    ];
+                    if spec.restart_required {
+                        ids.push(format!("restart-{}", spec.key));
+                    }
+                    let options: &[&str] = match spec.kind {
+                        SettingKind::Boolean => &["false", "true"],
+                        SettingKind::Choice(values) => values,
+                        _ => &[],
+                    };
+                    for value in options {
+                        let id = if *value == spec.default {
+                            spec.key.to_owned()
+                        } else {
+                            format!("{}:{value}", spec.key)
+                        };
+                        let option = window.find(id.clone());
+                        let expected = catalog
+                            .message(&format!("settings-value-{value}"))
+                            .unwrap()
+                            .to_string();
+                        assert_eq!(option.label(), Some(expected.as_str()));
+                        ids.push(id.clone());
+                        ids.push(format!("text-{id}"));
+                    }
+                    for id in ids {
+                        let bounds = window.find(id.clone()).bounds();
+                        assert!(
+                            bounds.size.width > px(0.) && bounds.size.height > px(0.),
+                            "{locale:?} {id}"
+                        );
+                        assert!(
+                            bounds.origin.x >= panel.origin.x
+                                && bounds.bottom_right().x <= panel.bottom_right().x,
+                            "{locale:?} {id}: {bounds:?} outside {panel:?}"
+                        );
+                        assert!(
+                            bounds.origin.y >= row.origin.y
+                                && bounds.bottom_right().y <= row.bottom_right().y,
+                            "{locale:?} {id}: content escapes row"
+                        );
+                    }
+                    assert!(
+                        row.size.height <= panel.size.height,
+                        "{locale:?} {} cannot fit a scroll viewport",
+                        spec.key
+                    );
+                    assert!(
+                        row.origin.y >= panel.origin.y
+                            && row.bottom_right().y <= panel.bottom_right().y,
+                        "{locale:?} {}: target row clipped {row:?} in {panel:?}",
+                        spec.key
+                    );
+                })
+                .unwrap();
+            }
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.click("settings-reset-all", cx);
+                window.render_frame(cx);
+                let bounds = window.find("settings-window").bounds();
+                for id in [
+                    "settings-reset-summary",
+                    "settings-reset-cancel",
+                    "settings-confirm",
+                ] {
+                    let item = window.find(id);
+                    assert!(item.visible());
+                    assert!(
+                        item.bounds().origin.x >= bounds.origin.x
+                            && item.bounds().bottom_right().x <= bounds.bottom_right().x,
+                        "{locale:?} {id}"
+                    );
+                    assert!(
+                        item.bounds().origin.y >= bounds.origin.y
+                            && item.bounds().bottom_right().y <= bounds.bottom_right().y,
+                        "{locale:?} {id}"
+                    );
+                }
+                assert!(window.find("settings-reset-cancel").focused().unwrap());
+                window.press("escape", cx);
                 window.remove_window();
             })
             .unwrap();

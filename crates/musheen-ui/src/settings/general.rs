@@ -18,6 +18,25 @@ pub(crate) fn configure_navigation(
     }
 }
 
+pub(crate) fn view_preferences(
+    document: &musheen_desktop::SettingsDocument,
+) -> crate::views::ViewPreferences {
+    use crate::views::{Layout, ViewPreferences};
+    ViewPreferences {
+        layout: match document.value("layout.view").as_deref() {
+            Some("list") => Layout::List,
+            Some("cards") => Layout::Cards,
+            Some("grid") => Layout::Grid,
+            Some("columns") => Layout::Columns,
+            Some("adaptive") => Layout::Adaptive,
+            _ => Layout::Details,
+        },
+        show_hidden: document.value("files.hidden").as_deref() == Some("true"),
+        directories_first: document.value("files.directories_first").as_deref() != Some("false"),
+        ..ViewPreferences::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,24 +62,5 @@ mod tests {
         let fresh = navigation.preferences_for(&StorePath::from_unix_path("/fresh"));
         assert_eq!(fresh.layout, Layout::Grid);
         assert!(fresh.show_hidden);
-    }
-}
-
-pub(crate) fn view_preferences(
-    document: &musheen_desktop::SettingsDocument,
-) -> crate::views::ViewPreferences {
-    use crate::views::{Layout, ViewPreferences};
-    ViewPreferences {
-        layout: match document.value("layout.view").as_deref() {
-            Some("list") => Layout::List,
-            Some("cards") => Layout::Cards,
-            Some("grid") => Layout::Grid,
-            Some("columns") => Layout::Columns,
-            Some("adaptive") => Layout::Adaptive,
-            _ => Layout::Details,
-        },
-        show_hidden: document.value("files.hidden").as_deref() == Some("true"),
-        directories_first: document.value("files.directories_first").as_deref() != Some("false"),
-        ..ViewPreferences::default()
     }
 }

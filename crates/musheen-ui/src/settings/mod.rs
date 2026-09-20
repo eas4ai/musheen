@@ -3,6 +3,7 @@ mod appearance;
 mod files;
 pub(crate) mod general;
 mod operations;
+mod presentation;
 mod remote;
 mod search;
 mod terminal;
@@ -199,7 +200,7 @@ impl SettingsState {
         Ok(())
     }
     pub fn page_controls(&self) -> Vec<&'static SettingSpec> {
-        match self.page {
+        let controls = match self.page {
             SettingsPage::General | SettingsPage::Layout | SettingsPage::Shortcuts => {
                 general::controls(self.page)
             }
@@ -212,7 +213,11 @@ impl SettingsState {
                 .chain(remote::controls())
                 .collect(),
             SettingsPage::Advanced => advanced::controls(),
-        }
+        };
+        controls
+            .into_iter()
+            .filter(|spec| self.available(spec))
+            .collect()
     }
 }
 

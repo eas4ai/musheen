@@ -1,17 +1,17 @@
+use super::presentation::{choices, display_number, display_value, input_value, stored_number};
 use super::{SettingsBackends, SettingsState};
 use crate::{AppearanceMode, Catalog, Locale, ThemeProfile};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{ActiveTheme, Disableable, Root, Selectable};
+use gpui_kit::component::{ActiveTheme, Disableable, Root, Theme, WindowExt};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, AppContext, Context, Entity, Focusable, Global, IntoElement, Render, Role, ScrollHandle,
-    SharedString, Subscription, TestSupportExt, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, div, px, size,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, Global, IntoElement, Render, Role,
+    ScrollHandle, SharedString, Subscription, TestSupportExt, TitlebarOptions, Window,
+    WindowBounds, WindowHandle, WindowOptions, div, px, size,
 };
 use musheen_desktop::{
-    SettingKind, SettingsDocument, SettingsPage, SettingsStore, settings_schema,
+    SettingKind, SettingSpec, SettingsDocument, SettingsPage, SettingsStore, settings_schema,
 };
 use std::collections::BTreeMap;
 
@@ -76,6 +76,9 @@ pub struct SettingsWindow {
     focus_pending: bool,
     scroll: ScrollHandle,
     saving: bool,
+    choices_focus: BTreeMap<&'static str, FocusHandle>,
+    reset_trigger: FocusHandle,
+    appearance_base: AppearanceSnapshot,
 }
 
 impl SettingsWindow {
@@ -111,24 +114,43 @@ impl SettingsWindow {
             focus_pending: false,
             scroll: ScrollHandle::new(),
             saving: false,
+            choices_focus: BTreeMap::new(),
+            reset_trigger: cx.focus_handle(),
+            appearance_base: AppearanceSnapshot::capture(cx),
         };
         for spec in settings_schema()
             .iter()
             .filter(|spec| this.state.available(spec))
         {
+            if !choices(spec.kind).is_empty() {
+                this.choices_focus.insert(spec.key, cx.focus_handle());
+                continue;
+            }
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .default_value(this.state.draft().value(spec.key).expect("schema key"))
+                    .placeholder(this.label("settings-value-none"))
+                    .default_value(input_value(
+                        spec,
+                        &this.state.draft().value(spec.key).expect("schema key"),
+                        &this.catalog,
+                    ))
             });
             this.subscriptions.push(cx.subscribe_in(
                 &input,
                 window,
                 move |this, input, event, _, cx| {
                     if matches!(event, InputEvent::Change) {
-                        let value = input.read(cx).value().to_string();
+                        if this.blocked() {
+                            return;
+                        }
+                        let value = if matches!(spec.kind, SettingKind::Integer { .. }) {
+                            stored_number(&input.read(cx).value())
+                        } else {
+                            input.read(cx).value().to_string()
+                        };
                         let _validation = this.state.edit(spec.key, &value);
                         if spec.page == SettingsPage::Appearance {
-                            apply_appearance(this.state.draft(), cx);
+                            this.preview_appearance(cx);
                         }
                         cx.notify();
                     }
@@ -145,7 +167,7 @@ impl SettingsWindow {
             }));
         this.subscriptions.push(cx.on_release(|this, cx| {
             this.state.cancel();
-            apply_appearance(this.state.draft(), cx);
+            this.appearance_base.restore(cx);
         }));
         this
     }
@@ -154,12 +176,17 @@ impl SettingsWindow {
         &self.state
     }
 
+    fn blocked(&self) -> bool {
+        self.saving || self.load_failed || self.state.reset_confirmation_pending()
+    }
+
+    fn preview_appearance(&self, cx: &mut App) {
+        self.appearance_base.restore(cx);
+        apply_appearance(self.state.draft(), cx);
+    }
+
     fn save(&mut self, cx: &mut Context<Self>) {
-        if self.saving
-            || self.load_failed
-            || !self.state.errors().is_empty()
-            || !self.state.is_dirty()
-        {
+        if self.blocked() || !self.state.errors().is_empty() || !self.state.is_dirty() {
             return;
         }
         self.saving = true;
@@ -178,6 +205,7 @@ impl SettingsWindow {
                         match result {
                             Ok(document) => {
                                 this.state.committed = document;
+                                this.appearance_base = AppearanceSnapshot::capture(cx);
                                 this.failure = None;
                             }
                             Err(_) => this.failure = Some("settings-save-error"),
@@ -208,9 +236,15 @@ impl SettingsWindow {
             self.sync_inputs = false;
             for (key, input) in &self.inputs {
                 let value = self.state.draft().value(key).expect("schema key");
-                input.update(cx, |input, cx| input.set_value(value, window, cx));
+                let spec = settings_schema()
+                    .iter()
+                    .find(|spec| spec.key == *key)
+                    .expect("schema key");
+                input.update(cx, |input, cx| {
+                    input.set_value(input_value(spec, &value, &self.catalog), window, cx)
+                });
             }
-            apply_appearance(self.state.draft(), cx);
+            self.preview_appearance(cx);
         }
         if self.focus_pending {
             self.focus_pending = false;
@@ -220,6 +254,12 @@ impl SettingsWindow {
                 .and_then(|key| self.inputs.get(key))
             {
                 input.read(cx).focus_handle(cx).focus(window, cx);
+            } else if let Some(focus) = self
+                .state
+                .focused_key()
+                .and_then(|key| self.choices_focus.get(key))
+            {
+                focus.focus(window, cx);
             }
         }
     }
@@ -235,9 +275,9 @@ impl SettingsWindow {
         if self.state.query().is_empty() {
             for page in SettingsPage::ALL {
                 sidebar = sidebar.child(
-                    Button::new(SharedString::from(page.label()))
-                        .label(self.label(page.label()))
-                        .ghost()
+                    native_button(page.label(), self.label(page.label()), cx)
+                        .w_full()
+                        .disabled(self.blocked())
                         .selected(self.state.page() == page)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.state.select_page(page);
@@ -249,19 +289,26 @@ impl SettingsWindow {
             for hit in self.state.search(self.state.query(), &self.catalog) {
                 let key = hit.key;
                 sidebar = sidebar.child(
-                    Button::new(SharedString::from(format!("result-{key}")))
-                        .label(format!("{} · {}", self.label(hit.page.label()), hit.label))
-                        .ghost()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.state.navigate_to(key).is_ok() {
-                                this.focus_pending = true;
-                            }
-                            cx.notify();
-                        })),
+                    native_button(
+                        format!("result-{key}"),
+                        format!("{} · {}", self.label(hit.page.label()), hit.label),
+                        cx,
+                    )
+                    .w_full()
+                    .disabled(self.blocked())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.state.navigate_to(key).is_ok() {
+                            this.focus_pending = true;
+                        }
+                        cx.notify();
+                    })),
                 );
             }
         }
-        sidebar.overflow_y_scrollbar()
+        sidebar
+            .id("settings-sidebar")
+            .test_support()
+            .overflow_y_scroll()
     }
 
     fn render_controls(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -285,52 +332,62 @@ impl SettingsWindow {
                 self.scroll.scroll_to_item(child_index);
             }
             child_index += 1;
-            if !self.state.available(spec) {
-                panel = panel.child(div().text_color(cx.theme().colors.muted_foreground).child(
-                    format!(
-                        "{} — {}",
-                        self.label(spec.label),
-                        self.label("settings-unavailable")
-                    ),
-                ));
-                continue;
-            }
             let mut row = div()
+                .id(SharedString::from(format!("row-{}", spec.key)))
+                .test_support()
+                .role(Role::Group)
+                .aria_label(self.label(spec.label))
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(self.label(spec.label));
+                .flex_shrink_0()
+                .child(observed_label(
+                    format!("label-{}", spec.key),
+                    self.label(spec.label),
+                ));
+            if !choices(spec.kind).is_empty() {
+                row = row.child(self.render_choices(spec, cx));
+            }
             if let Some(input) = self.inputs.get(spec.key) {
                 row = row.child(
                     Input::new(input)
                         .id(spec.key)
-                        .disabled(self.saving || self.load_failed)
+                        .disabled(self.blocked())
                         .accessibility_id(spec.key)
                         .aria_label(self.label(spec.label)),
                 );
             }
             let values = match spec.kind {
-                SettingKind::Boolean => "true / false".to_owned(),
-                SettingKind::Choice(choices) => choices.join(" / "),
+                SettingKind::Boolean | SettingKind::Choice(_) => String::new(),
                 SettingKind::Integer { maximum, units } => format!(
-                    "{}: {maximum} {}",
+                    "{}: {} {}",
                     self.label("settings-maximum"),
+                    display_number(&maximum.to_string(), self.catalog.locale()),
                     self.label(units)
                 ),
-                SettingKind::CredentialReference => "secret-service:<reference>".to_owned(),
+                SettingKind::CredentialReference => self.label("settings-credential-hint"),
             };
             row = row.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().colors.muted_foreground)
-                    .child(format!(
-                        "{}: {} · {values}",
+                observed_label(
+                    format!("help-{}", spec.key),
+                    format!(
+                        "{}: {} {}",
                         self.label("settings-default"),
-                        spec.default
-                    )),
+                        display_value(spec, spec.default, &self.catalog),
+                        values
+                    ),
+                )
+                .text_sm()
+                .text_color(cx.theme().colors.muted_foreground),
             );
             if spec.restart_required {
-                row = row.child(div().text_sm().child(self.label("settings-restart")));
+                row = row.child(
+                    observed_label(
+                        format!("restart-{}", spec.key),
+                        self.label("settings-restart"),
+                    )
+                    .text_sm(),
+                );
             }
             if self.state.errors().contains(spec.key) {
                 row = row.child(div().child(self.label("settings-invalid")));
@@ -340,7 +397,7 @@ impl SettingsWindow {
         panel
             .child(
                 Button::new("settings-reset-page")
-                    .disabled(self.saving || self.load_failed)
+                    .disabled(self.blocked())
                     .label(self.label("settings-reset-page"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.state.reset_page(this.state.page());
@@ -349,8 +406,89 @@ impl SettingsWindow {
                     })),
             )
             .id("settings-controls")
+            .test_support()
             .track_scroll(&self.scroll)
             .overflow_y_scroll()
+    }
+
+    fn render_choices(&self, spec: &'static SettingSpec, cx: &Context<Self>) -> impl IntoElement {
+        let selected = self.state.draft().value(spec.key).expect("schema key");
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children(choices(spec.kind).iter().map(|value| {
+                let value = *value;
+                let active = value == selected;
+                native_button(
+                    if active {
+                        spec.key.to_owned()
+                    } else {
+                        format!("{}:{value}", spec.key)
+                    },
+                    display_value(spec, value, &self.catalog),
+                    cx,
+                )
+                .selected(active)
+                .aria_toggled(if active {
+                    gpui_kit::accesskit::Toggled::True
+                } else {
+                    gpui_kit::accesskit::Toggled::False
+                })
+                .disabled(self.blocked())
+                .when(active, |button| {
+                    button.track_focus(&self.choices_focus[spec.key])
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.blocked() {
+                        return;
+                    }
+                    if this.state.edit(spec.key, value).is_ok()
+                        && spec.page == SettingsPage::Appearance
+                    {
+                        this.preview_appearance(cx);
+                    }
+                    this.choices_focus[spec.key].focus(window, cx);
+                    cx.notify();
+                }))
+            }))
+    }
+
+    fn confirm_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blocked() {
+            return;
+        }
+        self.state.request_reset_all();
+        self.reset_trigger.focus(window, cx);
+        let owner = cx.entity().downgrade();
+        let cancel_owner = owner.clone();
+        let title = self.label("settings-reset-all");
+        let summary = self.label("settings-reset-summary");
+        let footer = cx.new(|cx| ResetConfirmation {
+            owner,
+            cancel: self.label("settings-cancel"),
+            confirm: self.label("settings-confirm"),
+            cancel_focus: cx.focus_handle(),
+            pending_focus: true,
+        });
+        window.open_dialog(cx, move |dialog, _, _| {
+            let owner = cancel_owner.clone();
+            dialog
+                .title(title.clone())
+                .close_button(false)
+                .overlay_closable(false)
+                .child(observed_label("settings-reset-summary", summary.clone()))
+                .footer(footer.clone())
+                .on_ok(|_, _, _| false)
+                .on_cancel(move |_, _, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.state.confirm_reset_all(false);
+                        cx.notify();
+                    });
+                    true
+                })
+        });
+        cx.notify();
     }
 }
 
@@ -371,6 +509,7 @@ impl Render for SettingsWindow {
             .gap_3()
             .child(
                 Input::new(&self.search)
+                    .disabled(self.blocked())
                     .id("settings-search")
                     .accessibility_id("settings-search")
                     .aria_label(self.label("settings-search")),
@@ -392,50 +531,25 @@ impl Render for SettingsWindow {
         if self.saving {
             body = body.child(self.label("settings-saving"));
         }
-        if self.state.reset_confirmation_pending() {
-            body = body.child(
-                div()
-                    .child(self.label("settings-reset-summary"))
-                    .child(
-                        Button::new("settings-confirm")
-                            .disabled(self.saving || self.load_failed)
-                            .label(self.label("settings-confirm"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.confirm_reset_all(true);
-                                this.sync_inputs = true;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings-reset-cancel")
-                            .label(self.label("settings-cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.confirm_reset_all(false);
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
         body.child(
             div()
                 .flex()
                 .gap_2()
                 .child(
-                    Button::new("settings-reset-all")
-                        .disabled(self.saving || self.load_failed)
-                        .label(self.label("settings-reset-all"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.state.request_reset_all();
-                            cx.notify();
-                        })),
+                    native_button("settings-reset-all", self.label("settings-reset-all"), cx)
+                        .track_focus(&self.reset_trigger)
+                        .disabled(self.blocked())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.confirm_reset(window, cx)),
+                        ),
                 )
                 .child(
                     Button::new("settings-cancel")
-                        .disabled(self.saving)
+                        .disabled(self.blocked())
                         .label(self.label("settings-cancel"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.state.cancel();
-                            apply_appearance(this.state.draft(), cx);
+                            this.appearance_base.restore(cx);
                             window.remove_window();
                         })),
                 )
@@ -444,8 +558,7 @@ impl Render for SettingsWindow {
                         .label(self.label("settings-apply"))
                         .primary()
                         .disabled(
-                            self.load_failed
-                                || self.saving
+                            self.blocked()
                                 || !self.state.is_dirty()
                                 || !self.state.errors().is_empty(),
                         )
@@ -454,17 +567,27 @@ impl Render for SettingsWindow {
                         })),
                 ),
         )
+        .children(Root::render_dialog_layer(window, cx))
     }
 }
 
 pub(crate) fn apply_appearance(document: &SettingsDocument, cx: &mut App) {
-    let preferences = native_theme::AccessibilityPreferences::from_system();
-    if let Ok(system) = native_theme::SystemTheme::from_system() {
-        native_theme_gpui::apply_system_theme(&system, cx);
+    // Capture the bridge's resolved desktop appearance before the first user
+    // override. Reset must also work after reopening Settings with a saved override.
+    if !cx.has_global::<DesktopAppearance>() {
+        cx.set_global(DesktopAppearance(AppearanceSnapshot::capture(cx)));
     }
-    if document.value("appearance.mode").as_deref() == Some("system")
-        && document.value("appearance.reduce_motion").as_deref() != Some("true")
-    {
+    let preferences = native_theme::AccessibilityPreferences::from_system();
+    if document.value("appearance.mode").as_deref() == Some("system") {
+        let desktop = cx.global::<DesktopAppearance>().0.clone();
+        desktop.restore(cx);
+        let mut preferences = cx
+            .try_global::<native_theme_gpui::NativeTheme>()
+            .map(|theme| theme.accessibility().clone())
+            .unwrap_or(preferences.clone());
+        preferences.reduce_motion |=
+            document.value("appearance.reduce_motion").as_deref() == Some("true");
+        native_theme_gpui::apply_accessibility(&preferences, cx);
         return;
     }
     let native = ThemeProfile::from_active_native(
@@ -486,11 +609,344 @@ pub(crate) fn apply_appearance(document: &SettingsDocument, cx: &mut App) {
     }
 }
 
+struct DesktopAppearance(AppearanceSnapshot);
+impl Global for DesktopAppearance {}
+
+#[derive(Clone)]
+struct AppearanceSnapshot {
+    theme: Theme,
+    resolved: Option<native_theme::theme::ResolvedTheme>,
+    preferences: native_theme::AccessibilityPreferences,
+}
+
+impl AppearanceSnapshot {
+    fn capture(cx: &App) -> Self {
+        let native = cx.try_global::<native_theme_gpui::NativeTheme>();
+        Self {
+            theme: cx.theme().clone(),
+            resolved: native.and_then(|theme| theme.resolved(cx)).cloned(),
+            preferences: native
+                .map(|theme| theme.accessibility().clone())
+                .unwrap_or_default(),
+        }
+    }
+    fn restore(&self, cx: &mut App) {
+        if let Some(resolved) = &self.resolved {
+            native_theme_gpui::apply(self.theme.clone(), resolved, &self.preferences, cx);
+        } else {
+            *Theme::global_mut(cx) = self.theme.clone();
+            native_theme_gpui::apply_accessibility(&self.preferences, cx);
+        }
+    }
+}
+
+fn observed_label(id: impl Into<SharedString>, label: String) -> impl IntoElement + Styled {
+    div()
+        .id(id.into())
+        .test_support()
+        .role(Role::Label)
+        .aria_label(label.clone())
+        .min_w_0()
+        .max_w_full()
+        .whitespace_normal()
+        .child(label)
+}
+
+fn native_button(id: impl Into<SharedString>, label: String, cx: &App) -> gpui_kit::base::Button {
+    let id = id.into();
+    let colors = cx.theme().colors;
+    gpui_kit::base::Button::new(id.clone())
+        .accessibility_label(label.clone())
+        .min_w_0()
+        .max_w_full()
+        .flex_shrink_0()
+        .px_3()
+        .py_2()
+        .border_1()
+        .rounded(cx.theme().radius)
+        .bg(colors.secondary)
+        .text_color(colors.secondary_foreground)
+        .border_color(colors.border)
+        .focus_visible(move |style| style.border_color(colors.ring).border_2())
+        .styles(move |styles| {
+            styles
+                .selected(move |style| {
+                    style
+                        .bg(colors.primary)
+                        .text_color(colors.primary_foreground)
+                })
+                .disabled(move |style| style.text_color(colors.muted_foreground))
+        })
+        .child(observed_label(format!("text-{id}"), label))
+}
+
+struct ResetConfirmation {
+    owner: gpui_kit::WeakEntity<SettingsWindow>,
+    cancel: String,
+    confirm: String,
+    cancel_focus: FocusHandle,
+    pending_focus: bool,
+}
+
+impl Render for ResetConfirmation {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.pending_focus = false;
+            self.cancel_focus.focus(window, cx);
+        }
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .child(
+                native_button("settings-reset-cancel", self.cancel.clone(), cx)
+                    .track_focus(&self.cancel_focus)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let _ = this.owner.update(cx, |owner, cx| {
+                            owner.state.confirm_reset_all(false);
+                            cx.notify();
+                        });
+                        window.close_dialog(cx);
+                    })),
+            )
+            .child(
+                native_button("settings-confirm", self.confirm.clone(), cx).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        let _ = this.owner.update(cx, |owner, cx| {
+                            owner.state.confirm_reset_all(true);
+                            owner.sync_inputs = true;
+                            cx.notify();
+                        });
+                        window.close_dialog(cx);
+                    },
+                )),
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui_kit::TestAppContext;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+
+    #[gpui_kit::test]
+    async fn localized_choices_are_controls_not_serialized_input_values(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = tempfile::tempdir().unwrap();
+        for locale in [Locale::Ar, Locale::EnXa] {
+            let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
+                let entity = cx.new(|cx| {
+                    SettingsWindow::new(
+                        SettingsStore::from_config_home(root.path()),
+                        SettingsBackends::all(),
+                        Catalog::load(locale).unwrap(),
+                        window,
+                        cx,
+                    )
+                });
+                Root::new(entity, window, cx)
+            });
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(window.find("general.startup").role(), Some(Role::Button));
+                assert_ne!(window.find("general.startup").label(), Some("last-session"));
+                window.click("settings-page-appearance", cx);
+                window.render_frame(cx);
+                let label = window.find("appearance.mode").label().unwrap().to_owned();
+                assert_eq!(
+                    label,
+                    if locale == Locale::Ar {
+                        "اتّباع النظام"
+                    } else {
+                        "⟦Follow system ···⟧"
+                    }
+                );
+                window.remove_window();
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn localized_numeric_edits_round_trip_and_empty_credentials_remain_empty(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let root = tempfile::tempdir().unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
+            let entity = cx.new(|cx| {
+                SettingsWindow::new(
+                    SettingsStore::from_config_home(root.path()),
+                    SettingsBackends::all(),
+                    Catalog::load(Locale::Ar).unwrap(),
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(
+                view.read(cx).inputs["remote.credential"]
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+                ""
+            );
+            view.update(cx, |this, cx| {
+                this.state.navigate_to("directory_page_items").unwrap();
+                this.focus_pending = true;
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.press("ctrl-a", cx);
+            window.input("١٢٨", cx);
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(
+                view.read(cx)
+                    .state
+                    .draft()
+                    .value("directory_page_items")
+                    .as_deref(),
+                Some("128")
+            );
+            assert!(view.read(cx).state.errors().is_empty());
+            window.remove_window();
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn motion_preview_and_cancel_keep_desktop_resolved_colors(cx: &mut TestAppContext) {
+        let colors = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let prefs = native_theme::AccessibilityPreferences::default();
+            let (_, mut resolved) =
+                native_theme_gpui::from_preset("kde-breeze", false, &prefs).unwrap();
+            resolved.button.primary_background = "#805533".parse().unwrap();
+            let theme = native_theme_gpui::to_theme(&resolved, "Custom desktop", false, &prefs);
+            native_theme_gpui::apply(theme, &resolved, &prefs, cx);
+            cx.theme().colors
+        });
+        let root = tempfile::tempdir().unwrap();
+        let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
+            let entity = cx.new(|cx| {
+                SettingsWindow::new(
+                    SettingsStore::from_config_home(root.path()),
+                    SettingsBackends::all(),
+                    Catalog::load(Locale::EnUs).unwrap(),
+                    window,
+                    cx,
+                )
+            });
+            Root::new(entity, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-page-appearance", cx);
+            window.render_frame(cx);
+            window.click("appearance.reduce_motion:true", cx);
+            window.render_frame(cx);
+            assert_eq!(cx.theme().colors.background, colors.background);
+            assert_eq!(cx.theme().colors.primary, colors.primary);
+            assert!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .accessibility()
+                    .reduce_motion
+            );
+            window.click("settings-cancel", cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(cx.theme().colors.background, colors.background);
+            assert_eq!(cx.theme().colors.primary, colors.primary);
+            assert!(
+                !cx.global::<native_theme_gpui::NativeTheme>()
+                    .accessibility()
+                    .reduce_motion
+            );
+            let mut saved_override = SettingsDocument::default();
+            saved_override.set_value("appearance.mode", "dark").unwrap();
+            apply_appearance(&saved_override, cx);
+            apply_appearance(&SettingsDocument::default(), cx);
+            assert_eq!(
+                cx.theme().colors.primary,
+                colors.primary,
+                "resetting a saved override restores the desktop theme"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn reset_confirmation_traps_focus_and_escape_restores_trigger(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = tempfile::tempdir().unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
+            let entity = cx.new(|cx| {
+                SettingsWindow::new(
+                    SettingsStore::from_config_home(root.path()),
+                    SettingsBackends::default(),
+                    Catalog::load(Locale::EnUs).unwrap(),
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        let prior = cx
+            .update_window(handle.into(), |_, window, cx| {
+                view.update(cx, |this, _| {
+                    this.state.edit("files.hidden", "true").unwrap()
+                });
+                window.render_frame(cx);
+                window.click("settings-reset-all", cx);
+                window.render_frame(cx);
+                assert!(window.find("settings-reset-cancel").focused().unwrap());
+                let prior = view.read(cx).reset_trigger.clone();
+                for _ in 0..6 {
+                    window.press("tab", cx);
+                    window.render_frame(cx);
+                    assert!(
+                        window.find("settings-reset-cancel").focused() == Some(true)
+                            || window.find("settings-confirm").focused() == Some(true)
+                    );
+                }
+                window.click("settings-page-files", cx);
+                assert_eq!(view.read(cx).state.page(), SettingsPage::General);
+                window.press("escape", cx);
+                prior
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(prior.is_focused(window));
+            assert!(!view.read(cx).state.reset_confirmation_pending());
+            assert_eq!(
+                view.read(cx).state.draft().value("files.hidden").as_deref(),
+                Some("true")
+            );
+            window.click("settings-reset-all", cx);
+            window.render_frame(cx);
+            window.click("settings-confirm", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).state.draft().value("files.hidden").as_deref(),
+                Some("false")
+            );
+            assert!(prior.is_focused(window));
+            window.remove_window();
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     async fn apply_persists_the_ui_draft_before_marking_it_clean(cx: &mut TestAppContext) {
