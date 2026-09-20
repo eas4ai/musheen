@@ -8,6 +8,65 @@ use musheen_core::{
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn tab_commands_refuse_unavailable_navigation_transitions() {
+    let registry = CommandRegistry::built_in();
+    for id in [
+        "tab.close",
+        "tab.reopen_closed",
+        "tab.move_left",
+        "tab.move_right",
+    ] {
+        let state = registry.get(id).unwrap().state(&CommandContext::default());
+        assert!(!state.is_enabled(), "{id} must require live tab facts");
+        assert!(state.disabled_reason().is_some());
+    }
+    for (id, context) in [
+        (
+            "tab.close",
+            CommandContext {
+                can_close_tab: true,
+                ..CommandContext::default()
+            },
+        ),
+        (
+            "tab.reopen_closed",
+            CommandContext {
+                can_reopen_closed_tab: true,
+                ..CommandContext::default()
+            },
+        ),
+        (
+            "tab.move_left",
+            CommandContext {
+                can_move_tab_left: true,
+                ..CommandContext::default()
+            },
+        ),
+        (
+            "tab.move_right",
+            CommandContext {
+                can_move_tab_right: true,
+                ..CommandContext::default()
+            },
+        ),
+    ] {
+        for other in [
+            "tab.close",
+            "tab.reopen_closed",
+            "tab.move_left",
+            "tab.move_right",
+        ] {
+            let state = registry.get(other).unwrap().state(&context);
+            assert_eq!(
+                state.is_enabled(),
+                id == other,
+                "only {id} is possible, checking {other}"
+            );
+        }
+    }
+}
+
+#[test]
 fn open_with_dispatches_a_validated_application_identity_and_explicit_intent() {
     let registry = CommandRegistry::built_in();
     let target = local_target();

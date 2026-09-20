@@ -73,6 +73,10 @@ impl ProviderActionMatrix {
 pub struct CommandContext {
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    pub can_close_tab: bool,
+    pub can_reopen_closed_tab: bool,
+    pub can_move_tab_left: bool,
+    pub can_move_tab_right: bool,
     pub has_parent: bool,
     pub item_count: usize,
     pub selection_count: usize,
@@ -105,6 +109,10 @@ impl Default for CommandContext {
         Self {
             can_go_back: false,
             can_go_forward: false,
+            can_close_tab: false,
+            can_reopen_closed_tab: false,
+            can_move_tab_left: false,
+            can_move_tab_right: false,
             has_parent: false,
             item_count: 0,
             selection_count: 0,

@@ -2344,6 +2344,8 @@ impl MusheenApp {
             )
             .expect("the provider-action reason is valid"),
         );
+        let pane = self.navigation.focused_pane();
+        let active_tab = pane.active_tab().id();
         CommandContext {
             can_go_back: self
                 .navigation
@@ -2354,6 +2356,13 @@ impl MusheenApp {
                 .tab(tab_id)
                 .is_some_and(|tab| tab.history().can_go_forward()),
             has_parent: location.as_unix_path().and_then(Path::parent).is_some(),
+            can_close_tab: pane.tabs().len() > 1,
+            can_reopen_closed_tab: pane.has_closed_tabs(),
+            can_move_tab_left: pane
+                .tabs()
+                .first()
+                .is_some_and(|tab| tab.id() != active_tab),
+            can_move_tab_right: pane.tabs().last().is_some_and(|tab| tab.id() != active_tab),
             target: item_target,
             item_count,
             selection_count: selection.len(),
@@ -4451,12 +4460,22 @@ impl MusheenApp {
                 self.remember_browser_focus(window, cx);
             }
             self.dispatch_command(id.as_str(), cx);
-        } else if scope == musheen_core::ShortcutScope::Browser
-            && musheen_core::ShortcutMap::default()
-                .resolve(&chord, scope, self.shell.commands())
-                .is_some()
+        } else if musheen_core::ShortcutMap::default()
+            .resolve(
+                &chord,
+                musheen_core::ShortcutScope::Browser,
+                self.shell.commands(),
+            )
+            .is_some_and(|default| {
+                map.resolve(
+                    &chord,
+                    musheen_core::ShortcutScope::Browser,
+                    self.shell.commands(),
+                ) != Some(default)
+            })
         {
-            // Suppress the old static binding after a user removes or reassigns it.
+            // Static bindings have no browser scope. Suppress changed defaults even
+            // while the omnibar owns focus, but preserve unchanged text-editing keys.
             cx.stop_propagation();
             window.prevent_default();
         }
@@ -7289,6 +7308,10 @@ mod tests {
         });
         let temporary = tempfile::tempdir().unwrap();
         filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        let child = temporary.path().join("child");
+        filesystem::create_dir(&child).unwrap();
+        filesystem::write(child.join("child.txt"), b"test").unwrap();
+        let child = StorePath::from_unix_path(child.into_os_string());
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let view = cx.new(|cx| {
@@ -7302,6 +7325,14 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
+        cx.update_window(handle.into(), |_, _, cx| {
+            app.update(cx, |state, cx| state.navigate(child.clone(), true, cx));
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
         cx.update_window(handle.into(), |_, window, cx| {
             let mut document = musheen_desktop::SettingsDocument::default();
             let registry = musheen_core::CommandRegistry::built_in();
@@ -7311,6 +7342,21 @@ mod tests {
                     "view.sidebar",
                     musheen_core::ShortcutScope::Browser,
                     "ctrl-alt-b",
+                    &registry,
+                )
+                .unwrap();
+            shortcuts
+                .clear(
+                    "navigation.refresh",
+                    musheen_core::ShortcutScope::Browser,
+                    &registry,
+                )
+                .unwrap();
+            shortcuts
+                .assign(
+                    "navigation.back",
+                    musheen_core::ShortcutScope::Browser,
+                    "ctrl-alt-left",
                     &registry,
                 )
                 .unwrap();
@@ -7332,12 +7378,116 @@ mod tests {
                 !app.read(cx).sidebar_visible,
                 "removed static shortcut must not run"
             );
+            window.press("f5", cx);
+            assert_eq!(
+                app.read(cx).focused_directory().state(),
+                &DirectoryState::Ready,
+                "removed F5 must not start a reload"
+            );
+            window.press("alt-left", cx);
+            assert_eq!(app.read(cx).navigation.focused_tab().location(), &child);
             window.render_frame(cx);
             window.click("custom-toolbar-view.sidebar", cx);
             assert!(app.read(cx).sidebar_visible);
+            window.press("ctrl-l", cx);
+            window.render_frame(cx);
+            assert!(
+                app.read(cx)
+                    .omnibar_input
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            window.press("ctrl-b", cx);
+            assert!(
+                app.read(cx).sidebar_visible,
+                "removed browser shortcut must not bubble through omnibar focus"
+            );
+            window.press("f5", cx);
+            assert_eq!(
+                app.read(cx).focused_directory().state(),
+                &DirectoryState::Ready,
+                "removed F5 must not reload through omnibar focus"
+            );
+            window.press("alt-left", cx);
+            assert_eq!(
+                app.read(cx).navigation.focused_tab().location(),
+                &child,
+                "reassigned Alt+Left must not navigate through omnibar focus"
+            );
+            // Reset restores the static default while the omnibar remains focused.
+            cx.set_global(crate::settings::RuntimeSettings(
+                musheen_desktop::SettingsDocument::default(),
+            ));
+            window.press("ctrl-b", cx);
+            assert!(!app.read(cx).sidebar_visible);
             window.remove_window();
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn customization_tab_toolbar_tracks_live_navigation_state(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1200.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            let mut document = musheen_desktop::SettingsDocument::default();
+            document.set_value("layout.toolbar", "v1;navigation.location;tab.close;tab.reopen_closed;tab.move_left;tab.move_right").unwrap();
+            cx.set_global(crate::settings::RuntimeSettings(document));
+            for (trigger, expected) in [
+                (None, [false, false, false, false]),
+                (Some("ctrl-w"), [false, false, false, false]),
+                (Some("ctrl-shift-t"), [false, false, false, false]),
+                (Some("ctrl-t"), [true, false, true, false]),
+                (Some("custom-toolbar-tab.move_left"), [true, false, false, true]),
+                (Some("custom-toolbar-tab.close"), [false, true, false, false]),
+                (Some("custom-toolbar-tab.reopen_closed"), [true, false, true, false]),
+                (Some("ctrl-w"), [false, true, false, false]),
+                (Some("ctrl-shift-t"), [true, false, true, false]),
+            ] {
+                if let Some(trigger) = trigger {
+                    if trigger.starts_with("custom-toolbar-") {
+                        window.click(trigger, cx);
+                    } else {
+                        window.press(trigger, cx);
+                    }
+                }
+                window.render_frame(cx);
+                for (id, enabled) in ["tab.close", "tab.reopen_closed", "tab.move_left", "tab.move_right"].into_iter().zip(expected) {
+                    let state = app.read(cx);
+                    let command = state.shell.commands().get(id).unwrap();
+                    let command_state = command.state(&state.active_command_context(command.action()));
+                    assert_eq!(command_state.is_enabled(), enabled, "{id} after {trigger:?}");
+                    assert_eq!(command_state.disabled_reason().is_some(), !enabled);
+                    assert!(window.find(format!("custom-toolbar-{id}")).visible());
+                    if !enabled {
+                        let before = state.navigation.clone();
+                        window.click(format!("custom-toolbar-{id}"), cx);
+                        assert_eq!(app.read(cx).navigation, before, "disabled {id} must be inert");
+                    }
+                }
+            }
+            window.remove_window();
+        }).unwrap();
     }
 
     struct ImmediateSearchStream(Option<SearchBatch>);

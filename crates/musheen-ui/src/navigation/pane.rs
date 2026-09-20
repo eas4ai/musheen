@@ -57,6 +57,11 @@ impl PaneState {
         &self.tabs
     }
 
+    #[must_use]
+    pub fn has_closed_tabs(&self) -> bool {
+        !self.closed_tabs.is_empty()
+    }
+
     pub(super) fn tabs_mut(&mut self) -> &mut [TabState] {
         &mut self.tabs
     }
