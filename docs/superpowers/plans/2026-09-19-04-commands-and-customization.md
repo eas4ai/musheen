@@ -99,18 +99,18 @@ create `crates/musheen-desktop/src/custom_action.rs`; create
 `crates/musheen-ui/tests/themes.rs` and
 `crates/musheen-desktop/tests/custom_actions.rs`.
 
-- [ ] Test native-follow, explicit light/dark, high contrast, invalid/missing
+- [x] Test native-follow, explicit light/dark, high contrast, invalid/missing
   tokens, theme import rollback, custom action placeholders, shell injection
   strings, multi-selection, timeout, exit status, and missing executable.
-- [ ] Run both tests; expect failure.
-- [ ] Implement theme documents as semantic token overrides over GPUI Kit; no
+- [x] Run both tests; expect failure.
+- [x] Implement theme documents as semantic token overrides over GPUI Kit; no
   theme may replace command/content icon families or remove focus indicators.
-- [ ] Launch custom actions directly with an argv vector and explicit working
+- [x] Launch custom actions directly with an argv vector and explicit working
   directory. Shell execution requires an independently labeled opt-in action;
   never interpolate filenames into a shell string.
-- [ ] Run security fixtures containing quotes, newlines, leading dashes, and
+- [x] Run security fixtures containing quotes, newlines, leading dashes, and
   non-UTF-8 names.
-- [ ] Commit with `feat(custom): add themes and safe custom actions`.
+- [x] Commit with `feat(custom): add themes and safe custom actions`.
 
 ### Task 6: Implement tags, pins, Home, and folder preferences
 
