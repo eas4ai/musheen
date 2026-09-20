@@ -140,6 +140,7 @@ impl RenderOnce for MenuItemElement {
             .when_some(self.aria_has_popup, |this, popup| this.aria_has_popup(popup))
             .when_some(self.aria_expanded, |this, expanded| this.aria_expanded(expanded))
             .when_some(self.aria_toggled, |this, toggled| this.aria_toggled(toggled))
+            .aria_disabled(self.disabled)
             .aria_selected(self.selected)
             .group(&self.group_name)
             .gap_x_1()

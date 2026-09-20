@@ -12,7 +12,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuDirection, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Icon, Sizable};
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Context, Role, SharedString, TestSupportExt, Window, div};
+use gpui_kit::{App, Context, Role, SharedString, TestSupportExt, Window, div, px};
 
 /// App-owned bridge from a [`ContextMenu`] projection into GPUI Kit's live
 /// [`PopupMenu`]. The activation callback receives the real window so callers
@@ -56,7 +56,16 @@ impl ContextMenuRenderer {
     {
         let direction = menu.locale_direction();
         let theme_tokens = menu.theme_tokens();
-        popup = popup.direction(popup_direction(direction));
+        let viewport_height = window.viewport_size().height;
+        let available_height = if viewport_height > px(16.) {
+            viewport_height - px(16.)
+        } else {
+            viewport_height
+        };
+        popup = popup
+            .direction(popup_direction(direction))
+            .scrollable(true)
+            .max_h(available_height);
         for (index, entry) in menu.entries().iter().cloned().enumerate() {
             let row_path = format!("{path}-{index}");
             popup = match entry.kind() {
@@ -240,9 +249,15 @@ mod tests {
         AppearanceMode, ContextMenuRequest, ContextMenuSurface, Locale, MenuTarget,
         OpenWithApplication, ThemeProfile,
     };
-    use gpui_kit::component::{Root, menu::PopupMenu};
+    use gpui_kit::accesskit::Toggled;
+    use gpui_kit::component::{
+        Root,
+        menu::{PopupMenu, PopupMenuItem},
+    };
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext, Focusable, TestAppContext, px, size};
+    use gpui_kit::{
+        AppContext, Focusable, ParentElement as _, Role, TestAppContext, div, px, size,
+    };
     use musheen_core::{
         CapabilityMatrix, CapabilityState, CommandContext, CommandRegistry, CommandTarget,
         CommandTargetRef, ItemId, ProviderActionMatrix, ProviderId, StorePath,
@@ -338,6 +353,84 @@ mod tests {
                 .find(|node| node["aria"]["label"] == "Editor")
                 .expect("nested Editor item is rendered");
             assert_eq!(editor["aria"]["role"], "MenuItem");
+        })
+        .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    fn popup_row_forwards_disabled_accesskit_state_without_losing_toggle_semantics(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(640.), px(480.)), move |window, cx| {
+            let popup = PopupMenu::build(window, cx, |popup, _, _| {
+                popup.item(
+                    PopupMenuItem::element(|_, _| div().child("Unavailable layout"))
+                        .accessibility(Role::MenuItemRadio, "Unavailable layout")
+                        .accessibility_description("This layout is unavailable")
+                        .accessibility_toggled(Toggled::True)
+                        .checked(true)
+                        .disabled(true),
+                )
+            });
+            popup.update(cx, |popup, cx| popup.focus_handle(cx).focus(window, cx));
+            Root::new(popup, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.activate_accessibility_for_test();
+            window.render_frame(cx);
+            let tree = window
+                .debug_a11y_tree_json()
+                .expect("debug builds expose the live AccessKit tree");
+            let tree: serde_json::Value = serde_json::from_str(&tree).expect("valid tree JSON");
+            let node = tree["nodes"]
+                .as_object()
+                .expect("rendered accessibility nodes")
+                .values()
+                .find(|node| node["aria"]["label"] == "Unavailable layout")
+                .expect("disabled menu row is rendered");
+            assert_eq!(node["aria"]["role"], "MenuItemRadio");
+            assert_eq!(node["aria"]["description"], "This layout is unavailable");
+            assert_eq!(node["aria"]["toggled"], "True");
+            assert_eq!(node["aria"]["disabled"], true);
+        })
+        .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    fn viewport_bound_popup_scrolls_keyboard_selection_to_the_last_command(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(640.), px(480.)), move |window, cx| {
+            let popup = PopupMenu::build(window, cx, |popup, _, _| {
+                (0..24).fold(popup.scrollable(true).max_h(px(464.)), |popup, index| {
+                    popup.item(PopupMenuItem::new(format!("Command {index}")))
+                })
+            });
+            popup.update(cx, |popup, cx| popup.focus_handle(cx).focus(window, cx));
+            Root::new(popup, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.activate_accessibility_for_test();
+            window.render_frame(cx);
+            for _ in 0..24 {
+                window.press("down", cx);
+                window.render_frame(cx);
+            }
+            let tree = window
+                .debug_a11y_tree_json()
+                .expect("debug builds expose the live AccessKit tree");
+            let tree: serde_json::Value = serde_json::from_str(&tree).expect("valid tree JSON");
+            let node = tree["nodes"]
+                .as_object()
+                .expect("rendered accessibility nodes")
+                .values()
+                .find(|node| node["aria"]["label"] == "Command 23")
+                .expect("last command remains reachable");
+            assert_eq!(node["aria"]["selected"], true);
         })
         .expect("test window remains open");
     }

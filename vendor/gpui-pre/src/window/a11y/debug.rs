@@ -268,10 +268,13 @@ fn node_to_json(
     if let Some(v) = node.has_popup() {
         aria.insert("has_popup".into(), json!(format!("{v:?}")));
     }
-    if let Some(v) = node.toggled() {
-        aria.insert("toggled".into(), json!(format!("{v:?}")));
-    }
-    if let Some(v) = node.orientation() {
+      if let Some(v) = node.toggled() {
+          aria.insert("toggled".into(), json!(format!("{v:?}")));
+      }
+      if node.is_disabled() {
+          aria.insert("disabled".into(), json!(true));
+      }
+      if let Some(v) = node.orientation() {
         aria.insert("orientation".into(), json!(format!("{v:?}")));
     }
 

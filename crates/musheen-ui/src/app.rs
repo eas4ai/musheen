@@ -6464,7 +6464,8 @@ impl Render for MusheenApp {
                         .id("keyboard-context-menu")
                         .test_support()
                         .absolute()
-                        .top(px(72.))
+                        .top(px(8.))
+                        .bottom(px(8.))
                         .right(px(16.))
                         .child(popup),
                 )

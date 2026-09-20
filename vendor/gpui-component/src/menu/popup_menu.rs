@@ -1643,4 +1643,12 @@ mod tests {
         assert_eq!(PopupMenuItem::separator().a11y_label(), None);
         assert_eq!(PopupMenuItem::element(|_, _| div()).a11y_label(), None);
     }
+
+    #[gpui::test]
+    fn scrollable_popup_retains_its_viewport_height_cap(cx: &mut gpui::TestAppContext) {
+        let popup = cx.update(|cx| PopupMenu::new(cx).scrollable(true).max_h(px(464.)));
+
+        assert!(popup.scrollable);
+        assert_eq!(popup.max_height, Some(px(464.)));
+    }
 }
