@@ -6,7 +6,8 @@ use musheen_ops::{
     JobState, MutationError,
 };
 use musheen_ui::{
-    DropAction, DropError, FileDragPayload, LocalOperationQueue, PropertiesDialogModel,
+    DropAction, DropError, FileDragPayload, LocalOperationOutcome, LocalOperationQueue,
+    PropertiesDialogModel, TransferOutcome,
 };
 use std::fs;
 
@@ -211,6 +212,69 @@ fn resolved_copy_conflicts_execute_the_exact_visible_choice() {
                 assert_eq!(fs::read(&source).unwrap(), b"incoming");
             }
             _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn resolved_move_completion_reports_skip_and_exact_keep_both_destination() {
+    for choice in [ConflictChoice::Skip, ConflictChoice::KeepBoth] {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_parent = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source_parent).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let source = source_parent.join("same.txt");
+        let existing = destination.join("same.txt");
+        fs::write(&source, b"incoming").unwrap();
+        fs::write(&existing, b"existing").unwrap();
+        let payload = FileDragPayload::new(
+            vec![StorePath::from_unix_path(source.as_os_str())],
+            DropAction::Move,
+        )
+        .unwrap();
+        let target = StorePath::from_unix_path(destination.as_os_str());
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let conflict = queue
+            .conflicts_for_drop(&payload, &target)
+            .unwrap()
+            .remove(0);
+        let decision = ConflictPolicies::default()
+            .decide(
+                &conflict,
+                choice,
+                ApplyScope::ThisConflict,
+                &mut ConflictJournal,
+            )
+            .unwrap();
+        queue
+            .submit_drop_resolved(payload, target, vec![decision])
+            .unwrap();
+
+        let outcome = queue
+            .start_ready()
+            .unwrap()
+            .remove(0)
+            .execute_detailed()
+            .unwrap();
+        match (choice, outcome) {
+            (ConflictChoice::Skip, LocalOperationOutcome::Transfer(TransferOutcome::Skipped)) => {
+                assert_eq!(fs::read(&source).unwrap(), b"incoming");
+                assert_eq!(fs::read(&existing).unwrap(), b"existing");
+            }
+            (
+                ConflictChoice::KeepBoth,
+                LocalOperationOutcome::Transfer(TransferOutcome::Completed(target)),
+            ) => {
+                assert_ne!(target.path().as_unix_path(), Some(existing.as_path()));
+                assert_eq!(
+                    fs::read(target.path().as_unix_path().unwrap()).unwrap(),
+                    b"incoming"
+                );
+                assert_eq!(fs::read(&existing).unwrap(), b"existing");
+                assert!(!source.exists());
+            }
+            unexpected => panic!("unexpected completion outcome: {unexpected:?}"),
         }
     }
 }

@@ -24,7 +24,7 @@ pub use mutation::LocalTrashEntry;
 pub use probe::LocalFilesystemInfo;
 pub use queue::{
     DropAction, DropError, FileDragPayload, LocalFailureDisposition, LocalOperationFailure,
-    LocalOperationQueue, ReadyLocalOperation,
+    LocalOperationOutcome, LocalOperationQueue, ReadyLocalOperation, TransferOutcome,
 };
 pub use traverse::{LocalTraversal, TraversalOptions};
 

@@ -1,6 +1,6 @@
 pub use musheen_local::{
     DropAction, DropError, FileDragPayload, LocalFailureDisposition, LocalOperationFailure,
-    LocalOperationQueue, LocalStore, ReadyLocalOperation,
+    LocalOperationOutcome, LocalOperationQueue, LocalStore, ReadyLocalOperation, TransferOutcome,
 };
 
 use crate::{RecoveryAction, StatusCenterError, StatusCenterModel};
@@ -454,7 +454,9 @@ impl From<musheen_ops::MutationError> for OperationHubError {
 pub(crate) fn spawn_ready_hub_operations<V>(
     hub: OperationHub,
     cx: &mut Context<V>,
-    on_finish: impl Fn(&mut V, JobId, bool, Option<Box<str>>, &mut Context<V>) + Clone + 'static,
+    on_finish: impl Fn(&mut V, JobId, Option<LocalOperationOutcome>, Option<Box<str>>, &mut Context<V>)
+    + Clone
+    + 'static,
 ) -> Result<(), OperationHubError>
 where
     V: 'static,
@@ -478,9 +480,12 @@ where
         let work = cx.background_spawn(async move { operation.execute_detailed() });
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            let succeeded = result.is_ok();
+            let outcome = result.as_ref().ok().cloned();
             let failure = result.as_ref().err().cloned();
-            let queue_result = result.map_err(|error| Box::<str>::from(error.message().to_owned()));
+            let queue_result = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| Box::<str>::from(error.message().to_owned()));
             let finish = hub
                 .queue
                 .lock()
@@ -514,7 +519,7 @@ where
                 return;
             };
             this.update(cx, |state, cx| {
-                on_finish(state, id, succeeded, error, cx);
+                on_finish(state, id, outcome, error, cx);
             });
         })
         .detach();

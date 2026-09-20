@@ -378,11 +378,15 @@ fn unseen_catalog_location_preserves_the_session_view_contract() {
     let path =
         StorePath::from_provider_key(ProviderId::new("remote").unwrap(), b"offline".to_vec())
             .unwrap();
-    let mut session = ViewPreferences::default();
-    session.layout = Layout::List;
-    session.icon_size = 88;
-    session.sort.key = SortKey::Size;
-    session.sort.direction = SortDirection::Descending;
+    let session = ViewPreferences {
+        layout: Layout::List,
+        icon_size: 88,
+        sort: musheen_ui::views::SortSpec {
+            key: SortKey::Size,
+            direction: SortDirection::Descending,
+        },
+        ..ViewPreferences::default()
+    };
     let mut store = ViewPreferenceStore::new(session.clone());
 
     store.apply_catalog(&identity, path.clone(), &FolderPreferenceCatalog::default());

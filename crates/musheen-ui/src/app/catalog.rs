@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::WeakEntity;
 use musheen_core::CapabilityMatrix;
 use musheen_desktop::{HomeItemKind, HomeSection, MountShortcut, TagService, TagStorage};
 use std::collections::BTreeSet;
@@ -11,6 +12,19 @@ pub(super) struct CatalogBinding {
 }
 
 pub(super) type TagTarget = (ItemId, StorePath, CapabilityMatrix);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DirectoryObservation {
+    Partial,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OrphanCleanupOutcome {
+    Removed,
+    StillPresent,
+    NoLongerOrphaned,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct OrphanedTagRecord {
@@ -174,6 +188,80 @@ impl CatalogBinding {
         TagService::new(document.tags_mut(), self.xattr_opt_in).tag_names()
     }
 
+    pub(super) fn tag_name_from_target(
+        &self,
+        target: &CommandTargetRef,
+    ) -> Result<Box<str>, Box<str>> {
+        let Some((provider, key)) = target.path().provider_key() else {
+            return Err("tag actions require an exact tag shortcut identity".into());
+        };
+        if provider.as_str() != "musheen-tag"
+            || target.id().provider() != provider
+            || target.id().opaque_key() != key
+        {
+            return Err("the captured tag identity is invalid".into());
+        }
+        let name = std::str::from_utf8(key)
+            .map_err(|_| Box::<str>::from("the captured tag name is not valid UTF-8"))?;
+        self.tag_names()
+            .contains(name)
+            .then(|| Box::<str>::from(name))
+            .ok_or_else(|| Box::<str>::from("the captured tag no longer exists"))
+    }
+
+    pub(super) fn rename_tag(
+        &self,
+        old: &str,
+        new: &str,
+        mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
+    ) -> Result<usize, Box<str>> {
+        TagService::validate_tag(new).map_err(|error| Box::<str>::from(error.to_string()))?;
+        self.update_result(|document| {
+            let targets = document
+                .tags()
+                .tracked_items()
+                .filter(|(item, _, _)| document.tags().tags_for(item).contains(old))
+                .map(|(item, path, _)| (item.clone(), path.clone()))
+                .collect::<Vec<_>>();
+            let mut changed = 0;
+            for (item, path) in targets {
+                let matrix = capabilities(&path);
+                let mut service = TagService::new(document.tags_mut(), self.xattr_opt_in);
+                service
+                    .remove(&item, &path, &matrix, old)
+                    .map_err(|error| Box::<str>::from(error.to_string()))?;
+                service
+                    .assign(&item, &path, &matrix, new)
+                    .map_err(|error| Box::<str>::from(error.to_string()))?;
+                changed += 1;
+            }
+            Ok(changed)
+        })
+    }
+
+    pub(super) fn delete_tag(
+        &self,
+        tag: &str,
+        mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
+    ) -> Result<usize, Box<str>> {
+        self.update_result(|document| {
+            let targets = document
+                .tags()
+                .tracked_items()
+                .filter(|(item, _, _)| document.tags().tags_for(item).contains(tag))
+                .map(|(item, path, _)| (item.clone(), path.clone()))
+                .collect::<Vec<_>>();
+            let changed = targets.len();
+            for (item, path) in targets {
+                let matrix = capabilities(&path);
+                TagService::new(document.tags_mut(), self.xattr_opt_in)
+                    .remove(&item, &path, &matrix, tag)
+                    .map_err(|error| Box::<str>::from(error.to_string()))?;
+            }
+            Ok(changed)
+        })
+    }
+
     pub(super) fn items_with_tag(&self, tag: &str) -> BTreeSet<ItemId> {
         let mut document = self.document.lock().expect("catalog lock is not poisoned");
         TagService::new(document.tags_mut(), self.xattr_opt_in).items_with_tag(tag)
@@ -210,20 +298,19 @@ impl CatalogBinding {
         })
     }
 
-    #[cfg(test)]
     pub(super) fn observe_present(&self, item: &ItemId, path: StorePath) -> Result<(), Box<str>> {
         self.update(|document| {
             TagService::new(document.tags_mut(), self.xattr_opt_in).observe_present(item, path);
         })
     }
 
-    #[cfg(test)]
     pub(super) fn observe_missing(&self, item: &ItemId) -> Result<(), Box<str>> {
         self.update(|document| {
             TagService::new(document.tags_mut(), self.xattr_opt_in).observe_missing(item);
         })
     }
 
+    #[cfg(test)]
     pub(super) fn cleanup_reviewed_orphans<'a>(
         &self,
         reviewed: impl IntoIterator<Item = &'a ItemId>,
@@ -231,6 +318,42 @@ impl CatalogBinding {
         self.update_result(|document| {
             Ok(TagService::new(document.tags_mut(), self.xattr_opt_in)
                 .cleanup_reviewed_orphans(reviewed))
+        })
+    }
+
+    pub(super) fn cleanup_reviewed_orphan(
+        &self,
+        reviewed: &ItemId,
+        mut resolve: impl FnMut(&StorePath) -> Result<Option<StoreItem>, Box<str>>,
+    ) -> Result<OrphanCleanupOutcome, Box<str>> {
+        let snapshot = self.snapshot();
+        if !snapshot.tags().is_orphaned(reviewed) {
+            return Ok(OrphanCleanupOutcome::NoLongerOrphaned);
+        }
+        let path = snapshot
+            .tags()
+            .path_hint(reviewed)
+            .cloned()
+            .ok_or_else(|| Box::<str>::from("the reviewed tag record has no path hint"))?;
+        if let Some(item) = resolve(&path)?
+            && item.id() == reviewed
+        {
+            self.observe_present(reviewed, item.path().clone())?;
+            return Ok(OrphanCleanupOutcome::StillPresent);
+        }
+        self.update_result(|document| {
+            if !document.tags().is_orphaned(reviewed)
+                || document.tags().path_hint(reviewed) != Some(&path)
+            {
+                return Ok(OrphanCleanupOutcome::NoLongerOrphaned);
+            }
+            let removed = TagService::new(document.tags_mut(), self.xattr_opt_in)
+                .cleanup_reviewed_orphans([reviewed]);
+            Ok(if removed == 1 {
+                OrphanCleanupOutcome::Removed
+            } else {
+                OrphanCleanupOutcome::NoLongerOrphaned
+            })
         })
     }
 
@@ -296,6 +419,7 @@ impl CatalogBinding {
         &self,
         location: &StorePath,
         items: &[StoreItem],
+        observation: DirectoryObservation,
     ) -> Result<(), Box<str>> {
         let present = items
             .iter()
@@ -309,6 +433,9 @@ impl CatalogBinding {
             let mut service = TagService::new(document.tags_mut(), self.xattr_opt_in);
             for item in items {
                 service.observe_present(item.id(), item.path().clone());
+            }
+            if observation != DirectoryObservation::Complete {
+                return;
             }
             let Some(directory) = location.as_unix_path() else {
                 return;
@@ -328,6 +455,56 @@ impl CatalogBinding {
 }
 
 impl MusheenApp {
+    pub(super) fn apply_properties_tags(
+        &mut self,
+        targets: &[TagTarget],
+        desired: &BTreeSet<Box<str>>,
+    ) -> Result<(), Box<str>> {
+        self.catalog_binding.replace_tags(targets, desired)?;
+        self.sync_catalog_projection();
+        Ok(())
+    }
+
+    pub(super) fn delete_captured_tag(
+        &mut self,
+        target: &CommandTargetRef,
+    ) -> Result<(), Box<str>> {
+        let tag = self.catalog_binding.tag_name_from_target(target)?;
+        let store = Arc::clone(&self.store);
+        self.catalog_binding
+            .delete_tag(&tag, |path| store.capabilities(path))?;
+        self.sync_catalog_projection();
+        Ok(())
+    }
+
+    pub(super) fn rename_catalog_tag(&mut self, old: &str, new: &str) -> Result<(), Box<str>> {
+        let store = Arc::clone(&self.store);
+        let changed = self
+            .catalog_binding
+            .rename_tag(old, new, |path| store.capabilities(path))?;
+        if changed == 0 {
+            return Err("the captured tag no longer exists".into());
+        }
+        self.sync_catalog_projection();
+        Ok(())
+    }
+
+    pub(super) fn open_captured_tag_rename(
+        &mut self,
+        target: &CommandTargetRef,
+        cx: &mut Context<Self>,
+    ) -> Result<(), Box<str>> {
+        let tag = self.catalog_binding.tag_name_from_target(target)?;
+        let app = cx.entity().downgrade();
+        let options = properties_window_options("Rename Tag", cx);
+        cx.open_window(options, move |window, cx| {
+            let view = cx.new(|cx| TagRenameWindow::new(app, tag, window, cx));
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .map_err(|error| Box::<str>::from(error.to_string()))?;
+        Ok(())
+    }
+
     pub(super) fn sync_catalog_projection(&mut self) {
         let store = Arc::clone(&self.store);
         if let Err(error) = self.catalog_binding.reconcile_pins(|path| {
@@ -434,6 +611,72 @@ impl MusheenApp {
         self.omnibar.enter(OmnibarMode::Filter, expression.clone());
         self.pending_omnibar_value = Some(expression.clone());
         self.apply_filter(expression, cx);
+    }
+}
+
+struct TagRenameWindow {
+    app: WeakEntity<MusheenApp>,
+    old: Box<str>,
+    input: Entity<InputState>,
+    error: Option<Box<str>>,
+}
+
+impl TagRenameWindow {
+    fn new(
+        app: WeakEntity<MusheenApp>,
+        old: Box<str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(old.as_ref())
+                .placeholder("Tag name")
+        });
+        Self {
+            app,
+            old,
+            input,
+            error: None,
+        }
+    }
+}
+
+impl Render for TagRenameWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let error = self.error.clone();
+        div()
+            .id("tag-rename-dialog")
+            .test_support()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_lg().child(format!("Rename ‘{}’", self.old)))
+            .child(Input::new(&self.input).id("tag-rename-input"))
+            .children(error.map(|error| {
+                div()
+                    .id("tag-rename-error")
+                    .test_support()
+                    .role(Role::Alert)
+                    .child(error.to_string())
+            }))
+            .child(
+                Button::new("tag-rename-confirm")
+                    .label("Rename")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let new = this.input.read(cx).value().to_string();
+                        match this
+                            .app
+                            .update(cx, |app, _| app.rename_catalog_tag(&this.old, &new))
+                        {
+                            Ok(Ok(())) => window.remove_window(),
+                            Ok(Err(error)) => this.error = Some(error),
+                            Err(error) => this.error = Some(error.to_string().into()),
+                        }
+                        cx.notify();
+                    })),
+            )
     }
 }
 
@@ -612,12 +855,16 @@ impl MusheenApp {
     }
 
     fn cleanup_reviewed_orphan(&mut self, item: ItemId, cx: &mut Context<Self>) {
-        match self
-            .catalog_binding
-            .cleanup_reviewed_orphans(std::iter::once(&item))
-        {
-            Ok(1) => self.sync_catalog_projection(),
-            Ok(_) => {
+        let store = Arc::clone(&self.store);
+        match self.catalog_binding.cleanup_reviewed_orphan(&item, |path| {
+            store
+                .resolve_item(path)
+                .map_err(|error| Box::<str>::from(error.to_string()))
+        }) {
+            Ok(OrphanCleanupOutcome::Removed | OrphanCleanupOutcome::StillPresent) => {
+                self.sync_catalog_projection();
+            }
+            Ok(OrphanCleanupOutcome::NoLongerOrphaned) => {
                 self.operation_error = Some("the reviewed tag record is no longer orphaned".into());
             }
             Err(error) => self.operation_error = Some(error),
@@ -628,7 +875,7 @@ impl MusheenApp {
 
 #[cfg(test)]
 mod tests {
-    use super::super::CatalogBinding;
+    use super::{CatalogBinding, DirectoryObservation, OrphanCleanupOutcome};
     use musheen_core::{
         CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, ItemId, ProviderId,
         StorePath,
@@ -797,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_reconciliation_repairs_renames_and_marks_exact_disappearances() {
+    fn directory_reconciliation_requires_authoritative_completion_before_orphaning() {
         let binding = CatalogBinding::in_memory();
         let renamed = item("local", b"inode-41");
         let missing = item("local", b"inode-42");
@@ -818,10 +1065,53 @@ mod tests {
             None,
         )];
 
-        binding.reconcile_directory(&directory, &listing).unwrap();
+        binding
+            .reconcile_directory(&directory, &listing, DirectoryObservation::Partial)
+            .unwrap();
 
         assert_eq!(binding.path_hint(&renamed), Some(new_path));
         assert!(!binding.is_orphaned(&renamed));
+        assert!(!binding.is_orphaned(&missing));
+
+        binding
+            .reconcile_directory(&directory, &listing, DirectoryObservation::Complete)
+            .unwrap();
         assert!(binding.is_orphaned(&missing));
+    }
+
+    #[test]
+    fn reviewed_orphan_cleanup_rechecks_exact_identity_liveness() {
+        let binding = CatalogBinding::in_memory();
+        let target = item("local", b"inode-99");
+        let path = StorePath::from_unix_path("/scope/target");
+        binding
+            .assign_tag(&target, &path, &capabilities(true, false), "tracked")
+            .unwrap();
+        binding.observe_missing(&target).unwrap();
+
+        assert_eq!(
+            binding
+                .cleanup_reviewed_orphan(&target, |_| {
+                    Ok(Some(StoreItem::new(
+                        target.clone(),
+                        path.clone(),
+                        DisplayPath::new("target"),
+                        ItemKind::RegularFile,
+                        None,
+                    )))
+                })
+                .unwrap(),
+            OrphanCleanupOutcome::StillPresent
+        );
+        assert!(!binding.is_orphaned(&target));
+
+        binding.observe_missing(&target).unwrap();
+        assert_eq!(
+            binding
+                .cleanup_reviewed_orphan(&target, |_| Ok(None))
+                .unwrap(),
+            OrphanCleanupOutcome::Removed
+        );
+        assert!(binding.tags_for_identity(&target).is_empty());
     }
 }

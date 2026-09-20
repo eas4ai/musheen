@@ -11,7 +11,8 @@ use gpui_kit::{
     px, size,
 };
 use musheen_core::{
-    CancellationToken, CapabilityKind, CapabilityState, ItemKind, Store, StorePath,
+    CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityState, CommandTargetRef,
+    DisplayPath, ItemKind, Store, StorePath,
 };
 use musheen_desktop::{
     AclEntry, AclQualifier, AclState, AggregateValue, ChecksumAlgorithm, ChecksumResult,
@@ -253,6 +254,252 @@ pub enum PropertiesModelError {
     UnavailablePage,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProviderPropertiesDialogModel {
+    targets: Vec<CommandTargetRef>,
+    capabilities: Vec<CapabilityMatrix>,
+    pages: Vec<PropertiesPage>,
+    page: PropertiesPage,
+    original_tags: BTreeSet<Box<str>>,
+    tags: BTreeSet<Box<str>>,
+}
+
+impl ProviderPropertiesDialogModel {
+    #[must_use]
+    pub fn new(targets: Vec<(CommandTargetRef, CapabilityMatrix)>) -> Self {
+        let (targets, capabilities): (Vec<_>, Vec<_>) = targets.into_iter().unzip();
+        let mut pages = vec![PropertiesPage::General];
+        if capabilities.iter().all(|matrix: &CapabilityMatrix| {
+            matches!(matrix.get(CapabilityKind::Tags), CapabilityState::Supported)
+        }) {
+            pages.push(PropertiesPage::Tags);
+        }
+        Self {
+            targets,
+            capabilities,
+            pages,
+            page: PropertiesPage::General,
+            original_tags: BTreeSet::new(),
+            tags: BTreeSet::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> &[CommandTargetRef] {
+        &self.targets
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> &[CapabilityMatrix] {
+        &self.capabilities
+    }
+
+    #[must_use]
+    pub fn pages(&self) -> &[PropertiesPage] {
+        &self.pages
+    }
+
+    #[must_use]
+    pub const fn page(&self) -> PropertiesPage {
+        self.page
+    }
+
+    pub fn select_page(&mut self, page: PropertiesPage) -> Result<(), PropertiesModelError> {
+        if !self.pages.contains(&page) {
+            return Err(PropertiesModelError::UnavailablePage);
+        }
+        self.page = page;
+        Ok(())
+    }
+
+    pub fn set_tags<'a>(&mut self, tags: impl IntoIterator<Item = &'a str>) {
+        self.tags = tags.into_iter().map(Box::<str>::from).collect();
+        self.original_tags = self.tags.clone();
+    }
+
+    pub fn tags(&self) -> impl Iterator<Item = &str> {
+        self.tags.iter().map(AsRef::as_ref)
+    }
+
+    pub fn assign_tag(&mut self, tag: &str) -> Result<bool, TagError> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(TagError::Empty);
+        }
+        if tag.len() > 128 {
+            return Err(TagError::TooLong);
+        }
+        Ok(self.tags.insert(tag.into()))
+    }
+
+    pub fn remove_tag(&mut self, tag: &str) -> bool {
+        self.tags.remove(tag)
+    }
+
+    fn accept_tags(&mut self) {
+        self.original_tags = self.tags.clone();
+    }
+}
+
+pub(crate) struct ProviderPropertiesWindowData {
+    model: ProviderPropertiesDialogModel,
+    tag_writer: Option<TagWriter>,
+}
+
+impl ProviderPropertiesWindowData {
+    pub(crate) fn new(
+        targets: Vec<(CommandTargetRef, CapabilityMatrix)>,
+        tags: impl IntoIterator<Item = Box<str>>,
+        tag_writer: Option<TagWriter>,
+    ) -> Self {
+        let mut model = ProviderPropertiesDialogModel::new(targets);
+        let tags = tags.into_iter().collect::<Vec<_>>();
+        model.set_tags(tags.iter().map(AsRef::as_ref));
+        Self { model, tag_writer }
+    }
+}
+
+pub(crate) struct ProviderPropertiesWindow {
+    model: ProviderPropertiesDialogModel,
+    tag_writer: Option<TagWriter>,
+    tag_input: Entity<InputState>,
+    tag_error: Option<Box<str>>,
+}
+
+impl ProviderPropertiesWindow {
+    pub(crate) fn new(
+        data: ProviderPropertiesWindowData,
+        page: PropertiesPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut model = data.model;
+        let _ = model.select_page(page);
+        Self {
+            model,
+            tag_writer: data.tag_writer,
+            tag_input: cx.new(|cx| InputState::new(window, cx).placeholder("Tag name")),
+            tag_error: None,
+        }
+    }
+
+    fn apply_tags(&mut self, cx: &mut Context<Self>) {
+        let Some(writer) = self.tag_writer.as_ref() else {
+            self.tag_error = Some("Tag storage is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let tags = self.model.tags.clone();
+        // Provider and local windows use the same app-owned writer policy.
+        match writer(&tags, cx) {
+            Ok(()) => {
+                self.model.accept_tags();
+                self.tag_error = None;
+            }
+            Err(error) => self.tag_error = Some(error),
+        }
+        cx.notify();
+    }
+}
+
+impl Render for ProviderPropertiesWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tags = self.model.tags().map(str::to_owned).collect::<Vec<_>>();
+        let capability_rows = CapabilityKind::ALL
+            .iter()
+            .copied()
+            .map(|kind| {
+                let values = self
+                    .model
+                    .capabilities()
+                    .iter()
+                    .map(|matrix| capability_state_label(matrix.get(kind)))
+                    .collect::<Vec<_>>();
+                (
+                    capability_kind_label(kind).to_owned(),
+                    aggregate_strings(&values),
+                )
+            })
+            .collect::<Vec<_>>();
+        let content = if self.model.page() == PropertiesPage::Tags {
+            div()
+                .id("properties-tags-page")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(tags.into_iter().enumerate().map(|(index, tag)| {
+                    let remove = tag.clone();
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(tag)
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "provider-properties-remove-tag-{index}"
+                            )))
+                            .label("Remove")
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.model.remove_tag(&remove);
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                }))
+                .child(Input::new(&self.tag_input).id("provider-properties-tag-input"))
+                .child(
+                    Button::new("provider-properties-add-tag")
+                        .label("Add tag")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let tag = this.tag_input.read(cx).value().to_string();
+                            this.tag_error = this
+                                .model
+                                .assign_tag(&tag)
+                                .err()
+                                .map(|e| e.to_string().into());
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("provider-properties-apply-tags")
+                        .label("Apply")
+                        .on_click(cx.listener(|this, _, _, cx| this.apply_tags(cx))),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("provider-properties-general-page")
+                .test_support()
+                .children(self.model.targets().iter().map(|target| {
+                    div().child(
+                        DisplayPath::from_store_path(target.path())
+                            .as_str()
+                            .to_owned(),
+                    )
+                }))
+                .children(capability_rows.into_iter().map(|(label, value)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(label)
+                        .child(value)
+                }))
+                .into_any_element()
+        };
+        div()
+            .id("provider-properties")
+            .test_support()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(content)
+    }
+}
+
 pub struct PropertiesWindowData {
     snapshot: PropertySnapshot,
     filesystem_rows: Vec<(Box<str>, Box<str>)>,
@@ -262,7 +509,7 @@ pub struct PropertiesWindowData {
 }
 
 pub(crate) type TagWriter =
-    Arc<dyn Fn(&BTreeSet<Box<str>>) -> Result<(), Box<str>> + Send + Sync + 'static>;
+    Arc<dyn Fn(&BTreeSet<Box<str>>, &mut App) -> Result<(), Box<str>> + Send + Sync + 'static>;
 
 impl PropertiesWindowData {
     pub fn load(paths: &[PathBuf]) -> Result<Self, PropertyError> {
@@ -697,8 +944,8 @@ impl PropertiesWindow {
         let result = spawn_ready_hub_operations(
             self.operation_hub.clone(),
             cx,
-            |state: &mut Self, id, succeeded, error, cx| {
-                let succeeded = succeeded && error.is_none();
+            |state: &mut Self, id, outcome, error, cx| {
+                let succeeded = outcome.is_some() && error.is_none();
                 let outcome = state.permission_batch.finish(id, succeeded);
                 if outcome == PermissionBatchOutcome::Ignored {
                     return;
@@ -1369,7 +1616,7 @@ impl PropertiesWindow {
             return;
         };
         let tags = self.model.tags.clone();
-        match writer(&tags) {
+        match writer(&tags, cx) {
             Ok(()) => {
                 self.model.accept_tags();
                 self.tag_error = None;

@@ -29,6 +29,13 @@ impl ItemId {
     pub fn provider(&self) -> &ProviderId {
         &self.provider
     }
+
+    /// Provider-owned stable bytes. Callers must treat these as opaque and
+    /// compare them only for exact identity-bound workflows.
+    #[must_use]
+    pub fn opaque_key(&self) -> &[u8] {
+        &self.key
+    }
 }
 
 impl Serialize for ItemId {

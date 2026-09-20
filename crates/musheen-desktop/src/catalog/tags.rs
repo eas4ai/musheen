@@ -350,6 +350,10 @@ impl<'a> TagService<'a> {
         self.xattr_opt_in = enabled;
     }
 
+    pub fn validate_tag(tag: &str) -> Result<(), TagError> {
+        validated_tag(tag).map(|_| ())
+    }
+
     pub fn assign(
         &mut self,
         item: &ItemId,
@@ -359,9 +363,20 @@ impl<'a> TagService<'a> {
     ) -> Result<TagStorage, CatalogTagError> {
         let storage = self.storage(path_hint, capabilities)?;
         if storage == TagStorage::ExtendedAttribute {
-            BackendTagService::new(XattrTagBackend::new(true, true))
-                .assign(item, path_hint, tag)
-                .map_err(CatalogTagError::Xattr)?;
+            let tag = validated_tag(tag).map_err(CatalogTagError::InvalidTag)?;
+            let mut backend = XattrTagBackend::new(true, true);
+            let mut tags = backend
+                .read_tags(item, path_hint)
+                .map_err(|error| CatalogTagError::Xattr(TagServiceError::Backend(error)))?;
+            tags.extend(self.catalog.tags_for(item));
+            tags.insert(tag);
+            backend
+                .write_tags(item, path_hint, &tags)
+                .map_err(|error| CatalogTagError::Xattr(TagServiceError::Backend(error)))?;
+            self.catalog
+                .write_tags(item, path_hint, &tags)
+                .expect("the app-owned tag catalog is infallible");
+            return Ok(storage);
         }
         self.catalog
             .assign(item, path_hint.clone(), tag)
@@ -378,9 +393,19 @@ impl<'a> TagService<'a> {
     ) -> Result<TagStorage, CatalogTagError> {
         let storage = self.storage(path_hint, capabilities)?;
         if storage == TagStorage::ExtendedAttribute {
-            BackendTagService::new(XattrTagBackend::new(true, true))
-                .remove(item, path_hint, tag)
-                .map_err(CatalogTagError::Xattr)?;
+            let mut backend = XattrTagBackend::new(true, true);
+            let mut tags = backend
+                .read_tags(item, path_hint)
+                .map_err(|error| CatalogTagError::Xattr(TagServiceError::Backend(error)))?;
+            tags.extend(self.catalog.tags_for(item));
+            tags.remove(tag);
+            backend
+                .write_tags(item, path_hint, &tags)
+                .map_err(|error| CatalogTagError::Xattr(TagServiceError::Backend(error)))?;
+            self.catalog
+                .write_tags(item, path_hint, &tags)
+                .expect("the app-owned tag catalog is infallible");
+            return Ok(storage);
         }
         self.catalog.remove(item, tag);
         Ok(storage)
@@ -396,9 +421,16 @@ impl<'a> TagService<'a> {
         if storage == TagStorage::AppCatalog {
             return Ok(self.catalog.tags_for(item));
         }
-        let tags = BackendTagService::new(XattrTagBackend::new(true, true))
+        let xattr_tags = BackendTagService::new(XattrTagBackend::new(true, true))
             .tags(item, path_hint)
             .map_err(CatalogTagError::Xattr)?;
+        let mut tags = self.catalog.tags_for(item);
+        tags.extend(xattr_tags.iter().cloned());
+        if tags != xattr_tags {
+            XattrTagBackend::new(true, true)
+                .write_tags(item, path_hint, &tags)
+                .map_err(|error| CatalogTagError::Xattr(TagServiceError::Backend(error)))?;
+        }
         self.catalog
             .write_tags(item, path_hint, &tags)
             .expect("the app-owned tag catalog is infallible");

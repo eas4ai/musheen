@@ -34,6 +34,12 @@ pub(crate) enum ResolvedTransferFailure {
     NeedsAttention(Box<str>),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedTransferOutcome {
+    Skipped,
+    Completed(StorePath),
+}
+
 impl From<OperationFailure> for ResolvedTransferFailure {
     fn from(error: OperationFailure) -> Self {
         Self::Transfer(error)
@@ -565,11 +571,11 @@ pub(crate) fn execute_resolved_transfer(
     request: &CopyRequest,
     decision: &ConflictDecision,
     cancellation: &CancellationToken,
-) -> Result<(), ResolvedTransferFailure> {
+) -> Result<ResolvedTransferOutcome, ResolvedTransferFailure> {
     validate_transfer_decision(store, request, decision)
         .map_err(|error| ResolvedTransferFailure::Failed(error.to_string().into()))?;
     match decision.choice() {
-        ConflictChoice::Skip => Ok(()),
+        ConflictChoice::Skip => Ok(ResolvedTransferOutcome::Skipped),
         ConflictChoice::KeepBoth => {
             let destination = keep_both_destination(request.destination())?;
             let alternate = CopyRequest::new(
@@ -579,13 +585,22 @@ pub(crate) fn execute_resolved_transfer(
                 destination,
             )
             .with_options(request.options());
-            execute_transfer(store, &alternate, decision.operation(), cancellation)
+            execute_transfer(store, &alternate, decision.operation(), cancellation)?;
+            Ok(ResolvedTransferOutcome::Completed(
+                alternate.destination().clone(),
+            ))
         }
         ConflictChoice::Replace | ConflictChoice::ReplaceTree => {
-            execute_replacing_transfer(store, request, decision.operation(), cancellation)
+            execute_replacing_transfer(store, request, decision.operation(), cancellation)?;
+            Ok(ResolvedTransferOutcome::Completed(
+                request.destination().clone(),
+            ))
         }
         ConflictChoice::MergeDirectory => {
-            execute_merging_transfer(store, request, decision.operation(), cancellation)
+            execute_merging_transfer(store, request, decision.operation(), cancellation)?;
+            Ok(ResolvedTransferOutcome::Completed(
+                request.destination().clone(),
+            ))
         }
     }
 }

@@ -396,7 +396,7 @@ impl MenuEntry {
     }
 
     #[must_use]
-    pub(crate) fn captured_targets(&self) -> &[CommandTargetRef] {
+    pub fn captured_targets(&self) -> &[CommandTargetRef] {
         self.invocation
             .as_ref()
             .map(|invocation| invocation.selection.as_slice())
@@ -1081,7 +1081,7 @@ const MOUNT: &[&str] = &[
     "mount.power_off",
     "directory.properties",
 ];
-const TAG: &[&str] = &["item.tags", "item.properties"];
+const TAG: &[&str] = &["tag.rename", "tag.delete"];
 const TRASH_ITEM: &[&str] = &[
     "trash.restore",
     "file.delete_permanently",

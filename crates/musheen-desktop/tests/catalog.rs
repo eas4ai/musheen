@@ -205,6 +205,43 @@ fn production_tag_service_routes_by_live_capability_and_user_opt_in() {
 }
 
 #[test]
+fn enabling_xattrs_merges_existing_fallback_tags_for_the_same_item() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target_path = temporary.path().join("target");
+    std::fs::write(&target_path, b"content").unwrap();
+    let target = item("local", b"same-stable-item");
+    let path = StorePath::from_unix_path(target_path.clone());
+    let mut catalog = TagCatalog::default();
+
+    {
+        let mut fallback = TagService::new(&mut catalog, false);
+        fallback
+            .assign(&target, &path, &tag_capabilities(true, true), "fallback")
+            .unwrap();
+    }
+    {
+        let mut native = TagService::new(&mut catalog, true);
+        native
+            .assign(&target, &path, &tag_capabilities(true, true), "native")
+            .unwrap();
+        assert_eq!(
+            native
+                .tags(&target, &path, &tag_capabilities(true, true))
+                .unwrap(),
+            tags(&["fallback", "native"])
+        );
+    }
+
+    let stored = xattr::get(&target_path, "user.musheen.tags")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<BTreeSet<Box<str>>>(&stored).unwrap(),
+        tags(&["fallback", "native"])
+    );
+}
+
+#[test]
 fn one_tag_service_contract_covers_app_owned_fallback_and_opt_in_xattrs() {
     tag_service_contract(
         TagCatalog::default(),

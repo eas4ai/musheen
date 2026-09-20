@@ -173,6 +173,30 @@ fn registry_contains_the_mutation_actions_that_context_menus_project() {
 }
 
 #[test]
+fn tag_context_has_exact_registry_backed_rename_and_delete_actions() {
+    let registry = CommandRegistry::built_in();
+    let tag_context = CommandContext {
+        selection_count: 1,
+        target: CommandTarget::Tag,
+        ..CommandContext::default()
+    };
+
+    for (id, action) in [
+        ("tag.rename", CommandAction::RenameTag),
+        ("tag.delete", CommandAction::DeleteTag),
+    ] {
+        let command = registry.get(id).expect("tag command is registered");
+        assert_eq!(command.action(), action);
+        assert!(command.state(&tag_context).is_enabled());
+        assert!(!command.state(&CommandContext::default()).is_enabled());
+        assert_eq!(
+            action.parameter_contract(),
+            CommandParameterContract::Targets(TargetCardinality::ExactlyOne)
+        );
+    }
+}
+
+#[test]
 fn registry_audit_has_unique_ids_shortcuts_and_exactly_one_entry_per_action() {
     let registry = CommandRegistry::built_in();
     let audit = registry
@@ -306,6 +330,8 @@ fn registry_audit_snapshots_stable_public_ids() {
         "directory.unpin",
         "item.copy_location",
         "item.tags",
+        "tag.rename",
+        "tag.delete",
         "directory.share",
         "file.preview",
         "archive.browse",

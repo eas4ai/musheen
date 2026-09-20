@@ -493,7 +493,7 @@ fn sidebar_mount_tag_and_trash_background_project_their_exact_target_sets() {
             "directory.open_new_window",
         ),
         (MenuTarget::Mount, CommandTarget::Mount, "mount.unmount"),
-        (MenuTarget::Tag, CommandTarget::Tag, "item.tags"),
+        (MenuTarget::Tag, CommandTarget::Tag, "tag.rename"),
         (
             MenuTarget::TrashBackground,
             CommandTarget::TrashBackground,
@@ -514,6 +514,25 @@ fn sidebar_mount_tag_and_trash_background_project_their_exact_target_sets() {
         ));
         assert!(menu.entry(expected).is_some(), "{target_kind:?}");
     }
+}
+
+#[test]
+fn tag_context_captures_exact_identity_for_rename_and_delete() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let captured = target(b"tag:work", "/synthetic/work");
+    let menu = surface.compose(request(
+        supported_context(CommandTarget::Tag, 1),
+        MenuTarget::Tag,
+        vec![captured.clone()],
+    ));
+
+    for id in ["tag.rename", "tag.delete"] {
+        let entry = menu.entry(id).expect("tag action is projected");
+        assert_eq!(entry.captured_targets(), std::slice::from_ref(&captured));
+        assert!(entry.state().is_enabled());
+    }
+    assert!(menu.entry("item.tags").is_none());
+    assert!(menu.entry("item.properties").is_none());
 }
 
 #[test]

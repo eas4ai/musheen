@@ -399,6 +399,8 @@ pub enum CommandAction {
     Unpin,
     CopyLocation,
     ManageTags,
+    RenameTag,
+    DeleteTag,
     Share,
     Preview,
     BrowseArchive,
@@ -412,7 +414,7 @@ pub enum CommandAction {
     ExtractHere,
 }
 impl CommandAction {
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 82] = [
         Self::NavigateBack,
         Self::NavigateForward,
         Self::NavigateParent,
@@ -482,6 +484,8 @@ impl CommandAction {
         Self::Unpin,
         Self::CopyLocation,
         Self::ManageTags,
+        Self::RenameTag,
+        Self::DeleteTag,
         Self::Share,
         Self::Preview,
         Self::BrowseArchive,
@@ -783,6 +787,7 @@ pub enum CommandPredicate {
     UnpinnedDirectory,
     ExecutableRun,
     DirectoryOrMount,
+    Tag,
 }
 impl CommandPredicate {
     fn evaluate(self, context: &CommandContext) -> CommandState {
@@ -895,6 +900,9 @@ impl CommandPredicate {
             Self::TrashBackground if context.target == CommandTarget::TrashBackground => {
                 CommandState::enabled()
             }
+            Self::Tag if context.selection_count == 1 && context.target == CommandTarget::Tag => {
+                CommandState::enabled()
+            }
             Self::CustomActionSupportsRemote
                 if context.has_target_selection()
                     && (context.is_local || context.supports_provider_uris) =>
@@ -953,6 +961,7 @@ impl CommandPredicate {
             Self::Mount => CommandState::disabled("the selected item is not a mount"),
             Self::TrashItem => CommandState::disabled("the selected item is not in trash"),
             Self::TrashBackground => CommandState::disabled("the current location is not trash"),
+            Self::Tag => CommandState::disabled("exactly one tag must be targeted"),
             Self::CustomActionSupportsRemote => {
                 CommandState::disabled("the action does not support provider URIs")
             }
@@ -2001,6 +2010,26 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             A::ManageTags,
             G::Organization,
             D::None,
+        ),
+        command(
+            "tag.rename",
+            "command.rename-tag",
+            "pencil",
+            &[],
+            P::Tag,
+            A::RenameTag,
+            G::Organization,
+            D::None,
+        ),
+        command(
+            "tag.delete",
+            "command.delete-tag",
+            "trash-2",
+            &[],
+            P::Tag,
+            A::DeleteTag,
+            G::Destructive,
+            D::Review,
         ),
         command(
             "directory.share",

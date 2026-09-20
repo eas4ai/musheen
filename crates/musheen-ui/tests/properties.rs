@@ -1,11 +1,14 @@
-use musheen_core::{CancellationToken, ItemKind, ResourceLimits};
+use musheen_core::{
+    CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState,
+    CommandTargetRef, ItemId, ItemKind, ProviderId, ResourceLimits, StorePath,
+};
 use musheen_desktop::{
     AggregateValue, ChecksumAlgorithm, ChecksumError, ChecksumService, PropertyRefresh,
     PropertySnapshot, RecursiveSize, XattrState,
 };
 use musheen_ui::{
     ApplicationChoice, LocalOperationQueue, OpenWithIntent, OpenWithModel, PropertiesDialogModel,
-    PropertiesPage, PropertiesState,
+    PropertiesPage, PropertiesState, ProviderPropertiesDialogModel,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -202,6 +205,35 @@ fn properties_tags_page_presents_and_edits_the_shared_tag_model() {
     assert!(model.remove_tag("blue"));
     assert_eq!(model.tags().collect::<Vec<_>>(), ["reviewed", "work"]);
     assert!(model.tags_dirty());
+}
+
+#[test]
+fn provider_opaque_properties_keep_identity_tags_and_only_applicable_pages() {
+    let provider = ProviderId::new("remote").unwrap();
+    let target = CommandTargetRef::new(
+        ItemId::new(provider.clone(), b"stable-object".to_vec()).unwrap(),
+        StorePath::from_provider_key(provider, b"share/object".to_vec()).unwrap(),
+    )
+    .unwrap();
+    let capabilities = CapabilityMatrix::new(|kind| {
+        if kind == CapabilityKind::Tags {
+            CapabilityState::Supported
+        } else {
+            CapabilityState::Unsupported(CapabilityReason::new("remote metadata only").unwrap())
+        }
+    });
+
+    let mut model = ProviderPropertiesDialogModel::new(vec![(target.clone(), capabilities)]);
+    model.set_tags(["remote"]);
+
+    assert_eq!(model.targets(), &[target]);
+    assert_eq!(
+        model.pages(),
+        &[PropertiesPage::General, PropertiesPage::Tags]
+    );
+    assert_eq!(model.tags().collect::<Vec<_>>(), ["remote"]);
+    assert!(model.assign_tag("shared").unwrap());
+    assert_eq!(model.tags().collect::<Vec<_>>(), ["remote", "shared"]);
 }
 
 #[cfg(unix)]

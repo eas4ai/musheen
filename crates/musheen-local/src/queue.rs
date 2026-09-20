@@ -1,6 +1,8 @@
 use crate::LocalStore;
-use crate::mutation::{ResolvedTransferFailure, execute_resolved_transfer};
-use musheen_core::{DisplayPath, ItemId, ResourceLimits, Store, StorePath};
+use crate::mutation::{
+    ResolvedTransferFailure, ResolvedTransferOutcome, execute_resolved_transfer,
+};
+use musheen_core::{CommandTargetRef, DisplayPath, ItemId, ResourceLimits, Store, StorePath};
 use musheen_ops::{
     ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest, CopySession, EventGeneration,
     JobId, JobState, MetadataChange, MetadataPlan, MetadataScope, MutationError, MutationProvider,
@@ -124,6 +126,18 @@ pub struct ReadyLocalOperation {
     operation: LocalOperation,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransferOutcome {
+    Skipped,
+    Completed(CommandTargetRef),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalOperationOutcome {
+    Transfer(TransferOutcome),
+    Metadata,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalFailureDisposition {
     Failed,
@@ -225,10 +239,12 @@ impl ReadyLocalOperation {
     }
 
     pub fn execute(self) -> Result<(), Box<str>> {
-        self.execute_detailed().map_err(|error| error.message)
+        self.execute_detailed()
+            .map(|_| ())
+            .map_err(|error| error.message)
     }
 
-    pub fn execute_detailed(self) -> Result<(), LocalOperationFailure> {
+    pub fn execute_detailed(self) -> Result<LocalOperationOutcome, LocalOperationFailure> {
         let mut store = LocalStore::new();
         match self.operation {
             LocalOperation::Transfer {
@@ -256,29 +272,60 @@ impl ReadyLocalOperation {
                 }
                 let request = CopyRequest::new(self.id, self.generation, source, destination);
                 if let Some(decision) = decision {
-                    return execute_resolved_transfer(
+                    let outcome = execute_resolved_transfer(
                         &mut store,
                         &request,
                         &decision,
                         &self.cancellation,
                     )
-                    .map_err(LocalOperationFailure::from_resolved);
+                    .map_err(LocalOperationFailure::from_resolved)?;
+                    return match outcome {
+                        ResolvedTransferOutcome::Skipped => {
+                            Ok(LocalOperationOutcome::Transfer(TransferOutcome::Skipped))
+                        }
+                        ResolvedTransferOutcome::Completed(path) => {
+                            transfer_completed(&store, path)
+                        }
+                    };
                 }
                 match action {
-                    DropAction::Copy => CopySession::default()
-                        .execute(&mut store, &request, &self.cancellation)
-                        .map(|_| ())
-                        .map_err(LocalOperationFailure::from_transfer),
-                    DropAction::Move => execute_move(&mut store, &request, &self.cancellation)
-                        .map(|_| ())
-                        .map_err(LocalOperationFailure::from_transfer),
-                }
+                    DropAction::Copy => {
+                        CopySession::default()
+                            .execute(&mut store, &request, &self.cancellation)
+                            .map_err(LocalOperationFailure::from_transfer)?;
+                    }
+                    DropAction::Move => {
+                        execute_move(&mut store, &request, &self.cancellation)
+                            .map_err(LocalOperationFailure::from_transfer)?;
+                    }
+                };
+                transfer_completed(&store, request.destination().clone())
             }
             LocalOperation::Metadata(plan) => plan
                 .execute_controlled(&mut store, &self.cancellation)
+                .map(|()| LocalOperationOutcome::Metadata)
                 .map_err(|error| LocalOperationFailure::failed(error.to_string())),
         }
     }
+}
+
+fn transfer_completed(
+    store: &LocalStore,
+    path: StorePath,
+) -> Result<LocalOperationOutcome, LocalOperationFailure> {
+    let item = store
+        .resolve_item(&path)
+        .map_err(|error| LocalOperationFailure::failed(error.to_string()))?
+        .ok_or_else(|| {
+            LocalOperationFailure::failed(
+                "the completed transfer destination could not be resolved",
+            )
+        })?;
+    let target = CommandTargetRef::new(item.id().clone(), path)
+        .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+    Ok(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
+        target,
+    )))
 }
 
 #[derive(Debug)]

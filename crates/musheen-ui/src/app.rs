@@ -1,11 +1,12 @@
 mod catalog;
 mod custom_actions;
 
-use catalog::{CatalogBinding, TagTarget};
+use catalog::{CatalogBinding, DirectoryObservation, TagTarget};
 
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
-    PropertiesPage, PropertiesWindow, PropertiesWindowData, TagWriter, conflict_window_options,
+    PropertiesPage, PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow,
+    ProviderPropertiesWindowData, TagWriter, conflict_window_options,
     install_properties_key_bindings, properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
@@ -19,7 +20,10 @@ use crate::navigation::{
     ApplicationSession, BreadcrumbTrail, MAX_WINDOWS, NavigationError, OmnibarMode, OmnibarState,
     OmnibarSubmission, PaneId, TabId, WindowSession, resolve_path_input,
 };
-use crate::operations::{DropAction, FileDragPayload, OperationHub, spawn_ready_hub_operations};
+use crate::operations::{
+    DropAction, FileDragPayload, LocalOperationOutcome, OperationHub, TransferOutcome,
+    spawn_ready_hub_operations,
+};
 use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, SearchState};
 use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
@@ -47,12 +51,12 @@ use gpui_kit::{
     WindowOptions, div, img, px, size, uniform_list,
 };
 use musheen_core::{
-    ActiveLayout, CancellationToken, CapabilityReason, CapabilityState, CommandAction,
-    CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters, CommandTarget,
-    CommandTargetRef, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page, ProviderActionMatrix,
-    ProviderId, ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch,
-    SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem,
-    StorePath, WatchEvent,
+    ActiveLayout, CancellationToken, CapabilityKind, CapabilityReason, CapabilityState,
+    CommandAction, CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters,
+    CommandTarget, CommandTargetRef, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page,
+    ProviderActionMatrix, ProviderId, ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS,
+    SearchBatch, SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError,
+    StoreItem, StorePath, WatchEvent,
 };
 use musheen_desktop::{
     CatalogDocument, CatalogStore, ConflictDecisionStore, FolderIdentity, MimeDetector,
@@ -67,7 +71,7 @@ use musheen_ops::{
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::NativeTheme;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -220,7 +224,6 @@ struct FileDragPreview {
 #[derive(Clone, Debug)]
 struct PendingCatalogMove {
     source: ItemId,
-    destination: Option<StorePath>,
     source_path: StorePath,
     target_path: StorePath,
 }
@@ -1471,20 +1474,22 @@ impl MusheenApp {
         load: &DirectoryLoad,
         event: WatchEvent,
     ) -> bool {
+        let observed = event.clone();
         let applied = self
             .directories
             .get_mut(&tab_id)
             .is_some_and(|directory| directory.apply_watch_event(load, event));
         if applied {
-            let items = self
-                .directories
-                .get(&tab_id)
-                .map(|directory| directory.items().to_vec())
-                .unwrap_or_default();
-            if let Err(error) = self
-                .catalog_binding
-                .reconcile_directory(load.location(), &items)
-            {
+            let result = match observed {
+                WatchEvent::Created(item)
+                | WatchEvent::Changed(item)
+                | WatchEvent::Renamed { item, .. } => self
+                    .catalog_binding
+                    .observe_present(item.id(), item.path().clone()),
+                WatchEvent::Removed(item) => self.catalog_binding.observe_missing(&item),
+                WatchEvent::Invalidated { .. } => Ok(()),
+            };
+            if let Err(error) = result {
                 self.operation_error = Some(error);
             }
         }
@@ -1506,9 +1511,14 @@ impl MusheenApp {
                     directory.apply_page(load, page);
                 }
                 let items = directory.items().to_vec();
-                if let Err(error) = self
-                    .catalog_binding
-                    .reconcile_directory(load.location(), &items)
+                let observation = if directory.view().is_complete() {
+                    DirectoryObservation::Complete
+                } else {
+                    DirectoryObservation::Partial
+                };
+                if let Err(error) =
+                    self.catalog_binding
+                        .reconcile_directory(load.location(), &items, observation)
                 {
                     self.operation_error = Some(error);
                 }
@@ -1784,27 +1794,60 @@ impl MusheenApp {
                 )
             })
             .collect::<Vec<TagTarget>>();
-        let tags = match self.catalog_binding.common_tags(&tag_targets) {
-            Ok(tags) => tags,
-            Err(error) => {
-                self.operation_error = Some(error);
-                cx.notify();
-                return;
-            }
+        let provider_targets = targets
+            .iter()
+            .zip(tag_targets.iter())
+            .map(|(target, (_, _, capabilities))| (target.clone(), capabilities.clone()))
+            .collect::<Vec<_>>();
+        let tags_supported = tag_targets.iter().all(|(_, _, capabilities)| {
+            matches!(
+                capabilities.get(CapabilityKind::Tags),
+                CapabilityState::Supported
+            )
+        });
+        let (tags, tag_writer) = if tags_supported {
+            let tags = match self.catalog_binding.common_tags(&tag_targets) {
+                Ok(tags) => tags,
+                Err(error) => {
+                    self.operation_error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            };
+            let app = cx.entity().downgrade();
+            let writer: TagWriter = Arc::new(move |desired, cx| {
+                app.update(cx, |state, _| {
+                    state.apply_properties_tags(&tag_targets, desired)
+                })
+                .map_err(|error| Box::<str>::from(error.to_string()))?
+            });
+            (tags, Some(writer))
+        } else {
+            (BTreeSet::new(), None)
         };
-        let catalog_binding = self.catalog_binding.clone();
-        let tag_writer: TagWriter =
-            Arc::new(move |desired| catalog_binding.replace_tags(&tag_targets, desired));
-        self.open_properties_paths_with_tags(
-            targets
-                .iter()
-                .filter_map(|target| target.path().as_unix_path().map(Path::to_path_buf))
-                .collect(),
-            page,
-            tags,
-            Some(tag_writer),
-            cx,
-        );
+        let paths = targets
+            .iter()
+            .filter_map(|target| target.path().as_unix_path().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        if paths.len() == targets.len() {
+            self.open_properties_paths_with_tags(paths, page, tags, tag_writer, cx);
+        } else {
+            let title = if targets.len() == 1 {
+                format!(
+                    "{} Properties",
+                    DisplayPath::from_store_path(targets[0].path()).as_str()
+                )
+            } else {
+                format!("{} items — Properties", targets.len())
+            };
+            let data = ProviderPropertiesWindowData::new(provider_targets, tags, tag_writer);
+            let options = properties_window_options(title, cx);
+            cx.open_window(options, move |window, cx| {
+                let view = cx.new(|cx| ProviderPropertiesWindow::new(data, page, window, cx));
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("Musheen could not open a provider Properties window");
+        }
     }
 
     fn open_properties_paths(
@@ -1835,19 +1878,16 @@ impl MusheenApp {
         };
         let options = properties_window_options(title, cx);
         let operation_hub = self.operation_hub.clone();
-        let work = cx.background_spawn(async move {
-            PropertiesWindowData::load(&paths).map(|data| {
-                let data = data.with_tags(tags.iter().map(AsRef::as_ref));
-                match tag_writer {
-                    Some(writer) => data.with_tag_writer(writer),
-                    None => data,
-                }
-            })
-        });
+        let work = cx.background_spawn(async move { PropertiesWindowData::load(&paths) });
         cx.spawn(async move |_, cx| {
             let result = work.await;
             cx.open_window(options, move |window, cx| match result {
                 Ok(data) => {
+                    let data = data.with_tags(tags.iter().map(AsRef::as_ref));
+                    let data = match tag_writer {
+                        Some(writer) => data.with_tag_writer(writer),
+                        None => data,
+                    };
                     let view = cx.new(|cx| {
                         PropertiesWindow::with_hub_page(data, operation_hub, page, window, cx)
                     });
@@ -3148,6 +3188,28 @@ impl MusheenApp {
             (CommandAction::ManageTags, CommandParameters::Targets(targets)) => {
                 self.dispatch_manage_tags(targets, origin_tab, cx);
             }
+            (CommandAction::RenameTag, CommandParameters::Targets(targets)) => {
+                let result = targets
+                    .first()
+                    .filter(|_| targets.len() == 1)
+                    .ok_or_else(|| Box::<str>::from("rename tag requires exactly one tag"))
+                    .and_then(|target| self.open_captured_tag_rename(target, cx));
+                if let Err(error) = result {
+                    self.operation_error = Some(error);
+                    cx.notify();
+                }
+            }
+            (CommandAction::DeleteTag, CommandParameters::Targets(targets)) => {
+                let result = targets
+                    .first()
+                    .filter(|_| targets.len() == 1)
+                    .ok_or_else(|| Box::<str>::from("delete tag requires exactly one tag"))
+                    .and_then(|target| self.delete_captured_tag(target));
+                if let Err(error) = result {
+                    self.operation_error = Some(error);
+                }
+                cx.notify();
+            }
             (CommandAction::DirectoryProperties, CommandParameters::Location(location)) => {
                 if let Some(targets) = captured_targets
                     && let Err(error) = self.revalidate_context_targets(origin_tab, targets)
@@ -3525,16 +3587,8 @@ impl MusheenApp {
                         .flatten()
                         .map(|item| item.id().clone())
                 })?;
-                let destination = source.as_unix_path().zip(target.as_unix_path()).and_then(
-                    |(source_path, destination_root)| {
-                        source_path.file_name().map(|file_name| {
-                            StorePath::from_unix_path(destination_root.join(file_name))
-                        })
-                    },
-                );
                 Some(PendingCatalogMove {
                     source: source_identity,
-                    destination,
                     source_path: source.clone(),
                     target_path: target.clone(),
                 })
@@ -3722,12 +3776,12 @@ impl MusheenApp {
         let result = spawn_ready_hub_operations(
             self.operation_hub.clone(),
             cx,
-            |state: &mut Self, id, succeeded, error, cx| {
+            |state: &mut Self, id, outcome, error, cx| {
                 if let Some(error) = error {
                     state.operation_error = Some(error);
                 }
-                if succeeded {
-                    state.finish_catalog_move(id);
+                if let Some(outcome) = outcome {
+                    state.finish_catalog_move(id, outcome);
                     // A background completion refreshes the current tab; it
                     // must not steal focus restored when a review closes.
                     let pending_content_focus = state.pending_content_focus;
@@ -3746,40 +3800,30 @@ impl MusheenApp {
         }
     }
 
-    fn finish_catalog_move(&mut self, id: musheen_ops::JobId) {
+    fn finish_catalog_move(&mut self, id: musheen_ops::JobId, outcome: LocalOperationOutcome) {
         let Some(movement) = self.pending_catalog_moves.remove(&id) else {
             return;
         };
-        let Some(destination_path) = movement.destination else {
-            self.operation_error = Some(
-                format!(
-                    "move completed from {} to {}, but the provider did not report the exact destination item path; source tags were retained for review",
-                    DisplayPath::from_store_path(&movement.source_path).as_str(),
-                    DisplayPath::from_store_path(&movement.target_path).as_str(),
-                )
-                .into(),
-            );
-            return;
-        };
-        let destination = match self.store.resolve_item(&destination_path) {
-            Ok(Some(destination)) => destination,
-            Ok(None) => {
+        let target = match outcome {
+            LocalOperationOutcome::Transfer(TransferOutcome::Skipped) => return,
+            LocalOperationOutcome::Transfer(TransferOutcome::Completed(target)) => target,
+            LocalOperationOutcome::Metadata => {
                 self.operation_error = Some(
-                    "move completed but the destination identity could not be resolved".into(),
+                    format!(
+                        "move completed from {} to {}, but no transfer destination was reported; source tags were retained for review",
+                        DisplayPath::from_store_path(&movement.source_path).as_str(),
+                        DisplayPath::from_store_path(&movement.target_path).as_str(),
+                    )
+                    .into(),
                 );
                 return;
             }
-            Err(error) => {
-                self.operation_error =
-                    Some(format!("move completed but catalog repair failed: {error}").into());
-                return;
-            }
         };
-        let capabilities = self.store.capabilities(&destination_path);
+        let capabilities = self.store.capabilities(target.path());
         match self.catalog_binding.complete_move(
             &movement.source,
-            destination.id().clone(),
-            destination_path,
+            target.id().clone(),
+            target.path().clone(),
             &capabilities,
         ) {
             Ok(TagMoveOutcome::Preserved) => {}
@@ -8244,8 +8288,12 @@ mod tests {
         }
 
         fn capabilities(&self, _location: &StorePath) -> CapabilityMatrix {
-            CapabilityMatrix::new(|_| {
-                CapabilityState::Unsupported(CapabilityReason::new("test store").unwrap())
+            CapabilityMatrix::new(|kind| {
+                if kind == CapabilityKind::Tags {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Unsupported(CapabilityReason::new("test store").unwrap())
+                }
             })
         }
 
@@ -10638,7 +10686,8 @@ mod tests {
             window.click("home-item-tag-0", cx);
             window.render_frame(cx);
             window.click("home-orphan-cleanup-0", cx);
-        });
+        })
+        .unwrap();
 
         assert!(catalog_store.load().unwrap().pins().entries().is_empty());
         assert!(
@@ -10676,8 +10725,245 @@ mod tests {
                 tag.location().clone(),
                 tag.identity().cloned(),
             );
-            let targets = menu.entry("item.tags").unwrap().captured_targets();
+            let targets = menu.entry("tag.rename").unwrap().captured_targets();
             assert_eq!(targets.first().map(CommandTargetRef::id), tag.identity());
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn successful_properties_tag_edit_refreshes_sidebar_and_home_projection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("child");
+        filesystem::write(&child, b"tag target").unwrap();
+        let path = StorePath::from_unix_path(child.as_os_str());
+        let item = LocalStore::new().resolve_item(&path).unwrap().unwrap();
+
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        app.update(cx, |state, cx| {
+            let target = (
+                item.id().clone(),
+                path.clone(),
+                state.store.capabilities(&path),
+            );
+            state
+                .catalog_binding
+                .assign_tag(&target.0, &target.1, &target.2, "old")
+                .unwrap();
+            state.sync_catalog_projection();
+            state
+                .apply_properties_tags(
+                    &[target],
+                    &[Box::<str>::from("fresh")].into_iter().collect(),
+                )
+                .unwrap();
+            cx.notify();
+
+            let tab = state.navigation.focused_tab().id();
+            let sidebar_tags = state
+                .sidebars
+                .get(&tab)
+                .unwrap()
+                .sections()
+                .into_iter()
+                .find(|section| section.kind() == SidebarSectionKind::Tags)
+                .unwrap()
+                .items()
+                .iter()
+                .map(|entry| entry.label().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(sidebar_tags, ["fresh"]);
+            let home_tags = state
+                .catalog_binding
+                .home_sections(&[])
+                .into_iter()
+                .find(|section| section.kind() == musheen_desktop::HomeItemKind::Tag)
+                .unwrap()
+                .items()
+                .iter()
+                .map(|entry| entry.label().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(home_tags, ["fresh"]);
+
+            let provider = ProviderId::new("musheen-tag").unwrap();
+            let fresh_target = CommandTargetRef::new(
+                ItemId::new(provider.clone(), b"fresh".to_vec()).unwrap(),
+                StorePath::from_provider_key(provider.clone(), b"fresh".to_vec()).unwrap(),
+            )
+            .unwrap();
+            state.dispatch_typed_context_command(
+                CommandAction::RenameTag,
+                CommandParameters::Targets(vec![fresh_target]),
+                Some(tab),
+                None,
+                true,
+                cx,
+            );
+            assert!(
+                state.operation_error.is_none(),
+                "{:?}",
+                state.operation_error
+            );
+            assert!(cx.windows().len() >= 2);
+
+            state.rename_catalog_tag("fresh", "renamed").unwrap();
+            let tag_target = CommandTargetRef::new(
+                ItemId::new(provider.clone(), b"renamed".to_vec()).unwrap(),
+                StorePath::from_provider_key(provider, b"renamed".to_vec()).unwrap(),
+            )
+            .unwrap();
+            state.dispatch_typed_context_command(
+                CommandAction::DeleteTag,
+                CommandParameters::Targets(vec![tag_target]),
+                Some(tab),
+                None,
+                true,
+                cx,
+            );
+            assert!(state.catalog_binding.tag_names().is_empty());
+            assert!(
+                state.operation_error.is_none(),
+                "{:?}",
+                state.operation_error
+            );
+
+            state
+                .catalog_binding
+                .assign_tag(item.id(), &path, &state.store.capabilities(&path), "move")
+                .unwrap();
+            state.store = Arc::new(ImmediateSearchStore::new());
+            let remote_provider = ProviderId::new("remote").unwrap();
+            let remote_path = StorePath::from_provider_key(
+                remote_provider.clone(),
+                b"opaque/destination".to_vec(),
+            )
+            .unwrap();
+            let remote = CommandTargetRef::new(
+                ItemId::new(remote_provider, b"remote-stable-id".to_vec()).unwrap(),
+                remote_path.clone(),
+            )
+            .unwrap();
+            let job = musheen_ops::JobId::new(9_001).unwrap();
+            state.pending_catalog_moves.insert(
+                job,
+                PendingCatalogMove {
+                    source: item.id().clone(),
+                    source_path: path.clone(),
+                    target_path: remote_path,
+                },
+            );
+            state.finish_catalog_move(
+                job,
+                LocalOperationOutcome::Transfer(TransferOutcome::Completed(remote.clone())),
+            );
+            assert_eq!(
+                state.catalog_binding.tags_for_identity(remote.id()),
+                [Box::<str>::from("move")].into_iter().collect()
+            );
+            assert!(
+                state
+                    .catalog_binding
+                    .tags_for_identity(item.id())
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn provider_opaque_target_opens_metadata_properties_with_tags(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let provider = ProviderId::new("remote").unwrap();
+        let target = CommandTargetRef::new(
+            ItemId::new(provider.clone(), b"stable-object".to_vec()).unwrap(),
+            StorePath::from_provider_key(provider, b"share/object".to_vec()).unwrap(),
+        )
+        .unwrap();
+
+        cx.update_window(handle.into(), |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.store = Arc::new(ImmediateSearchStore::new());
+                state.open_properties_targets(&[target], PropertiesPage::Tags, cx);
+                assert!(
+                    state.operation_error.is_none(),
+                    "{:?}",
+                    state.operation_error
+                );
+            });
+        })
+        .unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.windows().iter().any(|window| *window != browser)
+        })
+        .await;
+        let properties = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.update_window(properties, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("provider-properties").visible());
+            assert!(window.find("properties-tags-page").visible());
+            assert!(window.try_find("properties-permissions-page").is_none());
+            window.click("provider-properties-tag-input", cx);
+            window.input("remote", cx);
+            window.click("provider-properties-add-tag", cx);
+            window.click("provider-properties-apply-tags", cx);
+        })
+        .unwrap();
+        app.update(cx, |state, _| {
+            assert_eq!(
+                state.catalog_binding.tag_names(),
+                ["remote".into()].into_iter().collect()
+            );
+            let tab = state.navigation.focused_tab().id();
+            assert!(
+                state
+                    .sidebars
+                    .get(&tab)
+                    .unwrap()
+                    .sections()
+                    .into_iter()
+                    .find(|section| section.kind() == SidebarSectionKind::Tags)
+                    .is_some_and(|section| section.items()[0].label() == "remote")
+            );
         });
     }
 }
