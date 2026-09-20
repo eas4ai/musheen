@@ -64,13 +64,13 @@ fn open_settings_at(store: SettingsStore, cx: &mut App) {
 }
 
 pub struct SettingsWindow {
-    state: SettingsState,
+    pub(super) state: SettingsState,
     store: SettingsStore,
     catalog: Catalog,
     search: Entity<InputState>,
     inputs: BTreeMap<&'static str, Entity<InputState>>,
     subscriptions: Vec<Subscription>,
-    failure: Option<&'static str>,
+    pub(super) failure: Option<&'static str>,
     load_failed: bool,
     sync_inputs: bool,
     focus_pending: bool,
@@ -79,6 +79,9 @@ pub struct SettingsWindow {
     choices_focus: BTreeMap<&'static str, FocusHandle>,
     reset_trigger: FocusHandle,
     appearance_base: AppearanceSnapshot,
+    pub(super) shortcut_input: Entity<InputState>,
+    pub(super) shortcut_scope: musheen_core::ShortcutScope,
+    pub(super) toolbar_move_focus: FocusHandle,
 }
 
 impl SettingsWindow {
@@ -101,7 +104,18 @@ impl SettingsWindow {
                     .to_owned(),
             )
         });
+        let shortcut_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(
+                catalog
+                    .message("customization-chord")
+                    .expect("localized shortcut prompt")
+                    .to_owned(),
+            )
+        });
         let mut this = Self {
+            toolbar_move_focus: cx.focus_handle(),
+            shortcut_input,
+            shortcut_scope: musheen_core::ShortcutScope::Browser,
             state: SettingsState::new(document, backends),
             store,
             catalog,
@@ -122,6 +136,10 @@ impl SettingsWindow {
             .iter()
             .filter(|spec| this.state.available(spec))
         {
+            if matches!(spec.kind, SettingKind::Toolbar | SettingKind::Shortcuts) {
+                this.choices_focus.insert(spec.key, cx.focus_handle());
+                continue;
+            }
             if !choices(spec.kind).is_empty() {
                 this.choices_focus.insert(spec.key, cx.focus_handle());
                 continue;
@@ -167,6 +185,7 @@ impl SettingsWindow {
             }));
         this.subscriptions.push(cx.on_release(|this, cx| {
             this.state.cancel();
+            this.preview_customization(cx);
             this.appearance_base.restore(cx);
         }));
         this
@@ -176,7 +195,7 @@ impl SettingsWindow {
         &self.state
     }
 
-    fn blocked(&self) -> bool {
+    pub(super) fn blocked(&self) -> bool {
         self.saving || self.load_failed || self.state.reset_confirmation_pending()
     }
 
@@ -224,7 +243,7 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    fn label(&self, key: &str) -> String {
+    pub(super) fn label(&self, key: &str) -> String {
         self.catalog
             .message(key)
             .expect("settings key is localized")
@@ -245,6 +264,7 @@ impl SettingsWindow {
                 });
             }
             self.preview_appearance(cx);
+            self.preview_customization(cx);
         }
         if self.focus_pending {
             self.focus_pending = false;
@@ -345,6 +365,14 @@ impl SettingsWindow {
                     format!("label-{}", spec.key),
                     self.label(spec.label),
                 ));
+            if matches!(spec.kind, SettingKind::Toolbar | SettingKind::Shortcuts) {
+                let editor = if spec.kind == SettingKind::Toolbar {
+                    self.render_toolbar_editor(cx).into_any_element()
+                } else {
+                    self.render_shortcut_editor(cx).into_any_element()
+                };
+                row = row.track_focus(&self.choices_focus[spec.key]).child(editor);
+            }
             if !choices(spec.kind).is_empty() {
                 row = row.child(self.render_choices(spec, cx));
             }
@@ -358,7 +386,10 @@ impl SettingsWindow {
                 );
             }
             let values = match spec.kind {
-                SettingKind::Boolean | SettingKind::Choice(_) => String::new(),
+                SettingKind::Boolean
+                | SettingKind::Choice(_)
+                | SettingKind::Toolbar
+                | SettingKind::Shortcuts => String::new(),
                 SettingKind::Integer { maximum, units } => format!(
                     "{}: {} {}",
                     self.label("settings-maximum"),
@@ -549,6 +580,7 @@ impl Render for SettingsWindow {
                         .label(self.label("settings-cancel"))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.state.cancel();
+                            this.preview_customization(cx);
                             this.appearance_base.restore(cx);
                             window.remove_window();
                         })),
@@ -640,7 +672,10 @@ impl AppearanceSnapshot {
     }
 }
 
-fn observed_label(id: impl Into<SharedString>, label: String) -> impl IntoElement + Styled {
+pub(super) fn observed_label(
+    id: impl Into<SharedString>,
+    label: String,
+) -> impl IntoElement + Styled {
     div()
         .id(id.into())
         .test_support()
@@ -652,7 +687,11 @@ fn observed_label(id: impl Into<SharedString>, label: String) -> impl IntoElemen
         .child(label)
 }
 
-fn native_button(id: impl Into<SharedString>, label: String, cx: &App) -> gpui_kit::base::Button {
+pub(super) fn native_button(
+    id: impl Into<SharedString>,
+    label: String,
+    cx: &App,
+) -> gpui_kit::base::Button {
     let id = id.into();
     let colors = cx.theme().colors;
     gpui_kit::base::Button::new(id.clone())
@@ -729,6 +768,65 @@ mod tests {
     use super::*;
     use gpui_kit::TestAppContext;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+
+    #[gpui_kit::test]
+    async fn toolbar_keyboard_move_previews_and_cancel_restores_runtime(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = tempfile::tempdir().unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
+            let entity = cx.new(|cx| {
+                SettingsWindow::new(
+                    SettingsStore::from_config_home(root.path()),
+                    SettingsBackends::default(),
+                    Catalog::load(Locale::EnUs).unwrap(),
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |this, _| {
+                this.state.navigate_to("layout.toolbar").unwrap()
+            });
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let focus = view.read(cx).toolbar_move_focus.clone();
+            focus.focus(window, cx);
+            window.render_frame(cx);
+            window.press("enter", cx);
+            window.dispatch_event(
+                gpui_kit::PlatformInput::KeyUp(gpui_kit::KeyUpEvent {
+                    keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),
+                }),
+                cx,
+            );
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).state.toolbar().ids()[1].as_str(),
+                "navigation.location"
+            );
+            assert_eq!(
+                super::super::toolbar::toolbar_from_document(
+                    &cx.global::<super::super::RuntimeSettings>().0
+                ),
+                view.read(cx).state.toolbar()
+            );
+            window.click("settings-cancel", cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(
+                super::super::toolbar::toolbar_from_document(
+                    &cx.global::<super::super::RuntimeSettings>().0
+                ),
+                musheen_core::ToolbarLayout::default()
+            )
+        });
+    }
 
     #[gpui_kit::test]
     async fn localized_choices_are_controls_not_serialized_input_values(cx: &mut TestAppContext) {

@@ -65,6 +65,8 @@ pub enum SettingKind {
     Choice(&'static [&'static str]),
     Integer { maximum: usize, units: &'static str },
     CredentialReference,
+    Toolbar,
+    Shortcuts,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -250,9 +252,9 @@ const SETTINGS: &[SettingSpec] = &[
         group: "settings-group-layout",
         aliases: "toolbar commands",
         default: "default",
-        kind: SettingKind::Choice(&["default"]),
-        restart_required: true,
-        feature: SettingsFeature::Customization,
+        kind: SettingKind::Toolbar,
+        restart_required: false,
+        feature: SettingsFeature::None,
     },
     SettingSpec {
         key: "files.hidden",
@@ -451,9 +453,9 @@ const SETTINGS: &[SettingSpec] = &[
         group: "settings-group-shortcuts",
         aliases: "keyboard shortcuts",
         default: "default",
-        kind: SettingKind::Choice(&["default"]),
-        restart_required: true,
-        feature: SettingsFeature::Customization,
+        kind: SettingKind::Shortcuts,
+        restart_required: false,
+        feature: SettingsFeature::None,
     },
     SettingSpec {
         key: "advanced.logging",

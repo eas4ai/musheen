@@ -6,7 +6,9 @@ mod operations;
 mod presentation;
 mod remote;
 mod search;
+pub mod shortcuts;
 mod terminal;
+pub mod toolbar;
 mod window;
 
 use crate::{Catalog, ThemeProfile};
@@ -66,6 +68,30 @@ pub struct SettingsState {
 }
 
 impl SettingsState {
+    pub fn toolbar(&self) -> musheen_core::ToolbarLayout {
+        musheen_core::ToolbarLayout::import(
+            &self.draft.value("layout.toolbar").expect("schema key"),
+        )
+        .expect("validated toolbar")
+    }
+    pub fn set_toolbar(
+        &mut self,
+        layout: musheen_core::ToolbarLayout,
+    ) -> Result<(), SettingsError> {
+        self.edit("layout.toolbar", &layout.export())
+    }
+    pub fn shortcuts(&self) -> musheen_core::ShortcutMap {
+        musheen_core::ShortcutMap::import(
+            &self.draft.value("shortcuts.bindings").expect("schema key"),
+        )
+        .expect("validated shortcuts")
+    }
+    pub fn set_shortcuts(
+        &mut self,
+        bindings: musheen_core::ShortcutMap,
+    ) -> Result<(), SettingsError> {
+        self.edit("shortcuts.bindings", &bindings.export())
+    }
     pub fn new(document: SettingsDocument, backends: SettingsBackends) -> Self {
         Self {
             committed: document.clone(),

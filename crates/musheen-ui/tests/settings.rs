@@ -334,6 +334,7 @@ async fn settings_gallery_checks_rendered_controls_labels_and_confirmation_at_do
                     assert!(control.visible(), "{locale:?} {}", spec.key);
                     let expected_role = match spec.kind {
                         SettingKind::Boolean | SettingKind::Choice(_) => Role::Button,
+                        SettingKind::Toolbar | SettingKind::Shortcuts => Role::Group,
                         _ => Role::TextInput,
                     };
                     assert_eq!(control.role(), Some(expected_role), "{}", spec.key);

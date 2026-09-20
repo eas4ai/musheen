@@ -1032,6 +1032,7 @@ struct MusheenApp {
     session_save_generation: u64,
     watch_directories: bool,
     sidebar_visible: bool,
+    customization_keys: Option<Subscription>,
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
     info_panes: HashMap<TabId, InfoPaneModel>,
     catalog: Catalog,
@@ -1148,6 +1149,7 @@ impl MusheenApp {
         let operation_error = operation_hub.persistence_error();
         let operation_status_revision = operation_hub.status_revision();
         let mut this = Self {
+            customization_keys: None,
             directories,
             searches: HashMap::new(),
             filters: HashMap::new(),
@@ -3925,6 +3927,15 @@ impl MusheenApp {
     }
 
     fn toolbar_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
+        self.named_toolbar_button(id, id.into(), cx)
+    }
+
+    fn named_toolbar_button(
+        &self,
+        id: &str,
+        control_id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Button {
         let command = self
             .shell
             .commands()
@@ -3956,7 +3967,8 @@ impl MusheenApp {
                 | CommandAction::ViewAdaptive
         )
         .then_some(state.is_checked());
-        Button::new(id)
+        let id = id.to_owned();
+        Button::new(control_id)
             .icon(menu_icon(Some(command.icon_key())))
             .accessibility_label(label.clone())
             .tooltip(tooltip)
@@ -3968,7 +3980,7 @@ impl MusheenApp {
             .when_some(toggled, |button, toggled| button.toggled(toggled))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.remember_context_invocation_focus(window, cx);
-                this.dispatch_command(id, cx);
+                this.dispatch_command(&id, cx);
             }))
     }
 
@@ -4278,6 +4290,176 @@ impl MusheenApp {
             .child(self.toolbar_button("pane.split", cx))
             .child(self.toolbar_button("pane.focus_next", cx))
             .child(self.toolbar_button("app.settings", cx))
+    }
+
+    fn render_custom_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout = cx
+            .try_global::<crate::settings::RuntimeSettings>()
+            .map(|settings| crate::settings::toolbar::toolbar_from_document(&settings.0))
+            .unwrap_or_default();
+        let overflow = layout.ids().iter().skip(8).cloned().collect::<Vec<_>>();
+        let host = cx.entity();
+        let overflow_items = overflow
+            .iter()
+            .map(|id| {
+                let command = self.shell.commands().get(id.as_str());
+                let label = command
+                    .map(|command| {
+                        self.catalog
+                            .message(command.label_key())
+                            .expect("localized command")
+                            .to_owned()
+                    })
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}: {}",
+                            self.catalog
+                                .message("customization-unavailable")
+                                .expect("localized unavailable"),
+                            id.as_str()
+                        )
+                    });
+                let enabled = command.is_some_and(|command| {
+                    command
+                        .state(&self.active_command_context(command.action()))
+                        .is_enabled()
+                });
+                (
+                    id.clone(),
+                    label,
+                    command.map(|command| menu_icon(Some(command.icon_key()))),
+                    enabled,
+                )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("custom-toolbar")
+            .test_support()
+            .role(Role::Toolbar)
+            .aria_label(
+                self.catalog
+                    .message("setting-layout-toolbar")
+                    .expect("localized toolbar")
+                    .to_owned(),
+            )
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .px_3()
+            .py_1()
+            .bg(cx.theme().colors.background)
+            .children(
+                layout
+                    .ids()
+                    .iter()
+                    .take(8)
+                    .filter(|id| self.shell.commands().get(id.as_str()).is_some())
+                    .map(|id| {
+                        self.named_toolbar_button(
+                            id.as_str(),
+                            format!("custom-toolbar-{}", id.as_str()).into(),
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .when(!overflow.is_empty(), |bar| {
+                bar.child(
+                    Button::new("custom-toolbar-overflow")
+                        .label(
+                            self.catalog
+                                .message("customization-more")
+                                .expect("localized overflow")
+                                .to_owned(),
+                        )
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for (id, label, icon, enabled) in &overflow_items {
+                                let host = host.clone();
+                                let id = id.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label.clone())
+                                        .when_some(*icon, |item, icon| item.icon(icon))
+                                        .disabled(!enabled)
+                                        .on_click(move |_, window, cx| {
+                                            host.update(cx, |this, cx| {
+                                                this.remember_context_invocation_focus(window, cx);
+                                                this.dispatch_command(id.as_str(), cx);
+                                            });
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
+                )
+            })
+    }
+
+    fn route_custom_shortcut(
+        &mut self,
+        key: &gpui_kit::Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.browser_input_blocked() {
+            cx.stop_propagation();
+            window.prevent_default();
+            self.activate_context_dialog(cx);
+            return;
+        }
+        if key.key == "escape" || self.keyboard_context_popup.is_some() {
+            return;
+        }
+        let mut parts = Vec::new();
+        if key.modifiers.control {
+            parts.push("ctrl");
+        }
+        if key.modifiers.alt {
+            parts.push("alt");
+        }
+        if key.modifiers.shift {
+            parts.push("shift");
+        }
+        if key.modifiers.platform {
+            parts.push("super");
+        }
+        parts.push(&key.key);
+        let chord = parts.join("-");
+        let map = cx
+            .try_global::<crate::settings::RuntimeSettings>()
+            .map(|settings| crate::settings::shortcuts::shortcuts_from_document(&settings.0))
+            .unwrap_or_default();
+        let scope = if self
+            .omnibar_input
+            .as_ref()
+            .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window))
+        {
+            musheen_core::ShortcutScope::Global
+        } else {
+            musheen_core::ShortcutScope::Browser
+        };
+        if let Some(id) = map.resolve(&chord, scope, self.shell.commands()) {
+            cx.stop_propagation();
+            window.prevent_default();
+            if self
+                .shell
+                .commands()
+                .get(id.as_str())
+                .is_some_and(|command| is_contextual_command(command.action()))
+            {
+                self.remember_context_invocation_focus(window, cx);
+            } else {
+                self.remember_browser_focus(window, cx);
+            }
+            self.dispatch_command(id.as_str(), cx);
+        } else if scope == musheen_core::ShortcutScope::Browser
+            && musheen_core::ShortcutMap::default()
+                .resolve(&chord, scope, self.shell.commands())
+                .is_some()
+        {
+            // Suppress the old static binding after a user removes or reassigns it.
+            cx.stop_propagation();
+            window.prevent_default();
+        }
     }
 
     fn render_view_controls(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -6553,6 +6735,17 @@ impl MusheenApp {
 
 impl Render for MusheenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.customization_keys.is_none() {
+            let owner = cx.entity().downgrade();
+            let window_id = window.window_handle().window_id();
+            self.customization_keys = Some(cx.intercept_keystrokes(move |event, window, cx| {
+                if window.window_handle().window_id() == window_id {
+                    let _ = owner.update(cx, |this, cx| {
+                        this.route_custom_shortcut(&event.keystroke, window, cx)
+                    });
+                }
+            }));
+        }
         self.ensure_omnibar(window, cx);
         if let Some(mode) = self.requested_omnibar_mode.take() {
             self.activate_omnibar(mode, window, cx);
@@ -6718,6 +6911,7 @@ impl Render for MusheenApp {
             }))
             .child(self.render_tab_strip(cx))
             .child(self.render_toolbar(window, cx))
+            .child(self.render_custom_toolbar(cx))
             .when_some(operation_error, |shell, message| {
                 shell.child(
                     div()
@@ -7086,6 +7280,65 @@ mod tests {
     use standard_library::fs as filesystem;
     use std as standard_library;
     use std::time::Duration;
+
+    #[gpui_kit::test]
+    async fn customization_keys_and_toolbar_use_live_registry_dispatch(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            let mut document = musheen_desktop::SettingsDocument::default();
+            let registry = musheen_core::CommandRegistry::built_in();
+            let mut shortcuts = musheen_core::ShortcutMap::default();
+            shortcuts
+                .assign(
+                    "view.sidebar",
+                    musheen_core::ShortcutScope::Browser,
+                    "ctrl-alt-b",
+                    &registry,
+                )
+                .unwrap();
+            document
+                .set_value("shortcuts.bindings", &shortcuts.export())
+                .unwrap();
+            let mut toolbar = musheen_core::ToolbarLayout::default();
+            toolbar.add("view.sidebar", &registry).unwrap();
+            document
+                .set_value("layout.toolbar", &toolbar.export())
+                .unwrap();
+            cx.set_global(crate::settings::RuntimeSettings(document));
+            window.render_frame(cx);
+            assert!(app.read(cx).sidebar_visible);
+            window.press("ctrl-alt-b", cx);
+            assert!(!app.read(cx).sidebar_visible);
+            window.press("ctrl-b", cx);
+            assert!(
+                !app.read(cx).sidebar_visible,
+                "removed static shortcut must not run"
+            );
+            window.render_frame(cx);
+            window.click("custom-toolbar-view.sidebar", cx);
+            assert!(app.read(cx).sidebar_visible);
+            window.remove_window();
+        })
+        .unwrap();
+    }
 
     struct ImmediateSearchStream(Option<SearchBatch>);
 

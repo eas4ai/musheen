@@ -4,6 +4,7 @@ mod cancel;
 mod capability;
 mod command;
 mod context;
+mod customization;
 mod error;
 mod item;
 mod limits;
@@ -21,6 +22,7 @@ pub use context::{
     CommandTargetRef, DesktopApplicationId, OpenWithIntent, ProviderAction, ProviderActionMatrix,
     ResolvedDestination,
 };
+pub use customization::*;
 pub use error::CoreError;
 pub use item::{ItemId, ItemKind, StoreItem};
 pub use limits::{ResourceLimitConfig, ResourceLimits};
