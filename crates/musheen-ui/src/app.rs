@@ -24,6 +24,7 @@ use crate::operations::{
     DropAction, FileDragPayload, LocalOperationOutcome, OperationHub, TransferOutcome,
     spawn_ready_hub_operations,
 };
+use crate::providers::{ProviderRuntime, network_root_path};
 use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, SearchState};
 use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
@@ -706,15 +707,14 @@ pub fn run(initial_path: PathBuf) {
             );
             let fallback = StorePath::from_unix_path(initial_path.into_os_string());
             let store = SessionStore::for_current_user();
+            let providers = ProviderRuntime::for_current_user();
             let application = (settings.value("general.restore_session").as_deref()
                 != Some("false")
                 && settings.value("general.startup").as_deref() == Some("last-session"))
             .then(|| {
-                restore_application_session(
-                    &store,
-                    fallback.clone(),
-                    LocalStore::session_location_exists,
-                )
+                restore_application_session(&store, fallback.clone(), |location| {
+                    providers.location_exists(location)
+                })
             })
             .flatten()
             .unwrap_or_else(|| {
@@ -725,7 +725,8 @@ pub fn run(initial_path: PathBuf) {
                 store,
                 application.windows().to_vec(),
             )));
-            let operation_hub = OperationHub::for_current_user(&limits);
+            let operation_hub =
+                OperationHub::for_current_user_with_provider_runtime(&limits, &providers);
             let catalog_store = CatalogStore::for_current_user();
             let mut catalog_document = catalog_store.load().unwrap_or_else(|error| {
                 eprintln!("Musheen could not load its catalog: {error}");
@@ -756,6 +757,7 @@ pub fn run(initial_path: PathBuf) {
                             window_id,
                             operation_hub: operation_hub.clone(),
                             catalog: catalog_binding.clone(),
+                            providers: providers.clone(),
                         },
                     )
                 })
@@ -768,6 +770,7 @@ pub fn run(initial_path: PathBuf) {
                             MusheenApp::new_with_navigation(
                                 navigation,
                                 Some(binding),
+                                None,
                                 limits.clone(),
                                 true,
                                 cx,
@@ -990,6 +993,7 @@ struct SessionBinding {
     window_id: u64,
     operation_hub: OperationHub,
     catalog: CatalogBinding,
+    providers: ProviderRuntime,
 }
 
 #[derive(Debug)]
@@ -1046,6 +1050,7 @@ impl SessionBinding {
             window_id,
             operation_hub: self.operation_hub.clone(),
             catalog: self.catalog.clone(),
+            providers: self.providers.clone(),
         })
     }
 }
@@ -1136,6 +1141,7 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let limits = ResourceLimits::default();
+        let providers = ProviderRuntime::for_current_user();
         let initial = StorePath::from_unix_path(initial_path.into_os_string());
         let (navigation, session_binding) = if let Some(store) = session_store {
             let application = restore_application_session(
@@ -1163,14 +1169,32 @@ impl MusheenApp {
                 Some(SessionBinding {
                     coordinator,
                     window_id,
-                    operation_hub: OperationHub::new(&limits),
+                    operation_hub: OperationHub::new_with_provider_runtime(&limits, &providers),
                     catalog: CatalogBinding::in_memory(),
+                    providers,
                 }),
             )
         } else {
             (WindowSession::new(initial), None)
         };
-        Self::new_with_navigation(navigation, session_binding, limits, false, cx)
+        Self::new_with_navigation(navigation, session_binding, None, limits, false, cx)
+    }
+
+    #[cfg(test)]
+    fn new_with_provider_runtime(
+        initial_path: PathBuf,
+        providers: ProviderRuntime,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let limits = ResourceLimits::default();
+        Self::new_with_navigation(
+            WindowSession::new(StorePath::from_unix_path(initial_path.into_os_string())),
+            None,
+            Some(providers),
+            limits,
+            false,
+            cx,
+        )
     }
 
     #[cfg(test)]
@@ -1182,7 +1206,7 @@ impl MusheenApp {
         let limits = ResourceLimits::default();
         let initial = StorePath::from_unix_path(initial_path.into_os_string());
         let mut app =
-            Self::new_with_navigation(WindowSession::new(initial), None, limits, false, cx);
+            Self::new_with_navigation(WindowSession::new(initial), None, None, limits, false, cx);
         let document = catalog_store.load().unwrap_or_default();
         app.catalog_binding = CatalogBinding::persistent(catalog_store, document);
         app.sync_catalog_projection();
@@ -1192,6 +1216,7 @@ impl MusheenApp {
     fn new_with_navigation(
         mut navigation: WindowSession,
         session_binding: Option<SessionBinding>,
+        provider_runtime: Option<ProviderRuntime>,
         limits: ResourceLimits,
         watch_directories: bool,
         cx: &mut Context<Self>,
@@ -1214,10 +1239,17 @@ impl MusheenApp {
         let mut sidebar = default_sidebar_model(pins.clone());
         sidebar.set_tag_names(tag_names.iter().map(AsRef::as_ref));
         sidebars.insert(focused_tab, sidebar);
+        let providers = provider_runtime
+            .or_else(|| {
+                session_binding
+                    .as_ref()
+                    .map(|binding| binding.providers.clone())
+            })
+            .unwrap_or_else(ProviderRuntime::for_current_user);
         let operation_hub = session_binding
             .as_ref()
             .map(|binding| binding.operation_hub.clone())
-            .unwrap_or_else(|| OperationHub::new(&limits));
+            .unwrap_or_else(|| OperationHub::new_with_provider_runtime(&limits, &providers));
         let operation_error = operation_hub.persistence_error();
         let operation_status_revision = operation_hub.status_revision();
         let mut this = Self {
@@ -1238,7 +1270,7 @@ impl MusheenApp {
             pins,
             catalog_binding,
             limits,
-            store: Arc::new(LocalStore::new()),
+            store: providers.store(),
             shell: crate::ShellModel::new(settings.as_ref().is_some_and(|settings| {
                 settings.value("layout.info_pane").as_deref() == Some("true")
             })),
@@ -4081,6 +4113,7 @@ impl MusheenApp {
                     MusheenApp::new_with_navigation(
                         detached,
                         Some(binding),
+                        None,
                         ResourceLimits::default(),
                         true,
                         cx,
@@ -7712,6 +7745,10 @@ fn default_sidebar_model(pins: PinStore) -> SidebarModel {
             StorePath::from_unix_path("/"),
         )],
     );
+    model.set_section_items(
+        SidebarSectionKind::Network,
+        [SidebarEntry::new("Network", network_root_path())],
+    );
     model
 }
 
@@ -7814,6 +7851,7 @@ fn column_label(column: ColumnKey) -> &'static str {
 mod tests {
     use super::*;
     use crate::Locale;
+    use crate::providers::{ProviderAdapter, ProviderRuntime};
     use crate::search::SearchState;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AnyWindowHandle, Modifiers, MouseButton, TestAppContext, VisualTestContext};
@@ -8380,17 +8418,124 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct OpaqueTransferRoute {
+    struct FixtureProviderStore {
         provider: ProviderId,
+        items: HashMap<StorePath, StoreItem>,
+        tags_supported: bool,
+    }
+
+    impl FixtureProviderStore {
+        fn new(provider: ProviderId, items: impl IntoIterator<Item = StoreItem>) -> Self {
+            Self {
+                provider,
+                items: items
+                    .into_iter()
+                    .map(|item| (item.path().clone(), item))
+                    .collect(),
+                tags_supported: true,
+            }
+        }
+
+        fn without_tags(mut self) -> Self {
+            self.tags_supported = false;
+            self
+        }
+    }
+
+    impl Store for FixtureProviderStore {
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider
+        }
+
+        fn capabilities(&self, _location: &StorePath) -> CapabilityMatrix {
+            let tags_supported = self.tags_supported;
+            CapabilityMatrix::new(move |kind| {
+                if kind == CapabilityKind::Tags && tags_supported {
+                    CapabilityState::Supported
+                } else {
+                    CapabilityState::Unsupported(CapabilityReason::new("fixture provider").unwrap())
+                }
+            })
+        }
+
+        fn resolve_item(&self, path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+            Ok(self.items.get(path).cloned())
+        }
+
+        fn read_directory<'a>(
+            &'a self,
+            _location: &'a StorePath,
+            request: PageRequest,
+            cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Page<StoreItem>, StoreError>> {
+            Box::pin(async move {
+                cancellation.check()?;
+                Page::try_new(
+                    &request,
+                    Vec::new(),
+                    None,
+                    musheen_core::TotalHint::Exact(0),
+                )
+            })
+        }
+
+        fn watch_directory<'a>(
+            &'a self,
+            _location: &'a StorePath,
+            _cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Box<dyn DirectoryWatch>, StoreError>> {
+            Box::pin(async {
+                Err(StoreError::unsupported(
+                    "watch_directory",
+                    "fixture provider",
+                ))
+            })
+        }
+
+        fn validate_mutation(&self, request: &MutationRequest) -> Result<(), StoreError> {
+            Err(request.unsupported("fixture provider"))
+        }
+
+        fn mutate<'a>(
+            &'a self,
+            request: MutationRequest,
+            _cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move { Err(request.unsupported("fixture provider")) })
+        }
+    }
+
+    struct FixtureProviderAdapter {
+        store: Arc<FixtureProviderStore>,
+        routes: Vec<Arc<dyn ProviderTransferRoute>>,
+    }
+
+    impl ProviderAdapter for FixtureProviderAdapter {
+        fn store(&self) -> Arc<dyn Store> {
+            self.store.clone()
+        }
+
+        fn transfer_routes(&self) -> Vec<Arc<dyn ProviderTransferRoute>> {
+            self.routes.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixtureTransferRoute {
+        source_provider: ProviderId,
+        destination_provider: ProviderId,
         expected_source: CommandTargetRef,
         target_directory: StorePath,
         completed: CommandTargetRef,
     }
 
-    impl ProviderTransferRoute for OpaqueTransferRoute {
-        fn provider_id(&self) -> &ProviderId {
-            &self.provider
+    impl ProviderTransferRoute for FixtureTransferRoute {
+        fn source_provider_id(&self) -> &ProviderId {
+            &self.source_provider
+        }
+
+        fn destination_provider_id(&self) -> &ProviderId {
+            &self.destination_provider
         }
 
         fn plan_destination(
@@ -8409,7 +8554,7 @@ mod tests {
 
         fn provider_snapshot(&self, _location: &StorePath) -> ProviderSnapshot {
             ProviderSnapshot::new(
-                self.provider.clone(),
+                self.destination_provider.clone(),
                 CapabilityMatrix::new(|_| CapabilityState::Supported),
                 ProviderLimits::default(),
             )
@@ -8550,6 +8695,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_preserves_a_live_opaque_session_location() {
+        let provider = ProviderId::new("fixture.session").unwrap();
+        let expected = StorePath::from_provider_key(provider.clone(), b"saved".to_vec()).unwrap();
+        let saved_item = StoreItem::new(
+            ItemId::new(provider.clone(), b"saved-id".to_vec()).unwrap(),
+            expected.clone(),
+            DisplayPath::new("Saved"),
+            ItemKind::Directory,
+            None,
+        );
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(FixtureProviderStore::new(provider, [saved_item])),
+                routes: Vec::new(),
+            }))
+            .unwrap()
+            .build()
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(temporary.path().join("session.json"));
+        store
+            .save(&WindowSession::new(expected.clone()).to_json().unwrap())
+            .unwrap();
+
+        let restored = restore_application_session(
+            &store,
+            StorePath::from_unix_path("/fallback"),
+            |location| providers.location_exists(location),
+        )
+        .expect("the routed provider keeps its live session target");
+
+        assert_eq!(restored.windows()[0].focused_tab().location(), &expected);
+    }
+
+    #[test]
     fn saving_one_window_preserves_every_other_window() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
@@ -8569,6 +8749,7 @@ mod tests {
             window_id: first_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
             catalog: CatalogBinding::in_memory(),
+            providers: ProviderRuntime::for_current_user(),
         };
 
         let prepared = binding
@@ -8609,6 +8790,7 @@ mod tests {
             window_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
             catalog: CatalogBinding::in_memory(),
+            providers: ProviderRuntime::for_current_user(),
         };
 
         let detached = binding
@@ -8638,6 +8820,7 @@ mod tests {
             window_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
             catalog: CatalogBinding::in_memory(),
+            providers: ProviderRuntime::for_current_user(),
         };
         let older = binding
             .prepare_save(WindowSession::new(StorePath::from_unix_path("/older")))
@@ -10912,7 +11095,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn submitted_provider_move_returns_exact_opaque_target_to_catalog(
+    async fn production_provider_bootstrap_routes_local_sources_and_unsupported_tags(
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
@@ -10969,11 +11152,51 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let local_provider = local.provider_id().clone();
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(FixtureProviderStore::new(supported_provider.clone(), [])),
+                routes: vec![Arc::new(FixtureTransferRoute {
+                    source_provider: local_provider.clone(),
+                    destination_provider: supported_provider.clone(),
+                    expected_source: CommandTargetRef::new(
+                        supported_source.id().clone(),
+                        supported_source.path().clone(),
+                    )
+                    .unwrap(),
+                    target_directory: supported_directory.clone(),
+                    completed: supported_target.clone(),
+                })],
+            }))
+            .unwrap()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(
+                    FixtureProviderStore::new(unsupported_provider.clone(), []).without_tags(),
+                ),
+                routes: vec![Arc::new(FixtureTransferRoute {
+                    source_provider: local_provider,
+                    destination_provider: unsupported_provider.clone(),
+                    expected_source: CommandTargetRef::new(
+                        unsupported_source.id().clone(),
+                        unsupported_source.path().clone(),
+                    )
+                    .unwrap(),
+                    target_directory: unsupported_directory.clone(),
+                    completed: unsupported_target.clone(),
+                })],
+            }))
+            .unwrap()
+            .build()
+            .unwrap();
 
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let view = cx.new(|cx| {
-                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+                MusheenApp::new_with_provider_runtime(
+                    temporary.path().to_path_buf(),
+                    providers.clone(),
+                    cx,
+                )
             });
             app = Some(view.clone());
             Root::new(view, window, cx)
@@ -10985,7 +11208,6 @@ mod tests {
         .await;
 
         app.update(cx, |state, cx| {
-            state.store = Arc::new(ImmediateSearchStore::new());
             for (source, path) in [
                 (&supported_source, &supported_source_path),
                 (&unsupported_source, &unsupported_source_path),
@@ -10995,33 +11217,10 @@ mod tests {
                     .assign_tag(source.id(), path, &local.capabilities(path), "move")
                     .unwrap();
             }
-            for (provider, source, directory, completed) in [
-                (
-                    supported_provider,
-                    supported_source.clone(),
-                    supported_directory.clone(),
-                    supported_target.clone(),
-                ),
-                (
-                    unsupported_provider,
-                    unsupported_source.clone(),
-                    unsupported_directory.clone(),
-                    unsupported_target.clone(),
-                ),
+            for (source, directory) in [
+                (supported_source.clone(), supported_directory.clone()),
+                (unsupported_source.clone(), unsupported_directory.clone()),
             ] {
-                state
-                    .operation_hub
-                    .register_provider_transfer_route(Arc::new(OpaqueTransferRoute {
-                        provider,
-                        expected_source: CommandTargetRef::new(
-                            source.id().clone(),
-                            source.path().clone(),
-                        )
-                        .unwrap(),
-                        target_directory: directory.clone(),
-                        completed,
-                    }))
-                    .unwrap();
                 state.submit_reviewed_transfer(
                     FileDragPayload::with_expected_identities(
                         vec![source.path().clone()],
@@ -11074,17 +11273,114 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn provider_opaque_target_opens_metadata_properties_with_tags(cx: &mut TestAppContext) {
+    async fn production_provider_bootstrap_routes_remote_sources_in_every_direction(
+        cx: &mut TestAppContext,
+    ) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
         });
         let temporary = tempfile::tempdir().unwrap();
-        filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
+        let local_destination = temporary.path().join("from-remote");
+        filesystem::write(&local_destination, b"completed").unwrap();
+        let local = LocalStore::new();
+        let local_destination = StorePath::from_unix_path(local_destination.into_os_string());
+        let local_completed = local.resolve_item(&local_destination).unwrap().unwrap();
+        let remote_a = ProviderId::new("remote-a").unwrap();
+        let remote_b = ProviderId::new("remote-b").unwrap();
+        let item = |identity: &[u8], path: &[u8]| {
+            StoreItem::new(
+                ItemId::new(remote_a.clone(), identity.to_vec()).unwrap(),
+                StorePath::from_provider_key(remote_a.clone(), path.to_vec()).unwrap(),
+                DisplayPath::new(String::from_utf8_lossy(path).into_owned()),
+                ItemKind::RegularFile,
+                Some(1),
+            )
+        };
+        let to_local = item(b"to-local", b"share/to-local");
+        let to_remote = item(b"to-remote", b"share/to-remote");
+        let same_remote = item(b"same-remote", b"share/same-remote");
+        let remote_b_completed = CommandTargetRef::new(
+            ItemId::new(remote_b.clone(), b"completed-b".to_vec()).unwrap(),
+            StorePath::from_provider_key(remote_b.clone(), b"share/exact-b".to_vec()).unwrap(),
+        )
+        .unwrap();
+        let same_remote_completed = CommandTargetRef::new(
+            ItemId::new(remote_a.clone(), b"completed-a".to_vec()).unwrap(),
+            StorePath::from_provider_key(remote_a.clone(), b"share/exact-a".to_vec()).unwrap(),
+        )
+        .unwrap();
+        let routes: Vec<Arc<dyn ProviderTransferRoute>> = vec![
+            Arc::new(FixtureTransferRoute {
+                source_provider: remote_a.clone(),
+                destination_provider: local.provider_id().clone(),
+                expected_source: CommandTargetRef::new(
+                    to_local.id().clone(),
+                    to_local.path().clone(),
+                )
+                .unwrap(),
+                target_directory: local_destination.clone(),
+                completed: CommandTargetRef::new(
+                    local_completed.id().clone(),
+                    local_completed.path().clone(),
+                )
+                .unwrap(),
+            }),
+            Arc::new(FixtureTransferRoute {
+                source_provider: remote_a.clone(),
+                destination_provider: remote_b.clone(),
+                expected_source: CommandTargetRef::new(
+                    to_remote.id().clone(),
+                    to_remote.path().clone(),
+                )
+                .unwrap(),
+                target_directory: StorePath::from_provider_key(
+                    remote_b.clone(),
+                    b"share/b".to_vec(),
+                )
+                .unwrap(),
+                completed: remote_b_completed.clone(),
+            }),
+            Arc::new(FixtureTransferRoute {
+                source_provider: remote_a.clone(),
+                destination_provider: remote_a.clone(),
+                expected_source: CommandTargetRef::new(
+                    same_remote.id().clone(),
+                    same_remote.path().clone(),
+                )
+                .unwrap(),
+                target_directory: StorePath::from_provider_key(
+                    remote_a.clone(),
+                    b"share/a".to_vec(),
+                )
+                .unwrap(),
+                completed: same_remote_completed.clone(),
+            }),
+        ];
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(FixtureProviderStore::new(
+                    remote_a.clone(),
+                    [to_local.clone(), to_remote.clone(), same_remote.clone()],
+                )),
+                routes,
+            }))
+            .unwrap()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(FixtureProviderStore::new(remote_b.clone(), [])),
+                routes: Vec::new(),
+            }))
+            .unwrap()
+            .build()
+            .unwrap();
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let view = cx.new(|cx| {
-                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+                MusheenApp::new_with_provider_runtime(
+                    temporary.path().to_path_buf(),
+                    providers.clone(),
+                    cx,
+                )
             });
             app = Some(view.clone());
             Root::new(view, window, cx)
@@ -11094,16 +11390,124 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
+        app.update(cx, |state, cx| {
+            assert_eq!(
+                state.store.resolve_item(to_local.path()).unwrap().unwrap(),
+                to_local
+            );
+            for source in [&to_local, &to_remote, &same_remote] {
+                state
+                    .catalog_binding
+                    .assign_tag(
+                        source.id(),
+                        source.path(),
+                        &state.store.capabilities(source.path()),
+                        "move",
+                    )
+                    .unwrap();
+            }
+            for (source, destination) in [
+                (&to_local, local_destination.clone()),
+                (
+                    &to_remote,
+                    StorePath::from_provider_key(remote_b.clone(), b"share/b".to_vec()).unwrap(),
+                ),
+                (
+                    &same_remote,
+                    StorePath::from_provider_key(remote_a.clone(), b"share/a".to_vec()).unwrap(),
+                ),
+            ] {
+                state.submit_reviewed_transfer(
+                    FileDragPayload::with_expected_identities(
+                        vec![source.path().clone()],
+                        vec![source.id().clone()],
+                        DropAction::Move,
+                    )
+                    .unwrap(),
+                    destination,
+                    cx,
+                );
+            }
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).pending_catalog_moves.is_empty()
+        })
+        .await;
+        app.update(cx, |state, _| {
+            for (source, destination) in [
+                (&to_local, local_completed.id()),
+                (&to_remote, remote_b_completed.id()),
+                (&same_remote, same_remote_completed.id()),
+            ] {
+                assert!(
+                    state
+                        .catalog_binding
+                        .tags_for_identity(source.id())
+                        .is_empty()
+                );
+                assert_eq!(
+                    state.catalog_binding.tags_for_identity(destination),
+                    [Box::<str>::from("move")].into_iter().collect()
+                );
+            }
+            assert!(
+                state.operation_error.is_none(),
+                "{:?}",
+                state.operation_error
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn provider_opaque_target_opens_metadata_properties_with_tags(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
         let provider = ProviderId::new("remote").unwrap();
         let target = CommandTargetRef::new(
             ItemId::new(provider.clone(), b"stable-object".to_vec()).unwrap(),
-            StorePath::from_provider_key(provider, b"share/object".to_vec()).unwrap(),
+            StorePath::from_provider_key(provider.clone(), b"share/object".to_vec()).unwrap(),
         )
         .unwrap();
-
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(FixtureProviderStore::new(
+                    provider,
+                    [StoreItem::new(
+                        target.id().clone(),
+                        target.path().clone(),
+                        DisplayPath::new("object"),
+                        ItemKind::RegularFile,
+                        Some(1),
+                    )],
+                )),
+                routes: Vec::new(),
+            }))
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_provider_runtime(
+                    temporary.path().to_path_buf(),
+                    providers.clone(),
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
         cx.update_window(handle.into(), |_, _, cx| {
             app.update(cx, |state, cx| {
-                state.store = Arc::new(ImmediateSearchStore::new());
                 state.navigate(home_store_path(), true, cx);
                 state.open_properties_targets(&[target], PropertiesPage::Tags, cx);
                 assert!(
@@ -11179,10 +11583,40 @@ mod tests {
         });
         let temporary = tempfile::tempdir().unwrap();
         filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
+        let provider = ProviderId::new("remote-no-tags").unwrap();
+        let target = CommandTargetRef::new(
+            ItemId::new(provider.clone(), b"stable-object".to_vec()).unwrap(),
+            StorePath::from_provider_key(provider.clone(), b"share/object".to_vec()).unwrap(),
+        )
+        .unwrap();
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(
+                    FixtureProviderStore::new(
+                        provider,
+                        [StoreItem::new(
+                            target.id().clone(),
+                            target.path().clone(),
+                            DisplayPath::new("object"),
+                            ItemKind::RegularFile,
+                            Some(1),
+                        )],
+                    )
+                    .without_tags(),
+                ),
+                routes: Vec::new(),
+            }))
+            .unwrap()
+            .build()
+            .unwrap();
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let view = cx.new(|cx| {
-                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+                MusheenApp::new_with_provider_runtime(
+                    temporary.path().to_path_buf(),
+                    providers.clone(),
+                    cx,
+                )
             });
             app = Some(view.clone());
             Root::new(view, window, cx)
@@ -11192,15 +11626,8 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
-        let provider = ProviderId::new("remote-no-tags").unwrap();
-        let target = CommandTargetRef::new(
-            ItemId::new(provider.clone(), b"stable-object".to_vec()).unwrap(),
-            StorePath::from_provider_key(provider, b"share/object".to_vec()).unwrap(),
-        )
-        .unwrap();
         cx.update_window(handle.into(), |_, _, cx| {
             app.update(cx, |state, cx| {
-                state.store = Arc::new(ImmediateSearchStore::new());
                 state.open_properties_targets(&[target], PropertiesPage::Tags, cx);
             });
         })
@@ -11227,5 +11654,55 @@ mod tests {
             assert!(window.try_find("provider-properties-tag-input").is_none());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn shipping_bootstrap_registers_the_reachable_network_provider(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let root = network_root_path();
+        let store = app.update(cx, |state, _| {
+            let item = state.store.resolve_item(&root).unwrap().unwrap();
+            assert_eq!(item.path(), &root);
+            assert_eq!(item.display_name().as_str(), "Network");
+            let tab = state.navigation.focused_tab().id();
+            assert!(
+                state
+                    .sidebars
+                    .get(&tab)
+                    .unwrap()
+                    .sections()
+                    .iter()
+                    .any(|section| section.kind() == SidebarSectionKind::Network
+                        && section.items()[0].location() == &root)
+            );
+            Arc::clone(&state.store)
+        });
+        let page = store
+            .read_directory(
+                &root,
+                PageRequest::first(&ResourceLimits::default()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(page.items().is_empty());
     }
 }

@@ -4,6 +4,7 @@ pub use musheen_local::{
     ReadyLocalOperation, TransferOutcome,
 };
 
+use crate::providers::ProviderRuntime;
 use crate::{RecoveryAction, StatusCenterError, StatusCenterModel};
 use gpui_kit::{AppContext, Context};
 use musheen_core::{ResourceLimits, StorePath};
@@ -26,17 +27,6 @@ pub struct OperationHub {
 }
 
 impl OperationHub {
-    pub fn register_provider_transfer_route(
-        &self,
-        route: Arc<dyn ProviderTransferRoute>,
-    ) -> Result<(), OperationHubError> {
-        self.queue
-            .lock()
-            .map_err(|_| OperationHubError::QueueLock)?
-            .register_provider_transfer_route(route);
-        Ok(())
-    }
-
     pub(crate) fn submit_custom_action(
         &self,
         context: crate::status_center::custom_actions::CustomActionContext,
@@ -80,8 +70,18 @@ impl OperationHub {
     }
     #[must_use]
     pub fn new(limits: &ResourceLimits) -> Self {
+        Self::new_with_provider_runtime(limits, &ProviderRuntime::for_current_user())
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_provider_runtime(
+        limits: &ResourceLimits,
+        providers: &ProviderRuntime,
+    ) -> Self {
+        let mut queue = LocalOperationQueue::new(limits);
+        providers.configure_queue(&mut queue);
         Self {
-            queue: Arc::new(Mutex::new(LocalOperationQueue::new(limits))),
+            queue: Arc::new(Mutex::new(queue)),
             status: Arc::new(Mutex::new(StatusCenterModel::default())),
             store: None,
             persistence_error: Arc::new(Mutex::new(None)),
@@ -92,6 +92,18 @@ impl OperationHub {
     pub fn with_status_store(
         limits: &ResourceLimits,
         store: StatusStore,
+    ) -> Result<Self, OperationHubError> {
+        Self::with_status_store_and_provider_runtime(
+            limits,
+            store,
+            &ProviderRuntime::for_current_user(),
+        )
+    }
+
+    pub(crate) fn with_status_store_and_provider_runtime(
+        limits: &ResourceLimits,
+        store: StatusStore,
+        providers: &ProviderRuntime,
     ) -> Result<Self, OperationHubError> {
         let mut status = load_status(&store)?;
         let interrupted = status.mark_unfinished_interrupted();
@@ -106,8 +118,10 @@ impl OperationHub {
                 .save(&document)
                 .map_err(|error| OperationHubError::Storage(error.to_string().into()))?;
         }
+        let mut queue = LocalOperationQueue::new(limits);
+        providers.configure_queue(&mut queue);
         Ok(Self {
-            queue: Arc::new(Mutex::new(LocalOperationQueue::new(limits))),
+            queue: Arc::new(Mutex::new(queue)),
             status: Arc::new(Mutex::new(status)),
             store: Some(store),
             persistence_error: Arc::new(Mutex::new(None)),
@@ -117,10 +131,21 @@ impl OperationHub {
 
     #[must_use]
     pub fn for_current_user(limits: &ResourceLimits) -> Self {
-        match Self::with_status_store(limits, StatusStore::for_current_user()) {
+        Self::for_current_user_with_provider_runtime(limits, &ProviderRuntime::for_current_user())
+    }
+
+    pub(crate) fn for_current_user_with_provider_runtime(
+        limits: &ResourceLimits,
+        providers: &ProviderRuntime,
+    ) -> Self {
+        match Self::with_status_store_and_provider_runtime(
+            limits,
+            StatusStore::for_current_user(),
+            providers,
+        ) {
             Ok(hub) => hub,
             Err(error) => {
-                let hub = Self::new(limits);
+                let hub = Self::new_with_provider_runtime(limits, providers);
                 if let Ok(mut persistence_error) = hub.persistence_error.lock() {
                     *persistence_error = Some(error.to_string().into());
                 }

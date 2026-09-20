@@ -192,7 +192,9 @@ impl<'a> ProviderTransferExecution<'a> {
 /// Implementations must revalidate `expected_identity` immediately before
 /// mutating the source and must return the exact completed destination target.
 pub trait ProviderTransferRoute: fmt::Debug + Send + Sync {
-    fn provider_id(&self) -> &musheen_core::ProviderId;
+    fn source_provider_id(&self) -> &musheen_core::ProviderId;
+
+    fn destination_provider_id(&self) -> &musheen_core::ProviderId;
 
     fn plan_destination(
         &self,
@@ -422,7 +424,10 @@ pub struct LocalOperationQueue {
     scheduler: Scheduler,
     operations: BTreeMap<JobId, LocalOperation>,
     failures: BTreeMap<JobId, Box<str>>,
-    provider_routes: HashMap<musheen_core::ProviderId, Arc<dyn ProviderTransferRoute>>,
+    provider_routes: HashMap<
+        (musheen_core::ProviderId, musheen_core::ProviderId),
+        Arc<dyn ProviderTransferRoute>,
+    >,
 }
 
 impl LocalOperationQueue {
@@ -437,8 +442,13 @@ impl LocalOperationQueue {
     }
 
     pub fn register_provider_transfer_route(&mut self, route: Arc<dyn ProviderTransferRoute>) {
-        self.provider_routes
-            .insert(route.provider_id().clone(), route);
+        self.provider_routes.insert(
+            (
+                route.source_provider_id().clone(),
+                route.destination_provider_id().clone(),
+            ),
+            route,
+        );
     }
 
     #[must_use]
@@ -688,13 +698,15 @@ impl LocalOperationQueue {
         payload: &FileDragPayload,
         target: &StorePath,
     ) -> Result<Vec<DropCandidate>, DropError> {
-        if let Some((provider, _)) = target.provider_key() {
-            let route = self
-                .provider_routes
-                .get(provider)
-                .cloned()
-                .ok_or_else(|| DropError::UnsupportedTarget(target.clone()))?;
-            return self.inspect_provider_drop(payload, target, route);
+        let destination_provider = path_provider_id(target);
+        let local_provider = local_provider_id();
+        if destination_provider != local_provider
+            || payload
+                .sources
+                .iter()
+                .any(|source| path_provider_id(source) != local_provider)
+        {
+            return self.inspect_provider_drop(payload, target, &destination_provider);
         }
         let target_path = writable_directory(target)?;
         let mut store = LocalStore::new();
@@ -797,7 +809,7 @@ impl LocalOperationQueue {
         &self,
         payload: &FileDragPayload,
         target: &StorePath,
-        route: Arc<dyn ProviderTransferRoute>,
+        destination_provider: &musheen_core::ProviderId,
     ) -> Result<Vec<DropCandidate>, DropError> {
         let mut sources = HashSet::with_capacity(payload.sources.len());
         let mut destinations = HashSet::with_capacity(payload.sources.len());
@@ -807,11 +819,24 @@ impl LocalOperationQueue {
                 return Err(DropError::DuplicateSource(source.clone()));
             }
             let expected_identity = payload.expected_identity(index).cloned();
+            let source_provider = expected_identity.as_ref().map_or_else(
+                || path_provider_id(source),
+                |identity| identity.provider().clone(),
+            );
+            if path_provider_id(source) != source_provider {
+                return Err(DropError::Plan(
+                    "the source identity belongs to another provider".into(),
+                ));
+            }
+            let route = self
+                .provider_routes
+                .get(&(source_provider, destination_provider.clone()))
+                .cloned()
+                .ok_or_else(|| DropError::UnsupportedTarget(target.clone()))?;
             let destination = route
                 .plan_destination(payload.action, source, target, expected_identity.as_ref())
                 .map_err(DropError::Plan)?;
-            if destination.provider_key().map(|(provider, _)| provider) != Some(route.provider_id())
-            {
+            if path_provider_id(&destination) != *route.destination_provider_id() {
                 return Err(DropError::Plan(
                     "the provider route returned a destination owned by another provider".into(),
                 ));
@@ -874,6 +899,15 @@ fn provider_snapshot(store: &LocalStore, location: &StorePath) -> ProviderSnapsh
         store.capabilities(location),
         ProviderLimits::default(),
     )
+}
+
+fn local_provider_id() -> musheen_core::ProviderId {
+    musheen_core::ProviderId::new("local").expect("the built-in local provider ID is valid")
+}
+
+fn path_provider_id(path: &StorePath) -> musheen_core::ProviderId {
+    path.provider_key()
+        .map_or_else(local_provider_id, |(provider, _)| provider.clone())
 }
 
 fn clean_absolute_path(path: &StorePath) -> Option<&Path> {

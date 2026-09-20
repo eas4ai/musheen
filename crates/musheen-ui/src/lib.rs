@@ -9,6 +9,7 @@ mod info_pane;
 pub mod menus;
 pub mod navigation;
 mod operations;
+mod providers;
 pub mod search;
 pub mod settings;
 mod shell;
