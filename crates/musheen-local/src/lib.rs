@@ -12,9 +12,9 @@ mod watch;
 
 use enumerate::EnumerationRegistry;
 use musheen_core::{
-    BoxFuture, CancellationToken, CapabilityMatrix, DirectoryWatch, MutationRequest, Page,
-    PageRequest, ProviderId, SearchCapabilities, SearchQuery, SearchStream, Store, StoreError,
-    StoreItem, StorePath,
+    BoxFuture, CancellationToken, CapabilityMatrix, CapabilityReason, CapabilityState,
+    DirectoryWatch, MutationRequest, Page, PageRequest, ProviderId, SearchCapabilities,
+    SearchQuery, SearchStream, Store, StoreError, StoreItem, StorePath,
 };
 use musheen_ops::{MetadataKind, SourceMetadata};
 use std::path::PathBuf;
@@ -85,6 +85,52 @@ impl Store for LocalStore {
 
     fn capabilities(&self, location: &StorePath) -> CapabilityMatrix {
         probe::capabilities(location)
+    }
+
+    fn resolve_item(&self, path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+        let Some(path) = path.as_unix_path() else {
+            return Ok(None);
+        };
+        match metadata::item_from_path(&self.provider, path) {
+            Ok(item) => Ok(Some(item)),
+            Err(StoreError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn location_writable(&self, path: &StorePath) -> Result<CapabilityState, StoreError> {
+        let Some(path) = path.as_unix_path() else {
+            return Ok(CapabilityState::Unknown(
+                CapabilityReason::new("this local provider path is not a Unix directory")
+                    .expect("the writable-location reason is valid"),
+            ));
+        };
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| StoreError::Io {
+            operation: "read directory access metadata",
+            kind: error.kind(),
+            path: Some(StorePath::from_unix_path(path.as_os_str())),
+            message: error.to_string().into(),
+        })?;
+        use std::os::unix::fs::PermissionsExt;
+        if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o222 == 0 {
+            return Ok(CapabilityState::Unsupported(
+                CapabilityReason::new("the destination directory is not writable")
+                    .expect("the writable-location reason is valid"),
+            ));
+        }
+        if self
+            .probe(&StorePath::from_unix_path(path.as_os_str()))?
+            .is_read_only()
+        {
+            return Ok(CapabilityState::Unsupported(
+                CapabilityReason::new("the containing mount is read-only")
+                    .expect("the writable-location reason is valid"),
+            ));
+        }
+        Ok(CapabilityState::Supported)
     }
 
     fn search_capabilities(&self, _location: &StorePath) -> SearchCapabilities {

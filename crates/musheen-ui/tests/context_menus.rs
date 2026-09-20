@@ -580,6 +580,12 @@ fn menu_accessibility_and_keyboard_follow_modal_focus_and_pseudo_locale_rules() 
     assert!(layout_menu.accessibility_tree().iter().any(|node| {
         matches!(node.role(), musheen_ui::MenuAccessibleRole::Radio) && node.name().starts_with('⟦')
     }));
+    let unchecked_hidden = layout_menu.entry("view.hidden").expect("toggle is present");
+    assert!(!unchecked_hidden.state().is_checked());
+    assert_eq!(
+        unchecked_hidden.accessible_role(),
+        musheen_ui::MenuAccessibleRole::Checkbox
+    );
 }
 
 #[test]

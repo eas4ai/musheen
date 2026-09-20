@@ -1,6 +1,6 @@
 use crate::LocalStore;
 use crate::mutation::{ResolvedTransferFailure, execute_resolved_transfer};
-use musheen_core::{DisplayPath, ResourceLimits, Store, StorePath};
+use musheen_core::{DisplayPath, ItemId, ResourceLimits, Store, StorePath};
 use musheen_ops::{
     ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest, CopySession, EventGeneration,
     JobId, JobState, MetadataChange, MetadataPlan, MetadataScope, MutationError, MutationProvider,
@@ -33,6 +33,7 @@ impl DropAction {
 pub struct FileDragPayload {
     sources: Vec<StorePath>,
     action: DropAction,
+    expected_identities: Option<Vec<ItemId>>,
 }
 
 impl FileDragPayload {
@@ -40,7 +41,27 @@ impl FileDragPayload {
         if sources.is_empty() {
             return Err(DropError::EmptySelection);
         }
-        Ok(Self { sources, action })
+        Ok(Self {
+            sources,
+            action,
+            expected_identities: None,
+        })
+    }
+
+    /// Binds a context-menu transfer to the provider identities observed when
+    /// the user opened the menu. Drag sources that lack an identity retain the
+    /// legacy path-only constructor.
+    pub fn with_expected_identities(
+        sources: Vec<StorePath>,
+        expected_identities: Vec<ItemId>,
+        action: DropAction,
+    ) -> Result<Self, DropError> {
+        if sources.len() != expected_identities.len() {
+            return Err(DropError::IdentityCountMismatch);
+        }
+        let mut payload = Self::new(sources, action)?;
+        payload.expected_identities = Some(expected_identities);
+        Ok(payload)
     }
 
     #[must_use]
@@ -52,6 +73,13 @@ impl FileDragPayload {
     pub const fn action(&self) -> DropAction {
         self.action
     }
+
+    #[must_use]
+    pub fn expected_identity(&self, index: usize) -> Option<&ItemId> {
+        self.expected_identities
+            .as_ref()
+            .and_then(|identities| identities.get(index))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +89,7 @@ enum LocalOperation {
         source: StorePath,
         destination: StorePath,
         decision: Option<ConflictDecision>,
+        expected_identity: Option<ItemId>,
     },
     Metadata(MetadataPlan),
 }
@@ -207,7 +236,24 @@ impl ReadyLocalOperation {
                 source,
                 destination,
                 decision,
+                expected_identity,
             } => {
+                if let Some(expected_identity) = expected_identity {
+                    let current = crate::metadata::item_from_path(
+                        store.provider_id(),
+                        clean_absolute_path(&source).ok_or_else(|| {
+                            LocalOperationFailure::failed(
+                                "source path is not a local absolute path",
+                            )
+                        })?,
+                    )
+                    .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+                    if current.id() != &expected_identity {
+                        return Err(LocalOperationFailure::failed(
+                            "the source identity changed before the transfer could execute",
+                        ));
+                    }
+                }
                 let request = CopyRequest::new(self.id, self.generation, source, destination);
                 if let Some(decision) = decision {
                     return execute_resolved_transfer(
@@ -483,6 +529,7 @@ impl LocalOperationQueue {
                     source: candidate.source,
                     destination: candidate.destination,
                     decision,
+                    expected_identity: candidate.expected_identity,
                 },
             ));
         }
@@ -504,7 +551,7 @@ impl LocalOperationQueue {
         let mut destinations = HashSet::with_capacity(payload.sources.len());
         let mut planned = Vec::with_capacity(payload.sources.len());
 
-        for source in &payload.sources {
+        for (index, source) in payload.sources.iter().enumerate() {
             let source_path = clean_absolute_path(source).ok_or_else(|| {
                 DropError::InvalidSource(source.clone(), "not an absolute local path".into())
             })?;
@@ -514,6 +561,16 @@ impl LocalOperationQueue {
             let metadata = fs::symlink_metadata(source_path).map_err(|error| {
                 DropError::InvalidSource(source.clone(), error.to_string().into())
             })?;
+            let expected_identity = payload.expected_identity(index).cloned();
+            if let Some(expected_identity) = expected_identity.as_ref() {
+                let current = crate::metadata::item_from_path(store.provider_id(), source_path)
+                    .map_err(|error| {
+                        DropError::InvalidSource(source.clone(), error.to_string().into())
+                    })?;
+                if current.id() != expected_identity {
+                    return Err(DropError::SourceIdentityChanged(source.clone()));
+                }
+            }
             let kind = metadata.file_type();
             if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
                 return Err(DropError::InvalidSource(
@@ -577,6 +634,7 @@ impl LocalOperationQueue {
                 source: source.clone(),
                 destination,
                 conflict,
+                expected_identity,
             });
         }
         Ok(planned)
@@ -589,6 +647,7 @@ struct DropCandidate {
     source: StorePath,
     destination: StorePath,
     conflict: Option<ConflictRecord>,
+    expected_identity: Option<ItemId>,
 }
 
 fn decision_matches_conflict(decision: &ConflictDecision, conflict: &ConflictRecord) -> bool {
@@ -651,8 +710,10 @@ fn writable_directory(target: &StorePath) -> Result<&Path, DropError> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DropError {
     EmptySelection,
+    IdentityCountMismatch,
     UnsupportedTarget(StorePath),
     InvalidSource(StorePath, Box<str>),
+    SourceIdentityChanged(StorePath),
     DuplicateSource(StorePath),
     DuplicateDestination(StorePath),
     DestinationExists(StorePath),
@@ -668,8 +729,14 @@ impl fmt::Display for DropError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptySelection => formatter.write_str("the drop contains no files"),
+            Self::IdentityCountMismatch => {
+                formatter.write_str("drop sources and identities differ")
+            }
             Self::UnsupportedTarget(_) => formatter.write_str("the drop target is not writable"),
             Self::InvalidSource(_, reason) => write!(formatter, "invalid drop source: {reason}"),
+            Self::SourceIdentityChanged(_) => {
+                formatter.write_str("the drop source identity changed before it could be queued")
+            }
             Self::DuplicateSource(_) => formatter.write_str("the drop repeats a source"),
             Self::DuplicateDestination(_) => {
                 formatter.write_str("multiple sources resolve to the same destination")

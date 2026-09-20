@@ -1,5 +1,6 @@
-use musheen_core::{ResourceLimits, StorePath};
+use musheen_core::{ResourceLimits, Store, StorePath};
 use musheen_desktop::PropertySnapshot;
+use musheen_local::LocalStore;
 use musheen_ops::{
     ApplyScope, ConflictChoice, ConflictDecision, ConflictDecisionJournal, ConflictPolicies,
     JobState, MutationError,
@@ -79,6 +80,74 @@ fn sidebar_and_content_drops_use_one_copy_move_queue() {
         b"move me"
     );
     assert!(!move_source.exists());
+}
+
+#[test]
+fn identity_bound_transfer_rejects_a_same_path_replacement_before_queueing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("captured.txt");
+    let destination = temporary.path().join("destination");
+    fs::write(&source, b"captured").unwrap();
+    fs::create_dir(&destination).unwrap();
+    let source_path = StorePath::from_unix_path(source.as_os_str());
+    let captured = LocalStore::new()
+        .resolve_item(&source_path)
+        .unwrap()
+        .expect("source exists")
+        .id()
+        .clone();
+    let replacement = temporary.path().join("replacement.txt");
+    fs::write(&replacement, b"replacement").unwrap();
+    fs::rename(&replacement, &source).unwrap();
+
+    let payload = FileDragPayload::with_expected_identities(
+        vec![source_path.clone()],
+        vec![captured],
+        DropAction::Copy,
+    )
+    .unwrap();
+    let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+    assert!(matches!(
+        queue.submit_drop(payload, StorePath::from_unix_path(destination.as_os_str())),
+        Err(DropError::SourceIdentityChanged(path)) if path == source_path
+    ));
+    assert!(!destination.join("captured.txt").exists());
+}
+
+#[test]
+fn identity_bound_transfer_rechecks_the_source_at_execution() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("captured.txt");
+    let destination = temporary.path().join("destination");
+    fs::write(&source, b"captured").unwrap();
+    fs::create_dir(&destination).unwrap();
+    let source_path = StorePath::from_unix_path(source.as_os_str());
+    let captured = LocalStore::new()
+        .resolve_item(&source_path)
+        .unwrap()
+        .expect("source exists")
+        .id()
+        .clone();
+    let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+    queue
+        .submit_drop(
+            FileDragPayload::with_expected_identities(
+                vec![source_path],
+                vec![captured],
+                DropAction::Copy,
+            )
+            .unwrap(),
+            StorePath::from_unix_path(destination.as_os_str()),
+        )
+        .unwrap();
+    let replacement = temporary.path().join("replacement.txt");
+    fs::write(&replacement, b"replacement").unwrap();
+    fs::rename(&replacement, &source).unwrap();
+
+    let ready = queue.start_ready().unwrap();
+    assert_eq!(ready.len(), 1);
+    assert!(ready.into_iter().next().unwrap().execute().is_err());
+    assert!(!destination.join("captured.txt").exists());
 }
 
 #[test]

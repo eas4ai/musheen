@@ -234,6 +234,13 @@ fn is_layout_choice(command_id: Option<&str>) -> bool {
     )
 }
 
+fn is_toggle_command(command_id: Option<&str>) -> bool {
+    matches!(
+        command_id,
+        Some("view.directories_first" | "view.hidden" | "view.sidebar" | "view.info")
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct MenuEntry {
     kind: MenuEntryKind,
@@ -289,7 +296,7 @@ impl MenuEntry {
             MenuAccessibleRole::Submenu
         } else if is_layout_choice(self.command_id()) {
             MenuAccessibleRole::Radio
-        } else if self.state.is_checked() {
+        } else if is_toggle_command(self.command_id()) {
             MenuAccessibleRole::Checkbox
         } else {
             MenuAccessibleRole::MenuItem

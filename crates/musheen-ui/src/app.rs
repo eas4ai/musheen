@@ -42,12 +42,12 @@ use gpui_kit::{
     WindowOptions, div, img, px, size, uniform_list,
 };
 use musheen_core::{
-    CancellationToken, CapabilityKind, CapabilityReason, CapabilityState, CommandAction,
-    CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters, CommandTarget,
-    CommandTargetRef, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page, ProviderActionMatrix,
-    ProviderId, ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch,
-    SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem,
-    StorePath, WatchEvent,
+    CancellationToken, CapabilityReason, CapabilityState, CommandAction, CommandContext,
+    CommandDispatchError, CommandDispatcher, CommandParameters, CommandTarget, CommandTargetRef,
+    DirectoryWatch, DisplayPath, ItemId, ItemKind, Page, ProviderActionMatrix, ProviderId,
+    ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch, SearchCompletion,
+    SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath,
+    WatchEvent,
 };
 use musheen_desktop::{
     ConflictDecisionStore, MimeDetector, PreviewDocument, SessionStore, ThumbnailCache,
@@ -130,6 +130,8 @@ gpui_kit::actions!(
         ToggleSidebarShortcut,
         OpenPropertiesShortcut,
         OpenContextMenuShortcut,
+        FocusNextDirectoryItem,
+        FocusPreviousDirectoryItem,
     ]
 );
 
@@ -162,6 +164,8 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("alt-enter", OpenPropertiesShortcut, None),
         KeyBinding::new("shift-f10", OpenContextMenuShortcut, None),
         KeyBinding::new("menu", OpenContextMenuShortcut, None),
+        KeyBinding::new("down", FocusNextDirectoryItem, Some("DirectoryContent")),
+        KeyBinding::new("up", FocusPreviousDirectoryItem, Some("DirectoryContent")),
     ]);
 }
 
@@ -307,6 +311,13 @@ struct PendingDrop {
 struct ContextDestinationChoice {
     label: String,
     location: StorePath,
+}
+
+#[derive(Clone)]
+struct ContextDialogWindow {
+    id: WindowId,
+    origin_tab: TabId,
+    focused_item: Option<ItemId>,
 }
 
 #[derive(Clone)]
@@ -906,7 +917,7 @@ struct MusheenApp {
     /// Dialog windows are tracked by their GPUI identity. The close observer
     /// clears only its own immutable pending workflow; opening a second review
     /// cannot overwrite the first one's command or targets.
-    context_dialog_windows: Vec<WindowId>,
+    context_dialog_windows: Vec<ContextDialogWindow>,
     context_dialog_close_subscription: Option<Subscription>,
     conflict_subscriptions: Vec<Subscription>,
 }
@@ -1397,6 +1408,11 @@ impl MusheenApp {
     }
 
     fn dispatch_command(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        if !self.context_dialog_windows.is_empty() {
+            // Context reviews are guarded modals: browser shortcuts must not
+            // reach a background pane while an immutable decision is open.
+            return;
+        }
         let Some(action) = self
             .shell
             .commands()
@@ -1793,6 +1809,35 @@ impl MusheenApp {
         cx.notify();
     }
 
+    fn focus_directory_item(&mut self, tab_id: TabId, id: Option<ItemId>, cx: &mut Context<Self>) {
+        if let Some(directory) = self.directories.get_mut(&tab_id) {
+            directory.view_mut().focus_item(id);
+            cx.notify();
+        }
+    }
+
+    fn move_directory_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        let Some(directory) = self.directories.get_mut(&tab_id) else {
+            return;
+        };
+        let items = directory.view().visible_items();
+        if items.is_empty() {
+            directory.view_mut().focus_item(None);
+            return;
+        }
+        let current = directory
+            .view()
+            .focused_item_id()
+            .and_then(|id| items.iter().position(|item| item.id() == id));
+        let index = current
+            .map(|index| (index as isize + delta).clamp(0, items.len() as isize - 1) as usize)
+            .unwrap_or_else(|| if delta < 0 { items.len() - 1 } else { 0 });
+        let next = items[index].id().clone();
+        directory.view_mut().focus_item(Some(next));
+        cx.notify();
+    }
+
     /// Builds a menu request from the pane that received the pointer event.
     /// Capturing the pane's tab id here prevents the other pane's selection
     /// from becoming an accidental target after focus changes.
@@ -1832,6 +1877,7 @@ impl MusheenApp {
         {
             self.select_item(tab_id, clicked, cx);
         }
+        self.focus_directory_item(tab_id, Some(clicked_target.id().clone()), cx);
         self.compose_context_menu(tab_id, MenuTarget::Item, prepared.selection().to_vec())
     }
 
@@ -1840,6 +1886,9 @@ impl MusheenApp {
     }
 
     fn open_keyboard_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
         let tab_id = self.navigation.focused_tab().id();
         let focused = self.directories.get(&tab_id).and_then(|directory| {
             directory
@@ -1952,10 +2001,21 @@ impl MusheenApp {
             };
         let capabilities = self.store.capabilities(&command_location);
         let is_local = location.as_unix_path().is_some();
-        let writable = matches!(
-            capabilities.get(CapabilityKind::AtomicRename),
-            CapabilityState::Supported
-        );
+        let writable_state = self
+            .store
+            .location_writable(&command_location)
+            .unwrap_or_else(|error| {
+                CapabilityState::Unknown(
+                    CapabilityReason::new(format!(
+                        "the provider could not verify directory access: {error}"
+                    ))
+                    .expect("the writable-location failure is visible"),
+                )
+            });
+        let writable = matches!(writable_state, CapabilityState::Supported);
+        let writable_reason = writable_state
+            .reason()
+            .unwrap_or("the provider did not report whether this location is writable");
         let unsupported_provider_action = CapabilityState::Unsupported(
             CapabilityReason::new("the active provider has no desktop action backend")
                 .expect("the provider-action reason is valid"),
@@ -1970,12 +2030,11 @@ impl MusheenApp {
             } else {
                 musheen_core::ResolvedDestination::read_only(
                     command_location.clone(),
-                    "the destination provider did not report a writable atomic operation path",
+                    writable_reason,
                 )
             }),
             mutation_is_supported: writable,
-            mutation_reason: (!writable)
-                .then_some("the provider did not report a writable atomic operation path".into()),
+            mutation_reason: (!writable).then(|| writable_reason.into()),
             is_local,
             has_dot_name_semantics: is_local,
             target_is_hidden: selected_item.is_some_and(|item| is_hidden_path(item.path())),
@@ -2184,8 +2243,23 @@ impl MusheenApp {
         cx.notify();
     }
 
-    fn track_context_dialog_window(&mut self, window_id: WindowId, cx: &mut Context<Self>) {
-        self.context_dialog_windows.push(window_id);
+    fn track_context_dialog_window(
+        &mut self,
+        window_id: WindowId,
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let origin_tab = origin_tab.unwrap_or_else(|| self.navigation.focused_tab().id());
+        let focused_item = self
+            .directories
+            .get(&origin_tab)
+            .and_then(|directory| directory.view().focused_item_id())
+            .cloned();
+        self.context_dialog_windows.push(ContextDialogWindow {
+            id: window_id,
+            origin_tab,
+            focused_item,
+        });
         if self.context_dialog_close_subscription.is_some() {
             return;
         }
@@ -2195,12 +2269,13 @@ impl MusheenApp {
                 if let Some(index) = this
                     .context_dialog_windows
                     .iter()
-                    .position(|window_id| *window_id == closed)
+                    .position(|dialog| dialog.id == closed)
                 {
-                    this.context_dialog_windows.remove(index);
+                    let dialog = this.context_dialog_windows.remove(index);
                     // A window-manager close is exactly a cancellation. It
                     // does not retain a mutable pending command or dispatch.
                     this.pending_content_focus = true;
+                    this.focus_directory_item(dialog.origin_tab, dialog.focused_item, cx);
                     cx.notify();
                 }
             });
@@ -2257,7 +2332,7 @@ impl MusheenApp {
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("Musheen could not open a context destination dialog");
-        self.track_context_dialog_window(dialog_window.window_id(), cx);
+        self.track_context_dialog_window(dialog_window.window_id(), pending.origin_tab(), cx);
         let dialog = dialog.expect("the destination dialog constructs its view");
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
             ContextDestinationEvent::Chosen(destination) => {
@@ -2300,7 +2375,7 @@ impl MusheenApp {
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("Musheen could not open a context review dialog");
-        self.track_context_dialog_window(dialog_window.window_id(), cx);
+        self.track_context_dialog_window(dialog_window.window_id(), pending.origin_tab(), cx);
         let dialog = dialog.expect("the context review dialog constructs its view");
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
             ContextReviewEvent::Confirmed => this.confirm_context_review(invocation.clone(), cx),
@@ -2358,8 +2433,9 @@ impl MusheenApp {
                 } else {
                     DropAction::Move
                 };
-                match FileDragPayload::new(
+                match FileDragPayload::with_expected_identities(
                     targets.iter().map(|target| target.path().clone()).collect(),
+                    targets.iter().map(|target| target.id().clone()).collect(),
                     drop_action,
                 ) {
                     Ok(payload) => self.submit_file_drop(payload, destination.clone(), cx),
@@ -2370,9 +2446,19 @@ impl MusheenApp {
                 }
             }
             (CommandAction::OpenProperties, CommandParameters::Targets(targets)) => {
+                if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+                    self.operation_error = Some(error);
+                    cx.notify();
+                    return;
+                }
                 self.open_properties_targets(targets, PropertiesPage::General, cx);
             }
             (CommandAction::Permissions, CommandParameters::Targets(targets)) => {
+                if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+                    self.operation_error = Some(error);
+                    cx.notify();
+                    return;
+                }
                 self.open_properties_targets(targets, PropertiesPage::Permissions, cx);
             }
             (CommandAction::DirectoryProperties, CommandParameters::Location(location)) => {
@@ -2426,16 +2512,26 @@ impl MusheenApp {
             return Err("the originating pane is no longer available".into());
         };
         targets.iter().try_for_each(|target| {
-            directory
+            let cached = directory
                 .view()
                 .item(target.id())
                 .filter(|item| item.path() == target.path())
-                .map(|_| ())
                 .ok_or_else(|| {
                     Box::<str>::from(
                         "the selected item changed or no longer exists; reopen the context menu",
                     )
-                })
+                })?;
+            let current = self.store.resolve_item(target.path()).map_err(|error| {
+                Box::<str>::from(format!(
+                    "the provider could not verify the selected item before this operation: {error}"
+                ))
+            })?;
+            match current {
+                Some(item) if item.id() == cached.id() && item.path() == target.path() => Ok(()),
+                _ => Err(Box::<str>::from(
+                    "the selected item changed or no longer exists; reopen the context menu",
+                )),
+            }
         })
     }
 
@@ -4006,6 +4102,7 @@ impl MusheenApp {
         div()
             .id(content_id)
             .test_support()
+            .key_context("DirectoryContent")
             .role(Role::Main)
             .aria_label("Folder contents")
             .tab_index(0)
@@ -4024,7 +4121,8 @@ impl MusheenApp {
             .child(body)
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, _, _| {
+                cx.listener(move |this, _, _, cx| {
+                    this.focus_directory_item(tab_id, None, cx);
                     if this.pending_context_menu.is_none() {
                         this.pending_context_menu = Some(this.compose_context_menu(
                             tab_id,
@@ -5242,6 +5340,7 @@ impl MusheenApp {
             SharedString::from(format!("directory-item-{}-{}", spec.pane_index, spec.index));
         let tab_id = spec.tab_id;
         let stable_id = spec.id.clone();
+        let focused_id = spec.id.clone();
         let context_menu_id = spec.id.clone();
         let drag_payload = self.drag_payload(&spec);
         let is_drop_target = spec.kind == ItemKind::Directory;
@@ -5366,6 +5465,7 @@ impl MusheenApp {
         };
         item.on_click(cx.listener(move |this, _, _, cx| {
             this.select_item(tab_id, stable_id.clone(), cx);
+            this.focus_directory_item(tab_id, Some(focused_id.clone()), cx);
         }))
         .on_mouse_down(
             MouseButton::Right,
@@ -5868,6 +5968,12 @@ impl Render for MusheenApp {
                     this.open_keyboard_context_menu(window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &FocusNextDirectoryItem, _, cx| {
+                this.move_directory_focus(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusPreviousDirectoryItem, _, cx| {
+                this.move_directory_focus(-1, cx);
+            }))
             .on_action(cx.listener(|this, _: &Escape, _, cx| {
                 this.handle_escape(cx);
             }))
@@ -6744,6 +6850,21 @@ mod tests {
         .await;
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            window.press("down", cx);
+            assert!(
+                app.read(cx)
+                    .focused_directory()
+                    .view()
+                    .selected_ids()
+                    .is_empty()
+            );
+            assert!(
+                app.read(cx)
+                    .focused_directory()
+                    .view()
+                    .focused_item_id()
+                    .is_some()
+            );
             window.press("shift-f10", cx);
             window.render_frame(cx);
             assert!(window.find("keyboard-context-menu").visible());
@@ -6795,11 +6916,21 @@ mod tests {
                 .expect("context modal opens");
             dialog_handle = Some(dialog.into());
             app.update(cx, |state, cx| {
-                state.track_context_dialog_window(dialog.window_id(), cx);
+                state.track_context_dialog_window(dialog.window_id(), None, cx);
                 assert_eq!(state.context_dialog_windows.len(), 1);
             });
         });
         let dialog_handle = dialog_handle.expect("dialog handle is retained");
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let before = state.focused_directory().view().preferences().layout;
+                state.dispatch_command("view.list", cx);
+                assert_eq!(
+                    state.focused_directory().view().preferences().layout,
+                    before
+                );
+            });
+        });
         cx.update(|cx| {
             dialog_handle
                 .update(cx, |_, window, _| window.remove_window())

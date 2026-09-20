@@ -1,6 +1,6 @@
 use crate::{
-    CancellationToken, CapabilityMatrix, CapabilityReason, DirectoryWatch, Page, PageRequest,
-    ProviderId, SearchCapabilities, SearchQuery, SearchStream, StoreItem, StorePath,
+    CancellationToken, CapabilityMatrix, CapabilityReason, CapabilityState, DirectoryWatch, Page,
+    PageRequest, ProviderId, SearchCapabilities, SearchQuery, SearchStream, StoreItem, StorePath,
 };
 use std::error::Error;
 use std::fmt;
@@ -256,6 +256,25 @@ pub trait Store: Send + Sync {
     fn provider_id(&self) -> &ProviderId;
 
     fn capabilities(&self, location: &StorePath) -> CapabilityMatrix;
+
+    /// Resolves a path immediately at the provider boundary. Context-menu
+    /// actions use this to reject a same-path replacement instead of trusting
+    /// an already-rendered directory row.
+    fn resolve_item(&self, _path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+        Err(StoreError::unsupported(
+            "resolve item identity",
+            "this provider does not expose current item identity",
+        ))
+    }
+
+    /// Provider-supplied access fact for a concrete directory. This is kept
+    /// separate from operation capabilities such as atomic rename.
+    fn location_writable(&self, _path: &StorePath) -> Result<CapabilityState, StoreError> {
+        Ok(CapabilityState::Unknown(
+            CapabilityReason::new("the provider did not report whether this location is writable")
+                .expect("the default writable-location reason is valid"),
+        ))
+    }
 
     fn search_capabilities(&self, _location: &StorePath) -> SearchCapabilities {
         SearchCapabilities::default()

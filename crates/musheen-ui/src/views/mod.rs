@@ -262,8 +262,7 @@ impl DirectoryViewModel {
 
     pub fn select_item(&mut self, id: ItemId, mode: SelectionMode) {
         if self.item(&id).is_some() {
-            self.selection.apply(vec![id.clone()], mode);
-            self.focused_item = Some(id);
+            self.selection.apply(vec![id], mode);
             self.trim_unpinned();
         }
     }
