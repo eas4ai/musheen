@@ -1613,6 +1613,7 @@ fn capability_kind_label(kind: CapabilityKind) -> &'static str {
         CapabilityKind::HardLinks => "Hard links",
         CapabilityKind::SparseFiles => "Sparse files",
         CapabilityKind::ExtendedAttributes => "Extended attributes",
+        CapabilityKind::Tags => "Tags",
         CapabilityKind::ReflinkCopies => "Reflink copies",
         CapabilityKind::Trash => "Trash",
         CapabilityKind::AtomicRename => "Atomic rename",

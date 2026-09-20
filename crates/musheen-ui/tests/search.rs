@@ -3,7 +3,6 @@ use musheen_core::{
     SEARCH_QUERY_TERMS, SearchBatch, SearchCapabilities, SearchCompletion, SearchQuery,
     SearchResult, SearchScopeError, StoreItem, StorePath,
 };
-use musheen_desktop::TagCatalog;
 use musheen_ui::search::{DirectoryFilter, SearchResultModel, SearchState};
 use musheen_ui::views::DirectoryViewModel;
 
@@ -183,11 +182,7 @@ fn in_view_search_filters_by_catalog_tags_without_path_guessing() {
     let untagged = item(2, "untagged.txt", ItemKind::RegularFile, Some(20));
     let mut directory = DirectoryViewModel::new(4_096);
     directory.extend([tagged.clone(), untagged]);
-    let mut tags = TagCatalog::default();
-    tags.assign(tagged.id(), tagged.path().clone(), "work")
-        .unwrap();
-
-    let filter = DirectoryFilter::default().with_catalog_tag(&tags, "work");
+    let filter = DirectoryFilter::default().with_tagged_items([tagged.id().clone()]);
 
     assert_eq!(filter.apply(&directory), vec![&tagged]);
 }

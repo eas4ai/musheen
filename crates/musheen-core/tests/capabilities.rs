@@ -25,13 +25,14 @@ fn every_capability_has_an_explicit_state() {
 
 #[test]
 fn capability_inventory_covers_the_portable_contract() {
-    assert_eq!(CapabilityKind::ALL.len(), 11);
+    assert_eq!(CapabilityKind::ALL.len(), 12);
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::Permissions));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::Ownership));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::SymbolicLinks));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::HardLinks));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::SparseFiles));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::ExtendedAttributes));
+    assert!(CapabilityKind::ALL.contains(&CapabilityKind::Tags));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::ReflinkCopies));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::Trash));
     assert!(CapabilityKind::ALL.contains(&CapabilityKind::AtomicRename));

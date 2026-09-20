@@ -4,7 +4,6 @@ use musheen_core::{
     CommandTarget, CommandTargetRef, ItemId, OpenWithIntent, ProviderActionMatrix, ProviderId,
     StorePath,
 };
-use musheen_desktop::TagCatalog;
 use musheen_ui::{
     AppearanceMode, ContextMenuDestinationResolver, ContextMenuRequest, ContextMenuSource,
     ContextMenuSurface, Locale, MenuDirection, MenuEntryKind, MenuFocus, MenuInvocation,
@@ -255,11 +254,6 @@ fn open_with_and_send_to_keep_one_time_association_and_copy_only_destinations_se
 #[test]
 fn catalog_tags_project_through_the_registry_and_dispatch_manage_tags() {
     let selected = target(b"tagged", "/work/tagged");
-    let mut tags = TagCatalog::default();
-    tags.assign(selected.id(), selected.path().clone(), "Important")
-        .unwrap();
-    tags.assign(selected.id(), selected.path().clone(), "Work")
-        .unwrap();
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
     let menu = surface.compose(
         request(
@@ -267,7 +261,7 @@ fn catalog_tags_project_through_the_registry_and_dispatch_manage_tags() {
             MenuTarget::Item,
             vec![selected],
         )
-        .with_catalog_tags(&tags),
+        .with_catalog_tag_names([Box::<str>::from("Important"), Box::<str>::from("Work")]),
     );
 
     let submenu = menu

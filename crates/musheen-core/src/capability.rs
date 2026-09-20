@@ -10,6 +10,7 @@ pub enum CapabilityKind {
     HardLinks,
     SparseFiles,
     ExtendedAttributes,
+    Tags,
     ReflinkCopies,
     Trash,
     AtomicRename,
@@ -18,13 +19,14 @@ pub enum CapabilityKind {
 }
 
 impl CapabilityKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Permissions,
         Self::Ownership,
         Self::SymbolicLinks,
         Self::HardLinks,
         Self::SparseFiles,
         Self::ExtendedAttributes,
+        Self::Tags,
         Self::ReflinkCopies,
         Self::Trash,
         Self::AtomicRename,

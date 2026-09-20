@@ -1,4 +1,4 @@
-use musheen_core::{ProviderId, StorePath};
+use musheen_core::{ItemId, ProviderId, StorePath};
 use musheen_desktop::{PinCatalog, PinState};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -33,6 +33,8 @@ impl SidebarSectionKind {
 pub struct SidebarEntry {
     label: Box<str>,
     location: StorePath,
+    identity: Option<ItemId>,
+    tag_name: Option<Box<str>>,
     unavailable_reason: Option<Box<str>>,
 }
 
@@ -42,6 +44,8 @@ impl SidebarEntry {
         Self {
             label: label.into(),
             location,
+            identity: None,
+            tag_name: None,
             unavailable_reason: None,
         }
     }
@@ -55,7 +59,37 @@ impl SidebarEntry {
         Self {
             label: label.into(),
             location,
+            identity: None,
+            tag_name: None,
             unavailable_reason: Some(reason.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn pinned(
+        item: ItemId,
+        label: impl Into<Box<str>>,
+        location: StorePath,
+        unavailable_reason: Option<Box<str>>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            location,
+            identity: Some(item),
+            tag_name: None,
+            unavailable_reason,
+        }
+    }
+
+    #[must_use]
+    pub fn tag(item: ItemId, label: impl Into<Box<str>>, location: StorePath) -> Self {
+        let label = label.into();
+        Self {
+            tag_name: Some(label.clone()),
+            label,
+            location,
+            identity: Some(item),
+            unavailable_reason: None,
         }
     }
 
@@ -67,6 +101,16 @@ impl SidebarEntry {
     #[must_use]
     pub fn location(&self) -> &StorePath {
         &self.location
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> Option<&ItemId> {
+        self.identity.as_ref()
+    }
+
+    #[must_use]
+    pub fn tag_name(&self) -> Option<&str> {
+        self.tag_name.as_deref()
     }
 
     #[must_use]
@@ -120,11 +164,17 @@ impl PinStore {
     }
 
     pub fn replace_catalog(&self, catalog: &PinCatalog) {
-        self.replace(catalog.entries().iter().map(|pin| match pin.state() {
-            PinState::Available => SidebarEntry::new(pin.label(), pin.path_hint().clone()),
-            PinState::Unavailable(reason) => {
-                SidebarEntry::unavailable(pin.label(), pin.path_hint().clone(), reason.clone())
-            }
+        self.replace(catalog.entries().iter().map(|pin| {
+            let unavailable_reason = match pin.state() {
+                PinState::Available => None,
+                PinState::Unavailable(reason) => Some(reason.clone()),
+            };
+            SidebarEntry::pinned(
+                pin.item().clone(),
+                pin.label(),
+                pin.path_hint().clone(),
+                unavailable_reason,
+            )
         }));
     }
 }
@@ -169,9 +219,10 @@ impl SidebarModel {
         self.set_section_items(
             SidebarSectionKind::Tags,
             tags.into_iter().filter_map(|tag| {
-                StorePath::from_provider_key(provider.clone(), tag.as_bytes().to_vec())
-                    .ok()
-                    .map(|location| SidebarEntry::new(tag, location))
+                let key = tag.as_bytes().to_vec();
+                let location = StorePath::from_provider_key(provider.clone(), key.clone()).ok()?;
+                let item = ItemId::new(provider.clone(), key).ok()?;
+                Some(SidebarEntry::tag(item, tag, location))
             }),
         );
     }

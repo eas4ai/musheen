@@ -230,6 +230,7 @@ setting-general-startup = ⟦Startup location ···⟧
 setting-general-click = ⟦Open items ···⟧
 setting-general-restore-session = ⟦Restore browsing session ···⟧
 setting-general-record-history = ⟦Record recent locations ···⟧
+setting-general-store-tags-in-files = ⟦Store tags in file metadata ···⟧
 setting-appearance-mode = ⟦Color scheme ···⟧
 setting-appearance-reduce-motion = ⟦Reduce motion ···⟧
 setting-appearance-density = ⟦Control density ···⟧

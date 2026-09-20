@@ -124,7 +124,9 @@ impl ViewPreferenceStore {
         path: StorePath,
         catalog: &FolderPreferenceCatalog,
     ) {
-        let durable = catalog.resolve(identity);
+        let Some(durable) = catalog.resolve_recorded(identity) else {
+            return;
+        };
         let mut preferences = self.for_path(&path).clone();
         preferences.layout = match durable.view() {
             FolderView::Details => Layout::Details,
@@ -134,6 +136,7 @@ impl ViewPreferenceStore {
             FolderView::Columns => Layout::Columns,
             FolderView::Adaptive => Layout::Adaptive,
         };
+        preferences.icon_size = durable.icon_size();
         preferences.sort.key = match durable.sort_key() {
             FolderSortKey::Name => SortKey::Name,
             FolderSortKey::Size => SortKey::Size,
@@ -177,7 +180,8 @@ impl ViewPreferenceStore {
             identity,
             path,
             parent,
-            musheen_desktop::FolderPreference::new(view, sort_key, sort_direction),
+            musheen_desktop::FolderPreference::new(view, sort_key, sort_direction)
+                .with_icon_size(preferences.icon_size),
         );
     }
 }

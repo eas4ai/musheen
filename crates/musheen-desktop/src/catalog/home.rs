@@ -1,4 +1,4 @@
-use super::{FolderIdentity, PinCatalog, TagCatalog};
+use super::{FolderIdentity, PinCatalog, PinState, TagCatalog};
 use musheen_core::{ItemId, StorePath};
 use serde::{Deserialize, Serialize};
 
@@ -120,6 +120,8 @@ pub struct HomeItem {
     kind: HomeItemKind,
     label: Box<str>,
     path_hint: Option<StorePath>,
+    identity: Option<ItemId>,
+    unavailable_reason: Option<Box<str>>,
 }
 
 impl HomeItem {
@@ -136,6 +138,16 @@ impl HomeItem {
     #[must_use]
     pub fn path_hint(&self) -> Option<&StorePath> {
         self.path_hint.as_ref()
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> Option<&ItemId> {
+        self.identity.as_ref()
+    }
+
+    #[must_use]
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.unavailable_reason.as_deref()
     }
 }
 
@@ -195,6 +207,8 @@ impl<'a> HomeModel<'a> {
                         kind: HomeItemKind::Recent,
                         label: entry.label.clone(),
                         path_hint: Some(entry.path_hint.clone()),
+                        identity: Some(entry.identity.as_item().clone()),
+                        unavailable_reason: None,
                     })
                     .collect(),
             },
@@ -208,6 +222,11 @@ impl<'a> HomeModel<'a> {
                         kind: HomeItemKind::Pin,
                         label: entry.label().into(),
                         path_hint: Some(entry.path_hint().clone()),
+                        identity: Some(entry.item().clone()),
+                        unavailable_reason: match entry.state() {
+                            PinState::Available => None,
+                            PinState::Unavailable(reason) => Some(reason.clone()),
+                        },
                     })
                     .collect(),
             },
@@ -220,6 +239,8 @@ impl<'a> HomeModel<'a> {
                         kind: HomeItemKind::Mount,
                         label: entry.label.clone(),
                         path_hint: Some(entry.path_hint.clone()),
+                        identity: Some(entry.identity.as_item().clone()),
+                        unavailable_reason: None,
                     })
                     .collect(),
             },
@@ -233,6 +254,8 @@ impl<'a> HomeModel<'a> {
                         kind: HomeItemKind::Tag,
                         label,
                         path_hint: None,
+                        identity: None,
+                        unavailable_reason: None,
                     })
                     .collect(),
             },

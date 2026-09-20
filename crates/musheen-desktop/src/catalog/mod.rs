@@ -72,6 +72,10 @@ impl CatalogDocument {
         &mut self.folder_preferences
     }
 
+    pub fn home_sections(&mut self, mounts: &[MountShortcut]) -> Vec<HomeSection> {
+        HomeModel::new(&mut self.recents, &mut self.pins, &mut self.tags, mounts).sections()
+    }
+
     /// The operation layer calls this only after a move has published its
     /// destination identity. Unsupported tag destinations return an explicit
     /// outcome and leave the source record intact for review.
@@ -80,13 +84,30 @@ impl CatalogDocument {
         source: &musheen_core::ItemId,
         destination: musheen_core::ItemId,
         destination_path_hint: musheen_core::StorePath,
-        destination_supports_tags: bool,
+        destination_capabilities: &musheen_core::CapabilityMatrix,
     ) -> TagMoveOutcome {
         self.tags.note_app_move(
             source,
             destination,
             destination_path_hint,
-            destination_supports_tags,
+            matches!(
+                destination_capabilities.get(musheen_core::CapabilityKind::Tags),
+                musheen_core::CapabilityState::Supported
+            ),
+        )
+    }
+
+    pub fn note_completed_rename(
+        &mut self,
+        item: &musheen_core::ItemId,
+        destination_path_hint: musheen_core::StorePath,
+        destination_capabilities: &musheen_core::CapabilityMatrix,
+    ) -> TagMoveOutcome {
+        self.note_completed_move(
+            item,
+            item.clone(),
+            destination_path_hint,
+            destination_capabilities,
         )
     }
 }

@@ -34,6 +34,16 @@ fn general_settings_clear_only_recent_location_history() {
 }
 
 #[test]
+fn tag_xattrs_are_an_explicit_catalog_opt_in() {
+    let setting = settings_schema()
+        .iter()
+        .find(|setting| setting.key == "general.store_tags_in_files")
+        .expect("tag metadata opt-in is exposed in General settings");
+    assert_eq!(setting.default, "false");
+    assert_eq!(setting.feature, musheen_desktop::SettingsFeature::Catalog);
+}
+
+#[test]
 fn all_settings_have_one_searchable_localized_owner() {
     let mut keys = std::collections::HashSet::new();
     for locale in [Locale::EnUs, Locale::EnXa, Locale::Ar] {

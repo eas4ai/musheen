@@ -83,6 +83,7 @@ setting-general-startup = موقع بدء التشغيل
 setting-general-click = فتح العناصر
 setting-general-restore-session = استعادة جلسة التصفح
 setting-general-record-history = تسجيل المواقع الأخيرة
+setting-general-store-tags-in-files = تخزين الوسوم في بيانات الملف
 setting-appearance-mode = نظام الألوان
 setting-appearance-reduce-motion = تقليل الحركة
 setting-appearance-density = كثافة عناصر التحكم

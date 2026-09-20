@@ -1,9 +1,12 @@
-use musheen_core::{ItemId, ProviderId, StorePath};
+use musheen_core::{
+    CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, ItemId, ProviderId,
+    StorePath,
+};
 use musheen_desktop::{
-    CatalogDocument, CatalogStore, FolderIdentity, FolderPreference, FolderPreferenceCatalog,
-    FolderSortDirection, FolderSortKey, FolderView, HomeItemKind, HomeModel, MountShortcut,
-    PinCatalog, PinError, PinState, RecentLocations, TagBackend, TagCatalog, TagMoveOutcome,
-    TagService, XattrTagBackend, XattrTagError,
+    BackendTagService, CatalogDocument, CatalogStore, FolderIdentity, FolderPreference,
+    FolderPreferenceCatalog, FolderSortDirection, FolderSortKey, FolderView, HomeItemKind,
+    HomeModel, MountShortcut, PinCatalog, PinError, PinState, RecentLocations, TagBackend,
+    TagCatalog, TagMoveOutcome, TagService, TagStorage, XattrTagBackend, XattrTagError,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -113,11 +116,92 @@ fn tag_service_contract<B: TagBackend>(backend: B, target: ItemId, hint: StorePa
 where
     B::Error: std::fmt::Debug,
 {
-    let mut service = TagService::new(backend);
+    let mut service = BackendTagService::new(backend);
     service.assign(&target, &hint, "blue").unwrap();
     service.assign(&target, &hint, "green").unwrap();
     service.remove(&target, &hint, "blue").unwrap();
     assert_eq!(service.tags(&target, &hint).unwrap(), tags(&["green"]));
+}
+
+fn tag_capabilities(tags: bool, xattrs: bool) -> CapabilityMatrix {
+    CapabilityMatrix::new(|kind| {
+        let supported = match kind {
+            CapabilityKind::Tags => tags,
+            CapabilityKind::ExtendedAttributes => xattrs,
+            _ => false,
+        };
+        if supported {
+            CapabilityState::Supported
+        } else {
+            CapabilityState::Unsupported(
+                CapabilityReason::new("test provider does not support this capability").unwrap(),
+            )
+        }
+    })
+}
+
+#[test]
+fn production_tag_service_routes_by_live_capability_and_user_opt_in() {
+    let temporary = tempfile::tempdir().unwrap();
+    let xattr_path = temporary.path().join("xattr");
+    let fallback_path = temporary.path().join("fallback");
+    std::fs::write(&xattr_path, b"xattr").unwrap();
+    std::fs::write(&fallback_path, b"fallback").unwrap();
+    let local = item("local", b"xattr");
+    let fallback = item("local", b"fallback");
+    let remote = item("remote", b"opaque");
+    let mut catalog = TagCatalog::default();
+    let mut service = TagService::new(&mut catalog, true);
+
+    assert_eq!(
+        service
+            .assign(
+                &local,
+                &StorePath::from_unix_path(xattr_path.clone()),
+                &tag_capabilities(true, true),
+                "native",
+            )
+            .unwrap(),
+        TagStorage::ExtendedAttribute
+    );
+    assert!(
+        xattr::get(&xattr_path, "user.musheen.tags")
+            .unwrap()
+            .is_some()
+    );
+
+    service.set_xattr_opt_in(false);
+    assert_eq!(
+        service
+            .assign(
+                &fallback,
+                &StorePath::from_unix_path(fallback_path.clone()),
+                &tag_capabilities(true, true),
+                "private",
+            )
+            .unwrap(),
+        TagStorage::AppCatalog
+    );
+    assert!(
+        xattr::get(&fallback_path, "user.musheen.tags")
+            .unwrap()
+            .is_none()
+    );
+
+    service.set_xattr_opt_in(true);
+    let remote_path = StorePath::from_provider_key(provider("remote"), b"opaque".to_vec()).unwrap();
+    assert_eq!(
+        service
+            .assign(
+                &remote,
+                &remote_path,
+                &tag_capabilities(true, false),
+                "remote",
+            )
+            .unwrap(),
+        TagStorage::AppCatalog
+    );
+    assert_eq!(service.tags_for(&remote), tags(&["remote"]));
 }
 
 #[test]
@@ -137,7 +221,7 @@ fn one_tag_service_contract_covers_app_owned_fallback_and_opt_in_xattrs() {
         StorePath::from_unix_path(xattr_path.into_os_string()),
     );
 
-    let mut disabled = TagService::new(XattrTagBackend::new(true, false));
+    let mut disabled = BackendTagService::new(XattrTagBackend::new(true, false));
     assert!(matches!(
         disabled.assign(&item("local", b"disabled"), &path(b"/disabled"), "blue"),
         Err(musheen_desktop::TagServiceError::Backend(
@@ -147,7 +231,7 @@ fn one_tag_service_contract_covers_app_owned_fallback_and_opt_in_xattrs() {
 }
 
 #[test]
-fn completed_moves_update_catalog_tags_through_one_operation_hook() {
+fn completed_renames_and_moves_update_tags_through_capability_aware_operation_hooks() {
     let source = item("local", b"source");
     let destination = item("remote", b"destination");
     let destination_path =
@@ -158,8 +242,24 @@ fn completed_moves_update_catalog_tags_through_one_operation_hook() {
         .assign(&source, path(b"/source"), "keep")
         .unwrap();
 
+    let renamed_path = path(b"/renamed");
     assert_eq!(
-        catalog.note_completed_move(&source, destination.clone(), destination_path.clone(), true,),
+        catalog.note_completed_rename(
+            &source,
+            renamed_path.clone(),
+            &tag_capabilities(true, false),
+        ),
+        TagMoveOutcome::Preserved
+    );
+    assert_eq!(catalog.tags().path_hint(&source), Some(&renamed_path));
+
+    assert_eq!(
+        catalog.note_completed_move(
+            &source,
+            destination.clone(),
+            destination_path.clone(),
+            &tag_capabilities(true, false),
+        ),
         TagMoveOutcome::Preserved
     );
     assert_eq!(catalog.tags().tags_for(&destination), tags(&["keep"]));
@@ -212,6 +312,7 @@ fn home_composes_owning_models_and_mutates_them_in_place() {
     let mut pins = PinCatalog::default();
     pins.pin(pinned.clone(), path(b"/pinned"), "Pinned")
         .unwrap();
+    pins.mark_unavailable(&pinned, "volume removed");
     let mut tag_catalog = TagCatalog::default();
     tag_catalog
         .assign(&tagged, path(b"/tagged"), "work")
@@ -240,6 +341,15 @@ fn home_composes_owning_models_and_mutates_them_in_place() {
                 HomeItemKind::Tag,
             ]
         );
+        let pin = sections
+            .iter()
+            .find(|section| section.kind() == HomeItemKind::Pin)
+            .unwrap()
+            .items()
+            .first()
+            .unwrap();
+        assert_eq!(pin.identity(), Some(&pinned));
+        assert_eq!(pin.unavailable_reason(), Some("volume removed"));
         assert!(home.unpin(&pinned));
         assert_eq!(home.rename_tag("work", "office").unwrap(), 1);
         home.clear_recent_locations();
@@ -287,7 +397,8 @@ fn folder_preferences_inherit_by_lossless_identity_without_touching_paths() {
         FolderView::Details,
         FolderSortKey::Modified,
         FolderSortDirection::Descending,
-    );
+    )
+    .with_icon_size(72);
     let child_preferences = FolderPreference::new(
         FolderView::Grid,
         FolderSortKey::Name,
@@ -315,6 +426,22 @@ fn folder_preferences_inherit_by_lossless_identity_without_touching_paths() {
 
     assert_eq!(catalog.resolve(&folder), &parent_preferences);
     assert_eq!(catalog.resolve(&inaccessible), &parent_preferences);
+    assert_eq!(catalog.resolve(&folder).icon_size(), 72);
+    assert_eq!(
+        catalog.identity_for_path(
+            &StorePath::from_provider_key(
+                provider("smb-account"),
+                b"offline-share/private".to_vec(),
+            )
+            .unwrap(),
+        ),
+        Some(&inaccessible)
+    );
+    assert!(
+        catalog
+            .resolve_recorded(&location("local", b"unseen"))
+            .is_none()
+    );
     catalog.set(
         folder.clone(),
         path(b"/run/media/user/USB/folder\xff"),

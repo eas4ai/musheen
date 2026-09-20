@@ -304,6 +304,7 @@ fn sidebar_projects_durable_pin_availability_and_catalog_tags() {
         .find(|section| section.kind() == SidebarSectionKind::Pinned)
         .unwrap();
     assert_eq!(pinned.items().len(), 2);
+    assert_eq!(pinned.items()[1].identity(), Some(&missing));
     assert!(pinned.items()[0].is_available());
     assert!(!pinned.items()[1].is_available());
     assert_eq!(
@@ -321,6 +322,12 @@ fn sidebar_projects_durable_pin_availability_and_catalog_tags() {
             .collect::<Vec<_>>(),
         ["Important", "Work"]
     );
+    let tags = sections
+        .iter()
+        .find(|section| section.kind() == SidebarSectionKind::Tags)
+        .unwrap();
+    assert_eq!(tags.items()[0].tag_name(), Some("Important"));
+    assert!(tags.items()[0].identity().is_some());
 }
 
 #[test]
@@ -338,7 +345,8 @@ fn session_view_store_overlays_durable_identity_preferences_with_inheritance() {
             FolderView::Details,
             FolderSortKey::Modified,
             FolderSortDirection::Descending,
-        ),
+        )
+        .with_icon_size(72),
     );
     catalog.remember_location(child.clone(), child_path.clone(), Some(parent));
     let mut store = ViewPreferenceStore::default();
@@ -349,6 +357,7 @@ fn session_view_store_overlays_durable_identity_preferences_with_inheritance() {
     assert_eq!(preferences.layout, Layout::Details);
     assert_eq!(preferences.sort.key, SortKey::Modified);
     assert_eq!(preferences.sort.direction, SortDirection::Descending);
+    assert_eq!(preferences.icon_size, 72);
 
     let mut changed = preferences.clone();
     changed.layout = Layout::Cards;
@@ -360,6 +369,25 @@ fn session_view_store_overlays_durable_identity_preferences_with_inheritance() {
     assert_eq!(durable.view(), FolderView::Cards);
     assert_eq!(durable.sort_key(), FolderSortKey::Size);
     assert_eq!(durable.sort_direction(), FolderSortDirection::Ascending);
+}
+
+#[test]
+fn unseen_catalog_location_preserves_the_session_view_contract() {
+    let identity =
+        FolderIdentity::new(ProviderId::new("remote").unwrap(), b"offline".to_vec()).unwrap();
+    let path =
+        StorePath::from_provider_key(ProviderId::new("remote").unwrap(), b"offline".to_vec())
+            .unwrap();
+    let mut session = ViewPreferences::default();
+    session.layout = Layout::List;
+    session.icon_size = 88;
+    session.sort.key = SortKey::Size;
+    session.sort.direction = SortDirection::Descending;
+    let mut store = ViewPreferenceStore::new(session.clone());
+
+    store.apply_catalog(&identity, path.clone(), &FolderPreferenceCatalog::default());
+
+    assert_eq!(store.for_path(&path), &session);
 }
 
 #[test]

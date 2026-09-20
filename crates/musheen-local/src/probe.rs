@@ -130,6 +130,7 @@ fn capabilities_from_info(info: &LocalFilesystemInfo) -> CapabilityMatrix {
             }
             CapabilityKind::SparseFiles if native_unix => CapabilityState::Supported,
             CapabilityKind::ExtendedAttributes if native_unix => CapabilityState::Supported,
+            CapabilityKind::Tags => CapabilityState::Supported,
             CapabilityKind::ReflinkCopies if matches!(filesystem, "btrfs" | "xfs") => {
                 CapabilityState::Supported
             }
@@ -148,7 +149,7 @@ fn capabilities_from_info(info: &LocalFilesystemInfo) -> CapabilityMatrix {
 fn mutation_capability(kind: CapabilityKind) -> bool {
     !matches!(
         kind,
-        CapabilityKind::Watching | CapabilityKind::CaseSensitivity
+        CapabilityKind::Watching | CapabilityKind::CaseSensitivity | CapabilityKind::Tags
     )
 }
 

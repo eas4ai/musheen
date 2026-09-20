@@ -103,9 +103,8 @@ impl ContextMenuRequest {
     }
 
     #[must_use]
-    pub fn with_catalog_tags(mut self, catalog: &musheen_desktop::TagCatalog) -> Self {
-        self.tags = catalog
-            .tag_names()
+    pub fn with_catalog_tag_names(mut self, tags: impl IntoIterator<Item = Box<str>>) -> Self {
+        self.tags = tags
             .into_iter()
             .map(|tag| crate::menus::MenuContribution::new(tag, "item.tags"))
             .collect();

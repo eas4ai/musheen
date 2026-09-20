@@ -149,6 +149,17 @@ const SETTINGS: &[SettingSpec] = &[
         feature: SettingsFeature::Catalog,
     },
     SettingSpec {
+        key: "general.store_tags_in_files",
+        page: SettingsPage::General,
+        label: "setting-general-store-tags-in-files",
+        group: "settings-group-privacy",
+        aliases: "tags xattr metadata files",
+        default: "false",
+        kind: SettingKind::Boolean,
+        restart_required: true,
+        feature: SettingsFeature::Catalog,
+    },
+    SettingSpec {
         key: "appearance.mode",
         page: SettingsPage::Appearance,
         label: "setting-appearance-mode",

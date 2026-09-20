@@ -59,6 +59,8 @@ pub enum FolderSortDirection {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FolderPreference {
     view: FolderView,
+    #[serde(default = "default_icon_size")]
+    icon_size: u16,
     sort_key: FolderSortKey,
     sort_direction: FolderSortDirection,
 }
@@ -72,6 +74,7 @@ impl FolderPreference {
     ) -> Self {
         Self {
             view,
+            icon_size: default_icon_size(),
             sort_key,
             sort_direction,
         }
@@ -83,6 +86,17 @@ impl FolderPreference {
     }
 
     #[must_use]
+    pub const fn with_icon_size(mut self, icon_size: u16) -> Self {
+        self.icon_size = icon_size;
+        self
+    }
+
+    #[must_use]
+    pub const fn icon_size(&self) -> u16 {
+        self.icon_size
+    }
+
+    #[must_use]
     pub const fn sort_key(&self) -> FolderSortKey {
         self.sort_key
     }
@@ -91,6 +105,10 @@ impl FolderPreference {
     pub const fn sort_direction(&self) -> FolderSortDirection {
         self.sort_direction
     }
+}
+
+const fn default_icon_size() -> u16 {
+    48
 }
 
 impl Default for FolderPreference {
@@ -150,6 +168,11 @@ impl FolderPreferenceCatalog {
 
     #[must_use]
     pub fn resolve(&self, identity: &FolderIdentity) -> &FolderPreference {
+        self.resolve_recorded(identity).unwrap_or(&self.defaults)
+    }
+
+    #[must_use]
+    pub fn resolve_recorded(&self, identity: &FolderIdentity) -> Option<&FolderPreference> {
         let mut current = Some(identity);
         for _ in 0..=self.records.len() {
             let Some(identity) = current else {
@@ -163,11 +186,11 @@ impl FolderPreferenceCatalog {
                 break;
             };
             if let Some(preference) = &record.preference {
-                return preference;
+                return Some(preference);
             }
             current = record.parent.as_ref();
         }
-        &self.defaults
+        None
     }
 
     #[must_use]
@@ -176,6 +199,14 @@ impl FolderPreferenceCatalog {
             .iter()
             .find(|record| &record.identity == identity)
             .map(|record| &record.path_hint)
+    }
+
+    #[must_use]
+    pub fn identity_for_path(&self, path: &StorePath) -> Option<&FolderIdentity> {
+        self.records
+            .iter()
+            .find(|record| &record.path_hint == path)
+            .map(|record| &record.identity)
     }
 
     #[must_use]

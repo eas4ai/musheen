@@ -1,6 +1,5 @@
 use crate::views::DirectoryViewModel;
 use musheen_core::{ItemId, ItemKind, SearchQuery, SearchQueryError, StoreItem};
-use musheen_desktop::TagCatalog;
 use std::collections::HashSet;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -69,8 +68,8 @@ impl DirectoryFilter {
     }
 
     #[must_use]
-    pub fn with_catalog_tag(mut self, catalog: &TagCatalog, tag: &str) -> Self {
-        self.tagged_items = Some(catalog.items_with_tag(tag).into_iter().collect());
+    pub fn with_tagged_items(mut self, items: impl IntoIterator<Item = ItemId>) -> Self {
+        self.tagged_items = Some(items.into_iter().collect());
         self
     }
 

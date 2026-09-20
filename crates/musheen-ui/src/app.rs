@@ -1,4 +1,7 @@
+mod catalog;
 mod custom_actions;
+
+use catalog::{CatalogBinding, TagTarget};
 
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
@@ -53,8 +56,8 @@ use musheen_core::{
 };
 use musheen_desktop::{
     CatalogDocument, CatalogStore, ConflictDecisionStore, FolderIdentity, MimeDetector,
-    PreviewDocument, SessionStore, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
-    ThumbnailRequest, ThumbnailService, ThumbnailSize,
+    PreviewDocument, SessionStore, TagMoveOutcome, ThumbnailCache, ThumbnailLimits,
+    ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -217,7 +220,9 @@ struct FileDragPreview {
 #[derive(Clone, Debug)]
 struct PendingCatalogMove {
     source: ItemId,
-    destination: StorePath,
+    destination: Option<StorePath>,
+    source_path: StorePath,
+    target_path: StorePath,
 }
 
 #[derive(Default)]
@@ -729,7 +734,11 @@ pub fn run(initial_path: PathBuf) {
             if let Err(error) = catalog_store.save(&catalog_document) {
                 eprintln!("Musheen could not persist its catalog policy: {error}");
             }
-            let catalog_binding = CatalogBinding::persistent(catalog_store, catalog_document);
+            let catalog_binding = CatalogBinding::persistent_with_xattr_opt_in(
+                catalog_store,
+                catalog_document,
+                settings.value("general.store_tags_in_files").as_deref() == Some("true"),
+            );
             let windows = coordinator
                 .lock()
                 .expect("session coordinator lock is not poisoned")
@@ -980,53 +989,6 @@ struct SessionBinding {
     catalog: CatalogBinding,
 }
 
-#[derive(Clone, Debug)]
-struct CatalogBinding {
-    store: Option<CatalogStore>,
-    document: Arc<Mutex<CatalogDocument>>,
-}
-
-impl CatalogBinding {
-    fn in_memory() -> Self {
-        Self {
-            store: None,
-            document: Arc::new(Mutex::new(CatalogDocument::default())),
-        }
-    }
-
-    fn persistent(store: CatalogStore, document: CatalogDocument) -> Self {
-        Self {
-            store: Some(store),
-            document: Arc::new(Mutex::new(document)),
-        }
-    }
-
-    fn snapshot(&self) -> CatalogDocument {
-        self.document
-            .lock()
-            .expect("catalog lock is not poisoned")
-            .clone()
-    }
-
-    fn update(&self, change: impl FnOnce(&mut CatalogDocument)) -> Result<(), Box<str>> {
-        let mut document = self.document.lock().expect("catalog lock is not poisoned");
-        if let Some(store) = &self.store {
-            *document = store
-                .load()
-                .map_err(|error| Box::<str>::from(error.to_string()))?;
-        }
-        let previous = document.clone();
-        change(&mut document);
-        if let Some(store) = &self.store
-            && let Err(error) = store.save(&document)
-        {
-            *document = previous;
-            return Err(error.to_string().into());
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 struct PreparedSessionSave {
     binding: SessionBinding,
@@ -1224,78 +1186,6 @@ impl MusheenApp {
         app
     }
 
-    fn sync_catalog_projection(&mut self) {
-        let document = self.catalog_binding.snapshot();
-        self.pins.replace_catalog(document.pins());
-        let tag_names = document.tags().tag_names();
-        for sidebar in self.sidebars.values_mut() {
-            sidebar.set_tag_names(tag_names.iter().map(AsRef::as_ref));
-        }
-        let locations = self
-            .navigation
-            .panes()
-            .iter()
-            .flat_map(|pane| pane.tabs())
-            .map(|tab| {
-                (
-                    tab.id(),
-                    tab.location().clone(),
-                    tab.view_preferences().clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (tab_id, location, base) in locations {
-            let preferences = self.preferences_with_catalog(&location, base, &document);
-            if let Some(directory) = self.directories.get_mut(&tab_id) {
-                *directory.view_mut().preferences_mut() = preferences.clone();
-            }
-            if let Some(tab) = self.navigation.tab_mut(tab_id) {
-                tab.set_view_preferences(preferences);
-            }
-        }
-    }
-
-    fn folder_identity(&self, location: &StorePath) -> Option<FolderIdentity> {
-        self.store
-            .resolve_item(location)
-            .ok()
-            .flatten()
-            .map(|item| FolderIdentity::from_item(item.id().clone()))
-    }
-
-    fn parent_folder_identity(&self, location: &StorePath) -> Option<FolderIdentity> {
-        let parent = location.as_unix_path()?.parent()?;
-        self.folder_identity(&StorePath::from_unix_path(parent.as_os_str()))
-    }
-
-    fn preferences_with_catalog(
-        &self,
-        location: &StorePath,
-        base: crate::views::ViewPreferences,
-        catalog: &CatalogDocument,
-    ) -> crate::views::ViewPreferences {
-        let Some(identity) = self.folder_identity(location) else {
-            return base;
-        };
-        let mut reconciled = ViewPreferenceStore::new(base.clone());
-        reconciled.set(location.clone(), base);
-        reconciled.apply_catalog(&identity, location.clone(), catalog.folder_preferences());
-        reconciled.for_path(location).clone()
-    }
-
-    fn catalog_models(
-        session_binding: Option<&SessionBinding>,
-    ) -> (CatalogBinding, PinStore, Vec<Box<str>>) {
-        let binding = session_binding
-            .map(|session| session.catalog.clone())
-            .unwrap_or_else(CatalogBinding::in_memory);
-        let snapshot = binding.snapshot();
-        let pins = PinStore::default();
-        pins.replace_catalog(snapshot.pins());
-        let tags = snapshot.tags().tag_names().into_iter().collect();
-        (binding, pins, tags)
-    }
-
     fn new_with_navigation(
         mut navigation: WindowSession,
         session_binding: Option<SessionBinding>,
@@ -1386,6 +1276,7 @@ impl MusheenApp {
             context_dialog_close_subscription: None,
             conflict_subscriptions: Vec::new(),
         };
+        this.sync_catalog_projection();
         this.start_load(location, cx);
         this.start_operation_status_refresh(cx);
         this
@@ -1431,14 +1322,21 @@ impl MusheenApp {
             }
             self.directories.insert(tab_id, directory);
         }
-        self.sidebars
-            .entry(tab_id)
-            .or_insert_with(|| default_sidebar_model(self.pins.clone()));
+        let tag_names = self.catalog_binding.tag_names();
+        self.sidebars.entry(tab_id).or_insert_with(|| {
+            let mut sidebar = default_sidebar_model(self.pins.clone());
+            sidebar.set_tag_names(tag_names.iter().map(AsRef::as_ref));
+            sidebar
+        });
         let load = self
             .directories
             .entry(tab_id)
             .or_insert_with(|| DirectoryModel::new(self.limits.snapshot()))
             .begin_navigation(location);
+        if is_home_location(load.location()) {
+            cx.notify();
+            return;
+        }
         if trash {
             self.start_trash_load(tab_id, cx);
             return;
@@ -1573,9 +1471,24 @@ impl MusheenApp {
         load: &DirectoryLoad,
         event: WatchEvent,
     ) -> bool {
-        self.directories
+        let applied = self
+            .directories
             .get_mut(&tab_id)
-            .is_some_and(|directory| directory.apply_watch_event(load, event))
+            .is_some_and(|directory| directory.apply_watch_event(load, event));
+        if applied {
+            let items = self
+                .directories
+                .get(&tab_id)
+                .map(|directory| directory.items().to_vec())
+                .unwrap_or_default();
+            if let Err(error) = self
+                .catalog_binding
+                .reconcile_directory(load.location(), &items)
+            {
+                self.operation_error = Some(error);
+            }
+        }
+        applied
     }
 
     fn apply_directory_result(
@@ -1592,6 +1505,14 @@ impl MusheenApp {
                 for page in pages {
                     directory.apply_page(load, page);
                 }
+                let items = directory.items().to_vec();
+                if let Err(error) = self
+                    .catalog_binding
+                    .reconcile_directory(load.location(), &items)
+                {
+                    self.operation_error = Some(error);
+                }
+                self.remember_folder_location(load.location());
             }
             Err(error) => {
                 directory.apply_error(load, error.to_string());
@@ -1611,6 +1532,7 @@ impl MusheenApp {
             self.navigation.navigate_focused(location.clone());
             self.schedule_session_save(cx);
         }
+        self.remember_folder_location(&location);
         let preferences = self.preferences_with_catalog(
             &location,
             self.navigation.preferences_for(&location).clone(),
@@ -1659,7 +1581,9 @@ impl MusheenApp {
             self.pending_omnibar_value = Some(display);
         }
         self.pending_content_focus = true;
-        let loaded = if is_trash_location(&location) {
+        let loaded = if is_home_location(&location) {
+            true
+        } else if is_trash_location(&location) {
             self.trash_states.contains_key(&tab_id)
         } else {
             self.directories
@@ -1850,33 +1774,27 @@ impl MusheenApp {
         page: PropertiesPage,
         cx: &mut Context<Self>,
     ) {
-        let catalog = self.catalog_binding.snapshot();
-        let mut tags = targets
-            .first()
-            .map(|target| catalog.tags().tags_for(target.id()))
-            .unwrap_or_default();
-        for target in targets.iter().skip(1) {
-            let item_tags = catalog.tags().tags_for(target.id());
-            tags.retain(|tag| item_tags.contains(tag));
-        }
         let tag_targets = targets
             .iter()
-            .map(|target| (target.id().clone(), target.path().clone()))
-            .collect::<Vec<_>>();
-        let catalog_binding = self.catalog_binding.clone();
-        let tag_writer: TagWriter = Arc::new(move |desired| {
-            catalog_binding.update(|document| {
-                for (item, path_hint) in &tag_targets {
-                    let current = document.tags().tags_for(item);
-                    for tag in current.difference(desired) {
-                        document.tags_mut().remove(item, tag);
-                    }
-                    for tag in desired.difference(&current) {
-                        let _ = document.tags_mut().assign(item, path_hint.clone(), tag);
-                    }
-                }
+            .map(|target| {
+                (
+                    target.id().clone(),
+                    target.path().clone(),
+                    self.store.capabilities(target.path()),
+                )
             })
-        });
+            .collect::<Vec<TagTarget>>();
+        let tags = match self.catalog_binding.common_tags(&tag_targets) {
+            Ok(tags) => tags,
+            Err(error) => {
+                self.operation_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let catalog_binding = self.catalog_binding.clone();
+        let tag_writer: TagWriter =
+            Arc::new(move |desired| catalog_binding.replace_tags(&tag_targets, desired));
         self.open_properties_paths_with_tags(
             targets
                 .iter()
@@ -2456,21 +2374,15 @@ impl MusheenApp {
         cx.notify();
     }
 
-    fn sidebar_location_context_menu(
+    fn sidebar_entry_context_menu(
         &self,
         tab_id: TabId,
         target: MenuTarget,
         location: StorePath,
+        identity: Option<ItemId>,
     ) -> ContextMenu {
-        // A sidebar/mount row is a concrete provider location, not a generic
-        // background. Capture its current identity when the provider exposes
-        // one so later invocation cannot be redirected by a pane change.
-        let selection = self
-            .store
-            .resolve_item(&location)
-            .ok()
-            .flatten()
-            .and_then(|item| CommandTargetRef::new(item.id().clone(), item.path().clone()).ok())
+        let selection = identity
+            .and_then(|item| CommandTargetRef::new(item, location.clone()).ok())
             .into_iter()
             .collect();
         self.compose_context_menu_at(tab_id, target, location, selection)
@@ -2523,8 +2435,7 @@ impl MusheenApp {
             .with_trash_contents(trash_contents)
             .with_origin_tab(tab_id)
             .with_actions(&contributions);
-        let catalog = self.catalog_binding.snapshot();
-        request.with_catalog_tags(catalog.tags())
+        request.with_catalog_tag_names(self.catalog_binding.tag_names())
     }
 
     fn compose_context_menu_at(
@@ -2567,8 +2478,16 @@ impl MusheenApp {
                 .then(|| self.store.executable_state(item.path()).ok())
                 .flatten()
         });
+        let selected_is_pinned = selection.first().is_some_and(|selected| {
+            self.catalog_binding
+                .snapshot()
+                .pins()
+                .contains(selected.id())
+        });
         let item_target = if target == MenuTarget::Mount {
             CommandTarget::Mount
+        } else if target == MenuTarget::SidebarLocation && selected_is_pinned {
+            CommandTarget::Directory
         } else if target == MenuTarget::SidebarLocation {
             CommandTarget::Sidebar
         } else if target == MenuTarget::Tag {
@@ -2690,9 +2609,7 @@ impl MusheenApp {
                 .any(|action| action.supports_provider_uris),
             has_dot_name_semantics: is_local,
             target_is_hidden: selected_item.is_some_and(|item| is_hidden_path(item.path())),
-            target_is_pinned: selection
-                .first()
-                .is_some_and(|target| self.catalog_binding.snapshot().pins().contains(target.id())),
+            target_is_pinned: selected_is_pinned,
             executable_run_enabled: matches!(executable_state, Some(CapabilityState::Supported)),
             capabilities,
             provider_actions: ProviderActionMatrix::from_states(
@@ -3286,16 +3203,23 @@ impl MusheenApp {
         origin_tab: Option<TabId>,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-            self.operation_error = Some(error);
-            cx.notify();
-            return;
-        }
         let Some(target) = targets.first().filter(|_| targets.len() == 1) else {
             self.operation_error = Some("pin commands require exactly one target".into());
             cx.notify();
             return;
         };
+        if action == CommandAction::Pin {
+            if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+                self.operation_error = Some(error);
+                cx.notify();
+                return;
+            }
+        } else if !self.catalog_binding.snapshot().pins().contains(target.id()) {
+            self.operation_error =
+                Some("the pinned location no longer exists in the catalog".into());
+            cx.notify();
+            return;
+        }
         let result = if action == CommandAction::Pin {
             let item = target.id().clone();
             let path = target.path().clone();
@@ -3601,12 +3525,18 @@ impl MusheenApp {
                         .flatten()
                         .map(|item| item.id().clone())
                 })?;
-                let source_path = source.as_unix_path()?;
-                let destination_root = target.as_unix_path()?;
-                let file_name = source_path.file_name()?;
+                let destination = source.as_unix_path().zip(target.as_unix_path()).and_then(
+                    |(source_path, destination_root)| {
+                        source_path.file_name().map(|file_name| {
+                            StorePath::from_unix_path(destination_root.join(file_name))
+                        })
+                    },
+                );
                 Some(PendingCatalogMove {
                     source: source_identity,
-                    destination: StorePath::from_unix_path(destination_root.join(file_name)),
+                    destination,
+                    source_path: source.clone(),
+                    target_path: target.clone(),
                 })
             })
             .collect()
@@ -3820,7 +3750,18 @@ impl MusheenApp {
         let Some(movement) = self.pending_catalog_moves.remove(&id) else {
             return;
         };
-        let destination = match self.store.resolve_item(&movement.destination) {
+        let Some(destination_path) = movement.destination else {
+            self.operation_error = Some(
+                format!(
+                    "move completed from {} to {}, but the provider did not report the exact destination item path; source tags were retained for review",
+                    DisplayPath::from_store_path(&movement.source_path).as_str(),
+                    DisplayPath::from_store_path(&movement.target_path).as_str(),
+                )
+                .into(),
+            );
+            return;
+        };
+        let destination = match self.store.resolve_item(&destination_path) {
             Ok(Some(destination)) => destination,
             Ok(None) => {
                 self.operation_error = Some(
@@ -3834,15 +3775,21 @@ impl MusheenApp {
                 return;
             }
         };
-        if let Err(error) = self.catalog_binding.update(|document| {
-            document.note_completed_move(
-                &movement.source,
-                destination.id().clone(),
-                movement.destination,
-                true,
-            );
-        }) {
-            self.operation_error = Some(error);
+        let capabilities = self.store.capabilities(&destination_path);
+        match self.catalog_binding.complete_move(
+            &movement.source,
+            destination.id().clone(),
+            destination_path,
+            &capabilities,
+        ) {
+            Ok(TagMoveOutcome::Preserved) => {}
+            Ok(TagMoveOutcome::UnsupportedDestination) => {
+                self.operation_error = Some(
+                    "move completed, but its destination does not support tags; source tags were retained for review"
+                        .into(),
+                );
+            }
+            Err(error) => self.operation_error = Some(error),
         }
     }
 
@@ -4284,7 +4231,18 @@ impl MusheenApp {
             cx.notify();
             return;
         }
-        let active = match SearchQuery::parse(&expression).and_then(DirectoryFilter::from_query) {
+        let filter = expression
+            .strip_prefix("tag:")
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(|tag| {
+                Ok(DirectoryFilter::default()
+                    .with_tagged_items(self.catalog_binding.items_with_tag(tag)))
+            })
+            .unwrap_or_else(|| {
+                SearchQuery::parse(&expression).and_then(DirectoryFilter::from_query)
+            });
+        let active = match filter {
             Ok(filter) => ActiveFilter {
                 filter: Some(filter),
                 expression,
@@ -5072,9 +5030,14 @@ impl MusheenApp {
                                     let can_drop_location = location.clone();
                                     let drop_location = location.clone();
                                     let context_location = location.clone();
+                                    let context_identity = entry.identity().cloned();
                                     let operation_hub = self.operation_hub.clone();
                                     let selected = current.as_ref() == Some(&location);
                                     let label = entry.label().to_owned();
+                                    let activation_tag = entry.tag_name().map(str::to_owned);
+                                    let available = entry.is_available();
+                                    let unavailable_reason =
+                                        entry.unavailable_reason().map(str::to_owned);
                                     let icon = match (kind, label.as_str()) {
                                         (SidebarSectionKind::Home, _) => IconName::House,
                                         (_, "Downloads") => IconName::Download,
@@ -5117,14 +5080,18 @@ impl MusheenApp {
                                                     return;
                                                 }
                                                 this.pending_context_menu =
-                                                    Some(this.sidebar_location_context_menu(
+                                                    Some(this.sidebar_entry_context_menu(
                                                         sidebar_tab,
-                                                        if kind == SidebarSectionKind::Mounts {
+                                                        if kind == SidebarSectionKind::Tags {
+                                                            MenuTarget::Tag
+                                                        } else if kind == SidebarSectionKind::Mounts
+                                                        {
                                                             MenuTarget::Mount
                                                         } else {
                                                             MenuTarget::SidebarLocation
                                                         },
                                                         context_location.clone(),
+                                                        context_identity.clone(),
                                                     ));
                                             }),
                                         )
@@ -5137,14 +5104,22 @@ impl MusheenApp {
                                             .accessibility_label(label)
                                             .ghost()
                                             .small()
+                                            .disabled(!available)
+                                            .when_some(unavailable_reason, |button, reason| {
+                                                button.tooltip(reason)
+                                            })
                                             .selected(selected)
                                             .w_full()
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.navigate(
-                                                    navigation_location.clone(),
-                                                    true,
-                                                    cx,
-                                                );
+                                                if let Some(tag) = activation_tag.as_deref() {
+                                                    this.apply_tag_filter(tag, cx);
+                                                } else {
+                                                    this.navigate(
+                                                        navigation_location.clone(),
+                                                        true,
+                                                        cx,
+                                                    );
+                                                }
                                             })),
                                         )
                                         .into_any_element()
@@ -5292,7 +5267,13 @@ impl MusheenApp {
             .navigation
             .tab(spec.tab_id)
             .is_some_and(|tab| is_trash_location(tab.location()));
-        let body = if trash {
+        let home = self
+            .navigation
+            .tab(spec.tab_id)
+            .is_some_and(|tab| is_home_location(tab.location()));
+        let body = if home {
+            self.render_home_surface(spec.tab_id, cx)
+        } else if trash {
             self.render_trash_surface(spec.tab_id, cx)
         } else if self.searches.contains_key(&spec.tab_id) {
             self.render_search_results(spec.tab_id, spec.pane_index, cx)
@@ -7490,17 +7471,31 @@ impl Render for MusheenApp {
 }
 
 fn place_path(label: &str, home: Option<&Path>) -> Option<StorePath> {
+    if label == "Home" {
+        return Some(home_store_path());
+    }
     if label == "Trash" {
         return Some(trash_store_path());
     }
     let home = home?;
     match label {
-        "Home" => Some(StorePath::from_unix_path(home.as_os_str())),
         "Desktop" | "Documents" | "Downloads" => {
             Some(StorePath::from_unix_path(home.join(label).into_os_string()))
         }
         _ => None,
     }
+}
+
+fn home_store_path() -> StorePath {
+    StorePath::from_provider_key(
+        ProviderId::new("musheen.home").expect("the built-in Home provider ID is valid"),
+        b"root".to_vec(),
+    )
+    .expect("the built-in Home path is valid")
+}
+
+fn is_home_location(path: &StorePath) -> bool {
+    path == &home_store_path()
 }
 
 fn operation_browser_location(path: &StorePath) -> StorePath {
@@ -7648,14 +7643,11 @@ fn is_archive_path(path: &StorePath) -> bool {
 fn default_sidebar_model(pins: PinStore) -> SidebarModel {
     let mut model = SidebarModel::new(pins);
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    model.set_section_items(
+        SidebarSectionKind::Home,
+        [SidebarEntry::new("Home", home_store_path())],
+    );
     if let Some(home) = home.as_deref() {
-        model.set_section_items(
-            SidebarSectionKind::Home,
-            [SidebarEntry::new(
-                "Home",
-                StorePath::from_unix_path(home.as_os_str()),
-            )],
-        );
         model.set_section_items(
             SidebarSectionKind::Places,
             ["Desktop", "Documents", "Downloads", "Trash"]
@@ -9394,11 +9386,15 @@ mod tests {
         app.update(cx, |state, _| {
             let tab = state.navigation.focused_tab().id();
             for target in [MenuTarget::SidebarLocation, MenuTarget::Mount] {
-                let menu = state.sidebar_location_context_menu(
-                    tab,
-                    target,
-                    StorePath::from_unix_path(external.as_os_str()),
-                );
+                let location = StorePath::from_unix_path(external.as_os_str());
+                let identity = state
+                    .store
+                    .resolve_item(&location)
+                    .unwrap()
+                    .unwrap()
+                    .id()
+                    .clone();
+                let menu = state.sidebar_entry_context_menu(tab, target, location, Some(identity));
                 let entry = MusheenApp::menu_entry_by_id(&menu, "directory.properties").unwrap();
                 assert_eq!(entry.captured_targets().len(), 1);
                 assert!(
@@ -9416,10 +9412,11 @@ mod tests {
                 filesystem::remove_dir(temporary.path().join("old")).unwrap();
             }
             state.store = Arc::new(ImmediateSearchStore::new());
-            let menu = state.sidebar_location_context_menu(
+            let menu = state.sidebar_entry_context_menu(
                 tab,
                 MenuTarget::SidebarLocation,
                 StorePath::from_unix_path(external.as_os_str()),
+                None,
             );
             assert!(
                 menu.entries()
@@ -10440,6 +10437,13 @@ mod tests {
             .pins_mut()
             .pin(child_item.id().clone(), child_path.clone(), "Child")
             .unwrap();
+        let missing_pin =
+            ItemId::new(child_item.id().provider().clone(), b"missing-pin".to_vec()).unwrap();
+        let missing_path = StorePath::from_unix_path(temporary.path().join("offline-volume"));
+        catalog
+            .pins_mut()
+            .pin(missing_pin.clone(), missing_path.clone(), "Offline volume")
+            .unwrap();
         catalog
             .tags_mut()
             .assign(child_item.id(), child_path.clone(), "Work")
@@ -10452,7 +10456,8 @@ mod tests {
                 musheen_desktop::FolderView::Details,
                 musheen_desktop::FolderSortKey::Modified,
                 musheen_desktop::FolderSortDirection::Descending,
-            ),
+            )
+            .with_icon_size(72),
         );
         catalog_store.save(&catalog).unwrap();
 
@@ -10483,6 +10488,7 @@ mod tests {
                 state.focused_directory().view().preferences().sort.key,
                 SortKey::Modified
             );
+            assert_eq!(state.focused_directory().view().preferences().icon_size, 72);
             let tab_id = state.navigation.focused_tab().id();
             let target =
                 CommandTargetRef::new(child_item.id().clone(), child_path.clone()).unwrap();
@@ -10498,11 +10504,18 @@ mod tests {
             assert_eq!(tags.entries()[0].label(), "Work");
             assert!(unpin.state().is_enabled());
             state.dispatch_context_entry(unpin, cx);
-            assert!(
-                state.catalog_binding.snapshot().pins().entries().is_empty(),
-                "dispatch failed: {:?}",
-                state.operation_error
+            let unavailable_target =
+                CommandTargetRef::new(missing_pin.clone(), missing_path.clone()).unwrap();
+            let unavailable_menu = state.compose_context_menu_at(
+                tab_id,
+                MenuTarget::SidebarLocation,
+                missing_path.clone(),
+                vec![unavailable_target],
             );
+            let unavailable_unpin = unavailable_menu.entry("directory.unpin").unwrap().clone();
+            assert!(unavailable_unpin.state().is_enabled());
+            state.dispatch_context_entry(unavailable_unpin, cx);
+            assert!(state.catalog_binding.snapshot().pins().entries().is_empty());
             state
                 .focused_directory_mut()
                 .view_mut()
@@ -10520,5 +10533,151 @@ mod tests {
                 .view(),
             musheen_desktop::FolderView::List
         );
+        assert_eq!(
+            persisted
+                .folder_preferences()
+                .resolve(&FolderIdentity::from_item(root_item.id().clone()))
+                .icon_size(),
+            72
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn home_surface_composes_owner_models_and_mutates_pins_through_registry(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("child");
+        filesystem::create_dir(&child).unwrap();
+        let child_path = StorePath::from_unix_path(child.as_os_str());
+        let child_item = LocalStore::new()
+            .resolve_item(&child_path)
+            .unwrap()
+            .unwrap();
+        let root_path = StorePath::from_unix_path(temporary.path().as_os_str());
+        let root_item = LocalStore::new().resolve_item(&root_path).unwrap().unwrap();
+        let catalog_store = CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let mut catalog = CatalogDocument::default();
+        catalog
+            .pins_mut()
+            .pin(child_item.id().clone(), child_path.clone(), "Child")
+            .unwrap();
+        let missing_pin = ItemId::new(
+            child_item.id().provider().clone(),
+            b"missing-home-pin".to_vec(),
+        )
+        .unwrap();
+        catalog
+            .pins_mut()
+            .pin(
+                missing_pin,
+                StorePath::from_unix_path(temporary.path().join("offline-volume")),
+                "Offline volume",
+            )
+            .unwrap();
+        catalog
+            .tags_mut()
+            .assign(child_item.id(), child_path, "Work")
+            .unwrap();
+        let orphan = ItemId::new(
+            child_item.id().provider().clone(),
+            b"missing-stable-identity".to_vec(),
+        )
+        .unwrap();
+        catalog
+            .tags_mut()
+            .assign(
+                &orphan,
+                StorePath::from_unix_path(temporary.path().join("gone")),
+                "Old",
+            )
+            .unwrap();
+        catalog.tags_mut().observe_missing(&orphan);
+        catalog.recents_mut().record(
+            FolderIdentity::from_item(root_item.id().clone()),
+            root_path,
+            "Temporary",
+        );
+        catalog_store.save(&catalog).unwrap();
+
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_catalog_store(
+                    temporary.path().to_path_buf(),
+                    catalog_store.clone(),
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("sidebar-0-0", cx);
+            window.render_frame(cx);
+            assert!(window.find("home-surface").visible());
+            assert!(window.find("home-section-recent").visible());
+            assert!(window.find("home-section-pin").visible());
+            assert!(window.find("home-section-mount").visible());
+            assert!(window.find("home-section-tag").visible());
+            assert!(window.find("home-orphan-review").visible());
+            window.click("home-unpin-1", cx);
+            window.render_frame(cx);
+            window.click("home-unpin-0", cx);
+            window.render_frame(cx);
+            window.click("home-item-tag-0", cx);
+            window.render_frame(cx);
+            window.click("home-orphan-cleanup-0", cx);
+        });
+
+        assert!(catalog_store.load().unwrap().pins().entries().is_empty());
+        assert!(
+            catalog_store
+                .load()
+                .unwrap()
+                .tags()
+                .orphaned_items()
+                .next()
+                .is_none()
+        );
+        app.update(cx, |state, _| {
+            assert!(is_home_location(state.navigation.focused_tab().location()));
+            assert_eq!(
+                state
+                    .filters
+                    .get(&state.navigation.focused_tab().id())
+                    .map(|filter| filter.expression.as_str()),
+                Some("tag:Work")
+            );
+            let tab_id = state.navigation.focused_tab().id();
+            let tag = state
+                .sidebars
+                .get(&tab_id)
+                .unwrap()
+                .sections()
+                .into_iter()
+                .find(|section| section.kind() == SidebarSectionKind::Tags)
+                .unwrap()
+                .items()[0]
+                .clone();
+            let menu = state.sidebar_entry_context_menu(
+                tab_id,
+                MenuTarget::Tag,
+                tag.location().clone(),
+                tag.identity().cloned(),
+            );
+            let targets = menu.entry("item.tags").unwrap().captured_targets();
+            assert_eq!(targets.first().map(CommandTargetRef::id), tag.identity());
+        });
     }
 }

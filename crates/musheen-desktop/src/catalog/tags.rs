@@ -1,4 +1,4 @@
-use musheen_core::{ItemId, StorePath};
+use musheen_core::{CapabilityKind, CapabilityMatrix, CapabilityState, ItemId, StorePath};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -59,6 +59,7 @@ impl TagCatalog {
     pub fn tag_names(&self) -> BTreeSet<Box<str>> {
         self.records
             .iter()
+            .filter(|record| !record.orphaned)
             .flat_map(|record| record.tags.iter().cloned())
             .collect()
     }
@@ -78,6 +79,21 @@ impl TagCatalog {
             .iter()
             .find(|record| &record.item == item)
             .map(|record| &record.path_hint)
+    }
+
+    pub fn tracked_items(&self) -> impl Iterator<Item = (&ItemId, &StorePath, bool)> {
+        self.records
+            .iter()
+            .map(|record| (&record.item, &record.path_hint, record.orphaned))
+    }
+
+    pub fn orphaned_items(
+        &self,
+    ) -> impl Iterator<Item = (&ItemId, &StorePath, &BTreeSet<Box<str>>)> {
+        self.records
+            .iter()
+            .filter(|record| record.orphaned)
+            .map(|record| (&record.item, &record.path_hint, &record.tags))
     }
 
     pub fn rename(&mut self, old: &str, new: &str) -> Result<usize, TagError> {
@@ -254,11 +270,11 @@ pub trait TagBackend {
 }
 
 /// One tag model used by every provider backend.
-pub struct TagService<B> {
+pub struct BackendTagService<B> {
     backend: B,
 }
 
-impl<B: TagBackend> TagService<B> {
+impl<B: TagBackend> BackendTagService<B> {
     #[must_use]
     pub const fn new(backend: B) -> Self {
         Self { backend }
@@ -306,6 +322,180 @@ impl<B: TagBackend> TagService<B> {
         self.backend
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagStorage {
+    ExtendedAttribute,
+    AppCatalog,
+}
+
+/// The single production tag model. Callers supply the provider's live
+/// capability matrix for each target; filesystem metadata is used only when
+/// both the provider explicitly supports xattrs and the user opted in.
+pub struct TagService<'a> {
+    catalog: &'a mut TagCatalog,
+    xattr_opt_in: bool,
+}
+
+impl<'a> TagService<'a> {
+    #[must_use]
+    pub const fn new(catalog: &'a mut TagCatalog, xattr_opt_in: bool) -> Self {
+        Self {
+            catalog,
+            xattr_opt_in,
+        }
+    }
+
+    pub fn set_xattr_opt_in(&mut self, enabled: bool) {
+        self.xattr_opt_in = enabled;
+    }
+
+    pub fn assign(
+        &mut self,
+        item: &ItemId,
+        path_hint: &StorePath,
+        capabilities: &CapabilityMatrix,
+        tag: &str,
+    ) -> Result<TagStorage, CatalogTagError> {
+        let storage = self.storage(path_hint, capabilities)?;
+        if storage == TagStorage::ExtendedAttribute {
+            BackendTagService::new(XattrTagBackend::new(true, true))
+                .assign(item, path_hint, tag)
+                .map_err(CatalogTagError::Xattr)?;
+        }
+        self.catalog
+            .assign(item, path_hint.clone(), tag)
+            .map_err(CatalogTagError::InvalidTag)?;
+        Ok(storage)
+    }
+
+    pub fn remove(
+        &mut self,
+        item: &ItemId,
+        path_hint: &StorePath,
+        capabilities: &CapabilityMatrix,
+        tag: &str,
+    ) -> Result<TagStorage, CatalogTagError> {
+        let storage = self.storage(path_hint, capabilities)?;
+        if storage == TagStorage::ExtendedAttribute {
+            BackendTagService::new(XattrTagBackend::new(true, true))
+                .remove(item, path_hint, tag)
+                .map_err(CatalogTagError::Xattr)?;
+        }
+        self.catalog.remove(item, tag);
+        Ok(storage)
+    }
+
+    pub fn tags(
+        &mut self,
+        item: &ItemId,
+        path_hint: &StorePath,
+        capabilities: &CapabilityMatrix,
+    ) -> Result<BTreeSet<Box<str>>, CatalogTagError> {
+        let storage = self.storage(path_hint, capabilities)?;
+        if storage == TagStorage::AppCatalog {
+            return Ok(self.catalog.tags_for(item));
+        }
+        let tags = BackendTagService::new(XattrTagBackend::new(true, true))
+            .tags(item, path_hint)
+            .map_err(CatalogTagError::Xattr)?;
+        self.catalog
+            .write_tags(item, path_hint, &tags)
+            .expect("the app-owned tag catalog is infallible");
+        Ok(tags)
+    }
+
+    #[must_use]
+    pub fn tags_for(&self, item: &ItemId) -> BTreeSet<Box<str>> {
+        self.catalog.tags_for(item)
+    }
+
+    #[must_use]
+    pub fn tag_names(&self) -> BTreeSet<Box<str>> {
+        self.catalog.tag_names()
+    }
+
+    #[must_use]
+    pub fn items_with_tag(&self, tag: &str) -> BTreeSet<ItemId> {
+        self.catalog.items_with_tag(tag)
+    }
+
+    pub fn tracked_items(&self) -> impl Iterator<Item = (&ItemId, &StorePath, bool)> {
+        self.catalog.tracked_items()
+    }
+
+    pub fn orphaned_items(
+        &self,
+    ) -> impl Iterator<Item = (&ItemId, &StorePath, &BTreeSet<Box<str>>)> {
+        self.catalog.orphaned_items()
+    }
+
+    pub fn observe_present(&mut self, item: &ItemId, path_hint: StorePath) {
+        self.catalog.observe_present(item, path_hint);
+    }
+
+    pub fn observe_missing(&mut self, item: &ItemId) {
+        self.catalog.observe_missing(item);
+    }
+
+    pub fn cleanup_reviewed_orphans<'b>(
+        &mut self,
+        reviewed: impl IntoIterator<Item = &'b ItemId>,
+    ) -> usize {
+        self.catalog.cleanup_reviewed_orphans(reviewed)
+    }
+
+    fn storage(
+        &self,
+        path_hint: &StorePath,
+        capabilities: &CapabilityMatrix,
+    ) -> Result<TagStorage, CatalogTagError> {
+        if !matches!(
+            capabilities.get(CapabilityKind::Tags),
+            CapabilityState::Supported
+        ) {
+            return Err(CatalogTagError::UnsupportedProvider(
+                capabilities
+                    .get(CapabilityKind::Tags)
+                    .reason()
+                    .unwrap_or("the provider does not support tags")
+                    .into(),
+            ));
+        }
+        Ok(
+            if self.xattr_opt_in
+                && path_hint.as_unix_path().is_some()
+                && matches!(
+                    capabilities.get(CapabilityKind::ExtendedAttributes),
+                    CapabilityState::Supported
+                )
+            {
+                TagStorage::ExtendedAttribute
+            } else {
+                TagStorage::AppCatalog
+            },
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum CatalogTagError {
+    InvalidTag(TagError),
+    UnsupportedProvider(Box<str>),
+    Xattr(TagServiceError<XattrTagError>),
+}
+
+impl fmt::Display for CatalogTagError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTag(error) => error.fmt(formatter),
+            Self::UnsupportedProvider(reason) => formatter.write_str(reason),
+            Self::Xattr(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for CatalogTagError {}
 
 #[derive(Debug)]
 pub enum TagServiceError<E> {
