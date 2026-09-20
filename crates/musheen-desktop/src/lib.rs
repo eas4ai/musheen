@@ -3,6 +3,7 @@
 mod checksum;
 mod clipboard;
 mod conflict_journal;
+mod custom_action;
 mod mime;
 mod operation_journal;
 mod permissions;
@@ -16,6 +17,7 @@ mod thumbnail;
 pub use checksum::*;
 pub use clipboard::*;
 pub use conflict_journal::*;
+pub use custom_action::*;
 pub use mime::*;
 pub use operation_journal::*;
 pub use permissions::*;

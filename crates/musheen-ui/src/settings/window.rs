@@ -1,9 +1,10 @@
 use super::presentation::{choices, display_number, display_value, input_value, stored_number};
 use super::{SettingsBackends, SettingsState};
-use crate::{AppearanceMode, Catalog, Locale, ThemeProfile};
+use crate::theme::preview::AppearanceSnapshot;
+use crate::{Catalog, Locale};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme, Disableable, Root, Theme, WindowExt};
+use gpui_kit::component::{ActiveTheme, Disableable, Root, WindowExt};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, Global, IntoElement, Render, Role,
@@ -65,7 +66,7 @@ fn open_settings_at(store: SettingsStore, cx: &mut App) {
 
 pub struct SettingsWindow {
     pub(super) state: SettingsState,
-    store: SettingsStore,
+    pub(super) store: SettingsStore,
     catalog: Catalog,
     search: Entity<InputState>,
     inputs: BTreeMap<&'static str, Entity<InputState>>,
@@ -79,9 +80,15 @@ pub struct SettingsWindow {
     choices_focus: BTreeMap<&'static str, FocusHandle>,
     reset_trigger: FocusHandle,
     appearance_base: AppearanceSnapshot,
+    pub(super) theme_input: Entity<InputState>,
+    pub(super) theme_error: Option<&'static str>,
     pub(super) shortcut_input: Entity<InputState>,
     pub(super) shortcut_scope: musheen_core::ShortcutScope,
     pub(super) toolbar_move_focus: FocusHandle,
+    pub(super) action_inputs: BTreeMap<&'static str, Entity<InputState>>,
+    pub(super) action_shell: bool,
+    pub(super) action_provider_uris: bool,
+    pub(super) action_confirmation: musheen_desktop::ActionConfirmation,
 }
 
 impl SettingsWindow {
@@ -112,7 +119,20 @@ impl SettingsWindow {
                     .to_owned(),
             )
         });
+        let theme_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(
+                document
+                    .value("appearance.theme")
+                    .expect("theme schema key"),
+            )
+        });
         let mut this = Self {
+            action_inputs: super::custom_actions::inputs(window, cx),
+            action_shell: false,
+            action_provider_uris: false,
+            action_confirmation: musheen_desktop::ActionConfirmation::Always,
+            theme_input: theme_input.clone(),
+            theme_error: None,
             toolbar_move_focus: cx.focus_handle(),
             shortcut_input,
             shortcut_scope: musheen_core::ShortcutScope::Browser,
@@ -120,7 +140,7 @@ impl SettingsWindow {
             store,
             catalog,
             search,
-            inputs: BTreeMap::new(),
+            inputs: BTreeMap::from([("appearance.theme", theme_input)]),
             subscriptions: Vec::new(),
             failure,
             load_failed: failure.is_some(),
@@ -136,7 +156,13 @@ impl SettingsWindow {
             .iter()
             .filter(|spec| this.state.available(spec))
         {
-            if matches!(spec.kind, SettingKind::Toolbar | SettingKind::Shortcuts) {
+            if matches!(
+                spec.kind,
+                SettingKind::Toolbar
+                    | SettingKind::Shortcuts
+                    | SettingKind::Theme
+                    | SettingKind::CustomActions
+            ) {
                 this.choices_focus.insert(spec.key, cx.focus_handle());
                 continue;
             }
@@ -199,7 +225,7 @@ impl SettingsWindow {
         self.saving || self.load_failed || self.state.reset_confirmation_pending()
     }
 
-    fn preview_appearance(&self, cx: &mut App) {
+    pub(super) fn preview_appearance(&self, cx: &mut App) {
         self.appearance_base.restore(cx);
         apply_appearance(self.state.draft(), cx);
     }
@@ -217,6 +243,7 @@ impl SettingsWindow {
             cx.update(|cx| {
                 if let Ok(document) = &result {
                     cx.set_global(super::RuntimeSettings(document.clone()));
+                    cx.refresh_windows();
                 }
                 if let Some(this) = this.upgrade() {
                     this.update(cx, |this, cx| {
@@ -253,6 +280,14 @@ impl SettingsWindow {
     fn synchronize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sync_inputs {
             self.sync_inputs = false;
+            self.theme_error = None;
+            let theme_value = self
+                .state
+                .draft()
+                .value("appearance.theme")
+                .expect("theme schema key");
+            self.theme_input
+                .update(cx, |input, cx| input.set_value(theme_value, window, cx));
             for (key, input) in &self.inputs {
                 let value = self.state.draft().value(key).expect("schema key");
                 let spec = settings_schema()
@@ -365,11 +400,21 @@ impl SettingsWindow {
                     format!("label-{}", spec.key),
                     self.label(spec.label),
                 ));
-            if matches!(spec.kind, SettingKind::Toolbar | SettingKind::Shortcuts) {
-                let editor = if spec.kind == SettingKind::Toolbar {
-                    self.render_toolbar_editor(cx).into_any_element()
-                } else {
-                    self.render_shortcut_editor(cx).into_any_element()
+            if matches!(
+                spec.kind,
+                SettingKind::Toolbar
+                    | SettingKind::Shortcuts
+                    | SettingKind::Theme
+                    | SettingKind::CustomActions
+            ) {
+                let editor = match spec.kind {
+                    SettingKind::Toolbar => self.render_toolbar_editor(cx).into_any_element(),
+                    SettingKind::Shortcuts => self.render_shortcut_editor(cx).into_any_element(),
+                    SettingKind::Theme => self.render_theme_editor(cx).into_any_element(),
+                    SettingKind::CustomActions => {
+                        self.render_custom_actions_editor(cx).into_any_element()
+                    }
+                    _ => unreachable!("editor kind"),
                 };
                 row = row.track_focus(&self.choices_focus[spec.key]).child(editor);
             }
@@ -389,7 +434,9 @@ impl SettingsWindow {
                 SettingKind::Boolean
                 | SettingKind::Choice(_)
                 | SettingKind::Toolbar
-                | SettingKind::Shortcuts => String::new(),
+                | SettingKind::Shortcuts
+                | SettingKind::Theme
+                | SettingKind::CustomActions => String::new(),
                 SettingKind::Integer { maximum, units } => format!(
                     "{}: {} {}",
                     self.label("settings-maximum"),
@@ -609,70 +656,40 @@ pub(crate) fn apply_appearance(document: &SettingsDocument, cx: &mut App) {
     if !cx.has_global::<DesktopAppearance>() {
         cx.set_global(DesktopAppearance(AppearanceSnapshot::capture(cx)));
     }
-    // Startup resolves desktop preferences through the native bridge. Reuse that
-    // snapshot: preview must not block on the portal or inherit a prior override.
-    let preferences = cx.global::<DesktopAppearance>().0.preferences.clone();
-    if document.value("appearance.mode").as_deref() == Some("system") {
-        let desktop = cx.global::<DesktopAppearance>().0.clone();
-        desktop.restore(cx);
-        let mut preferences = cx
-            .try_global::<native_theme_gpui::NativeTheme>()
-            .map(|theme| theme.accessibility().clone())
-            .unwrap_or(preferences.clone());
-        preferences.reduce_motion |=
-            document.value("appearance.reduce_motion").as_deref() == Some("true");
-        native_theme_gpui::apply_accessibility(&preferences, cx);
-        return;
-    }
-    let native = ThemeProfile::from_active_native(
-        cx.theme().mode.is_dark(),
-        preferences.high_contrast,
-        preferences.reduce_motion,
-    );
-    let profile = super::appearance_profile(document, native);
-    let mut preferences = preferences;
-    preferences.high_contrast = profile.mode() == AppearanceMode::HighContrast;
-    preferences.reduce_motion = profile.motion() == crate::MotionPolicy::Reduced;
+    // Startup resolves both desktop variants through the native bridge. Always
+    // select from that lossless snapshot; previews must not replace one side
+    // with a generic preset or inherit a previous preview.
+    let desktop = cx.global::<DesktopAppearance>().0.clone();
+    let mut preferences = desktop.preferences.clone();
+    let mode = document.value("appearance.mode");
+    let is_dark = match mode.as_deref() {
+        Some("light" | "high-contrast") => false,
+        Some("dark") => true,
+        _ => desktop.is_dark(),
+    };
+    preferences.high_contrast |= mode.as_deref() == Some("high-contrast");
+    preferences.reduce_motion |=
+        document.value("appearance.reduce_motion").as_deref() == Some("true");
     preferences.reduce_transparency |= preferences.high_contrast;
-    if let Ok((theme, resolved)) = native_theme_gpui::from_preset(
-        "adwaita",
-        profile.mode() == AppearanceMode::Dark,
-        &preferences,
-    ) {
-        native_theme_gpui::apply(theme, &resolved, &preferences, cx);
+    desktop.restore_mode(is_dark, &preferences, cx);
+    crate::theme::preview::apply_tokens(document, cx);
+}
+
+/// Accept a freshly installed native theme, replace the immutable preview
+/// base, and then replay the saved user policy over it. Called on the GPUI
+/// thread by the runtime theme watcher.
+pub(crate) fn accept_native_theme_change(cx: &mut App) {
+    cx.set_global(DesktopAppearance(AppearanceSnapshot::capture(cx)));
+    if let Some(document) = cx
+        .try_global::<super::RuntimeSettings>()
+        .map(|settings| settings.0.clone())
+    {
+        apply_appearance(&document, cx);
     }
 }
 
 struct DesktopAppearance(AppearanceSnapshot);
 impl Global for DesktopAppearance {}
-
-#[derive(Clone)]
-struct AppearanceSnapshot {
-    theme: Theme,
-    resolved: Option<native_theme::theme::ResolvedTheme>,
-    preferences: native_theme::AccessibilityPreferences,
-}
-
-impl AppearanceSnapshot {
-    fn capture(cx: &App) -> Self {
-        let native = cx.try_global::<native_theme_gpui::NativeTheme>();
-        Self {
-            theme: cx.theme().clone(),
-            resolved: native.and_then(|theme| theme.resolved(cx)).cloned(),
-            preferences: native
-                .map(|theme| theme.accessibility().clone())
-                .unwrap_or_default(),
-        }
-    }
-    fn restore(&self, cx: &mut App) {
-        if let Some(resolved) = &self.resolved {
-            native_theme_gpui::apply(self.theme.clone(), resolved, &self.preferences, cx);
-        } else {
-            *Theme::global_mut(cx) = self.theme.clone();
-            native_theme_gpui::apply_accessibility(&self.preferences, cx);
-        }
-    }
-}
 
 pub(super) fn observed_label(
     id: impl Into<SharedString>,
@@ -950,6 +967,74 @@ mod tests {
                     "desktop transparency preference lost in {mode}"
                 );
             }
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn native_refresh_reapplies_user_overrides_and_replaces_both_base_variants(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::component::{Theme, ThemeMode};
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let preferences = native_theme::AccessibilityPreferences::default();
+            let (old_dark_theme, old_dark) =
+                native_theme_gpui::from_preset("kde-breeze", true, &preferences).unwrap();
+            let (old_light_theme, old_light) =
+                native_theme_gpui::from_preset("kde-breeze", false, &preferences).unwrap();
+            native_theme_gpui::apply(old_dark_theme, &old_dark, &preferences, cx);
+            native_theme_gpui::apply(old_light_theme, &old_light, &preferences, cx);
+
+            let mut saved = SettingsDocument::default();
+            saved.set_value("appearance.mode", "dark").unwrap();
+            saved
+                .set_value(
+                    "appearance.theme",
+                    &crate::theme::document::ThemeDocument::starter().export(),
+                )
+                .unwrap();
+            cx.set_global(crate::settings::RuntimeSettings(saved.clone()));
+            apply_appearance(&saved, cx);
+            assert_eq!(
+                cx.theme().colors.background,
+                gpui_kit::Hsla::from(gpui_kit::rgb(0xffffff))
+            );
+
+            // Simulate the watcher installing a newly resolved native theme.
+            let (new_light_theme, new_light) =
+                native_theme_gpui::from_preset("adwaita", false, &preferences).unwrap();
+            let (new_dark_theme, new_dark) =
+                native_theme_gpui::from_preset("adwaita", true, &preferences).unwrap();
+            native_theme_gpui::apply(new_light_theme, &new_light, &preferences, cx);
+            native_theme_gpui::apply(new_dark_theme, &new_dark, &preferences, cx);
+            accept_native_theme_change(cx);
+
+            assert!(
+                cx.theme().mode.is_dark(),
+                "saved explicit mode is reapplied"
+            );
+            assert_eq!(
+                cx.theme().colors.background,
+                gpui_kit::Hsla::from(gpui_kit::rgb(0xffffff)),
+                "saved semantic overrides survive the native refresh",
+            );
+
+            apply_appearance(&SettingsDocument::default(), cx);
+            Theme::change(ThemeMode::Light, None, cx);
+            assert_eq!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .resolved(cx)
+                    .unwrap(),
+                &new_light,
+            );
+            Theme::change(ThemeMode::Dark, None, cx);
+            assert_eq!(
+                cx.global::<native_theme_gpui::NativeTheme>()
+                    .resolved(cx)
+                    .unwrap(),
+                &new_dark,
+            );
         });
     }
 

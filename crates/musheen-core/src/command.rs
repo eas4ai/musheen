@@ -684,8 +684,23 @@ fn validate_parameters(
         ) => cardinality_matches(cardinality, targets.len()),
         (
             CommandParameterContract::CustomAction(cardinality),
-            CommandParameters::CustomAction { targets, .. },
-        ) => cardinality_matches(cardinality, targets.len()),
+            CommandParameters::CustomAction {
+                targets,
+                action_id: Some(id),
+                definition: Some(definition),
+                ..
+            },
+        ) => {
+            cardinality_matches(cardinality, targets.len())
+                && !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+                && !definition.is_empty()
+                && definition.len() <= 256 * 1024
+                && !definition.chars().any(char::is_control)
+        }
         (
             CommandParameterContract::OpenWith(cardinality),
             CommandParameters::OpenWith {

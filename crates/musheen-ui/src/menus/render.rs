@@ -40,20 +40,40 @@ impl ContextMenuRenderer {
             window,
             cx,
             on_activate,
+            |_, _, _, _| {},
         )
     }
 
-    fn populate_with_direction<F>(
+    pub(crate) fn populate_live<F, G>(
+        popup: PopupMenu,
+        menu: ContextMenu,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+        on_activate: F,
+        on_built: G,
+    ) -> PopupMenu
+    where
+        F: Fn(MenuEntry, &mut Window, &mut App) + Clone + 'static,
+        G: Fn(&ContextMenu, &str, &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
+    {
+        Self::populate_with_direction(popup, menu, path, window, cx, on_activate, on_built)
+    }
+
+    fn populate_with_direction<F, G>(
         mut popup: PopupMenu,
         menu: ContextMenu,
         path: String,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
         on_activate: F,
+        on_built: G,
     ) -> PopupMenu
     where
         F: Fn(MenuEntry, &mut Window, &mut App) + Clone + 'static,
+        G: Fn(&ContextMenu, &str, &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
     {
+        on_built(&menu, &path, window, cx);
         let direction = menu.locale_direction();
         let theme_tokens = menu.theme_tokens();
         let viewport_height = window.viewport_size().height;
@@ -76,9 +96,10 @@ impl ContextMenuRenderer {
                     };
                     let child_path = row_path.clone();
                     let activate = on_activate.clone();
+                    let built = on_built.clone();
                     let submenu = PopupMenu::build(window, cx, move |popup, window, cx| {
                         Self::populate_with_direction(
-                            popup, submenu, child_path, window, cx, activate,
+                            popup, submenu, child_path, window, cx, activate, built,
                         )
                     });
                     let item = PopupMenuItem::submenu(entry.label(), submenu)

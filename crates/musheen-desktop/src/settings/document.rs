@@ -67,6 +67,8 @@ pub enum SettingKind {
     CredentialReference,
     Toolbar,
     Shortcuts,
+    Theme,
+    CustomActions,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -165,6 +167,17 @@ const SETTINGS: &[SettingSpec] = &[
         aliases: "animation accessibility",
         default: "false",
         kind: SettingKind::Boolean,
+        restart_required: false,
+        feature: SettingsFeature::None,
+    },
+    SettingSpec {
+        key: "appearance.theme",
+        page: SettingsPage::Appearance,
+        label: "setting-appearance-theme",
+        group: "settings-group-theme",
+        aliases: "theme tokens import colors",
+        default: "native",
+        kind: SettingKind::Theme,
         restart_required: false,
         feature: SettingsFeature::None,
     },
@@ -485,10 +498,21 @@ const SETTINGS: &[SettingSpec] = &[
         label: "setting-advanced-custom-actions",
         group: "settings-group-advanced",
         aliases: "scripts actions",
+        default: "{\"version\":1,\"actions\":[]}",
+        kind: SettingKind::CustomActions,
+        restart_required: false,
+        feature: SettingsFeature::None,
+    },
+    SettingSpec {
+        key: "advanced.script_directory",
+        page: SettingsPage::Advanced,
+        label: "setting-advanced-script-directory",
+        group: "settings-group-advanced",
+        aliases: "scripts actions directory manifest",
         default: "false",
         kind: SettingKind::Boolean,
-        restart_required: true,
-        feature: SettingsFeature::Customization,
+        restart_required: false,
+        feature: SettingsFeature::None,
     },
     SettingSpec {
         key: "search.cache_mib",
@@ -628,6 +652,20 @@ impl SettingsDocument {
             .find(|spec| spec.key == key)
             .ok_or_else(|| SettingsError::InvalidValue { key: key.into() })?;
         super::validate::validate_value(spec, value)?;
+        let canonical = match spec.kind {
+            SettingKind::Theme if value != "native" => Some(
+                super::theme::ThemeDocument::import(value)
+                    .map_err(|_| SettingsError::InvalidValue { key: key.into() })?
+                    .export(),
+            ),
+            SettingKind::CustomActions => Some(
+                crate::CustomActionDocument::import(value)
+                    .map_err(|_| SettingsError::InvalidValue { key: key.into() })?
+                    .export(),
+            ),
+            _ => None,
+        };
+        let value = canonical.as_deref().unwrap_or(value);
         match key {
             "directory_page_items" => {
                 self.resource_limits.directory_page_items = value

@@ -1,5 +1,6 @@
 mod advanced;
 mod appearance;
+pub(crate) mod custom_actions;
 mod files;
 pub(crate) mod general;
 mod operations;
@@ -18,8 +19,8 @@ use musheen_desktop::{
     settings_schema,
 };
 use std::collections::BTreeSet;
-pub(crate) use window::apply_appearance;
 pub use window::{SettingsWindow, open_settings_window};
+pub(crate) use window::{accept_native_theme_change, apply_appearance};
 
 /// Availability is supplied by backend owners, never inferred from a saved preference.
 #[derive(Clone, Debug, Default)]

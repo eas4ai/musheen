@@ -12,6 +12,10 @@ pub(super) fn choices(kind: SettingKind) -> &'static [&'static str] {
 pub(super) fn display_value(spec: &SettingSpec, value: &str, catalog: &Catalog) -> String {
     match spec.kind {
         SettingKind::Toolbar | SettingKind::Shortcuts => value.to_owned(),
+        SettingKind::Theme | SettingKind::CustomActions => catalog
+            .message("settings-value-none")
+            .expect("localized empty document")
+            .to_owned(),
         SettingKind::Boolean | SettingKind::Choice(_) => catalog
             .message(&format!("settings-value-{value}"))
             .expect("schema option is localized")

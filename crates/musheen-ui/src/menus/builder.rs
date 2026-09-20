@@ -142,6 +142,34 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
+    pub(crate) fn refresh_custom_actions(
+        &mut self,
+        registry: &CommandRegistry,
+        catalog: &Catalog,
+        availability: impl Fn(
+            &musheen_desktop::CustomAction,
+            &[CommandTargetRef],
+            &StorePath,
+        ) -> Result<(), &'static str>,
+    ) {
+        for entry in &mut self.entries {
+            let Some(data) = &entry.invocation else {
+                continue;
+            };
+            let Some(action) = &data.custom_action else {
+                continue;
+            };
+            let mut context = data.context.clone();
+            set_custom_action_availability(
+                &mut context,
+                catalog,
+                availability(action, &data.selection, &data.location),
+            );
+            if let Some(command) = registry.get(data.id.as_str()) {
+                entry.state = command.state(&context);
+            }
+        }
+    }
     #[must_use]
     pub fn entries(&self) -> &[MenuEntry] {
         &self.entries
@@ -408,6 +436,7 @@ pub(crate) struct InvocationData {
     pub(crate) location: StorePath,
     pub(crate) destination: Option<StorePath>,
     pub(crate) origin_tab: Option<crate::navigation::TabId>,
+    pub(crate) custom_action: Option<musheen_desktop::CustomAction>,
 }
 
 pub(crate) fn compose(
@@ -611,6 +640,7 @@ fn plain_command_entry(
             location: selected_directory_location(command.action(), context, request),
             destination: None,
             origin_tab: request.origin_tab(),
+            custom_action: None,
         }),
     }
 }
@@ -806,11 +836,7 @@ fn add_contribution_submenu(
                 .filter(|command| command.submenu() == Some(expected_submenu))
                 .map(|command| (contribution, command))
         })
-        .map(|(contribution, command)| {
-            let mut child = plain_command_entry(command, catalog, request, request.context());
-            child.label = contribution.label().into();
-            child
-        })
+        .map(|(contribution, command)| contribution_entry(contribution, command, catalog, request))
         .collect::<Vec<_>>();
     let overflow = entries.split_off(entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
     append_overflow_submenu(
@@ -827,6 +853,71 @@ fn add_contribution_submenu(
         theme_tokens: MenuThemeTokens::from_profile(theme),
         direction,
     }));
+}
+
+fn set_custom_action_availability(
+    context: &mut CommandContext,
+    catalog: &Catalog,
+    availability: Result<(), &'static str>,
+) {
+    let states = context.backend_actions.get_or_insert_with(Default::default);
+    states.retain(|(action, _)| *action != CommandAction::CustomAction);
+    let state = match availability {
+        Ok(()) => musheen_core::CapabilityState::Supported,
+        Err(key) => musheen_core::CapabilityState::Unsupported(
+            musheen_core::CapabilityReason::new(
+                catalog.message(key).expect("localized action state"),
+            )
+            .expect("nonempty action state"),
+        ),
+    };
+    states.push((CommandAction::CustomAction, state));
+}
+
+fn contribution_entry(
+    contribution: &super::MenuContribution,
+    command: &CommandDefinition,
+    catalog: &Catalog,
+    request: &ContextMenuRequest,
+) -> MenuEntry {
+    let mut context = request.context().clone();
+    if let Some(action) = &contribution.custom_action {
+        context.supports_provider_uris = action.supports_provider_uris;
+        set_custom_action_availability(
+            &mut context,
+            catalog,
+            contribution
+                .custom_action_availability
+                .unwrap_or(Err("custom-action-checking")),
+        );
+    }
+    let mut child = plain_command_entry(command, catalog, request, &context);
+    child.label = contribution.label().into();
+    let Some(action) = &contribution.custom_action else {
+        return child;
+    };
+    if matches!(
+        action.execution,
+        musheen_desktop::ActionExecution::Shell { .. }
+    ) {
+        child.label = format!(
+            "{} — {}",
+            child.label,
+            catalog
+                .message("custom-action-shell")
+                .expect("localized shell label")
+        )
+        .into();
+    }
+    child.danger = match action.confirmation {
+        musheen_desktop::ActionConfirmation::Never => DangerLevel::None,
+        musheen_desktop::ActionConfirmation::Always => DangerLevel::Review,
+        musheen_desktop::ActionConfirmation::Destructive => DangerLevel::Destructive,
+    };
+    if let Some(data) = &mut child.invocation {
+        data.custom_action = Some(action.clone());
+    }
+    child
 }
 
 fn append_overflow_submenu(

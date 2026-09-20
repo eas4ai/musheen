@@ -93,3 +93,26 @@ mod tests {
         assert_eq!(profile, ThemeProfile::new(AppearanceMode::Dark, false));
     }
 }
+pub mod document;
+pub mod preview;
+pub(crate) mod runtime;
+pub mod validate;
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::runtime;
+
+    #[test]
+    fn native_refresh_signals_coalesce_and_close_with_their_owner() {
+        let (signal, receiver) = runtime::refresh_signals();
+        signal.notify();
+        signal.notify();
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert_eq!(receiver.try_recv(), Err(async_channel::TryRecvError::Empty),);
+        drop(signal);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Closed),
+        );
+    }
+}

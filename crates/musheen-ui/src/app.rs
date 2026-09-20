@@ -1,3 +1,5 @@
+mod custom_actions;
+
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
     PropertiesPage, PropertiesWindow, PropertiesWindowData, conflict_window_options,
@@ -794,12 +796,18 @@ fn install_native_theme(cx: &mut App) {
             eprintln!("Musheen could not read the system theme: {error}. Using Adwaita.");
             let preferences = native_theme::AccessibilityPreferences::from_system();
             if let Ok((theme, resolved)) =
+                native_theme_gpui::from_preset("adwaita", true, &preferences)
+            {
+                native_theme_gpui::apply(theme, &resolved, &preferences, cx);
+            }
+            if let Ok((theme, resolved)) =
                 native_theme_gpui::from_preset("adwaita", false, &preferences)
             {
                 native_theme_gpui::apply(theme, &resolved, &preferences, cx);
             }
         }
     }
+    crate::theme::runtime::install(cx);
 }
 
 fn preview_theme(value: &str) -> Option<(bool, bool)> {
@@ -1033,6 +1041,13 @@ struct MusheenApp {
     watch_directories: bool,
     sidebar_visible: bool,
     customization_keys: Option<Subscription>,
+    custom_actions: musheen_desktop::CustomActionDocument,
+    running_custom_actions: usize,
+    script_actions: musheen_desktop::CustomActionDocument,
+    scripts_enabled: bool,
+    script_reload_revision: u64,
+    custom_preflight: Option<custom_actions::ActionPreflight>,
+    live_action_popups: Vec<custom_actions::LiveActionPopup>,
     icon_cache: HashMap<Box<str>, Option<ImageSource>>,
     info_panes: HashMap<TabId, InfoPaneModel>,
     catalog: Catalog,
@@ -1149,6 +1164,13 @@ impl MusheenApp {
         let operation_error = operation_hub.persistence_error();
         let operation_status_revision = operation_hub.status_revision();
         let mut this = Self {
+            custom_actions: custom_actions::from_settings(settings.as_ref()),
+            running_custom_actions: 0,
+            script_actions: musheen_desktop::CustomActionDocument::default(),
+            scripts_enabled: false,
+            script_reload_revision: 0,
+            custom_preflight: None,
+            live_action_popups: Vec::new(),
             customization_keys: None,
             directories,
             searches: HashMap::new(),
@@ -2106,6 +2128,15 @@ impl MusheenApp {
             self.select_item(tab_id, clicked, cx);
         }
         self.focus_directory_item(tab_id, Some(clicked_target.id().clone()), cx);
+        self.preflight_custom_actions(
+            prepared.selection(),
+            self.navigation
+                .tab(tab_id)
+                .expect("context tab exists")
+                .location()
+                .clone(),
+            cx,
+        );
         self.compose_context_menu(tab_id, MenuTarget::Item, prepared.selection().to_vec())
     }
 
@@ -2231,9 +2262,11 @@ impl MusheenApp {
         } else {
             Vec::new()
         };
+        let contributions = self.custom_action_contributions(&selection, &location);
         crate::ContextMenuRequest::new(context, target, location, selection)
             .with_trash_contents(trash_contents)
             .with_origin_tab(tab_id)
+            .with_actions(&contributions)
     }
 
     fn compose_context_menu_at(
@@ -2392,6 +2425,11 @@ impl MusheenApp {
             mutation_is_supported: writable,
             mutation_reason: (!writable).then(|| writable_reason.into()),
             is_local,
+            supports_provider_uris: self
+                .custom_actions
+                .actions()
+                .iter()
+                .any(|action| action.supports_provider_uris),
             has_dot_name_semantics: is_local,
             target_is_hidden: selected_item.is_some_and(|item| is_hidden_path(item.path())),
             executable_run_enabled: matches!(executable_state, Some(CapabilityState::Supported)),
@@ -2453,7 +2491,8 @@ impl MusheenApp {
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        crate::menus::ContextMenuRenderer::populate(
+        let observer = app.clone();
+        crate::menus::ContextMenuRenderer::populate_live(
             popup,
             menu,
             path,
@@ -2461,6 +2500,9 @@ impl MusheenApp {
             cx,
             move |entry, _, cx| {
                 let _ = app.update(cx, |this, cx| this.dispatch_context_entry(entry, cx));
+            },
+            move |menu, path, window, cx| {
+                MusheenApp::track_live_action_popup(observer.clone(), menu, path, window, cx);
             },
         )
     }
@@ -2482,6 +2524,7 @@ impl MusheenApp {
                         parameters,
                         entry.origin_tab(),
                         Some(entry.captured_targets()),
+                        false,
                         cx,
                     );
                 }
@@ -2554,6 +2597,7 @@ impl MusheenApp {
                         parameters,
                         origin_tab,
                         Some(&captured_targets),
+                        false,
                         cx,
                     );
                 }
@@ -2742,12 +2786,15 @@ impl MusheenApp {
         };
         let move_operation = pending.command_id() == "clipboard.move_to";
         let command = self
-            .shell
-            .commands()
-            .get(pending.command_id())
-            .and_then(|command| self.catalog.message(command.label_key()).ok())
-            .unwrap_or(pending.command_id())
-            .to_owned();
+            .custom_action_review_label(pending.custom_action_id())
+            .unwrap_or_else(|| {
+                self.shell
+                    .commands()
+                    .get(pending.command_id())
+                    .and_then(|command| self.catalog.message(command.label_key()).ok())
+                    .unwrap_or(pending.command_id())
+                    .to_owned()
+            });
         let targets = pending
             .selection()
             .iter()
@@ -2810,6 +2857,7 @@ impl MusheenApp {
                         parameters,
                         origin_tab,
                         captured_targets.as_deref(),
+                        true,
                         cx,
                     );
                 }
@@ -2827,9 +2875,13 @@ impl MusheenApp {
         parameters: CommandParameters,
         origin_tab: Option<TabId>,
         captured_targets: Option<&[CommandTargetRef]>,
+        confirmed: bool,
         cx: &mut Context<Self>,
     ) {
         match (&action, &parameters) {
+            (CommandAction::CustomAction, CommandParameters::CustomAction { .. }) => {
+                self.run_custom_action(parameters, origin_tab, confirmed, cx);
+            }
             (CommandAction::Restore, CommandParameters::Targets(targets)) => {
                 if let Some(tab_id) = origin_tab
                     && targets.len() == 1
@@ -3046,6 +3098,7 @@ impl MusheenApp {
                 | CommandAction::MoveTo
                 | CommandAction::Restore
                 | CommandAction::EmptyTrash
+                | CommandAction::CustomAction
         ) {
             return CapabilityState::Supported;
         }
@@ -6778,6 +6831,9 @@ impl MusheenApp {
 
 impl Render for MusheenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_custom_actions(cx);
+        let request = self.active_command_request(CommandAction::CustomAction);
+        self.preflight_custom_actions(request.selection(), request.location().clone(), cx);
         if self.customization_keys.is_none() {
             let owner = cx.entity().downgrade();
             let window_id = window.window_handle().window_id();

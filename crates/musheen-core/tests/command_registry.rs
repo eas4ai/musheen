@@ -8,6 +8,36 @@ use musheen_core::{
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn custom_actions_require_a_bounded_stable_identity_before_dispatch() {
+    let registry = CommandRegistry::built_in();
+    let handler = registry.get("actions.custom").unwrap().handler();
+    let mut dispatcher = RecordingDispatcher::default();
+    for (id, definition) in [
+        (None, Some("{}")),
+        (Some("valid"), None),
+        (Some("../invalid"), Some("{}")),
+        (Some(""), Some("{}")),
+        (Some("valid"), Some("")),
+    ] {
+        assert!(
+            handler
+                .invoke(
+                    &mut dispatcher,
+                    CommandParameters::CustomAction {
+                        targets: vec![local_target()],
+                        supports_provider_uris: false,
+                        action_id: id.map(Into::into),
+                        definition: definition.map(Into::into),
+                        location: StorePath::from_unix_path("/tmp"),
+                    }
+                )
+                .is_err()
+        );
+    }
+    assert!(dispatcher.actions.is_empty());
+}
+
+#[test]
 fn tab_commands_refuse_unavailable_navigation_transitions() {
     let registry = CommandRegistry::built_in();
     for id in [

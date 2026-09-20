@@ -15,7 +15,7 @@ mod shell;
 pub mod sidebar;
 mod status_bar;
 mod status_center;
-mod theme;
+pub mod theme;
 mod toolbar;
 pub mod views;
 

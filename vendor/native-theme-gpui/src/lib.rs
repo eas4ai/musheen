@@ -557,6 +557,16 @@ impl NativeTheme {
         self.variant(self.is_dark(cx))
     }
 
+    /// The stored resolved variant for an explicit color mode, if available.
+    ///
+    /// Applications that preview theme modes need both variants to make a
+    /// lossless rollback. This accessor keeps the stored themes immutable and
+    /// avoids rebuilding them from a different preset.
+    #[must_use]
+    pub fn resolved_variant(&self, is_dark: bool) -> Option<&ResolvedTheme> {
+        self.variant(is_dark)
+    }
+
     /// The preferences `apply` / `apply_accessibility` last installed.
     #[must_use]
     pub fn accessibility(&self) -> &AccessibilityPreferences {

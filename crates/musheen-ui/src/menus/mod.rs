@@ -32,6 +32,8 @@ use std::fmt;
 pub struct MenuContribution {
     label: Box<str>,
     command_id: Box<str>,
+    custom_action: Option<musheen_desktop::CustomAction>,
+    custom_action_availability: Option<Result<(), &'static str>>,
 }
 
 impl MenuContribution {
@@ -40,6 +42,8 @@ impl MenuContribution {
         Self {
             label: label.into(),
             command_id: command_id.into(),
+            custom_action: None,
+            custom_action_availability: None,
         }
     }
 
@@ -51,6 +55,21 @@ impl MenuContribution {
     #[must_use]
     pub fn command_id(&self) -> &str {
         &self.command_id
+    }
+
+    pub fn custom_action(action: musheen_desktop::CustomAction) -> Self {
+        Self {
+            label: action.label.clone().into(),
+            command_id: "actions.custom".into(),
+            custom_action: Some(action),
+            custom_action_availability: None,
+        }
+    }
+    /// Availability is supplied by the background desktop preflight. Dispatch
+    /// still revalidates the captured action, targets, and execution policies.
+    pub fn with_availability(mut self, availability: Result<(), &'static str>) -> Self {
+        self.custom_action_availability = Some(availability);
+        self
     }
 }
 
@@ -244,6 +263,12 @@ pub struct PendingInvocation {
 }
 
 impl PendingInvocation {
+    pub(crate) fn custom_action_id(&self) -> Option<&str> {
+        match &self.parameters {
+            CommandParameters::CustomAction { action_id, .. } => action_id.as_deref(),
+            _ => None,
+        }
+    }
     #[must_use]
     pub fn command_id(&self) -> &str {
         self.id.as_str()
@@ -292,6 +317,15 @@ fn pending_with_parameters(
         CommandParameterContract::CustomAction(_) => CommandParameters::CustomAction {
             targets: data.selection.clone(),
             supports_provider_uris: data.context.supports_provider_uris,
+            action_id: data
+                .custom_action
+                .as_ref()
+                .map(|action| action.id.clone().into()),
+            definition: data
+                .custom_action
+                .as_ref()
+                .map(|action| action.fingerprint().into()),
+            location: data.location.clone(),
         },
         CommandParameterContract::OpenWith(_) => {
             let application = application.ok_or(MenuInvocationError::ApplicationRequired)?;

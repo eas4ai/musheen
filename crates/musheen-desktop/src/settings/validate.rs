@@ -2,6 +2,8 @@ use super::{SettingKind, SettingSpec, SettingsError};
 
 pub(super) fn validate_value(spec: &SettingSpec, value: &str) -> Result<(), SettingsError> {
     let valid = match spec.kind {
+        SettingKind::Theme => super::theme::validate_setting(value).is_ok(),
+        SettingKind::CustomActions => crate::CustomActionDocument::import(value).is_ok(),
         SettingKind::Toolbar => musheen_core::ToolbarLayout::import(value).is_ok(),
         SettingKind::Shortcuts => musheen_core::ShortcutMap::import(value).is_ok(),
         SettingKind::Boolean => matches!(value, "true" | "false"),

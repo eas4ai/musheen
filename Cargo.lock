@@ -4411,6 +4411,7 @@ dependencies = [
  "open",
  "png 0.18.1",
  "posix-acl",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4467,6 +4468,7 @@ dependencies = [
 name = "musheen-ui"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "futures-lite",
  "gpui-kit",
  "musheen-core",
@@ -4521,6 +4523,7 @@ dependencies = [
  "configparser",
  "inventory",
  "native-theme-derive",
+ "notify 8.2.0",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -4530,6 +4533,7 @@ dependencies = [
  "serde_with",
  "toml 1.1.6+spec-1.1.0",
  "windows 0.62.2",
+ "zbus",
 ]
 
 [[package]]

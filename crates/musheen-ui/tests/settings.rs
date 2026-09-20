@@ -93,10 +93,13 @@ fn appearance_preview_rolls_back_and_follows_native_theme() {
 fn prior_schema_fixture_migrates_preserving_unknown_fields() {
     let root = tempfile::tempdir().unwrap();
     let store = SettingsStore::at(root.path().join("settings.conf"));
-    // v1 is the sole schema published before this change.
+    // The original resource-limit schema remains supported.
     fs::write(store.path(), include_str!("fixtures/settings-v1.conf")).unwrap();
     let document = store.load().unwrap();
-    assert_eq!(document.schema_version(), 2);
+    assert_eq!(
+        document.schema_version(),
+        musheen_desktop::SETTINGS_SCHEMA_VERSION
+    );
     assert_eq!(document.resource_limits().directory_page_items, 128);
     assert_eq!(document.value("appearance.mode").unwrap(), "system");
     store.save(&document).unwrap();
@@ -334,7 +337,9 @@ async fn settings_gallery_checks_rendered_controls_labels_and_confirmation_at_do
                     assert!(control.visible(), "{locale:?} {}", spec.key);
                     let expected_role = match spec.kind {
                         SettingKind::Boolean | SettingKind::Choice(_) => Role::Button,
-                        SettingKind::Toolbar | SettingKind::Shortcuts => Role::Group,
+                        SettingKind::Toolbar
+                        | SettingKind::Shortcuts
+                        | SettingKind::CustomActions => Role::Group,
                         _ => Role::TextInput,
                     };
                     assert_eq!(control.role(), Some(expected_role), "{}", spec.key);

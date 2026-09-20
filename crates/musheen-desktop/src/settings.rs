@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod document;
 mod migrate;
+pub mod theme;
 mod validate;
 pub use document::*;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 const SETTINGS_FILE_NAME: &str = "settings.conf";
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
@@ -285,6 +286,16 @@ fn parse_document(path: &Path, text: &str) -> Result<SettingsDocument, SettingsE
             )
         })?;
     let version = migrate::migrate_version(path, version)?;
+
+    if entries
+        .get("advanced.custom_actions")
+        .is_some_and(|value| matches!(value.as_ref(), "true" | "false"))
+    {
+        entries.insert(
+            "advanced.custom_actions".into(),
+            crate::CustomActionDocument::default().export().into(),
+        );
+    }
 
     let resource_limits = parse_resource_limits(&mut entries);
     let mut values = SettingsDocument::default().values;

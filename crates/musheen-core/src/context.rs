@@ -293,6 +293,9 @@ pub enum CommandParameters {
     CustomAction {
         targets: Vec<CommandTargetRef>,
         supports_provider_uris: bool,
+        action_id: Option<Box<str>>,
+        definition: Option<Box<str>>,
+        location: StorePath,
     },
     OpenWith {
         targets: Vec<CommandTargetRef>,

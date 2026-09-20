@@ -17,6 +17,7 @@ musheen-ops = { path = "../musheen-ops" }
 open.workspace = true
 png.workspace = true
 posix-acl.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
