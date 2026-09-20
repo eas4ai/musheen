@@ -1,5 +1,7 @@
 use crate::views::DirectoryViewModel;
-use musheen_core::{ItemKind, SearchQuery, SearchQueryError, StoreItem};
+use musheen_core::{ItemId, ItemKind, SearchQuery, SearchQueryError, StoreItem};
+use musheen_desktop::TagCatalog;
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DirectoryFilter {
@@ -10,6 +12,7 @@ pub struct DirectoryFilter {
     modified_after: Option<i64>,
     modified_before: Option<i64>,
     query: Option<SearchQuery>,
+    tagged_items: Option<HashSet<ItemId>>,
 }
 
 impl DirectoryFilter {
@@ -66,6 +69,12 @@ impl DirectoryFilter {
     }
 
     #[must_use]
+    pub fn with_catalog_tag(mut self, catalog: &TagCatalog, tag: &str) -> Self {
+        self.tagged_items = Some(catalog.items_with_tag(tag).into_iter().collect());
+        self
+    }
+
+    #[must_use]
     pub fn apply<'a>(&self, directory: &'a DirectoryViewModel) -> Vec<&'a StoreItem> {
         directory
             .visible_items()
@@ -75,6 +84,13 @@ impl DirectoryFilter {
     }
 
     fn matches(&self, item: &StoreItem) -> bool {
+        if self
+            .tagged_items
+            .as_ref()
+            .is_some_and(|items| !items.contains(item.id()))
+        {
+            return false;
+        }
         if let Some(query) = &self.query {
             let name = item.display_name().as_str().to_lowercase();
             if !query

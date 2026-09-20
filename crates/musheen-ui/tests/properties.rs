@@ -187,6 +187,23 @@ fn properties_model_only_offers_apply_for_dirty_valid_reviewed_edits() {
     assert_eq!(model.state(), PropertiesState::Replaced);
 }
 
+#[test]
+fn properties_tags_page_presents_and_edits_the_shared_tag_model() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("tagged");
+    fs::write(&path, b"contents").unwrap();
+    let snapshot = PropertySnapshot::load(std::slice::from_ref(&path)).unwrap();
+    let mut model = PropertiesDialogModel::new(snapshot);
+    model.set_tags(["blue", "reviewed"]);
+
+    model.select_page(PropertiesPage::Tags).unwrap();
+    assert_eq!(model.tags().collect::<Vec<_>>(), ["blue", "reviewed"]);
+    assert!(model.assign_tag("work").unwrap());
+    assert!(model.remove_tag("blue"));
+    assert_eq!(model.tags().collect::<Vec<_>>(), ["reviewed", "work"]);
+    assert!(model.tags_dirty());
+}
+
 #[cfg(unix)]
 #[test]
 fn properties_model_never_discards_dirty_permissions_during_refresh() {

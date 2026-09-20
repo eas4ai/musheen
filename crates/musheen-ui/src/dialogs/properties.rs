@@ -16,13 +16,14 @@ use musheen_core::{
 use musheen_desktop::{
     AclEntry, AclQualifier, AclState, AggregateValue, ChecksumAlgorithm, ChecksumResult,
     ChecksumService, PropertyError, PropertyRefresh, PropertySnapshot, PropertyTimestamp,
-    RecursiveSize, XattrState,
+    RecursiveSize, TagError, XattrState,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{JobId, MetadataChange, MetadataScope};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -82,6 +83,8 @@ pub struct PropertiesDialogModel {
     pages: Vec<PropertiesPage>,
     page: PropertiesPage,
     state: PropertiesState,
+    original_tags: BTreeSet<Box<str>>,
+    tags: BTreeSet<Box<str>>,
 }
 
 impl PropertiesDialogModel {
@@ -106,6 +109,8 @@ impl PropertiesDialogModel {
             pages,
             page: PropertiesPage::General,
             state: PropertiesState::Ready,
+            original_tags: BTreeSet::new(),
+            tags: BTreeSet::new(),
         }
     }
 
@@ -139,6 +144,39 @@ impl PropertiesDialogModel {
 
     pub fn permissions_mut(&mut self) -> &mut PermissionsPageModel {
         &mut self.permissions
+    }
+
+    pub fn set_tags<'a>(&mut self, tags: impl IntoIterator<Item = &'a str>) {
+        self.tags = tags.into_iter().map(Box::<str>::from).collect();
+        self.original_tags = self.tags.clone();
+    }
+
+    pub fn tags(&self) -> impl Iterator<Item = &str> {
+        self.tags.iter().map(AsRef::as_ref)
+    }
+
+    pub fn assign_tag(&mut self, tag: &str) -> Result<bool, TagError> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(TagError::Empty);
+        }
+        if tag.len() > 128 {
+            return Err(TagError::TooLong);
+        }
+        Ok(self.tags.insert(tag.into()))
+    }
+
+    pub fn remove_tag(&mut self, tag: &str) -> bool {
+        self.tags.remove(tag)
+    }
+
+    #[must_use]
+    pub fn tags_dirty(&self) -> bool {
+        self.tags != self.original_tags
+    }
+
+    pub fn accept_tags(&mut self) {
+        self.original_tags = self.tags.clone();
     }
 
     pub fn apply_visible(&self) -> bool {
@@ -215,12 +253,16 @@ pub enum PropertiesModelError {
     UnavailablePage,
 }
 
-#[derive(Debug)]
 pub struct PropertiesWindowData {
     snapshot: PropertySnapshot,
     filesystem_rows: Vec<(Box<str>, Box<str>)>,
     capability_rows: Vec<(Box<str>, Box<str>)>,
+    tags: BTreeSet<Box<str>>,
+    tag_writer: Option<TagWriter>,
 }
+
+pub(crate) type TagWriter =
+    Arc<dyn Fn(&BTreeSet<Box<str>>) -> Result<(), Box<str>> + Send + Sync + 'static>;
 
 impl PropertiesWindowData {
     pub fn load(paths: &[PathBuf]) -> Result<Self, PropertyError> {
@@ -288,7 +330,21 @@ impl PropertiesWindowData {
             snapshot,
             filesystem_rows,
             capability_rows,
+            tags: BTreeSet::new(),
+            tag_writer: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_tags<'a>(mut self, tags: impl IntoIterator<Item = &'a str>) -> Self {
+        self.tags = tags.into_iter().map(Box::<str>::from).collect();
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_tag_writer(mut self, writer: TagWriter) -> Self {
+        self.tag_writer = Some(writer);
+        self
     }
 }
 
@@ -441,6 +497,9 @@ pub(crate) struct PropertiesWindow {
     operation_hub: OperationHub,
     permission_error: Option<Box<str>>,
     permission_batch: PermissionBatchState,
+    tag_input: Entity<InputState>,
+    tag_writer: Option<TagWriter>,
+    tag_error: Option<Box<str>>,
 }
 
 impl PropertiesWindow {
@@ -485,8 +544,11 @@ impl PropertiesWindow {
                     .placeholder("0755")
             }),
         };
+        let tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("Tag name"));
+        let mut model = PropertiesDialogModel::new(data.snapshot);
+        model.set_tags(data.tags.iter().map(AsRef::as_ref));
         let mut this = Self {
-            model: PropertiesDialogModel::new(data.snapshot),
+            model,
             filesystem_rows: data.filesystem_rows,
             capability_rows: data.capability_rows,
             rows: Vec::new(),
@@ -505,6 +567,9 @@ impl PropertiesWindow {
             operation_hub,
             permission_error: None,
             permission_batch: PermissionBatchState::default(),
+            tag_input,
+            tag_writer: data.tag_writer,
+            tag_error: None,
         };
         this.subscribe_permission_inputs(window, cx);
         this.sync_rows(window, cx);
@@ -956,7 +1021,11 @@ impl PropertiesWindow {
     }
 
     fn tag_rows(&self) -> Vec<(Box<str>, Box<str>)> {
-        let mut rows = Vec::new();
+        let mut rows = self
+            .model
+            .tags()
+            .map(|tag| (Box::<str>::from("Tag"), Box::<str>::from(tag)))
+            .collect::<Vec<_>>();
         for (item_index, item) in self.model.snapshot().items().iter().enumerate() {
             match item.xattrs() {
                 XattrState::Available(entries) if entries.is_empty() => rows.push((
@@ -1227,6 +1296,89 @@ impl PropertiesWindow {
             .into_any_element()
     }
 
+    fn render_tag_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tags = self.model.tags().map(str::to_owned).collect::<Vec<_>>();
+        div()
+            .id("properties-tag-editor")
+            .test_support()
+            .role(Role::Region)
+            .aria_label("Tag editor")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Input::new(&self.tag_input)
+                            .id("properties-tag-input")
+                            .aria_label("Tag name"),
+                    )
+                    .child(Button::new("properties-tag-add").label("Add tag").on_click(
+                        cx.listener(|this, _, window, cx| {
+                            let tag = this.tag_input.read(cx).value().to_string();
+                            match this.model.assign_tag(&tag) {
+                                Ok(_) => {
+                                    this.tag_error = None;
+                                    this.tag_input.update(cx, |input, cx| {
+                                        input.set_value("", window, cx);
+                                    });
+                                }
+                                Err(error) => this.tag_error = Some(error.to_string().into()),
+                            }
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .children(tags.into_iter().enumerate().map(|(index, tag)| {
+                let remove = tag.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(tag)
+                    .child(
+                        Button::new(SharedString::from(format!("properties-tag-remove-{index}")))
+                            .label("Remove")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.model.remove_tag(&remove);
+                                cx.notify();
+                            })),
+                    )
+            }))
+            .when_some(self.tag_error.as_deref(), |editor, error| {
+                editor.child(
+                    div()
+                        .id("properties-tag-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(error.to_owned())
+                        .child(error.to_owned()),
+                )
+            })
+            .child(self.render_rows())
+            .into_any_element()
+    }
+
+    fn apply_tags(&mut self, cx: &mut Context<Self>) {
+        let Some(writer) = self.tag_writer.as_ref() else {
+            self.tag_error = Some("Tag storage is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let tags = self.model.tags.clone();
+        match writer(&tags) {
+            Ok(()) => {
+                self.model.accept_tags();
+                self.tag_error = None;
+            }
+            Err(error) => self.tag_error = Some(error),
+        }
+        cx.notify();
+    }
+
     fn render_page_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut actions = div().flex().items_center().gap_2();
         if self.model.page() == PropertiesPage::Permissions
@@ -1238,6 +1390,17 @@ impl PropertiesWindow {
                     .label("Apply")
                     .primary()
                     .on_click(cx.listener(|this, _, _, cx| this.apply_permissions(cx))),
+            );
+        }
+        if self.model.page() == PropertiesPage::Tags
+            && self.model.tags_dirty()
+            && self.tag_writer.is_some()
+        {
+            actions = actions.child(
+                Button::new("properties-tags-apply")
+                    .label("Apply tags")
+                    .primary()
+                    .on_click(cx.listener(|this, _, _, cx| this.apply_tags(cx))),
             );
         }
         if self.model.page() == PropertiesPage::General && self.single_directory_path().is_some() {
@@ -1374,6 +1537,8 @@ impl Render for PropertiesWindow {
                             .overflow_x_hidden()
                             .child(if self.model.page() == PropertiesPage::Permissions {
                                 self.render_permission_editor(cx)
+                            } else if self.model.page() == PropertiesPage::Tags {
+                                self.render_tag_editor(cx)
                             } else {
                                 self.render_rows()
                             })

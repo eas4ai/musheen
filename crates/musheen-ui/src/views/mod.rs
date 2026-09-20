@@ -17,6 +17,9 @@ pub use selection::SelectionMode;
 pub use sort::{SortDirection, SortKey, SortSpec};
 
 use musheen_core::{ItemId, ItemKind, StoreItem, StorePath, WatchEvent};
+use musheen_desktop::{
+    FolderIdentity, FolderPreferenceCatalog, FolderSortDirection, FolderSortKey, FolderView,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
@@ -111,6 +114,71 @@ impl ViewPreferenceStore {
 
     pub(crate) fn set_defaults(&mut self, preferences: ViewPreferences) {
         self.defaults = preferences;
+    }
+
+    /// Migrates the durable view/sort portion of a catalog preference into the
+    /// existing session model. Session-only presentation fields remain intact.
+    pub fn apply_catalog(
+        &mut self,
+        identity: &FolderIdentity,
+        path: StorePath,
+        catalog: &FolderPreferenceCatalog,
+    ) {
+        let durable = catalog.resolve(identity);
+        let mut preferences = self.for_path(&path).clone();
+        preferences.layout = match durable.view() {
+            FolderView::Details => Layout::Details,
+            FolderView::List => Layout::List,
+            FolderView::Cards => Layout::Cards,
+            FolderView::Grid => Layout::Grid,
+            FolderView::Columns => Layout::Columns,
+            FolderView::Adaptive => Layout::Adaptive,
+        };
+        preferences.sort.key = match durable.sort_key() {
+            FolderSortKey::Name => SortKey::Name,
+            FolderSortKey::Size => SortKey::Size,
+            FolderSortKey::Kind => SortKey::Kind,
+            FolderSortKey::Modified => SortKey::Modified,
+        };
+        preferences.sort.direction = match durable.sort_direction() {
+            FolderSortDirection::Ascending => SortDirection::Ascending,
+            FolderSortDirection::Descending => SortDirection::Descending,
+        };
+        self.set(path, preferences);
+    }
+
+    pub fn persist_catalog(
+        &self,
+        identity: FolderIdentity,
+        path: StorePath,
+        parent: Option<FolderIdentity>,
+        catalog: &mut FolderPreferenceCatalog,
+    ) {
+        let preferences = self.for_path(&path);
+        let view = match preferences.layout {
+            Layout::Details => FolderView::Details,
+            Layout::List => FolderView::List,
+            Layout::Cards => FolderView::Cards,
+            Layout::Grid => FolderView::Grid,
+            Layout::Columns => FolderView::Columns,
+            Layout::Adaptive => FolderView::Adaptive,
+        };
+        let sort_key = match preferences.sort.key {
+            SortKey::Name => FolderSortKey::Name,
+            SortKey::Size => FolderSortKey::Size,
+            SortKey::Kind => FolderSortKey::Kind,
+            SortKey::Modified => FolderSortKey::Modified,
+        };
+        let sort_direction = match preferences.sort.direction {
+            SortDirection::Ascending => FolderSortDirection::Ascending,
+            SortDirection::Descending => FolderSortDirection::Descending,
+        };
+        catalog.set(
+            identity,
+            path,
+            parent,
+            musheen_desktop::FolderPreference::new(view, sort_key, sort_direction),
+        );
     }
 }
 

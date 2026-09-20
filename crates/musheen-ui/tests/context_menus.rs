@@ -4,6 +4,7 @@ use musheen_core::{
     CommandTarget, CommandTargetRef, ItemId, OpenWithIntent, ProviderActionMatrix, ProviderId,
     StorePath,
 };
+use musheen_desktop::TagCatalog;
 use musheen_ui::{
     AppearanceMode, ContextMenuDestinationResolver, ContextMenuRequest, ContextMenuSource,
     ContextMenuSurface, Locale, MenuDirection, MenuEntryKind, MenuFocus, MenuInvocation,
@@ -249,6 +250,50 @@ fn open_with_and_send_to_keep_one_time_association_and_copy_only_destinations_se
     let send_to = menu.entry("clipboard.send_to").unwrap().submenu().unwrap();
     assert!(send_to.destination("/archive").unwrap().copy_only());
     assert!(!send_to.destination("/remote").unwrap().state().is_enabled());
+}
+
+#[test]
+fn catalog_tags_project_through_the_registry_and_dispatch_manage_tags() {
+    let selected = target(b"tagged", "/work/tagged");
+    let mut tags = TagCatalog::default();
+    tags.assign(selected.id(), selected.path().clone(), "Important")
+        .unwrap();
+    tags.assign(selected.id(), selected.path().clone(), "Work")
+        .unwrap();
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let menu = surface.compose(
+        request(
+            supported_context(CommandTarget::File, 1),
+            MenuTarget::Item,
+            vec![selected],
+        )
+        .with_catalog_tags(&tags),
+    );
+
+    let submenu = menu
+        .entry("item.tags")
+        .unwrap()
+        .submenu()
+        .expect("catalog tags use the registry Tags submenu");
+    assert_eq!(
+        submenu
+            .entries()
+            .iter()
+            .map(|entry| entry.label())
+            .collect::<Vec<_>>(),
+        ["Important", "Work"]
+    );
+    let mut dispatcher = RecordingDispatcher::default();
+    assert!(
+        surface
+            .invoke(&submenu.entries()[0], &mut dispatcher)
+            .is_dispatched()
+    );
+    assert_eq!(dispatcher.calls[0].0, CommandAction::ManageTags);
+    assert!(matches!(
+        dispatcher.calls[0].1,
+        CommandParameters::Targets(_)
+    ));
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Linux desktop-service adapters.
 
+mod catalog;
 mod checksum;
 mod clipboard;
 mod conflict_journal;
@@ -14,6 +15,7 @@ mod settings;
 mod status;
 mod thumbnail;
 
+pub use catalog::*;
 pub use checksum::*;
 pub use clipboard::*;
 pub use conflict_journal::*;

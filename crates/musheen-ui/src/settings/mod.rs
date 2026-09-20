@@ -15,12 +15,21 @@ mod window;
 use crate::{Catalog, ThemeProfile};
 pub use appearance::appearance_profile;
 use musheen_desktop::{
-    SettingSpec, SettingsDocument, SettingsError, SettingsFeature, SettingsPage, SettingsStore,
-    settings_schema,
+    CatalogError, CatalogStore, SettingSpec, SettingsDocument, SettingsError, SettingsFeature,
+    SettingsPage, SettingsStore, settings_schema,
 };
 use std::collections::BTreeSet;
 pub use window::{SettingsWindow, open_settings_window};
 pub(crate) use window::{accept_native_theme_change, apply_appearance};
+
+/// The General page owns the explicit clear-history action. The catalog keeps
+/// pins, tags, and session restore in independent models, so this operation
+/// cannot erase them as a side effect.
+pub fn clear_recent_locations(store: &CatalogStore) -> Result<(), CatalogError> {
+    let mut catalog = store.load()?;
+    catalog.recents_mut().clear();
+    store.save(&catalog)
+}
 
 /// Availability is supplied by backend owners, never inferred from a saved preference.
 #[derive(Clone, Debug, Default)]

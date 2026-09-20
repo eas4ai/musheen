@@ -40,6 +40,7 @@ theme-error-color = استخدم ألوانًا معتمة بالتنسيق #RRG
 theme-error-contrast = يتطلب النص تباينًا 4.5:1، وحلقات التركيز والحدود تباينًا 3:1.
 settings-cancel = إلغاء
 settings-reset-page = استعادة إعدادات الصفحة
+settings-clear-recent-locations = مسح المواقع الأخيرة
 settings-reset-all = استعادة جميع الإعدادات
 settings-reset-summary = استعادة الإعدادات الافتراضية لكل الصفحات؟ يتم الحفظ بعد التطبيق.
 settings-confirm = استعادة الإعدادات

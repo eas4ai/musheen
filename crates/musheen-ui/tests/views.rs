@@ -1,4 +1,8 @@
 use musheen_core::{DisplayPath, ItemId, ItemKind, ProviderId, StoreItem, StorePath, WatchEvent};
+use musheen_desktop::{
+    FolderIdentity, FolderPreference, FolderPreferenceCatalog, FolderSortDirection, FolderSortKey,
+    FolderView, PinCatalog,
+};
 use musheen_ui::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use musheen_ui::views::{
     AdaptiveLayout, ColumnKey, DirectoryViewModel, GroupKey, Layout, SelectionMode, SortDirection,
@@ -266,6 +270,96 @@ fn sidebar_sections_hide_when_empty_and_pins_are_shared_between_tabs() {
             .iter()
             .all(|section| section.kind() != SidebarSectionKind::Tags)
     );
+}
+
+#[test]
+fn sidebar_projects_durable_pin_availability_and_catalog_tags() {
+    let provider = ProviderId::new("local").unwrap();
+    let available = ItemId::new(provider.clone(), b"available".to_vec()).unwrap();
+    let missing = ItemId::new(provider, b"missing".to_vec()).unwrap();
+    let mut catalog = PinCatalog::default();
+    catalog
+        .pin(
+            available,
+            StorePath::from_unix_path("/available"),
+            "Available",
+        )
+        .unwrap();
+    catalog
+        .pin(
+            missing.clone(),
+            StorePath::from_unix_path("/missing"),
+            "Missing",
+        )
+        .unwrap();
+    catalog.mark_unavailable(&missing, "volume removed");
+    let pins = PinStore::default();
+    pins.replace_catalog(&catalog);
+    let mut sidebar = SidebarModel::new(pins);
+    sidebar.set_tag_names(["Important", "Work"]);
+
+    let sections = sidebar.sections();
+    let pinned = sections
+        .iter()
+        .find(|section| section.kind() == SidebarSectionKind::Pinned)
+        .unwrap();
+    assert_eq!(pinned.items().len(), 2);
+    assert!(pinned.items()[0].is_available());
+    assert!(!pinned.items()[1].is_available());
+    assert_eq!(
+        pinned.items()[1].unavailable_reason(),
+        Some("volume removed")
+    );
+    assert_eq!(
+        sections
+            .iter()
+            .find(|section| section.kind() == SidebarSectionKind::Tags)
+            .unwrap()
+            .items()
+            .iter()
+            .map(SidebarEntry::label)
+            .collect::<Vec<_>>(),
+        ["Important", "Work"]
+    );
+}
+
+#[test]
+fn session_view_store_overlays_durable_identity_preferences_with_inheritance() {
+    let parent =
+        FolderIdentity::new(ProviderId::new("local").unwrap(), b"volume".to_vec()).unwrap();
+    let child = FolderIdentity::new(ProviderId::new("local").unwrap(), b"folder".to_vec()).unwrap();
+    let child_path = StorePath::from_unix_bytes(b"/media/usb/folder\xff".to_vec());
+    let mut catalog = FolderPreferenceCatalog::default();
+    catalog.set(
+        parent.clone(),
+        StorePath::from_unix_path("/media/usb"),
+        None,
+        FolderPreference::new(
+            FolderView::Details,
+            FolderSortKey::Modified,
+            FolderSortDirection::Descending,
+        ),
+    );
+    catalog.remember_location(child.clone(), child_path.clone(), Some(parent));
+    let mut store = ViewPreferenceStore::default();
+
+    store.apply_catalog(&child, child_path.clone(), &catalog);
+
+    let preferences = store.for_path(&child_path);
+    assert_eq!(preferences.layout, Layout::Details);
+    assert_eq!(preferences.sort.key, SortKey::Modified);
+    assert_eq!(preferences.sort.direction, SortDirection::Descending);
+
+    let mut changed = preferences.clone();
+    changed.layout = Layout::Cards;
+    changed.sort.key = SortKey::Size;
+    changed.sort.direction = SortDirection::Ascending;
+    store.set(child_path.clone(), changed);
+    store.persist_catalog(child.clone(), child_path, None, &mut catalog);
+    let durable = catalog.resolve(&child);
+    assert_eq!(durable.view(), FolderView::Cards);
+    assert_eq!(durable.sort_key(), FolderSortKey::Size);
+    assert_eq!(durable.sort_direction(), FolderSortDirection::Ascending);
 }
 
 #[test]

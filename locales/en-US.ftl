@@ -187,6 +187,7 @@ theme-error-color = Use opaque colors in #RRGGBB format.
 theme-error-contrast = Text needs 4.5:1 contrast; focus rings and boundaries need 3:1 contrast.
 settings-cancel = Cancel
 settings-reset-page = Restore Page Defaults
+settings-clear-recent-locations = Clear recent locations
 settings-reset-all = Restore All Defaults
 settings-reset-summary = Restore every page to its defaults? Saved preferences change only after Apply.
 settings-confirm = Restore defaults

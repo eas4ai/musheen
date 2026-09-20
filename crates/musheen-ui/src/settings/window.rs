@@ -7,12 +7,13 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Disableable, Root, WindowExt};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, Global, IntoElement, Render, Role,
-    ScrollHandle, SharedString, Subscription, TestSupportExt, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowOptions, div, px, size,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, Global, IntoElement,
+    Render, Role, ScrollHandle, SharedString, Subscription, TestSupportExt, TitlebarOptions,
+    Window, WindowBounds, WindowHandle, WindowOptions, div, px, size,
 };
 use musheen_desktop::{
-    SettingKind, SettingSpec, SettingsDocument, SettingsPage, SettingsStore, settings_schema,
+    CatalogStore, SettingKind, SettingSpec, SettingsDocument, SettingsFeature, SettingsPage,
+    SettingsStore, settings_schema,
 };
 use std::collections::BTreeMap;
 
@@ -56,8 +57,15 @@ fn open_settings_at(store: SettingsStore, cx: &mut App) {
         ..Default::default()
     };
     match cx.open_window(options, move |window, cx| {
-        let view = cx
-            .new(|cx| SettingsWindow::new(store, SettingsBackends::default(), catalog, window, cx));
+        let view = cx.new(|cx| {
+            SettingsWindow::new(
+                store,
+                SettingsBackends::default().with(SettingsFeature::Catalog),
+                catalog,
+                window,
+                cx,
+            )
+        });
         cx.global_mut::<SettingsWindowOwner>().view = Some(view.downgrade());
         cx.new(|cx| Root::new(view, window, cx))
     }) {
@@ -481,6 +489,9 @@ impl SettingsWindow {
             }
             panel = panel.child(row);
         }
+        if let Some(clear_history) = self.clear_history_button(cx) {
+            panel = panel.child(clear_history);
+        }
         panel
             .child(
                 Button::new("settings-reset-page")
@@ -496,6 +507,30 @@ impl SettingsWindow {
             .test_support()
             .track_scroll(&self.scroll)
             .overflow_y_scroll()
+    }
+
+    fn clear_history_button(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let catalog_available = self
+            .state
+            .page_controls()
+            .iter()
+            .any(|spec| spec.key == "general.record_history");
+        (self.state.page() == SettingsPage::General && catalog_available).then(|| {
+            Button::new("settings-clear-recent-locations")
+                .disabled(self.blocked())
+                .label(self.label("settings-clear-recent-locations"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.clear_recent_locations();
+                    cx.notify();
+                }))
+                .into_any_element()
+        })
+    }
+
+    fn clear_recent_locations(&mut self) {
+        let store = CatalogStore::for_current_user();
+        let result = super::clear_recent_locations(&store);
+        self.failure = result.err().map(|_| "settings-save-error");
     }
 
     fn render_choices(&self, spec: &'static SettingSpec, cx: &Context<Self>) -> impl IntoElement {

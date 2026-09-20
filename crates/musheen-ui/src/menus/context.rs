@@ -103,6 +103,16 @@ impl ContextMenuRequest {
     }
 
     #[must_use]
+    pub fn with_catalog_tags(mut self, catalog: &musheen_desktop::TagCatalog) -> Self {
+        self.tags = catalog
+            .tag_names()
+            .into_iter()
+            .map(|tag| crate::menus::MenuContribution::new(tag, "item.tags"))
+            .collect();
+        self
+    }
+
+    #[must_use]
     pub fn with_actions(mut self, actions: &[crate::menus::MenuContribution]) -> Self {
         self.actions = actions.to_vec();
         self

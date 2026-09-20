@@ -1,9 +1,37 @@
 use gpui_kit::test::TestWindowExt;
-use musheen_desktop::{SettingsDocument, SettingsPage, SettingsStore, settings_schema};
-use musheen_ui::settings::{SettingsBackends, SettingsState};
+use musheen_core::{ItemId, ProviderId, StorePath};
+use musheen_desktop::{
+    CatalogDocument, CatalogStore, FolderIdentity, SettingsDocument, SettingsPage, SettingsStore,
+    settings_schema,
+};
+use musheen_ui::settings::{SettingsBackends, SettingsState, clear_recent_locations};
 use musheen_ui::{AppearanceMode, Catalog, Locale, ThemeProfile};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+
+#[test]
+fn general_settings_clear_only_recent_location_history() {
+    let root = tempfile::tempdir().unwrap();
+    let store = CatalogStore::at(root.path().join("catalog.json"));
+    let provider = ProviderId::new("local").unwrap();
+    let recent = FolderIdentity::new(provider.clone(), b"recent".to_vec()).unwrap();
+    let pinned = ItemId::new(provider, b"pinned".to_vec()).unwrap();
+    let mut catalog = CatalogDocument::default();
+    catalog
+        .recents_mut()
+        .record(recent, StorePath::from_unix_path("/recent"), "Recent");
+    catalog
+        .pins_mut()
+        .pin(pinned, StorePath::from_unix_path("/pinned"), "Pinned")
+        .unwrap();
+    store.save(&catalog).unwrap();
+
+    clear_recent_locations(&store).unwrap();
+
+    let catalog = store.load().unwrap();
+    assert!(catalog.recents().entries().is_empty());
+    assert_eq!(catalog.pins().entries().len(), 1);
+}
 
 #[test]
 fn all_settings_have_one_searchable_localized_owner() {

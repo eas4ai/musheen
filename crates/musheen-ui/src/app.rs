@@ -2,7 +2,7 @@ mod custom_actions;
 
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
-    PropertiesPage, PropertiesWindow, PropertiesWindowData, conflict_window_options,
+    PropertiesPage, PropertiesWindow, PropertiesWindowData, TagWriter, conflict_window_options,
     install_properties_key_bindings, properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
@@ -24,6 +24,7 @@ use crate::status_center::{OperationStatus, OperationStatusEntry, TrashItem, Tra
 use crate::toolbar::COMMAND_IDS;
 use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
+    ViewPreferenceStore,
 };
 use crate::{
     ContextMenu, ContextMenuDestinationResolver, MenuEntry, MenuInvocation, MenuTarget,
@@ -51,9 +52,9 @@ use musheen_core::{
     StorePath, WatchEvent,
 };
 use musheen_desktop::{
-    ConflictDecisionStore, MimeDetector, PreviewDocument, SessionStore, ThumbnailCache,
-    ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService,
-    ThumbnailSize,
+    CatalogDocument, CatalogStore, ConflictDecisionStore, FolderIdentity, MimeDetector,
+    PreviewDocument, SessionStore, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
+    ThumbnailRequest, ThumbnailService, ThumbnailSize,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -211,6 +212,12 @@ struct ItemRenderSpec {
 struct FileDragPreview {
     label: String,
     position: Point<Pixels>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCatalogMove {
+    source: ItemId,
+    destination: StorePath,
 }
 
 #[derive(Default)]
@@ -711,6 +718,18 @@ pub fn run(initial_path: PathBuf) {
                 application.windows().to_vec(),
             )));
             let operation_hub = OperationHub::for_current_user(&limits);
+            let catalog_store = CatalogStore::for_current_user();
+            let mut catalog_document = catalog_store.load().unwrap_or_else(|error| {
+                eprintln!("Musheen could not load its catalog: {error}");
+                CatalogDocument::default()
+            });
+            catalog_document.recents_mut().set_recording_enabled(
+                settings.value("general.record_history").as_deref() != Some("false"),
+            );
+            if let Err(error) = catalog_store.save(&catalog_document) {
+                eprintln!("Musheen could not persist its catalog policy: {error}");
+            }
+            let catalog_binding = CatalogBinding::persistent(catalog_store, catalog_document);
             let windows = coordinator
                 .lock()
                 .expect("session coordinator lock is not poisoned")
@@ -724,6 +743,7 @@ pub fn run(initial_path: PathBuf) {
                             coordinator: Arc::clone(&coordinator),
                             window_id,
                             operation_hub: operation_hub.clone(),
+                            catalog: catalog_binding.clone(),
                         },
                     )
                 })
@@ -957,6 +977,54 @@ struct SessionBinding {
     coordinator: Arc<Mutex<SessionCoordinator>>,
     window_id: u64,
     operation_hub: OperationHub,
+    catalog: CatalogBinding,
+}
+
+#[derive(Clone, Debug)]
+struct CatalogBinding {
+    store: Option<CatalogStore>,
+    document: Arc<Mutex<CatalogDocument>>,
+}
+
+impl CatalogBinding {
+    fn in_memory() -> Self {
+        Self {
+            store: None,
+            document: Arc::new(Mutex::new(CatalogDocument::default())),
+        }
+    }
+
+    fn persistent(store: CatalogStore, document: CatalogDocument) -> Self {
+        Self {
+            store: Some(store),
+            document: Arc::new(Mutex::new(document)),
+        }
+    }
+
+    fn snapshot(&self) -> CatalogDocument {
+        self.document
+            .lock()
+            .expect("catalog lock is not poisoned")
+            .clone()
+    }
+
+    fn update(&self, change: impl FnOnce(&mut CatalogDocument)) -> Result<(), Box<str>> {
+        let mut document = self.document.lock().expect("catalog lock is not poisoned");
+        if let Some(store) = &self.store {
+            *document = store
+                .load()
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+        }
+        let previous = document.clone();
+        change(&mut document);
+        if let Some(store) = &self.store
+            && let Err(error) = store.save(&document)
+        {
+            *document = previous;
+            return Err(error.to_string().into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1012,6 +1080,7 @@ impl SessionBinding {
             coordinator: Arc::clone(&self.coordinator),
             window_id,
             operation_hub: self.operation_hub.clone(),
+            catalog: self.catalog.clone(),
         })
     }
 }
@@ -1022,6 +1091,7 @@ struct MusheenApp {
     filters: HashMap<TabId, ActiveFilter>,
     sidebars: HashMap<TabId, SidebarModel>,
     pins: PinStore,
+    catalog_binding: CatalogBinding,
     limits: ResourceLimits,
     store: Arc<dyn Store>,
     shell: crate::ShellModel,
@@ -1063,6 +1133,7 @@ struct MusheenApp {
     pending_empty_trash: Option<MenuInvocation>,
     pending_restores: HashMap<WindowId, PendingRestore>,
     pending_drop: Option<PendingDrop>,
+    pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
     pending_context_menu: Option<ContextMenu>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
     /// Dialog windows are tracked by their GPUI identity. The close observer
@@ -1128,12 +1199,101 @@ impl MusheenApp {
                     coordinator,
                     window_id,
                     operation_hub: OperationHub::new(&limits),
+                    catalog: CatalogBinding::in_memory(),
                 }),
             )
         } else {
             (WindowSession::new(initial), None)
         };
         Self::new_with_navigation(navigation, session_binding, limits, false, cx)
+    }
+
+    #[cfg(test)]
+    fn new_with_catalog_store(
+        initial_path: PathBuf,
+        catalog_store: CatalogStore,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let limits = ResourceLimits::default();
+        let initial = StorePath::from_unix_path(initial_path.into_os_string());
+        let mut app =
+            Self::new_with_navigation(WindowSession::new(initial), None, limits, false, cx);
+        let document = catalog_store.load().unwrap_or_default();
+        app.catalog_binding = CatalogBinding::persistent(catalog_store, document);
+        app.sync_catalog_projection();
+        app
+    }
+
+    fn sync_catalog_projection(&mut self) {
+        let document = self.catalog_binding.snapshot();
+        self.pins.replace_catalog(document.pins());
+        let tag_names = document.tags().tag_names();
+        for sidebar in self.sidebars.values_mut() {
+            sidebar.set_tag_names(tag_names.iter().map(AsRef::as_ref));
+        }
+        let locations = self
+            .navigation
+            .panes()
+            .iter()
+            .flat_map(|pane| pane.tabs())
+            .map(|tab| {
+                (
+                    tab.id(),
+                    tab.location().clone(),
+                    tab.view_preferences().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (tab_id, location, base) in locations {
+            let preferences = self.preferences_with_catalog(&location, base, &document);
+            if let Some(directory) = self.directories.get_mut(&tab_id) {
+                *directory.view_mut().preferences_mut() = preferences.clone();
+            }
+            if let Some(tab) = self.navigation.tab_mut(tab_id) {
+                tab.set_view_preferences(preferences);
+            }
+        }
+    }
+
+    fn folder_identity(&self, location: &StorePath) -> Option<FolderIdentity> {
+        self.store
+            .resolve_item(location)
+            .ok()
+            .flatten()
+            .map(|item| FolderIdentity::from_item(item.id().clone()))
+    }
+
+    fn parent_folder_identity(&self, location: &StorePath) -> Option<FolderIdentity> {
+        let parent = location.as_unix_path()?.parent()?;
+        self.folder_identity(&StorePath::from_unix_path(parent.as_os_str()))
+    }
+
+    fn preferences_with_catalog(
+        &self,
+        location: &StorePath,
+        base: crate::views::ViewPreferences,
+        catalog: &CatalogDocument,
+    ) -> crate::views::ViewPreferences {
+        let Some(identity) = self.folder_identity(location) else {
+            return base;
+        };
+        let mut reconciled = ViewPreferenceStore::new(base.clone());
+        reconciled.set(location.clone(), base);
+        reconciled.apply_catalog(&identity, location.clone(), catalog.folder_preferences());
+        reconciled.for_path(location).clone()
+    }
+
+    fn catalog_models(
+        session_binding: Option<&SessionBinding>,
+    ) -> (CatalogBinding, PinStore, Vec<Box<str>>) {
+        let binding = session_binding
+            .map(|session| session.catalog.clone())
+            .unwrap_or_else(CatalogBinding::in_memory);
+        let snapshot = binding.snapshot();
+        let pins = PinStore::default();
+        pins.replace_catalog(snapshot.pins());
+        let tags = snapshot.tags().tag_names().into_iter().collect();
+        (binding, pins, tags)
     }
 
     fn new_with_navigation(
@@ -1151,14 +1311,16 @@ impl MusheenApp {
         }
         let location = navigation.focused_tab().location().clone();
         let focused_tab = navigation.focused_tab().id();
-        let pins = PinStore::default();
+        let (catalog_binding, pins, tag_names) = Self::catalog_models(session_binding.as_ref());
         let mut directories = HashMap::new();
         let mut directory = DirectoryModel::new(limits.snapshot());
         *directory.view_mut().preferences_mut() =
             navigation.focused_tab().view_preferences().clone();
         directories.insert(focused_tab, directory);
         let mut sidebars = HashMap::new();
-        sidebars.insert(focused_tab, default_sidebar_model(pins.clone()));
+        let mut sidebar = default_sidebar_model(pins.clone());
+        sidebar.set_tag_names(tag_names.iter().map(AsRef::as_ref));
+        sidebars.insert(focused_tab, sidebar);
         let operation_hub = session_binding
             .as_ref()
             .map(|binding| binding.operation_hub.clone())
@@ -1181,6 +1343,7 @@ impl MusheenApp {
             filters: HashMap::new(),
             sidebars,
             pins,
+            catalog_binding,
             limits,
             store: Arc::new(LocalStore::new()),
             shell: crate::ShellModel::new(settings.as_ref().is_some_and(|settings| {
@@ -1216,6 +1379,7 @@ impl MusheenApp {
             pending_empty_trash: None,
             pending_restores: HashMap::new(),
             pending_drop: None,
+            pending_catalog_moves: HashMap::new(),
             pending_context_menu: None,
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
@@ -1258,8 +1422,12 @@ impl MusheenApp {
         if !self.directories.contains_key(&tab_id) {
             let mut directory = DirectoryModel::new(self.limits.snapshot());
             if let Some(tab) = self.navigation.tab(tab_id) {
-                *directory.view_mut().preferences_mut() =
-                    self.navigation.preferences_for(tab.location()).clone();
+                let base = self.navigation.preferences_for(tab.location()).clone();
+                *directory.view_mut().preferences_mut() = self.preferences_with_catalog(
+                    tab.location(),
+                    base,
+                    &self.catalog_binding.snapshot(),
+                );
             }
             self.directories.insert(tab_id, directory);
         }
@@ -1443,7 +1611,11 @@ impl MusheenApp {
             self.navigation.navigate_focused(location.clone());
             self.schedule_session_save(cx);
         }
-        let preferences = self.navigation.preferences_for(&location).clone();
+        let preferences = self.preferences_with_catalog(
+            &location,
+            self.navigation.preferences_for(&location).clone(),
+            &self.catalog_binding.snapshot(),
+        );
         *self.focused_directory_mut().view_mut().preferences_mut() = preferences.clone();
         self.navigation
             .focused_tab_mut()
@@ -1456,6 +1628,17 @@ impl MusheenApp {
         );
         self.pending_content_focus = true;
         self.start_load(location, cx);
+        if remember {
+            let location = self.navigation.focused_tab().location().clone();
+            if let Some(identity) = self.folder_identity(&location) {
+                let label = DisplayPath::from_store_path(&location).as_str().to_owned();
+                if let Err(error) = self.catalog_binding.update(|document| {
+                    document.recents_mut().record(identity, location, label);
+                }) {
+                    self.operation_error = Some(error);
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -1667,12 +1850,41 @@ impl MusheenApp {
         page: PropertiesPage,
         cx: &mut Context<Self>,
     ) {
-        self.open_properties_paths(
+        let catalog = self.catalog_binding.snapshot();
+        let mut tags = targets
+            .first()
+            .map(|target| catalog.tags().tags_for(target.id()))
+            .unwrap_or_default();
+        for target in targets.iter().skip(1) {
+            let item_tags = catalog.tags().tags_for(target.id());
+            tags.retain(|tag| item_tags.contains(tag));
+        }
+        let tag_targets = targets
+            .iter()
+            .map(|target| (target.id().clone(), target.path().clone()))
+            .collect::<Vec<_>>();
+        let catalog_binding = self.catalog_binding.clone();
+        let tag_writer: TagWriter = Arc::new(move |desired| {
+            catalog_binding.update(|document| {
+                for (item, path_hint) in &tag_targets {
+                    let current = document.tags().tags_for(item);
+                    for tag in current.difference(desired) {
+                        document.tags_mut().remove(item, tag);
+                    }
+                    for tag in desired.difference(&current) {
+                        let _ = document.tags_mut().assign(item, path_hint.clone(), tag);
+                    }
+                }
+            })
+        });
+        self.open_properties_paths_with_tags(
             targets
                 .iter()
                 .filter_map(|target| target.path().as_unix_path().map(Path::to_path_buf))
                 .collect(),
             page,
+            tags,
+            Some(tag_writer),
             cx,
         );
     }
@@ -1683,9 +1895,21 @@ impl MusheenApp {
         page: PropertiesPage,
         cx: &mut Context<Self>,
     ) {
+        self.open_properties_paths_with_tags(paths, page, std::iter::empty::<Box<str>>(), None, cx);
+    }
+
+    fn open_properties_paths_with_tags(
+        &mut self,
+        paths: Vec<PathBuf>,
+        page: PropertiesPage,
+        tags: impl IntoIterator<Item = Box<str>>,
+        tag_writer: Option<TagWriter>,
+        cx: &mut Context<Self>,
+    ) {
         if paths.is_empty() {
             return;
         }
+        let tags = tags.into_iter().collect::<Vec<_>>();
         let title = if paths.len() == 1 {
             format!("{} Properties", paths[0].display())
         } else {
@@ -1693,7 +1917,15 @@ impl MusheenApp {
         };
         let options = properties_window_options(title, cx);
         let operation_hub = self.operation_hub.clone();
-        let work = cx.background_spawn(async move { PropertiesWindowData::load(&paths) });
+        let work = cx.background_spawn(async move {
+            PropertiesWindowData::load(&paths).map(|data| {
+                let data = data.with_tags(tags.iter().map(AsRef::as_ref));
+                match tag_writer {
+                    Some(writer) => data.with_tag_writer(writer),
+                    None => data,
+                }
+            })
+        });
         cx.spawn(async move |_, cx| {
             let result = work.await;
             cx.open_window(options, move |window, cx| match result {
@@ -1915,7 +2147,23 @@ impl MusheenApp {
         if let Some(tab) = self.navigation.tab_mut(tab_id) {
             tab.set_view_preferences(preferences.clone());
         }
-        self.navigation.set_preferences_for(location, preferences);
+        self.navigation
+            .set_preferences_for(location.clone(), preferences.clone());
+        if let Some(identity) = self.folder_identity(&location) {
+            let parent = self.parent_folder_identity(&location);
+            let mut reconciled = ViewPreferenceStore::new(preferences.clone());
+            reconciled.set(location.clone(), preferences);
+            if let Err(error) = self.catalog_binding.update(|document| {
+                reconciled.persist_catalog(
+                    identity,
+                    location,
+                    parent,
+                    document.folder_preferences_mut(),
+                );
+            }) {
+                self.operation_error = Some(error);
+            }
+        }
         self.schedule_session_save(cx);
     }
 
@@ -2271,10 +2519,12 @@ impl MusheenApp {
             Vec::new()
         };
         let contributions = self.custom_action_contributions(&selection, &location);
-        crate::ContextMenuRequest::new(context, target, location, selection)
+        let request = crate::ContextMenuRequest::new(context, target, location, selection)
             .with_trash_contents(trash_contents)
             .with_origin_tab(tab_id)
-            .with_actions(&contributions)
+            .with_actions(&contributions);
+        let catalog = self.catalog_binding.snapshot();
+        request.with_catalog_tags(catalog.tags())
     }
 
     fn compose_context_menu_at(
@@ -2440,6 +2690,9 @@ impl MusheenApp {
                 .any(|action| action.supports_provider_uris),
             has_dot_name_semantics: is_local,
             target_is_hidden: selected_item.is_some_and(|item| is_hidden_path(item.path())),
+            target_is_pinned: selection
+                .first()
+                .is_some_and(|target| self.catalog_binding.snapshot().pins().contains(target.id())),
             executable_run_enabled: matches!(executable_state, Some(CapabilityState::Supported)),
             capabilities,
             provider_actions: ProviderActionMatrix::from_states(
@@ -2972,6 +3225,12 @@ impl MusheenApp {
                 }
                 self.open_properties_targets(targets, PropertiesPage::Permissions, cx);
             }
+            (CommandAction::Pin | CommandAction::Unpin, CommandParameters::Targets(targets)) => {
+                self.dispatch_pin_command(action, targets, origin_tab, cx);
+            }
+            (CommandAction::ManageTags, CommandParameters::Targets(targets)) => {
+                self.dispatch_manage_tags(targets, origin_tab, cx);
+            }
             (CommandAction::DirectoryProperties, CommandParameters::Location(location)) => {
                 if let Some(targets) = captured_targets
                     && let Err(error) = self.revalidate_context_targets(origin_tab, targets)
@@ -3018,6 +3277,60 @@ impl MusheenApp {
                 cx.notify();
             }
         }
+    }
+
+    fn dispatch_pin_command(
+        &mut self,
+        action: CommandAction,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+            self.operation_error = Some(error);
+            cx.notify();
+            return;
+        }
+        let Some(target) = targets.first().filter(|_| targets.len() == 1) else {
+            self.operation_error = Some("pin commands require exactly one target".into());
+            cx.notify();
+            return;
+        };
+        let result = if action == CommandAction::Pin {
+            let item = target.id().clone();
+            let path = target.path().clone();
+            let label = DisplayPath::from_store_path(target.path())
+                .as_str()
+                .to_owned();
+            self.catalog_binding.update(|document| {
+                let _ = document.pins_mut().pin(item, path, label);
+            })
+        } else {
+            let item = target.id().clone();
+            self.catalog_binding.update(|document| {
+                document.pins_mut().unpin(&item);
+            })
+        };
+        if let Err(error) = result {
+            self.operation_error = Some(error);
+        } else {
+            self.sync_catalog_projection();
+        }
+        cx.notify();
+    }
+
+    fn dispatch_manage_tags(
+        &mut self,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+            self.operation_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.open_properties_targets(targets, PropertiesPage::Tags, cx);
     }
 
     fn revalidate_context_targets(
@@ -3106,6 +3419,9 @@ impl MusheenApp {
                 | CommandAction::MoveTo
                 | CommandAction::Restore
                 | CommandAction::EmptyTrash
+                | CommandAction::Pin
+                | CommandAction::Unpin
+                | CommandAction::ManageTags
                 | CommandAction::CustomAction
         ) {
             return CapabilityState::Supported;
@@ -3257,20 +3573,58 @@ impl MusheenApp {
             self.advance_pending_drop(cx);
             return;
         }
+        let catalog_moves = self.catalog_moves_for_transfer(&payload, &target);
         let submitted = self
             .operation_hub
             .submit_drop(payload, target)
             .map_err(|error| Box::<str>::from(error.to_string()));
-        self.finish_drop_submission(submitted, cx);
+        self.finish_drop_submission(submitted, catalog_moves, cx);
+    }
+
+    fn catalog_moves_for_transfer(
+        &self,
+        payload: &FileDragPayload,
+        target: &StorePath,
+    ) -> Vec<Option<PendingCatalogMove>> {
+        if payload.action() != DropAction::Move {
+            return vec![None; payload.sources().len()];
+        }
+        payload
+            .sources()
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let source_identity = payload.expected_identity(index).cloned().or_else(|| {
+                    self.store
+                        .resolve_item(source)
+                        .ok()
+                        .flatten()
+                        .map(|item| item.id().clone())
+                })?;
+                let source_path = source.as_unix_path()?;
+                let destination_root = target.as_unix_path()?;
+                let file_name = source_path.file_name()?;
+                Some(PendingCatalogMove {
+                    source: source_identity,
+                    destination: StorePath::from_unix_path(destination_root.join(file_name)),
+                })
+            })
+            .collect()
     }
 
     fn finish_drop_submission(
         &mut self,
         submitted: Result<Vec<musheen_ops::JobId>, Box<str>>,
+        catalog_moves: Vec<Option<PendingCatalogMove>>,
         cx: &mut Context<Self>,
     ) {
         match submitted {
-            Ok(_) => {
+            Ok(ids) => {
+                self.pending_catalog_moves.extend(
+                    ids.into_iter()
+                        .zip(catalog_moves)
+                        .filter_map(|(id, movement)| movement.map(|movement| (id, movement))),
+                );
                 self.operation_error = self.operation_hub.persistence_error();
                 self.pump_operation_queue(cx);
             }
@@ -3291,11 +3645,13 @@ impl MusheenApp {
                     .pending_drop
                     .take()
                     .expect("the completed drop remains pending");
+                let catalog_moves =
+                    self.catalog_moves_for_transfer(&pending.payload, &pending.target);
                 let submitted = self
                     .operation_hub
                     .submit_drop_resolved(pending.payload, pending.target, pending.decisions)
                     .map_err(|error| Box::<str>::from(error.to_string()));
-                self.finish_drop_submission(submitted, cx);
+                self.finish_drop_submission(submitted, catalog_moves, cx);
                 return;
             }
             let conflict = pending.conflicts[pending.next_conflict].clone();
@@ -3436,16 +3792,19 @@ impl MusheenApp {
         let result = spawn_ready_hub_operations(
             self.operation_hub.clone(),
             cx,
-            |state: &mut Self, _, succeeded, error, cx| {
+            |state: &mut Self, id, succeeded, error, cx| {
                 if let Some(error) = error {
                     state.operation_error = Some(error);
                 }
                 if succeeded {
+                    state.finish_catalog_move(id);
                     // A background completion refreshes the current tab; it
                     // must not steal focus restored when a review closes.
                     let pending_content_focus = state.pending_content_focus;
                     state.load_focused_tab(cx);
                     state.pending_content_focus = pending_content_focus;
+                } else {
+                    state.pending_catalog_moves.remove(&id);
                 }
                 state.pump_operation_queue(cx);
                 cx.notify();
@@ -3454,6 +3813,36 @@ impl MusheenApp {
         if let Err(error) = result {
             self.operation_error = Some(error.to_string().into());
             cx.notify();
+        }
+    }
+
+    fn finish_catalog_move(&mut self, id: musheen_ops::JobId) {
+        let Some(movement) = self.pending_catalog_moves.remove(&id) else {
+            return;
+        };
+        let destination = match self.store.resolve_item(&movement.destination) {
+            Ok(Some(destination)) => destination,
+            Ok(None) => {
+                self.operation_error = Some(
+                    "move completed but the destination identity could not be resolved".into(),
+                );
+                return;
+            }
+            Err(error) => {
+                self.operation_error =
+                    Some(format!("move completed but catalog repair failed: {error}").into());
+                return;
+            }
+        };
+        if let Err(error) = self.catalog_binding.update(|document| {
+            document.note_completed_move(
+                &movement.source,
+                destination.id().clone(),
+                movement.destination,
+                true,
+            );
+        }) {
+            self.operation_error = Some(error);
         }
     }
 
@@ -8074,6 +8463,7 @@ mod tests {
             coordinator,
             window_id: first_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
+            catalog: CatalogBinding::in_memory(),
         };
 
         let prepared = binding
@@ -8113,6 +8503,7 @@ mod tests {
             coordinator,
             window_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
+            catalog: CatalogBinding::in_memory(),
         };
 
         let detached = binding
@@ -8141,6 +8532,7 @@ mod tests {
             coordinator,
             window_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
+            catalog: CatalogBinding::in_memory(),
         };
         let older = binding
             .prepare_save(WindowSession::new(StorePath::from_unix_path("/older")))
@@ -10023,5 +10415,110 @@ mod tests {
             );
         })
         .expect("the application window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn durable_catalog_drives_sidebar_and_registry_pin_tag_commands(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("child");
+        filesystem::create_dir(&child).unwrap();
+        let child_path = StorePath::from_unix_path(child.into_os_string());
+        let child_item = LocalStore::new()
+            .resolve_item(&child_path)
+            .unwrap()
+            .unwrap();
+        let root_path = StorePath::from_unix_path(temporary.path().as_os_str());
+        let root_item = LocalStore::new().resolve_item(&root_path).unwrap().unwrap();
+        let catalog_store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let mut catalog = musheen_desktop::CatalogDocument::default();
+        catalog
+            .pins_mut()
+            .pin(child_item.id().clone(), child_path.clone(), "Child")
+            .unwrap();
+        catalog
+            .tags_mut()
+            .assign(child_item.id(), child_path.clone(), "Work")
+            .unwrap();
+        catalog.folder_preferences_mut().set(
+            FolderIdentity::from_item(root_item.id().clone()),
+            root_path.clone(),
+            None,
+            musheen_desktop::FolderPreference::new(
+                musheen_desktop::FolderView::Details,
+                musheen_desktop::FolderSortKey::Modified,
+                musheen_desktop::FolderSortDirection::Descending,
+            ),
+        );
+        catalog_store.save(&catalog).unwrap();
+
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_catalog_store(
+                    temporary.path().to_path_buf(),
+                    catalog_store.clone(),
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        app.update(cx, |state, cx| {
+            assert_eq!(
+                state.focused_directory().view().preferences().layout,
+                Layout::Details
+            );
+            assert_eq!(
+                state.focused_directory().view().preferences().sort.key,
+                SortKey::Modified
+            );
+            let tab_id = state.navigation.focused_tab().id();
+            let target =
+                CommandTargetRef::new(child_item.id().clone(), child_path.clone()).unwrap();
+            let menu = state.compose_context_menu_at(
+                tab_id,
+                MenuTarget::Item,
+                StorePath::from_unix_path(temporary.path()),
+                vec![target],
+            );
+            assert!(menu.entry("directory.pin").is_none());
+            let unpin = menu.entry("directory.unpin").unwrap().clone();
+            let tags = menu.entry("item.tags").unwrap().submenu().unwrap();
+            assert_eq!(tags.entries()[0].label(), "Work");
+            assert!(unpin.state().is_enabled());
+            state.dispatch_context_entry(unpin, cx);
+            assert!(
+                state.catalog_binding.snapshot().pins().entries().is_empty(),
+                "dispatch failed: {:?}",
+                state.operation_error
+            );
+            state
+                .focused_directory_mut()
+                .view_mut()
+                .preferences_mut()
+                .layout = Layout::List;
+            state.persist_focused_view_preferences(cx);
+        });
+
+        let persisted = catalog_store.load().unwrap();
+        assert!(persisted.pins().entries().is_empty());
+        assert_eq!(
+            persisted
+                .folder_preferences()
+                .resolve(&FolderIdentity::from_item(root_item.id().clone()))
+                .view(),
+            musheen_desktop::FolderView::List
+        );
     }
 }

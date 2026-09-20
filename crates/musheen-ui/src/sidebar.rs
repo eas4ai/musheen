@@ -1,4 +1,5 @@
-use musheen_core::StorePath;
+use musheen_core::{ProviderId, StorePath};
+use musheen_desktop::{PinCatalog, PinState};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -32,6 +33,7 @@ impl SidebarSectionKind {
 pub struct SidebarEntry {
     label: Box<str>,
     location: StorePath,
+    unavailable_reason: Option<Box<str>>,
 }
 
 impl SidebarEntry {
@@ -40,6 +42,20 @@ impl SidebarEntry {
         Self {
             label: label.into(),
             location,
+            unavailable_reason: None,
+        }
+    }
+
+    #[must_use]
+    pub fn unavailable(
+        label: impl Into<Box<str>>,
+        location: StorePath,
+        reason: impl Into<Box<str>>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            location,
+            unavailable_reason: Some(reason.into()),
         }
     }
 
@@ -51,6 +67,16 @@ impl SidebarEntry {
     #[must_use]
     pub fn location(&self) -> &StorePath {
         &self.location
+    }
+
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.unavailable_reason.is_none()
+    }
+
+    #[must_use]
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.unavailable_reason.as_deref()
     }
 }
 
@@ -92,6 +118,15 @@ impl PinStore {
             .expect("pin store lock is not poisoned")
             .clone()
     }
+
+    pub fn replace_catalog(&self, catalog: &PinCatalog) {
+        self.replace(catalog.entries().iter().map(|pin| match pin.state() {
+            PinState::Available => SidebarEntry::new(pin.label(), pin.path_hint().clone()),
+            PinState::Unavailable(reason) => {
+                SidebarEntry::unavailable(pin.label(), pin.path_hint().clone(), reason.clone())
+            }
+        }));
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -126,6 +161,19 @@ impl SidebarModel {
         } else {
             self.sections.insert(kind, items);
         }
+    }
+
+    pub fn set_tag_names<'a>(&mut self, tags: impl IntoIterator<Item = &'a str>) {
+        let provider =
+            ProviderId::new("musheen-tag").expect("the built-in tag shortcut provider ID is valid");
+        self.set_section_items(
+            SidebarSectionKind::Tags,
+            tags.into_iter().filter_map(|tag| {
+                StorePath::from_provider_key(provider.clone(), tag.as_bytes().to_vec())
+                    .ok()
+                    .map(|location| SidebarEntry::new(tag, location))
+            }),
+        );
     }
 
     #[must_use]
