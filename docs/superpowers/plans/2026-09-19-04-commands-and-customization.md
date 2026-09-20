@@ -81,16 +81,16 @@ create `crates/musheen-ui/tests/settings.rs`.
 `crates/musheen-core/src/customization.rs`; create
 `crates/musheen-ui/tests/customization.rs`.
 
-- [ ] Test add/remove/reorder, duplicate prevention, required navigation escape,
+- [x] Test add/remove/reorder, duplicate prevention, required navigation escape,
   shortcut conflicts across scopes, reserved OS combinations, import/export,
   reset, and orphaned command IDs after upgrade.
-- [ ] Run the customization test; expect failure.
-- [ ] Store only command IDs and presentation preferences. Render current label,
+- [x] Run the customization test; expect failure.
+- [x] Store only command IDs and presentation preferences. Render current label,
   icon, enablement, and handler from the registry so custom surfaces cannot
   fork behavior.
-- [ ] Add accessible drag alternatives and immediate preview with cancel rollback.
-- [ ] Run the test and manually verify mouse-free editing.
-- [ ] Commit with `feat(ui): add toolbar and shortcut customization`.
+- [x] Add accessible drag alternatives and immediate preview with cancel rollback.
+- [x] Run the test and manually verify mouse-free editing.
+- [x] Commit with `feat(ui): add toolbar and shortcut customization`.
 
 ### Task 5: Add themes and custom actions safely
 
