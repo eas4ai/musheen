@@ -59,21 +59,21 @@ create `crates/musheen-ui/tests/context_menus.rs`.
 create `crates/musheen-ui/src/settings/{mod,window,general,appearance,files,search,operations,terminal,remote,advanced}.rs`;
 create `crates/musheen-ui/tests/settings.rs`.
 
-- [ ] Test category search, validation, cancel/apply semantics, live appearance
+- [x] Test category search, validation, cancel/apply semantics, live appearance
   preview with rollback, reset-by-section, corrupt recovery, unknown-field
   preservation, and migration from every earlier schema fixture.
-- [ ] Run `cargo test -p musheen-ui --test settings`; expect failure.
-- [ ] Implement a single-instance Settings window. Each section edits a draft;
+- [x] Run `cargo test -p musheen-ui --test settings`; expect failure.
+- [x] Implement a single-instance Settings window. Each section edits a draft;
   apply validates the whole transaction and writes atomically. Resource-limit
   controls show defaults, hard maxima, units, and restart requirements.
-- [ ] Keep Settings and Properties non-modal. Trap focus only in conflict,
+- [x] Keep Settings and Properties non-modal. Trap focus only in conflict,
   authorization, and destructive confirmation dialogs, then restore it to the
   exact prior control. Dialog-local keys take precedence over browser keys.
-- [ ] Ensure secret fields store only a credential reference; terminal,
+- [x] Ensure secret fields store only a credential reference; terminal,
   privilege, and remote settings remain hidden until their owning feature is
   available.
-- [ ] Run tests plus light/dark/high-contrast and 200% visual baselines.
-- [ ] Commit with `feat(settings): add validated settings window`.
+- [x] Run tests plus light/dark/high-contrast and 200% visual baselines.
+- [x] Commit with `feat(settings): add validated settings window`.
 
 ### Task 4: Add toolbar and shortcut editors
 
