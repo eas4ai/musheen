@@ -2459,6 +2459,15 @@ impl MusheenApp {
     ) -> ContextMenu {
         let selection = identity
             .and_then(|item| CommandTargetRef::new(item, location.clone()).ok())
+            .or_else(|| {
+                self.store
+                    .resolve_item(&location)
+                    .ok()
+                    .flatten()
+                    .and_then(|item| {
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                    })
+            })
             .into_iter()
             .collect();
         self.compose_context_menu_at(tab_id, target, location, selection)
@@ -2562,7 +2571,9 @@ impl MusheenApp {
         });
         let item_target = if target == MenuTarget::Mount {
             CommandTarget::Mount
-        } else if target == MenuTarget::SidebarLocation && selected_is_pinned {
+        } else if target == MenuTarget::SidebarLocation
+            && (selected_is_pinned || selection.len() == 1)
+        {
             CommandTarget::Directory
         } else if target == MenuTarget::SidebarLocation {
             CommandTarget::Sidebar
@@ -3252,6 +3263,10 @@ impl MusheenApp {
                 {
                     self.operation_error = Some(error);
                     cx.notify();
+                    return;
+                }
+                if let Some(targets) = captured_targets.filter(|targets| !targets.is_empty()) {
+                    self.open_properties_targets(targets, PropertiesPage::General, cx);
                     return;
                 }
                 self.open_properties_paths(
@@ -9692,6 +9707,7 @@ mod tests {
                     .clone();
                 let menu = state.sidebar_entry_context_menu(tab, target, location, Some(identity));
                 let entry = MusheenApp::menu_entry_by_id(&menu, "directory.properties").unwrap();
+                assert!(entry.state().is_enabled());
                 assert_eq!(entry.captured_targets().len(), 1);
                 assert!(
                     state
@@ -11704,5 +11720,89 @@ mod tests {
             .await
             .unwrap();
         assert!(page.items().is_empty());
+    }
+
+    #[gpui_kit::test]
+    async fn shipping_network_sidebar_opens_provider_properties_through_the_live_menu(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let (network_button, root) = app.read_with(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
+            let sidebar = state.sidebars.get(&tab).unwrap();
+            let section = sidebar
+                .sections()
+                .iter()
+                .position(|section| section.kind() == SidebarSectionKind::Network)
+                .unwrap();
+            (format!("sidebar-{section}-0"), network_root_path())
+        });
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(network_button.clone(), cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).navigation.focused_tab().location() == &root
+                && app.read(cx).focused_directory().state() == &DirectoryState::Empty
+        })
+        .await;
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            window.right_click(network_button, cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |window, _| {
+            window.find("popup-menu").visible()
+        })
+        .await;
+        cx.update_window(browser, |_, window, cx| {
+            window.press("up", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.windows().iter().any(|window| *window != browser)
+        })
+        .await;
+        let properties = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.update_window(properties, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("provider-properties").visible());
+            assert!(window.find("provider-properties-pages").visible());
+            assert!(window.find("provider-properties-general-page").visible());
+            assert!(window.find("provider-properties-provider-0").visible());
+            assert!(window.find("provider-properties-identity-0").visible());
+            assert!(window.find("provider-properties-location-0").visible());
+            assert!(window.find("provider-properties-page-tags").visible());
+            window.click("provider-properties-page-tags", cx);
+            window.render_frame(cx);
+            assert!(window.find("provider-properties-general-page").visible());
+            assert!(window.try_find("properties-tags-page").is_none());
+        })
+        .unwrap();
     }
 }
