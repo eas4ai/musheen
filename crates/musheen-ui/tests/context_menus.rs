@@ -1,15 +1,16 @@
 use musheen_core::{
     CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, CommandAction,
-    CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters, CommandRegistry,
-    CommandTarget, CommandTargetRef, ItemId, OpenWithIntent, ProviderActionMatrix, ProviderId,
-    StorePath,
+    CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters,
+    CommandPresentation, CommandRegistry, CommandTarget, CommandTargetRef, ItemId, OpenWithIntent,
+    ProviderActionMatrix, ProviderId, ShortcutMap, StorePath, ToolbarLayout,
 };
 use musheen_ui::{
-    AppearanceMode, ContextMenuDestinationResolver, ContextMenuRequest, ContextMenuSource,
-    ContextMenuSurface, Locale, MenuDirection, MenuEntryKind, MenuFocus, MenuInvocation,
-    MenuKeyRoute, MenuPresentation, MenuTarget, OpenWithApplication, SendToDestination, ShellModel,
-    ThemeProfile,
+    AppearanceMode, ContextMenu, ContextMenuDestinationResolver, ContextMenuRequest,
+    ContextMenuSource, ContextMenuSurface, Locale, MenuContribution, MenuDirection, MenuEntryKind,
+    MenuFocus, MenuInvocation, MenuKeyRoute, MenuPresentation, MenuTarget, OpenWithApplication,
+    SendToDestination, ShellModel, ThemeProfile,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 fn path(value: &str) -> StorePath {
     StorePath::from_unix_path(value)
@@ -737,6 +738,241 @@ fn shell_owns_the_context_menu_surface_used_by_the_application() {
     ));
     assert_eq!(menu.presentation(), MenuPresentation::CompactNativeTheme);
     assert!(menu.entry("create.directory").is_some());
+}
+
+fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
+    let file = target(b"file", "/work/file.txt");
+    let variable_rows = request(
+        supported_context(CommandTarget::File, 1),
+        MenuTarget::Item,
+        vec![file.clone()],
+    )
+    .with_open_with(&[OpenWithApplication::compatible(
+        "Editor",
+        "org.example.Editor",
+    )])
+    .with_send_to(&[SendToDestination::pinned("Archive", path("/archive"), true)])
+    .with_tags(&[MenuContribution::new("Work", "item.tags")])
+    .with_actions(&[MenuContribution::new("Inspect", "actions.custom")]);
+    let mut hidden = supported_context(CommandTarget::File, 1);
+    hidden.target_is_hidden = true;
+    let mut pinned = supported_context(CommandTarget::Directory, 1);
+    pinned.target_is_pinned = true;
+
+    vec![
+        (
+            "background",
+            request(
+                supported_context(CommandTarget::Background, 0),
+                MenuTarget::Background,
+                vec![],
+            ),
+        ),
+        ("file", variable_rows),
+        ("hidden-file", request(hidden, MenuTarget::Item, vec![file])),
+        (
+            "archive",
+            request(
+                supported_context(CommandTarget::Archive, 1),
+                MenuTarget::Item,
+                vec![target(b"archive", "/work/archive.tar")],
+            ),
+        ),
+        (
+            "executable",
+            request(
+                supported_context(CommandTarget::ExecutableFile, 1),
+                MenuTarget::Item,
+                vec![target(b"executable", "/work/tool")],
+            ),
+        ),
+        (
+            "directory",
+            request(
+                supported_context(CommandTarget::Directory, 1),
+                MenuTarget::Item,
+                vec![target(b"directory", "/work/folder")],
+            ),
+        ),
+        (
+            "pinned-directory",
+            request(
+                pinned,
+                MenuTarget::Item,
+                vec![target(b"pinned", "/work/pinned")],
+            ),
+        ),
+        (
+            "sidebar",
+            request(
+                supported_context(CommandTarget::Sidebar, 1),
+                MenuTarget::SidebarLocation,
+                vec![target(b"sidebar", "/work/sidebar")],
+            ),
+        ),
+        (
+            "mount",
+            request(
+                supported_context(CommandTarget::Mount, 1),
+                MenuTarget::Mount,
+                vec![target(b"mount", "/media/device")],
+            ),
+        ),
+        (
+            "tag",
+            request(
+                supported_context(CommandTarget::Tag, 1),
+                MenuTarget::Tag,
+                vec![target(b"tag:work", "/synthetic/work")],
+            ),
+        ),
+        (
+            "trash-item",
+            request(
+                supported_context(CommandTarget::TrashItem, 1),
+                MenuTarget::TrashItem,
+                vec![target(b"trash", "/trash/file")],
+            ),
+        ),
+        (
+            "trash-background",
+            request(
+                supported_context(CommandTarget::TrashBackground, 0),
+                MenuTarget::TrashBackground,
+                vec![],
+            ),
+        ),
+    ]
+}
+
+fn audit_matrix_menu(
+    menu: &ContextMenu,
+    registry: &CommandRegistry,
+    surface_name: &'static str,
+    contexts: &mut BTreeMap<String, BTreeSet<&'static str>>,
+) {
+    for entry in menu.entries() {
+        match entry.kind() {
+            MenuEntryKind::Separator => assert!(entry.command_id().is_none()),
+            MenuEntryKind::Command => {
+                assert!(
+                    entry.command_id().is_some(),
+                    "command row on {surface_name}"
+                );
+            }
+            MenuEntryKind::Submenu | MenuEntryKind::Overflow => {}
+        }
+        if let Some(id) = entry.command_id() {
+            let command = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("{surface_name} bypasses the registry with {id}"));
+            assert_eq!(entry.icon_key(), Some(command.icon_key()));
+            contexts
+                .entry(id.to_owned())
+                .or_default()
+                .insert(surface_name);
+        } else {
+            assert!(
+                matches!(entry.kind(), MenuEntryKind::Separator) || entry.submenu().is_some(),
+                "non-command row on {surface_name} must be structural"
+            );
+        }
+        if let Some(submenu) = entry.submenu() {
+            audit_matrix_menu(submenu, registry, surface_name, contexts);
+        }
+    }
+}
+
+fn matrix_marker(value: bool) -> &'static str {
+    if value { "yes" } else { "—" }
+}
+
+fn render_surface_matrix(
+    registry: &CommandRegistry,
+    contexts: &BTreeMap<String, BTreeSet<&'static str>>,
+) -> String {
+    let toolbar = ToolbarLayout::default()
+        .ids()
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let shortcuts = ShortcutMap::default()
+        .bindings(registry)
+        .into_iter()
+        .map(|binding| binding.command.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut output = String::from(
+        "# Command Surface Matrix\n\n\
+         Generated by `cargo test -p musheen-ui --test context_menus`. Each row names the one registry predicate used by every projection. `Context` lists canonical menus; `Toolbar` and `Shortcut` describe defaults. All commands project to the menu and palette.\n\n\
+         | Command ID | Capability policy | Context | Toolbar | Menu | Shortcut | Palette |\n\
+         |---|---|---|---:|---:|---:|---:|\n",
+    );
+    for command in registry.commands() {
+        let context = contexts
+            .get(command.id().as_str())
+            .map(|values| values.iter().copied().collect::<Vec<_>>().join(", "))
+            .unwrap_or_else(|| "—".to_owned());
+        output.push_str(&format!(
+            "| `{}` | `{:?}` | {} | {} | yes | {} | yes |\n",
+            command.id().as_str(),
+            command.predicate(),
+            context,
+            matrix_marker(toolbar.contains(command.id().as_str())),
+            matrix_marker(shortcuts.contains(command.id().as_str())),
+        ));
+    }
+    output
+}
+
+#[test]
+fn every_command_surface_uses_one_registry_definition_and_policy() {
+    let registry = CommandRegistry::built_in();
+    registry.audit().expect("built-in registry is unique");
+    let surface = ContextMenuSurface::new(registry.clone());
+    let mut contexts = BTreeMap::new();
+    for (name, request) in surface_matrix_requests() {
+        audit_matrix_menu(&surface.compose(request), &registry, name, &mut contexts);
+    }
+
+    for command in registry.commands() {
+        for presentation in CommandPresentation::ALL {
+            let projection = registry
+                .project(command.id(), presentation)
+                .expect("every command projects to every generic command surface");
+            assert!(
+                std::ptr::eq(projection.command(), command),
+                "{} has a forked {presentation:?} definition",
+                command.id().as_str()
+            );
+            for context in [
+                CommandContext::default(),
+                supported_context(CommandTarget::File, 1),
+                supported_context(CommandTarget::Directory, 1),
+            ] {
+                assert_eq!(
+                    projection.command().state(&context),
+                    command.state(&context)
+                );
+            }
+        }
+    }
+    for id in ToolbarLayout::default().ids() {
+        assert!(registry.project(id, CommandPresentation::Toolbar).is_some());
+    }
+    for binding in ShortcutMap::default().bindings(&registry) {
+        assert!(
+            registry
+                .project(&binding.command, CommandPresentation::Menu)
+                .is_some()
+        );
+    }
+
+    let expected = render_surface_matrix(&registry, &contexts);
+    let actual =
+        std::fs::read_to_string("../../docs/command-surface-matrix.md").unwrap_or_else(|error| {
+            panic!("the checked-in command-surface matrix exists: {error}\n\n{expected}")
+        });
+    assert_eq!(actual, expected, "regenerate the command-surface matrix");
 }
 
 #[derive(Default)]
