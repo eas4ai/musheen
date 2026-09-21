@@ -7073,6 +7073,14 @@ impl MusheenApp {
                         .map(|(section_index, section)| {
                             let kind = section.kind();
                             let collapsed = sidebar.is_section_collapsed(kind);
+                            let section_label = self
+                                .catalog
+                                .message(section.label_key())
+                                .expect("the sidebar section label is localized")
+                                .to_owned();
+                            let section_description = self
+                                .catalog
+                                .sidebar_section_description(&section_label, collapsed);
                             let entries = section
                                 .items()
                                 .iter()
@@ -7204,12 +7212,8 @@ impl MusheenApp {
                                     Button::new(SharedString::from(format!(
                                         "sidebar-section-{section_index}"
                                     )))
-                                    .label(section.label())
-                                    .accessibility_label(format!(
-                                        "{} section, {}",
-                                        section.label(),
-                                        if collapsed { "collapsed" } else { "expanded" }
-                                    ))
+                                    .label(section_label)
+                                    .accessibility_label(section_description)
                                     .ghost()
                                     .small()
                                     .w_full()
@@ -7228,7 +7232,11 @@ impl MusheenApp {
             .id("sidebar")
             .test_support()
             .role(Role::Navigation)
-            .aria_label("Places")
+            .aria_label(
+                self.catalog
+                    .message("sidebar-navigation")
+                    .expect("the sidebar navigation label is localized"),
+            )
             .w(px(220.))
             .h_full()
             .flex_shrink_0()
@@ -12757,6 +12765,72 @@ mod tests {
             assert!(window.try_find("info-pane").is_none());
         })
         .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn sidebar_section_and_navigation_text_is_localized_in_pseudo_and_arabic(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let cases = [
+            (
+                Locale::EnXa,
+                "⟦Ƥŀȧƈḗş··⟧",
+                "⟦Şŧǿřȧɠḗ··⟧",
+                "⟦Şŧǿřȧɠḗ··⟧ · ⟦şḗƈŧīǿƞ··⟧ · ⟦ḗẋƥȧƞḓḗḓ··⟧",
+                "⟦Şŧǿřȧɠḗ··⟧ · ⟦şḗƈŧīǿƞ··⟧ · ⟦ƈǿŀŀȧƥşḗḓ··⟧",
+            ),
+            (
+                Locale::Ar,
+                "الأماكن",
+                "التخزين",
+                "التخزين، قسم، موسّع",
+                "التخزين، قسم، مطوي",
+            ),
+        ];
+        for (locale, navigation, storage, storage_expanded, storage_collapsed) in cases {
+            let initial_path = fixture.clone();
+            let mut app = None;
+            let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut state = MusheenApp::new_with_session_store(initial_path, None, cx);
+                    state.catalog = Catalog::load(locale).expect("the locale catalog is valid");
+                    state
+                });
+                app = Some(view.clone());
+                Root::new(view, window, cx)
+            });
+            let app = app.expect("the localized application view is constructed");
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(
+                    app.read(cx)
+                        .catalog
+                        .message(SidebarSectionKind::Mounts.label_key())
+                        .unwrap(),
+                    storage
+                );
+                let navigation_label = window.find("sidebar").label().unwrap().to_owned();
+                let storage_label = window.find("sidebar-section-2").label().unwrap().to_owned();
+                assert_eq!(navigation_label, navigation);
+                assert_eq!(storage_label, storage_expanded);
+                for forbidden in ["Places", "Storage", "section", "expanded", "collapsed"] {
+                    assert!(!navigation_label.contains(forbidden));
+                    assert!(!storage_label.contains(forbidden));
+                }
+                window.click("sidebar-section-2", cx);
+                assert_eq!(
+                    window.find("sidebar-section-2").label(),
+                    Some(storage_collapsed)
+                );
+            })
+            .expect("localized sidebar window remains open");
+        }
     }
 
     #[gpui_kit::test]

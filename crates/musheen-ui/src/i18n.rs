@@ -121,6 +121,25 @@ impl Catalog {
             format!("{label}, {unavailable}: {reason}")
         }
     }
+
+    #[must_use]
+    pub fn sidebar_section_description(&self, label: &str, collapsed: bool) -> String {
+        let section = self
+            .message("sidebar-section-noun")
+            .expect("the sidebar section noun exists");
+        let state = self
+            .message(if collapsed {
+                "sidebar-section-collapsed"
+            } else {
+                "sidebar-section-expanded"
+            })
+            .expect("the sidebar section state exists");
+        if self.locale == Locale::Ar {
+            format!("{label}، {section}، {state}")
+        } else {
+            format!("{label} · {section} · {state}")
+        }
+    }
 }
 
 fn parse_catalog(source: &str) -> Result<BTreeMap<Box<str>, Box<str>>, CatalogError> {

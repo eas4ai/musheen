@@ -70,6 +70,65 @@ struct FakeBlock {
     slow: Arc<AtomicBool>,
 }
 
+struct IdentityBlock {
+    device: Vec<u8>,
+    uuid: &'static str,
+}
+
+#[zbus::interface(name = "org.freedesktop.UDisks2.Block")]
+impl IdentityBlock {
+    #[zbus(property)]
+    fn device(&self) -> Vec<u8> {
+        self.device.clone()
+    }
+    #[zbus(property)]
+    fn symlinks(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    #[zbus(property)]
+    fn id_uuid(&self) -> &str {
+        self.uuid
+    }
+    #[zbus(property)]
+    fn id_label(&self) -> &str {
+        ""
+    }
+    #[zbus(property)]
+    fn size(&self) -> u64 {
+        4096
+    }
+    #[zbus(property)]
+    fn read_only(&self) -> bool {
+        false
+    }
+    #[zbus(property)]
+    fn drive(&self) -> OwnedObjectPath {
+        OwnedObjectPath::try_from(DRIVE_PATH).unwrap()
+    }
+}
+
+struct FakePartition {
+    uuid: &'static str,
+    number: u32,
+    offset: u64,
+}
+
+#[zbus::interface(name = "org.freedesktop.UDisks2.Partition")]
+impl FakePartition {
+    #[zbus(property)]
+    fn uuid(&self) -> &str {
+        self.uuid
+    }
+    #[zbus(property)]
+    fn number(&self) -> u32 {
+        self.number
+    }
+    #[zbus(property)]
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
 #[zbus::interface(name = "org.freedesktop.UDisks2.Block")]
 impl FakeBlock {
     fn pause(&self) {
@@ -245,6 +304,106 @@ fn start_service(
             .await
             .unwrap()
     })
+}
+
+fn start_identity_service(
+    address: &str,
+    paths: [(&'static str, &'static [u8]); 3],
+) -> zbus::Connection {
+    futures_lite::future::block_on(async {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = zbus::connection::Builder::address(address)
+            .unwrap()
+            .name(SERVICE)
+            .unwrap()
+            .serve_at(ROOT, ObjectManager)
+            .unwrap()
+            .serve_at(DRIVE_PATH, FakeDrive { actions })
+            .unwrap();
+        for (index, (path, device)) in paths.into_iter().enumerate() {
+            builder = builder
+                .serve_at(
+                    path,
+                    IdentityBlock {
+                        device: device.to_vec(),
+                        uuid: if index == 2 { "" } else { "same-uuid" },
+                    },
+                )
+                .unwrap()
+                .serve_at(
+                    path,
+                    FakePartition {
+                        uuid: "",
+                        number: u32::try_from(index + 1).unwrap(),
+                        offset: u64::try_from(index + 1).unwrap() * 4096,
+                    },
+                )
+                .unwrap();
+        }
+        builder.build().await.unwrap()
+    })
+}
+
+#[test]
+fn same_drive_partition_identities_survive_object_and_kernel_path_churn() {
+    let Some(bus) = PrivateBus::start() else {
+        return;
+    };
+    let first_service = start_identity_service(
+        &bus.address,
+        [
+            (
+                "/org/freedesktop/UDisks2/block_devices/sdb1",
+                b"/dev/sdb1\0",
+            ),
+            (
+                "/org/freedesktop/UDisks2/block_devices/sdb2",
+                b"/dev/sdb2\0",
+            ),
+            (
+                "/org/freedesktop/UDisks2/block_devices/sdb3",
+                b"/dev/sdb3\0",
+            ),
+        ],
+    );
+    let backend =
+        ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
+            .unwrap();
+    let before = backend.snapshot().unwrap();
+    assert_eq!(before.devices().len(), 3);
+    let before_ids = before
+        .devices()
+        .iter()
+        .map(|device| device.id().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(before_ids.len(), 3);
+
+    drop(first_service);
+    let second_service = start_identity_service(
+        &bus.address,
+        [
+            (
+                "/org/freedesktop/UDisks2/block_devices/sdz7",
+                b"/dev/sdz7\0",
+            ),
+            (
+                "/org/freedesktop/UDisks2/block_devices/sdz8",
+                b"/dev/sdz8\0",
+            ),
+            (
+                "/org/freedesktop/UDisks2/block_devices/sdz9",
+                b"/dev/sdz9\0",
+            ),
+        ],
+    );
+    let after = backend.snapshot().unwrap();
+    let after_ids = after
+        .devices()
+        .iter()
+        .map(|device| device.id().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(after_ids, before_ids);
+    drop(second_service);
 }
 
 #[test]

@@ -18,6 +18,7 @@ const BLOCK: &str = "org.freedesktop.UDisks2.Block";
 const FILESYSTEM: &str = "org.freedesktop.UDisks2.Filesystem";
 const DRIVE: &str = "org.freedesktop.UDisks2.Drive";
 const ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
+const PARTITION: &str = "org.freedesktop.UDisks2.Partition";
 const DEFAULT_METHOD_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,19 +338,22 @@ impl ZbusUDisksBackend {
         let has_filesystem = interfaces.keys().any(|name| name.as_str() == FILESYSTEM);
         let mount_points = self.mount_points(path, has_filesystem).await?;
         let has_encrypted = interfaces.keys().any(|name| name.as_str() == ENCRYPTED);
+        let has_partition = interfaces.keys().any(|name| name.as_str() == PARTITION);
         let locked = self.is_locked(path, has_encrypted).await?;
         let (can_eject, can_power_off, drive_identity) =
             self.drive_facts(drive_path.as_ref()).await;
-        let persistent_hint = symlinks
-            .iter()
-            .map(|bytes| bytes_to_path(bytes.clone()))
-            .find(|path| path.starts_with("/dev/disk/by-id"))
-            .unwrap_or_else(|| device.clone());
-        // UUIDs are filesystem identifiers, not device identifiers: cloned
-        // media can legitimately share them. The hardware hint provides
-        // persistence while the object path is the collision discriminator.
-        let id_value = stable_device_id(&uuid, &drive_identity, &persistent_hint, path);
-        let id = VolumeId::new(id_value)
+        let identity = self
+            .device_identity(
+                path,
+                &uuid,
+                &drive_identity,
+                &device,
+                &symlinks,
+                has_partition,
+            )
+            .await;
+        let identity_stable = identity.stable;
+        let id = VolumeId::new(identity.value)
             .map_err(|error| UDisksError::Protocol(error.to_string().into()))?;
         let display_label = if label.is_empty() {
             device
@@ -365,11 +369,11 @@ impl ZbusUDisksBackend {
             .with_device(device)
             .with_mount_points(mount_points)
             .with_capabilities(
-                has_filesystem && !locked && !mounted,
-                has_filesystem && !locked && mounted,
-                can_eject,
-                has_encrypted && locked,
-                can_power_off,
+                identity_stable && has_filesystem && !locked && !mounted,
+                identity_stable && has_filesystem && !locked && mounted,
+                identity_stable && can_eject,
+                identity_stable && has_encrypted && locked,
+                identity_stable && can_power_off,
             )
             .with_read_only(read_only)
             .with_locked(locked);
@@ -433,6 +437,48 @@ impl ZbusUDisksBackend {
                 .unwrap_or_default();
         }
         (ejectable, can_power_off, identity)
+    }
+
+    async fn partition_identity(&self, path: &str, present: bool) -> Option<String> {
+        if !present {
+            return None;
+        }
+        let partition = self.proxy(path, PARTITION).await.ok()?;
+        let uuid = partition
+            .get_property::<String>("UUID")
+            .await
+            .unwrap_or_default();
+        let number = partition.get_property::<u32>("Number").await.ok()?;
+        let offset = partition.get_property::<u64>("Offset").await.ok()?;
+        Some(format!("uuid:{uuid}:number:{number}:offset:{offset}"))
+    }
+
+    async fn device_identity(
+        &self,
+        path: &str,
+        uuid: &str,
+        drive: &str,
+        device: &std::path::Path,
+        symlinks: &[Vec<u8>],
+        partition: bool,
+    ) -> DeviceIdentity {
+        let stable_link = symlinks
+            .iter()
+            .map(|bytes| bytes_to_path(bytes.clone()))
+            .filter(|path| is_stable_block_link(path))
+            .min();
+        let partition_hint = self.partition_identity(path, partition).await;
+        let fallback = if partition || drive.is_empty() {
+            BlockIdentity::Ambiguous
+        } else {
+            BlockIdentity::WholeDevice
+        };
+        let block = stable_link
+            .as_deref()
+            .map(BlockIdentity::Link)
+            .or_else(|| partition_hint.as_deref().map(BlockIdentity::Partition))
+            .unwrap_or(fallback);
+        stable_device_id(uuid, drive, block, device, path)
     }
 }
 
@@ -548,31 +594,73 @@ fn bytes_to_path(mut bytes: Vec<u8>) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes))
 }
 
-fn stable_device_id(uuid: &str, drive: &str, device: &std::path::Path, object: &str) -> String {
+#[derive(Clone, Copy, Debug)]
+enum BlockIdentity<'a> {
+    WholeDevice,
+    Link(&'a std::path::Path),
+    Partition(&'a str),
+    Ambiguous,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DeviceIdentity {
+    value: String,
+    stable: bool,
+}
+
+fn stable_device_id(
+    uuid: &str,
+    drive: &str,
+    block: BlockIdentity<'_>,
+    device: &std::path::Path,
+    object: &str,
+) -> DeviceIdentity {
     use std::os::unix::ffi::OsStrExt as _;
 
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(uuid.as_bytes());
-    bytes.push(0);
-    // A by-id symlink, WWN, or serial survives reconnects, kernel device-name
-    // changes, and UDisks object recreation. Only truly anonymous devices need
-    // the volatile object path as a last-resort collision discriminator.
-    if !drive.is_empty() {
+    let stable = !matches!(block, BlockIdentity::Ambiguous);
+    if stable {
         bytes.extend_from_slice(drive.as_bytes());
+        match block {
+            BlockIdentity::WholeDevice => {}
+            BlockIdentity::Link(path) => {
+                bytes.push(0);
+                bytes.extend_from_slice(path.as_os_str().as_bytes());
+            }
+            BlockIdentity::Partition(partition) => {
+                bytes.push(0);
+                bytes.extend_from_slice(partition.as_bytes());
+            }
+            BlockIdentity::Ambiguous => unreachable!(),
+        }
     } else {
+        // There is no stable per-block discriminator. Keep the object visible
+        // and collision-free for this snapshot, but disable actions because the
+        // identity cannot be reconciled safely after object or kernel churn.
+        bytes.extend_from_slice(uuid.as_bytes());
+        bytes.push(0);
         bytes.extend_from_slice(device.as_os_str().as_bytes());
-    }
-    if drive.is_empty() && !device.starts_with("/dev/disk/by-id") {
         bytes.push(0);
         bytes.extend_from_slice(object.as_bytes());
     }
     let mut encoded = String::with_capacity(bytes.len() * 2 + 7);
-    encoded.push_str("device-");
+    encoded.push_str(if stable {
+        "device-"
+    } else {
+        "device-ambiguous-"
+    });
     for byte in bytes {
         use std::fmt::Write as _;
         write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    encoded
+    DeviceIdentity {
+        value: encoded,
+        stable,
+    }
+}
+
+fn is_stable_block_link(path: &std::path::Path) -> bool {
+    path.starts_with("/dev/disk/by-id") || path.starts_with("/dev/disk/by-partuuid")
 }
 
 fn map_connection_error(error: zbus::Error) -> UDisksError {
@@ -828,12 +916,14 @@ mod tests {
         let first = stable_device_id(
             "same-uuid",
             "SERIAL-A",
+            BlockIdentity::Link(std::path::Path::new("/dev/disk/by-id/a")),
             std::path::Path::new("/dev/disk/by-id/a"),
             "/org/freedesktop/UDisks2/block_devices/sdb1",
         );
         let second = stable_device_id(
             "same-uuid",
             "SERIAL-B",
+            BlockIdentity::Link(std::path::Path::new("/dev/disk/by-id/b")),
             std::path::Path::new("/dev/disk/by-id/b"),
             "/org/freedesktop/UDisks2/block_devices/sdc1",
         );
@@ -843,6 +933,7 @@ mod tests {
             stable_device_id(
                 "same-uuid",
                 "SERIAL-A",
+                BlockIdentity::Link(std::path::Path::new("/dev/disk/by-id/a")),
                 std::path::Path::new("/dev/disk/by-id/a"),
                 "/org/freedesktop/UDisks2/block_devices/sdb1",
             )
@@ -854,16 +945,85 @@ mod tests {
         let before = stable_device_id(
             "same-uuid",
             "wwn-123",
+            BlockIdentity::WholeDevice,
             std::path::Path::new("/dev/sdb1"),
             "/org/freedesktop/UDisks2/block_devices/sdb1",
         );
         let after = stable_device_id(
             "same-uuid",
             "wwn-123",
+            BlockIdentity::WholeDevice,
             std::path::Path::new("/dev/sdz1"),
             "/org/freedesktop/UDisks2/block_devices/sdz1",
         );
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn same_drive_block_identities_are_distinct_and_stable_across_path_churn() {
+        let first_before = stable_device_id(
+            "cloned-uuid",
+            "wwn-123",
+            BlockIdentity::Link(std::path::Path::new("/dev/disk/by-id/wwn-123-part1")),
+            std::path::Path::new("/dev/disk/by-id/wwn-123-part1"),
+            "/org/freedesktop/UDisks2/block_devices/sdb1",
+        );
+        let first_after = stable_device_id(
+            "cloned-uuid",
+            "wwn-123",
+            BlockIdentity::Link(std::path::Path::new("/dev/disk/by-id/wwn-123-part1")),
+            std::path::Path::new("/dev/disk/by-id/wwn-123-part1"),
+            "/org/freedesktop/UDisks2/block_devices/sdz1",
+        );
+        let second = stable_device_id(
+            "cloned-uuid",
+            "wwn-123",
+            BlockIdentity::Link(std::path::Path::new("/dev/disk/by-id/wwn-123-part2")),
+            std::path::Path::new("/dev/disk/by-id/wwn-123-part2"),
+            "/org/freedesktop/UDisks2/block_devices/sdb2",
+        );
+        let blank = stable_device_id(
+            "",
+            "wwn-123",
+            BlockIdentity::Link(std::path::Path::new("/dev/disk/by-id/wwn-123-part3")),
+            std::path::Path::new("/dev/disk/by-id/wwn-123-part3"),
+            "/org/freedesktop/UDisks2/block_devices/sdb3",
+        );
+
+        assert_eq!(first_before, first_after);
+        assert_ne!(first_before, second);
+        assert_ne!(second, blank);
+
+        let mut model = crate::volumes::VolumeModel::default();
+        let volumes = [first_before, second, blank].map(|value| {
+            assert!(value.stable);
+            let id = VolumeId::new(value.value).unwrap();
+            let descriptor = DeviceDescriptor::new(id, "/org/freedesktop/UDisks2/block");
+            crate::volumes::Volume::from_device(descriptor, crate::volumes::ServiceState::Available)
+        });
+        assert!(model.replace(Some(":1.42".into()), volumes).is_ok());
+        assert_eq!(model.volumes().len(), 3);
+    }
+
+    #[test]
+    fn ambiguous_same_drive_blocks_remain_visible_but_are_not_stable() {
+        let first = stable_device_id(
+            "",
+            "wwn-123",
+            BlockIdentity::Ambiguous,
+            std::path::Path::new("/dev/sdb1"),
+            "/org/freedesktop/UDisks2/block_devices/sdb1",
+        );
+        let second = stable_device_id(
+            "",
+            "wwn-123",
+            BlockIdentity::Ambiguous,
+            std::path::Path::new("/dev/sdb2"),
+            "/org/freedesktop/UDisks2/block_devices/sdb2",
+        );
+        assert!(!first.stable && !second.stable);
+        assert_ne!(first.value, second.value);
+        assert!(first.value.starts_with("device-ambiguous-"));
     }
 
     #[test]

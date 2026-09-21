@@ -18,15 +18,15 @@ pub enum SidebarSectionKind {
 
 impl SidebarSectionKind {
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub const fn label_key(self) -> &'static str {
         match self {
-            Self::Home => "Home",
-            Self::Places => "Places",
-            Self::Pinned => "Pinned",
-            Self::Mounts => "Storage",
-            Self::Remote => "Remote",
-            Self::Network => "Network",
-            Self::Tags => "Tags",
+            Self::Home => "sidebar-section-home",
+            Self::Places => "sidebar-section-places",
+            Self::Pinned => "sidebar-section-pinned",
+            Self::Mounts => "sidebar-section-storage",
+            Self::Remote => "sidebar-section-remote",
+            Self::Network => "sidebar-section-network",
+            Self::Tags => "sidebar-section-tags",
         }
     }
 }
@@ -220,8 +220,8 @@ impl SidebarSection {
     }
 
     #[must_use]
-    pub const fn label(&self) -> &'static str {
-        self.kind.label()
+    pub const fn label_key(&self) -> &'static str {
+        self.kind.label_key()
     }
 
     #[must_use]
