@@ -19,16 +19,16 @@ DEP-016–017; CUSTOM-022; UXF-005, UXF-017; UIV-019, UIV-023; LIMIT-007.
 create `crates/musheen-desktop/tests/{mimeapps,launch}.rs`; connect
 `crates/musheen-ui/src/dialogs/open_with.rs`.
 
-- [ ] Test the full mimeapps.list precedence cascade, removed associations,
+- [x] Test the full mimeapps.list precedence cascade, removed associations,
   defaults, desktop visibility, `%f/%F/%u/%U` expansion, invalid entries,
   terminal apps, non-UTF-8 path refusal, and association persistence.
-- [ ] Run the tests; expect failure.
-- [ ] Implement the custom resolver and freedesktop desktop-entry adapter.
+- [x] Run the tests; expect failure.
+- [x] Implement the custom resolver and freedesktop desktop-entry adapter.
   Launch with argv vectors, honor `TryExec`, never use shell interpolation, and
   report every item that cannot cross a URI/path boundary losslessly.
-- [ ] Make Open With support one-time choice and explicit default association.
-- [ ] Run malicious desktop-entry and argument fixtures.
-- [ ] Commit with `feat(desktop): add MIME application associations`.
+- [x] Make Open With support one-time choice and explicit default association.
+- [x] Run malicious desktop-entry and argument fixtures.
+- [x] Commit with `feat(desktop): add MIME application associations`.
 
 ### Task 2: Add mounts, devices, and UDisks2 operations
 
