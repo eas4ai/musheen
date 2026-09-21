@@ -2,8 +2,8 @@
 
 use musheen_desktop::{
     Capacity, MountProvider, MountRecord, NoOperationUsage, UDisksBackend, UDisksBusConfig,
-    UDisksError, VolumeAction, VolumeError, VolumeRuntime, VolumeService, VolumeSubscription,
-    VolumeTrigger, ZbusUDisksBackend,
+    UDisksError, UDisksRequest, VolumeAction, VolumeError, VolumeRuntime, VolumeService,
+    VolumeSubscription, VolumeTrigger, ZbusUDisksBackend,
 };
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader};
@@ -41,21 +41,25 @@ struct PrivateBus {
 }
 
 impl PrivateBus {
-    fn start() -> Option<Self> {
+    fn start() -> Self {
         let mut child = Command::new("dbus-daemon")
             .args(["--session", "--nofork", "--print-address=1"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+            .expect("private D-Bus tests require dbus-daemon");
         let mut address = String::new();
-        BufReader::new(child.stdout.take()?)
+        BufReader::new(child.stdout.take().expect("dbus-daemon stdout is piped"))
             .read_line(&mut address)
-            .ok()?;
-        Some(Self {
+            .expect("dbus-daemon must report its address");
+        assert!(
+            !address.trim().is_empty(),
+            "dbus-daemon returned no address"
+        );
+        Self {
             child,
             address: address.trim().to_owned(),
-        })
+        }
     }
 }
 
@@ -471,9 +475,7 @@ fn assert_duplicate_hardware_is_visible_but_unsafe(backend: ZbusUDisksBackend) {
 
 #[test]
 fn empty_hardware_identity_does_not_trust_duplicate_partition_layouts() {
-    let Some(bus) = PrivateBus::start() else {
-        return;
-    };
+    let bus = PrivateBus::start();
     let _service = start_duplicate_hardware_service(&bus.address, "", true);
     let backend =
         ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
@@ -483,9 +485,7 @@ fn empty_hardware_identity_does_not_trust_duplicate_partition_layouts() {
 
 #[test]
 fn duplicated_serial_does_not_trust_whole_device_identity() {
-    let Some(bus) = PrivateBus::start() else {
-        return;
-    };
+    let bus = PrivateBus::start();
     let _service = start_duplicate_hardware_service(&bus.address, "duplicate-serial", false);
     let backend =
         ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
@@ -495,9 +495,7 @@ fn duplicated_serial_does_not_trust_whole_device_identity() {
 
 #[test]
 fn same_drive_partition_identities_survive_object_and_kernel_path_churn() {
-    let Some(bus) = PrivateBus::start() else {
-        return;
-    };
+    let bus = PrivateBus::start();
     let first_service = start_identity_service(
         &bus.address,
         [
@@ -561,9 +559,7 @@ fn same_drive_partition_identities_survive_object_and_kernel_path_churn() {
 
 #[test]
 fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
-    let Some(mut bus) = PrivateBus::start() else {
-        return;
-    };
+    let mut bus = PrivateBus::start();
     let calls = Arc::new(AtomicUsize::new(0));
     let slow = Arc::new(AtomicBool::new(false));
     let error_mode = Arc::new(AtomicUsize::new(1));
@@ -647,6 +643,19 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
     );
     let restarted = backend.snapshot().unwrap();
     assert_ne!(first.owner(), restarted.owner());
+    let actions_before = actions.lock().unwrap().len();
+    let request = UDisksRequest::with_timeout(Duration::from_millis(500));
+    assert_eq!(
+        backend.perform_validated_with_request(
+            &first.devices()[0],
+            Some(first.owner()),
+            VolumeAction::Unmount,
+            None,
+            &request,
+        ),
+        Err(UDisksError::StaleObject)
+    );
+    assert_eq!(actions.lock().unwrap().len(), actions_before);
 
     slow.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
@@ -689,9 +698,7 @@ fn wait_for_trigger(subscription: &VolumeSubscription, expected: VolumeTrigger) 
 
 #[test]
 fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
-    let Some(bus) = PrivateBus::start() else {
-        return;
-    };
+    let bus = PrivateBus::start();
     let calls = Arc::new(AtomicUsize::new(0));
     let slow = Arc::new(AtomicBool::new(false));
     let error_mode = Arc::new(AtomicUsize::new(0));
@@ -700,7 +707,9 @@ fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
     let subscription =
         VolumeSubscription::with_udisks(UDisksBusConfig::address(bus.address.as_str()), false);
     wait_for_trigger(&subscription, VolumeTrigger::MountTableChanged);
-    std::thread::sleep(Duration::from_millis(100));
+    // Registration itself reconciles the already-running service, closing the
+    // signal-before-match-rule race.
+    wait_for_trigger(&subscription, VolumeTrigger::UDisksChanged);
 
     futures_lite::future::block_on(async {
         service
@@ -773,6 +782,7 @@ fn listener_drop_cancels_stalled_bus_setup_without_leaking_threads() {
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let (release, released) = mpsc::sync_channel(1);
+    let (ready, accepted) = mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
         let mut connections = Vec::new();
         let started = std::time::Instant::now();
@@ -785,13 +795,14 @@ fn listener_drop_cancels_stalled_bus_setup_without_leaking_threads() {
                 Err(error) => panic!("stalled bus accept failed: {error}"),
             }
         }
+        ready.send(()).unwrap();
         let _ = released.recv_timeout(Duration::from_secs(2));
         drop(connections);
     });
     let config = UDisksBusConfig::address(format!("unix:path={}", socket.display()));
     let subscription = VolumeSubscription::with_udisks(config, false);
     wait_for_trigger(&subscription, VolumeTrigger::MountTableChanged);
-    std::thread::sleep(Duration::from_millis(50));
+    accepted.recv_timeout(Duration::from_secs(1)).unwrap();
 
     let started = std::time::Instant::now();
     drop(subscription);
@@ -806,16 +817,14 @@ fn listener_drop_cancels_stalled_bus_setup_without_leaking_threads() {
 
 #[test]
 fn listener_disconnect_reconnect_loop_remains_cancellable() {
-    let Some(mut bus) = PrivateBus::start() else {
-        return;
-    };
+    let mut bus = PrivateBus::start();
     let subscription =
         VolumeSubscription::with_udisks(UDisksBusConfig::address(bus.address.as_str()), false);
     wait_for_trigger(&subscription, VolumeTrigger::MountTableChanged);
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_trigger(&subscription, VolumeTrigger::UDisksChanged);
     bus.child.kill().unwrap();
     let _ = bus.child.wait();
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_trigger(&subscription, VolumeTrigger::ServiceOwnerChanged);
 
     let started = std::time::Instant::now();
     drop(subscription);

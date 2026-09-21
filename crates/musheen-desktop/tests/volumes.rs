@@ -16,6 +16,7 @@ struct FakeBackend {
     snapshots: Mutex<VecDeque<Result<BackendSnapshot, UDisksError>>>,
     actions: Mutex<Vec<(VolumeId, VolumeAction)>>,
     action_results: Mutex<VecDeque<Result<(), UDisksError>>>,
+    validation_results: Mutex<VecDeque<Result<(), UDisksError>>>,
 }
 
 impl FakeBackend {
@@ -26,6 +27,38 @@ impl FakeBackend {
     fn queue_action(&self, result: Result<(), UDisksError>) {
         self.action_results.lock().unwrap().push_back(result);
     }
+
+    fn queue_validation(&self, result: Result<(), UDisksError>) {
+        self.validation_results.lock().unwrap().push_back(result);
+    }
+}
+
+#[test]
+fn action_revalidates_owner_and_object_identity_before_dispatch() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    backend.queue_snapshot(Ok(snapshot(
+        "owner-before",
+        [device("sdb1", Some("/media/a"))],
+    )));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let mut service = service(backend.clone(), mounts, Arc::new(FakeUsage::default()));
+    service.refresh().unwrap();
+    backend.queue_validation(Err(UDisksError::StaleObject));
+
+    let error = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        VolumeError::StaleObject | VolumeError::Disappeared(_)
+    ));
+    assert!(backend.actions.lock().unwrap().is_empty());
 }
 
 impl UDisksBackend for FakeBackend {
@@ -48,6 +81,19 @@ impl UDisksBackend for FakeBackend {
             .unwrap()
             .push((volume.id().clone(), action));
         self.action_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(()))
+    }
+
+    fn validate_action(
+        &self,
+        _volume: &DeviceDescriptor,
+        _expected_owner: Option<&str>,
+        _request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        self.validation_results
             .lock()
             .unwrap()
             .pop_front()
@@ -766,4 +812,220 @@ fn listener_enabled_shutdown_preempts_a_slow_snapshot_and_queued_refreshes() {
         started.elapsed() < Duration::from_millis(250),
         "shutdown must cancel an in-flight snapshot instead of draining refresh FIFO"
     );
+}
+
+#[derive(Default)]
+struct ScriptedUsage {
+    responses: Mutex<VecDeque<Vec<OperationUse>>>,
+    queried_mounts: Mutex<Vec<Vec<PathBuf>>>,
+}
+
+impl OperationUsage for ScriptedUsage {
+    fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
+        self.queried_mounts.lock().unwrap().push(mounts.to_vec());
+        self.responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default()
+    }
+
+    fn cancel(&self, _operations: &[OperationUse]) -> Result<(), VolumeError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn drive_wide_actions_include_sibling_partition_jobs() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let usage = Arc::new(ScriptedUsage::default());
+    usage
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(vec![OperationUse::new(
+            MountOperation::new(9),
+            "writing sibling",
+        )]);
+    let drive = "/org/freedesktop/UDisks2/drives/shared";
+    let first = device("sdb1", Some("/media/a")).with_drive_path(drive);
+    let second = device("sdb2", Some("/media/b")).with_drive_path(drive);
+    backend.queue_snapshot(Ok(snapshot("owner", [first, second])));
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/media/b", false),
+    ]);
+    let mut service = VolumeService::new(backend.clone(), mounts, usage.clone());
+    service.refresh().unwrap();
+
+    let error = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Eject,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(error, VolumeError::InUse(_)));
+    assert_eq!(
+        usage.queried_mounts.lock().unwrap()[0],
+        vec![PathBuf::from("/media/a"), PathBuf::from("/media/b")]
+    );
+    assert!(backend.actions.lock().unwrap().is_empty());
+}
+
+#[test]
+fn cancellation_waits_and_rechecks_for_new_jobs_before_dispatch() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let usage = Arc::new(ScriptedUsage::default());
+    let approved = OperationUse::new(MountOperation::new(10), "copying");
+    let replacement = OperationUse::new(MountOperation::new(11), "new write");
+    usage.responses.lock().unwrap().extend([
+        vec![approved.clone()],
+        vec![approved.clone()],
+        vec![replacement.clone()],
+    ]);
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let mut service = VolumeService::new(backend.clone(), mounts, usage);
+    service.refresh().unwrap();
+
+    let error = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::CancelApproved(vec![approved]),
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(error, VolumeError::InUse(ref jobs) if jobs == &[replacement]));
+    assert!(backend.actions.lock().unwrap().is_empty());
+}
+
+struct BlockingCapacity {
+    snapshots: Mutex<VecDeque<Result<Vec<MountRecord>, VolumeError>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl MountProvider for BlockingCapacity {
+    fn snapshot(&self) -> Result<Vec<MountRecord>, VolumeError> {
+        self.snapshots
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(Vec::new()))
+    }
+
+    fn capacity(&self, _path: &Path) -> Result<Capacity, VolumeError> {
+        let _ = self.release.lock().unwrap().recv();
+        Ok(Capacity::new(1, 1))
+    }
+}
+
+#[test]
+fn listener_shutdown_is_not_blocked_by_a_stalled_capacity_probe() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/hang"))])));
+    let (release, blocked) = std::sync::mpsc::channel();
+    let provider = Arc::new(BlockingCapacity {
+        snapshots: Mutex::new(VecDeque::from([Ok(vec![mount(
+            "/dev/sdb1",
+            "/hang",
+            false,
+        )])])),
+        release: Mutex::new(blocked),
+    });
+    let (events, receiver) = async_channel::bounded(1);
+    events.try_send(VolumeTrigger::MountTableChanged).unwrap();
+    let runtime = VolumeRuntime::from_service_with_subscription(
+        VolumeService::new(backend, provider, Arc::new(FakeUsage::default())),
+        VolumeSubscription::from_parts(receiver, Vec::new()),
+    );
+    std::thread::sleep(Duration::from_millis(25));
+    let started = Instant::now();
+    drop(runtime);
+    assert!(started.elapsed() < Duration::from_millis(250));
+    release.send(()).unwrap();
+}
+
+#[test]
+fn subscriber_backpressure_replaces_stale_updates_with_the_latest_state() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    for index in 0..12 {
+        backend.queue_snapshot(Ok(snapshot(
+            "owner",
+            [device(&format!("sdb{index}"), None)],
+        )));
+        mounts.queue(Vec::new());
+    }
+    backend.queue_snapshot(Ok(snapshot("owner", [])));
+    mounts.queue(Vec::new());
+    let runtime = VolumeRuntime::from_service(VolumeService::new(
+        backend,
+        mounts,
+        Arc::new(FakeUsage::default()),
+    ));
+    let updates = runtime.subscribe();
+    for _ in 0..13 {
+        runtime.refresh(VolumeTrigger::UDisksChanged).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !runtime.snapshot().volumes().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut last = updates.recv_blocking().unwrap();
+    while let Ok(update) = updates.try_recv() {
+        last = update;
+    }
+    assert!(last.model().volumes().is_empty());
+}
+
+struct CurrentBackend(Mutex<BackendSnapshot>);
+
+impl UDisksBackend for CurrentBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn event_overflow_still_reconciles_the_final_device_removal() {
+    let backend = Arc::new(CurrentBackend(Mutex::new(snapshot(
+        "owner",
+        [device("sdb1", None)],
+    ))));
+    let (sender, receiver) = async_channel::bounded(32);
+    let runtime = VolumeRuntime::from_service_with_subscription(
+        VolumeService::new(
+            backend.clone(),
+            Arc::new(FakeMounts::default()),
+            Arc::new(FakeUsage::default()),
+        ),
+        VolumeSubscription::from_parts(receiver, Vec::new()),
+    );
+    sender.try_send(VolumeTrigger::UDisksChanged).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.snapshot().get(&id("sdb1")).is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    *backend.0.lock().unwrap() = snapshot("owner", []);
+    for _ in 0..32 {
+        let _ = sender.try_send(VolumeTrigger::UDisksChanged);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !runtime.snapshot().volumes().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(runtime.snapshot().volumes().is_empty());
 }

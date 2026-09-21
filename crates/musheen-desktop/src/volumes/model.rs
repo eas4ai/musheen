@@ -1,4 +1,4 @@
-use super::{Capacity, MountRecord};
+use super::{Capacity, MountRecord, VolumeAction};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -526,6 +526,22 @@ impl VolumeModel {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    #[must_use]
+    pub fn mounts_affected_by(&self, id: &VolumeId, action: VolumeAction) -> Vec<PathBuf> {
+        let Some(selected) = self.get(id) else {
+            return Vec::new();
+        };
+        if !matches!(action, VolumeAction::Eject | VolumeAction::PowerOff) {
+            return selected.mount_points().to_vec();
+        }
+        let drive = selected.descriptor().and_then(DeviceDescriptor::drive_path);
+        self.volumes
+            .values()
+            .filter(|volume| volume.descriptor().and_then(DeviceDescriptor::drive_path) == drive)
+            .flat_map(|volume| volume.mount_points().iter().cloned())
+            .collect()
     }
 }
 

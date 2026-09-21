@@ -43,10 +43,15 @@ pub struct VolumeRuntime(Arc<RuntimeInner>);
 struct RuntimeInner {
     commands: mpsc::SyncSender<RuntimeCommand>,
     model: Arc<RwLock<VolumeModel>>,
-    subscribers: Arc<Mutex<Vec<async_channel::Sender<VolumeUpdate>>>>,
+    subscribers: Arc<Mutex<Vec<LatestSubscriber>>>,
     stopped: Arc<AtomicBool>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     event_thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+struct LatestSubscriber {
+    sender: async_channel::Sender<VolumeUpdate>,
+    receiver: async_channel::Receiver<VolumeUpdate>,
 }
 
 impl std::fmt::Debug for VolumeRuntime {
@@ -102,16 +107,18 @@ impl VolumeRuntime {
         // is an out-of-band cancellation flag, never the tail of a FIFO.
         let (commands, receiver) = mpsc::sync_channel(1);
         let model = Arc::new(RwLock::new(service.model().clone()));
-        let subscribers = Arc::new(Mutex::new(Vec::<async_channel::Sender<VolumeUpdate>>::new()));
+        let subscribers = Arc::new(Mutex::new(Vec::<LatestSubscriber>::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_model = Arc::clone(&model);
         let worker_subscribers = Arc::clone(&subscribers);
         let worker_stopped = Arc::clone(&stopped);
+        let refresh_pending = Arc::new(AtomicBool::new(false));
+        let worker_refresh_pending = Arc::clone(&refresh_pending);
         let worker = thread::Builder::new()
             .name("musheen-volume-service".into())
             .spawn(move || {
                 while !worker_stopped.load(Ordering::Acquire) {
-                    let Ok(command) = receiver.recv() else {
+                    let Some(command) = next_command(&receiver, &worker_refresh_pending) else {
                         break;
                     };
                     if worker_stopped.load(Ordering::Acquire) {
@@ -156,25 +163,24 @@ impl VolumeRuntime {
                         model: snapshot,
                         warning,
                     };
-                    if let Ok(mut listeners) = worker_subscribers.lock() {
-                        listeners.retain(|listener| match listener.try_send(update.clone()) {
-                            Ok(()) | Err(async_channel::TrySendError::Full(_)) => true,
-                            Err(async_channel::TrySendError::Closed(_)) => false,
-                        });
-                    }
+                    publish_update(&worker_subscribers, update);
                 }
             })
             .expect("volume service worker starts");
         let event_thread = events.map(|events| {
             let commands = commands.clone();
             let stopped = Arc::clone(&stopped);
+            let refresh_pending = Arc::clone(&refresh_pending);
             thread::Builder::new()
                 .name("musheen-volume-dispatch".into())
                 .spawn(move || {
                     while !stopped.load(Ordering::Acquire) {
                         if let Some(trigger) = events.recv_timeout(Duration::from_millis(100)) {
                             match commands.try_send(RuntimeCommand::Refresh(trigger)) {
-                                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    refresh_pending.store(true, Ordering::Release);
+                                }
                                 Err(mpsc::TrySendError::Disconnected(_)) => break,
                             }
                         }
@@ -209,7 +215,10 @@ impl VolumeRuntime {
         };
         let _ = sender.try_send(initial);
         if let Ok(mut subscribers) = self.0.subscribers.lock() {
-            subscribers.push(sender);
+            subscribers.push(LatestSubscriber {
+                sender,
+                receiver: receiver.clone(),
+            });
         }
         receiver
     }
@@ -240,6 +249,33 @@ impl VolumeRuntime {
             })
             .map_err(|_| VolumeError::WorkerStopped)?;
         result.recv().map_err(|_| VolumeError::WorkerStopped)?
+    }
+}
+
+fn next_command(
+    receiver: &mpsc::Receiver<RuntimeCommand>,
+    refresh_pending: &AtomicBool,
+) -> Option<RuntimeCommand> {
+    if refresh_pending.swap(false, Ordering::AcqRel) {
+        Some(RuntimeCommand::Refresh(VolumeTrigger::UDisksChanged))
+    } else {
+        receiver.recv().ok()
+    }
+}
+
+fn publish_update(subscribers: &Mutex<Vec<LatestSubscriber>>, update: VolumeUpdate) {
+    if let Ok(mut listeners) = subscribers.lock() {
+        listeners.retain(|listener| match listener.sender.try_send(update.clone()) {
+            Ok(()) => true,
+            Err(async_channel::TrySendError::Full(update)) => {
+                let _ = listener.receiver.try_recv();
+                !matches!(
+                    listener.sender.try_send(update),
+                    Err(async_channel::TrySendError::Closed(_))
+                )
+            }
+            Err(async_channel::TrySendError::Closed(_)) => false,
+        });
     }
 }
 

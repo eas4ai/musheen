@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const VOLUME_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -360,6 +361,7 @@ pub struct VolumeService {
     mounts: Arc<dyn MountProvider>,
     usage: Arc<dyn OperationUsage>,
     model: VolumeModel,
+    capacity_probe_active: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for VolumeService {
@@ -383,6 +385,7 @@ impl VolumeService {
             mounts,
             usage,
             model: VolumeModel::default(),
+            capacity_probe_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -472,7 +475,7 @@ impl VolumeService {
                         .mount_points()
                         .contains(&record.destination().to_path_buf())
                 {
-                    let capacity = self.mounts.capacity(record.destination()).ok();
+                    let capacity = self.probe_capacity(record.destination(), request);
                     volume.attach_mount(record, capacity);
                     consumed.insert(destination.clone());
                 }
@@ -490,7 +493,7 @@ impl VolumeService {
         let mut mount_only = BTreeMap::<VolumeId, Volume>::new();
         for (destination, record) in &mounts {
             if !consumed.contains(destination) {
-                let capacity = self.mounts.capacity(record.destination()).ok();
+                let capacity = self.probe_capacity(record.destination(), request);
                 if record.source().starts_with("/dev/") {
                     let id = VolumeId::from_mount(record);
                     mount_only
@@ -570,12 +573,26 @@ impl VolumeService {
             .ok_or(VolumeError::MountNotExposed)?;
         ensure_supported(&volume, action, unlock_secret)?;
 
-        self.resolve_usage(&volume, action, usage_resolution)?;
+        let affected_mounts = self.model.mounts_affected_by(id, action);
+        self.resolve_usage(&affected_mounts, action, usage_resolution, request)?;
 
-        if let Err(error) =
-            self.backend
-                .perform_with_request(&descriptor, action, unlock_secret, request)
-        {
+        if matches!(
+            action,
+            VolumeAction::Unmount | VolumeAction::Eject | VolumeAction::PowerOff
+        ) {
+            let newly_active = self.usage.operations_using(&affected_mounts);
+            if !newly_active.is_empty() {
+                return Err(VolumeError::InUse(newly_active));
+            }
+        }
+
+        if let Err(error) = self.backend.perform_validated_with_request(
+            &descriptor,
+            self.model.service_owner(),
+            action,
+            unlock_secret,
+            request,
+        ) {
             if error == UDisksError::StaleObject {
                 let _ = self.refresh_with_request(request)?;
                 if self.model.get(id).is_none() {
@@ -593,9 +610,10 @@ impl VolumeService {
 
     fn resolve_usage(
         &self,
-        volume: &Volume,
+        mounts: &[PathBuf],
         action: VolumeAction,
         resolution: UsageResolution,
+        request: &UDisksRequest,
     ) -> Result<(), VolumeError> {
         if !matches!(
             action,
@@ -603,7 +621,7 @@ impl VolumeService {
         ) {
             return Ok(());
         }
-        let operations = self.usage.operations_using(volume.mount_points());
+        let operations = self.usage.operations_using(mounts);
         if operations.is_empty() {
             return Ok(());
         }
@@ -615,7 +633,63 @@ impl VolumeService {
         if ids(&operations) != ids(&approved) {
             return Err(VolumeError::InUse(operations));
         }
-        self.usage.cancel(&approved)
+        self.usage.cancel(&approved)?;
+        loop {
+            request.check()?;
+            let active = self.usage.operations_using(mounts);
+            if active.is_empty() {
+                return Ok(());
+            }
+            if !ids(&active).is_subset(&ids(&approved)) {
+                return Err(VolumeError::InUse(active));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn probe_capacity(&self, path: &std::path::Path, request: &UDisksRequest) -> Option<Capacity> {
+        probe_capacity(
+            Arc::clone(&self.mounts),
+            path,
+            request,
+            Arc::clone(&self.capacity_probe_active),
+        )
+    }
+}
+
+fn probe_capacity(
+    provider: Arc<dyn MountProvider>,
+    path: &std::path::Path,
+    request: &UDisksRequest,
+    active: Arc<AtomicBool>,
+) -> Option<Capacity> {
+    if active.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let path = path.to_path_buf();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let active_on_exit = Arc::clone(&active);
+    if std::thread::Builder::new()
+        .name("musheen-capacity-probe".into())
+        .spawn(move || {
+            let result = provider.capacity(&path).ok();
+            let _ = sender.send(result);
+            active_on_exit.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        active.store(false, Ordering::Release);
+        return None;
+    }
+    loop {
+        if request.check().is_err() {
+            return None;
+        }
+        match receiver.recv_timeout(Duration::from_millis(5)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -655,6 +729,25 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         request.check()?;
         let backend = ZbusUDisksBackend::connect(UDisksBusConfig::system(), request.remaining())?;
         backend.perform_with_request(volume, action, unlock_secret, request)
+    }
+
+    fn perform_validated_with_request(
+        &self,
+        volume: &DeviceDescriptor,
+        expected_owner: Option<&str>,
+        action: VolumeAction,
+        unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        request.check()?;
+        let backend = ZbusUDisksBackend::connect(UDisksBusConfig::system(), request.remaining())?;
+        backend.perform_validated_with_request(
+            volume,
+            expected_owner,
+            action,
+            unlock_secret,
+            request,
+        )
     }
 }
 

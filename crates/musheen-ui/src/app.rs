@@ -1853,7 +1853,12 @@ struct MusheenApp {
     operation_error: Option<Box<str>>,
     volumes: VolumeRuntime,
     volume_revision: u64,
-    volume_properties_windows: Vec<(VolumeId, gpui_kit::WeakEntity<VolumePropertiesWindow>)>,
+    volume_properties_windows: Vec<(
+        VolumeId,
+        gpui_kit::WeakEntity<VolumePropertiesWindow>,
+        WindowId,
+    )>,
+    volume_properties_release_subscription: Option<Subscription>,
     application_notice: Option<&'static str>,
     desktop_paths: Option<DesktopPaths>,
     desktop_applications: DesktopApplicationService,
@@ -2104,6 +2109,7 @@ impl MusheenApp {
             volumes,
             volume_revision: 0,
             volume_properties_windows: Vec::new(),
+            volume_properties_release_subscription: None,
             application_notice: None,
             desktop_paths: DesktopPaths::from_environment().ok(),
             desktop_applications: DesktopApplicationService::default(),
@@ -2128,6 +2134,7 @@ impl MusheenApp {
             context_dialog_close_subscription: None,
             conflict_subscriptions: Vec::new(),
         };
+        this.install_volume_properties_cleanup(cx);
         this.sync_catalog_projection();
         this.start_load(location, cx);
         this.start_operation_status_refresh(cx);
@@ -2169,6 +2176,21 @@ impl MusheenApp {
             }
         })
         .detach();
+    }
+
+    fn install_volume_properties_cleanup(&mut self, cx: &mut Context<Self>) {
+        self.volume_properties_release_subscription = Some(cx.on_release(|this, cx| {
+            let ids = this
+                .volume_properties_windows
+                .drain(..)
+                .map(|(_, _, id)| id)
+                .collect::<Vec<_>>();
+            for handle in cx.windows() {
+                if ids.contains(&handle.window_id()) {
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                }
+            }
+        }));
     }
 
     fn start_pending_xattr_reconciliation(&mut self, cx: &mut Context<Self>) {
@@ -2238,7 +2260,7 @@ impl MusheenApp {
         for sidebar in self.sidebars.values_mut() {
             sidebar.sync_volumes(model);
         }
-        self.volume_properties_windows.retain(|(id, weak)| {
+        self.volume_properties_windows.retain(|(id, weak, _)| {
             let Some(window) = weak.upgrade() else {
                 return false;
             };
@@ -2864,11 +2886,13 @@ impl MusheenApp {
             )
         });
         let weak = view.downgrade();
-        cx.open_window(options, move |window, cx| {
-            cx.new(|cx| Root::new(view, window, cx))
-        })
-        .expect("Musheen could not open a volume Properties window");
-        self.volume_properties_windows.push((id, weak));
+        let handle = cx
+            .open_window(options, move |window, cx| {
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("Musheen could not open a volume Properties window");
+        self.volume_properties_windows
+            .push((id, weak, handle.window_id()));
         true
     }
 
@@ -4451,7 +4475,13 @@ impl MusheenApp {
                     .to_owned()
             })
             .collect();
-        let cancellation_review = self.volume_cancellation_warning(pending.selection());
+        let volume_action = self
+            .shell
+            .commands()
+            .get(pending.command_id())
+            .and_then(|command| volume_action_for_command(command.action()));
+        let cancellation_review =
+            self.volume_cancellation_warning(pending.selection(), volume_action);
         let cancellation_warning = cancellation_review
             .as_ref()
             .map(|(warning, _)| warning.clone());
@@ -4501,12 +4531,14 @@ impl MusheenApp {
     fn volume_cancellation_warning(
         &self,
         targets: &[CommandTargetRef],
+        action: Option<VolumeAction>,
     ) -> Option<(String, Vec<OperationUse>)> {
         let id = targets
             .first()
             .filter(|_| targets.len() == 1)
             .and_then(volume_id_from_target)?;
-        let mounts = self.volumes.snapshot().get(&id)?.mount_points().to_vec();
+        let model = self.volumes.snapshot();
+        let mounts = model.mounts_affected_by(&id, action?);
         let operations = HubVolumeUsage {
             hub: self.operation_hub.clone(),
         }
@@ -14169,6 +14201,121 @@ mod tests {
             assert!(window.find("properties-identity").visible());
         })
         .expect("the Properties window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn closing_browser_closes_its_volume_properties_window(cx: &mut TestAppContext) {
+        struct Backend;
+        impl musheen_desktop::UDisksBackend for Backend {
+            fn snapshot(
+                &self,
+            ) -> Result<musheen_desktop::BackendSnapshot, musheen_desktop::UDisksError>
+            {
+                let descriptor = musheen_desktop::DeviceDescriptor::new(
+                    VolumeId::new("owned-volume").unwrap(),
+                    "/org/freedesktop/UDisks2/block_devices/owned",
+                )
+                .with_label("Owned volume")
+                .with_device("/dev/owned")
+                .with_capabilities(true, false, false, false, false);
+                Ok(musheen_desktop::BackendSnapshot::new(
+                    ":test-owner",
+                    [descriptor],
+                ))
+            }
+            fn perform(
+                &self,
+                _volume: &musheen_desktop::DeviceDescriptor,
+                _action: VolumeAction,
+                _secret: Option<&str>,
+            ) -> Result<(), musheen_desktop::UDisksError> {
+                Ok(())
+            }
+        }
+        struct Mounts;
+        impl musheen_desktop::MountProvider for Mounts {
+            fn snapshot(&self) -> Result<Vec<musheen_desktop::MountRecord>, VolumeError> {
+                Ok(Vec::new())
+            }
+            fn capacity(&self, path: &Path) -> Result<musheen_desktop::Capacity, VolumeError> {
+                Err(VolumeError::Capacity {
+                    path: path.to_path_buf(),
+                    reason: "unused".into(),
+                })
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let runtime = VolumeRuntime::from_service(musheen_desktop::VolumeService::new(
+            Arc::new(Backend),
+            Arc::new(Mounts),
+            Arc::new(musheen_desktop::NoOperationUsage),
+        ));
+        runtime
+            .refresh(musheen_desktop::VolumeTrigger::UDisksChanged)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime
+            .snapshot()
+            .get(&VolumeId::new("owned-volume").unwrap())
+            .is_none()
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let navigation = WindowSession::new(StorePath::from_unix_path(temporary.path()));
+        let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
+            SessionStore::at(temporary.path().join("session.json")),
+            vec![navigation.clone()],
+        )));
+        let window_id = coordinator.lock().unwrap().entries()[0].0;
+        let binding = SessionBinding {
+            window_id,
+            coordinator,
+            operation_hub: OperationHub::new(&ResourceLimits::default()),
+            volume_runtime: Some(runtime),
+            catalog: CatalogBinding::in_memory(),
+            providers: ProviderRuntime::for_current_user(),
+        };
+        let mut app = None;
+        let browser = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_navigation(
+                    navigation,
+                    Some(binding),
+                    None,
+                    ResourceLimits::default(),
+                    false,
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let provider = ProviderId::new("musheen.volume").unwrap();
+        let key = b"owned-volume".to_vec();
+        let target = CommandTargetRef::new(
+            ItemId::new(provider.clone(), key.clone()).unwrap(),
+            StorePath::from_provider_key(provider, key).unwrap(),
+        )
+        .unwrap();
+        app.update(cx, |state, cx| {
+            assert!(state.open_volume_properties_target(&target, cx));
+        });
+        cx.wait_for(browser.into(), Duration::from_secs(2), |_, cx| {
+            cx.windows().len() == 2
+        })
+        .await;
+        drop(app);
+        cx.update_window(browser.into(), |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.windows().is_empty());
     }
 
     #[gpui_kit::test]

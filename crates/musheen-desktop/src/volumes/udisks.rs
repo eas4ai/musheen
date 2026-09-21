@@ -209,6 +209,27 @@ pub trait UDisksBackend: Send + Sync {
         request.check()?;
         result
     }
+
+    fn validate_action(
+        &self,
+        _volume: &DeviceDescriptor,
+        _expected_owner: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        request.check()
+    }
+
+    fn perform_validated_with_request(
+        &self,
+        volume: &DeviceDescriptor,
+        expected_owner: Option<&str>,
+        action: VolumeAction,
+        unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        self.validate_action(volume, expected_owner, request)?;
+        self.perform_with_request(volume, action, unlock_secret, request)
+    }
 }
 
 #[derive(Clone)]
@@ -267,7 +288,16 @@ impl ZbusUDisksBackend {
         path: &'a str,
         interface: &'a str,
     ) -> Result<zbus::Proxy<'a>, UDisksError> {
-        zbus::Proxy::new(&self.connection, self.config.service(), path, interface)
+        self.proxy_at(self.config.service(), path, interface).await
+    }
+
+    async fn proxy_at<'a>(
+        &'a self,
+        destination: &'a str,
+        path: &'a str,
+        interface: &'a str,
+    ) -> Result<zbus::Proxy<'a>, UDisksError> {
+        zbus::Proxy::new(&self.connection, destination, path, interface)
             .await
             .map_err(map_zbus_error)
     }
@@ -587,6 +617,90 @@ impl UDisksBackend for ZbusUDisksBackend {
             Ok(())
         })
     }
+
+    fn validate_action(
+        &self,
+        volume: &DeviceDescriptor,
+        expected_owner: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        let snapshot = self.snapshot_with_request(request)?;
+        if expected_owner.is_none_or(|owner| owner != snapshot.owner()) {
+            return Err(UDisksError::StaleObject);
+        }
+        let current = snapshot
+            .devices()
+            .iter()
+            .find(|candidate| candidate.id() == volume.id());
+        if current.is_none_or(|candidate| {
+            candidate.object_path() != volume.object_path()
+                || candidate.device() != volume.device()
+                || candidate.drive_path() != volume.drive_path()
+        }) {
+            return Err(UDisksError::StaleObject);
+        }
+        Ok(())
+    }
+
+    fn perform_validated_with_request(
+        &self,
+        volume: &DeviceDescriptor,
+        expected_owner: Option<&str>,
+        action: VolumeAction,
+        unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        self.validate_action(volume, expected_owner, request)?;
+        let owner = expected_owner.ok_or(UDisksError::StaleObject)?.to_owned();
+        block_on_request(request, async {
+            if self.service_owner().await? != owner {
+                return Err(UDisksError::StaleObject);
+            }
+            let options: HashMap<&str, Value<'_>> = HashMap::new();
+            match action {
+                VolumeAction::Mount => {
+                    let _: String = self
+                        .proxy_at(&owner, volume.object_path(), FILESYSTEM)
+                        .await?
+                        .call("Mount", &(options,))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+                VolumeAction::Unmount => {
+                    let _: () = self
+                        .proxy_at(&owner, volume.object_path(), FILESYSTEM)
+                        .await?
+                        .call("Unmount", &(options,))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+                VolumeAction::Eject | VolumeAction::PowerOff => {
+                    let drive = volume.drive_path().ok_or(UDisksError::ActionUnavailable)?;
+                    let method = if action == VolumeAction::Eject {
+                        "Eject"
+                    } else {
+                        "PowerOff"
+                    };
+                    let _: () = self
+                        .proxy_at(&owner, drive, DRIVE)
+                        .await?
+                        .call(method, &(options,))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+                VolumeAction::Unlock => {
+                    let secret = unlock_secret.ok_or(UDisksError::UnlockSecretRequired)?;
+                    let _: OwnedObjectPath = self
+                        .proxy_at(&owner, volume.object_path(), ENCRYPTED)
+                        .await?
+                        .call("Unlock", &(secret, options))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 fn block_on_request<T>(
@@ -882,6 +996,7 @@ fn spawn_name_owner_listener(
                     else {
                         return Ok::<(), UDisksError>(());
                     };
+                    let _ = sender.try_send(super::VolumeTrigger::ServiceOwnerChanged);
                     loop {
                         let message =
                             futures_lite::future::race(async { messages.next().await }, async {
@@ -937,6 +1052,7 @@ async fn listen_for_udisks_events(
     else {
         return Ok(());
     };
+    let _ = sender.try_send(super::VolumeTrigger::UDisksChanged);
     loop {
         let message = futures_lite::future::race(async { messages.next().await }, async {
             sender.closed().await;
