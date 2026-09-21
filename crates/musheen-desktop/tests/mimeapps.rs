@@ -1,6 +1,7 @@
 use musheen_desktop::{DesktopEntryCatalog, DesktopPaths, MimeAppsResolver};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 
 fn write(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -107,6 +108,32 @@ fn default_resolution_follows_all_eight_precedence_tiers() {
         let resolved = resolver.default_for(mime_type, &catalog).unwrap().unwrap();
         assert_eq!(resolved.desktop_id(), format!("tier-{index}.desktop"));
     }
+}
+
+#[test]
+fn every_xdg_data_directory_contributes_entries_and_associations_in_order() {
+    let fixture = Fixture::new();
+    let second_data_dir = fixture._temporary.path().join("second-data-dir");
+    desktop(
+        &second_data_dir.join("applications/second.desktop"),
+        "Second data directory",
+        &["text/plain"],
+        "",
+    );
+    write(
+        &second_data_dir.join("applications/mimeapps.list"),
+        "[Default Applications]\ntext/plain=second.desktop;\n",
+    );
+    let paths = DesktopPaths::new(&fixture.config_home, &fixture.data_home)
+        .with_data_dirs([fixture.data_dir.clone(), second_data_dir])
+        .with_current_desktops("GNOME")
+        .with_executable_dirs([PathBuf::from("/usr/bin")]);
+    let catalog = DesktopEntryCatalog::new(paths.clone());
+    let application = MimeAppsResolver::new(paths)
+        .default_for("text/plain", &catalog)
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.desktop_id(), "second.desktop");
 }
 
 #[test]
@@ -385,4 +412,40 @@ fn unavailable_try_exec_entries_are_filtered_and_default_resolution_falls_throug
             .desktop_id(),
         "available.desktop"
     );
+}
+
+#[test]
+fn concurrent_default_writers_share_one_stable_lock_without_losing_associations() {
+    let fixture = Fixture::new();
+    desktop(&fixture.user_app("writer.desktop"), "Writer", &[], "");
+    desktop(&fixture.user_app("viewer.desktop"), "Viewer", &[], "");
+    let paths = fixture.paths();
+    let barrier = Arc::new(Barrier::new(3));
+    let workers = ["writer.desktop", "viewer.desktop"].map(|desktop_id| {
+        let paths = paths.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let catalog = DesktopEntryCatalog::new(paths.clone());
+            let resolver = MimeAppsResolver::new(paths);
+            barrier.wait();
+            resolver
+                .set_default("text/plain", desktop_id, &catalog)
+                .unwrap();
+        })
+    });
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let catalog = DesktopEntryCatalog::new(paths.clone());
+    let applications = MimeAppsResolver::new(paths)
+        .associations_for("text/plain", &catalog)
+        .unwrap();
+    let ids = applications
+        .iter()
+        .map(|application| application.desktop_id())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"writer.desktop"));
+    assert!(ids.contains(&"viewer.desktop"));
 }

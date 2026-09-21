@@ -1,11 +1,13 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable;
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::Button;
+use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, Context, EventEmitter, FocusHandle, ImageSource, IntoElement, Render, Role, SharedString,
-    TestSupportExt, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img, px, size,
+    AnyElement, App, Context, EventEmitter, FocusHandle, ImageSource, IntoElement, Render, Role,
+    SharedString, TestSupportExt, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img,
+    px, size, uniform_list,
 };
 use musheen_desktop::{
     ApplicationIconProvider, DesktopApplication, DesktopEntryCatalog, DesktopEntryLauncher,
@@ -249,6 +251,67 @@ impl OpenWithDialog {
         cx.emit(OpenWithDialogEvent::Chosen { desktop_id, intent });
         window.remove_window();
     }
+
+    fn render_application(
+        &mut self,
+        application: ApplicationChoice,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let desktop_id = application.desktop_id.clone();
+        let view = cx.entity().downgrade();
+        let icon_id = format!("open-with-icon-{}", application.desktop_id());
+        let icon = application.icon().map_or_else(
+            || {
+                div()
+                    .id(SharedString::from(format!(
+                        "open-with-icon-fallback-{}",
+                        application.desktop_id()
+                    )))
+                    .test_support()
+                    .child(Icon::new(IconName::File).small())
+                    .into_any_element()
+            },
+            |path| {
+                div()
+                    .id(SharedString::from(icon_id))
+                    .test_support()
+                    .child(img(ImageSource::from(path.to_path_buf())).size(px(20.)))
+                    .into_any_element()
+            },
+        );
+        div()
+            .id(SharedString::from(format!(
+                "open-with-row-{}",
+                application.desktop_id()
+            )))
+            .test_support()
+            .role(Role::ListItem)
+            .aria_label(application.name())
+            .h(px(40.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(icon)
+            .child(
+                Radio::new(SharedString::from(format!(
+                    "open-with-application-{}",
+                    application.desktop_id()
+                )))
+                .label(application.name())
+                .checked(is_selected)
+                .on_click(move |checked, _, cx| {
+                    if *checked {
+                        let _ = view.update(cx, |this, cx| {
+                            if this.model.select(&desktop_id).is_ok() {
+                                cx.notify();
+                            }
+                        });
+                    }
+                }),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for OpenWithDialog {
@@ -282,51 +345,45 @@ impl Render for OpenWithDialog {
                 .expect("the Set Default action is localized")
                 .to_owned(),
         );
-        let mut applications = div().flex().flex_col().gap_2();
-        for application in self.model.compatible_applications() {
-            let desktop_id = Box::<str>::from(application.desktop_id());
-            let is_selected = selected.as_deref() == Some(application.desktop_id());
-            let icon_id = format!("open-with-icon-{}", application.desktop_id());
-            let icon = application.icon().map_or_else(
-                || {
-                    div()
-                        .id(SharedString::from(format!(
-                            "open-with-icon-fallback-{}",
-                            application.desktop_id()
-                        )))
-                        .test_support()
-                        .child(Icon::new(IconName::File).small())
-                        .into_any_element()
-                },
-                |path| {
-                    div()
-                        .id(SharedString::from(icon_id))
-                        .test_support()
-                        .child(img(ImageSource::from(path.to_path_buf())).size(px(20.)))
-                        .into_any_element()
-                },
-            );
-            applications = applications.child(
-                div().flex().items_center().gap_2().child(icon).child(
-                    Button::new(SharedString::from(format!(
-                        "open-with-application-{}",
-                        application.desktop_id()
-                    )))
-                    .label(application.name())
-                    .when(is_selected, Button::primary)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.model.select(&desktop_id).is_ok() {
-                            cx.notify();
-                        }
-                    })),
-                ),
-            );
-        }
+        let applications = self
+            .model
+            .compatible_applications()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let item_count = applications.len();
+        let applications = std::sync::Arc::new(applications);
+        let list_items = std::sync::Arc::clone(&applications);
+        let applications = uniform_list(
+            "open-with-applications",
+            item_count,
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                let selected = this.model.selected().map(str::to_owned);
+                range
+                    .filter_map(|index| list_items.get(index).cloned())
+                    .map(|application| {
+                        let is_selected = selected.as_deref() == Some(application.desktop_id());
+                        this.render_application(application, is_selected, cx)
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .h(px(320.))
+        .w_full();
+        let applications = div()
+            .id("open-with-application-list")
+            .test_support()
+            .role(Role::List)
+            .aria_label(title.clone())
+            .h(px(320.))
+            .w_full()
+            .child(applications);
         div()
             .id("open-with-dialog")
             .test_support()
             .role(Role::Dialog)
             .aria_label(title.clone())
+            .tab_index(0)
             .track_focus(&self.focus)
             .flex()
             .flex_col()
@@ -420,5 +477,60 @@ impl std::error::Error for OpenWithExecutionError {
             Self::MimeApps(error) => Some(error),
             Self::Launch(error) => Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::component::Root;
+    use gpui_kit::test::TestWindowExt;
+
+    #[gpui_kit::test]
+    async fn many_applications_are_virtualized_accessible_and_focused_at_200_percent(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let choices = (0..500)
+            .map(|index| {
+                ApplicationChoice::new(
+                    format!("example-{index}.desktop"),
+                    format!("Example {index}"),
+                    true,
+                )
+            })
+            .collect();
+        let handle = cx.open_window(size(px(560.), px(480.)), |window, cx| {
+            let view = cx.new(|cx| {
+                OpenWithDialog::new(
+                    OpenWithModel::new("text/plain", choices),
+                    Catalog::load(crate::Locale::EnUs).unwrap(),
+                    cx,
+                )
+            });
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.set_scale_factor(2.0);
+            window.render_frame(cx);
+            assert_eq!(window.scale_factor(), 2.0);
+            assert_eq!(window.find("open-with-dialog").focused(), Some(true));
+            assert!(window.find("open-with-application-list").visible());
+            window.click("open-with-application-example-0.desktop", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window
+                    .find("open-with-application-example-0.desktop")
+                    .checked(),
+                Some(true)
+            );
+            assert!(
+                window
+                    .try_find("open-with-row-example-499.desktop")
+                    .is_none()
+            );
+        })
+        .unwrap();
     }
 }

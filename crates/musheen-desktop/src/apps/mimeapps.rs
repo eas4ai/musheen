@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_MIMEAPPS_BYTES: u64 = 1024 * 1024;
 const MAX_ASSOCIATIONS: usize = 16_384;
-const WRITE_RETRIES: usize = 3;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const DEFAULT_APPLICATIONS: &str = "Default Applications";
@@ -148,27 +147,8 @@ impl MimeAppsResolver {
         fs::create_dir_all(self.paths.config_home())
             .map_err(|source| MimeAppsError::io(self.paths.config_home(), source))?;
 
-        for _ in 0..WRITE_RETRIES {
-            let before = file_identity(&target)?;
-            let mut document = MimeAppsDocument::read_optional(&target)?;
-            document.prepend(DEFAULT_APPLICATIONS, mime_type, desktop_id);
-            document.prepend(ADDED_ASSOCIATIONS, mime_type, desktop_id);
-            document.remove(REMOVED_ASSOCIATIONS, mime_type, desktop_id);
-            let bytes = document.render();
-            if bytes.len() > usize::try_from(MAX_MIMEAPPS_BYTES).expect("limit fits usize") {
-                return Err(MimeAppsError::FileTooLarge(target));
-            }
-            let temporary = write_temporary(&target, bytes.as_bytes())?;
-            if file_identity(&target)? != before {
-                let _ = fs::remove_file(&temporary);
-                continue;
-            }
-            replace_temporary(&temporary, &target)
-                .map_err(|source| MimeAppsError::io(&target, source))?;
-            sync_parent(&target)?;
-            return Ok(());
-        }
-        Err(MimeAppsError::ConcurrentModification(target))
+        let _lock = lock_exclusive(&target)?;
+        persist_default_locked(&target, mime_type, desktop_id, |_| Ok(()))
     }
 
     fn locations(&self) -> Vec<MimeAppsLocation> {
@@ -409,33 +389,66 @@ impl MimeAppsDocument {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    length: u64,
-    modified_nanos: u128,
+fn lock_exclusive(target: &Path) -> Result<File, MimeAppsError> {
+    let mut lock_path = target.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|source| MimeAppsError::io(&lock_path, source))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|source| MimeAppsError::io(&lock_path, io::Error::from(source)))?;
+    Ok(lock)
 }
 
-fn file_identity(path: &Path) -> Result<Option<FileIdentity>, MimeAppsError> {
-    use std::os::unix::fs::MetadataExt;
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(Some(FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            length: metadata.len(),
-            modified_nanos: metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_nanos()),
-        })),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(MimeAppsError::io(path, source)),
+struct TemporaryFile {
+    path: PathBuf,
+}
+
+impl TemporaryFile {
+    fn replace(mut self, target: &Path) -> io::Result<()> {
+        fs::rename(&self.path, target)?;
+        self.path.clear();
+        Ok(())
     }
 }
 
-fn write_temporary(target: &Path, bytes: &[u8]) -> Result<PathBuf, MimeAppsError> {
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn persist_default_locked(
+    target: &Path,
+    mime_type: &str,
+    desktop_id: &str,
+    post_write_check: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), MimeAppsError> {
+    let mut document = MimeAppsDocument::read_optional(target)?;
+    document.prepend(DEFAULT_APPLICATIONS, mime_type, desktop_id);
+    document.prepend(ADDED_ASSOCIATIONS, mime_type, desktop_id);
+    document.remove(REMOVED_ASSOCIATIONS, mime_type, desktop_id);
+    let bytes = document.render();
+    if bytes.len() > usize::try_from(MAX_MIMEAPPS_BYTES).expect("limit fits usize") {
+        return Err(MimeAppsError::FileTooLarge(target.to_path_buf()));
+    }
+    let temporary = write_temporary(target, bytes.as_bytes())?;
+    post_write_check(target).map_err(|source| MimeAppsError::io(target, source))?;
+    temporary
+        .replace(target)
+        .map_err(|source| MimeAppsError::io(target, source))?;
+    sync_parent(target)
+}
+
+fn write_temporary(target: &Path, bytes: &[u8]) -> Result<TemporaryFile, MimeAppsError> {
     let directory = target
         .parent()
         .ok_or(MimeAppsError::InvalidPersistencePath)?;
@@ -459,17 +472,9 @@ fn write_temporary(target: &Path, bytes: &[u8]) -> Result<PathBuf, MimeAppsError
             let _ = fs::remove_file(&temporary);
             return Err(MimeAppsError::io(&temporary, source));
         }
-        return Ok(temporary);
+        return Ok(TemporaryFile { path: temporary });
     }
     Err(MimeAppsError::TemporaryFileUnavailable)
-}
-
-fn replace_temporary(temporary: &Path, target: &Path) -> io::Result<()> {
-    if let Err(source) = fs::rename(temporary, target) {
-        let _ = fs::remove_file(temporary);
-        return Err(source);
-    }
-    Ok(())
 }
 
 fn sync_parent(target: &Path) -> Result<(), MimeAppsError> {
@@ -489,7 +494,6 @@ pub enum MimeAppsError {
     Io { path: PathBuf, source: io::Error },
     FileTooLarge(PathBuf),
     AssociationLimitExceeded,
-    ConcurrentModification(PathBuf),
     InvalidPersistencePath,
     TemporaryFileUnavailable,
 }
@@ -528,11 +532,6 @@ impl std::fmt::Display for MimeAppsError {
             Self::AssociationLimitExceeded => {
                 formatter.write_str("MIME association limit exceeded")
             }
-            Self::ConcurrentModification(path) => write!(
-                formatter,
-                "mimeapps file changed during update: {}",
-                path.display()
-            ),
             Self::InvalidPersistencePath => {
                 formatter.write_str("invalid mimeapps persistence path")
             }
@@ -555,18 +554,36 @@ impl std::error::Error for MimeAppsError {
 
 #[cfg(test)]
 mod tests {
-    use super::replace_temporary;
+    use super::{TemporaryFile, persist_default_locked};
     use std::fs;
 
     #[test]
     fn failed_replace_removes_the_private_temporary_file() {
         let temporary = tempfile::tempdir().unwrap();
         let pending = temporary.path().join(".mimeapps.list.pending");
+        let pending_path = pending.clone();
         let target = temporary.path().join("mimeapps.list");
         fs::write(&pending, "pending").unwrap();
         fs::create_dir(&target).unwrap();
 
-        assert!(replace_temporary(&pending, &target).is_err());
-        assert!(!pending.exists());
+        let pending = TemporaryFile { path: pending };
+        assert!(pending.replace(&target).is_err());
+        assert!(!pending_path.exists());
+    }
+
+    #[test]
+    fn post_write_failure_removes_the_private_temporary_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("mimeapps.list");
+        let error = persist_default_locked(&target, "text/plain", "writer.desktop", |_| {
+            Err(std::io::Error::other("injected post-write stat failure"))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected post-write stat failure")
+        );
+        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
     }
 }

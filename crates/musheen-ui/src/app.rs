@@ -67,10 +67,10 @@ use musheen_core::{
 use musheen_desktop::{
     ApplicationIconProvider, CatalogDocument, CatalogStore, ConflictDecisionStore,
     DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths, FolderIdentity,
-    FreedesktopIconProvider, LaunchTarget, MimeAppsResolver, MimeDetector, PreviewDocument,
-    ProcessRunner, SessionStore, SystemProcessRunner, TagMoveOutcome, TerminalCommand,
-    ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest,
-    ThumbnailService, ThumbnailSize,
+    FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
+    MimeDetector, PreviewDocument, ProcessRunner, SessionStore, SystemProcessRunner,
+    TagMoveOutcome, TerminalCommand, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
+    ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -411,9 +411,204 @@ struct ContextDialogStrings {
     operation_review: String,
 }
 
+#[derive(Clone)]
 struct ResolvedApplicationSelection {
     mime_type: Box<str>,
     targets: Vec<LaunchTarget>,
+}
+
+type ApplicationSelectionKey = Vec<(ItemId, StorePath)>;
+const MAX_DESKTOP_APPLICATION_SNAPSHOTS: usize = 64;
+
+#[derive(Clone)]
+struct DesktopApplicationSnapshot {
+    selection: ResolvedApplicationSelection,
+    choices: Vec<crate::dialogs::ApplicationChoice>,
+    applications: HashMap<Box<str>, musheen_desktop::DesktopApplication>,
+    default_application: Option<Box<str>>,
+}
+
+#[derive(Clone)]
+enum DesktopApplicationSnapshotState {
+    Loading,
+    Ready(Arc<DesktopApplicationSnapshot>),
+    Error(DesktopApplicationLoadError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopApplicationLoadError {
+    Selection(ApplicationSelectionError),
+    Associations,
+}
+
+trait DesktopApplicationSnapshotLoader: Send + Sync {
+    fn load(
+        &self,
+        paths: DesktopPaths,
+        providers: ProviderRuntime,
+        selection: Vec<CommandTargetRef>,
+        icons: Arc<dyn ApplicationIconProvider>,
+    ) -> Result<DesktopApplicationSnapshot, DesktopApplicationLoadError>;
+}
+
+#[derive(Clone, Copy, Default)]
+struct SystemDesktopApplicationSnapshotLoader;
+
+impl DesktopApplicationSnapshotLoader for SystemDesktopApplicationSnapshotLoader {
+    fn load(
+        &self,
+        paths: DesktopPaths,
+        providers: ProviderRuntime,
+        selection: Vec<CommandTargetRef>,
+        icons: Arc<dyn ApplicationIconProvider>,
+    ) -> Result<DesktopApplicationSnapshot, DesktopApplicationLoadError> {
+        let selection = resolve_application_selection(&providers, &selection)
+            .map_err(DesktopApplicationLoadError::Selection)?;
+        let catalog = DesktopEntryCatalog::new(paths.clone());
+        let resolver = MimeAppsResolver::new(paths);
+        let visible = resolver
+            .visible_applications_for(&selection.mime_type, &catalog)
+            .map_err(|_| DesktopApplicationLoadError::Associations)?;
+        let choices = visible
+            .iter()
+            .map(|application| {
+                crate::dialogs::ApplicationChoice::from_desktop_application(
+                    application,
+                    icons.as_ref(),
+                )
+            })
+            .collect();
+        let applications = visible
+            .into_iter()
+            .map(|application| (Box::<str>::from(application.desktop_id()), application))
+            .collect();
+        let default_application = resolver
+            .default_for(&selection.mime_type, &catalog)
+            .map_err(|_| DesktopApplicationLoadError::Associations)?
+            .map(|application| Box::<str>::from(application.desktop_id()));
+        Ok(DesktopApplicationSnapshot {
+            selection,
+            choices,
+            applications,
+            default_application,
+        })
+    }
+}
+
+struct DesktopApplicationService {
+    generation: u64,
+    loader: Arc<dyn DesktopApplicationSnapshotLoader>,
+    entries: HashMap<ApplicationSelectionKey, (u64, DesktopApplicationSnapshotState)>,
+}
+
+impl Default for DesktopApplicationService {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            loader: Arc::new(SystemDesktopApplicationSnapshotLoader),
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl DesktopApplicationService {
+    fn key(selection: &[CommandTargetRef]) -> ApplicationSelectionKey {
+        selection
+            .iter()
+            .map(|target| (target.id().clone(), target.path().clone()))
+            .collect()
+    }
+
+    fn state(&self, selection: &[CommandTargetRef]) -> Option<&DesktopApplicationSnapshotState> {
+        self.entries
+            .get(&Self::key(selection))
+            .map(|(_, state)| state)
+    }
+
+    fn begin_refresh(&mut self, selection: &[CommandTargetRef]) -> Option<u64> {
+        let key = Self::key(selection);
+        if matches!(
+            self.entries.get(&key).map(|(_, state)| state),
+            Some(DesktopApplicationSnapshotState::Loading)
+                | Some(DesktopApplicationSnapshotState::Ready(_))
+        ) {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        if self.entries.len() >= MAX_DESKTOP_APPLICATION_SNAPSHOTS
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (generation, _))| *generation)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries
+            .insert(key, (generation, DesktopApplicationSnapshotState::Loading));
+        Some(generation)
+    }
+
+    fn finish_refresh(
+        &mut self,
+        selection: &[CommandTargetRef],
+        generation: u64,
+        result: Result<DesktopApplicationSnapshot, DesktopApplicationLoadError>,
+    ) {
+        let key = Self::key(selection);
+        if self
+            .entries
+            .get(&key)
+            .is_none_or(|(current, _)| *current != generation)
+        {
+            return;
+        }
+        let state = match result {
+            Ok(snapshot) => DesktopApplicationSnapshotState::Ready(Arc::new(snapshot)),
+            Err(error) => DesktopApplicationSnapshotState::Error(error),
+        };
+        self.entries.insert(key, (generation, state));
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+    }
+
+    fn set_cached_default(&mut self, selection: &[CommandTargetRef], desktop_id: Box<str>) {
+        let key = Self::key(selection);
+        let Some((generation, DesktopApplicationSnapshotState::Ready(snapshot))) =
+            self.entries.get(&key).cloned()
+        else {
+            return;
+        };
+        let mut updated = (*snapshot).clone();
+        updated.default_application = Some(desktop_id);
+        self.entries.insert(
+            key,
+            (
+                generation,
+                DesktopApplicationSnapshotState::Ready(Arc::new(updated)),
+            ),
+        );
+    }
+
+    #[cfg(test)]
+    fn install_ready(
+        &mut self,
+        targets: &[CommandTargetRef],
+        snapshot: DesktopApplicationSnapshot,
+    ) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.insert(
+            Self::key(targets),
+            (
+                self.generation,
+                DesktopApplicationSnapshotState::Ready(Arc::new(snapshot)),
+            ),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,6 +617,87 @@ enum ApplicationSelectionError {
     DetectionFailed,
     ProviderUnsupported,
     MixedMimeTypes,
+}
+
+#[derive(Debug)]
+enum ApplicationActionError {
+    Persistence(MimeAppsError),
+    Launch(LaunchError),
+}
+
+impl From<LaunchError> for ApplicationActionError {
+    fn from(error: LaunchError) -> Self {
+        Self::Launch(error)
+    }
+}
+
+fn application_action_error_message(
+    catalog: &Catalog,
+    application_name: &str,
+    item_count: usize,
+    error: &ApplicationActionError,
+) -> Box<str> {
+    let key = match error {
+        ApplicationActionError::Persistence(_) => "application-open-persistence-failed",
+        ApplicationActionError::Launch(LaunchError::TerminalUnavailable) => {
+            "application-open-terminal-unavailable"
+        }
+        ApplicationActionError::Launch(LaunchError::UnrepresentableTargets(_)) => {
+            "application-open-unrepresentable-target"
+        }
+        ApplicationActionError::Launch(LaunchError::TryExecUnavailable(_)) => {
+            "application-open-try-exec-unavailable"
+        }
+        ApplicationActionError::Launch(LaunchError::Spawn(_)) => "application-open-spawn-failed",
+        ApplicationActionError::Launch(_) => "application-open-launch-failed",
+    };
+    let message = catalog
+        .message(key)
+        .expect("typed application failures are localized");
+    let recovery = catalog
+        .message("application-open-recovery")
+        .expect("application failure recovery is localized");
+    let items = catalog
+        .message("application-open-items")
+        .expect("application failure item count is localized");
+    let cause = match error {
+        ApplicationActionError::Persistence(error) => error.to_string(),
+        ApplicationActionError::Launch(error) => error.to_string(),
+    };
+    format!("{application_name} — {item_count} {items}: {message} {cause}. {recovery}").into()
+}
+
+fn resolve_application_selection(
+    providers: &ProviderRuntime,
+    selection: &[CommandTargetRef],
+) -> Result<ResolvedApplicationSelection, ApplicationSelectionError> {
+    let mut resolved = selection
+        .iter()
+        .map(|target| providers.application_target(target.path()));
+    let first = resolved
+        .next()
+        .ok_or(ApplicationSelectionError::NoTargets)?
+        .map_err(|error| match error {
+            ApplicationTargetError::DetectionFailed => ApplicationSelectionError::DetectionFailed,
+            ApplicationTargetError::ProviderUnsupported => {
+                ApplicationSelectionError::ProviderUnsupported
+            }
+        })?;
+    let mime_type = Box::<str>::from(first.mime_type());
+    let mut targets = vec![first.launch_target().clone()];
+    for target in resolved {
+        let target = target.map_err(|error| match error {
+            ApplicationTargetError::DetectionFailed => ApplicationSelectionError::DetectionFailed,
+            ApplicationTargetError::ProviderUnsupported => {
+                ApplicationSelectionError::ProviderUnsupported
+            }
+        })?;
+        if target.mime_type() != mime_type.as_ref() {
+            return Err(ApplicationSelectionError::MixedMimeTypes);
+        }
+        targets.push(target.launch_target().clone());
+    }
+    Ok(ResolvedApplicationSelection { mime_type, targets })
 }
 
 impl ContextDialogStrings {
@@ -1144,6 +1420,7 @@ struct MusheenApp {
     operation_status_revision: u64,
     operation_error: Option<Box<str>>,
     desktop_paths: Option<DesktopPaths>,
+    desktop_applications: DesktopApplicationService,
     application_icons: Arc<dyn ApplicationIconProvider>,
     application_runner: Arc<dyn ProcessRunner>,
     terminal_command: Option<TerminalCommand>,
@@ -1374,6 +1651,7 @@ impl MusheenApp {
             operation_status_revision,
             operation_error,
             desktop_paths: DesktopPaths::from_environment().ok(),
+            desktop_applications: DesktopApplicationService::default(),
             application_icons: Arc::new(FreedesktopIconProvider),
             application_runner: Arc::new(SystemProcessRunner),
             terminal_command: TerminalCommand::new("x-terminal-emulator", ["-e"]).ok(),
@@ -2207,6 +2485,7 @@ impl MusheenApp {
                 }
             }
             CommandAction::Refresh => {
+                self.desktop_applications.invalidate();
                 if let Some(location) = self.focused_directory().location().cloned() {
                     self.start_load(location, cx);
                 }
@@ -2566,6 +2845,7 @@ impl MusheenApp {
                 .clone(),
             cx,
         );
+        self.refresh_application_snapshot(prepared.selection(), cx);
         self.compose_context_menu(tab_id, MenuTarget::Item, prepared.selection().to_vec())
     }
 
@@ -2601,6 +2881,7 @@ impl MusheenApp {
         } else {
             MenuTarget::Item
         };
+        self.refresh_application_snapshot(prepared.selection(), cx);
         let menu = self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec());
         let app = cx.entity().downgrade();
         let popup = PopupMenu::build(window, cx, move |popup, window, popup_cx| {
@@ -2702,43 +2983,6 @@ impl MusheenApp {
         request.with_catalog_tag_names(self.catalog_binding.tag_names())
     }
 
-    fn resolve_application_selection(
-        &self,
-        selection: &[CommandTargetRef],
-    ) -> Result<ResolvedApplicationSelection, ApplicationSelectionError> {
-        let mut resolved = selection
-            .iter()
-            .map(|target| self.providers.application_target(target.path()));
-        let first = resolved
-            .next()
-            .ok_or(ApplicationSelectionError::NoTargets)?
-            .map_err(|error| match error {
-                ApplicationTargetError::DetectionFailed => {
-                    ApplicationSelectionError::DetectionFailed
-                }
-                ApplicationTargetError::ProviderUnsupported => {
-                    ApplicationSelectionError::ProviderUnsupported
-                }
-            })?;
-        let mime_type = Box::<str>::from(first.mime_type());
-        let mut targets = vec![first.launch_target().clone()];
-        for target in resolved {
-            let target = target.map_err(|error| match error {
-                ApplicationTargetError::DetectionFailed => {
-                    ApplicationSelectionError::DetectionFailed
-                }
-                ApplicationTargetError::ProviderUnsupported => {
-                    ApplicationSelectionError::ProviderUnsupported
-                }
-            })?;
-            if target.mime_type() != mime_type.as_ref() {
-                return Err(ApplicationSelectionError::MixedMimeTypes);
-            }
-            targets.push(target.launch_target().clone());
-        }
-        Ok(ResolvedApplicationSelection { mime_type, targets })
-    }
-
     fn application_selection_error(&self, error: ApplicationSelectionError) -> Box<str> {
         let key = match error {
             ApplicationSelectionError::NoTargets => "application-open-no-targets",
@@ -2761,29 +3005,106 @@ impl MusheenApp {
             .into()
     }
 
+    fn application_action_error(
+        &self,
+        application_name: &str,
+        item_count: usize,
+        error: &ApplicationActionError,
+    ) -> Box<str> {
+        application_action_error_message(&self.catalog, application_name, item_count, error)
+    }
+
+    fn refresh_application_snapshot(
+        &mut self,
+        selection: &[CommandTargetRef],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(paths) = self.desktop_paths.clone() else {
+            return;
+        };
+        let Some(generation) = self.desktop_applications.begin_refresh(selection) else {
+            return;
+        };
+        let selection = selection.to_vec();
+        let worker_selection = selection.clone();
+        let loader = Arc::clone(&self.desktop_applications.loader);
+        let providers = self.providers.clone();
+        let icons = Arc::clone(&self.application_icons);
+        let work =
+            cx.background_spawn(
+                async move { loader.load(paths, providers, worker_selection, icons) },
+            );
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state
+                    .desktop_applications
+                    .finish_refresh(&selection, generation, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn application_snapshot(
+        &self,
+        selection: &[CommandTargetRef],
+    ) -> Result<Arc<DesktopApplicationSnapshot>, Box<str>> {
+        match self.desktop_applications.state(selection) {
+            Some(DesktopApplicationSnapshotState::Ready(snapshot)) => Ok(Arc::clone(snapshot)),
+            Some(DesktopApplicationSnapshotState::Error(
+                DesktopApplicationLoadError::Selection(error),
+            )) => Err(self.application_selection_error(*error)),
+            Some(DesktopApplicationSnapshotState::Error(
+                DesktopApplicationLoadError::Associations,
+            )) => Err(self.application_error("application-open-association-unavailable")),
+            Some(DesktopApplicationSnapshotState::Loading) | None => {
+                Err(self.application_error("application-open-loading"))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn preload_application_snapshot_for_test(&mut self, selection: &[CommandTargetRef]) {
+        let paths = self.desktop_paths.clone().expect("test desktop paths");
+        let result = self.desktop_applications.loader.load(
+            paths,
+            self.providers.clone(),
+            selection.to_vec(),
+            Arc::clone(&self.application_icons),
+        );
+        match result {
+            Ok(snapshot) => self.desktop_applications.install_ready(selection, snapshot),
+            Err(error) => {
+                self.desktop_applications.generation =
+                    self.desktop_applications.generation.wrapping_add(1);
+                self.desktop_applications.entries.insert(
+                    DesktopApplicationService::key(selection),
+                    (
+                        self.desktop_applications.generation,
+                        DesktopApplicationSnapshotState::Error(error),
+                    ),
+                );
+            }
+        }
+    }
+
     fn open_with_applications(
         &self,
         selection: &[CommandTargetRef],
     ) -> Vec<crate::OpenWithApplication> {
-        let Ok(selection) = self.resolve_application_selection(selection) else {
+        let Some(DesktopApplicationSnapshotState::Ready(snapshot)) =
+            self.desktop_applications.state(selection)
+        else {
             return Vec::new();
         };
-        let Some(paths) = self.desktop_paths.clone() else {
-            return Vec::new();
-        };
-        let catalog = DesktopEntryCatalog::new(paths.clone());
-        let resolver = MimeAppsResolver::new(paths);
-        let Ok(model) = OpenWithModel::from_resolver(
-            selection.mime_type.as_ref(),
-            &resolver,
-            &catalog,
-            self.application_icons.as_ref(),
-        ) else {
-            return Vec::new();
-        };
-        model
-            .compatible_applications()
-            .into_iter()
+        snapshot
+            .choices
+            .iter()
+            .filter(|application| application.compatible())
             .map(|application| {
                 crate::OpenWithApplication::compatible(application.name(), application.desktop_id())
             })
@@ -3654,8 +3975,7 @@ impl MusheenApp {
 
         match (action, parameters) {
             (CommandAction::Open, CommandParameters::Targets(_)) => {
-                self.operation_error = self.execute_default_application(targets).err();
-                cx.notify();
+                self.execute_default_application(targets, cx);
             }
             (
                 CommandAction::OpenWith | CommandAction::SetDefaultApplication,
@@ -3665,10 +3985,7 @@ impl MusheenApp {
                     ..
                 },
             ) => {
-                self.operation_error = self
-                    .execute_open_with(targets, application.as_str(), *intent)
-                    .err();
-                cx.notify();
+                self.execute_open_with(targets, application.as_str(), *intent, cx);
             }
             (CommandAction::ChooseApplication, CommandParameters::Targets(_)) => {
                 if let Err(error) = self.open_choose_application(targets, origin_tab, cx) {
@@ -3687,74 +4004,99 @@ impl MusheenApp {
     }
 
     fn execute_open_with(
-        &self,
+        &mut self,
         targets: &[CommandTargetRef],
         desktop_id: &str,
         intent: CoreOpenWithIntent,
-    ) -> Result<(), Box<str>> {
-        let selection = self
-            .resolve_application_selection(targets)
-            .map_err(|error| self.application_selection_error(error))?;
-        let paths = self
-            .desktop_paths
-            .clone()
-            .ok_or_else(|| self.application_error("application-open-association-unavailable"))?;
-        let catalog = DesktopEntryCatalog::new(paths.clone());
-        let resolver = MimeAppsResolver::new(paths.clone());
-        let launcher = DesktopEntryLauncher::new(paths.executable_dirs().to_vec());
-        let mut model = OpenWithModel::from_resolver(
-            selection.mime_type.as_ref(),
-            &resolver,
-            &catalog,
-            self.application_icons.as_ref(),
-        )
-        .map_err(|_| self.application_error("application-open-association-unavailable"))?;
-        model
-            .select(desktop_id)
-            .map_err(|_| self.application_error("application-open-application-unavailable"))?;
-        let intent = match intent {
-            CoreOpenWithIntent::OpenOnce => DialogOpenWithIntent::OpenOnce,
-            CoreOpenWithIntent::SetAsDefault => DialogOpenWithIntent::SetAsDefault,
-        };
-        let plan = model
-            .plan(intent)
-            .map_err(|_| self.application_error("application-open-application-unavailable"))?;
-        plan.execute(
-            &resolver,
-            &catalog,
-            &launcher,
-            self.application_runner.as_ref(),
-            &selection.targets,
-            self.terminal_command.as_ref(),
-        )
-        .map_err(|_| self.application_error("application-open-launch-failed"))
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_application(targets, Some(desktop_id), intent, cx);
     }
 
-    fn execute_default_application(&self, targets: &[CommandTargetRef]) -> Result<(), Box<str>> {
-        let selection = self
-            .resolve_application_selection(targets)
-            .map_err(|error| self.application_selection_error(error))?;
-        let paths = self
-            .desktop_paths
-            .clone()
-            .ok_or_else(|| self.application_error("application-open-association-unavailable"))?;
-        let catalog = DesktopEntryCatalog::new(paths.clone());
-        let resolver = MimeAppsResolver::new(paths.clone());
-        let application = resolver
-            .default_for(&selection.mime_type, &catalog)
-            .map_err(|_| self.application_error("application-open-association-unavailable"))?
-            .ok_or_else(|| self.application_error("application-open-no-default"))?;
-        let launcher = DesktopEntryLauncher::new(paths.executable_dirs().to_vec());
-        let prepared = launcher
-            .prepare(
-                &application,
-                &selection.targets,
-                self.terminal_command.as_ref(),
-            )
-            .map_err(|_| self.application_error("application-open-launch-failed"))?;
-        launcher
-            .launch(&prepared, self.application_runner.as_ref())
-            .map_err(|_| self.application_error("application-open-launch-failed"))
+    fn execute_default_application(
+        &mut self,
+        targets: &[CommandTargetRef],
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_application(targets, None, CoreOpenWithIntent::OpenOnce, cx);
+    }
+
+    fn execute_application(
+        &mut self,
+        targets: &[CommandTargetRef],
+        desktop_id: Option<&str>,
+        intent: CoreOpenWithIntent,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = match self.application_snapshot(targets) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.refresh_application_snapshot(targets, cx);
+                self.operation_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let application_id = desktop_id
+            .map(Box::<str>::from)
+            .or_else(|| snapshot.default_application.clone());
+        let Some(application_id) = application_id else {
+            self.operation_error = Some(self.application_error("application-open-no-default"));
+            cx.notify();
+            return;
+        };
+        let Some(application) = snapshot.applications.get(&application_id).cloned() else {
+            self.operation_error =
+                Some(self.application_error("application-open-application-unavailable"));
+            cx.notify();
+            return;
+        };
+        let Some(paths) = self.desktop_paths.clone() else {
+            self.operation_error =
+                Some(self.application_error("application-open-association-unavailable"));
+            cx.notify();
+            return;
+        };
+        let selection = snapshot.selection.clone();
+        let runner = Arc::clone(&self.application_runner);
+        let terminal = self.terminal_command.clone();
+        let app_name = Box::<str>::from(application.name());
+        let item_count = selection.targets.len();
+        let set_default = intent == CoreOpenWithIntent::SetAsDefault;
+        if set_default {
+            self.desktop_applications
+                .set_cached_default(targets, application_id.clone());
+        }
+        self.operation_error = None;
+        cx.notify();
+        let work = cx.background_spawn(async move {
+            let launcher = DesktopEntryLauncher::new(paths.executable_dirs().to_vec());
+            let prepared = launcher.prepare(&application, &selection.targets, terminal.as_ref())?;
+            if set_default {
+                let catalog = DesktopEntryCatalog::new(paths.clone());
+                MimeAppsResolver::new(paths.clone())
+                    .set_default(&selection.mime_type, &application_id, &catalog)
+                    .map_err(ApplicationActionError::Persistence)?;
+            }
+            launcher.launch(&prepared, runner.as_ref())?;
+            Ok::<(), ApplicationActionError>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.operation_error = result
+                    .err()
+                    .map(|error| state.application_action_error(&app_name, item_count, &error));
+                if set_default {
+                    state.desktop_applications.invalidate();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_choose_application(
@@ -3763,22 +4105,11 @@ impl MusheenApp {
         origin_tab: Option<TabId>,
         cx: &mut Context<Self>,
     ) -> Result<(), Box<str>> {
-        let selection = self
-            .resolve_application_selection(targets)
-            .map_err(|error| self.application_selection_error(error))?;
-        let paths = self
-            .desktop_paths
-            .clone()
-            .ok_or_else(|| self.application_error("application-open-association-unavailable"))?;
-        let catalog = DesktopEntryCatalog::new(paths.clone());
-        let resolver = MimeAppsResolver::new(paths);
-        let model = OpenWithModel::from_resolver(
-            selection.mime_type.as_ref(),
-            &resolver,
-            &catalog,
-            self.application_icons.as_ref(),
-        )
-        .map_err(|_| self.application_error("application-open-association-unavailable"))?;
+        let snapshot = self.application_snapshot(targets)?;
+        let model = OpenWithModel::new(
+            snapshot.selection.mime_type.clone(),
+            snapshot.choices.clone(),
+        );
         let options = open_with_window_options(&self.catalog, cx);
         let chooser_catalog = self.catalog.clone();
         let mut dialog = None;
@@ -3794,17 +4125,16 @@ impl MusheenApp {
         let targets = targets.to_vec();
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
             OpenWithDialogEvent::Chosen { desktop_id, intent } => {
-                let result = this
-                    .revalidate_context_targets(origin_tab, &targets)
-                    .and_then(|()| {
-                        let intent = match intent {
-                            DialogOpenWithIntent::OpenOnce => CoreOpenWithIntent::OpenOnce,
-                            DialogOpenWithIntent::SetAsDefault => CoreOpenWithIntent::SetAsDefault,
-                        };
-                        this.execute_open_with(&targets, desktop_id, intent)
-                    });
-                this.operation_error = result.err();
-                cx.notify();
+                if let Err(error) = this.revalidate_context_targets(origin_tab, &targets) {
+                    this.operation_error = Some(error);
+                    cx.notify();
+                    return;
+                }
+                let intent = match intent {
+                    DialogOpenWithIntent::OpenOnce => CoreOpenWithIntent::OpenOnce,
+                    DialogOpenWithIntent::SetAsDefault => CoreOpenWithIntent::SetAsDefault,
+                };
+                this.execute_open_with(&targets, desktop_id, intent, cx);
             }
             OpenWithDialogEvent::Cancelled => cx.notify(),
         });
@@ -8314,6 +8644,167 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typed_application_failures_preserve_app_count_cause_and_recovery() {
+        let catalog = Catalog::load(Locale::EnUs).unwrap();
+        let cases = [
+            (
+                ApplicationActionError::Launch(LaunchError::TerminalUnavailable),
+                "configured terminal",
+            ),
+            (
+                ApplicationActionError::Launch(LaunchError::UnrepresentableTargets(Vec::new())),
+                "path or URI boundary",
+            ),
+            (
+                ApplicationActionError::Launch(LaunchError::TryExecUnavailable(
+                    "missing-viewer".into(),
+                )),
+                "required executable",
+            ),
+            (
+                ApplicationActionError::Persistence(MimeAppsError::TemporaryFileUnavailable),
+                "could not be saved",
+            ),
+            (
+                ApplicationActionError::Launch(LaunchError::Spawn(std::io::Error::other(
+                    "spawn refused",
+                ))),
+                "process could not be started",
+            ),
+        ];
+        for (error, expected) in cases {
+            let message = application_action_error_message(&catalog, "Image Viewer", 3, &error);
+            assert!(message.contains("Image Viewer — 3 items"));
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("retry or choose another application"));
+        }
+        let arabic = application_action_error_message(
+            &Catalog::load(Locale::Ar).unwrap(),
+            "عارض الصور",
+            3,
+            &ApplicationActionError::Launch(LaunchError::TerminalUnavailable),
+        );
+        assert!(arabic.contains("عارض الصور — 3 عناصر"));
+        assert!(arabic.contains("أعد المحاولة أو اختر تطبيقًا آخر"));
+    }
+
+    #[test]
+    fn desktop_application_snapshot_cache_is_bounded_and_identity_keyed() {
+        let provider = ProviderId::new("local").unwrap();
+        let mut service = DesktopApplicationService::default();
+        let selections = (0..=MAX_DESKTOP_APPLICATION_SNAPSHOTS)
+            .map(|index| {
+                let bytes = format!("item-{index}").into_bytes();
+                vec![
+                    CommandTargetRef::new(
+                        ItemId::new(provider.clone(), bytes.clone()).unwrap(),
+                        StorePath::from_unix_bytes(
+                            [b"/tmp/".as_slice(), bytes.as_slice()].concat(),
+                        ),
+                    )
+                    .unwrap(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        for selection in &selections {
+            assert!(service.begin_refresh(selection).is_some());
+        }
+        assert_eq!(service.entries.len(), MAX_DESKTOP_APPLICATION_SNAPSHOTS);
+        assert!(service.state(&selections[0]).is_none());
+        assert!(matches!(
+            service.state(selections.last().unwrap()),
+            Some(DesktopApplicationSnapshotState::Loading)
+        ));
+    }
+
+    struct BlockingSnapshotLoader {
+        scans: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DesktopApplicationSnapshotLoader for BlockingSnapshotLoader {
+        fn load(
+            &self,
+            _paths: DesktopPaths,
+            _providers: ProviderRuntime,
+            _selection: Vec<CommandTargetRef>,
+            _icons: Arc<dyn ApplicationIconProvider>,
+        ) -> Result<DesktopApplicationSnapshot, DesktopApplicationLoadError> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            Err(DesktopApplicationLoadError::Associations)
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn context_menu_returns_while_the_desktop_application_scan_is_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        let loader = Arc::new(BlockingSnapshotLoader {
+            scans: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let loader = Arc::clone(&loader);
+            let view = cx.new(|cx| {
+                let mut state =
+                    MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx);
+                state.desktop_paths = Some(DesktopPaths::new(
+                    temporary.path().join("config"),
+                    temporary.path().join("data"),
+                ));
+                state.desktop_applications.loader = loader;
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let started = std::time::Instant::now();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                let item = state.focused_directory().view().items()[0].id().clone();
+                let menu = state.item_context_menu(tab, item, cx);
+                assert!(MusheenApp::menu_entry_by_id(&menu, "file.open_with").is_some());
+                assert!(
+                    state
+                        .desktop_applications
+                        .state(
+                            state
+                                .active_command_request(CommandAction::Open)
+                                .selection()
+                        )
+                        .is_some_and(|state| matches!(
+                            state,
+                            DesktopApplicationSnapshotState::Loading
+                        ))
+                );
+            });
+        })
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the context-menu handler must not run the 300ms scan"
+        );
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            loader.scans.load(std::sync::atomic::Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(loader.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[gpui_kit::test]
     async fn customization_keys_and_toolbar_use_live_registry_dispatch(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -8764,6 +9255,7 @@ mod tests {
                     CommandTargetRef::new(second_item.id().clone(), second_item.path().clone())
                         .unwrap(),
                 ];
+                state.preload_application_snapshot_for_test(&application_targets);
                 let application_menu =
                     state.compose_context_menu(tab, MenuTarget::Item, application_targets.clone());
                 let open_with = MusheenApp::menu_entry_by_id(&application_menu, "file.open_with")
@@ -8871,13 +9363,17 @@ mod tests {
         let provider = ProviderId::new("remote.open").unwrap();
         let remote_path =
             StorePath::from_provider_key(provider.clone(), b"opaque-not-a-uri".to_vec()).unwrap();
-        let target = CommandTargetRef::new(
+        let remote_item = StoreItem::new(
             ItemId::new(provider.clone(), b"remote-image".to_vec()).unwrap(),
-            remote_path,
-        )
-        .unwrap();
+            remote_path.clone(),
+            DisplayPath::new("image.png"),
+            ItemKind::RegularFile,
+            Some(12),
+        );
+        let target =
+            CommandTargetRef::new(remote_item.id().clone(), remote_item.path().clone()).unwrap();
         let adapter = UriApplicationAdapter {
-            store: Arc::new(FixtureProviderStore::new(provider, [])),
+            store: Arc::new(FixtureProviderStore::new(provider.clone(), [remote_item])),
             target: ProviderApplicationTarget::new(
                 LaunchTarget::uri("sftp://files.example.test/image.png").unwrap(),
                 "image/png",
@@ -8909,14 +9405,16 @@ mod tests {
         let browser: AnyWindowHandle = handle.into();
         cx.update_window(browser, |_, _, cx| {
             app.update(cx, |state, cx| {
+                state.preload_application_snapshot_for_test(std::slice::from_ref(&target));
+                let origin = state.navigation.focused_tab().id();
                 state.dispatch_typed_context_command(
                     CommandAction::OpenWith,
                     CommandParameters::open_with(
-                        vec![target],
+                        vec![target.clone()],
                         musheen_core::DesktopApplicationId::new("viewer.desktop").unwrap(),
                         CoreOpenWithIntent::OpenOnce,
                     ),
-                    None,
+                    Some(origin),
                     None,
                     false,
                     cx,
@@ -8929,12 +9427,45 @@ mod tests {
             });
         })
         .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            !application_runner.0.lock().unwrap().is_empty()
+        })
+        .await;
         let launches = application_runner.0.lock().unwrap();
         assert_eq!(launches.len(), 1);
         assert_eq!(
             launches[0].arguments(),
             [std::ffi::OsStr::new("sftp://files.example.test/image.png")]
         );
+        drop(launches);
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let stale = CommandTargetRef::new(
+                    ItemId::new(provider.clone(), b"replaced-image".to_vec()).unwrap(),
+                    target.path().clone(),
+                )
+                .unwrap();
+                let origin = state.navigation.focused_tab().id();
+                state.dispatch_typed_context_command(
+                    CommandAction::OpenWith,
+                    CommandParameters::open_with(
+                        vec![stale],
+                        musheen_core::DesktopApplicationId::new("viewer.desktop").unwrap(),
+                        CoreOpenWithIntent::OpenOnce,
+                    ),
+                    Some(origin),
+                    None,
+                    false,
+                    cx,
+                );
+                assert_eq!(
+                    state.operation_error.as_deref(),
+                    Some(state.catalog.message("context.target-changed").unwrap())
+                );
+            });
+        })
+        .unwrap();
+        assert_eq!(application_runner.0.lock().unwrap().len(), 1);
     }
 
     #[gpui_kit::test]
@@ -9004,6 +9535,7 @@ mod tests {
                         CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()
                     })
                     .collect::<Vec<_>>();
+                state.preload_application_snapshot_for_test(&mixed);
                 state.dispatch_typed_context_command(
                     CommandAction::Open,
                     CommandParameters::targets(mixed),
@@ -9022,9 +9554,11 @@ mod tests {
                     )
                 );
 
+                let unsupported = vec![unsupported_target];
+                state.preload_application_snapshot_for_test(&unsupported);
                 state.dispatch_typed_context_command(
                     CommandAction::Open,
-                    CommandParameters::targets(vec![unsupported_target]),
+                    CommandParameters::targets(unsupported),
                     None,
                     None,
                     false,
@@ -9043,6 +9577,7 @@ mod tests {
                 let no_default =
                     CommandTargetRef::new(text_item.id().clone(), text_item.path().clone())
                         .unwrap();
+                state.preload_application_snapshot_for_test(std::slice::from_ref(&no_default));
                 state.dispatch_typed_context_command(
                     CommandAction::Open,
                     CommandParameters::targets(vec![no_default]),
