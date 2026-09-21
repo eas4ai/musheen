@@ -4,10 +4,11 @@ mod custom_actions;
 use catalog::{CatalogBinding, DirectoryObservation, TagTarget};
 
 use crate::dialogs::{
-    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
-    PropertiesPage, PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow,
-    ProviderPropertiesWindowData, TagDelta, TagWriter, conflict_window_options,
-    install_properties_key_bindings, properties_window_options,
+    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, OpenWithDialog, OpenWithDialogEvent,
+    OpenWithIntent as DialogOpenWithIntent, OpenWithModel, PropertiesFailureWindow, PropertiesPage,
+    PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow, ProviderPropertiesWindowData,
+    TagDelta, TagWriter, conflict_window_options, install_properties_key_bindings,
+    open_with_window_options, properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
 use crate::i18n::Catalog;
@@ -58,15 +59,17 @@ use gpui_kit::{
 use musheen_core::{
     ActiveLayout, CancellationToken, CapabilityKind, CapabilityReason, CapabilityState,
     CommandAction, CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters,
-    CommandTarget, CommandTargetRef, DirectoryWatch, DisplayPath, ItemId, ItemKind, Page,
-    ProviderActionMatrix, ProviderId, ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS,
-    SearchBatch, SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError,
-    StoreItem, StorePath, WatchEvent,
+    CommandTarget, CommandTargetRef, DirectoryWatch, DisplayPath, ItemId, ItemKind,
+    OpenWithIntent as CoreOpenWithIntent, Page, ProviderActionMatrix, ProviderId, ResourceLimits,
+    SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch, SearchCompletion, SearchQuery,
+    SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath, WatchEvent,
 };
 use musheen_desktop::{
-    CatalogDocument, CatalogStore, ConflictDecisionStore, FolderIdentity, MimeDetector,
-    PreviewDocument, SessionStore, TagMoveOutcome, ThumbnailCache, ThumbnailLimits,
-    ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
+    CatalogDocument, CatalogStore, ConflictDecisionStore, DesktopEntryCatalog,
+    DesktopEntryLauncher, DesktopPaths, FolderIdentity, LaunchTarget, MimeAppsResolver,
+    MimeDetector, PreviewDocument, ProcessRunner, SessionStore, SystemProcessRunner,
+    TagMoveOutcome, TerminalCommand, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
+    ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -1125,6 +1128,9 @@ struct MusheenApp {
     operation_hub: OperationHub,
     operation_status_revision: u64,
     operation_error: Option<Box<str>>,
+    desktop_paths: Option<DesktopPaths>,
+    application_runner: Arc<dyn ProcessRunner>,
+    terminal_command: Option<TerminalCommand>,
     status_center_open: bool,
     trash_states: HashMap<TabId, TrashState>,
     trash_focus: HashMap<TabId, CommandTargetRef>,
@@ -1350,6 +1356,9 @@ impl MusheenApp {
             operation_hub,
             operation_status_revision,
             operation_error,
+            desktop_paths: DesktopPaths::from_environment().ok(),
+            application_runner: Arc::new(SystemProcessRunner),
+            terminal_command: TerminalCommand::new("x-terminal-emulator", ["-e"]).ok(),
             status_center_open: false,
             trash_states: HashMap::new(),
             trash_focus: HashMap::new(),
@@ -2662,6 +2671,38 @@ impl MusheenApp {
         request.with_catalog_tag_names(self.catalog_binding.tag_names())
     }
 
+    fn open_with_applications(
+        &self,
+        selection: &[CommandTargetRef],
+    ) -> Vec<crate::OpenWithApplication> {
+        let Some(path) = selection
+            .first()
+            .filter(|_| selection.len() == 1)
+            .and_then(|target| target.path().as_unix_path())
+        else {
+            return Vec::new();
+        };
+        let Ok(detected) = MimeDetector::default().detect(path) else {
+            return Vec::new();
+        };
+        let Some(paths) = self.desktop_paths.clone() else {
+            return Vec::new();
+        };
+        let catalog = DesktopEntryCatalog::new(paths.clone());
+        let resolver = MimeAppsResolver::new(paths);
+        let Ok(model) = OpenWithModel::from_resolver(detected.mime_type(), &resolver, &catalog)
+        else {
+            return Vec::new();
+        };
+        model
+            .compatible_applications()
+            .into_iter()
+            .map(|application| {
+                crate::OpenWithApplication::compatible(application.name(), application.desktop_id())
+            })
+            .collect()
+    }
+
     fn send_to_destinations(&self, tab_id: TabId) -> Vec<crate::SendToDestination> {
         let Some(sidebar) = self.sidebars.get(&tab_id) else {
             return Vec::new();
@@ -2721,9 +2762,11 @@ impl MusheenApp {
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
         let send_to = self.send_to_destinations(tab_id);
+        let open_with = self.open_with_applications(&selection);
         let request = self
             .context_menu_request(tab_id, target, location, selection)
-            .with_send_to(&send_to);
+            .with_send_to(&send_to)
+            .with_open_with(&open_with);
         self.compose_context_request(request)
     }
 
@@ -3412,21 +3455,15 @@ impl MusheenApp {
                     }
                 }
             }
-            (CommandAction::OpenProperties, CommandParameters::Targets(targets)) => {
-                if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-                    self.operation_error = Some(error);
-                    cx.notify();
-                    return;
-                }
-                self.open_properties_targets(targets, PropertiesPage::General, cx);
-            }
-            (CommandAction::Permissions, CommandParameters::Targets(targets)) => {
-                if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-                    self.operation_error = Some(error);
-                    cx.notify();
-                    return;
-                }
-                self.open_properties_targets(targets, PropertiesPage::Permissions, cx);
+            (
+                action @ (CommandAction::OpenWith
+                | CommandAction::SetDefaultApplication
+                | CommandAction::ChooseApplication
+                | CommandAction::OpenProperties
+                | CommandAction::Permissions),
+                parameters @ (CommandParameters::OpenWith { .. } | CommandParameters::Targets(_)),
+            ) => {
+                self.dispatch_local_target_command(action, parameters, origin_tab, cx);
             }
             (CommandAction::Pin | CommandAction::Unpin, CommandParameters::Targets(targets)) => {
                 self.dispatch_pin_command(action, targets, origin_tab, cx);
@@ -3506,6 +3543,172 @@ impl MusheenApp {
                 cx.notify();
             }
         }
+    }
+
+    fn dispatch_local_target_command(
+        &mut self,
+        action: &CommandAction,
+        parameters: &CommandParameters,
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = match parameters {
+            CommandParameters::OpenWith { targets, .. } | CommandParameters::Targets(targets) => {
+                targets
+            }
+            _ => unreachable!("the caller accepts only target-based commands"),
+        };
+        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+            self.operation_error = Some(error);
+            cx.notify();
+            return;
+        }
+
+        match (action, parameters) {
+            (
+                CommandAction::OpenWith | CommandAction::SetDefaultApplication,
+                CommandParameters::OpenWith {
+                    application,
+                    intent,
+                    ..
+                },
+            ) => {
+                self.operation_error = self
+                    .execute_open_with(targets, application.as_str(), *intent)
+                    .err();
+                cx.notify();
+            }
+            (CommandAction::ChooseApplication, CommandParameters::Targets(_)) => {
+                if let Err(error) = self.open_choose_application(targets, origin_tab, cx) {
+                    self.operation_error = Some(error);
+                    cx.notify();
+                }
+            }
+            (CommandAction::OpenProperties, CommandParameters::Targets(_)) => {
+                self.open_properties_targets(targets, PropertiesPage::General, cx);
+            }
+            (CommandAction::Permissions, CommandParameters::Targets(_)) => {
+                self.open_properties_targets(targets, PropertiesPage::Permissions, cx);
+            }
+            _ => unreachable!("the caller pairs each local command with typed parameters"),
+        }
+    }
+
+    fn execute_open_with(
+        &self,
+        targets: &[CommandTargetRef],
+        desktop_id: &str,
+        intent: CoreOpenWithIntent,
+    ) -> Result<(), Box<str>> {
+        let path = targets
+            .first()
+            .filter(|_| targets.len() == 1)
+            .and_then(|target| target.path().as_unix_path())
+            .ok_or_else(|| {
+                Box::<str>::from(
+                    "Open With requires exactly one local path; this provider has no lossless URI",
+                )
+            })?;
+        let detected = MimeDetector::default()
+            .detect(path)
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let paths = self.desktop_paths.clone().ok_or_else(|| {
+            Box::<str>::from("Open With is unavailable because XDG user paths are not configured")
+        })?;
+        let catalog = DesktopEntryCatalog::new(paths.clone());
+        let resolver = MimeAppsResolver::new(paths.clone());
+        let launcher = DesktopEntryLauncher::new(paths.executable_dirs().to_vec());
+        let mut model = OpenWithModel::from_resolver(detected.mime_type(), &resolver, &catalog)
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        model
+            .select(desktop_id)
+            .map_err(|error| Box::<str>::from(format!("Open With selection failed: {error:?}")))?;
+        let intent = match intent {
+            CoreOpenWithIntent::OpenOnce => DialogOpenWithIntent::OpenOnce,
+            CoreOpenWithIntent::SetAsDefault => DialogOpenWithIntent::SetAsDefault,
+        };
+        let plan = model
+            .plan(intent)
+            .map_err(|error| Box::<str>::from(format!("Open With planning failed: {error:?}")))?;
+        let launch_targets = targets
+            .iter()
+            .map(|target| {
+                target
+                    .path()
+                    .as_unix_path()
+                    .map(|path| LaunchTarget::local(path.to_path_buf()))
+                    .ok_or_else(|| {
+                        Box::<str>::from(
+                            "Open With cannot convert a provider target to a lossless URI",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        plan.execute(
+            &resolver,
+            &catalog,
+            &launcher,
+            self.application_runner.as_ref(),
+            &launch_targets,
+            self.terminal_command.as_ref(),
+        )
+        .map_err(|error| Box::<str>::from(error.to_string()))
+    }
+
+    fn open_choose_application(
+        &mut self,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), Box<str>> {
+        let path = targets
+            .first()
+            .filter(|_| targets.len() == 1)
+            .and_then(|target| target.path().as_unix_path())
+            .ok_or_else(|| Box::<str>::from("Choose Application requires one local path"))?;
+        let detected = MimeDetector::default()
+            .detect(path)
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let paths = self.desktop_paths.clone().ok_or_else(|| {
+            Box::<str>::from(
+                "Choose Application is unavailable because XDG user paths are not configured",
+            )
+        })?;
+        let catalog = DesktopEntryCatalog::new(paths.clone());
+        let resolver = MimeAppsResolver::new(paths);
+        let model = OpenWithModel::from_resolver(detected.mime_type(), &resolver, &catalog)
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let options = open_with_window_options(&self.catalog, cx);
+        let chooser_catalog = self.catalog.clone();
+        let mut dialog = None;
+        let handle = cx
+            .open_window(options, |window, cx| {
+                let view = cx.new(|cx| OpenWithDialog::new(model, chooser_catalog, cx));
+                dialog = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        self.track_context_dialog_window(handle.window_id(), origin_tab, cx);
+        let dialog = dialog.expect("the Open With window constructs its view");
+        let targets = targets.to_vec();
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
+            OpenWithDialogEvent::Chosen { desktop_id, intent } => {
+                let result = this
+                    .revalidate_context_targets(origin_tab, &targets)
+                    .and_then(|()| {
+                        let intent = match intent {
+                            DialogOpenWithIntent::OpenOnce => CoreOpenWithIntent::OpenOnce,
+                            DialogOpenWithIntent::SetAsDefault => CoreOpenWithIntent::SetAsDefault,
+                        };
+                        this.execute_open_with(&targets, desktop_id, intent)
+                    });
+                this.operation_error = result.err();
+                cx.notify();
+            }
+            OpenWithDialogEvent::Cancelled => cx.notify(),
+        });
+        self.conflict_subscriptions.push(subscription);
+        Ok(())
     }
 
     fn dispatch_pin_command(
@@ -3659,6 +3862,9 @@ impl MusheenApp {
                 | CommandAction::Pin
                 | CommandAction::Unpin
                 | CommandAction::ManageTags
+                | CommandAction::OpenWith
+                | CommandAction::ChooseApplication
+                | CommandAction::SetDefaultApplication
                 | CommandAction::CustomAction
         ) {
             return CapabilityState::Supported;
@@ -3669,11 +3875,6 @@ impl MusheenApp {
             }
             CommandAction::OpenAsAdministrator | CommandAction::RunAsAdministrator => {
                 "Privilege elevation is unavailable because no authorization broker is installed"
-            }
-            CommandAction::OpenWith
-            | CommandAction::ChooseApplication
-            | CommandAction::SetDefaultApplication => {
-                "Desktop application association is unavailable because no association backend is installed"
             }
             _ => "This command is not available in the current desktop backend",
         };
@@ -7971,7 +8172,7 @@ mod tests {
         CapabilityMatrix, CapabilityReason, CapabilityState, MutationRequest, PageRequest,
         ProviderId, SearchCapabilities, SearchResult, SearchScopeError,
     };
-    use musheen_desktop::{TagBackend, XattrTagBackend};
+    use musheen_desktop::{PreparedLaunch, ProcessRunner, TagBackend, XattrTagBackend};
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
 
@@ -8000,6 +8201,16 @@ mod tests {
     use standard_library::fs as filesystem;
     use std as standard_library;
     use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingApplicationRunner(Mutex<Vec<PreparedLaunch>>);
+
+    impl ProcessRunner for RecordingApplicationRunner {
+        fn spawn(&self, launch: &PreparedLaunch) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(launch.clone());
+            Ok(())
+        }
+    }
 
     #[gpui_kit::test]
     async fn customization_keys_and_toolbar_use_live_registry_dispatch(cx: &mut TestAppContext) {
@@ -8299,9 +8510,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn live_send_to_uses_exact_destination_and_open_with_refusal_is_visible(
-        cx: &mut TestAppContext,
-    ) {
+    async fn live_send_to_and_open_with_use_exact_typed_parameters(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
@@ -8309,13 +8518,32 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("send-me.txt");
         let destination = temporary.path().join("archive");
+        let config_home = temporary.path().join("config");
+        let data_home = temporary.path().join("data");
+        let desktop_file = data_home.join("applications/writer.desktop");
         filesystem::write(&source, b"send-to payload").unwrap();
         filesystem::create_dir(&destination).unwrap();
+        filesystem::create_dir_all(desktop_file.parent().unwrap()).unwrap();
+        filesystem::write(
+            &desktop_file,
+            "[Desktop Entry]\nType=Application\nName=Writer\nExec=/usr/bin/writer %F\nMimeType=text/plain;\n",
+        )
+        .unwrap();
+        let desktop_paths = musheen_desktop::DesktopPaths::new(&config_home, &data_home)
+            .with_current_desktops("GNOME")
+            .with_executable_dirs([PathBuf::from("/usr/bin")]);
+        let application_runner = Arc::new(RecordingApplicationRunner::default());
         let destination_path = StorePath::from_unix_path(destination.as_os_str());
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let desktop_paths = desktop_paths.clone();
+            let application_runner = Arc::clone(&application_runner);
             let view = cx.new(|cx| {
-                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+                let mut state =
+                    MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx);
+                state.desktop_paths = Some(desktop_paths);
+                state.application_runner = application_runner;
+                state
             });
             app = Some(view.clone());
             Root::new(view, window, cx)
@@ -8390,8 +8618,11 @@ mod tests {
                     SidebarSectionKind::Pinned,
                     [SidebarEntry::new("Archive", destination_path.clone())],
                 );
-                let request = state.active_command_request(CommandAction::SendTo);
-                let menu = state.compose_context_request(request);
+                let menu = state.compose_context_menu(
+                    tab,
+                    MenuTarget::Item,
+                    vec![CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()],
+                );
                 let entry = MusheenApp::menu_entry_by_id(&menu, "clipboard.send_to")
                     .unwrap()
                     .clone();
@@ -8419,15 +8650,39 @@ mod tests {
                 let open_with = MusheenApp::menu_entry_by_id(&menu, "file.open_with")
                     .unwrap()
                     .clone();
-                state.dispatch_context_entry(open_with, cx);
+                let open_once = open_with
+                    .submenu()
+                    .and_then(|submenu| submenu.application("writer.desktop"))
+                    .expect("the live MIME resolver contributes Writer")
+                    .clone();
+                state.dispatch_context_entry(open_once, cx);
                 assert!(
-                    state
-                        .operation_error
-                        .as_deref()
-                        .is_some_and(|error| error.contains("association backend")),
-                    "Open With refusal must be visible: {:?}",
+                    state.operation_error.is_none(),
+                    "Open With dispatch failed: {:?}",
                     state.operation_error,
                 );
+                let default_parent = open_with
+                    .submenu()
+                    .unwrap()
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.command_id() == Some("file.set_default_application"))
+                    .expect("the explicit default submenu is present");
+                let make_default = default_parent
+                    .submenu()
+                    .and_then(|submenu| submenu.application("writer.desktop"))
+                    .expect("Writer can be made the explicit default")
+                    .clone();
+                let parameters = make_default.generated_parameters().unwrap();
+                state.dispatch_typed_context_command(
+                    CommandAction::SetDefaultApplication,
+                    parameters,
+                    Some(tab),
+                    Some(&[CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()]),
+                    true,
+                    cx,
+                );
+                assert!(state.operation_error.is_none());
 
                 let registry = musheen_core::CommandRegistry::built_in();
                 let mut toolbar = musheen_core::ToolbarLayout::default();
@@ -8453,6 +8708,9 @@ mod tests {
             destination.join("send-me.txt").exists()
         })
         .await;
+        assert_eq!(application_runner.0.lock().unwrap().len(), 2);
+        let saved = filesystem::read_to_string(config_home.join("mimeapps.list")).unwrap();
+        assert!(saved.contains("text/plain=writer.desktop;"));
     }
 
     #[gpui_kit::test]
@@ -9098,10 +9356,13 @@ mod tests {
                 .reason()
                 .is_some_and(|reason| reason.contains("authorization broker"))
         );
-        assert!(
-            MusheenApp::backend_action_state(CommandAction::OpenWith)
-                .reason()
-                .is_some_and(|reason| reason.contains("association backend"))
+        assert_eq!(
+            MusheenApp::backend_action_state(CommandAction::OpenWith),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            MusheenApp::backend_action_state(CommandAction::ChooseApplication),
+            CapabilityState::Supported
         );
     }
 

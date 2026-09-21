@@ -1,5 +1,6 @@
-//! Linux desktop-service adapters.
+//! Linux desktop-service adapters, including XDG MIME-application integration.
 
+mod apps;
 mod catalog;
 mod checksum;
 mod clipboard;
@@ -15,6 +16,7 @@ mod settings;
 mod status;
 mod thumbnail;
 
+pub use apps::*;
 pub use catalog::*;
 pub use checksum::*;
 pub use clipboard::*;

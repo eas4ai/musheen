@@ -198,6 +198,9 @@ mod tests {
             "dialog-targets",
             "dialog-move-review",
             "dialog-operation-review",
+            "open-with-title",
+            "open-with-open-once",
+            "open-with-set-default-and-open",
             "context-backend-unavailable",
             "context-target-changed",
         ] {
