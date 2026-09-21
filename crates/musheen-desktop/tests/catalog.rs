@@ -534,6 +534,116 @@ fn catalog_uses_xdg_data_and_recovers_last_known_good_after_interrupted_write() 
 }
 
 #[test]
+fn independent_catalog_writers_reject_stale_updates_and_keep_a_recoverable_snapshot() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = CatalogStore::at(temporary.path().join("catalog.json"));
+    let first_store = store.clone();
+    let retry_store = store.clone();
+    let second_store = store.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let first = std::thread::spawn(move || {
+        first_store.update(|document| {
+            document
+                .pins_mut()
+                .pin(item("local", b"first"), path(b"/first"), "First")
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            entered_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(())
+        })
+    });
+    entered_rx.recv().unwrap();
+    let second = std::thread::spawn(move || {
+        second_store.update(|document| {
+            document
+                .pins_mut()
+                .pin(item("local", b"second"), path(b"/second"), "Second")
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            Ok(())
+        })
+    });
+    assert!(matches!(
+        first.join().unwrap(),
+        Err(musheen_desktop::CatalogError::UpdateConflict)
+    ));
+    second.join().unwrap().unwrap();
+    retry_store
+        .update(|document| {
+            document
+                .pins_mut()
+                .pin(item("local", b"first"), path(b"/first"), "First")
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.load().unwrap().pins().entries().len(), 2);
+
+    store
+        .update(|document| {
+            document
+                .pins_mut()
+                .pin(item("local", b"third"), path(b"/third"), "Third")
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+    std::fs::write(store.path(), b"{ interrupted").unwrap();
+    let recovered = store.load().unwrap();
+    assert_eq!(recovered.pins().entries().len(), 2);
+    assert!(
+        recovered
+            .pins()
+            .entries()
+            .iter()
+            .any(|pin| pin.item().opaque_key() == b"first")
+    );
+    assert!(
+        recovered
+            .pins()
+            .entries()
+            .iter()
+            .any(|pin| pin.item().opaque_key() == b"second")
+    );
+}
+
+#[test]
+fn catalog_update_does_not_hold_the_file_lock_while_preparing_a_change() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = CatalogStore::at(temporary.path().join("catalog.json"));
+    store.save(&CatalogDocument::default()).unwrap();
+    let writer = store.clone();
+    let reader = store.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let update = std::thread::spawn(move || {
+        writer.update(|document| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            document
+                .pins_mut()
+                .pin(item("local", b"prepared"), path(b"/prepared"), "Prepared")
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            Ok(())
+        })
+    });
+    entered_rx.recv().unwrap();
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+    let load = std::thread::spawn(move || loaded_tx.send(reader.load()).unwrap());
+
+    let loaded_without_waiting_for_provider_work = loaded_rx
+        .recv_timeout(std::time::Duration::from_millis(250))
+        .is_ok();
+    release_tx.send(()).unwrap();
+    update.join().unwrap().unwrap();
+    load.join().unwrap();
+
+    assert!(
+        loaded_without_waiting_for_provider_work,
+        "catalog readers must not wait for preflight work inside an update closure"
+    );
+}
+
+#[test]
 fn catalog_load_rejects_oversized_bytes_collections_and_strings() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("catalog.json");

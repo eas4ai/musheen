@@ -994,14 +994,16 @@ enum ChecksumState {
 
 pub(crate) struct PropertiesFailureWindow {
     message: Box<str>,
+    catalog: Catalog,
     focus: FocusHandle,
     pending_focus: bool,
 }
 
 impl PropertiesFailureWindow {
-    pub fn new(message: impl Into<Box<str>>, cx: &mut Context<Self>) -> Self {
+    pub fn new(message: impl Into<Box<str>>, catalog: Catalog, cx: &mut Context<Self>) -> Self {
         Self {
             message: message.into(),
+            catalog,
             focus: cx.focus_handle(),
             pending_focus: true,
         }
@@ -1019,7 +1021,11 @@ impl Render for PropertiesFailureWindow {
             .test_support()
             .key_context("PropertiesWindow")
             .role(Role::Dialog)
-            .aria_label("Properties could not be loaded")
+            .aria_label(
+                self.catalog
+                    .message("properties-load-failed")
+                    .expect("the Properties failure message exists"),
+            )
             .track_focus(&self.focus)
             .tab_index(0)
             .size_full()
@@ -1044,7 +1050,11 @@ impl Render for PropertiesFailureWindow {
             )
             .child(
                 Button::new("properties-close")
-                    .label("Close")
+                    .label(
+                        self.catalog
+                            .message("properties-close")
+                            .expect("the Properties close message exists"),
+                    )
                     .primary()
                     .on_click(|_, window, _| window.remove_window()),
             )
@@ -1482,6 +1492,17 @@ impl PropertiesWindow {
         }
     }
 
+    fn message(&self, key: &str) -> Box<str> {
+        self.catalog
+            .message(key)
+            .expect("the local Properties catalog message exists")
+            .into()
+    }
+
+    fn localized_value(&self, value: impl AsRef<str>) -> Box<str> {
+        self.catalog.localize_reason(value.as_ref()).into()
+    }
+
     fn sync_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let desired = self.desired_rows();
         if desired.len() != self.rows.len()
@@ -1515,43 +1536,64 @@ impl PropertiesWindow {
         let snapshot = self.model.snapshot();
         let aggregate = snapshot.aggregate();
         let mut rows = vec![
-            ("Items".into(), snapshot.items().len().to_string().into()),
-            ("Type".into(), aggregate_kind(aggregate.kind()).into()),
             (
-                "MIME type".into(),
-                aggregate_text(aggregate.mime_type()).into(),
+                self.message("properties-items"),
+                snapshot.items().len().to_string().into(),
             ),
-            ("Location".into(), aggregate_location(snapshot).into()),
-            ("Identity".into(), aggregate_identity(snapshot).into()),
             (
-                "Logical size".into(),
+                self.message("properties-type"),
+                self.localized_value(aggregate_kind(aggregate.kind())),
+            ),
+            (
+                self.message("properties-mime-type"),
+                self.localized_value(aggregate_text(aggregate.mime_type())),
+            ),
+            (
+                self.message("properties-location"),
+                aggregate_location(snapshot).into(),
+            ),
+            (
+                self.message("properties-identity"),
+                self.localized_value(aggregate_identity(snapshot)),
+            ),
+            (
+                self.message("properties-logical-size"),
                 format_size(aggregate.logical_size()).into(),
             ),
             (
-                "Allocated size".into(),
+                self.message("properties-allocated-size"),
                 format_size(aggregate.allocated_size()).into(),
             ),
             (
-                "Modified".into(),
-                aggregate_time(aggregate.modified()).into(),
+                self.message("properties-modified"),
+                self.localized_value(aggregate_time(aggregate.modified())),
             ),
             (
-                "Accessed".into(),
-                aggregate_time(aggregate.accessed()).into(),
+                self.message("properties-accessed"),
+                self.localized_value(aggregate_time(aggregate.accessed())),
             ),
             (
-                "Metadata changed".into(),
-                aggregate_time(aggregate.changed()).into(),
+                self.message("properties-metadata-changed"),
+                self.localized_value(aggregate_time(aggregate.changed())),
             ),
         ];
         if self.single_directory_path().is_some() {
             rows.push((
-                "Contained items".into(),
-                recursive_size_label(&self.recursive_size).into(),
+                self.message("properties-contained-items"),
+                self.localized_value(recursive_size_label(&self.recursive_size)),
             ));
         }
-        rows.extend(self.filesystem_rows.iter().cloned());
-        rows.extend(self.capability_rows.iter().cloned());
+        rows.extend(
+            self.filesystem_rows
+                .iter()
+                .map(|(label, value)| (self.localized_value(label), self.localized_value(value))),
+        );
+        rows.extend(self.capability_rows.iter().map(|(label, value)| {
+            (
+                localize_property_label(&self.catalog, label).into(),
+                localize_property_value(&self.catalog, value).into(),
+            )
+        }));
         rows
     }
 
@@ -1559,32 +1601,49 @@ impl PropertiesWindow {
         let permissions = self.model.permissions();
         let mut rows = vec![
             (
-                "Owner (UID)".into(),
-                aggregate_u32(permissions.owner()).into(),
+                self.message("properties-owner"),
+                self.localized_value(aggregate_u32(permissions.owner())),
             ),
             (
-                "Group (GID)".into(),
-                aggregate_u32(permissions.group()).into(),
+                self.message("properties-group"),
+                self.localized_value(aggregate_u32(permissions.group())),
             ),
-            ("Mode".into(), aggregate_mode(permissions.mode()).into()),
             (
-                "Editing".into(),
-                permissions
-                    .edit_disabled_reason()
-                    .unwrap_or("Ready to edit")
-                    .to_owned()
-                    .into(),
+                self.message("properties-mode"),
+                self.localized_value(aggregate_mode(permissions.mode())),
+            ),
+            (
+                self.message("properties-editing"),
+                self.localized_value(
+                    permissions
+                        .edit_disabled_reason()
+                        .unwrap_or("Ready to edit"),
+                ),
             ),
         ];
         for (index, item) in self.model.snapshot().items().iter().enumerate() {
             rows.push((
-                indexed_label("Access ACL", index, self.model.snapshot().items().len()).into(),
-                acl_state_label(item.permissions().acl()).into(),
+                indexed_label(
+                    self.catalog
+                        .message("properties-access-acl")
+                        .expect("the access ACL message exists"),
+                    index,
+                    self.model.snapshot().items().len(),
+                )
+                .into(),
+                self.localized_value(acl_state_label(item.permissions().acl())),
             ));
             if let Some(default_acl) = item.permissions().default_acl() {
                 rows.push((
-                    indexed_label("Default ACL", index, self.model.snapshot().items().len()).into(),
-                    acl_state_label(default_acl).into(),
+                    indexed_label(
+                        self.catalog
+                            .message("properties-default-acl")
+                            .expect("the default ACL message exists"),
+                        index,
+                        self.model.snapshot().items().len(),
+                    )
+                    .into(),
+                    self.localized_value(acl_state_label(default_acl)),
                 ));
             }
         }
@@ -1594,12 +1653,14 @@ impl PropertiesWindow {
     fn open_with_rows(&self) -> Vec<(Box<str>, Box<str>)> {
         vec![
             (
-                "MIME type".into(),
-                aggregate_text(self.model.snapshot().aggregate().mime_type()).into(),
+                self.message("properties-mime-type"),
+                self.localized_value(aggregate_text(
+                    self.model.snapshot().aggregate().mime_type(),
+                )),
             ),
             (
-                "Association".into(),
-                "Choose an application for one launch or set the desktop default".into(),
+                self.message("properties-association"),
+                self.message("properties-association-help"),
             ),
         ]
     }
@@ -1608,18 +1669,20 @@ impl PropertiesWindow {
         let mut rows = self
             .model
             .tags()
-            .map(|tag| (Box::<str>::from("Tag"), Box::<str>::from(tag)))
+            .map(|tag| (self.message("properties-tag"), Box::<str>::from(tag)))
             .collect::<Vec<_>>();
         for (item_index, item) in self.model.snapshot().items().iter().enumerate() {
             match item.xattrs() {
                 XattrState::Available(entries) if entries.is_empty() => rows.push((
                     indexed_label(
-                        "Extended attributes",
+                        self.catalog
+                            .message("properties-extended-attributes")
+                            .expect("the extended-attributes message exists"),
                         item_index,
                         self.model.snapshot().items().len(),
                     )
                     .into(),
-                    "None".into(),
+                    self.message("properties-none"),
                 )),
                 XattrState::Available(entries) => {
                     for entry in entries {
@@ -1627,7 +1690,9 @@ impl PropertiesWindow {
                             format!(
                                 "{}: {}",
                                 indexed_label(
-                                    "Attribute",
+                                    self.catalog
+                                        .message("properties-attribute")
+                                        .expect("the attribute message exists"),
                                     item_index,
                                     self.model.snapshot().items().len()
                                 ),
@@ -1640,12 +1705,20 @@ impl PropertiesWindow {
                 }
                 XattrState::Unavailable(reason) => rows.push((
                     indexed_label(
-                        "Extended attributes",
+                        self.catalog
+                            .message("properties-extended-attributes")
+                            .expect("the extended-attributes message exists"),
                         item_index,
                         self.model.snapshot().items().len(),
                     )
                     .into(),
-                    format!("Unavailable: {reason}").into(),
+                    format!(
+                        "{}: {reason}",
+                        self.catalog
+                            .message("properties-unavailable")
+                            .expect("the unavailable message exists")
+                    )
+                    .into(),
                 )),
             }
         }
@@ -1654,29 +1727,54 @@ impl PropertiesWindow {
 
     fn checksum_rows(&self) -> Vec<(Box<str>, Box<str>)> {
         match &self.checksum {
-            ChecksumState::Idle => vec![("Checksum".into(), "Not calculated".into())],
+            ChecksumState::Idle => vec![(
+                self.message("properties-checksum"),
+                self.message("properties-not-calculated"),
+            )],
             ChecksumState::Running(algorithm) => vec![(
-                "Checksum".into(),
-                format!("Calculating {}…", algorithm.label()).into(),
+                self.message("properties-checksum"),
+                format!(
+                    "{} {}",
+                    self.catalog
+                        .message("properties-calculating")
+                        .expect("the calculating message exists"),
+                    algorithm.label()
+                )
+                .into(),
             )],
             ChecksumState::Failed(error) => {
-                vec![("Checksum".into(), format!("Failed: {error}").into())]
+                vec![(
+                    self.message("properties-checksum"),
+                    format!(
+                        "{}: {error}",
+                        self.catalog
+                            .message("properties-failed")
+                            .expect("the failed message exists")
+                    )
+                    .into(),
+                )]
             }
             ChecksumState::Ready(result) => {
                 let fingerprint = result.fingerprint();
                 vec![
-                    ("Algorithm".into(), result.algorithm().label().into()),
-                    ("Digest".into(), result.hex_digest().into()),
                     (
-                        "Stable identity".into(),
+                        self.message("properties-algorithm"),
+                        result.algorithm().label().into(),
+                    ),
+                    (
+                        self.message("properties-digest"),
+                        result.hex_digest().into(),
+                    ),
+                    (
+                        self.message("properties-stable-identity"),
                         format!("{}:{}", fingerprint.device(), fingerprint.inode()).into(),
                     ),
                     (
-                        "Size at read".into(),
+                        self.message("properties-size-at-read"),
                         format_size(fingerprint.size()).into(),
                     ),
                     (
-                        "Modified at read".into(),
+                        self.message("properties-modified-at-read"),
                         format_timestamp(
                             fingerprint.modified_seconds(),
                             fingerprint.modified_nanoseconds(),
@@ -1699,7 +1797,7 @@ impl PropertiesWindow {
                     "properties-page-{}",
                     page_id(page)
                 )))
-                .label(page_label(page))
+                .label(provider_page_label(page, &self.catalog))
                 .selected(self.model.page() == page)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.select_page(page, window, cx);
@@ -1710,7 +1808,11 @@ impl PropertiesWindow {
             .id("properties-pages")
             .test_support()
             .role(Role::TabList)
-            .aria_label("Properties pages")
+            .aria_label(
+                self.catalog
+                    .message("properties-pages")
+                    .expect("the Properties pages message exists"),
+            )
             .w(px(180.))
             .h_full()
             .flex_shrink_0()
@@ -1730,7 +1832,13 @@ impl PropertiesWindow {
             .id("properties-values")
             .test_support()
             .role(Role::Region)
-            .aria_label(format!("{} properties", page_label(self.model.page())))
+            .aria_label(format!(
+                "{} {}",
+                self.catalog
+                    .message("properties-for")
+                    .expect("the Properties message exists"),
+                provider_page_label(self.model.page(), &self.catalog)
+            ))
             .w_full()
             .flex()
             .flex_col()
@@ -1759,13 +1867,13 @@ impl PropertiesWindow {
         let scope = self.model.permissions().scope();
         let recursive = scope.is_recursive();
         let review_needed = recursive && !scope.is_reviewed();
-        let field = |label: &'static str, id: &'static str, input: &Entity<InputState>| {
+        let field = |label: String, id: &'static str, input: &Entity<InputState>| {
             div()
                 .w_full()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_xs().child(label))
+                .child(div().text_xs().child(label.clone()))
                 .child(
                     Input::new(input)
                         .id(id)
@@ -1778,28 +1886,44 @@ impl PropertiesWindow {
             .id("permissions-editor")
             .test_support()
             .role(Role::Region)
-            .aria_label("Permission and ownership editor")
+            .aria_label(
+                self.catalog
+                    .message("properties-permission-editor")
+                    .expect("the permission-editor message exists"),
+            )
             .w_full()
             .flex()
             .flex_col()
             .gap_3()
             .child(field(
-                "Owner (UID)",
+                self.catalog
+                    .message("properties-owner")
+                    .expect("the owner message exists")
+                    .to_owned(),
                 "permissions-owner",
                 &self.permission_inputs.owner,
             ))
             .child(field(
-                "Group (GID)",
+                self.catalog
+                    .message("properties-group")
+                    .expect("the group message exists")
+                    .to_owned(),
                 "permissions-group",
                 &self.permission_inputs.group,
             ))
             .child(field(
-                "File mode (octal)",
+                self.catalog
+                    .message("properties-file-mode")
+                    .expect("the file-mode message exists")
+                    .to_owned(),
                 "permissions-file-mode",
                 &self.permission_inputs.file_mode,
             ))
             .child(field(
-                "Directory mode (octal)",
+                self.catalog
+                    .message("properties-directory-mode")
+                    .expect("the directory-mode message exists")
+                    .to_owned(),
                 "permissions-directory-mode",
                 &self.permission_inputs.directory_mode,
             ))
@@ -1810,7 +1934,11 @@ impl PropertiesWindow {
                     .gap_2()
                     .child(
                         Button::new("permissions-scope-single")
-                            .label("Selected items only")
+                            .label(
+                                self.catalog
+                                    .message("properties-selected-only")
+                                    .expect("the selected-only message exists"),
+                            )
                             .selected(!recursive)
                             .disabled(disabled)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1820,7 +1948,11 @@ impl PropertiesWindow {
                     )
                     .child(
                         Button::new("permissions-scope-recursive")
-                            .label("Include descendants")
+                            .label(
+                                self.catalog
+                                    .message("properties-include-descendants")
+                                    .expect("the descendants message exists"),
+                            )
                             .selected(recursive && !scope.includes_nested_mounts())
                             .disabled(disabled)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1830,7 +1962,11 @@ impl PropertiesWindow {
                     )
                     .child(
                         Button::new("permissions-scope-mounts")
-                            .label("Include descendants and nested mounts")
+                            .label(
+                                self.catalog
+                                    .message("properties-include-nested-mounts")
+                                    .expect("the nested-mounts message exists"),
+                            )
                             .selected(recursive && scope.includes_nested_mounts())
                             .disabled(disabled)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1846,13 +1982,23 @@ impl PropertiesWindow {
                         .flex_col()
                         .gap_2()
                         .child(div().text_sm().child(if scope.includes_nested_mounts() {
-                            "Review: this will include nested filesystems."
+                            self.catalog
+                                .message("properties-review-nested")
+                                .expect("the nested review message exists")
+                                .to_owned()
                         } else {
-                            "Review: this will include descendants but stop at nested filesystems."
+                            self.catalog
+                                .message("properties-review-descendants")
+                                .expect("the descendant review message exists")
+                                .to_owned()
                         }))
                         .child(
                             Button::new("permissions-review-scope")
-                                .label("I reviewed this scope")
+                                .label(
+                                    self.catalog
+                                        .message("properties-reviewed-scope")
+                                        .expect("the reviewed-scope message exists"),
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.model.permissions_mut().review_recursive_scope();
                                     cx.notify();
@@ -2033,7 +2179,11 @@ impl PropertiesWindow {
         {
             actions = actions.child(
                 Button::new("properties-apply")
-                    .label("Apply")
+                    .label(
+                        self.catalog
+                            .message("properties-apply")
+                            .expect("the apply message exists"),
+                    )
                     .primary()
                     .on_click(cx.listener(|this, _, _, cx| this.apply_permissions(cx))),
             );
@@ -2058,9 +2208,13 @@ impl PropertiesWindow {
                 Button::new("properties-calculate-size")
                     .label(
                         if matches!(self.recursive_size, RecursiveSizeState::Running) {
-                            "Calculating…"
+                            self.catalog
+                                .message("properties-calculating")
+                                .expect("the calculating message exists")
                         } else {
-                            "Calculate contained size"
+                            self.catalog
+                                .message("properties-calculate-size")
+                                .expect("the calculate-size message exists")
                         },
                     )
                     .disabled(matches!(self.recursive_size, RecursiveSizeState::Running))
@@ -2073,14 +2227,22 @@ impl PropertiesWindow {
             actions = actions
                 .child(
                     Button::new("properties-checksum-blake3")
-                        .label("Calculate BLAKE3")
+                        .label(
+                            self.catalog
+                                .message("properties-calculate-blake3")
+                                .expect("the BLAKE3 message exists"),
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.start_checksum(ChecksumAlgorithm::Blake3, cx);
                         })),
                 )
                 .child(
                     Button::new("properties-checksum-sha256")
-                        .label("Calculate SHA-256")
+                        .label(
+                            self.catalog
+                                .message("properties-calculate-sha256")
+                                .expect("the SHA-256 message exists"),
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.start_checksum(ChecksumAlgorithm::Sha256, cx);
                         })),
@@ -2116,18 +2278,23 @@ impl Render for PropertiesWindow {
         let location = aggregate_location(self.model.snapshot());
         let state_message = match self.model.state() {
             PropertiesState::Ready => self.refresh_error.as_deref(),
-            PropertiesState::Replaced => self.refresh_error.as_deref().or(Some(
-                "The selected item was replaced. Close and reopen Properties.",
-            )),
-            PropertiesState::Missing => Some("The selected item no longer exists."),
+            PropertiesState::Replaced => self
+                .refresh_error
+                .as_deref()
+                .or_else(|| self.catalog.message("properties-replaced").ok()),
+            PropertiesState::Missing => self.catalog.message("properties-missing").ok(),
         };
+        let properties_for = self
+            .catalog
+            .message("properties-for")
+            .expect("the Properties title message exists");
         let colors = cx.theme().colors;
         div()
             .id("properties-dialog")
             .test_support()
             .key_context("PropertiesWindow")
             .role(Role::Dialog)
-            .aria_label(format!("Properties for {title}"))
+            .aria_label(format!("{properties_for} {title}"))
             .track_focus(&self.focus)
             .tab_index(0)
             .size_full()
@@ -2149,7 +2316,7 @@ impl Render for PropertiesWindow {
                     .id("properties-identity")
                     .test_support()
                     .role(Role::Heading)
-                    .aria_label(format!("{title}, {location}"))
+                    .aria_label(format!("{properties_for} {title}, {location}"))
                     .p_4()
                     .border_b_1()
                     .border_color(colors.border)
@@ -2200,7 +2367,11 @@ impl Render for PropertiesWindow {
                     .id("properties-actions")
                     .test_support()
                     .role(Role::Toolbar)
-                    .aria_label("Properties actions")
+                    .aria_label(
+                        self.catalog
+                            .message("properties-actions")
+                            .expect("the Properties actions message exists"),
+                    )
                     .flex()
                     .items_center()
                     .justify_between()
@@ -2211,7 +2382,11 @@ impl Render for PropertiesWindow {
                     .child(self.render_page_actions(cx))
                     .child(
                         Button::new("properties-close")
-                            .label("Close")
+                            .label(
+                                self.catalog
+                                    .message("properties-close")
+                                    .expect("the close message exists"),
+                            )
                             .primary()
                             .on_click(cx.listener(|this, _, window, _| this.close(window))),
                     ),
@@ -2355,16 +2530,48 @@ fn page_label(page: PropertiesPage) -> &'static str {
 
 fn provider_page_label(page: PropertiesPage, catalog: &Catalog) -> String {
     let key = match page {
-        PropertiesPage::General => "provider-properties-general",
-        PropertiesPage::Tags => "provider-properties-tags",
-        PropertiesPage::Permissions => "command-permissions",
-        PropertiesPage::OpenWith => "command-open-with",
-        PropertiesPage::Checksums => "provider-properties-general",
+        PropertiesPage::General => "properties-page-general",
+        PropertiesPage::Permissions => "properties-page-permissions",
+        PropertiesPage::OpenWith => "properties-page-open-with",
+        PropertiesPage::Tags => "properties-page-tags",
+        PropertiesPage::Checksums => "properties-page-checksums",
     };
     catalog
         .message(key)
         .unwrap_or_else(|_| page_label(page))
         .to_owned()
+}
+
+fn localize_property_label(catalog: &Catalog, label: &str) -> String {
+    if let Some(kind) = label.strip_prefix("Capability: ") {
+        return format!(
+            "{}: {}",
+            catalog
+                .message("properties-capability")
+                .expect("the capability message exists"),
+            catalog.localize_reason(kind)
+        );
+    }
+    catalog.localize_reason(label)
+}
+
+fn localize_property_value(catalog: &Catalog, value: &str) -> String {
+    for (prefix, key) in [
+        ("Unsupported: ", "properties-unsupported"),
+        ("Unknown: ", "properties-unknown"),
+        ("Unavailable: ", "properties-unavailable"),
+        ("Failed: ", "properties-failed"),
+    ] {
+        if let Some(reason) = value.strip_prefix(prefix) {
+            return format!(
+                "{}: {reason}",
+                catalog
+                    .message(key)
+                    .expect("the property-state catalog message exists")
+            );
+        }
+    }
+    catalog.localize_reason(value)
 }
 
 fn identity_title(snapshot: &PropertySnapshot) -> String {
@@ -2576,6 +2783,35 @@ mod tests {
     use standard_library::fs as filesystem;
     use std as standard_library;
 
+    #[gpui_kit::test]
+    async fn properties_failure_window_localizes_aria_and_close_at_200_percent(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(760.), px(620.)), |window, cx| {
+            let view = cx.new(|cx| {
+                PropertiesFailureWindow::new(
+                    "provider unavailable",
+                    Catalog::load(crate::Locale::Ar).unwrap(),
+                    cx,
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.set_scale_factor(2.0);
+            window.render_frame(cx);
+            assert_eq!(window.scale_factor(), 2.0);
+            assert_eq!(
+                window.find("properties-dialog").label(),
+                Some("تعذّر تحميل الخصائص")
+            );
+            assert_eq!(window.find("properties-close").label(), Some("إغلاق"));
+        })
+        .unwrap();
+    }
+
     #[test]
     fn permission_batches_clear_edits_only_after_every_job_succeeds() {
         let mut batch = PermissionBatchState::default();
@@ -2650,7 +2886,7 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(
                 window.find("properties-values").label(),
-                Some("Permissions properties")
+                Some("Properties for Permissions")
             );
             assert!(
                 window
@@ -2682,6 +2918,76 @@ mod tests {
         })
         .expect("the default action is dispatched");
         assert!(cx.update(|cx| default_action_view.read(cx).close_requested));
+    }
+
+    #[gpui_kit::test]
+    async fn local_properties_localizes_arabic_and_pseudo_chrome_at_200_percent(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_properties_key_bindings(cx);
+        });
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery/notes.txt");
+        let arabic = PropertiesWindowData::load(std::slice::from_ref(&path))
+            .unwrap()
+            .with_catalog(Catalog::load(crate::Locale::Ar).unwrap());
+        let arabic_handle = cx.open_window(size(px(1520.), px(1240.)), |window, cx| {
+            let view = cx.new(|cx| PropertiesWindow::new(arabic, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(arabic_handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("properties-dialog").label(),
+                Some("خصائص notes.txt")
+            );
+            assert_eq!(
+                window.find("properties-page-permissions").label(),
+                Some("الأذونات")
+            );
+            window.click("properties-page-permissions", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("properties-values").label(),
+                Some("خصائص الأذونات")
+            );
+            assert_eq!(
+                window.find("permissions-editor").label(),
+                Some("محرر الأذونات والملكية")
+            );
+            assert_eq!(
+                window.find("permissions-owner").label(),
+                Some("المالك (UID)")
+            );
+            assert!(window.find("properties-close").visible());
+        })
+        .unwrap();
+
+        let pseudo = PropertiesWindowData::load(&[path])
+            .unwrap()
+            .with_catalog(Catalog::load(crate::Locale::EnXa).unwrap());
+        let pseudo_handle = cx.open_window(size(px(1520.), px(1240.)), |window, cx| {
+            let view = cx.new(|cx| PropertiesWindow::new(pseudo, window, cx));
+            Root::new(view, window, cx)
+        });
+        cx.update_window(pseudo_handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("properties-dialog")
+                    .label()
+                    .is_some_and(|label| label.starts_with('⟦'))
+            );
+            assert!(
+                window
+                    .find("properties-page-general")
+                    .label()
+                    .is_some_and(|label| label.starts_with('⟦'))
+            );
+        })
+        .unwrap();
     }
 
     #[cfg(unix)]

@@ -3,14 +3,23 @@ use crate::Locale;
 use gpui_kit::WeakEntity;
 use musheen_core::CapabilityMatrix;
 use musheen_desktop::{
-    HomeItemKind, HomeSection, MountShortcut, TagBackend, TagService, TagStorage, XattrTagBackend,
+    BackendTagService, HomeItemKind, HomeSection, MountShortcut, TagBackend, TagService,
+    TagStorage, XattrTagBackend,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const MAX_OBSERVED_SCOPES: usize = 16;
+const MAX_OBSERVED_ITEMS_PER_SCOPE: usize = 4_096;
+const MAX_XATTR_RECONCILIATION_WRITES: usize = 32;
+type ObservedScopes = Vec<(StorePath, BTreeMap<ItemId, StorePath>)>;
 
 #[derive(Clone, Debug)]
 pub(super) struct CatalogBinding {
     store: Option<CatalogStore>,
     document: Arc<Mutex<CatalogDocument>>,
+    revision: Arc<AtomicU64>,
+    observed_scopes: Arc<Mutex<ObservedScopes>>,
     xattr_opt_in: bool,
 }
 
@@ -46,6 +55,8 @@ impl CatalogBinding {
         Self {
             store: None,
             document: Arc::new(Mutex::new(CatalogDocument::default())),
+            revision: Arc::new(AtomicU64::new(0)),
+            observed_scopes: Arc::new(Mutex::new(Vec::new())),
             xattr_opt_in,
         }
     }
@@ -63,15 +74,65 @@ impl CatalogBinding {
         Self {
             store: Some(store),
             document: Arc::new(Mutex::new(document)),
+            revision: Arc::new(AtomicU64::new(0)),
+            observed_scopes: Arc::new(Mutex::new(Vec::new())),
             xattr_opt_in,
         }
     }
 
     pub(super) fn snapshot(&self) -> CatalogDocument {
-        self.document
+        self.snapshot_with_revision().0
+    }
+
+    fn snapshot_with_revision(&self) -> (CatalogDocument, u64) {
+        let document = self.document.lock().expect("catalog lock is not poisoned");
+        (document.clone(), self.revision.load(Ordering::Acquire))
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    fn remember_directory_observation(
+        &self,
+        location: &StorePath,
+        items: &[StoreItem],
+        observation: DirectoryObservation,
+    ) {
+        let mut scopes = self
+            .observed_scopes
             .lock()
-            .expect("catalog lock is not poisoned")
-            .clone()
+            .expect("observed-scope lock is not poisoned");
+        let mut entries = scopes
+            .iter()
+            .position(|(scope, _)| scope == location)
+            .map(|index| scopes.remove(index).1)
+            .unwrap_or_default();
+        if observation == DirectoryObservation::Complete {
+            entries.clear();
+        }
+        for item in items.iter().rev().take(MAX_OBSERVED_ITEMS_PER_SCOPE) {
+            entries.insert(item.id().clone(), item.path().clone());
+        }
+        while entries.len() > MAX_OBSERVED_ITEMS_PER_SCOPE {
+            let Some(item) = entries.keys().next().cloned() else {
+                break;
+            };
+            entries.remove(&item);
+        }
+        scopes.push((location.clone(), entries));
+        if scopes.len() > MAX_OBSERVED_SCOPES {
+            scopes.remove(0);
+        }
+    }
+
+    fn observed_scope_for(&self, item: &ItemId, path: &StorePath) -> Option<StorePath> {
+        self.observed_scopes
+            .lock()
+            .expect("observed-scope lock is not poisoned")
+            .iter()
+            .rev()
+            .find_map(|(scope, entries)| (entries.get(item) == Some(path)).then(|| scope.clone()))
     }
 
     pub(super) fn update(&self, change: impl FnOnce(&mut CatalogDocument)) -> Result<(), Box<str>> {
@@ -87,9 +148,21 @@ impl CatalogBinding {
     ) -> Result<T, Box<str>> {
         let mut document = self.document.lock().expect("catalog lock is not poisoned");
         if let Some(store) = &self.store {
-            *document = store
-                .load()
-                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            let previous_visible = document.clone();
+            let (changed, current) = store
+                .update(|current| {
+                    let changed = change(current)?;
+                    Ok((changed, current.clone()))
+                })
+                .map_err(|error| match error {
+                    musheen_desktop::CatalogError::Update(error) => error,
+                    error => Box::<str>::from(error.to_string()),
+                })?;
+            *document = current;
+            if *document != previous_visible {
+                self.revision.fetch_add(1, Ordering::AcqRel);
+            }
+            return Ok(changed);
         }
         let previous = document.clone();
         let changed = match change(&mut document) {
@@ -99,11 +172,8 @@ impl CatalogBinding {
                 return Err(error);
             }
         };
-        if let Some(store) = &self.store
-            && let Err(error) = store.save(&document)
-        {
-            *document = previous;
-            return Err(error.to_string().into());
+        if *document != previous {
+            self.revision.fetch_add(1, Ordering::AcqRel);
         }
         Ok(changed)
     }
@@ -135,11 +205,54 @@ impl CatalogBinding {
         path: &StorePath,
         capabilities: &CapabilityMatrix,
     ) -> Result<BTreeSet<Box<str>>, Box<str>> {
-        self.update_result(|document| {
-            TagService::new(document.tags_mut(), self.xattr_opt_in)
-                .tags(item, path, capabilities)
-                .map_err(|error| error.to_string().into())
-        })
+        let mut snapshot = self.snapshot();
+        let storage = TagService::new(snapshot.tags_mut(), self.xattr_opt_in)
+            .storage_for(path, capabilities)
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let catalog_tags = snapshot.tags().tags_for(item);
+        if storage == TagStorage::AppCatalog {
+            return Ok(catalog_tags);
+        }
+        if snapshot.tags().is_xattr_pending(item) {
+            self.reconcile_pending_xattrs()?;
+            return Ok(self.snapshot().tags().tags_for(item));
+        }
+
+        let xattr_tags = BackendTagService::new(XattrTagBackend::new(true, true))
+            .tags(item, path)
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let mut merged = catalog_tags.clone();
+        merged.extend(xattr_tags.iter().cloned());
+        if merged != xattr_tags {
+            XattrTagBackend::new(true, true)
+                .write_tags(item, path, &merged)
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+        }
+
+        let expected_path = snapshot.tags().path_hint(item).cloned();
+        let needs_rewrite = self.update_result(|document| {
+            let current_path = document.tags().path_hint(item).cloned();
+            let current_tags = document.tags().tags_for(item);
+            let current_pending = document.tags().is_xattr_pending(item);
+            if current_path != expected_path || current_tags != catalog_tags || current_pending {
+                document.tags_mut().stage_xattr_tags(
+                    item,
+                    current_path.unwrap_or_else(|| path.clone()),
+                    current_tags,
+                );
+                return Ok(true);
+            }
+            document
+                .tags_mut()
+                .write_tags(item, path, &merged)
+                .expect("the app-owned tag catalog is infallible");
+            Ok(false)
+        })?;
+        if needs_rewrite {
+            self.reconcile_pending_xattrs()?;
+            return Ok(self.snapshot().tags().tags_for(item));
+        }
+        Ok(merged)
     }
 
     pub(super) fn tag_states(&self, targets: &[TagTarget]) -> Result<TagStates, Box<str>> {
@@ -180,29 +293,56 @@ impl CatalogBinding {
         for tag in added {
             TagService::validate_tag(tag).map_err(|error| Box::<str>::from(error.to_string()))?;
         }
+        let mut prepared = Vec::with_capacity(targets.len());
+        for (item, path, capabilities) in targets {
+            let current = self.tags_for(item, path, capabilities)?;
+            let mut snapshot = self.snapshot();
+            let storage = TagService::new(snapshot.tags_mut(), self.xattr_opt_in)
+                .storage_for(path, capabilities)
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            let mut desired = current.clone();
+            desired.retain(|tag| !removed.contains(tag));
+            desired.extend(added.iter().cloned());
+            prepared.push((
+                item.clone(),
+                path.clone(),
+                storage,
+                current,
+                desired,
+                self.observed_scope_for(item, path),
+            ));
+        }
         self.update_result(|document| {
-            for (item, path, capabilities) in targets {
-                let (mut desired, storage) = {
-                    let mut service = TagService::new(document.tags_mut(), self.xattr_opt_in);
-                    let desired = service
-                        .tags(item, path, capabilities)
-                        .map_err(|error| Box::<str>::from(error.to_string()))?;
-                    let storage = service
-                        .storage_for(path, capabilities)
-                        .map_err(|error| Box::<str>::from(error.to_string()))?;
-                    (desired, storage)
-                };
-                desired.retain(|tag| !removed.contains(tag));
-                desired.extend(added.iter().cloned());
-                if storage == TagStorage::ExtendedAttribute {
+            if prepared.iter().any(|(item, path, _, current, _, _)| {
+                document.tags().tags_for(item) != *current
+                    || document.tags().is_xattr_pending(item)
+                    || document
+                        .tags()
+                        .path_hint(item)
+                        .is_some_and(|current_path| current_path != path)
+            }) {
+                return Err(Box::<str>::from(
+                    "catalog tags changed while preparing the update; retry the action",
+                ));
+            }
+            for (item, path, storage, _, desired, scope_hint) in &prepared {
+                let has_desired_tags = !desired.is_empty();
+                if *storage == TagStorage::ExtendedAttribute {
                     document
                         .tags_mut()
-                        .stage_xattr_tags(item, path.clone(), desired);
+                        .stage_xattr_tags(item, path.clone(), desired.clone());
                 } else {
                     document
                         .tags_mut()
-                        .write_tags(item, path, &desired)
+                        .write_tags(item, path, desired)
                         .expect("the app-owned tag catalog is infallible");
+                }
+                if has_desired_tags && let Some(scope_hint) = scope_hint {
+                    document.tags_mut().observe_present_in_scope(
+                        item,
+                        path.clone(),
+                        scope_hint.clone(),
+                    );
                 }
             }
             Ok(())
@@ -214,19 +354,72 @@ impl CatalogBinding {
         &self,
         mut writer: impl FnMut(&ItemId, &StorePath, &BTreeSet<Box<str>>) -> Result<(), Box<str>>,
     ) -> Result<(), Box<str>> {
-        self.update_result(|document| {
-            let pending = document
+        let pending = {
+            let document = self.document.lock().expect("catalog lock is not poisoned");
+            document
                 .tags()
                 .pending_xattr_records()
                 .map(|(item, path, tags)| (item.clone(), path.clone(), tags.clone()))
-                .collect::<Vec<_>>();
-            for (item, path, tags) in &pending {
-                writer(item, path, tags)?;
+                .collect::<Vec<_>>()
+        };
+        let mut first_error = None;
+        for (item, initial_path, initial_tags) in pending {
+            let mut desired = (initial_path, initial_tags);
+            let mut converged = false;
+            for _ in 0..MAX_XATTR_RECONCILIATION_WRITES {
+                if let Err(error) = writer(&item, &desired.0, &desired.1) {
+                    first_error.get_or_insert(error);
+                    break;
+                }
+                let next = self.update_result(|document| {
+                    let current = document.tags().path_hint(&item).cloned().map(|path| {
+                        let tags = document.tags().tags_for(&item);
+                        let pending = document.tags().is_xattr_pending(&item);
+                        (path, tags, pending)
+                    });
+                    match current {
+                        Some((path, tags, pending)) if path == desired.0 && tags == desired.1 => {
+                            if pending {
+                                document.tags_mut().finish_xattr_reconciliation(&item);
+                            }
+                            Ok(None)
+                        }
+                        Some((path, tags, _)) => {
+                            document
+                                .tags_mut()
+                                .stage_xattr_tags(&item, path.clone(), tags.clone());
+                            Ok(Some((path, tags)))
+                        }
+                        None => {
+                            let path = desired.0.clone();
+                            let tags = BTreeSet::new();
+                            document
+                                .tags_mut()
+                                .stage_xattr_tags(&item, path.clone(), tags.clone());
+                            Ok(Some((path, tags)))
+                        }
+                    }
+                })?;
+                let Some(next) = next else {
+                    converged = true;
+                    break;
+                };
+                desired = next;
             }
-            for (item, _, _) in pending {
-                document.tags_mut().finish_xattr_reconciliation(&item);
+            if !converged && first_error.is_none() {
+                first_error = Some(Box::<str>::from(
+                    "tag metadata changed too often to reconcile extended attributes safely",
+                ));
             }
-            Ok(())
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn reconcile_pending_xattrs(&self) -> Result<(), Box<str>> {
+        self.reconcile_pending_xattrs_with(|item, path, tags| {
+            XattrTagBackend::new(true, true)
+                .write_tags(item, path, tags)
+                .map_err(|error| Box::<str>::from(error.to_string()))
         })
     }
 
@@ -273,15 +466,28 @@ impl CatalogBinding {
         let targets = document
             .tags()
             .tracked_items()
-            .filter(|(item, _, _)| document.tags().tags_for(item).contains(old))
+            .filter(|(item, _, orphaned)| {
+                !*orphaned && document.tags().tags_for(item).contains(old)
+            })
             .map(|(item, path, _)| (item.clone(), path.clone(), capabilities(path)))
             .collect::<Vec<_>>();
-        let changed = targets.len();
+        let changed = document
+            .tags()
+            .tracked_items()
+            .filter(|(item, _, _)| document.tags().tags_for(item).contains(old))
+            .count();
         self.apply_tag_delta(
             &targets,
             &[Box::<str>::from(new.trim())].into_iter().collect(),
             &[Box::<str>::from(old)].into_iter().collect(),
         )?;
+        self.update_result(|document| {
+            document
+                .tags_mut()
+                .rename(old, new)
+                .map_err(|error| Box::<str>::from(error.to_string()))?;
+            Ok(())
+        })?;
         Ok(changed)
     }
 
@@ -294,15 +500,24 @@ impl CatalogBinding {
         let targets = document
             .tags()
             .tracked_items()
-            .filter(|(item, _, _)| document.tags().tags_for(item).contains(tag))
+            .filter(|(item, _, orphaned)| {
+                !*orphaned && document.tags().tags_for(item).contains(tag)
+            })
             .map(|(item, path, _)| (item.clone(), path.clone(), capabilities(path)))
             .collect::<Vec<_>>();
-        let changed = targets.len();
+        let changed = document
+            .tags()
+            .tracked_items()
+            .filter(|(item, _, _)| document.tags().tags_for(item).contains(tag))
+            .count();
         self.apply_tag_delta(
             &targets,
             &BTreeSet::new(),
             &[Box::<str>::from(tag)].into_iter().collect(),
         )?;
+        self.update(|document| {
+            document.tags_mut().delete(tag);
+        })?;
         Ok(changed)
     }
 
@@ -431,28 +646,39 @@ impl CatalogBinding {
         &self,
         mut resolve: impl FnMut(&StorePath) -> Result<Option<StoreItem>, Box<str>>,
     ) -> Result<(), Box<str>> {
+        let resolutions = self
+            .snapshot()
+            .pins()
+            .entries()
+            .iter()
+            .map(|pin| {
+                let resolution = match resolve(pin.path_hint()) {
+                    Ok(Some(item)) if item.id() == pin.item() => Ok(item.path().clone()),
+                    Ok(Some(_)) => Err(Box::<str>::from(
+                        "the stored path now identifies a different item",
+                    )),
+                    Ok(None) => Err(Box::<str>::from("the target is missing")),
+                    Err(error) => Err(error),
+                };
+                (pin.item().clone(), pin.path_hint().clone(), resolution)
+            })
+            .collect::<Vec<_>>();
         self.update(|document| {
-            let pins = document.pins().entries().to_vec();
-            for pin in pins {
-                match resolve(pin.path_hint()) {
-                    Ok(Some(item)) if item.id() == pin.item() => {
-                        document
-                            .pins_mut()
-                            .mark_available(pin.item(), item.path().clone());
+            for (item, expected_path, resolution) in resolutions {
+                if !document
+                    .pins()
+                    .entries()
+                    .iter()
+                    .any(|pin| pin.item() == &item && pin.path_hint() == &expected_path)
+                {
+                    continue;
+                }
+                match resolution {
+                    Ok(path) => {
+                        document.pins_mut().mark_available(&item, path);
                     }
-                    Ok(Some(_)) => {
-                        document.pins_mut().mark_unavailable(
-                            pin.item(),
-                            "the stored path now identifies a different item",
-                        );
-                    }
-                    Ok(None) => {
-                        document
-                            .pins_mut()
-                            .mark_unavailable(pin.item(), "the target is missing");
-                    }
-                    Err(error) => {
-                        document.pins_mut().mark_unavailable(pin.item(), error);
+                    Err(reason) => {
+                        document.pins_mut().mark_unavailable(&item, reason);
                     }
                 }
             }
@@ -465,6 +691,7 @@ impl CatalogBinding {
         items: &[StoreItem],
         observation: DirectoryObservation,
     ) -> Result<(), Box<str>> {
+        self.remember_directory_observation(location, items, observation);
         let present = items
             .iter()
             .map(|item| item.id().clone())
@@ -575,9 +802,9 @@ impl MusheenApp {
         }) {
             self.operation_error = Some(error);
         }
-        let document = self.catalog_binding.snapshot();
+        let (document, projection_revision) = self.catalog_binding.snapshot_with_revision();
         self.pins.replace_catalog(document.pins());
-        let tag_names = self.catalog_binding.tag_names();
+        let tag_names = document.tags().tag_names();
         for sidebar in self.sidebars.values_mut() {
             sidebar.set_tag_names(tag_names.iter().map(AsRef::as_ref));
         }
@@ -591,8 +818,7 @@ impl MusheenApp {
                 continue;
             };
             active.filter = Some(
-                DirectoryFilter::default()
-                    .with_tagged_items(self.catalog_binding.items_with_tag(tag)),
+                DirectoryFilter::default().with_tagged_items(document.tags().items_with_tag(tag)),
             );
             active.error = None;
         }
@@ -618,6 +844,7 @@ impl MusheenApp {
                 tab.set_view_preferences(preferences);
             }
         }
+        self.catalog_projection_revision = projection_revision;
     }
 
     pub(super) fn folder_identity(&self, location: &StorePath) -> Option<FolderIdentity> {
@@ -1012,7 +1239,12 @@ impl MusheenApp {
                 self.sync_catalog_projection();
             }
             Ok(OrphanCleanupOutcome::NoLongerOrphaned) => {
-                self.operation_error = Some("the reviewed tag record is no longer orphaned".into());
+                self.operation_error = Some(
+                    self.catalog
+                        .message("catalog-error-orphan-live")
+                        .expect("the orphan-live catalog message exists")
+                        .into(),
+                );
             }
             Err(error) => self.operation_error = Some(error),
         }
@@ -1080,6 +1312,22 @@ mod tests {
                 .unwrap(),
             [Box::<str>::from("blue")].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn read_only_catalog_queries_do_not_advance_the_projection_revision() {
+        let binding = CatalogBinding::in_memory();
+        let target = item("remote", b"stable-item");
+        let path = remote_path("remote", b"folder/file");
+        let revision = binding.revision();
+
+        assert!(
+            binding
+                .tags_for(&target, &path, &capabilities(true, false))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(binding.revision(), revision);
     }
 
     #[test]
@@ -1174,7 +1422,9 @@ mod tests {
 
         assert_eq!(error.as_ref(), "injected second mirror failure");
         let durable = catalog_store.load().unwrap();
-        assert_eq!(durable.tags().pending_xattr_count(), 2);
+        assert_eq!(durable.tags().pending_xattr_count(), 1);
+        assert!(!durable.tags().is_xattr_pending(&first));
+        assert!(durable.tags().is_xattr_pending(&second));
         assert_eq!(
             durable.tags().tags_for(&first),
             ["blue", "red"].into_iter().map(Box::<str>::from).collect()
@@ -1191,6 +1441,240 @@ mod tests {
             catalog_store.load().unwrap().tags().pending_xattr_count(),
             0
         );
+    }
+
+    #[test]
+    fn global_tag_changes_include_catalog_only_orphans_without_touching_missing_xattrs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let active_path = temporary.path().join("active");
+        filesystem::write(&active_path, b"active").unwrap();
+        let active = item("local", b"active");
+        let orphan = item("local", b"orphan");
+        let active_path = StorePath::from_unix_path(active_path.into_os_string());
+        let orphan_path = StorePath::from_unix_path(temporary.path().join("missing"));
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document
+            .tags_mut()
+            .assign(&active, active_path.clone(), "old")
+            .unwrap();
+        document
+            .tags_mut()
+            .assign(&orphan, orphan_path, "old")
+            .unwrap();
+        document.tags_mut().observe_missing(&orphan);
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        store.save(&document).unwrap();
+        let binding = CatalogBinding::persistent_with_xattr_opt_in(store, document, true);
+
+        assert_eq!(
+            binding
+                .rename_tag("old", "new", |_| capabilities(true, true))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            binding.tags_for_identity(&orphan),
+            [Box::<str>::from("new")].into_iter().collect()
+        );
+        assert!(binding.is_orphaned(&orphan));
+        assert_eq!(
+            binding
+                .delete_tag("new", |_| capabilities(true, true))
+                .unwrap(),
+            2
+        );
+        assert!(binding.tags_for_identity(&orphan).is_empty());
+    }
+
+    #[test]
+    fn independent_catalog_bindings_reject_a_stale_write_without_losing_updates() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let document = musheen_desktop::CatalogDocument::default();
+        store.save(&document).unwrap();
+        let first_binding = CatalogBinding::persistent(store.clone(), document.clone());
+        let second_binding = CatalogBinding::persistent(store.clone(), document);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let stale_binding = first_binding.clone();
+        let first = std::thread::spawn(move || {
+            stale_binding.update(|document| {
+                document
+                    .pins_mut()
+                    .pin(
+                        item("local", b"first-binding"),
+                        StorePath::from_unix_path("/first"),
+                        "First",
+                    )
+                    .unwrap();
+                entered_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            })
+        });
+        entered_rx.recv().unwrap();
+        let second = std::thread::spawn(move || {
+            second_binding.update(|document| {
+                document
+                    .pins_mut()
+                    .pin(
+                        item("local", b"second-binding"),
+                        StorePath::from_unix_path("/second"),
+                        "Second",
+                    )
+                    .unwrap();
+            })
+        });
+        assert_eq!(
+            first.join().unwrap().unwrap_err().as_ref(),
+            "catalog changed before the update could be committed safely; retry the action"
+        );
+        second.join().unwrap().unwrap();
+
+        first_binding
+            .update(|document| {
+                document
+                    .pins_mut()
+                    .pin(
+                        item("local", b"first-binding"),
+                        StorePath::from_unix_path("/first"),
+                        "First",
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(store.load().unwrap().pins().entries().len(), 2);
+    }
+
+    #[test]
+    fn independent_disk_changes_advance_a_binding_revision_on_refresh() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        store
+            .save(&musheen_desktop::CatalogDocument::default())
+            .unwrap();
+        let first =
+            CatalogBinding::persistent(store.clone(), musheen_desktop::CatalogDocument::default());
+        let second = CatalogBinding::persistent(store, musheen_desktop::CatalogDocument::default());
+        second
+            .update(|document| {
+                document
+                    .pins_mut()
+                    .pin(
+                        item("local", b"external"),
+                        StorePath::from_unix_path("/external"),
+                        "External",
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+        let revision = first.revision();
+
+        first.update(|_| {}).unwrap();
+
+        assert!(first.revision() > revision);
+        assert_eq!(first.snapshot().pins().entries().len(), 1);
+    }
+
+    #[test]
+    fn stale_xattr_worker_rewrites_the_latest_desired_tags_before_clearing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let target = item("local", b"raced-item");
+        let path = StorePath::from_unix_path(temporary.path().join("raced-item"));
+        filesystem::write(path.as_unix_path().unwrap(), b"fixture").unwrap();
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document.tags_mut().stage_xattr_tags(
+            &target,
+            path.clone(),
+            [Box::<str>::from("old")].into_iter().collect(),
+        );
+        store.save(&document).unwrap();
+        let binding = CatalogBinding::persistent_with_xattr_opt_in(store, document, true);
+        let worker = binding.clone();
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_writes = std::sync::Arc::clone(&writes);
+        let (old_written_tx, old_written_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stale = std::thread::spawn(move || {
+            let mut first = true;
+            worker.reconcile_pending_xattrs_with(|_, _, tags| {
+                worker_writes.lock().unwrap().push(tags.clone());
+                if first {
+                    first = false;
+                    old_written_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                Ok(())
+            })
+        });
+        old_written_rx.recv().unwrap();
+        binding
+            .apply_tag_delta_with_xattr_writer(
+                &[(target.clone(), path.clone(), capabilities(true, true))],
+                &[Box::<str>::from("new")].into_iter().collect(),
+                &[Box::<str>::from("old")].into_iter().collect(),
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+        release_tx.send(()).unwrap();
+        stale.join().unwrap().unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().last().cloned().unwrap(),
+            [Box::<str>::from("new")].into_iter().collect()
+        );
+        assert!(!binding.snapshot().tags().is_xattr_pending(&target));
+    }
+
+    #[test]
+    fn ordinary_large_listings_do_not_persist_empty_tag_records() {
+        let binding = CatalogBinding::in_memory();
+        let directory = remote_path("remote", b"large-scope");
+        let items = (0..4_097)
+            .map(|index| {
+                let key = format!("child-{index}");
+                StoreItem::new(
+                    item("remote", key.as_bytes()),
+                    remote_path("remote", key.as_bytes()),
+                    DisplayPath::new(key),
+                    ItemKind::RegularFile,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let tagged = items.last().unwrap().clone();
+
+        binding
+            .reconcile_directory(&directory, &items, DirectoryObservation::Complete)
+            .unwrap();
+        assert_eq!(binding.snapshot().tags().tracked_items().count(), 0);
+
+        binding
+            .assign_tag(
+                tagged.id(),
+                tagged.path(),
+                &capabilities(true, false),
+                "tracked",
+            )
+            .unwrap();
+        assert_eq!(
+            binding
+                .snapshot()
+                .tags()
+                .tracked_scoped_items()
+                .find(|(item, _, _, _)| *item == tagged.id())
+                .and_then(|(_, _, scope, _)| scope),
+            Some(&directory)
+        );
+
+        binding
+            .reconcile_directory(&directory, &[], DirectoryObservation::Complete)
+            .unwrap();
+        assert!(binding.is_orphaned(tagged.id()));
     }
 
     #[test]
@@ -1313,6 +1797,57 @@ mod tests {
     }
 
     #[test]
+    fn slow_provider_resolution_does_not_block_an_independent_catalog_update() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let pinned = item("remote", b"slow-pin");
+        let pinned_path = remote_path("remote", b"slow-pin");
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document
+            .pins_mut()
+            .pin(pinned, pinned_path, "Slow")
+            .unwrap();
+        store.save(&document).unwrap();
+        let binding = CatalogBinding::persistent(store.clone(), document);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            binding.reconcile_pins(|_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(None)
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let available_store = store.clone();
+        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            let result = available_store.update(|catalog| {
+                catalog
+                    .pins_mut()
+                    .pin(
+                        item("local", b"available"),
+                        StorePath::from_unix_path("/available"),
+                        "Available",
+                    )
+                    .map_err(|error| Box::<str>::from(error.to_string()))?;
+                Ok(())
+            });
+            updated_tx.send(result).unwrap();
+        });
+        updated_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .expect("catalog update must not wait for provider resolution")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        updater.join().unwrap();
+        assert_eq!(store.load().unwrap().pins().entries().len(), 2);
+    }
+
+    #[test]
     fn directory_reconciliation_requires_authoritative_completion_before_orphaning() {
         let binding = CatalogBinding::in_memory();
         let renamed = item("local", b"inode-41");
@@ -1362,14 +1897,14 @@ mod tests {
             None,
         );
         binding
-            .assign_tag(&target, &path, &capabilities(true, false), "tracked")
-            .unwrap();
-        binding
             .reconcile_directory(
                 &directory,
                 std::slice::from_ref(&listed),
                 DirectoryObservation::Complete,
             )
+            .unwrap();
+        binding
+            .assign_tag(&target, &path, &capabilities(true, false), "tracked")
             .unwrap();
 
         binding

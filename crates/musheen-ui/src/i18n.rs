@@ -264,5 +264,20 @@ mod tests {
             assert!(pseudo_message.starts_with('⟦'), "{key} is pseudo-localized");
             assert!(pseudo_message.ends_with('⟧'), "{key} is pseudo-localized");
         }
+        for key in english
+            .message_ids()
+            .into_iter()
+            .filter(|key| key.starts_with("properties-") || key.starts_with("catalog-error-move-"))
+        {
+            let english_message = english.message(key).expect("English message exists");
+            let arabic_message = arabic.message(key).expect("Arabic message exists");
+            let pseudo_message = pseudo.message(key).expect("pseudo message exists");
+            assert_ne!(
+                arabic_message, english_message,
+                "{key} is translated to Arabic"
+            );
+            assert!(pseudo_message.starts_with('⟦'), "{key} is pseudo-localized");
+            assert!(pseudo_message.ends_with('⟧'), "{key} is pseudo-localized");
+        }
     }
 }

@@ -44,7 +44,7 @@ impl TagCatalog {
             return false;
         };
         let removed = record.tags.remove(tag);
-        if record.tags.is_empty() {
+        if record.tags.is_empty() && !record.pending_xattr {
             self.records.retain(|record| &record.item != item);
         }
         removed
@@ -122,7 +122,8 @@ impl TagCatalog {
                 changed += 1;
             }
         }
-        self.records.retain(|record| !record.tags.is_empty());
+        self.records
+            .retain(|record| !record.tags.is_empty() || record.pending_xattr);
         changed
     }
 
@@ -689,7 +690,12 @@ impl TagBackend for TagCatalog {
         tags: &BTreeSet<Box<str>>,
     ) -> Result<(), Self::Error> {
         if tags.is_empty() {
-            self.records.retain(|record| &record.item != item);
+            if let Some(index) = self.records.iter().position(|record| &record.item == item) {
+                let record = &mut self.records[index];
+                record.tags.clear();
+                record.pending_xattr = false;
+                self.records.remove(index);
+            }
         } else {
             let record = self.record_mut_or_insert(item, path_hint.clone());
             record.tags = tags.clone();

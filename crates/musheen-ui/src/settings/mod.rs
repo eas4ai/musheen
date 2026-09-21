@@ -29,9 +29,10 @@ pub use window::{SettingsWindow, open_settings_window};
 /// pins, tags, and session restore in independent models, so this operation
 /// cannot erase them as a side effect.
 pub fn clear_recent_locations(store: &CatalogStore) -> Result<(), CatalogError> {
-    let mut catalog = store.load()?;
-    catalog.recents_mut().clear();
-    store.save(&catalog)
+    store.update(|catalog| {
+        catalog.recents_mut().clear();
+        Ok(())
+    })
 }
 
 /// Availability is supplied by backend owners, never inferred from a saved preference.

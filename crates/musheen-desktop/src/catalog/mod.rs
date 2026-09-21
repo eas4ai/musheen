@@ -132,6 +132,7 @@ impl Default for CatalogDocument {
 pub struct CatalogStore {
     path: PathBuf,
     backup_path: PathBuf,
+    lock_path: PathBuf,
 }
 
 impl CatalogStore {
@@ -150,9 +151,12 @@ impl CatalogStore {
         let path = path.into();
         let mut backup = path.as_os_str().to_os_string();
         backup.push(".bak");
+        let mut lock = path.as_os_str().to_os_string();
+        lock.push(".lock");
         Self {
             path,
             backup_path: PathBuf::from(backup),
+            lock_path: PathBuf::from(lock),
         }
     }
 
@@ -167,6 +171,11 @@ impl CatalogStore {
     }
 
     pub fn load(&self) -> Result<CatalogDocument, CatalogError> {
+        let _lock = self.lock_exclusive()?;
+        self.load_unlocked()
+    }
+
+    fn load_unlocked(&self) -> Result<CatalogDocument, CatalogError> {
         match load_document(&self.path) {
             Ok(Some(document)) => Ok(document),
             Ok(None) | Err(CatalogError::Corrupt { .. }) => self.recover_or_default(),
@@ -175,6 +184,11 @@ impl CatalogStore {
     }
 
     pub fn save(&self, document: &CatalogDocument) -> Result<(), CatalogError> {
+        let _lock = self.lock_exclusive()?;
+        self.save_unlocked(document)
+    }
+
+    fn save_unlocked(&self, document: &CatalogDocument) -> Result<(), CatalogError> {
         ensure_parent(&self.path)?;
         match load_document(&self.path) {
             Ok(Some(previous)) => atomic_replace(&self.backup_path, &serialize(&previous)?)?,
@@ -182,6 +196,43 @@ impl CatalogStore {
             Err(error) => return Err(error),
         }
         atomic_replace(&self.path, &serialize(document)?)
+    }
+
+    pub fn update<T>(
+        &self,
+        change: impl FnOnce(&mut CatalogDocument) -> Result<T, Box<str>>,
+    ) -> Result<T, CatalogError> {
+        let previous = self.load()?;
+        let mut document = previous.clone();
+        let changed = change(&mut document).map_err(CatalogError::Update)?;
+        let _lock = self.lock_exclusive()?;
+        if self.load_unlocked()? != previous {
+            return Err(CatalogError::UpdateConflict);
+        }
+        if document != previous {
+            self.save_unlocked(&document)?;
+        }
+        Ok(changed)
+    }
+
+    fn lock_exclusive(&self) -> Result<File, CatalogError> {
+        ensure_parent(&self.lock_path)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&self.lock_path)
+            .map_err(|source| io_error("open catalog lock", &self.lock_path, source))?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).map_err(|source| {
+            io_error(
+                "lock catalog",
+                &self.lock_path,
+                std::io::Error::from(source),
+            )
+        })?;
+        Ok(lock)
     }
 
     fn recover_or_default(&self) -> Result<CatalogDocument, CatalogError> {
@@ -370,6 +421,8 @@ pub enum CatalogError {
         path: PathBuf,
         version: u32,
     },
+    UpdateConflict,
+    Update(Box<str>),
     Serialize(serde_json::Error),
 }
 
@@ -397,6 +450,10 @@ impl fmt::Display for CatalogError {
                 "unsupported catalog schema {version} at {}",
                 path.display()
             ),
+            Self::UpdateConflict => formatter.write_str(
+                "catalog changed before the update could be committed safely; retry the action",
+            ),
+            Self::Update(error) => write!(formatter, "catalog update failed: {error}"),
             Self::Serialize(error) => write!(formatter, "could not serialize catalog: {error}"),
         }
     }
@@ -407,7 +464,10 @@ impl Error for CatalogError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Serialize(error) => Some(error),
-            Self::Corrupt { .. } | Self::UnsupportedVersion { .. } => None,
+            Self::Corrupt { .. }
+            | Self::UnsupportedVersion { .. }
+            | Self::UpdateConflict
+            | Self::Update(_) => None,
         }
     }
 }

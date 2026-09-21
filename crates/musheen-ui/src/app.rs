@@ -127,6 +127,7 @@ const GRID_ITEM_WIDTH: f32 = 128.0;
 const GRID_GAP: f32 = 8.0;
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(250);
 const OPERATION_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
+const XATTR_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 
 gpui_kit::actions!(
     musheen,
@@ -728,16 +729,17 @@ pub fn run(initial_path: PathBuf) {
             let operation_hub =
                 OperationHub::for_current_user_with_provider_runtime(&limits, &providers);
             let catalog_store = CatalogStore::for_current_user();
-            let mut catalog_document = catalog_store.load().unwrap_or_else(|error| {
-                eprintln!("Musheen could not load its catalog: {error}");
-                CatalogDocument::default()
-            });
-            catalog_document.recents_mut().set_recording_enabled(
-                settings.value("general.record_history").as_deref() != Some("false"),
-            );
-            if let Err(error) = catalog_store.save(&catalog_document) {
-                eprintln!("Musheen could not persist its catalog policy: {error}");
-            }
+            let catalog_document = catalog_store
+                .update(|catalog| {
+                    catalog.recents_mut().set_recording_enabled(
+                        settings.value("general.record_history").as_deref() != Some("false"),
+                    );
+                    Ok(catalog.clone())
+                })
+                .unwrap_or_else(|error| {
+                    eprintln!("Musheen could not load or update its catalog: {error}");
+                    CatalogDocument::default()
+                });
             let catalog_binding = CatalogBinding::persistent_with_xattr_opt_in(
                 catalog_store,
                 catalog_document,
@@ -1062,6 +1064,7 @@ struct MusheenApp {
     sidebars: HashMap<TabId, SidebarModel>,
     pins: PinStore,
     catalog_binding: CatalogBinding,
+    catalog_projection_revision: u64,
     limits: ResourceLimits,
     store: Arc<dyn Store>,
     shell: crate::ShellModel,
@@ -1125,6 +1128,24 @@ impl Drop for MusheenApp {
         for info_pane in self.info_panes.values_mut() {
             info_pane.cancel_active();
         }
+    }
+}
+
+fn properties_window_title(catalog: &Catalog, item_label: &str, item_count: usize) -> String {
+    if item_count == 1 {
+        format!(
+            "{} {item_label}",
+            catalog
+                .message("properties-for")
+                .expect("the Properties title message exists")
+        )
+    } else {
+        format!(
+            "{item_count} {}",
+            catalog
+                .message("properties-items-title")
+                .expect("the Properties items title message exists")
+        )
     }
 }
 
@@ -1252,6 +1273,7 @@ impl MusheenApp {
             .unwrap_or_else(|| OperationHub::new_with_provider_runtime(&limits, &providers));
         let operation_error = operation_hub.persistence_error();
         let operation_status_revision = operation_hub.status_revision();
+        let catalog_projection_revision = catalog_binding.revision();
         let mut this = Self {
             custom_actions: custom_actions::from_settings(settings.as_ref()),
             custom_action_warning: None,
@@ -1269,6 +1291,7 @@ impl MusheenApp {
             sidebars,
             pins,
             catalog_binding,
+            catalog_projection_revision,
             limits,
             store: providers.store(),
             shell: crate::ShellModel::new(settings.as_ref().is_some_and(|settings| {
@@ -1314,6 +1337,7 @@ impl MusheenApp {
         this.sync_catalog_projection();
         this.start_load(location, cx);
         this.start_operation_status_refresh(cx);
+        this.start_pending_xattr_reconciliation(cx);
         this
     }
 
@@ -1327,12 +1351,46 @@ impl MusheenApp {
                     return;
                 };
                 this.update(cx, |state, cx| {
+                    let mut changed = false;
                     let revision = state.operation_hub.status_revision();
                     if revision != state.operation_status_revision {
                         state.operation_status_revision = revision;
+                        changed = true;
+                    }
+                    let revision = state.catalog_binding.revision();
+                    if revision != state.catalog_projection_revision {
+                        state.sync_catalog_projection();
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 });
+            }
+        })
+        .detach();
+    }
+
+    fn start_pending_xattr_reconciliation(&mut self, cx: &mut Context<Self>) {
+        let binding = self.catalog_binding.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let worker = binding.clone();
+                let work = cx.background_spawn(async move { worker.reconcile_pending_xattrs() });
+                let result = work.await;
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |state, cx| {
+                    if let Err(error) = result {
+                        state.operation_error = Some(error);
+                        cx.notify();
+                    }
+                });
+                drop(this);
+                cx.background_executor()
+                    .timer(XATTR_RECONCILIATION_INTERVAL)
+                    .await;
             }
         })
         .detach();
@@ -1816,6 +1874,9 @@ impl MusheenApp {
         page: PropertiesPage,
         cx: &mut Context<Self>,
     ) {
+        if targets.is_empty() {
+            return;
+        }
         let tag_targets = targets
             .iter()
             .map(|target| {
@@ -1875,14 +1936,11 @@ impl MusheenApp {
                 cx,
             );
         } else {
-            let title = if targets.len() == 1 {
-                format!(
-                    "{} Properties",
-                    DisplayPath::from_store_path(targets[0].path()).as_str()
-                )
-            } else {
-                format!("{} items — Properties", targets.len())
-            };
+            let title = properties_window_title(
+                &self.catalog,
+                DisplayPath::from_store_path(targets[0].path()).as_str(),
+                targets.len(),
+            );
             let data = ProviderPropertiesWindowData::new(
                 provider_targets,
                 common_tags,
@@ -1929,11 +1987,11 @@ impl MusheenApp {
         }
         let common_tags = common_tags.into_iter().collect::<Vec<_>>();
         let mixed_tags = mixed_tags.into_iter().collect::<Vec<_>>();
-        let title = if paths.len() == 1 {
-            format!("{} Properties", paths[0].display())
-        } else {
-            format!("{} items — Properties", paths.len())
-        };
+        let title = properties_window_title(
+            &self.catalog,
+            paths[0].to_string_lossy().as_ref(),
+            paths.len(),
+        );
         let options = properties_window_options(title, cx);
         let operation_hub = self.operation_hub.clone();
         let catalog = self.catalog.clone();
@@ -1955,7 +2013,8 @@ impl MusheenApp {
                     cx.new(|cx| Root::new(view, window, cx))
                 }
                 Err(error) => {
-                    let view = cx.new(|cx| PropertiesFailureWindow::new(error.to_string(), cx));
+                    let view =
+                        cx.new(|cx| PropertiesFailureWindow::new(error.to_string(), catalog, cx));
                     cx.new(|cx| Root::new(view, window, cx))
                 }
             })
@@ -3893,7 +3952,10 @@ impl MusheenApp {
             LocalOperationOutcome::Metadata => {
                 self.operation_error = Some(
                     format!(
-                        "move completed from {} to {}, but no transfer destination was reported; source tags were retained for review",
+                        "{}: {} → {}",
+                        self.catalog
+                            .message("catalog-error-move-destination-missing")
+                            .expect("the move-destination catalog message exists"),
                         DisplayPath::from_store_path(&movement.source_path).as_str(),
                         DisplayPath::from_store_path(&movement.target_path).as_str(),
                     )
@@ -3912,7 +3974,9 @@ impl MusheenApp {
             Ok(TagMoveOutcome::Preserved) => {}
             Ok(TagMoveOutcome::UnsupportedDestination) => {
                 self.operation_error = Some(
-                    "move completed, but its destination does not support tags; source tags were retained for review"
+                    self.catalog
+                        .message("catalog-error-move-tags-unsupported")
+                        .expect("the unsupported-move catalog message exists")
                         .into(),
                 );
             }
@@ -7918,8 +7982,32 @@ mod tests {
         CapabilityMatrix, CapabilityReason, CapabilityState, MutationRequest, PageRequest,
         ProviderId, SearchCapabilities, SearchResult, SearchScopeError,
     };
+    use musheen_desktop::{TagBackend, XattrTagBackend};
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[test]
+    fn local_and_provider_properties_titles_use_the_active_catalog() {
+        let arabic = Catalog::load(Locale::Ar).unwrap();
+        assert_eq!(
+            properties_window_title(&arabic, "notes.txt", 1),
+            "خصائص notes.txt"
+        );
+        assert_eq!(
+            properties_window_title(&arabic, "ignored", 2),
+            "2 عناصر — الخصائص"
+        );
+
+        let pseudo = Catalog::load(Locale::EnXa).unwrap();
+        assert_eq!(
+            properties_window_title(&pseudo, "remote-object", 1),
+            "⟦Proopeertiiees foor··⟧ remote-object"
+        );
+        assert_eq!(
+            properties_window_title(&pseudo, "ignored", 3),
+            "3 ⟦iiteems — Proopeertiiees··⟧"
+        );
+    }
     use standard_library::fs as filesystem;
     use std as standard_library;
     use std::time::Duration;
@@ -10899,6 +10987,66 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    async fn production_window_bootstrap_replays_pending_xattr_records(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let target_path = temporary.path().join("target");
+        filesystem::write(&target_path, b"target").unwrap();
+        let path = StorePath::from_unix_path(target_path.into_os_string());
+        let target = LocalStore::new().resolve_item(&path).unwrap().unwrap();
+        let catalog_store = CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let mut document = CatalogDocument::default();
+        document.tags_mut().stage_xattr_tags(
+            target.id(),
+            path.clone(),
+            [Box::<str>::from("recovered")].into_iter().collect(),
+        );
+        catalog_store.save(&document).unwrap();
+        let limits = ResourceLimits::default();
+        let providers = ProviderRuntime::for_current_user();
+        let navigation = WindowSession::new(StorePath::from_unix_path(temporary.path()));
+        let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
+            SessionStore::at(temporary.path().join("session.json")),
+            vec![navigation.clone()],
+        )));
+        let window_id = coordinator.lock().unwrap().entries()[0].0;
+        let binding = SessionBinding {
+            coordinator,
+            window_id,
+            operation_hub: OperationHub::new_with_provider_runtime(&limits, &providers),
+            catalog: CatalogBinding::persistent_with_xattr_opt_in(
+                catalog_store.clone(),
+                document,
+                true,
+            ),
+            providers,
+        };
+
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_navigation(navigation, Some(binding), None, limits, false, cx)
+            });
+            Root::new(view, window, cx)
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, _| {
+            catalog_store
+                .load()
+                .is_ok_and(|document| document.tags().pending_xattr_count() == 0)
+        })
+        .await;
+
+        assert_eq!(
+            XattrTagBackend::new(true, true)
+                .read_tags(target.id(), &path)
+                .unwrap(),
+            [Box::<str>::from("recovered")].into_iter().collect()
+        );
+    }
+
+    #[gpui_kit::test]
     async fn home_surface_composes_owner_models_and_mutates_pins_through_registry(
         cx: &mut TestAppContext,
     ) {
@@ -11194,6 +11342,131 @@ mod tests {
             assert!(window.find("home-section-tag").visible());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn catalog_change_in_one_window_refreshes_the_other_window_projection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("child");
+        filesystem::create_dir(&child).unwrap();
+        let child_path = StorePath::from_unix_path(child.as_os_str());
+        let child_item = LocalStore::new()
+            .resolve_item(&child_path)
+            .unwrap()
+            .unwrap();
+        let initial = StorePath::from_unix_path(temporary.path());
+        let first_navigation = WindowSession::new(initial.clone());
+        let second_navigation = WindowSession::new(initial);
+        let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
+            SessionStore::at(temporary.path().join("session.json")),
+            vec![first_navigation.clone(), second_navigation.clone()],
+        )));
+        let window_ids = coordinator
+            .lock()
+            .unwrap()
+            .entries()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        let limits = ResourceLimits::default();
+        let providers = ProviderRuntime::for_current_user();
+        let operation_hub = OperationHub::new_with_provider_runtime(&limits, &providers);
+        let catalog_store = CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let catalog = CatalogBinding::persistent(catalog_store, CatalogDocument::default());
+        let binding = |window_id| SessionBinding {
+            coordinator: Arc::clone(&coordinator),
+            window_id,
+            operation_hub: operation_hub.clone(),
+            catalog: catalog.clone(),
+            providers: providers.clone(),
+        };
+
+        let mut first = None;
+        let first_handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_navigation(
+                    first_navigation,
+                    Some(binding(window_ids[0])),
+                    None,
+                    limits.clone(),
+                    false,
+                    cx,
+                )
+            });
+            first = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let mut second = None;
+        let second_handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_navigation(
+                    second_navigation,
+                    Some(binding(window_ids[1])),
+                    None,
+                    limits,
+                    false,
+                    cx,
+                )
+            });
+            second = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let first = first.unwrap();
+        let second = second.unwrap();
+        cx.wait_for(first_handle.into(), Duration::from_secs(2), |_, cx| {
+            first.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.wait_for(second_handle.into(), Duration::from_secs(2), |_, cx| {
+            second.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        first.update(cx, |state, cx| {
+            state
+                .catalog_binding
+                .update(|catalog| {
+                    catalog
+                        .pins_mut()
+                        .pin(child_item.id().clone(), child_path.clone(), "Shared pin")
+                        .unwrap();
+                    catalog
+                        .tags_mut()
+                        .assign(child_item.id(), child_path.clone(), "shared")
+                        .unwrap();
+                })
+                .unwrap();
+            state.sync_catalog_projection();
+            cx.notify();
+        });
+
+        cx.wait_for(second_handle.into(), Duration::from_secs(2), |_, cx| {
+            let state = second.read(cx);
+            state
+                .pins
+                .entries()
+                .iter()
+                .any(|entry| entry.identity() == Some(child_item.id()))
+                && state.sidebars.values().all(|sidebar| {
+                    sidebar
+                        .sections()
+                        .iter()
+                        .find(|section| section.kind() == SidebarSectionKind::Tags)
+                        .is_some_and(|section| {
+                            section
+                                .items()
+                                .iter()
+                                .any(|entry| entry.label() == "shared")
+                        })
+                })
+        })
+        .await;
     }
 
     #[gpui_kit::test]
