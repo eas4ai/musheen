@@ -249,7 +249,7 @@ fn setting_a_default_is_explicit_idempotent_and_preserves_other_associations() {
     write(
         &fixture.config_home.join("mimeapps.list"),
         "[Default Applications]\nx-scheme-handler/http=browser.desktop;\n\
-         [Removed Associations]\ntext/plain=old.desktop;\n",
+         [Removed Associations]\ntext/plain=old.desktop;writer.desktop;\n",
     );
     let paths = fixture.paths();
     let catalog = DesktopEntryCatalog::new(paths.clone());
@@ -265,6 +265,8 @@ fn setting_a_default_is_explicit_idempotent_and_preserves_other_associations() {
     let saved = fs::read_to_string(fixture.config_home.join("mimeapps.list")).unwrap();
     assert!(saved.contains("x-scheme-handler/http=browser.desktop;"));
     assert!(saved.contains("text/plain=old.desktop;"));
+    assert!(!saved.contains("text/plain=old.desktop;writer.desktop;"));
+    assert!(!saved.contains("[Removed Associations]\ntext/plain=writer.desktop;"));
     assert_eq!(saved.matches("text/plain=writer.desktop;").count(), 2);
     let resolved = resolver
         .default_for("text/plain", &catalog)
@@ -276,5 +278,111 @@ fn setting_a_default_is_explicit_idempotent_and_preserves_other_associations() {
         resolver
             .set_default("text/plain", "../escape.desktop", &catalog)
             .is_err()
+    );
+}
+
+#[test]
+fn desktop_order_and_each_xdg_config_directory_participate_in_precedence() {
+    let fixture = Fixture::new();
+    let second_config_dir = fixture.config_home.join("second-config-dir");
+    desktop(
+        &fixture.user_app("gnome.desktop"),
+        "GNOME Viewer",
+        &["text/plain"],
+        "",
+    );
+    desktop(
+        &fixture.user_app("unity.desktop"),
+        "Unity Viewer",
+        &["text/plain"],
+        "",
+    );
+    desktop(
+        &fixture.user_app("second.desktop"),
+        "Second Config Viewer",
+        &["image/png"],
+        "",
+    );
+    write(
+        &fixture.config_dir.join("gnome-mimeapps.list"),
+        "[Default Applications]\ntext/plain=gnome.desktop;\n",
+    );
+    write(
+        &fixture.config_dir.join("unity-mimeapps.list"),
+        "[Default Applications]\ntext/plain=unity.desktop;\n",
+    );
+    write(
+        &second_config_dir.join("mimeapps.list"),
+        "[Default Applications]\nimage/png=second.desktop;\n",
+    );
+
+    for (desktops, expected) in [
+        ("GNOME:Unity", "gnome.desktop"),
+        ("Unity:GNOME", "unity.desktop"),
+    ] {
+        let paths = DesktopPaths::new(&fixture.config_home, &fixture.data_home)
+            .with_config_dirs([fixture.config_dir.clone(), second_config_dir.clone()])
+            .with_data_dirs([fixture.data_dir.clone()])
+            .with_current_desktops(desktops)
+            .with_executable_dirs([fixture.bin_dir.clone(), PathBuf::from("/usr/bin")]);
+        let catalog = DesktopEntryCatalog::new(paths.clone());
+        let resolver = MimeAppsResolver::new(paths);
+        assert_eq!(
+            resolver
+                .default_for("text/plain", &catalog)
+                .unwrap()
+                .unwrap()
+                .desktop_id(),
+            expected
+        );
+        assert_eq!(
+            resolver
+                .default_for("image/png", &catalog)
+                .unwrap()
+                .unwrap()
+                .desktop_id(),
+            "second.desktop"
+        );
+    }
+}
+
+#[test]
+fn unavailable_try_exec_entries_are_filtered_and_default_resolution_falls_through() {
+    let fixture = Fixture::new();
+    desktop(
+        &fixture.user_app("missing.desktop"),
+        "Missing Viewer",
+        &["text/plain"],
+        "TryExec=definitely-not-installed-musheen-fixture\n",
+    );
+    desktop(
+        &fixture.user_app("available.desktop"),
+        "Available Viewer",
+        &["text/plain"],
+        "",
+    );
+    write(
+        &fixture.config_home.join("mimeapps.list"),
+        "[Default Applications]\ntext/plain=missing.desktop;available.desktop;\n",
+    );
+    let paths = fixture.paths();
+    let catalog = DesktopEntryCatalog::new(paths.clone());
+    let resolver = MimeAppsResolver::new(paths);
+
+    let applications = resolver.associations_for("text/plain", &catalog).unwrap();
+    assert_eq!(
+        applications
+            .iter()
+            .map(|application| application.desktop_id())
+            .collect::<Vec<_>>(),
+        ["available.desktop"]
+    );
+    assert_eq!(
+        resolver
+            .default_for("text/plain", &catalog)
+            .unwrap()
+            .unwrap()
+            .desktop_id(),
+        "available.desktop"
     );
 }

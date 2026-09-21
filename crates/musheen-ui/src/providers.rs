@@ -4,6 +4,7 @@ use musheen_core::{
     PageRequest, ProviderId, SearchCapabilities, SearchQuery, SearchStream, Store, StoreError,
     StoreItem, StorePath, TotalHint,
 };
+use musheen_desktop::{LaunchTarget, MimeDetector};
 use musheen_local::{LocalOperationQueue, LocalStore, ProviderTransferRoute};
 use std::collections::HashMap;
 use std::fmt;
@@ -15,6 +16,12 @@ const NETWORK_ROOT_KEY: &[u8] = b"root";
 pub(crate) trait ProviderAdapter: Send + Sync {
     fn store(&self) -> Arc<dyn Store>;
 
+    /// Converts an opaque provider key at the provider boundary. Callers must
+    /// never guess that a provider key is a URI.
+    fn application_target(&self, _path: &StorePath) -> Option<ProviderApplicationTarget> {
+        None
+    }
+
     fn transfer_routes(&self) -> Vec<Arc<dyn ProviderTransferRoute>> {
         Vec::new()
     }
@@ -24,6 +31,36 @@ pub(crate) trait ProviderAdapter: Send + Sync {
 pub(crate) struct ProviderRuntime {
     store: Arc<RoutingStore>,
     routes: Arc<[Arc<dyn ProviderTransferRoute>]>,
+    adapters: Arc<HashMap<ProviderId, Arc<dyn ProviderAdapter>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderApplicationTarget {
+    launch_target: LaunchTarget,
+    mime_type: Box<str>,
+}
+
+impl ProviderApplicationTarget {
+    pub(crate) fn new(launch_target: LaunchTarget, mime_type: impl Into<Box<str>>) -> Self {
+        Self {
+            launch_target,
+            mime_type: mime_type.into(),
+        }
+    }
+
+    pub(crate) fn launch_target(&self) -> &LaunchTarget {
+        &self.launch_target
+    }
+
+    pub(crate) fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationTargetError {
+    DetectionFailed,
+    ProviderUnsupported,
 }
 
 impl fmt::Debug for ProviderRuntime {
@@ -54,6 +91,29 @@ impl ProviderRuntime {
 
     pub(crate) fn store(&self) -> Arc<dyn Store> {
         self.store.clone()
+    }
+
+    pub(crate) fn application_target(
+        &self,
+        path: &StorePath,
+    ) -> Result<ProviderApplicationTarget, ApplicationTargetError> {
+        if let Some(path) = path.as_unix_path() {
+            let detected = MimeDetector::default()
+                .detect(path)
+                .map_err(|_| ApplicationTargetError::DetectionFailed)?;
+            return Ok(ProviderApplicationTarget::new(
+                LaunchTarget::local(path.to_path_buf()),
+                detected.mime_type(),
+            ));
+        }
+        let provider = path
+            .provider_key()
+            .map(|(provider, _)| provider)
+            .ok_or(ApplicationTargetError::ProviderUnsupported)?;
+        self.adapters
+            .get(provider)
+            .and_then(|adapter| adapter.application_target(path))
+            .ok_or(ApplicationTargetError::ProviderUnsupported)
     }
 
     /// Returns false only when the owning provider authoritatively reports
@@ -121,8 +181,8 @@ impl ProviderRuntimeBuilder {
         let mut providers = HashMap::with_capacity(self.adapters.len());
         let mut routes = Vec::new();
         let mut route_pairs = HashMap::new();
-        for (provider, adapter) in self.adapters {
-            providers.insert(provider, adapter.store());
+        for (provider, adapter) in &self.adapters {
+            providers.insert(provider.clone(), adapter.store());
             for route in adapter.transfer_routes() {
                 let pair = (
                     route.source_provider_id().clone(),
@@ -137,6 +197,7 @@ impl ProviderRuntimeBuilder {
         Ok(ProviderRuntime {
             store: Arc::new(RoutingStore { primary, providers }),
             routes: routes.into(),
+            adapters: Arc::new(self.adapters),
         })
     }
 }

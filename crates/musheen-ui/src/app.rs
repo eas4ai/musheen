@@ -25,7 +25,7 @@ use crate::operations::{
     DropAction, FileDragPayload, LocalOperationOutcome, OperationHub, TransferOutcome,
     spawn_ready_hub_operations,
 };
-use crate::providers::{ProviderRuntime, network_root_path};
+use crate::providers::{ApplicationTargetError, ProviderRuntime, network_root_path};
 use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, SearchState};
 use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
@@ -65,11 +65,12 @@ use musheen_core::{
     SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath, WatchEvent,
 };
 use musheen_desktop::{
-    CatalogDocument, CatalogStore, ConflictDecisionStore, DesktopEntryCatalog,
-    DesktopEntryLauncher, DesktopPaths, FolderIdentity, LaunchTarget, MimeAppsResolver,
-    MimeDetector, PreviewDocument, ProcessRunner, SessionStore, SystemProcessRunner,
-    TagMoveOutcome, TerminalCommand, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
-    ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
+    ApplicationIconProvider, CatalogDocument, CatalogStore, ConflictDecisionStore,
+    DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths, FolderIdentity,
+    FreedesktopIconProvider, LaunchTarget, MimeAppsResolver, MimeDetector, PreviewDocument,
+    ProcessRunner, SessionStore, SystemProcessRunner, TagMoveOutcome, TerminalCommand,
+    ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest,
+    ThumbnailService, ThumbnailSize,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -408,6 +409,19 @@ struct ContextDialogStrings {
     targets: String,
     move_review: String,
     operation_review: String,
+}
+
+struct ResolvedApplicationSelection {
+    mime_type: Box<str>,
+    targets: Vec<LaunchTarget>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationSelectionError {
+    NoTargets,
+    DetectionFailed,
+    ProviderUnsupported,
+    MixedMimeTypes,
 }
 
 impl ContextDialogStrings {
@@ -1095,6 +1109,7 @@ struct MusheenApp {
     catalog_projection_revision: u64,
     limits: ResourceLimits,
     store: Arc<dyn Store>,
+    providers: ProviderRuntime,
     shell: crate::ShellModel,
     navigation: WindowSession,
     omnibar: OmnibarState,
@@ -1129,6 +1144,7 @@ struct MusheenApp {
     operation_status_revision: u64,
     operation_error: Option<Box<str>>,
     desktop_paths: Option<DesktopPaths>,
+    application_icons: Arc<dyn ApplicationIconProvider>,
     application_runner: Arc<dyn ProcessRunner>,
     terminal_command: Option<TerminalCommand>,
     status_center_open: bool,
@@ -1329,6 +1345,7 @@ impl MusheenApp {
             catalog_projection_revision,
             limits,
             store: providers.store(),
+            providers,
             shell: crate::ShellModel::new(settings.as_ref().is_some_and(|settings| {
                 settings.value("layout.info_pane").as_deref() == Some("true")
             })),
@@ -1357,6 +1374,7 @@ impl MusheenApp {
             operation_status_revision,
             operation_error,
             desktop_paths: DesktopPaths::from_environment().ok(),
+            application_icons: Arc::new(FreedesktopIconProvider),
             application_runner: Arc::new(SystemProcessRunner),
             terminal_command: TerminalCommand::new("x-terminal-emulator", ["-e"]).ok(),
             status_center_open: false,
@@ -2137,6 +2155,19 @@ impl MusheenApp {
             CommandAction::Permissions => {
                 self.open_selected_properties_page(PropertiesPage::Permissions, cx);
             }
+            CommandAction::Open => {
+                let tab = self.navigation.focused_tab().id();
+                let targets = self
+                    .active_command_request(CommandAction::Open)
+                    .selection()
+                    .to_vec();
+                self.dispatch_local_target_command(
+                    &CommandAction::Open,
+                    &CommandParameters::targets(targets),
+                    Some(tab),
+                    cx,
+                );
+            }
             action => {
                 self.operation_error = Some(
                     format!(
@@ -2671,18 +2702,70 @@ impl MusheenApp {
         request.with_catalog_tag_names(self.catalog_binding.tag_names())
     }
 
+    fn resolve_application_selection(
+        &self,
+        selection: &[CommandTargetRef],
+    ) -> Result<ResolvedApplicationSelection, ApplicationSelectionError> {
+        let mut resolved = selection
+            .iter()
+            .map(|target| self.providers.application_target(target.path()));
+        let first = resolved
+            .next()
+            .ok_or(ApplicationSelectionError::NoTargets)?
+            .map_err(|error| match error {
+                ApplicationTargetError::DetectionFailed => {
+                    ApplicationSelectionError::DetectionFailed
+                }
+                ApplicationTargetError::ProviderUnsupported => {
+                    ApplicationSelectionError::ProviderUnsupported
+                }
+            })?;
+        let mime_type = Box::<str>::from(first.mime_type());
+        let mut targets = vec![first.launch_target().clone()];
+        for target in resolved {
+            let target = target.map_err(|error| match error {
+                ApplicationTargetError::DetectionFailed => {
+                    ApplicationSelectionError::DetectionFailed
+                }
+                ApplicationTargetError::ProviderUnsupported => {
+                    ApplicationSelectionError::ProviderUnsupported
+                }
+            })?;
+            if target.mime_type() != mime_type.as_ref() {
+                return Err(ApplicationSelectionError::MixedMimeTypes);
+            }
+            targets.push(target.launch_target().clone());
+        }
+        Ok(ResolvedApplicationSelection { mime_type, targets })
+    }
+
+    fn application_selection_error(&self, error: ApplicationSelectionError) -> Box<str> {
+        let key = match error {
+            ApplicationSelectionError::NoTargets => "application-open-no-targets",
+            ApplicationSelectionError::DetectionFailed => "application-open-detection-failed",
+            ApplicationSelectionError::ProviderUnsupported => {
+                "application-open-provider-unsupported"
+            }
+            ApplicationSelectionError::MixedMimeTypes => "application-open-mixed-mime",
+        };
+        self.catalog
+            .message(key)
+            .expect("application launch refusals are localized")
+            .into()
+    }
+
+    fn application_error(&self, key: &str) -> Box<str> {
+        self.catalog
+            .message(key)
+            .expect("application launch errors are localized")
+            .into()
+    }
+
     fn open_with_applications(
         &self,
         selection: &[CommandTargetRef],
     ) -> Vec<crate::OpenWithApplication> {
-        let Some(path) = selection
-            .first()
-            .filter(|_| selection.len() == 1)
-            .and_then(|target| target.path().as_unix_path())
-        else {
-            return Vec::new();
-        };
-        let Ok(detected) = MimeDetector::default().detect(path) else {
+        let Ok(selection) = self.resolve_application_selection(selection) else {
             return Vec::new();
         };
         let Some(paths) = self.desktop_paths.clone() else {
@@ -2690,8 +2773,12 @@ impl MusheenApp {
         };
         let catalog = DesktopEntryCatalog::new(paths.clone());
         let resolver = MimeAppsResolver::new(paths);
-        let Ok(model) = OpenWithModel::from_resolver(detected.mime_type(), &resolver, &catalog)
-        else {
+        let Ok(model) = OpenWithModel::from_resolver(
+            selection.mime_type.as_ref(),
+            &resolver,
+            &catalog,
+            self.application_icons.as_ref(),
+        ) else {
             return Vec::new();
         };
         model
@@ -3456,7 +3543,8 @@ impl MusheenApp {
                 }
             }
             (
-                action @ (CommandAction::OpenWith
+                action @ (CommandAction::Open
+                | CommandAction::OpenWith
                 | CommandAction::SetDefaultApplication
                 | CommandAction::ChooseApplication
                 | CommandAction::OpenProperties
@@ -3565,6 +3653,10 @@ impl MusheenApp {
         }
 
         match (action, parameters) {
+            (CommandAction::Open, CommandParameters::Targets(_)) => {
+                self.operation_error = self.execute_default_application(targets).err();
+                cx.notify();
+            }
             (
                 CommandAction::OpenWith | CommandAction::SetDefaultApplication,
                 CommandParameters::OpenWith {
@@ -3600,59 +3692,69 @@ impl MusheenApp {
         desktop_id: &str,
         intent: CoreOpenWithIntent,
     ) -> Result<(), Box<str>> {
-        let path = targets
-            .first()
-            .filter(|_| targets.len() == 1)
-            .and_then(|target| target.path().as_unix_path())
-            .ok_or_else(|| {
-                Box::<str>::from(
-                    "Open With requires exactly one local path; this provider has no lossless URI",
-                )
-            })?;
-        let detected = MimeDetector::default()
-            .detect(path)
-            .map_err(|error| Box::<str>::from(error.to_string()))?;
-        let paths = self.desktop_paths.clone().ok_or_else(|| {
-            Box::<str>::from("Open With is unavailable because XDG user paths are not configured")
-        })?;
+        let selection = self
+            .resolve_application_selection(targets)
+            .map_err(|error| self.application_selection_error(error))?;
+        let paths = self
+            .desktop_paths
+            .clone()
+            .ok_or_else(|| self.application_error("application-open-association-unavailable"))?;
         let catalog = DesktopEntryCatalog::new(paths.clone());
         let resolver = MimeAppsResolver::new(paths.clone());
         let launcher = DesktopEntryLauncher::new(paths.executable_dirs().to_vec());
-        let mut model = OpenWithModel::from_resolver(detected.mime_type(), &resolver, &catalog)
-            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let mut model = OpenWithModel::from_resolver(
+            selection.mime_type.as_ref(),
+            &resolver,
+            &catalog,
+            self.application_icons.as_ref(),
+        )
+        .map_err(|_| self.application_error("application-open-association-unavailable"))?;
         model
             .select(desktop_id)
-            .map_err(|error| Box::<str>::from(format!("Open With selection failed: {error:?}")))?;
+            .map_err(|_| self.application_error("application-open-application-unavailable"))?;
         let intent = match intent {
             CoreOpenWithIntent::OpenOnce => DialogOpenWithIntent::OpenOnce,
             CoreOpenWithIntent::SetAsDefault => DialogOpenWithIntent::SetAsDefault,
         };
         let plan = model
             .plan(intent)
-            .map_err(|error| Box::<str>::from(format!("Open With planning failed: {error:?}")))?;
-        let launch_targets = targets
-            .iter()
-            .map(|target| {
-                target
-                    .path()
-                    .as_unix_path()
-                    .map(|path| LaunchTarget::local(path.to_path_buf()))
-                    .ok_or_else(|| {
-                        Box::<str>::from(
-                            "Open With cannot convert a provider target to a lossless URI",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map_err(|_| self.application_error("application-open-application-unavailable"))?;
         plan.execute(
             &resolver,
             &catalog,
             &launcher,
             self.application_runner.as_ref(),
-            &launch_targets,
+            &selection.targets,
             self.terminal_command.as_ref(),
         )
-        .map_err(|error| Box::<str>::from(error.to_string()))
+        .map_err(|_| self.application_error("application-open-launch-failed"))
+    }
+
+    fn execute_default_application(&self, targets: &[CommandTargetRef]) -> Result<(), Box<str>> {
+        let selection = self
+            .resolve_application_selection(targets)
+            .map_err(|error| self.application_selection_error(error))?;
+        let paths = self
+            .desktop_paths
+            .clone()
+            .ok_or_else(|| self.application_error("application-open-association-unavailable"))?;
+        let catalog = DesktopEntryCatalog::new(paths.clone());
+        let resolver = MimeAppsResolver::new(paths.clone());
+        let application = resolver
+            .default_for(&selection.mime_type, &catalog)
+            .map_err(|_| self.application_error("application-open-association-unavailable"))?
+            .ok_or_else(|| self.application_error("application-open-no-default"))?;
+        let launcher = DesktopEntryLauncher::new(paths.executable_dirs().to_vec());
+        let prepared = launcher
+            .prepare(
+                &application,
+                &selection.targets,
+                self.terminal_command.as_ref(),
+            )
+            .map_err(|_| self.application_error("application-open-launch-failed"))?;
+        launcher
+            .launch(&prepared, self.application_runner.as_ref())
+            .map_err(|_| self.application_error("application-open-launch-failed"))
     }
 
     fn open_choose_application(
@@ -3661,23 +3763,22 @@ impl MusheenApp {
         origin_tab: Option<TabId>,
         cx: &mut Context<Self>,
     ) -> Result<(), Box<str>> {
-        let path = targets
-            .first()
-            .filter(|_| targets.len() == 1)
-            .and_then(|target| target.path().as_unix_path())
-            .ok_or_else(|| Box::<str>::from("Choose Application requires one local path"))?;
-        let detected = MimeDetector::default()
-            .detect(path)
-            .map_err(|error| Box::<str>::from(error.to_string()))?;
-        let paths = self.desktop_paths.clone().ok_or_else(|| {
-            Box::<str>::from(
-                "Choose Application is unavailable because XDG user paths are not configured",
-            )
-        })?;
+        let selection = self
+            .resolve_application_selection(targets)
+            .map_err(|error| self.application_selection_error(error))?;
+        let paths = self
+            .desktop_paths
+            .clone()
+            .ok_or_else(|| self.application_error("application-open-association-unavailable"))?;
         let catalog = DesktopEntryCatalog::new(paths.clone());
         let resolver = MimeAppsResolver::new(paths);
-        let model = OpenWithModel::from_resolver(detected.mime_type(), &resolver, &catalog)
-            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let model = OpenWithModel::from_resolver(
+            selection.mime_type.as_ref(),
+            &resolver,
+            &catalog,
+            self.application_icons.as_ref(),
+        )
+        .map_err(|_| self.application_error("application-open-association-unavailable"))?;
         let options = open_with_window_options(&self.catalog, cx);
         let chooser_catalog = self.catalog.clone();
         let mut dialog = None;
@@ -3687,7 +3788,7 @@ impl MusheenApp {
                 dialog = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             })
-            .map_err(|error| Box::<str>::from(error.to_string()))?;
+            .map_err(|_| self.application_error("application-open-dialog-unavailable"))?;
         self.track_context_dialog_window(handle.window_id(), origin_tab, cx);
         let dialog = dialog.expect("the Open With window constructs its view");
         let targets = targets.to_vec();
@@ -3862,6 +3963,7 @@ impl MusheenApp {
                 | CommandAction::Pin
                 | CommandAction::Unpin
                 | CommandAction::ManageTags
+                | CommandAction::Open
                 | CommandAction::OpenWith
                 | CommandAction::ChooseApplication
                 | CommandAction::SetDefaultApplication
@@ -8161,7 +8263,7 @@ fn column_label(column: ColumnKey) -> &'static str {
 mod tests {
     use super::*;
     use crate::Locale;
-    use crate::providers::{ProviderAdapter, ProviderRuntime};
+    use crate::providers::{ProviderAdapter, ProviderApplicationTarget, ProviderRuntime};
     use crate::search::SearchState;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{
@@ -8517,11 +8619,13 @@ mod tests {
         });
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("send-me.txt");
+        let second_source = temporary.path().join("also-open-me.txt");
         let destination = temporary.path().join("archive");
         let config_home = temporary.path().join("config");
         let data_home = temporary.path().join("data");
         let desktop_file = data_home.join("applications/writer.desktop");
         filesystem::write(&source, b"send-to payload").unwrap();
+        filesystem::write(&second_source, b"open-with payload").unwrap();
         filesystem::create_dir(&destination).unwrap();
         filesystem::create_dir_all(desktop_file.parent().unwrap()).unwrap();
         filesystem::write(
@@ -8563,6 +8667,14 @@ mod tests {
                     .items()
                     .iter()
                     .find(|item| item.path().as_unix_path() == Some(source.as_path()))
+                    .unwrap()
+                    .clone();
+                let second_item = state
+                    .focused_directory()
+                    .view()
+                    .items()
+                    .iter()
+                    .find(|item| item.path().as_unix_path() == Some(second_source.as_path()))
                     .unwrap()
                     .clone();
                 state.select_item(tab, item.id().clone(), cx);
@@ -8647,7 +8759,14 @@ mod tests {
                     state.operation_error
                 );
 
-                let open_with = MusheenApp::menu_entry_by_id(&menu, "file.open_with")
+                let application_targets = vec![
+                    CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap(),
+                    CommandTargetRef::new(second_item.id().clone(), second_item.path().clone())
+                        .unwrap(),
+                ];
+                let application_menu =
+                    state.compose_context_menu(tab, MenuTarget::Item, application_targets.clone());
+                let open_with = MusheenApp::menu_entry_by_id(&application_menu, "file.open_with")
                     .unwrap()
                     .clone();
                 let open_once = open_with
@@ -8678,11 +8797,21 @@ mod tests {
                     CommandAction::SetDefaultApplication,
                     parameters,
                     Some(tab),
-                    Some(&[CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()]),
+                    Some(&application_targets),
                     true,
                     cx,
                 );
                 assert!(state.operation_error.is_none());
+
+                let open = MusheenApp::menu_entry_by_id(&application_menu, "file.open")
+                    .expect("ordinary Open remains available for multiple same-MIME items")
+                    .clone();
+                state.dispatch_context_entry(open, cx);
+                assert!(
+                    state.operation_error.is_none(),
+                    "default Open dispatch failed: {:?}",
+                    state.operation_error
+                );
 
                 let registry = musheen_core::CommandRegistry::built_in();
                 let mut toolbar = musheen_core::ToolbarLayout::default();
@@ -8708,9 +8837,232 @@ mod tests {
             destination.join("send-me.txt").exists()
         })
         .await;
-        assert_eq!(application_runner.0.lock().unwrap().len(), 2);
+        let launches = application_runner.0.lock().unwrap();
+        assert_eq!(launches.len(), 3);
+        for launch in launches.iter() {
+            assert_eq!(
+                launch.arguments(),
+                [source.as_os_str(), second_source.as_os_str()]
+            );
+        }
         let saved = filesystem::read_to_string(config_home.join("mimeapps.list")).unwrap();
         assert!(saved.contains("text/plain=writer.desktop;"));
+    }
+
+    #[gpui_kit::test]
+    async fn live_open_with_uses_the_provider_owned_lossless_uri(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let config_home = temporary.path().join("config");
+        let data_home = temporary.path().join("data");
+        let desktop_file = data_home.join("applications/viewer.desktop");
+        filesystem::create_dir_all(desktop_file.parent().unwrap()).unwrap();
+        filesystem::write(
+            &desktop_file,
+            "[Desktop Entry]\nType=Application\nName=Viewer\nExec=/usr/bin/viewer %U\nMimeType=image/png;\n",
+        )
+        .unwrap();
+        let desktop_paths = musheen_desktop::DesktopPaths::new(&config_home, &data_home)
+            .with_current_desktops("GNOME")
+            .with_executable_dirs([PathBuf::from("/usr/bin")]);
+        let provider = ProviderId::new("remote.open").unwrap();
+        let remote_path =
+            StorePath::from_provider_key(provider.clone(), b"opaque-not-a-uri".to_vec()).unwrap();
+        let target = CommandTargetRef::new(
+            ItemId::new(provider.clone(), b"remote-image".to_vec()).unwrap(),
+            remote_path,
+        )
+        .unwrap();
+        let adapter = UriApplicationAdapter {
+            store: Arc::new(FixtureProviderStore::new(provider, [])),
+            target: ProviderApplicationTarget::new(
+                LaunchTarget::uri("sftp://files.example.test/image.png").unwrap(),
+                "image/png",
+            ),
+        };
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(adapter))
+            .unwrap()
+            .build()
+            .unwrap();
+        let application_runner = Arc::new(RecordingApplicationRunner::default());
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let application_runner = Arc::clone(&application_runner);
+            let view = cx.new(|cx| {
+                let mut state = MusheenApp::new_with_provider_runtime(
+                    temporary.path().to_path_buf(),
+                    providers,
+                    cx,
+                );
+                state.desktop_paths = Some(desktop_paths);
+                state.application_runner = application_runner;
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_typed_context_command(
+                    CommandAction::OpenWith,
+                    CommandParameters::open_with(
+                        vec![target],
+                        musheen_core::DesktopApplicationId::new("viewer.desktop").unwrap(),
+                        CoreOpenWithIntent::OpenOnce,
+                    ),
+                    None,
+                    None,
+                    false,
+                    cx,
+                );
+                assert!(
+                    state.operation_error.is_none(),
+                    "URI dispatch failed: {:?}",
+                    state.operation_error
+                );
+            });
+        })
+        .unwrap();
+        let launches = application_runner.0.lock().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(
+            launches[0].arguments(),
+            [std::ffi::OsStr::new("sftp://files.example.test/image.png")]
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn live_application_dispatch_localizes_mixed_mime_and_provider_uri_refusals(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let text_path = temporary.path().join("notes.txt");
+        let image_path = temporary.path().join("image.png");
+        filesystem::write(&text_path, b"notes").unwrap();
+        filesystem::write(&image_path, b"not actually a png").unwrap();
+        let local = LocalStore::new();
+        let text_item = local
+            .resolve_item(&StorePath::from_unix_path(text_path.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let image_item = local
+            .resolve_item(&StorePath::from_unix_path(image_path.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let unsupported_provider = ProviderId::new("remote.unsupported-open").unwrap();
+        let unsupported_path =
+            StorePath::from_provider_key(unsupported_provider.clone(), b"opaque-object".to_vec())
+                .unwrap();
+        let unsupported_target = CommandTargetRef::new(
+            ItemId::new(unsupported_provider.clone(), b"opaque-object".to_vec()).unwrap(),
+            unsupported_path,
+        )
+        .unwrap();
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(FixtureProviderAdapter {
+                store: Arc::new(FixtureProviderStore::new(unsupported_provider, [])),
+                routes: Vec::new(),
+            }))
+            .unwrap()
+            .build()
+            .unwrap();
+        let isolated_desktop_paths = DesktopPaths::new(
+            temporary.path().join("isolated-config"),
+            temporary.path().join("isolated-data"),
+        );
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut state = MusheenApp::new_with_provider_runtime(
+                    temporary.path().to_path_buf(),
+                    providers,
+                    cx,
+                );
+                state.desktop_paths = Some(isolated_desktop_paths);
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let mixed = [&text_item, &image_item]
+                    .into_iter()
+                    .map(|item| {
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                state.dispatch_typed_context_command(
+                    CommandAction::Open,
+                    CommandParameters::targets(mixed),
+                    None,
+                    None,
+                    false,
+                    cx,
+                );
+                assert_eq!(
+                    state.operation_error.as_deref(),
+                    Some(
+                        state
+                            .catalog
+                            .message("application-open-mixed-mime")
+                            .unwrap()
+                    )
+                );
+
+                state.dispatch_typed_context_command(
+                    CommandAction::Open,
+                    CommandParameters::targets(vec![unsupported_target]),
+                    None,
+                    None,
+                    false,
+                    cx,
+                );
+                assert_eq!(
+                    state.operation_error.as_deref(),
+                    Some(
+                        state
+                            .catalog
+                            .message("application-open-provider-unsupported")
+                            .unwrap()
+                    )
+                );
+
+                let no_default =
+                    CommandTargetRef::new(text_item.id().clone(), text_item.path().clone())
+                        .unwrap();
+                state.dispatch_typed_context_command(
+                    CommandAction::Open,
+                    CommandParameters::targets(vec![no_default]),
+                    None,
+                    None,
+                    false,
+                    cx,
+                );
+                assert_eq!(
+                    state.operation_error.as_deref(),
+                    Some(
+                        state
+                            .catalog
+                            .message("application-open-no-default")
+                            .unwrap()
+                    )
+                );
+            });
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
@@ -9197,6 +9549,24 @@ mod tests {
     struct FixtureProviderAdapter {
         store: Arc<FixtureProviderStore>,
         routes: Vec<Arc<dyn ProviderTransferRoute>>,
+    }
+
+    struct UriApplicationAdapter {
+        store: Arc<FixtureProviderStore>,
+        target: ProviderApplicationTarget,
+    }
+
+    impl ProviderAdapter for UriApplicationAdapter {
+        fn store(&self) -> Arc<dyn Store> {
+            self.store.clone()
+        }
+
+        fn application_target(&self, path: &StorePath) -> Option<ProviderApplicationTarget> {
+            (path
+                .provider_key()
+                .is_some_and(|(provider, _)| provider == self.store.provider_id()))
+            .then(|| self.target.clone())
+        }
     }
 
     impl ProviderAdapter for FixtureProviderAdapter {

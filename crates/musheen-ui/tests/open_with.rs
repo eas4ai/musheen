@@ -2,8 +2,8 @@ use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, TestAppContext, px, size};
 use musheen_desktop::{
-    DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths, LaunchTarget, MimeAppsResolver,
-    PreparedLaunch, ProcessRunner,
+    DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths, FreedesktopIconProvider, LaunchTarget,
+    MimeAppsResolver, PreparedLaunch, ProcessRunner,
 };
 use musheen_ui::{
     ApplicationChoice, Catalog, Locale, OpenWithDialog, OpenWithIntent, OpenWithModel,
@@ -43,7 +43,9 @@ fn open_once_never_persists_and_make_default_is_explicit() {
     let runner = RecordingRunner::default();
     let targets = [LaunchTarget::local("/tmp/report.txt")];
 
-    let mut model = OpenWithModel::from_resolver("text/plain", &resolver, &catalog).unwrap();
+    let mut model =
+        OpenWithModel::from_resolver("text/plain", &resolver, &catalog, &FreedesktopIconProvider)
+            .unwrap();
     model.select("writer.desktop").unwrap();
     model
         .plan(OpenWithIntent::OpenOnce)
@@ -97,4 +99,35 @@ async fn chooser_requires_a_selection_and_returns_the_explicit_intent(cx: &mut T
         }),
         Some(("writer.desktop".to_owned(), OpenWithIntent::SetAsDefault))
     );
+}
+
+#[gpui_kit::test]
+async fn chooser_renders_resolved_application_icons_and_a_lucide_fallback(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let temporary = tempfile::tempdir().unwrap();
+    let icon = temporary.path().join("writer.svg");
+    fs::write(&icon, "<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+    let model = OpenWithModel::new(
+        "text/plain",
+        vec![
+            ApplicationChoice::new("writer.desktop", "Writer", true).with_icon_path(&icon),
+            ApplicationChoice::new("plain.desktop", "Plain", true),
+        ],
+    );
+    let handle = cx.open_window(size(px(560.), px(480.)), |window, cx| {
+        let catalog = Catalog::load(Locale::EnUs).unwrap();
+        let view = cx.new(|cx| OpenWithDialog::new(model, catalog, cx));
+        Root::new(view, window, cx)
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("open-with-icon-writer.desktop").visible());
+        assert!(
+            window
+                .find("open-with-icon-fallback-plain.desktop")
+                .visible()
+        );
+    })
+    .unwrap();
 }

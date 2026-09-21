@@ -1,14 +1,17 @@
+use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    App, Context, EventEmitter, FocusHandle, IntoElement, Render, Role, SharedString,
-    TestSupportExt, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
+    App, Context, EventEmitter, FocusHandle, ImageSource, IntoElement, Render, Role, SharedString,
+    TestSupportExt, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img, px, size,
 };
 use musheen_desktop::{
-    DesktopApplication, DesktopEntryCatalog, DesktopEntryLauncher, LaunchError, LaunchTarget,
-    MimeAppsError, MimeAppsResolver, ProcessRunner, TerminalCommand,
+    ApplicationIconProvider, DesktopApplication, DesktopEntryCatalog, DesktopEntryLauncher,
+    LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver, ProcessRunner, TerminalCommand,
 };
+use std::path::{Path, PathBuf};
 
 use crate::Catalog;
 
@@ -16,7 +19,7 @@ use crate::Catalog;
 pub struct ApplicationChoice {
     desktop_id: Box<str>,
     name: Box<str>,
-    icon: Option<Box<str>>,
+    icon: Option<PathBuf>,
     compatible: bool,
 }
 
@@ -35,11 +38,14 @@ impl ApplicationChoice {
     }
 
     #[must_use]
-    pub fn from_desktop_application(application: &DesktopApplication) -> Self {
+    pub fn from_desktop_application(
+        application: &DesktopApplication,
+        icons: &dyn ApplicationIconProvider,
+    ) -> Self {
         Self {
             desktop_id: application.desktop_id().into(),
             name: application.name().into(),
-            icon: application.icon().map(Into::into),
+            icon: application.resolve_icon(icons),
             compatible: true,
         }
     }
@@ -52,8 +58,14 @@ impl ApplicationChoice {
         &self.name
     }
 
-    pub fn icon(&self) -> Option<&str> {
+    pub fn icon(&self) -> Option<&Path> {
         self.icon.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_icon_path(mut self, icon: impl Into<PathBuf>) -> Self {
+        self.icon = Some(icon.into());
+        self
     }
 
     pub fn compatible(&self) -> bool {
@@ -128,12 +140,13 @@ impl OpenWithModel {
         mime_type: impl Into<Box<str>>,
         resolver: &MimeAppsResolver,
         catalog: &DesktopEntryCatalog,
+        icons: &dyn ApplicationIconProvider,
     ) -> Result<Self, MimeAppsError> {
         let mime_type = mime_type.into();
         let applications = resolver
             .visible_applications_for(&mime_type, catalog)?
             .iter()
-            .map(ApplicationChoice::from_desktop_application)
+            .map(|application| ApplicationChoice::from_desktop_application(application, icons))
             .collect();
         Ok(Self::new(mime_type, applications))
     }
@@ -273,18 +286,40 @@ impl Render for OpenWithDialog {
         for application in self.model.compatible_applications() {
             let desktop_id = Box::<str>::from(application.desktop_id());
             let is_selected = selected.as_deref() == Some(application.desktop_id());
+            let icon_id = format!("open-with-icon-{}", application.desktop_id());
+            let icon = application.icon().map_or_else(
+                || {
+                    div()
+                        .id(SharedString::from(format!(
+                            "open-with-icon-fallback-{}",
+                            application.desktop_id()
+                        )))
+                        .test_support()
+                        .child(Icon::new(IconName::File).small())
+                        .into_any_element()
+                },
+                |path| {
+                    div()
+                        .id(SharedString::from(icon_id))
+                        .test_support()
+                        .child(img(ImageSource::from(path.to_path_buf())).size(px(20.)))
+                        .into_any_element()
+                },
+            );
             applications = applications.child(
-                Button::new(SharedString::from(format!(
-                    "open-with-application-{}",
-                    application.desktop_id()
-                )))
-                .label(application.name())
-                .when(is_selected, Button::primary)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.model.select(&desktop_id).is_ok() {
-                        cx.notify();
-                    }
-                })),
+                div().flex().items_center().gap_2().child(icon).child(
+                    Button::new(SharedString::from(format!(
+                        "open-with-application-{}",
+                        application.desktop_id()
+                    )))
+                    .label(application.name())
+                    .when(is_selected, Button::primary)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.model.select(&desktop_id).is_ok() {
+                            cx.notify();
+                        }
+                    })),
+                ),
             );
         }
         div()

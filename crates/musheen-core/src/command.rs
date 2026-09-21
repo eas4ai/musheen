@@ -640,10 +640,13 @@ impl CommandAction {
                 CommandParameterContract::DestinationWorkflow(TargetCardinality::ExactlyOne)
             }
             CommandAction::OpenWith | CommandAction::SetDefaultApplication => {
-                CommandParameterContract::OpenWith(TargetCardinality::ExactlyOne)
+                CommandParameterContract::OpenWith(TargetCardinality::OneOrMore)
             }
             CommandAction::CustomAction => {
                 CommandParameterContract::CustomAction(TargetCardinality::OneOrMore)
+            }
+            CommandAction::Open | CommandAction::ChooseApplication => {
+                CommandParameterContract::Targets(TargetCardinality::OneOrMore)
             }
             CommandAction::Cut
             | CommandAction::Copy
@@ -1656,7 +1659,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.open",
             "folder-open",
             &[],
-            P::ExactlyOneSelection,
+            P::HasSelection,
             A::Open,
             G::Open,
             D::None,
@@ -1666,7 +1669,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.open-with",
             "app-window",
             &[],
-            P::ExactlyOneSelection,
+            P::HasSelection,
             A::OpenWith,
             G::Open,
             D::None,
@@ -1676,7 +1679,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.choose-application",
             "app-window",
             &[],
-            P::ExactlyOneSelection,
+            P::HasSelection,
             A::ChooseApplication,
             G::Open,
             D::None,
@@ -1686,7 +1689,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.set-default-application",
             "star",
             &[],
-            P::ExactlyOneSelection,
+            P::HasSelection,
             A::SetDefaultApplication,
             G::Open,
             D::Review,

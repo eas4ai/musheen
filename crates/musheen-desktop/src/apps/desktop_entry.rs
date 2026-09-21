@@ -1,4 +1,4 @@
-use super::DesktopPaths;
+use super::{ApplicationIcon, ApplicationIconProvider, DesktopPaths};
 use freedesktop::ApplicationEntry;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -15,7 +15,7 @@ const MAX_DIRECTORY_DEPTH: usize = 16;
 pub struct DesktopApplication {
     desktop_id: Box<str>,
     name: Box<str>,
-    icon: Option<Box<str>>,
+    icon: Option<ApplicationIcon>,
     exec: Box<str>,
     try_exec: Option<OsString>,
     terminal: bool,
@@ -38,8 +38,13 @@ impl DesktopApplication {
     }
 
     #[must_use]
-    pub fn icon(&self) -> Option<&str> {
-        self.icon.as_deref()
+    pub const fn icon(&self) -> Option<&ApplicationIcon> {
+        self.icon.as_ref()
+    }
+
+    #[must_use]
+    pub fn resolve_icon(&self, provider: &dyn ApplicationIconProvider) -> Option<PathBuf> {
+        provider.resolve(self.icon.as_ref()?)
     }
 
     #[must_use]
@@ -275,7 +280,7 @@ fn parse_record(
         name.zip(exec).map(|(name, exec)| DesktopApplication {
             desktop_id: desktop_id.clone(),
             name: name.into_boxed_str(),
-            icon: entry.icon().map(String::into_boxed_str),
+            icon: entry.icon().as_deref().and_then(ApplicationIcon::parse),
             exec: exec.into_boxed_str(),
             try_exec: entry.get_string("TryExec").map(OsString::from),
             terminal: entry.terminal(),

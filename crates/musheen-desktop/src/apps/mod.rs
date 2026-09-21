@@ -1,10 +1,12 @@
 //! Freedesktop application discovery, MIME associations, and safe launching.
 
 mod desktop_entry;
+mod icon;
 mod launch;
 mod mimeapps;
 
 pub use desktop_entry::*;
+pub use icon::*;
 pub use launch::*;
 pub use mimeapps::*;
 

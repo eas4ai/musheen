@@ -186,7 +186,7 @@ fn build_launch(
         if token.value == "%i" {
             if let Some(icon) = application.icon() {
                 argv.push(OsString::from("--icon"));
-                argv.push(OsString::from(icon));
+                argv.push(icon.as_os_str().to_os_string());
             }
             continue;
         }

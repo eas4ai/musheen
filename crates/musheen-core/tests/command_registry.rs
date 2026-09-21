@@ -155,6 +155,39 @@ fn open_with_dispatches_a_validated_application_identity_and_explicit_intent() {
 }
 
 #[test]
+fn application_commands_accept_one_or_more_selected_targets() {
+    let registry = CommandRegistry::built_in();
+    let context = CommandContext {
+        selection_count: 2,
+        target: CommandTarget::File,
+        ..CommandContext::default()
+    };
+
+    for (id, contract) in [
+        (
+            "file.open",
+            CommandParameterContract::Targets(TargetCardinality::OneOrMore),
+        ),
+        (
+            "file.open_with",
+            CommandParameterContract::OpenWith(TargetCardinality::OneOrMore),
+        ),
+        (
+            "file.choose_application",
+            CommandParameterContract::Targets(TargetCardinality::OneOrMore),
+        ),
+        (
+            "file.set_default_application",
+            CommandParameterContract::OpenWith(TargetCardinality::OneOrMore),
+        ),
+    ] {
+        let command = registry.get(id).expect("application command is registered");
+        assert_eq!(command.parameter_contract(), contract, "{id}");
+        assert!(command.state(&context).is_enabled(), "{id}");
+    }
+}
+
+#[test]
 fn registry_contains_the_mutation_actions_that_context_menus_project() {
     let registry = CommandRegistry::built_in();
 

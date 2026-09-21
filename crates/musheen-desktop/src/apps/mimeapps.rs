@@ -153,6 +153,7 @@ impl MimeAppsResolver {
             let mut document = MimeAppsDocument::read_optional(&target)?;
             document.prepend(DEFAULT_APPLICATIONS, mime_type, desktop_id);
             document.prepend(ADDED_ASSOCIATIONS, mime_type, desktop_id);
+            document.remove(REMOVED_ASSOCIATIONS, mime_type, desktop_id);
             let bytes = document.render();
             if bytes.len() > usize::try_from(MAX_MIMEAPPS_BYTES).expect("limit fits usize") {
                 return Err(MimeAppsError::FileTooLarge(target));
@@ -162,7 +163,8 @@ impl MimeAppsResolver {
                 let _ = fs::remove_file(&temporary);
                 continue;
             }
-            fs::rename(&temporary, &target).map_err(|source| MimeAppsError::io(&target, source))?;
+            replace_temporary(&temporary, &target)
+                .map_err(|source| MimeAppsError::io(&target, source))?;
             sync_parent(&target)?;
             return Ok(());
         }
@@ -360,6 +362,16 @@ impl MimeAppsDocument {
         values.insert(0, desktop_id.into());
     }
 
+    fn remove(&mut self, group: &str, mime_type: &str, desktop_id: &str) {
+        if let Some(values) = self
+            .groups
+            .get_mut(group)
+            .and_then(|associations| associations.get_mut(mime_type))
+        {
+            values.retain(|existing| existing.as_ref() != desktop_id);
+        }
+    }
+
     fn render(&self) -> String {
         let mut result = String::new();
         for group in [
@@ -452,6 +464,14 @@ fn write_temporary(target: &Path, bytes: &[u8]) -> Result<PathBuf, MimeAppsError
     Err(MimeAppsError::TemporaryFileUnavailable)
 }
 
+fn replace_temporary(temporary: &Path, target: &Path) -> io::Result<()> {
+    if let Err(source) = fs::rename(temporary, target) {
+        let _ = fs::remove_file(temporary);
+        return Err(source);
+    }
+    Ok(())
+}
+
 fn sync_parent(target: &Path) -> Result<(), MimeAppsError> {
     let parent = target
         .parent()
@@ -530,5 +550,23 @@ impl std::error::Error for MimeAppsError {
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_temporary;
+    use std::fs;
+
+    #[test]
+    fn failed_replace_removes_the_private_temporary_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let pending = temporary.path().join(".mimeapps.list.pending");
+        let target = temporary.path().join("mimeapps.list");
+        fs::write(&pending, "pending").unwrap();
+        fs::create_dir(&target).unwrap();
+
+        assert!(replace_temporary(&pending, &target).is_err());
+        assert!(!pending.exists());
     }
 }

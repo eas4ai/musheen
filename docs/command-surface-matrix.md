@@ -40,10 +40,10 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `selection.clear` | `HasSelection` | — | command-mode, customizable, shortcut-default |
 | `item.properties` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, trash-item, unsupported-file | command-mode, customizable, shortcut-default, static-shortcut |
 | `app.settings` | `Always` | — | command-mode, custom-visible, customizable, navigation-toolbar, shortcut-default |
-| `file.open` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, mount, pinned-directory, read-only-file, sidebar, unsupported-file | command-mode, customizable |
-| `file.open_with` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | — |
-| `file.choose_application` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `file.set_default_application` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | — |
+| `file.open` | `HasSelection` | archive, directory, executable, file, hidden-file, mount, multi-selection, pinned-directory, read-only-file, sidebar, unsupported-file | command-mode, customizable |
+| `file.open_with` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | — |
+| `file.choose_application` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `file.set_default_application` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | — |
 | `clipboard.send_to` | `WritableDestination` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | — |
 | `clipboard.cut` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
 | `clipboard.copy` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
