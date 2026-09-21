@@ -226,18 +226,25 @@ impl CustomToolbarProjection {
 }
 
 #[must_use]
-pub fn project_custom_toolbar(layout: &ToolbarLayout) -> CustomToolbarProjection {
-    let visible = layout
+pub fn project_custom_toolbar(
+    layout: &ToolbarLayout,
+    registry: &CommandRegistry,
+) -> CustomToolbarProjection {
+    let projected = layout
         .ids()
         .iter()
-        .take(CUSTOM_TOOLBAR_VISIBLE_LIMIT)
-        .cloned()
-        .collect();
-    let overflow = layout
-        .ids()
+        .filter_map(|id| registry.get(id.as_str()))
+        .filter(|command| is_direct_surface_command(command))
+        .map(|command| command.id().clone())
+        .collect::<Vec<_>>();
+    let overflow = projected
         .iter()
         .skip(CUSTOM_TOOLBAR_VISIBLE_LIMIT)
         .cloned()
+        .collect();
+    let visible = projected
+        .into_iter()
+        .take(CUSTOM_TOOLBAR_VISIBLE_LIMIT)
         .collect();
     CustomToolbarProjection { visible, overflow }
 }

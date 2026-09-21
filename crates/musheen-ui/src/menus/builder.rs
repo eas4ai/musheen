@@ -3,8 +3,8 @@ use super::{MenuInvocationError, MenuTarget, OpenWithApplication, SendToDestinat
 use crate::{Catalog, Locale};
 use musheen_core::{
     CommandAction, CommandContext, CommandDefinition, CommandGroup, CommandId, CommandParameters,
-    CommandPredicate, CommandRegistry, CommandState, CommandTarget, CommandTargetRef, DangerLevel,
-    StorePath,
+    CommandPredicate, CommandRegistry, CommandState, CommandSubmenu, CommandTarget,
+    CommandTargetRef, DangerLevel, StorePath,
 };
 use std::fmt;
 
@@ -486,7 +486,7 @@ pub(crate) fn compose(
         .filter_map(|(index, id)| {
             registry
                 .get(id)
-                .filter(|command| is_presentable(command, &request))
+                .filter(|command| is_presentable(registry, command, &request))
                 .map(|command| (index, command))
         })
         .collect::<Vec<_>>();
@@ -531,7 +531,11 @@ fn effective_target(request: &ContextMenuRequest) -> MenuTarget {
     }
 }
 
-fn is_presentable(command: &CommandDefinition, request: &ContextMenuRequest) -> bool {
+fn is_presentable(
+    registry: &CommandRegistry,
+    command: &CommandDefinition,
+    request: &ContextMenuRequest,
+) -> bool {
     let target = request.context().target;
     match command.id().as_str() {
         // These are target-shape applicability rules, not capability policy.
@@ -574,6 +578,15 @@ fn is_presentable(command: &CommandDefinition, request: &ContextMenuRequest) -> 
             return false;
         }
         "trash.restore" if target != CommandTarget::TrashItem => return false,
+        "clipboard.send_to" if request.send_to.is_empty() => return false,
+        "actions.custom"
+            if !request.actions.iter().any(|contribution| {
+                valid_contribution_command(registry, contribution, CommandSubmenu::Actions)
+                    .is_some()
+            }) =>
+        {
+            return false;
+        }
         _ => {}
     }
     if command.state(request.context()).is_enabled() {
@@ -826,8 +839,10 @@ fn add_send_to_submenu(
         .send_to
         .iter()
         .find(|destination| destination.writable())
+        .or_else(|| request.send_to.first())
     {
-        let context = request.context_with_destination(destination.path().clone(), true);
+        let context =
+            request.context_with_destination(destination.path().clone(), destination.writable());
         entry.state = send_to
             .state(&context)
             .map_disabled_reason(|reason| catalog.localize_reason(reason));
@@ -865,16 +880,14 @@ fn add_contribution_submenu(
         return;
     }
     let expected_submenu = if tags {
-        musheen_core::CommandSubmenu::Tags
+        CommandSubmenu::Tags
     } else {
-        musheen_core::CommandSubmenu::Actions
+        CommandSubmenu::Actions
     };
     let mut entries = contributions
         .iter()
         .filter_map(|contribution| {
-            registry
-                .get(contribution.command_id())
-                .filter(|command| command.submenu() == Some(expected_submenu))
+            valid_contribution_command(registry, contribution, expected_submenu)
                 .map(|command| (contribution, command))
         })
         .map(|(contribution, command)| contribution_entry(contribution, command, catalog, request))
@@ -894,6 +907,17 @@ fn add_contribution_submenu(
         theme_tokens: MenuThemeTokens::from_profile(theme),
         direction,
     }));
+}
+
+fn valid_contribution_command<'a>(
+    registry: &'a CommandRegistry,
+    contribution: &super::MenuContribution,
+    expected_submenu: CommandSubmenu,
+) -> Option<&'a CommandDefinition> {
+    let command = registry.get(contribution.command_id())?;
+    (command.submenu() == Some(expected_submenu)
+        && (expected_submenu != CommandSubmenu::Actions || contribution.custom_action.is_some()))
+    .then_some(command)
 }
 
 fn set_custom_action_availability(

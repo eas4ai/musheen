@@ -31,8 +31,8 @@ use crate::status_bar::status_text_with_size;
 use crate::status_center::{OperationStatus, OperationStatusEntry, TrashItem, TrashSurfaceModel};
 use crate::toolbar::{
     NAVIGATION_LEADING_IDS, NAVIGATION_TRAILING_IDS, OMNIBAR_COMMANDS, SEARCH_COMMAND_ID,
-    TAB_STRIP_COMMAND_IDS, VIEW_COMMAND_IDS, is_direct_surface_command, omnibar_command_for_action,
-    project_custom_toolbar, resolve_command_mode, static_shortcut_declarations,
+    TAB_STRIP_COMMAND_IDS, VIEW_COMMAND_IDS, omnibar_command_for_action, project_custom_toolbar,
+    resolve_command_mode, static_shortcut_declarations,
 };
 use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
@@ -4999,48 +4999,29 @@ impl MusheenApp {
             .try_global::<crate::settings::RuntimeSettings>()
             .map(|settings| crate::settings::toolbar::toolbar_from_document(&settings.0))
             .unwrap_or_default();
-        let projection = project_custom_toolbar(&layout);
-        let overflow = projection
-            .overflow()
-            .iter()
-            .filter(|id| {
-                self.shell
-                    .commands()
-                    .get(id.as_str())
-                    .is_some_and(is_direct_surface_command)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let projection = project_custom_toolbar(&layout, self.shell.commands());
+        let overflow = projection.overflow().to_vec();
         let host = cx.entity();
         let overflow_items = overflow
             .iter()
             .map(|id| {
-                let command = self.shell.commands().get(id.as_str());
-                let label = command
-                    .map(|command| {
-                        self.catalog
-                            .message(command.label_key())
-                            .expect("localized command")
-                            .to_owned()
-                    })
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{}: {}",
-                            self.catalog
-                                .message("customization-unavailable")
-                                .expect("localized unavailable"),
-                            id.as_str()
-                        )
-                    });
-                let enabled = command.is_some_and(|command| {
-                    command
-                        .state(&self.active_command_context(command.action()))
-                        .is_enabled()
-                });
+                let command = self
+                    .shell
+                    .commands()
+                    .get(id.as_str())
+                    .expect("the custom toolbar projection contains registry commands");
+                let label = self
+                    .catalog
+                    .message(command.label_key())
+                    .expect("localized command")
+                    .to_owned();
+                let enabled = command
+                    .state(&self.active_command_context(command.action()))
+                    .is_enabled();
                 (
                     id.clone(),
                     label,
-                    command.map(|command| menu_icon(Some(command.icon_key()))),
+                    Some(menu_icon(Some(command.icon_key()))),
                     enabled,
                 )
             })
@@ -5065,12 +5046,6 @@ impl MusheenApp {
                 projection
                     .visible()
                     .iter()
-                    .filter(|id| {
-                        self.shell
-                            .commands()
-                            .get(id.as_str())
-                            .is_some_and(is_direct_surface_command)
-                    })
                     .map(|id| {
                         self.named_toolbar_button(
                             id.as_str(),
@@ -8363,6 +8338,54 @@ mod tests {
                     .unwrap()
                     .clone();
                 state.select_item(tab, item.id().clone(), cx);
+                for section in [
+                    SidebarSectionKind::Pinned,
+                    SidebarSectionKind::Mounts,
+                    SidebarSectionKind::Remote,
+                ] {
+                    state
+                        .sidebars
+                        .get_mut(&tab)
+                        .unwrap()
+                        .set_section_items(section, std::iter::empty::<SidebarEntry>());
+                }
+                let empty_menu = state
+                    .compose_context_request(state.active_command_request(CommandAction::SendTo));
+                assert!(
+                    MusheenApp::menu_entry_by_id(&empty_menu, "actions.custom").is_none(),
+                    "Actions must be omitted when no custom actions contribute children",
+                );
+                assert!(
+                    MusheenApp::menu_entry_by_id(&empty_menu, "clipboard.send_to").is_none(),
+                    "Send To must be omitted when the live sidebar has no destinations",
+                );
+
+                state.sidebars.get_mut(&tab).unwrap().set_section_items(
+                    SidebarSectionKind::Pinned,
+                    [SidebarEntry::unavailable(
+                        "Read-only archive",
+                        destination_path.clone(),
+                        "read-only fixture",
+                    )],
+                );
+                let read_only_menu = state
+                    .compose_context_request(state.active_command_request(CommandAction::SendTo));
+                let read_only_parent =
+                    MusheenApp::menu_entry_by_id(&read_only_menu, "clipboard.send_to")
+                        .expect("an unavailable destination remains visible with its refusal");
+                assert!(!read_only_parent.state().is_enabled());
+                assert!(
+                    read_only_parent
+                        .accessible_disabled_reason()
+                        .is_some_and(|reason| reason.contains("read-only")),
+                    "the parent exposes the destination refusal, not the source location state",
+                );
+                let read_only_child = read_only_parent
+                    .submenu()
+                    .and_then(|submenu| submenu.destination(destination.to_str().unwrap()))
+                    .expect("the unavailable destination remains inspectable");
+                assert!(!read_only_child.state().is_enabled());
+
                 state.sidebars.get_mut(&tab).unwrap().set_section_items(
                     SidebarSectionKind::Pinned,
                     [SidebarEntry::new("Archive", destination_path.clone())],

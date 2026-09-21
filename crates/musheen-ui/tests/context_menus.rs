@@ -4,6 +4,9 @@ use musheen_core::{
     CommandTarget, CommandTargetRef, ItemId, OpenWithIntent, ProviderActionMatrix, ProviderId,
     ShortcutMap, StorePath, ToolbarLayout, canonical_chord,
 };
+use musheen_desktop::{
+    ActionArgument, ActionConfirmation, ActionExecution, CustomAction, WorkingDirectory,
+};
 use musheen_ui::toolbar::{
     FixedCommandSurface, OMNIBAR_COMMANDS, STATIC_SHORTCUTS, customizable_commands,
     fixed_surface_ids, project_custom_toolbar, resolve_command_mode,
@@ -47,6 +50,24 @@ fn supported_context(target: CommandTarget, selected: usize) -> CommandContext {
             CapabilityState::Supported,
         ),
         ..CommandContext::default()
+    }
+}
+
+fn custom_action() -> CustomAction {
+    CustomAction {
+        id: "inspect".into(),
+        label: "Inspect".into(),
+        execution: ActionExecution::Direct {
+            executable: "/bin/true".into(),
+        },
+        arguments: vec![ActionArgument::Files],
+        working_directory: WorkingDirectory::CurrentLocation,
+        mime_patterns: vec!["*/*".into()],
+        location_prefix: None,
+        supports_provider_uris: false,
+        confirmation: ActionConfirmation::Always,
+        environment: Vec::new(),
+        timeout_ms: 1_000,
     }
 }
 
@@ -933,6 +954,37 @@ fn shell_owns_the_context_menu_surface_used_by_the_application() {
     assert!(menu.entry("create.directory").is_some());
 }
 
+#[test]
+fn custom_actions_parent_is_omitted_without_a_valid_action_contribution() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let invalid = request(
+        supported_context(CommandTarget::File, 1),
+        MenuTarget::Item,
+        vec![target(b"file", "/work/file.txt")],
+    )
+    .with_actions(&[MenuContribution::new(
+        "Missing typed action",
+        "actions.custom",
+    )]);
+    assert!(surface.compose(invalid).entry("actions.custom").is_none());
+
+    let valid = request(
+        supported_context(CommandTarget::File, 1),
+        MenuTarget::Item,
+        vec![target(b"file", "/work/file.txt")],
+    )
+    .with_actions(&[MenuContribution::custom_action(custom_action())]);
+    let menu = surface.compose(valid);
+    let parent = menu
+        .entry("actions.custom")
+        .expect("a valid action contribution exposes its parent");
+    assert!(parent.state().is_enabled());
+    let child = &parent.submenu().unwrap().entries()[0];
+    assert_eq!(child.label(), "Inspect");
+    assert!(!child.state().is_enabled());
+    assert!(child.accessible_disabled_reason().is_some());
+}
+
 fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
     let file = target(b"file", "/work/file.txt");
     let variable_rows = request(
@@ -946,7 +998,7 @@ fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
     )])
     .with_send_to(&[SendToDestination::pinned("Archive", path("/archive"), true)])
     .with_tags(&[MenuContribution::new("Work", "item.tags")])
-    .with_actions(&[MenuContribution::new("Inspect", "actions.custom")]);
+    .with_actions(&[MenuContribution::custom_action(custom_action())]);
     let mut hidden = supported_context(CommandTarget::File, 1);
     hidden.target_is_hidden = true;
     let mut pinned = supported_context(CommandTarget::Directory, 1);
@@ -1220,7 +1272,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "clipboard.copy_to",
         "clipboard.move_to",
         "clipboard.paste_into",
-        "clipboard.send_to",
         "file.compress",
         "file.rename",
         "file.duplicate",
@@ -1228,7 +1279,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.hide",
         "directory.pin",
         "item.tags",
-        "actions.custom",
         "directory.share",
         "file.move_to_trash",
         "file.delete_permanently",
@@ -1239,7 +1289,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "directory.properties",
     ];
     const MULTI_SELECTION: &[&str] = &[
-        "actions.custom",
         "clipboard.copy",
         "clipboard.copy_to",
         "clipboard.cut",
@@ -1263,7 +1312,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
-        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1278,7 +1326,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.hide",
         "item.tags",
-        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1290,7 +1337,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
-        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1302,7 +1348,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.hide",
         "item.tags",
-        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1314,7 +1359,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
-        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1327,7 +1371,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.unhide",
         "item.tags",
-        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1339,7 +1382,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
-        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1354,7 +1396,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.hide",
         "item.tags",
-        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1375,7 +1416,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "clipboard.copy_to",
         "clipboard.move_to",
         "clipboard.paste_into",
-        "clipboard.send_to",
         "file.compress",
         "file.rename",
         "file.duplicate",
@@ -1383,7 +1423,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.hide",
         "directory.unpin",
         "item.tags",
-        "actions.custom",
         "directory.share",
         "file.move_to_trash",
         "file.delete_permanently",
@@ -1481,10 +1520,9 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "view.sort",
     ];
     const NONE: &[&str] = &[];
-    const SEND_TO_DISABLED: &[&str] = &["clipboard.send_to"];
+    const FILE_DISABLED: &[&str] = &["actions.custom"];
     const READ_ONLY_DISABLED: &[&str] = &[
         "clipboard.move_to",
-        "clipboard.send_to",
         "file.create_hard_link",
         "file.create_symbolic_link",
         "file.delete_permanently",
@@ -1495,7 +1533,6 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
     ];
     const UNSUPPORTED_DISABLED: &[&str] = &[
         "clipboard.move_to",
-        "clipboard.send_to",
         "file.create_hard_link",
         "file.create_symbolic_link",
         "file.delete_permanently",
@@ -1506,7 +1543,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "item.permissions",
         "item.tags",
     ];
-    const DIRECTORY_DISABLED: &[&str] = &["clipboard.paste_into", "clipboard.send_to"];
+    const DIRECTORY_DISABLED: &[&str] = &["clipboard.paste_into"];
     const MULTI_SELECTION_DISABLED: &[&str] = &[
         "clipboard.paste_into",
         "file.create_hard_link",
@@ -1516,12 +1553,12 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
 
     let expected = [
         ("background", BACKGROUND, &["clipboard.paste_into"][..]),
-        ("file", FILE, NONE),
-        ("hidden-file", HIDDEN_FILE, SEND_TO_DISABLED),
+        ("file", FILE, FILE_DISABLED),
+        ("hidden-file", HIDDEN_FILE, NONE),
         ("read-only-file", UNSUPPORTED_FILE, READ_ONLY_DISABLED),
         ("unsupported-file", UNSUPPORTED_FILE, UNSUPPORTED_DISABLED),
-        ("archive", ARCHIVE, SEND_TO_DISABLED),
-        ("executable", EXECUTABLE, SEND_TO_DISABLED),
+        ("archive", ARCHIVE, NONE),
+        ("executable", EXECUTABLE, NONE),
         ("directory", DIRECTORY, DIRECTORY_DISABLED),
         ("multi-selection", MULTI_SELECTION, MULTI_SELECTION_DISABLED),
         ("pinned-directory", PINNED_DIRECTORY, DIRECTORY_DISABLED),
@@ -1606,7 +1643,7 @@ fn live_surface_inventory(registry: &CommandRegistry) -> BTreeMap<String, BTreeS
     }
 
     let default_layout = ToolbarLayout::default();
-    let default_projection = project_custom_toolbar(&default_layout);
+    let default_projection = project_custom_toolbar(&default_layout, registry);
     add_surface_ids(
         &mut surfaces,
         "custom-visible",
@@ -1621,7 +1658,7 @@ fn live_surface_inventory(registry: &CommandRegistry) -> BTreeMap<String, BTreeS
     overflow_layout
         .add("tab.new", registry)
         .expect("ninth custom command");
-    let overflow_projection = project_custom_toolbar(&overflow_layout);
+    let overflow_projection = project_custom_toolbar(&overflow_layout, registry);
     add_surface_ids(
         &mut surfaces,
         "custom-overflow",
@@ -1647,6 +1684,31 @@ fn live_surface_inventory(registry: &CommandRegistry) -> BTreeMap<String, BTreeS
         }
     }
     surfaces
+}
+
+#[test]
+fn custom_toolbar_filters_stale_and_dynamic_ids_before_assigning_visible_slots() {
+    let layout = ToolbarLayout::import(
+        "v1;navigation.location;clipboard.send_to;file.open_with;actions.custom;missing.command;file.set_default_application;view.sidebar;navigation.refresh;tab.new;view.info",
+    )
+    .expect("syntactically valid persisted toolbar");
+
+    let projection = project_custom_toolbar(&layout, &CommandRegistry::built_in());
+    assert_eq!(
+        projection
+            .visible()
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "navigation.location",
+            "view.sidebar",
+            "navigation.refresh",
+            "tab.new",
+            "view.info",
+        ],
+    );
+    assert!(projection.overflow().is_empty());
 }
 
 fn render_surface_matrix(
