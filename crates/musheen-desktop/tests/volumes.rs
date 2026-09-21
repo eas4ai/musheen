@@ -2,9 +2,10 @@
 
 use musheen_desktop::{
     BackendSnapshot, Capacity, DeviceDescriptor, MountOperation, MountProvider, MountRecord,
-    OperationUsage, OperationUse, ServiceState, UDisksBackend, UDisksError, UDisksRequest,
-    UsageResolution, VolumeAction, VolumeChange, VolumeError, VolumeEvent, VolumeId, VolumeRuntime,
-    VolumeService, VolumeSubscription, VolumeTrigger, ZbusUDisksBackend,
+    OperationReservation, OperationUsage, OperationUse, ServiceState, UDisksBackend, UDisksError,
+    UDisksRequest, UsageResolution, ValidatedActionScope, VolumeAction, VolumeChange, VolumeError,
+    VolumeEvent, VolumeId, VolumeRuntime, VolumeService, VolumeSubscription, VolumeTrigger,
+    ZbusUDisksBackend,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ struct FakeBackend {
     actions: Mutex<Vec<(VolumeId, VolumeAction)>>,
     action_results: Mutex<VecDeque<Result<(), UDisksError>>>,
     validation_results: Mutex<VecDeque<Result<(), UDisksError>>>,
+    validation_scopes: Mutex<VecDeque<ValidatedActionScope>>,
     validation_job: Mutex<Option<(Arc<FakeUsage>, OperationUse)>>,
     dispatch_job: Mutex<
         Option<(
@@ -44,6 +46,13 @@ impl FakeBackend {
 
     fn queue_validation(&self, result: Result<(), UDisksError>) {
         self.validation_results.lock().unwrap().push_back(result);
+    }
+
+    fn queue_validation_scope(&self, devices: impl IntoIterator<Item = DeviceDescriptor>) {
+        self.validation_scopes
+            .lock()
+            .unwrap()
+            .push_back(ValidatedActionScope::from_devices(devices));
     }
 }
 
@@ -118,7 +127,7 @@ impl UDisksBackend for FakeBackend {
         _expected_owner: Option<&str>,
         _action: VolumeAction,
         _request: &UDisksRequest,
-    ) -> Result<Vec<PathBuf>, UDisksError> {
+    ) -> Result<ValidatedActionScope, UDisksError> {
         if let Some((usage, operation)) = self.validation_job.lock().unwrap().take() {
             usage.active.lock().unwrap().push(operation);
         }
@@ -127,7 +136,13 @@ impl UDisksBackend for FakeBackend {
             .unwrap()
             .pop_front()
             .unwrap_or(Ok(()))
-            .map(|()| volume.mount_points().to_vec())
+            .map(|()| {
+                self.validation_scopes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| ValidatedActionScope::from_devices([volume.clone()]))
+            })
     }
 }
 
@@ -761,6 +776,7 @@ fn drive_wide_reservation_tracks_procfs_only_sibling_aliases() {
     ]);
     let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
     service.refresh().unwrap();
+    backend.queue_validation_scope([first.clone(), second.clone()]);
 
     let alias_accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     *backend.alias_submission.lock().unwrap() = Some((
@@ -775,7 +791,7 @@ fn drive_wide_reservation_tracks_procfs_only_sibling_aliases() {
     ];
     mounts.queue(live.clone());
     mounts.queue(live);
-    backend.queue_snapshot(Ok(snapshot("owner", [first, second])));
+    backend.queue_snapshot(Ok(snapshot("owner", [first.clone(), second.clone()])));
     service
         .perform(
             &id("sdb1"),
@@ -1161,13 +1177,14 @@ struct ScriptedUsage {
 #[derive(Default)]
 struct AliasUsage {
     active: Mutex<Vec<(PathBuf, OperationUse)>>,
+    after_cancel: Mutex<Option<(PathBuf, OperationUse)>>,
     queried_mounts: Mutex<Vec<Vec<PathBuf>>>,
     canceled: Mutex<Vec<MountOperation>>,
+    reservation_scopes: Mutex<Vec<Vec<PathBuf>>>,
 }
 
-impl OperationUsage for AliasUsage {
-    fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
-        self.queried_mounts.lock().unwrap().push(mounts.to_vec());
+impl AliasUsage {
+    fn operations_for(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
         self.active
             .lock()
             .unwrap()
@@ -1175,6 +1192,161 @@ impl OperationUsage for AliasUsage {
             .filter(|(path, _)| mounts.contains(path))
             .map(|(_, operation)| operation.clone())
             .collect()
+    }
+}
+
+struct AliasUsageGuard<'a> {
+    usage: &'a AliasUsage,
+    mounts: Vec<PathBuf>,
+}
+
+impl OperationReservation for AliasUsageGuard<'_> {
+    fn operations_using(&self) -> Vec<OperationUse> {
+        self.usage.operations_for(&self.mounts)
+    }
+}
+
+#[test]
+fn drive_scope_expansion_after_cancellation_blocks_dispatch() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let approved = OperationUse::new(MountOperation::new(30), "writing partition A");
+    let sibling = OperationUse::new(MountOperation::new(31), "writing new partition B");
+    let usage = Arc::new(AliasUsage {
+        active: Mutex::new(vec![(PathBuf::from("/media/a"), approved.clone())]),
+        after_cancel: Mutex::new(Some((PathBuf::from("/bind/b"), sibling.clone()))),
+        queried_mounts: Mutex::new(Vec::new()),
+        canceled: Mutex::new(Vec::new()),
+        reservation_scopes: Mutex::new(Vec::new()),
+    });
+    let drive = "/org/freedesktop/UDisks2/drives/shared";
+    let first = device("sdb1", Some("/media/a")).with_drive_path(drive);
+    let second = device("sdb2", Some("/media/b")).with_drive_path(drive);
+    backend.queue_snapshot(Ok(snapshot("owner", [first.clone()])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
+    service.refresh().unwrap();
+
+    backend.queue_validation_scope([first.clone()]);
+    backend.queue_validation_scope([first.clone(), second.clone()]);
+    backend.queue_snapshot(Ok(snapshot("owner", [first, second])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/proc-b", false),
+        mount("/proc-b", "/bind/b", false),
+    ]);
+    let error = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Eject,
+            UsageResolution::CancelApproved(vec![approved]),
+            None,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, VolumeError::InUse(ref active) if active == &[sibling]));
+    assert!(backend.actions.lock().unwrap().is_empty());
+    assert!(
+        usage
+            .reservation_scopes
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|scope| scope.contains(&PathBuf::from("/bind/b")))
+    );
+}
+
+#[test]
+fn drive_scope_contraction_after_cancellation_drops_removed_sibling() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let approved = OperationUse::new(MountOperation::new(32), "writing partition A");
+    let usage = Arc::new(AliasUsage {
+        active: Mutex::new(vec![(PathBuf::from("/media/a"), approved.clone())]),
+        after_cancel: Mutex::new(None),
+        queried_mounts: Mutex::new(Vec::new()),
+        canceled: Mutex::new(Vec::new()),
+        reservation_scopes: Mutex::new(Vec::new()),
+    });
+    let drive = "/org/freedesktop/UDisks2/drives/shared";
+    let first = device("sdb1", Some("/media/a")).with_drive_path(drive);
+    let second = device("sdb2", Some("/media/b")).with_drive_path(drive);
+    backend.queue_snapshot(Ok(snapshot("owner", [first.clone(), second.clone()])));
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/media/b", false),
+    ]);
+    let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
+    service.refresh().unwrap();
+
+    backend.queue_validation_scope([first.clone(), second.clone()]);
+    backend.queue_validation_scope([first.clone()]);
+    backend.queue_snapshot(Ok(snapshot("owner", [first])));
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/media/b", false),
+    ]);
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::PowerOff,
+            UsageResolution::CancelApproved(vec![approved]),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        backend.actions.lock().unwrap().as_slice(),
+        &[(id("sdb1"), VolumeAction::PowerOff)]
+    );
+    assert!(
+        usage
+            .reservation_scopes
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|scope| !scope.contains(&PathBuf::from("/media/b")))
+    );
+}
+
+#[test]
+fn dispatch_refuses_drive_scope_expansion_outside_reservation() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let drive = "/org/freedesktop/UDisks2/drives/shared";
+    let first = device("sdb1", Some("/media/a")).with_drive_path(drive);
+    let second = device("sdb2", Some("/media/b")).with_drive_path(drive);
+    backend.queue_snapshot(Ok(snapshot("owner", [first.clone()])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let mut service = VolumeService::new(
+        backend.clone(),
+        mounts.clone(),
+        Arc::new(FakeUsage::default()),
+    );
+    service.refresh().unwrap();
+
+    backend.queue_validation_scope([first.clone()]);
+    backend.queue_validation_scope([first, second]);
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let error = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Eject,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, VolumeError::StaleObject));
+    assert!(backend.actions.lock().unwrap().is_empty());
+}
+
+impl OperationUsage for AliasUsage {
+    fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
+        self.queried_mounts.lock().unwrap().push(mounts.to_vec());
+        self.operations_for(mounts)
     }
 
     fn cancel(&self, operations: &[OperationUse]) -> Result<(), VolumeError> {
@@ -1190,7 +1362,24 @@ impl OperationUsage for AliasUsage {
             .lock()
             .unwrap()
             .retain(|(_, operation)| !canceled.contains(&operation.id()));
+        if let Some(operation) = self.after_cancel.lock().unwrap().take() {
+            self.active.lock().unwrap().push(operation);
+        }
         Ok(())
+    }
+
+    fn reserve<'a>(
+        &'a self,
+        mounts: &[PathBuf],
+    ) -> Result<Box<dyn OperationReservation + 'a>, VolumeError> {
+        self.reservation_scopes
+            .lock()
+            .unwrap()
+            .push(mounts.to_vec());
+        Ok(Box::new(AliasUsageGuard {
+            usage: self,
+            mounts: mounts.to_vec(),
+        }))
     }
 }
 
@@ -1274,13 +1463,14 @@ fn drive_wide_actions_include_sibling_partition_jobs() {
     let drive = "/org/freedesktop/UDisks2/drives/shared";
     let first = device("sdb1", Some("/media/a")).with_drive_path(drive);
     let second = device("sdb2", Some("/media/b")).with_drive_path(drive);
-    backend.queue_snapshot(Ok(snapshot("owner", [first, second])));
+    backend.queue_snapshot(Ok(snapshot("owner", [first.clone(), second.clone()])));
     mounts.queue(vec![
         mount("/dev/sdb1", "/media/a", false),
         mount("/dev/sdb2", "/media/b", false),
     ]);
     let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
     service.refresh().unwrap();
+    backend.queue_validation_scope([first, second]);
     mounts.queue(vec![
         mount("/dev/sdb1", "/media/a", false),
         mount("/dev/sdb2", "/media/b", false),

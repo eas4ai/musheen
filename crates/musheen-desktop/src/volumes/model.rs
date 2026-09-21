@@ -536,15 +536,6 @@ impl VolumeModel {
             .collect()
     }
 
-    #[must_use]
-    pub fn devices_affected_by(&self, id: &VolumeId, action: VolumeAction) -> Vec<PathBuf> {
-        self.volumes_affected_by(id, action)
-            .into_iter()
-            .filter_map(Volume::descriptor)
-            .map(|descriptor| descriptor.device().to_path_buf())
-            .collect()
-    }
-
     fn volumes_affected_by(&self, id: &VolumeId, action: VolumeAction) -> Vec<&Volume> {
         let Some(selected) = self.get(id) else {
             return Vec::new();

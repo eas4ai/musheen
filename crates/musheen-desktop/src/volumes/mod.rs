@@ -600,24 +600,14 @@ impl VolumeService {
             action,
             VolumeAction::Unmount | VolumeAction::Eject | VolumeAction::PowerOff
         ) {
-            let validated_mounts = self.backend.validate_action(
-                &descriptor,
-                self.model.service_owner(),
-                action,
-                request,
-            )?;
-            request.check()?;
-            let live_mounts = self.mounts.snapshot()?;
-            request.check()?;
-            let affected_devices = self.model.devices_affected_by(id, action);
-            let usage_mounts =
-                reconcile_mount_aliases(&validated_mounts, &affected_devices, &live_mounts);
+            let (mut validated_scope, usage_mounts) =
+                self.validate_action_scope(&descriptor, action, request)?;
             let canceled = self.resolve_usage(&usage_mounts, action, usage_resolution, request)?;
             let reservation_mounts = if canceled {
-                request.check()?;
-                let live_mounts = self.mounts.snapshot()?;
-                request.check()?;
-                reconcile_mount_aliases(&validated_mounts, &affected_devices, &live_mounts)
+                let (fresh_scope, fresh_mounts) =
+                    self.validate_action_scope(&descriptor, action, request)?;
+                validated_scope = fresh_scope;
+                fresh_mounts
             } else {
                 usage_mounts
             };
@@ -631,6 +621,7 @@ impl VolumeService {
                 self.model.service_owner(),
                 action,
                 unlock_secret,
+                Some(&validated_scope),
                 request,
             ) {
                 drop(reservation);
@@ -642,6 +633,7 @@ impl VolumeService {
             self.model.service_owner(),
             action,
             unlock_secret,
+            None,
             request,
         ) {
             return self.handle_action_error(id, error, request);
@@ -651,6 +643,26 @@ impl VolumeService {
             volume_present: self.model.get(id).is_some(),
             refresh,
         })
+    }
+
+    fn validate_action_scope(
+        &self,
+        descriptor: &DeviceDescriptor,
+        action: VolumeAction,
+        request: &UDisksRequest,
+    ) -> Result<(ValidatedActionScope, Vec<PathBuf>), VolumeError> {
+        let scope = self.backend.validate_action(
+            descriptor,
+            self.model.service_owner(),
+            action,
+            request,
+        )?;
+        request.check()?;
+        let live_mounts = self.mounts.snapshot()?;
+        request.check()?;
+        let mounts =
+            reconcile_mount_aliases(scope.mount_points(), scope.device_paths(), &live_mounts);
+        Ok((scope, mounts))
     }
 
     fn handle_action_error(
@@ -823,6 +835,7 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         expected_owner: Option<&str>,
         action: VolumeAction,
         unlock_secret: Option<&str>,
+        covered_scope: Option<&ValidatedActionScope>,
         request: &UDisksRequest,
     ) -> Result<(), UDisksError> {
         request.check()?;
@@ -832,6 +845,7 @@ impl UDisksBackend for ReconnectingUDisksBackend {
             expected_owner,
             action,
             unlock_secret,
+            covered_scope,
             request,
         )
     }
@@ -842,7 +856,7 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         expected_owner: Option<&str>,
         action: VolumeAction,
         request: &UDisksRequest,
-    ) -> Result<Vec<PathBuf>, UDisksError> {
+    ) -> Result<ValidatedActionScope, UDisksError> {
         self.connect(request)?
             .validate_action(volume, expected_owner, action, request)
     }

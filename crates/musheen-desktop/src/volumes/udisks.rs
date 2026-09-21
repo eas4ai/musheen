@@ -136,6 +136,71 @@ impl BackendSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedActionScope {
+    identities: Vec<(VolumeId, Box<str>, PathBuf)>,
+    device_paths: Vec<PathBuf>,
+    mount_points: Vec<PathBuf>,
+}
+
+impl ValidatedActionScope {
+    #[must_use]
+    pub fn from_devices(devices: impl IntoIterator<Item = DeviceDescriptor>) -> Self {
+        let devices = devices.into_iter().collect::<Vec<_>>();
+        let mut identities = devices
+            .iter()
+            .map(|device| {
+                (
+                    device.id().clone(),
+                    device.object_path().into(),
+                    device.device().to_path_buf(),
+                )
+            })
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities.dedup();
+        let mut device_paths = devices
+            .iter()
+            .map(|device| device.device().to_path_buf())
+            .collect::<Vec<_>>();
+        device_paths.sort();
+        device_paths.dedup();
+        let mut mount_points = devices
+            .iter()
+            .flat_map(|device| device.mount_points().iter().cloned())
+            .collect::<Vec<_>>();
+        mount_points.sort();
+        mount_points.dedup();
+        Self {
+            identities,
+            device_paths,
+            mount_points,
+        }
+    }
+
+    #[must_use]
+    pub fn device_paths(&self) -> &[PathBuf] {
+        &self.device_paths
+    }
+
+    #[must_use]
+    pub fn mount_points(&self) -> &[PathBuf] {
+        &self.mount_points
+    }
+
+    #[must_use]
+    pub fn covers(&self, current: &Self) -> bool {
+        current
+            .identities
+            .iter()
+            .all(|identity| self.identities.contains(identity))
+            && current
+                .mount_points
+                .iter()
+                .all(|mount| self.mount_points.contains(mount))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UDisksError {
     Unavailable(Box<str>),
     Timeout(Box<str>),
@@ -216,19 +281,24 @@ pub trait UDisksBackend: Send + Sync {
         _expected_owner: Option<&str>,
         _action: VolumeAction,
         request: &UDisksRequest,
-    ) -> Result<Vec<PathBuf>, UDisksError> {
+    ) -> Result<ValidatedActionScope, UDisksError> {
         request.check()?;
-        Ok(volume.mount_points().to_vec())
+        Ok(ValidatedActionScope::from_devices([volume.clone()]))
     }
 
     fn perform_validated_with_request(
         &self,
         volume: &DeviceDescriptor,
-        _expected_owner: Option<&str>,
+        expected_owner: Option<&str>,
         action: VolumeAction,
         unlock_secret: Option<&str>,
+        covered_scope: Option<&ValidatedActionScope>,
         request: &UDisksRequest,
     ) -> Result<(), UDisksError> {
+        let current = self.validate_action(volume, expected_owner, action, request)?;
+        if covered_scope.is_some_and(|covered| !covered.covers(&current)) {
+            return Err(UDisksError::StaleObject);
+        }
         self.perform_with_request(volume, action, unlock_secret, request)
     }
 }
@@ -625,7 +695,7 @@ impl UDisksBackend for ZbusUDisksBackend {
         expected_owner: Option<&str>,
         action: VolumeAction,
         request: &UDisksRequest,
-    ) -> Result<Vec<PathBuf>, UDisksError> {
+    ) -> Result<ValidatedActionScope, UDisksError> {
         let snapshot = self.snapshot_with_request(request)?;
         if expected_owner.is_none_or(|owner| owner != snapshot.owner()) {
             return Err(UDisksError::StaleObject);
@@ -646,18 +716,19 @@ impl UDisksBackend for ZbusUDisksBackend {
         } else {
             None
         };
-        Ok(snapshot
-            .devices()
-            .iter()
-            .filter(|candidate| {
-                if matches!(action, VolumeAction::Eject | VolumeAction::PowerOff) {
-                    candidate.drive_path() == drive
-                } else {
-                    candidate.id() == current.id()
-                }
-            })
-            .flat_map(|candidate| candidate.mount_points().iter().cloned())
-            .collect())
+        Ok(ValidatedActionScope::from_devices(
+            snapshot
+                .devices()
+                .iter()
+                .filter(|candidate| {
+                    if matches!(action, VolumeAction::Eject | VolumeAction::PowerOff) {
+                        candidate.drive_path() == drive
+                    } else {
+                        candidate.id() == current.id()
+                    }
+                })
+                .cloned(),
+        ))
     }
 
     fn perform_validated_with_request(
@@ -666,9 +737,13 @@ impl UDisksBackend for ZbusUDisksBackend {
         expected_owner: Option<&str>,
         action: VolumeAction,
         unlock_secret: Option<&str>,
+        covered_scope: Option<&ValidatedActionScope>,
         request: &UDisksRequest,
     ) -> Result<(), UDisksError> {
-        let _ = self.validate_action(volume, expected_owner, action, request)?;
+        let current = self.validate_action(volume, expected_owner, action, request)?;
+        if covered_scope.is_some_and(|covered| !covered.covers(&current)) {
+            return Err(UDisksError::StaleObject);
+        }
         let owner = expected_owner.ok_or(UDisksError::StaleObject)?.to_owned();
         block_on_request(request, async {
             if self.service_owner().await? != owner {

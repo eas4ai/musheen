@@ -2,8 +2,9 @@
 
 use musheen_desktop::{
     Capacity, MountProvider, MountRecord, NoOperationUsage, ReconnectingUDisksBackend,
-    UDisksBackend, UDisksBusConfig, UDisksError, UDisksRequest, VolumeAction, VolumeError,
-    VolumeRuntime, VolumeService, VolumeSubscription, VolumeTrigger, ZbusUDisksBackend,
+    UDisksBackend, UDisksBusConfig, UDisksError, UDisksRequest, ValidatedActionScope, VolumeAction,
+    VolumeError, VolumeRuntime, VolumeService, VolumeSubscription, VolumeTrigger,
+    ZbusUDisksBackend,
 };
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader};
@@ -541,10 +542,11 @@ fn production_validation_scopes_unmount_to_selected_and_drive_actions_to_sibling
                 VolumeAction::Unmount,
                 &request,
             )
-            .unwrap(),
-        vec![std::path::PathBuf::from("/media/a")]
+            .unwrap()
+            .mount_points(),
+        &[std::path::PathBuf::from("/media/a")]
     );
-    let mut drive_mounts = backend
+    let drive_scope = backend
         .validate_action(
             selected,
             Some(snapshot.owner()),
@@ -552,13 +554,25 @@ fn production_validation_scopes_unmount_to_selected_and_drive_actions_to_sibling
             &request,
         )
         .unwrap();
-    drive_mounts.sort();
     assert_eq!(
-        drive_mounts,
+        drive_scope.mount_points(),
         ["/media/a", "/media/b"]
             .into_iter()
             .map(std::path::PathBuf::from)
             .collect::<Vec<_>>()
+            .as_slice()
+    );
+    let selected_only = ValidatedActionScope::from_devices([selected.clone()]);
+    assert_eq!(
+        backend.perform_validated_with_request(
+            selected,
+            Some(snapshot.owner()),
+            VolumeAction::Eject,
+            None,
+            Some(&selected_only),
+            &request,
+        ),
+        Err(UDisksError::StaleObject)
     );
 }
 
@@ -771,6 +785,7 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
             Some(first.owner()),
             VolumeAction::Unmount,
             None,
+            None,
             &request,
         ),
         Err(UDisksError::StaleObject)
@@ -819,8 +834,9 @@ fn reconnecting_production_adapter_delegates_owner_bound_validation() {
                 VolumeAction::Unmount,
                 &request,
             )
-            .unwrap(),
-        vec![std::path::PathBuf::from("/media/fake")]
+            .unwrap()
+            .mount_points(),
+        &[std::path::PathBuf::from("/media/fake")]
     );
 
     futures_lite::future::block_on(service.release_name(SERVICE)).unwrap();
@@ -851,8 +867,9 @@ fn reconnecting_production_adapter_delegates_owner_bound_validation() {
                 VolumeAction::Unmount,
                 &request,
             )
-            .unwrap(),
-        vec![std::path::PathBuf::from("/media/fake")]
+            .unwrap()
+            .mount_points(),
+        &[std::path::PathBuf::from("/media/fake")]
     );
 }
 
@@ -899,6 +916,7 @@ fn same_owner_replacement_at_the_same_object_path_is_rejected() {
             &before.devices()[0],
             Some(before.owner()),
             VolumeAction::Unmount,
+            None,
             None,
             &request,
         ),
