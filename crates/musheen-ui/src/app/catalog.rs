@@ -1,7 +1,10 @@
 use super::*;
+use crate::Locale;
 use gpui_kit::WeakEntity;
 use musheen_core::CapabilityMatrix;
-use musheen_desktop::{HomeItemKind, HomeSection, MountShortcut, TagService, TagStorage};
+use musheen_desktop::{
+    HomeItemKind, HomeSection, MountShortcut, TagBackend, TagService, TagStorage, XattrTagBackend,
+};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
@@ -12,6 +15,7 @@ pub(super) struct CatalogBinding {
 }
 
 pub(super) type TagTarget = (ItemId, StorePath, CapabilityMatrix);
+type TagStates = (BTreeSet<Box<str>>, BTreeSet<Box<str>>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DirectoryObservation {
@@ -104,6 +108,7 @@ impl CatalogBinding {
         Ok(changed)
     }
 
+    #[cfg(test)]
     pub(super) fn assign_tag(
         &self,
         item: &ItemId,
@@ -111,25 +116,17 @@ impl CatalogBinding {
         capabilities: &CapabilityMatrix,
         tag: &str,
     ) -> Result<TagStorage, Box<str>> {
-        self.update_result(|document| {
-            TagService::new(document.tags_mut(), self.xattr_opt_in)
-                .assign(item, path, capabilities, tag)
-                .map_err(|error| error.to_string().into())
-        })
-    }
-
-    pub(super) fn remove_tag(
-        &self,
-        item: &ItemId,
-        path: &StorePath,
-        capabilities: &CapabilityMatrix,
-        tag: &str,
-    ) -> Result<TagStorage, Box<str>> {
-        self.update_result(|document| {
-            TagService::new(document.tags_mut(), self.xattr_opt_in)
-                .remove(item, path, capabilities, tag)
-                .map_err(|error| error.to_string().into())
-        })
+        TagService::validate_tag(tag).map_err(|error| Box::<str>::from(error.to_string()))?;
+        let mut snapshot = self.snapshot();
+        let storage = TagService::new(snapshot.tags_mut(), self.xattr_opt_in)
+            .storage_for(path, capabilities)
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        self.apply_tag_delta(
+            &[(item.clone(), path.clone(), capabilities.clone())],
+            &[Box::<str>::from(tag.trim())].into_iter().collect(),
+            &BTreeSet::new(),
+        )?;
+        Ok(storage)
     }
 
     pub(super) fn tags_for(
@@ -145,36 +142,92 @@ impl CatalogBinding {
         })
     }
 
-    pub(super) fn common_tags(
-        &self,
-        targets: &[TagTarget],
-    ) -> Result<BTreeSet<Box<str>>, Box<str>> {
+    pub(super) fn tag_states(&self, targets: &[TagTarget]) -> Result<TagStates, Box<str>> {
         let Some((first_item, first_path, first_capabilities)) = targets.first() else {
-            return Ok(BTreeSet::new());
+            return Ok((BTreeSet::new(), BTreeSet::new()));
         };
         let mut common = self.tags_for(first_item, first_path, first_capabilities)?;
+        let mut all = common.clone();
         for (item, path, capabilities) in targets.iter().skip(1) {
             let tags = self.tags_for(item, path, capabilities)?;
             common.retain(|tag| tags.contains(tag));
+            all.extend(tags);
         }
-        Ok(common)
+        let mixed = all.difference(&common).cloned().collect();
+        Ok((common, mixed))
     }
 
-    pub(super) fn replace_tags(
+    pub(super) fn apply_tag_delta(
         &self,
         targets: &[TagTarget],
-        desired: &BTreeSet<Box<str>>,
+        added: &BTreeSet<Box<str>>,
+        removed: &BTreeSet<Box<str>>,
     ) -> Result<(), Box<str>> {
-        for (item, path, capabilities) in targets {
-            let current = self.tags_for(item, path, capabilities)?;
-            for tag in current.difference(desired) {
-                self.remove_tag(item, path, capabilities, tag)?;
-            }
-            for tag in desired.difference(&current) {
-                self.assign_tag(item, path, capabilities, tag)?;
-            }
+        self.apply_tag_delta_with_xattr_writer(targets, added, removed, |item, path, tags| {
+            XattrTagBackend::new(true, true)
+                .write_tags(item, path, tags)
+                .map_err(|error| Box::<str>::from(error.to_string()))
+        })
+    }
+
+    fn apply_tag_delta_with_xattr_writer(
+        &self,
+        targets: &[TagTarget],
+        added: &BTreeSet<Box<str>>,
+        removed: &BTreeSet<Box<str>>,
+        writer: impl FnMut(&ItemId, &StorePath, &BTreeSet<Box<str>>) -> Result<(), Box<str>>,
+    ) -> Result<(), Box<str>> {
+        for tag in added {
+            TagService::validate_tag(tag).map_err(|error| Box::<str>::from(error.to_string()))?;
         }
-        Ok(())
+        self.update_result(|document| {
+            for (item, path, capabilities) in targets {
+                let (mut desired, storage) = {
+                    let mut service = TagService::new(document.tags_mut(), self.xattr_opt_in);
+                    let desired = service
+                        .tags(item, path, capabilities)
+                        .map_err(|error| Box::<str>::from(error.to_string()))?;
+                    let storage = service
+                        .storage_for(path, capabilities)
+                        .map_err(|error| Box::<str>::from(error.to_string()))?;
+                    (desired, storage)
+                };
+                desired.retain(|tag| !removed.contains(tag));
+                desired.extend(added.iter().cloned());
+                if storage == TagStorage::ExtendedAttribute {
+                    document
+                        .tags_mut()
+                        .stage_xattr_tags(item, path.clone(), desired);
+                } else {
+                    document
+                        .tags_mut()
+                        .write_tags(item, path, &desired)
+                        .expect("the app-owned tag catalog is infallible");
+                }
+            }
+            Ok(())
+        })?;
+        self.reconcile_pending_xattrs_with(writer)
+    }
+
+    fn reconcile_pending_xattrs_with(
+        &self,
+        mut writer: impl FnMut(&ItemId, &StorePath, &BTreeSet<Box<str>>) -> Result<(), Box<str>>,
+    ) -> Result<(), Box<str>> {
+        self.update_result(|document| {
+            let pending = document
+                .tags()
+                .pending_xattr_records()
+                .map(|(item, path, tags)| (item.clone(), path.clone(), tags.clone()))
+                .collect::<Vec<_>>();
+            for (item, path, tags) in &pending {
+                writer(item, path, tags)?;
+            }
+            for (item, _, _) in pending {
+                document.tags_mut().finish_xattr_reconciliation(&item);
+            }
+            Ok(())
+        })
     }
 
     #[cfg(test)]
@@ -216,27 +269,20 @@ impl CatalogBinding {
         mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
     ) -> Result<usize, Box<str>> {
         TagService::validate_tag(new).map_err(|error| Box::<str>::from(error.to_string()))?;
-        self.update_result(|document| {
-            let targets = document
-                .tags()
-                .tracked_items()
-                .filter(|(item, _, _)| document.tags().tags_for(item).contains(old))
-                .map(|(item, path, _)| (item.clone(), path.clone()))
-                .collect::<Vec<_>>();
-            let mut changed = 0;
-            for (item, path) in targets {
-                let matrix = capabilities(&path);
-                let mut service = TagService::new(document.tags_mut(), self.xattr_opt_in);
-                service
-                    .remove(&item, &path, &matrix, old)
-                    .map_err(|error| Box::<str>::from(error.to_string()))?;
-                service
-                    .assign(&item, &path, &matrix, new)
-                    .map_err(|error| Box::<str>::from(error.to_string()))?;
-                changed += 1;
-            }
-            Ok(changed)
-        })
+        let document = self.snapshot();
+        let targets = document
+            .tags()
+            .tracked_items()
+            .filter(|(item, _, _)| document.tags().tags_for(item).contains(old))
+            .map(|(item, path, _)| (item.clone(), path.clone(), capabilities(path)))
+            .collect::<Vec<_>>();
+        let changed = targets.len();
+        self.apply_tag_delta(
+            &targets,
+            &[Box::<str>::from(new.trim())].into_iter().collect(),
+            &[Box::<str>::from(old)].into_iter().collect(),
+        )?;
+        Ok(changed)
     }
 
     pub(super) fn delete_tag(
@@ -244,22 +290,20 @@ impl CatalogBinding {
         tag: &str,
         mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
     ) -> Result<usize, Box<str>> {
-        self.update_result(|document| {
-            let targets = document
-                .tags()
-                .tracked_items()
-                .filter(|(item, _, _)| document.tags().tags_for(item).contains(tag))
-                .map(|(item, path, _)| (item.clone(), path.clone()))
-                .collect::<Vec<_>>();
-            let changed = targets.len();
-            for (item, path) in targets {
-                let matrix = capabilities(&path);
-                TagService::new(document.tags_mut(), self.xattr_opt_in)
-                    .remove(&item, &path, &matrix, tag)
-                    .map_err(|error| Box::<str>::from(error.to_string()))?;
-            }
-            Ok(changed)
-        })
+        let document = self.snapshot();
+        let targets = document
+            .tags()
+            .tracked_items()
+            .filter(|(item, _, _)| document.tags().tags_for(item).contains(tag))
+            .map(|(item, path, _)| (item.clone(), path.clone(), capabilities(path)))
+            .collect::<Vec<_>>();
+        let changed = targets.len();
+        self.apply_tag_delta(
+            &targets,
+            &BTreeSet::new(),
+            &[Box::<str>::from(tag)].into_iter().collect(),
+        )?;
+        Ok(changed)
     }
 
     pub(super) fn items_with_tag(&self, tag: &str) -> BTreeSet<ItemId> {
@@ -427,26 +471,25 @@ impl CatalogBinding {
             .collect::<BTreeSet<_>>();
         self.update(|document| {
             let tracked = TagService::new(document.tags_mut(), self.xattr_opt_in)
-                .tracked_items()
-                .map(|(item, path, _)| (item.clone(), path.clone()))
+                .tracked_scoped_items()
+                .map(|(item, path, scope, _)| (item.clone(), path.clone(), scope.cloned()))
                 .collect::<Vec<_>>();
             let mut service = TagService::new(document.tags_mut(), self.xattr_opt_in);
             for item in items {
-                service.observe_present(item.id(), item.path().clone());
+                service.observe_present_in_scope(item.id(), item.path().clone(), location.clone());
             }
             if observation != DirectoryObservation::Complete {
                 return;
             }
-            let Some(directory) = location.as_unix_path() else {
-                return;
-            };
-            for (item, path) in tracked {
-                if path
-                    .as_unix_path()
-                    .and_then(std::path::Path::parent)
-                    .is_some_and(|parent| parent == directory)
-                    && !present.contains(&item)
-                {
+            for (item, path, scope) in tracked {
+                let observed_in_scope = scope.as_ref() == Some(location)
+                    || scope.is_none()
+                        && location.as_unix_path().is_some_and(|directory| {
+                            path.as_unix_path()
+                                .and_then(std::path::Path::parent)
+                                .is_some_and(|parent| parent == directory)
+                        });
+                if observed_in_scope && !present.contains(&item) {
                     service.observe_missing(&item);
                 }
             }
@@ -455,12 +498,24 @@ impl CatalogBinding {
 }
 
 impl MusheenApp {
+    pub(super) fn clear_recent_locations(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<(), Box<str>> {
+        self.catalog_binding
+            .update(|document| document.recents_mut().clear())?;
+        self.sync_catalog_projection();
+        cx.notify();
+        Ok(())
+    }
+
     pub(super) fn apply_properties_tags(
         &mut self,
         targets: &[TagTarget],
-        desired: &BTreeSet<Box<str>>,
+        delta: &TagDelta,
     ) -> Result<(), Box<str>> {
-        self.catalog_binding.replace_tags(targets, desired)?;
+        self.catalog_binding
+            .apply_tag_delta(targets, &delta.added, &delta.removed)?;
         self.sync_catalog_projection();
         Ok(())
     }
@@ -496,9 +551,15 @@ impl MusheenApp {
     ) -> Result<(), Box<str>> {
         let tag = self.catalog_binding.tag_name_from_target(target)?;
         let app = cx.entity().downgrade();
-        let options = properties_window_options("Rename Tag", cx);
+        let title = self
+            .catalog
+            .message("catalog-rename-tag")
+            .expect("the rename-tag catalog message exists")
+            .to_owned();
+        let catalog = self.catalog.clone();
+        let options = properties_window_options(title, cx);
         cx.open_window(options, move |window, cx| {
-            let view = cx.new(|cx| TagRenameWindow::new(app, tag, window, cx));
+            let view = cx.new(|cx| TagRenameWindow::new(app, tag, catalog, window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         })
         .map_err(|error| Box::<str>::from(error.to_string()))?;
@@ -519,6 +580,21 @@ impl MusheenApp {
         let tag_names = self.catalog_binding.tag_names();
         for sidebar in self.sidebars.values_mut() {
             sidebar.set_tag_names(tag_names.iter().map(AsRef::as_ref));
+        }
+        for active in self.filters.values_mut() {
+            let Some(tag) = active
+                .expression
+                .strip_prefix("tag:")
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+            else {
+                continue;
+            };
+            active.filter = Some(
+                DirectoryFilter::default()
+                    .with_tagged_items(self.catalog_binding.items_with_tag(tag)),
+            );
+            active.error = None;
         }
         let locations = self
             .navigation
@@ -617,6 +693,7 @@ impl MusheenApp {
 struct TagRenameWindow {
     app: WeakEntity<MusheenApp>,
     old: Box<str>,
+    catalog: Catalog,
     input: Entity<InputState>,
     error: Option<Box<str>>,
 }
@@ -625,17 +702,23 @@ impl TagRenameWindow {
     fn new(
         app: WeakEntity<MusheenApp>,
         old: Box<str>,
+        catalog: Catalog,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let placeholder = catalog
+            .message("catalog-tag-name")
+            .expect("the tag-name catalog message exists")
+            .to_owned();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(old.as_ref())
-                .placeholder("Tag name")
+                .placeholder(placeholder)
         });
         Self {
             app,
             old,
+            catalog,
             input,
             error: None,
         }
@@ -644,7 +727,18 @@ impl TagRenameWindow {
 
 impl Render for TagRenameWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let error = self.error.clone();
+        let error = self
+            .error
+            .as_deref()
+            .map(|error| self.catalog.localize_reason(error));
+        let rename_tag = self
+            .catalog
+            .message("catalog-rename-tag")
+            .expect("the rename-tag catalog message exists");
+        let rename = self
+            .catalog
+            .message("catalog-rename")
+            .expect("the rename catalog message exists");
         div()
             .id("tag-rename-dialog")
             .test_support()
@@ -652,18 +746,22 @@ impl Render for TagRenameWindow {
             .flex()
             .flex_col()
             .gap_3()
-            .child(div().text_lg().child(format!("Rename ‘{}’", self.old)))
+            .child(
+                div()
+                    .text_lg()
+                    .child(format!("{rename_tag}: ‘{}’", self.old)),
+            )
             .child(Input::new(&self.input).id("tag-rename-input"))
             .children(error.map(|error| {
                 div()
                     .id("tag-rename-error")
                     .test_support()
                     .role(Role::Alert)
-                    .child(error.to_string())
+                    .child(error)
             }))
             .child(
                 Button::new("tag-rename-confirm")
-                    .label("Rename")
+                    .label(rename)
                     .on_click(cx.listener(|this, _, window, cx| {
                         let new = this.input.read(cx).value().to_string();
                         match this
@@ -704,14 +802,18 @@ impl MusheenApp {
         let orphaned = self.catalog_binding.orphaned_tags();
         let rows = sections
             .into_iter()
-            .map(|section| Self::render_home_section(section, cx))
+            .map(|section| self.render_home_section(section, cx))
             .collect::<Vec<_>>();
-        let orphan_review = Self::render_orphan_review(orphaned, cx);
+        let orphan_review = self.render_orphan_review(orphaned, cx);
+        let home = self
+            .catalog
+            .message("catalog-home")
+            .expect("the Home catalog message exists");
         div()
             .id("home-surface")
             .test_support()
             .role(Role::Main)
-            .aria_label("Home")
+            .aria_label(home)
             .size_full()
             .p_4()
             .flex()
@@ -722,32 +824,54 @@ impl MusheenApp {
             .into_any_element()
     }
 
-    fn render_home_section(section: HomeSection, cx: &mut Context<Self>) -> AnyElement {
+    fn render_home_section(&self, section: HomeSection, cx: &mut Context<Self>) -> AnyElement {
         let kind = section.kind();
-        let (kind_id, heading) = match kind {
-            HomeItemKind::Recent => ("recent", "Recent locations"),
-            HomeItemKind::Pin => ("pin", "Pinned"),
-            HomeItemKind::Mount => ("mount", "Storage"),
-            HomeItemKind::Tag => ("tag", "Tags"),
+        let (kind_id, heading_key) = match kind {
+            HomeItemKind::Recent => ("recent", "catalog-recent-locations"),
+            HomeItemKind::Pin => ("pin", "catalog-pinned"),
+            HomeItemKind::Mount => ("mount", "catalog-storage"),
+            HomeItemKind::Tag => ("tag", "catalog-tags"),
         };
+        let heading = self
+            .catalog
+            .message(heading_key)
+            .expect("the Home section catalog message exists")
+            .to_owned();
+        let unpin = self
+            .catalog
+            .message("catalog-unpin")
+            .expect("the unpin catalog message exists")
+            .to_owned();
+        let catalog = self.catalog.clone();
+        let rtl = self.catalog.locale() == Locale::Ar;
         let items = section.items().iter().enumerate().map(|(index, item)| {
             let path = item.path_hint().cloned();
             let pin_path = path.clone();
             let pin_identity = item.identity().cloned();
             let tag = (kind == HomeItemKind::Tag).then(|| item.label().to_owned());
             let unavailable = item.unavailable_reason().map(str::to_owned);
+            let localized_unavailable = unavailable
+                .as_deref()
+                .map(|reason| catalog.localize_reason(reason));
+            let accessibility_label = unavailable.as_deref().map_or_else(
+                || item.label().to_owned(),
+                |reason| catalog.unavailable_label(item.label(), reason),
+            );
             div()
                 .w_full()
                 .flex()
                 .items_center()
+                .when(rtl, |row| row.flex_row_reverse())
                 .child(
                     Button::new(SharedString::from(format!("home-item-{kind_id}-{index}")))
                         .label(item.label().to_owned())
-                        .accessibility_label(item.label().to_owned())
+                        .accessibility_label(accessibility_label)
                         .ghost()
                         .small()
-                        .disabled(unavailable.is_some())
-                        .when_some(unavailable, |button, reason| button.tooltip(reason))
+                        .disabled(localized_unavailable.is_some())
+                        .when_some(localized_unavailable, |button, reason| {
+                            button.tooltip(reason)
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(tag) = tag.as_deref() {
                                 this.apply_tag_filter(tag, cx);
@@ -761,7 +885,7 @@ impl MusheenApp {
                     |row| {
                         row.child(
                             Button::new(SharedString::from(format!("home-unpin-{index}")))
-                                .label("Unpin")
+                                .label(unpin.clone())
                                 .ghost()
                                 .small()
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -789,12 +913,34 @@ impl MusheenApp {
     }
 
     fn render_orphan_review(
+        &self,
         orphaned: Vec<OrphanedTagRecord>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if orphaned.is_empty() {
             return None;
         }
+        let remove = self
+            .catalog
+            .message("catalog-remove-metadata")
+            .expect("the remove-metadata catalog message exists")
+            .to_owned();
+        let remove_accessibility = self
+            .catalog
+            .message("catalog-remove-reviewed-orphan")
+            .expect("the orphan action catalog message exists")
+            .to_owned();
+        let review = self
+            .catalog
+            .message("catalog-orphan-review")
+            .expect("the orphan review catalog message exists")
+            .to_owned();
+        let heading = self
+            .catalog
+            .message("catalog-orphan-heading")
+            .expect("the orphan heading catalog message exists")
+            .to_owned();
+        let rtl = self.catalog.locale() == Locale::Ar;
         let rows = orphaned.into_iter().enumerate().map(|(index, orphan)| {
             let item = orphan.item.clone();
             let tags = orphan
@@ -807,6 +953,7 @@ impl MusheenApp {
                 .w_full()
                 .flex()
                 .items_center()
+                .when(rtl, |row| row.flex_row_reverse())
                 .gap_2()
                 .child(div().flex_grow(1.0).text_sm().child(format!(
                     "{} — {tags}",
@@ -814,8 +961,8 @@ impl MusheenApp {
                 )))
                 .child(
                     Button::new(SharedString::from(format!("home-orphan-cleanup-{index}")))
-                        .label("Remove metadata")
-                        .accessibility_label("Remove reviewed orphaned tag metadata")
+                        .label(remove.clone())
+                        .accessibility_label(remove_accessibility.clone())
                         .ghost()
                         .small()
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -828,12 +975,12 @@ impl MusheenApp {
                 .id("home-orphan-review")
                 .test_support()
                 .role(Role::Region)
-                .aria_label("Orphaned tag metadata review")
+                .aria_label(review)
                 .w_full()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_sm().child("Tag metadata needing review"))
+                .child(div().text_sm().child(heading))
                 .children(rows)
                 .into_any_element(),
         )
@@ -882,6 +1029,9 @@ mod tests {
     };
     use musheen_core::{DisplayPath, ItemKind, StoreItem};
     use musheen_desktop::{TagMoveOutcome, TagStorage};
+    use standard_library::fs as filesystem;
+    use std as standard_library;
+    use std::collections::BTreeSet;
 
     fn provider(name: &str) -> ProviderId {
         ProviderId::new(name).expect("valid provider")
@@ -933,6 +1083,117 @@ mod tests {
     }
 
     #[test]
+    fn multi_selection_tag_additions_preserve_item_specific_tags() {
+        let binding = CatalogBinding::in_memory();
+        let first = item("remote", b"first");
+        let second = item("remote", b"second");
+        let first_path = remote_path("remote", b"folder/first");
+        let second_path = remote_path("remote", b"folder/second");
+        let matrix = capabilities(true, false);
+        binding
+            .assign_tag(&first, &first_path, &matrix, "red")
+            .unwrap();
+        binding
+            .assign_tag(&first, &first_path, &matrix, "private")
+            .unwrap();
+        binding
+            .assign_tag(&second, &second_path, &matrix, "red")
+            .unwrap();
+
+        binding
+            .apply_tag_delta(
+                &[
+                    (first.clone(), first_path, matrix.clone()),
+                    (second.clone(), second_path, matrix),
+                ],
+                &[Box::<str>::from("blue")].into_iter().collect(),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            binding.tags_for_identity(&first),
+            ["blue", "private", "red"]
+                .into_iter()
+                .map(Box::<str>::from)
+                .collect()
+        );
+        assert_eq!(
+            binding.tags_for_identity(&second),
+            ["blue", "red"].into_iter().map(Box::<str>::from).collect()
+        );
+    }
+
+    #[test]
+    fn failed_tag_mirror_batch_persists_desired_state_for_deterministic_recovery() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog_store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let first_path = temporary.path().join("first");
+        let second_path = temporary.path().join("second");
+        filesystem::write(&first_path, b"first").unwrap();
+        filesystem::write(&second_path, b"second").unwrap();
+        let first = item("local", b"first");
+        let second = item("local", b"second");
+        let first_path = StorePath::from_unix_path(first_path.as_os_str());
+        let second_path = StorePath::from_unix_path(second_path.as_os_str());
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document
+            .tags_mut()
+            .assign(&first, first_path.clone(), "red")
+            .unwrap();
+        document
+            .tags_mut()
+            .assign(&second, second_path.clone(), "red")
+            .unwrap();
+        catalog_store.save(&document).unwrap();
+        let binding =
+            CatalogBinding::persistent_with_xattr_opt_in(catalog_store.clone(), document, true);
+        let matrix = capabilities(true, true);
+        let targets = [
+            (first.clone(), first_path, matrix.clone()),
+            (second.clone(), second_path, matrix),
+        ];
+        let mut writes = 0;
+
+        let error = binding
+            .apply_tag_delta_with_xattr_writer(
+                &targets,
+                &[Box::<str>::from("blue")].into_iter().collect(),
+                &BTreeSet::new(),
+                |_, _, _| {
+                    writes += 1;
+                    if writes == 2 {
+                        Err(Box::<str>::from("injected second mirror failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.as_ref(), "injected second mirror failure");
+        let durable = catalog_store.load().unwrap();
+        assert_eq!(durable.tags().pending_xattr_count(), 2);
+        assert_eq!(
+            durable.tags().tags_for(&first),
+            ["blue", "red"].into_iter().map(Box::<str>::from).collect()
+        );
+        assert_eq!(
+            durable.tags().tags_for(&second),
+            ["blue", "red"].into_iter().map(Box::<str>::from).collect()
+        );
+
+        binding
+            .reconcile_pending_xattrs_with(|_, _, _| Ok(()))
+            .unwrap();
+        assert_eq!(
+            catalog_store.load().unwrap().tags().pending_xattr_count(),
+            0
+        );
+    }
+
+    #[test]
     fn binding_preserves_provider_paths_and_refuses_unsupported_move_targets() {
         let binding = CatalogBinding::in_memory();
         let source = item("local", b"inode-1");
@@ -971,6 +1232,14 @@ mod tests {
         );
         assert_eq!(binding.tags_for_identity(&remote).len(), 1);
         assert!(binding.tags_for_identity(&archive).is_empty());
+        assert!(binding.is_orphaned(&remote));
+        assert!(!binding.items_with_tag("keep").contains(&remote));
+        assert!(
+            binding
+                .orphaned_tags()
+                .iter()
+                .any(|record| record.item == remote)
+        );
     }
 
     #[test]
@@ -1077,6 +1346,38 @@ mod tests {
             .reconcile_directory(&directory, &listing, DirectoryObservation::Complete)
             .unwrap();
         assert!(binding.is_orphaned(&missing));
+    }
+
+    #[test]
+    fn authoritative_opaque_listing_orphans_disappeared_items_by_observed_scope() {
+        let binding = CatalogBinding::in_memory();
+        let directory = remote_path("remote", b"opaque-container-token");
+        let target = item("remote", b"stable-child");
+        let path = remote_path("remote", b"opaque-child-token");
+        let listed = StoreItem::new(
+            target.clone(),
+            path.clone(),
+            DisplayPath::new("child"),
+            ItemKind::RegularFile,
+            None,
+        );
+        binding
+            .assign_tag(&target, &path, &capabilities(true, false), "tracked")
+            .unwrap();
+        binding
+            .reconcile_directory(
+                &directory,
+                std::slice::from_ref(&listed),
+                DirectoryObservation::Complete,
+            )
+            .unwrap();
+
+        binding
+            .reconcile_directory(&directory, &[], DirectoryObservation::Complete)
+            .unwrap();
+
+        assert!(binding.is_orphaned(&target));
+        assert!(!binding.items_with_tag("tracked").contains(&target));
     }
 
     #[test]

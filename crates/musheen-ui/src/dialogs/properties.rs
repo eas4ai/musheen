@@ -1,3 +1,4 @@
+use crate::i18n::Catalog;
 use crate::operations::{OperationHub, spawn_ready_hub_operations};
 use crate::{ApplicationIdentity, DropError, LocalOperationQueue, PermissionsPageModel};
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -86,6 +87,9 @@ pub struct PropertiesDialogModel {
     state: PropertiesState,
     original_tags: BTreeSet<Box<str>>,
     tags: BTreeSet<Box<str>>,
+    mixed_tags: BTreeSet<Box<str>>,
+    added_tags: BTreeSet<Box<str>>,
+    removed_tags: BTreeSet<Box<str>>,
 }
 
 impl PropertiesDialogModel {
@@ -112,6 +116,9 @@ impl PropertiesDialogModel {
             state: PropertiesState::Ready,
             original_tags: BTreeSet::new(),
             tags: BTreeSet::new(),
+            mixed_tags: BTreeSet::new(),
+            added_tags: BTreeSet::new(),
+            removed_tags: BTreeSet::new(),
         }
     }
 
@@ -148,12 +155,35 @@ impl PropertiesDialogModel {
     }
 
     pub fn set_tags<'a>(&mut self, tags: impl IntoIterator<Item = &'a str>) {
-        self.tags = tags.into_iter().map(Box::<str>::from).collect();
+        self.set_tag_states(tags, std::iter::empty());
+    }
+
+    pub fn set_tag_states<'a>(
+        &mut self,
+        common: impl IntoIterator<Item = &'a str>,
+        mixed: impl IntoIterator<Item = &'a str>,
+    ) {
+        self.tags = common.into_iter().map(Box::<str>::from).collect();
         self.original_tags = self.tags.clone();
+        self.mixed_tags = mixed.into_iter().map(Box::<str>::from).collect();
+        self.added_tags.clear();
+        self.removed_tags.clear();
     }
 
     pub fn tags(&self) -> impl Iterator<Item = &str> {
         self.tags.iter().map(AsRef::as_ref)
+    }
+
+    pub fn mixed_tags(&self) -> impl Iterator<Item = &str> {
+        self.mixed_tags.iter().map(AsRef::as_ref)
+    }
+
+    pub fn added_tags(&self) -> impl Iterator<Item = &str> {
+        self.added_tags.iter().map(AsRef::as_ref)
+    }
+
+    pub fn removed_tags(&self) -> impl Iterator<Item = &str> {
+        self.removed_tags.iter().map(AsRef::as_ref)
     }
 
     pub fn assign_tag(&mut self, tag: &str) -> Result<bool, TagError> {
@@ -164,20 +194,33 @@ impl PropertiesDialogModel {
         if tag.len() > 128 {
             return Err(TagError::TooLong);
         }
-        Ok(self.tags.insert(tag.into()))
+        let was_mixed = self.mixed_tags.remove(tag);
+        let changed = self.tags.insert(tag.into()) || was_mixed;
+        if changed {
+            self.removed_tags.remove(tag);
+            self.added_tags.insert(tag.into());
+        }
+        Ok(changed)
     }
 
     pub fn remove_tag(&mut self, tag: &str) -> bool {
-        self.tags.remove(tag)
+        let changed = self.tags.remove(tag) || self.mixed_tags.remove(tag);
+        if changed {
+            self.added_tags.remove(tag);
+            self.removed_tags.insert(tag.into());
+        }
+        changed
     }
 
     #[must_use]
     pub fn tags_dirty(&self) -> bool {
-        self.tags != self.original_tags
+        !self.added_tags.is_empty() || !self.removed_tags.is_empty()
     }
 
     pub fn accept_tags(&mut self) {
         self.original_tags = self.tags.clone();
+        self.added_tags.clear();
+        self.removed_tags.clear();
     }
 
     pub fn apply_visible(&self) -> bool {
@@ -262,6 +305,9 @@ pub struct ProviderPropertiesDialogModel {
     page: PropertiesPage,
     original_tags: BTreeSet<Box<str>>,
     tags: BTreeSet<Box<str>>,
+    mixed_tags: BTreeSet<Box<str>>,
+    added_tags: BTreeSet<Box<str>>,
+    removed_tags: BTreeSet<Box<str>>,
 }
 
 impl ProviderPropertiesDialogModel {
@@ -281,6 +327,9 @@ impl ProviderPropertiesDialogModel {
             page: PropertiesPage::General,
             original_tags: BTreeSet::new(),
             tags: BTreeSet::new(),
+            mixed_tags: BTreeSet::new(),
+            added_tags: BTreeSet::new(),
+            removed_tags: BTreeSet::new(),
         }
     }
 
@@ -313,12 +362,27 @@ impl ProviderPropertiesDialogModel {
     }
 
     pub fn set_tags<'a>(&mut self, tags: impl IntoIterator<Item = &'a str>) {
-        self.tags = tags.into_iter().map(Box::<str>::from).collect();
+        self.set_tag_states(tags, std::iter::empty());
+    }
+
+    pub fn set_tag_states<'a>(
+        &mut self,
+        common: impl IntoIterator<Item = &'a str>,
+        mixed: impl IntoIterator<Item = &'a str>,
+    ) {
+        self.tags = common.into_iter().map(Box::<str>::from).collect();
         self.original_tags = self.tags.clone();
+        self.mixed_tags = mixed.into_iter().map(Box::<str>::from).collect();
+        self.added_tags.clear();
+        self.removed_tags.clear();
     }
 
     pub fn tags(&self) -> impl Iterator<Item = &str> {
         self.tags.iter().map(AsRef::as_ref)
+    }
+
+    pub fn mixed_tags(&self) -> impl Iterator<Item = &str> {
+        self.mixed_tags.iter().map(AsRef::as_ref)
     }
 
     pub fn assign_tag(&mut self, tag: &str) -> Result<bool, TagError> {
@@ -329,33 +393,63 @@ impl ProviderPropertiesDialogModel {
         if tag.len() > 128 {
             return Err(TagError::TooLong);
         }
-        Ok(self.tags.insert(tag.into()))
+        let was_mixed = self.mixed_tags.remove(tag);
+        let changed = self.tags.insert(tag.into()) || was_mixed;
+        if changed {
+            self.removed_tags.remove(tag);
+            self.added_tags.insert(tag.into());
+        }
+        Ok(changed)
     }
 
     pub fn remove_tag(&mut self, tag: &str) -> bool {
-        self.tags.remove(tag)
+        let changed = self.tags.remove(tag) || self.mixed_tags.remove(tag);
+        if changed {
+            self.added_tags.remove(tag);
+            self.removed_tags.insert(tag.into());
+        }
+        changed
     }
 
     fn accept_tags(&mut self) {
         self.original_tags = self.tags.clone();
+        self.added_tags.clear();
+        self.removed_tags.clear();
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TagDelta {
+    pub(crate) added: BTreeSet<Box<str>>,
+    pub(crate) removed: BTreeSet<Box<str>>,
 }
 
 pub(crate) struct ProviderPropertiesWindowData {
     model: ProviderPropertiesDialogModel,
     tag_writer: Option<TagWriter>,
+    catalog: Catalog,
 }
 
 impl ProviderPropertiesWindowData {
     pub(crate) fn new(
         targets: Vec<(CommandTargetRef, CapabilityMatrix)>,
-        tags: impl IntoIterator<Item = Box<str>>,
+        common_tags: impl IntoIterator<Item = Box<str>>,
+        mixed_tags: impl IntoIterator<Item = Box<str>>,
         tag_writer: Option<TagWriter>,
+        catalog: Catalog,
     ) -> Self {
         let mut model = ProviderPropertiesDialogModel::new(targets);
-        let tags = tags.into_iter().collect::<Vec<_>>();
-        model.set_tags(tags.iter().map(AsRef::as_ref));
-        Self { model, tag_writer }
+        let common_tags = common_tags.into_iter().collect::<Vec<_>>();
+        let mixed_tags = mixed_tags.into_iter().collect::<Vec<_>>();
+        model.set_tag_states(
+            common_tags.iter().map(AsRef::as_ref),
+            mixed_tags.iter().map(AsRef::as_ref),
+        );
+        Self {
+            model,
+            tag_writer,
+            catalog,
+        }
     }
 }
 
@@ -365,6 +459,7 @@ pub(crate) struct ProviderPropertiesWindow {
     tag_input: Entity<InputState>,
     tag_error: Option<Box<str>>,
     page_notice: Option<Box<str>>,
+    catalog: Catalog,
 }
 
 impl ProviderPropertiesWindow {
@@ -378,13 +473,19 @@ impl ProviderPropertiesWindow {
         let page_notice = model
             .select_page(page)
             .err()
-            .map(|_| provider_page_unavailable_message(&model, page));
+            .map(|_| provider_page_unavailable_message(&model, page, &data.catalog));
+        let tag_name = data
+            .catalog
+            .message("catalog-tag-name")
+            .expect("the tag-name catalog message exists")
+            .to_owned();
         Self {
             model,
             tag_writer: data.tag_writer,
-            tag_input: cx.new(|cx| InputState::new(window, cx).placeholder("Tag name")),
+            tag_input: cx.new(|cx| InputState::new(window, cx).placeholder(tag_name)),
             tag_error: None,
             page_notice,
+            catalog: data.catalog,
         }
     }
 
@@ -392,7 +493,11 @@ impl ProviderPropertiesWindow {
         match self.model.select_page(page) {
             Ok(()) => self.page_notice = None,
             Err(_) => {
-                self.page_notice = Some(provider_page_unavailable_message(&self.model, page));
+                self.page_notice = Some(provider_page_unavailable_message(
+                    &self.model,
+                    page,
+                    &self.catalog,
+                ));
             }
         }
         cx.notify();
@@ -400,13 +505,21 @@ impl ProviderPropertiesWindow {
 
     fn apply_tags(&mut self, cx: &mut Context<Self>) {
         let Some(writer) = self.tag_writer.as_ref() else {
-            self.tag_error = Some("Tag storage is unavailable".into());
+            self.tag_error = Some(
+                self.catalog
+                    .message("provider-properties-tag-storage-unavailable")
+                    .expect("the tag-storage catalog message exists")
+                    .into(),
+            );
             cx.notify();
             return;
         };
-        let tags = self.model.tags.clone();
+        let delta = TagDelta {
+            added: self.model.added_tags.clone(),
+            removed: self.model.removed_tags.clone(),
+        };
         // Provider and local windows use the same app-owned writer policy.
-        match writer(&tags, cx) {
+        match writer(&delta, cx) {
             Ok(()) => {
                 self.model.accept_tags();
                 self.tag_error = None;
@@ -425,7 +538,7 @@ impl ProviderPropertiesWindow {
                     "provider-properties-page-{}",
                     page_id(page)
                 )))
-                .label(page_label(page))
+                .label(provider_page_label(page, &self.catalog))
                 .selected(self.model.page() == page)
                 .disabled(!available)
                 .on_click(cx.listener(move |this, _, _, cx| this.select_page(page, cx)))
@@ -443,6 +556,21 @@ impl ProviderPropertiesWindow {
 
     fn render_tags_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let tags = self.model.tags().map(str::to_owned).collect::<Vec<_>>();
+        let mixed_tags = self
+            .model
+            .mixed_tags()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let remove_label = self
+            .catalog
+            .message("provider-properties-remove")
+            .expect("the remove catalog message exists")
+            .to_owned();
+        let some_items = self
+            .catalog
+            .message("provider-properties-some-items")
+            .expect("the some-items catalog message exists")
+            .to_owned();
         div()
             .id("properties-tags-page")
             .test_support()
@@ -455,12 +583,36 @@ impl ProviderPropertiesWindow {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .when(self.catalog.locale() == crate::Locale::Ar, |row| {
+                        row.flex_row_reverse()
+                    })
                     .child(tag)
                     .child(
                         Button::new(SharedString::from(format!(
                             "provider-properties-remove-tag-{index}"
                         )))
-                        .label("Remove")
+                        .label(remove_label.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.remove_tag(&remove);
+                            cx.notify();
+                        })),
+                    )
+            }))
+            .children(mixed_tags.into_iter().enumerate().map(|(index, tag)| {
+                let remove = tag.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .when(self.catalog.locale() == crate::Locale::Ar, |row| {
+                        row.flex_row_reverse()
+                    })
+                    .child(format!("{tag} ({some_items})"))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "provider-properties-remove-mixed-tag-{index}"
+                        )))
+                        .label(remove_label.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.model.remove_tag(&remove);
                             cx.notify();
@@ -468,9 +620,24 @@ impl ProviderPropertiesWindow {
                     )
             }))
             .child(Input::new(&self.tag_input).id("provider-properties-tag-input"))
+            .when_some(self.tag_error.as_deref(), |view, error| {
+                let error = self.catalog.localize_reason(error);
+                view.child(
+                    div()
+                        .id("provider-properties-tag-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .child(error),
+                )
+            })
             .child(
                 Button::new("provider-properties-add-tag")
-                    .label("Add tag")
+                    .label(
+                        self.catalog
+                            .message("provider-properties-add-tag")
+                            .expect("the add-tag catalog message exists"),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         let tag = this.tag_input.read(cx).value().to_string();
                         this.tag_error = this
@@ -483,13 +650,32 @@ impl ProviderPropertiesWindow {
             )
             .child(
                 Button::new("provider-properties-apply-tags")
-                    .label("Apply")
+                    .label(
+                        self.catalog
+                            .message("provider-properties-apply")
+                            .expect("the apply catalog message exists"),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| this.apply_tags(cx))),
             )
             .into_any_element()
     }
 
     fn render_general_page(&self) -> AnyElement {
+        let provider_label = self
+            .catalog
+            .message("provider-properties-provider")
+            .expect("the provider catalog message exists")
+            .to_owned();
+        let identity_label = self
+            .catalog
+            .message("provider-properties-stable-identity")
+            .expect("the stable-identity catalog message exists")
+            .to_owned();
+        let location_label = self
+            .catalog
+            .message("provider-properties-location")
+            .expect("the location catalog message exists")
+            .to_owned();
         let targets = self
             .model
             .targets()
@@ -505,16 +691,16 @@ impl ProviderPropertiesWindow {
                     .flex_col()
                     .child(provider_property_row(
                         format!("provider-properties-provider-{index}"),
-                        format!("Provider: {}", target.id().provider().as_str()),
+                        format!("{provider_label}: {}", target.id().provider().as_str()),
                     ))
                     .child(provider_property_row(
                         format!("provider-properties-identity-{index}"),
-                        format!("Stable identity: {:?}", target.id().opaque_key()),
+                        format!("{identity_label}: {:?}", target.id().opaque_key()),
                     ))
                     .child(provider_property_row(
                         format!("provider-properties-location-{index}"),
                         format!(
-                            "Location: {}",
+                            "{location_label}: {}",
                             DisplayPath::from_store_path(target.path()).as_str()
                         ),
                     ))
@@ -528,7 +714,7 @@ impl ProviderPropertiesWindow {
                     .model
                     .capabilities()
                     .iter()
-                    .map(|matrix| capability_state_label(matrix.get(kind)))
+                    .map(|matrix| provider_capability_state_label(matrix.get(kind), &self.catalog))
                     .collect::<Vec<_>>();
                 div()
                     .id(SharedString::from(format!(
@@ -538,8 +724,8 @@ impl ProviderPropertiesWindow {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(capability_kind_label(kind))
-                    .child(aggregate_strings(&values))
+                    .child(provider_capability_kind_label(kind, &self.catalog))
+                    .child(provider_aggregate_strings(&values, &self.catalog))
             });
         div()
             .id("provider-properties-general-page")
@@ -583,6 +769,7 @@ fn provider_property_row(id: String, value: String) -> AnyElement {
     div()
         .id(SharedString::from(id))
         .test_support()
+        .aria_label(value.clone())
         .child(value)
         .into_any_element()
 }
@@ -590,22 +777,31 @@ fn provider_property_row(id: String, value: String) -> AnyElement {
 fn provider_page_unavailable_message(
     model: &ProviderPropertiesDialogModel,
     page: PropertiesPage,
+    catalog: &Catalog,
 ) -> Box<str> {
     if page == PropertiesPage::Tags {
         let states = model
             .capabilities()
             .iter()
-            .map(|matrix| capability_state_label(matrix.get(CapabilityKind::Tags)))
+            .map(|matrix| {
+                provider_capability_state_label(matrix.get(CapabilityKind::Tags), catalog)
+            })
             .collect::<Vec<_>>();
         return format!(
-            "Tags is unavailable for this provider target: {}",
-            aggregate_strings(&states)
+            "{}: {}",
+            catalog
+                .message("provider-properties-tags-unavailable")
+                .expect("the unavailable-tags catalog message exists"),
+            provider_aggregate_strings(&states, catalog)
         )
         .into();
     }
     format!(
-        "{} is unavailable for this provider target",
-        page_label(page)
+        "{} {}",
+        provider_page_label(page, catalog),
+        catalog
+            .message("provider-properties-page-unavailable")
+            .expect("the unavailable-page catalog message exists")
     )
     .into()
 }
@@ -615,11 +811,13 @@ pub struct PropertiesWindowData {
     filesystem_rows: Vec<(Box<str>, Box<str>)>,
     capability_rows: Vec<(Box<str>, Box<str>)>,
     tags: BTreeSet<Box<str>>,
+    mixed_tags: BTreeSet<Box<str>>,
     tag_writer: Option<TagWriter>,
+    catalog: Catalog,
 }
 
 pub(crate) type TagWriter =
-    Arc<dyn Fn(&BTreeSet<Box<str>>, &mut App) -> Result<(), Box<str>> + Send + Sync + 'static>;
+    Arc<dyn Fn(&TagDelta, &mut App) -> Result<(), Box<str>> + Send + Sync + 'static>;
 
 impl PropertiesWindowData {
     pub fn load(paths: &[PathBuf]) -> Result<Self, PropertyError> {
@@ -688,7 +886,9 @@ impl PropertiesWindowData {
             filesystem_rows,
             capability_rows,
             tags: BTreeSet::new(),
+            mixed_tags: BTreeSet::new(),
             tag_writer: None,
+            catalog: Catalog::system().expect("the built-in locale catalogs are valid"),
         })
     }
 
@@ -699,8 +899,25 @@ impl PropertiesWindowData {
     }
 
     #[must_use]
+    pub(crate) fn with_tag_states(
+        mut self,
+        common: impl IntoIterator<Item = Box<str>>,
+        mixed: impl IntoIterator<Item = Box<str>>,
+    ) -> Self {
+        self.tags = common.into_iter().collect();
+        self.mixed_tags = mixed.into_iter().collect();
+        self
+    }
+
+    #[must_use]
     pub(crate) fn with_tag_writer(mut self, writer: TagWriter) -> Self {
         self.tag_writer = Some(writer);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_catalog(mut self, catalog: Catalog) -> Self {
+        self.catalog = catalog;
         self
     }
 }
@@ -857,6 +1074,7 @@ pub(crate) struct PropertiesWindow {
     tag_input: Entity<InputState>,
     tag_writer: Option<TagWriter>,
     tag_error: Option<Box<str>>,
+    catalog: Catalog,
 }
 
 impl PropertiesWindow {
@@ -901,9 +1119,17 @@ impl PropertiesWindow {
                     .placeholder("0755")
             }),
         };
-        let tag_input = cx.new(|cx| InputState::new(window, cx).placeholder("Tag name"));
+        let tag_name = data
+            .catalog
+            .message("catalog-tag-name")
+            .expect("the tag-name catalog message exists")
+            .to_owned();
+        let tag_input = cx.new(|cx| InputState::new(window, cx).placeholder(tag_name));
         let mut model = PropertiesDialogModel::new(data.snapshot);
-        model.set_tags(data.tags.iter().map(AsRef::as_ref));
+        model.set_tag_states(
+            data.tags.iter().map(AsRef::as_ref),
+            data.mixed_tags.iter().map(AsRef::as_ref),
+        );
         let mut this = Self {
             model,
             filesystem_rows: data.filesystem_rows,
@@ -927,6 +1153,7 @@ impl PropertiesWindow {
             tag_input,
             tag_writer: data.tag_writer,
             tag_error: None,
+            catalog: data.catalog,
         };
         this.subscribe_permission_inputs(window, cx);
         this.sync_rows(window, cx);
@@ -1655,11 +1882,38 @@ impl PropertiesWindow {
 
     fn render_tag_editor(&self, cx: &mut Context<Self>) -> AnyElement {
         let tags = self.model.tags().map(str::to_owned).collect::<Vec<_>>();
+        let mixed_tags = self
+            .model
+            .mixed_tags()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let tag_editor = self
+            .catalog
+            .message("catalog-tag-editor")
+            .expect("the tag-editor catalog message exists");
+        let tag_name = self
+            .catalog
+            .message("catalog-tag-name")
+            .expect("the tag-name catalog message exists");
+        let add_tag = self
+            .catalog
+            .message("provider-properties-add-tag")
+            .expect("the add-tag catalog message exists");
+        let remove_label = self
+            .catalog
+            .message("provider-properties-remove")
+            .expect("the remove catalog message exists")
+            .to_owned();
+        let some_items = self
+            .catalog
+            .message("provider-properties-some-items")
+            .expect("the some-items catalog message exists")
+            .to_owned();
         div()
             .id("properties-tag-editor")
             .test_support()
             .role(Role::Region)
-            .aria_label("Tag editor")
+            .aria_label(tag_editor)
             .w_full()
             .flex()
             .flex_col()
@@ -1671,23 +1925,25 @@ impl PropertiesWindow {
                     .child(
                         Input::new(&self.tag_input)
                             .id("properties-tag-input")
-                            .aria_label("Tag name"),
+                            .aria_label(tag_name),
                     )
-                    .child(Button::new("properties-tag-add").label("Add tag").on_click(
-                        cx.listener(|this, _, window, cx| {
-                            let tag = this.tag_input.read(cx).value().to_string();
-                            match this.model.assign_tag(&tag) {
-                                Ok(_) => {
-                                    this.tag_error = None;
-                                    this.tag_input.update(cx, |input, cx| {
-                                        input.set_value("", window, cx);
-                                    });
+                    .child(
+                        Button::new("properties-tag-add")
+                            .label(add_tag)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let tag = this.tag_input.read(cx).value().to_string();
+                                match this.model.assign_tag(&tag) {
+                                    Ok(_) => {
+                                        this.tag_error = None;
+                                        this.tag_input.update(cx, |input, cx| {
+                                            input.set_value("", window, cx);
+                                        });
+                                    }
+                                    Err(error) => this.tag_error = Some(error.to_string().into()),
                                 }
-                                Err(error) => this.tag_error = Some(error.to_string().into()),
-                            }
-                            cx.notify();
-                        }),
-                    )),
+                                cx.notify();
+                            })),
+                    ),
             )
             .children(tags.into_iter().enumerate().map(|(index, tag)| {
                 let remove = tag.clone();
@@ -1695,24 +1951,49 @@ impl PropertiesWindow {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .when(self.catalog.locale() == crate::Locale::Ar, |row| {
+                        row.flex_row_reverse()
+                    })
                     .child(tag)
                     .child(
                         Button::new(SharedString::from(format!("properties-tag-remove-{index}")))
-                            .label("Remove")
+                            .label(remove_label.clone())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.model.remove_tag(&remove);
                                 cx.notify();
                             })),
                     )
             }))
+            .children(mixed_tags.into_iter().enumerate().map(|(index, tag)| {
+                let remove = tag.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .when(self.catalog.locale() == crate::Locale::Ar, |row| {
+                        row.flex_row_reverse()
+                    })
+                    .child(format!("{tag} ({some_items})"))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "properties-tag-remove-mixed-{index}"
+                        )))
+                        .label(remove_label.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.remove_tag(&remove);
+                            cx.notify();
+                        })),
+                    )
+            }))
             .when_some(self.tag_error.as_deref(), |editor, error| {
+                let error = self.catalog.localize_reason(error);
                 editor.child(
                     div()
                         .id("properties-tag-error")
                         .test_support()
                         .role(Role::Alert)
-                        .aria_label(error.to_owned())
-                        .child(error.to_owned()),
+                        .aria_label(error.clone())
+                        .child(error),
                 )
             })
             .child(self.render_rows())
@@ -1721,12 +2002,20 @@ impl PropertiesWindow {
 
     fn apply_tags(&mut self, cx: &mut Context<Self>) {
         let Some(writer) = self.tag_writer.as_ref() else {
-            self.tag_error = Some("Tag storage is unavailable".into());
+            self.tag_error = Some(
+                self.catalog
+                    .message("provider-properties-tag-storage-unavailable")
+                    .expect("the tag-storage catalog message exists")
+                    .into(),
+            );
             cx.notify();
             return;
         };
-        let tags = self.model.tags.clone();
-        match writer(&tags, cx) {
+        let delta = TagDelta {
+            added: self.model.added_tags.clone(),
+            removed: self.model.removed_tags.clone(),
+        };
+        match writer(&delta, cx) {
             Ok(()) => {
                 self.model.accept_tags();
                 self.tag_error = None;
@@ -1755,7 +2044,11 @@ impl PropertiesWindow {
         {
             actions = actions.child(
                 Button::new("properties-tags-apply")
-                    .label("Apply tags")
+                    .label(
+                        self.catalog
+                            .message("catalog-apply-tags")
+                            .expect("the apply-tags catalog message exists"),
+                    )
                     .primary()
                     .on_click(cx.listener(|this, _, _, cx| this.apply_tags(cx))),
             );
@@ -1954,6 +2247,67 @@ fn aggregate_strings(values: &[String]) -> String {
     }
 }
 
+fn provider_aggregate_strings(values: &[String], catalog: &Catalog) -> String {
+    let Some(first) = values.first() else {
+        return catalog
+            .message("provider-properties-unavailable")
+            .expect("the unavailable catalog message exists")
+            .to_owned();
+    };
+    if values.iter().all(|value| value == first) {
+        first.clone()
+    } else {
+        catalog
+            .message("provider-properties-mixed")
+            .expect("the mixed catalog message exists")
+            .to_owned()
+    }
+}
+
+fn provider_capability_state_label(state: &CapabilityState, catalog: &Catalog) -> String {
+    match state {
+        CapabilityState::Supported => catalog
+            .message("provider-properties-supported")
+            .expect("the supported catalog message exists")
+            .to_owned(),
+        CapabilityState::Unsupported(reason) => format!(
+            "{}: {}",
+            catalog
+                .message("provider-properties-unsupported")
+                .expect("the unsupported catalog message exists"),
+            reason.as_str()
+        ),
+        CapabilityState::Unknown(reason) => format!(
+            "{}: {}",
+            catalog
+                .message("provider-properties-unknown")
+                .expect("the unknown catalog message exists"),
+            reason.as_str()
+        ),
+    }
+}
+
+fn provider_capability_kind_label(kind: CapabilityKind, catalog: &Catalog) -> String {
+    let key = match kind {
+        CapabilityKind::Permissions => "provider-capability-permissions",
+        CapabilityKind::Ownership => "provider-capability-ownership",
+        CapabilityKind::SymbolicLinks => "provider-capability-symbolic-links",
+        CapabilityKind::HardLinks => "provider-capability-hard-links",
+        CapabilityKind::SparseFiles => "provider-capability-sparse-files",
+        CapabilityKind::ExtendedAttributes => "provider-capability-extended-attributes",
+        CapabilityKind::Tags => "provider-capability-tags",
+        CapabilityKind::ReflinkCopies => "provider-capability-reflink-copies",
+        CapabilityKind::Trash => "provider-capability-trash",
+        CapabilityKind::AtomicRename => "provider-capability-atomic-rename",
+        CapabilityKind::Watching => "provider-capability-watching",
+        CapabilityKind::CaseSensitivity => "provider-capability-case-sensitivity",
+    };
+    catalog
+        .message(key)
+        .expect("the provider capability catalog message exists")
+        .to_owned()
+}
+
 fn capability_state_label(state: &CapabilityState) -> String {
     match state {
         CapabilityState::Supported => "Supported".to_owned(),
@@ -1997,6 +2351,20 @@ fn page_label(page: PropertiesPage) -> &'static str {
         PropertiesPage::Tags => "Tags",
         PropertiesPage::Checksums => "Checksums",
     }
+}
+
+fn provider_page_label(page: PropertiesPage, catalog: &Catalog) -> String {
+    let key = match page {
+        PropertiesPage::General => "provider-properties-general",
+        PropertiesPage::Tags => "provider-properties-tags",
+        PropertiesPage::Permissions => "command-permissions",
+        PropertiesPage::OpenWith => "command-open-with",
+        PropertiesPage::Checksums => "provider-properties-general",
+    };
+    catalog
+        .message(key)
+        .unwrap_or_else(|_| page_label(page))
+        .to_owned()
 }
 
 fn identity_title(snapshot: &PropertySnapshot) -> String {

@@ -12,13 +12,17 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 const CATALOG_FILE_NAME: &str = "catalog.json";
+const MAX_CATALOG_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CATALOG_COLLECTION_ITEMS: usize = 4_096;
+const MAX_CATALOG_STRING_BYTES: usize = 4_096;
+const MAX_TAG_BYTES: usize = 128;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -196,13 +200,33 @@ impl CatalogStore {
 }
 
 fn load_document(path: &Path) -> Result<Option<CatalogDocument>, CatalogError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let mut file = match File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(io_error("read catalog", path, source)),
     };
-    let document: CatalogDocument =
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error("read catalog", path, source))?;
+    if bytes.len() as u64 > MAX_CATALOG_BYTES {
+        return Err(CatalogError::Corrupt {
+            path: path.to_path_buf(),
+            message: format!("catalog exceeds the {MAX_CATALOG_BYTES}-byte limit").into(),
+        });
+    }
+    let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|error| CatalogError::Corrupt {
+            path: path.to_path_buf(),
+            message: error.to_string().into(),
+        })?;
+    validate_catalog_value(&value).map_err(|message| CatalogError::Corrupt {
+        path: path.to_path_buf(),
+        message,
+    })?;
+    let document: CatalogDocument =
+        serde_json::from_value(value).map_err(|error| CatalogError::Corrupt {
             path: path.to_path_buf(),
             message: error.to_string().into(),
         })?;
@@ -213,6 +237,59 @@ fn load_document(path: &Path) -> Result<Option<CatalogDocument>, CatalogError> {
         });
     }
     Ok(Some(document))
+}
+
+fn validate_catalog_value(value: &serde_json::Value) -> Result<(), Box<str>> {
+    fn validate(value: &serde_json::Value) -> Result<(), Box<str>> {
+        match value {
+            serde_json::Value::String(value) if value.len() > MAX_CATALOG_STRING_BYTES => {
+                Err("catalog string exceeds the decoded size limit".into())
+            }
+            serde_json::Value::Array(values) if values.len() > MAX_CATALOG_COLLECTION_ITEMS => {
+                Err("catalog collection exceeds the item limit".into())
+            }
+            serde_json::Value::Object(values) if values.len() > MAX_CATALOG_COLLECTION_ITEMS => {
+                Err("catalog object exceeds the field limit".into())
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    validate(value)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    validate(value)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    validate(value)?;
+    let Some(records) = value
+        .get("tags")
+        .and_then(|tags| tags.get("records"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    for record in records {
+        if record
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tags| {
+                tags.iter().any(|tag| {
+                    tag.as_str()
+                        .is_none_or(|tag| tag.is_empty() || tag.len() > MAX_TAG_BYTES)
+                })
+            })
+        {
+            return Err("catalog tag violates the decoded tag limit".into());
+        }
+    }
+    Ok(())
 }
 
 fn serialize(document: &CatalogDocument) -> Result<Vec<u8>, CatalogError> {

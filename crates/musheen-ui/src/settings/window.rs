@@ -16,6 +16,10 @@ use musheen_desktop::{
     SettingsStore, settings_schema,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+pub(crate) type RecentHistoryClearer =
+    Arc<dyn Fn(&mut App) -> Result<(), Box<str>> + Send + Sync + 'static>;
 
 #[derive(Default)]
 struct SettingsWindowOwner {
@@ -27,10 +31,21 @@ impl Global for SettingsWindowOwner {}
 /// Application-global ownership ensures Settings commands from separate
 /// browsers activate the same non-modal window and retain its draft and query.
 pub fn open_settings_window(cx: &mut App) {
-    open_settings_at(SettingsStore::for_current_user(), cx);
+    open_settings_at(SettingsStore::for_current_user(), None, cx);
 }
 
-fn open_settings_at(store: SettingsStore, cx: &mut App) {
+pub(crate) fn open_settings_window_with_recent_clearer(
+    clearer: RecentHistoryClearer,
+    cx: &mut App,
+) {
+    open_settings_at(SettingsStore::for_current_user(), Some(clearer), cx);
+}
+
+fn open_settings_at(
+    store: SettingsStore,
+    recent_history_clearer: Option<RecentHistoryClearer>,
+    cx: &mut App,
+) {
     if !cx.has_global::<SettingsWindowOwner>() {
         cx.set_global(SettingsWindowOwner::default());
     }
@@ -58,13 +73,15 @@ fn open_settings_at(store: SettingsStore, cx: &mut App) {
     };
     match cx.open_window(options, move |window, cx| {
         let view = cx.new(|cx| {
-            SettingsWindow::new(
+            let mut settings = SettingsWindow::new(
                 store,
                 SettingsBackends::default().with(SettingsFeature::Catalog),
                 catalog,
                 window,
                 cx,
-            )
+            );
+            settings.recent_history_clearer = recent_history_clearer;
+            settings
         });
         cx.global_mut::<SettingsWindowOwner>().view = Some(view.downgrade());
         cx.new(|cx| Root::new(view, window, cx))
@@ -102,6 +119,7 @@ pub struct SettingsWindow {
     pub(super) action_shell: bool,
     pub(super) action_provider_uris: bool,
     pub(super) action_confirmation: musheen_desktop::ActionConfirmation,
+    recent_history_clearer: Option<RecentHistoryClearer>,
 }
 
 impl SettingsWindow {
@@ -144,6 +162,7 @@ impl SettingsWindow {
             action_shell: false,
             action_provider_uris: false,
             action_confirmation: musheen_desktop::ActionConfirmation::Always,
+            recent_history_clearer: None,
             theme_input: theme_input.clone(),
             theme_error: None,
             toolbar_move_focus: cx.focus_handle(),
@@ -520,16 +539,19 @@ impl SettingsWindow {
                 .disabled(self.blocked())
                 .label(self.label("settings-clear-recent-locations"))
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.clear_recent_locations();
+                    this.clear_recent_locations(cx);
                     cx.notify();
                 }))
                 .into_any_element()
         })
     }
 
-    fn clear_recent_locations(&mut self) {
-        let store = CatalogStore::for_current_user();
-        let result = super::clear_recent_locations(&store);
+    fn clear_recent_locations(&mut self, cx: &mut Context<Self>) {
+        let result = match self.recent_history_clearer.as_ref() {
+            Some(clearer) => clearer(cx),
+            None => super::clear_recent_locations(&CatalogStore::for_current_user())
+                .map_err(|error| Box::<str>::from(error.to_string())),
+        };
         self.failure = result.err().map(|_| "settings-save-error");
     }
 
@@ -1125,7 +1147,7 @@ mod tests {
         let handle = cx.update(|cx| {
             gpui_kit::init(cx);
             install_native_pair("kde-breeze", false, cx);
-            open_settings_at(store, cx);
+            open_settings_at(store, None, cx);
             cx.global::<SettingsWindowOwner>().handle.unwrap()
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -1192,7 +1214,7 @@ mod tests {
         let handle = cx.update(|cx| {
             gpui_kit::init(cx);
             install_native_pair("kde-breeze", false, cx);
-            open_settings_at(store.clone(), cx);
+            open_settings_at(store.clone(), None, cx);
             cx.global::<SettingsWindowOwner>().handle.unwrap()
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -1432,10 +1454,10 @@ mod tests {
         let store = SettingsStore::from_config_home(root.path());
         cx.update(|cx| {
             gpui_kit::init(cx);
-            open_settings_at(store.clone(), cx);
+            open_settings_at(store.clone(), None, cx);
             let first = cx.global::<SettingsWindowOwner>().handle.unwrap();
             let count = cx.windows().len();
-            open_settings_at(store.clone(), cx);
+            open_settings_at(store.clone(), None, cx);
             assert_eq!(
                 first.window_id(),
                 cx.global::<SettingsWindowOwner>()

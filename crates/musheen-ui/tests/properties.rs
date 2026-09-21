@@ -208,6 +208,25 @@ fn properties_tags_page_presents_and_edits_the_shared_tag_model() {
 }
 
 #[test]
+fn multi_selection_tags_keep_common_and_mixed_states_as_explicit_deltas() {
+    let temporary = tempfile::tempdir().unwrap();
+    let first = temporary.path().join("first");
+    let second = temporary.path().join("second");
+    fs::write(&first, b"first").unwrap();
+    fs::write(&second, b"second").unwrap();
+    let snapshot = PropertySnapshot::load(&[first, second]).unwrap();
+    let mut model = PropertiesDialogModel::new(snapshot);
+    model.set_tag_states(["red"], ["private"]);
+
+    assert_eq!(model.tags().collect::<Vec<_>>(), ["red"]);
+    assert_eq!(model.mixed_tags().collect::<Vec<_>>(), ["private"]);
+    assert!(model.assign_tag("blue").unwrap());
+
+    assert_eq!(model.added_tags().collect::<Vec<_>>(), ["blue"]);
+    assert!(model.removed_tags().next().is_none());
+}
+
+#[test]
 fn provider_opaque_properties_keep_identity_tags_and_only_applicable_pages() {
     let provider = ProviderId::new("remote").unwrap();
     let target = CommandTargetRef::new(

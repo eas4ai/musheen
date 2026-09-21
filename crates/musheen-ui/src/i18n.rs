@@ -105,6 +105,19 @@ impl Catalog {
             .unwrap_or(reason)
             .to_owned()
     }
+
+    #[must_use]
+    pub fn unavailable_label(&self, label: &str, reason: &str) -> String {
+        let unavailable = self
+            .message("catalog-unavailable")
+            .expect("the unavailable catalog message exists");
+        let reason = self.localize_reason(reason);
+        if self.locale == Locale::Ar {
+            format!("{label}، {unavailable}: {reason}")
+        } else {
+            format!("{label}, {unavailable}: {reason}")
+        }
+    }
 }
 
 fn parse_catalog(source: &str) -> Result<BTreeMap<Box<str>, Box<str>>, CatalogError> {
@@ -195,6 +208,61 @@ mod tests {
                     .starts_with('⟦'),
                 "{key} is pseudo-localized"
             );
+        }
+    }
+
+    #[test]
+    fn catalog_and_provider_properties_messages_cover_every_shipped_locale() {
+        let keys = [
+            "catalog-home",
+            "catalog-recent-locations",
+            "catalog-pinned",
+            "catalog-storage",
+            "catalog-tags",
+            "catalog-unpin",
+            "catalog-unavailable",
+            "catalog-orphan-review",
+            "catalog-orphan-heading",
+            "catalog-remove-metadata",
+            "catalog-remove-reviewed-orphan",
+            "catalog-tag-name",
+            "catalog-rename-tag",
+            "catalog-rename",
+            "catalog-tag-editor",
+            "catalog-apply-tags",
+            "provider-properties-general",
+            "provider-properties-tags",
+            "provider-properties-remove",
+            "provider-properties-some-items",
+            "provider-properties-add-tag",
+            "provider-properties-apply",
+            "provider-properties-provider",
+            "provider-properties-stable-identity",
+            "provider-properties-location",
+            "provider-properties-capability",
+            "provider-properties-tag-storage-unavailable",
+            "provider-properties-tags-unavailable",
+            "provider-properties-page-unavailable",
+            "provider-properties-supported",
+            "provider-properties-unsupported",
+            "provider-properties-unknown",
+            "provider-properties-mixed",
+            "provider-properties-unavailable",
+        ];
+        let english = Catalog::load(Locale::EnUs).expect("English catalog loads");
+        let arabic = Catalog::load(Locale::Ar).expect("Arabic catalog loads");
+        let pseudo = Catalog::load(Locale::EnXa).expect("pseudo catalog loads");
+
+        for key in keys {
+            let english_message = english.message(key).expect("English message exists");
+            let arabic_message = arabic.message(key).expect("Arabic message exists");
+            let pseudo_message = pseudo.message(key).expect("pseudo message exists");
+            assert_ne!(
+                arabic_message, english_message,
+                "{key} is translated to Arabic"
+            );
+            assert!(pseudo_message.starts_with('⟦'), "{key} is pseudo-localized");
+            assert!(pseudo_message.ends_with('⟧'), "{key} is pseudo-localized");
         }
     }
 }

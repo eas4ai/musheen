@@ -532,3 +532,31 @@ fn catalog_uses_xdg_data_and_recovers_last_known_good_after_interrupted_write() 
     assert_eq!(store.load().unwrap(), first);
     assert!(Path::new(store.path()).exists());
 }
+
+#[test]
+fn catalog_load_rejects_oversized_bytes_collections_and_strings() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("catalog.json");
+    let store = CatalogStore::at(&path);
+    std::fs::write(&path, vec![b' '; 9 * 1024 * 1024]).unwrap();
+    assert!(store.load().is_err());
+
+    let provider = ProviderId::new("local").unwrap();
+    let item = ItemId::new(provider, b"stable".to_vec()).unwrap();
+    let mut catalog = CatalogDocument::default();
+    catalog
+        .tags_mut()
+        .assign(&item, StorePath::from_unix_path("/bounded"), "tag")
+        .unwrap();
+    let mut value = serde_json::to_value(&catalog).unwrap();
+    let records = value["tags"]["records"].as_array_mut().unwrap();
+    let record = records[0].clone();
+    records.resize(4_097, record);
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(store.load().is_err());
+
+    let mut value = serde_json::to_value(&catalog).unwrap();
+    value["tags"]["records"][0]["tags"][0] = serde_json::Value::String("x".repeat(129));
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(store.load().is_err());
+}

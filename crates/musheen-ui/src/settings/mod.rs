@@ -19,8 +19,11 @@ use musheen_desktop::{
     SettingsPage, SettingsStore, settings_schema,
 };
 use std::collections::BTreeSet;
+pub(crate) use window::{
+    RecentHistoryClearer, accept_native_theme_change, apply_appearance,
+    open_settings_window_with_recent_clearer,
+};
 pub use window::{SettingsWindow, open_settings_window};
-pub(crate) use window::{accept_native_theme_change, apply_appearance};
 
 /// The General page owns the explicit clear-history action. The catalog keeps
 /// pins, tags, and session restore in independent models, so this operation

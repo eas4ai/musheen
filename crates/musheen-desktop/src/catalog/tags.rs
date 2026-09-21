@@ -14,6 +14,10 @@ struct TagRecord {
     path_hint: StorePath,
     tags: BTreeSet<Box<str>>,
     orphaned: bool,
+    #[serde(default)]
+    pending_xattr: bool,
+    #[serde(default)]
+    scope_hint: Option<StorePath>,
 }
 
 /// App-owned fallback tag metadata, keyed only by provider-scoped item identity.
@@ -132,6 +136,15 @@ impl TagCatalog {
         destination_supports_tags: bool,
     ) -> TagMoveOutcome {
         if !destination_supports_tags {
+            if let Some(record) = self
+                .records
+                .iter_mut()
+                .find(|record| &record.item == source)
+            {
+                record.orphaned = true;
+                record.pending_xattr = false;
+                record.scope_hint = None;
+            }
             return TagMoveOutcome::UnsupportedDestination;
         }
         let Some(source_index) = self
@@ -145,6 +158,7 @@ impl TagCatalog {
             let record = &mut self.records[source_index];
             record.path_hint = path_hint;
             record.orphaned = false;
+            record.scope_hint = None;
             return TagMoveOutcome::Preserved;
         }
         let source_record = self.records.remove(source_index);
@@ -156,12 +170,15 @@ impl TagCatalog {
             destination_record.tags.extend(source_record.tags);
             destination_record.path_hint = path_hint;
             destination_record.orphaned = false;
+            destination_record.scope_hint = None;
         } else {
             self.records.push(TagRecord {
                 item: destination,
                 path_hint,
                 tags: source_record.tags,
                 orphaned: false,
+                pending_xattr: source_record.pending_xattr,
+                scope_hint: None,
             });
         }
         TagMoveOutcome::Preserved
@@ -172,6 +189,32 @@ impl TagCatalog {
             record.path_hint = path_hint;
             record.orphaned = false;
         }
+    }
+
+    pub fn observe_present_in_scope(
+        &mut self,
+        item: &ItemId,
+        path_hint: StorePath,
+        scope_hint: StorePath,
+    ) {
+        if let Some(record) = self.records.iter_mut().find(|record| &record.item == item) {
+            record.path_hint = path_hint;
+            record.scope_hint = Some(scope_hint);
+            record.orphaned = false;
+        }
+    }
+
+    pub fn tracked_scoped_items(
+        &self,
+    ) -> impl Iterator<Item = (&ItemId, &StorePath, Option<&StorePath>, bool)> {
+        self.records.iter().map(|record| {
+            (
+                &record.item,
+                &record.path_hint,
+                record.scope_hint.as_ref(),
+                record.orphaned,
+            )
+        })
     }
 
     pub fn observe_missing(&mut self, item: &ItemId) {
@@ -186,6 +229,55 @@ impl TagCatalog {
             .iter()
             .find(|record| &record.item == item)
             .is_some_and(|record| record.orphaned)
+    }
+
+    #[must_use]
+    pub fn pending_xattr_count(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.pending_xattr)
+            .count()
+    }
+
+    #[must_use]
+    pub fn is_xattr_pending(&self, item: &ItemId) -> bool {
+        self.records
+            .iter()
+            .find(|record| &record.item == item)
+            .is_some_and(|record| record.pending_xattr)
+    }
+
+    pub fn pending_xattr_records(
+        &self,
+    ) -> impl Iterator<Item = (&ItemId, &StorePath, &BTreeSet<Box<str>>)> {
+        self.records
+            .iter()
+            .filter(|record| record.pending_xattr)
+            .map(|record| (&record.item, &record.path_hint, &record.tags))
+    }
+
+    pub fn mark_xattr_pending(&mut self, item: &ItemId, pending: bool) {
+        if let Some(record) = self.records.iter_mut().find(|record| &record.item == item) {
+            record.pending_xattr = pending;
+        }
+    }
+
+    pub fn stage_xattr_tags(
+        &mut self,
+        item: &ItemId,
+        path_hint: StorePath,
+        tags: BTreeSet<Box<str>>,
+    ) {
+        let record = self.record_mut_or_insert(item, path_hint);
+        record.tags = tags;
+        record.orphaned = false;
+        record.pending_xattr = true;
+    }
+
+    pub fn finish_xattr_reconciliation(&mut self, item: &ItemId) {
+        self.mark_xattr_pending(item, false);
+        self.records
+            .retain(|record| !record.tags.is_empty() || record.pending_xattr);
     }
 
     /// Deletes only exact, reviewed identities which are already orphaned.
@@ -212,6 +304,8 @@ impl TagCatalog {
             path_hint,
             tags: BTreeSet::new(),
             orphaned: false,
+            pending_xattr: false,
+            scope_hint: None,
         });
         self.records.last_mut().expect("a tag record was inserted")
     }
@@ -361,7 +455,7 @@ impl<'a> TagService<'a> {
         capabilities: &CapabilityMatrix,
         tag: &str,
     ) -> Result<TagStorage, CatalogTagError> {
-        let storage = self.storage(path_hint, capabilities)?;
+        let storage = self.storage_for(path_hint, capabilities)?;
         if storage == TagStorage::ExtendedAttribute {
             let tag = validated_tag(tag).map_err(CatalogTagError::InvalidTag)?;
             let mut backend = XattrTagBackend::new(true, true);
@@ -391,7 +485,7 @@ impl<'a> TagService<'a> {
         capabilities: &CapabilityMatrix,
         tag: &str,
     ) -> Result<TagStorage, CatalogTagError> {
-        let storage = self.storage(path_hint, capabilities)?;
+        let storage = self.storage_for(path_hint, capabilities)?;
         if storage == TagStorage::ExtendedAttribute {
             let mut backend = XattrTagBackend::new(true, true);
             let mut tags = backend
@@ -417,9 +511,17 @@ impl<'a> TagService<'a> {
         path_hint: &StorePath,
         capabilities: &CapabilityMatrix,
     ) -> Result<BTreeSet<Box<str>>, CatalogTagError> {
-        let storage = self.storage(path_hint, capabilities)?;
+        let storage = self.storage_for(path_hint, capabilities)?;
         if storage == TagStorage::AppCatalog {
             return Ok(self.catalog.tags_for(item));
+        }
+        if self.catalog.is_xattr_pending(item) {
+            let tags = self.catalog.tags_for(item);
+            XattrTagBackend::new(true, true)
+                .write_tags(item, path_hint, &tags)
+                .map_err(|error| CatalogTagError::Xattr(TagServiceError::Backend(error)))?;
+            self.catalog.finish_xattr_reconciliation(item);
+            return Ok(tags);
         }
         let xattr_tags = BackendTagService::new(XattrTagBackend::new(true, true))
             .tags(item, path_hint)
@@ -456,6 +558,12 @@ impl<'a> TagService<'a> {
         self.catalog.tracked_items()
     }
 
+    pub fn tracked_scoped_items(
+        &self,
+    ) -> impl Iterator<Item = (&ItemId, &StorePath, Option<&StorePath>, bool)> {
+        self.catalog.tracked_scoped_items()
+    }
+
     pub fn orphaned_items(
         &self,
     ) -> impl Iterator<Item = (&ItemId, &StorePath, &BTreeSet<Box<str>>)> {
@@ -464,6 +572,16 @@ impl<'a> TagService<'a> {
 
     pub fn observe_present(&mut self, item: &ItemId, path_hint: StorePath) {
         self.catalog.observe_present(item, path_hint);
+    }
+
+    pub fn observe_present_in_scope(
+        &mut self,
+        item: &ItemId,
+        path_hint: StorePath,
+        scope_hint: StorePath,
+    ) {
+        self.catalog
+            .observe_present_in_scope(item, path_hint, scope_hint);
     }
 
     pub fn observe_missing(&mut self, item: &ItemId) {
@@ -477,7 +595,7 @@ impl<'a> TagService<'a> {
         self.catalog.cleanup_reviewed_orphans(reviewed)
     }
 
-    fn storage(
+    pub fn storage_for(
         &self,
         path_hint: &StorePath,
         capabilities: &CapabilityMatrix,
@@ -570,14 +688,13 @@ impl TagBackend for TagCatalog {
         path_hint: &StorePath,
         tags: &BTreeSet<Box<str>>,
     ) -> Result<(), Self::Error> {
-        self.records.retain(|record| &record.item != item);
-        if !tags.is_empty() {
-            self.records.push(TagRecord {
-                item: item.clone(),
-                path_hint: path_hint.clone(),
-                tags: tags.clone(),
-                orphaned: false,
-            });
+        if tags.is_empty() {
+            self.records.retain(|record| &record.item != item);
+        } else {
+            let record = self.record_mut_or_insert(item, path_hint.clone());
+            record.tags = tags.clone();
+            record.orphaned = false;
+            record.pending_xattr = false;
         }
         Ok(())
     }

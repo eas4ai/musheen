@@ -6,7 +6,7 @@ use catalog::{CatalogBinding, DirectoryObservation, TagTarget};
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, PropertiesFailureWindow,
     PropertiesPage, PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow,
-    ProviderPropertiesWindowData, TagWriter, conflict_window_options,
+    ProviderPropertiesWindowData, TagDelta, TagWriter, conflict_window_options,
     install_properties_key_bindings, properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
@@ -1837,9 +1837,9 @@ impl MusheenApp {
                 CapabilityState::Supported
             )
         });
-        let (tags, tag_writer) = if tags_supported {
-            let tags = match self.catalog_binding.common_tags(&tag_targets) {
-                Ok(tags) => tags,
+        let (common_tags, mixed_tags, tag_writer) = if tags_supported {
+            let (common_tags, mixed_tags) = match self.catalog_binding.tag_states(&tag_targets) {
+                Ok(states) => states,
                 Err(error) => {
                     self.operation_error = Some(error);
                     cx.notify();
@@ -1857,16 +1857,23 @@ impl MusheenApp {
                 })
                 .map_err(|error| Box::<str>::from(error.to_string()))?
             });
-            (tags, Some(writer))
+            (common_tags, mixed_tags, Some(writer))
         } else {
-            (BTreeSet::new(), None)
+            (BTreeSet::new(), BTreeSet::new(), None)
         };
         let paths = targets
             .iter()
             .filter_map(|target| target.path().as_unix_path().map(Path::to_path_buf))
             .collect::<Vec<_>>();
         if paths.len() == targets.len() {
-            self.open_properties_paths_with_tags(paths, page, tags, tag_writer, cx);
+            self.open_properties_paths_with_tags(
+                paths,
+                page,
+                common_tags,
+                mixed_tags,
+                tag_writer,
+                cx,
+            );
         } else {
             let title = if targets.len() == 1 {
                 format!(
@@ -1876,7 +1883,13 @@ impl MusheenApp {
             } else {
                 format!("{} items — Properties", targets.len())
             };
-            let data = ProviderPropertiesWindowData::new(provider_targets, tags, tag_writer);
+            let data = ProviderPropertiesWindowData::new(
+                provider_targets,
+                common_tags,
+                mixed_tags,
+                tag_writer,
+                self.catalog.clone(),
+            );
             let options = properties_window_options(title, cx);
             cx.open_window(options, move |window, cx| {
                 let view = cx.new(|cx| ProviderPropertiesWindow::new(data, page, window, cx));
@@ -1892,21 +1905,30 @@ impl MusheenApp {
         page: PropertiesPage,
         cx: &mut Context<Self>,
     ) {
-        self.open_properties_paths_with_tags(paths, page, std::iter::empty::<Box<str>>(), None, cx);
+        self.open_properties_paths_with_tags(
+            paths,
+            page,
+            std::iter::empty::<Box<str>>(),
+            std::iter::empty::<Box<str>>(),
+            None,
+            cx,
+        );
     }
 
     fn open_properties_paths_with_tags(
         &mut self,
         paths: Vec<PathBuf>,
         page: PropertiesPage,
-        tags: impl IntoIterator<Item = Box<str>>,
+        common_tags: impl IntoIterator<Item = Box<str>>,
+        mixed_tags: impl IntoIterator<Item = Box<str>>,
         tag_writer: Option<TagWriter>,
         cx: &mut Context<Self>,
     ) {
         if paths.is_empty() {
             return;
         }
-        let tags = tags.into_iter().collect::<Vec<_>>();
+        let common_tags = common_tags.into_iter().collect::<Vec<_>>();
+        let mixed_tags = mixed_tags.into_iter().collect::<Vec<_>>();
         let title = if paths.len() == 1 {
             format!("{} Properties", paths[0].display())
         } else {
@@ -1914,12 +1936,15 @@ impl MusheenApp {
         };
         let options = properties_window_options(title, cx);
         let operation_hub = self.operation_hub.clone();
+        let catalog = self.catalog.clone();
         let work = cx.background_spawn(async move { PropertiesWindowData::load(&paths) });
         cx.spawn(async move |_, cx| {
             let result = work.await;
             cx.open_window(options, move |window, cx| match result {
                 Ok(data) => {
-                    let data = data.with_tags(tags.iter().map(AsRef::as_ref));
+                    let data = data
+                        .with_tag_states(common_tags, mixed_tags)
+                        .with_catalog(catalog);
                     let data = match tag_writer {
                         Some(writer) => data.with_tag_writer(writer),
                         None => data,
@@ -1945,7 +1970,14 @@ impl MusheenApp {
 
     fn dispatch_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
         match action {
-            CommandAction::OpenSettings => crate::settings::open_settings_window(cx),
+            CommandAction::OpenSettings => {
+                let app = cx.entity().downgrade();
+                let clearer: crate::settings::RecentHistoryClearer = Arc::new(move |cx| {
+                    app.update(cx, |state, cx| state.clear_recent_locations(cx))
+                        .map_err(|error| Box::<str>::from(error.to_string()))?
+                });
+                crate::settings::open_settings_window_with_recent_clearer(clearer, cx);
+            }
             CommandAction::NavigateBack
             | CommandAction::NavigateForward
             | CommandAction::NavigateParent
@@ -5134,6 +5166,14 @@ impl MusheenApp {
                                     let available = entry.is_available();
                                     let unavailable_reason =
                                         entry.unavailable_reason().map(str::to_owned);
+                                    let localized_unavailable = unavailable_reason
+                                        .as_deref()
+                                        .map(|reason| self.catalog.localize_reason(reason));
+                                    let accessibility_label =
+                                        unavailable_reason.as_deref().map_or_else(
+                                            || label.clone(),
+                                            |reason| self.catalog.unavailable_label(&label, reason),
+                                        );
                                     let icon = match (kind, label.as_str()) {
                                         (SidebarSectionKind::Home, _) => IconName::House,
                                         (_, "Downloads") => IconName::Download,
@@ -5197,11 +5237,11 @@ impl MusheenApp {
                                             )))
                                             .label(label.clone())
                                             .icon(icon)
-                                            .accessibility_label(label)
+                                            .accessibility_label(accessibility_label)
                                             .ghost()
                                             .small()
                                             .disabled(!available)
-                                            .when_some(unavailable_reason, |button, reason| {
+                                            .when_some(localized_unavailable, |button, reason| {
                                                 button.tooltip(reason)
                                             })
                                             .selected(selected)
@@ -7370,6 +7410,7 @@ impl Render for MusheenApp {
         let operation_error = self
             .operation_error
             .as_deref()
+            .map(|error| self.catalog.localize_reason(error))
             .map(|error| SharedString::from(format!("File operation failed: {error}")));
         div()
             .id("musheen-shell")
@@ -7869,7 +7910,10 @@ mod tests {
     use crate::providers::{ProviderAdapter, ProviderRuntime};
     use crate::search::SearchState;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{AnyWindowHandle, Modifiers, MouseButton, TestAppContext, VisualTestContext};
+    use gpui_kit::{
+        AnyWindowHandle, Modifiers, MouseButton, ScrollDelta, TestAppContext, VisualTestContext,
+        point,
+    };
     use musheen_core::{
         CapabilityMatrix, CapabilityReason, CapabilityState, MutationRequest, PageRequest,
         ProviderId, SearchCapabilities, SearchResult, SearchScopeError,
@@ -10919,11 +10963,13 @@ mod tests {
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let view = cx.new(|cx| {
-                MusheenApp::new_with_catalog_store(
+                let mut state = MusheenApp::new_with_catalog_store(
                     temporary.path().to_path_buf(),
                     catalog_store.clone(),
                     cx,
-                )
+                );
+                state.catalog = Catalog::load(Locale::Ar).unwrap();
+                state
             });
             app = Some(view.clone());
             Root::new(view, window, cx)
@@ -10933,8 +10979,24 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
+        let pinned_section_index = app.update(cx, |state, _| {
+            state
+                .sidebars
+                .get(&state.navigation.focused_tab().id())
+                .unwrap()
+                .sections()
+                .iter()
+                .position(|section| section.kind() == SidebarSectionKind::Pinned)
+                .expect("pinned section is visible")
+        });
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            assert_eq!(
+                window
+                    .find(format!("sidebar-{pinned_section_index}-1"))
+                    .label(),
+                Some("Offline volume، غير متاح: الهدف مفقود")
+            );
             window.click("sidebar-0-0", cx);
             window.render_frame(cx);
             assert!(window.find("home-surface").visible());
@@ -10943,6 +11005,16 @@ mod tests {
             assert!(window.find("home-section-mount").visible());
             assert!(window.find("home-section-tag").visible());
             assert!(window.find("home-orphan-review").visible());
+            assert_eq!(
+                window.find("home-item-pin-1").label(),
+                Some("Offline volume، غير متاح: الهدف مفقود")
+            );
+            assert_eq!(window.find("home-unpin-1").label(), Some("إلغاء التثبيت"));
+            assert!(
+                window.find("home-unpin-1").bounds().center().x
+                    < window.find("home-item-pin-1").bounds().center().x,
+                "Arabic Home rows mirror their directional controls"
+            );
             window.click("home-unpin-1", cx);
             window.render_frame(cx);
             window.click("home-unpin-0", cx);
@@ -10995,6 +11067,136 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    async fn settings_clear_history_uses_shared_catalog_and_refreshes_home(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("child");
+        filesystem::write(&child, b"fixture").unwrap();
+        let child_path = StorePath::from_unix_path(child.as_os_str());
+        let child_item = LocalStore::new()
+            .resolve_item(&child_path)
+            .unwrap()
+            .unwrap();
+        let concurrent = temporary.path().join("concurrent");
+        filesystem::write(&concurrent, b"concurrent fixture").unwrap();
+        let concurrent_path = StorePath::from_unix_path(concurrent.as_os_str());
+        let concurrent_item = LocalStore::new()
+            .resolve_item(&concurrent_path)
+            .unwrap()
+            .unwrap();
+        let catalog_store = CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let mut catalog = CatalogDocument::default();
+        catalog.recents_mut().record(
+            FolderIdentity::from_item(child_item.id().clone()),
+            child_path.clone(),
+            "Recent child",
+        );
+        catalog
+            .pins_mut()
+            .pin(child_item.id().clone(), child_path.clone(), "Pinned child")
+            .unwrap();
+        catalog
+            .tags_mut()
+            .assign(child_item.id(), child_path.clone(), "work")
+            .unwrap();
+        catalog_store.save(&catalog).unwrap();
+
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_catalog_store(
+                    temporary.path().to_path_buf(),
+                    catalog_store.clone(),
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            state.navigate(home_store_path(), true, cx);
+            state.dispatch_command("app.settings", cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.windows().iter().any(|window| *window != browser)
+        })
+        .await;
+        let settings = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        app.update(cx, |state, _| {
+            state
+                .catalog_binding
+                .update(|catalog| {
+                    catalog
+                        .pins_mut()
+                        .pin(
+                            concurrent_item.id().clone(),
+                            concurrent_path.clone(),
+                            "Concurrent pin",
+                        )
+                        .unwrap();
+                    catalog
+                        .tags_mut()
+                        .assign(concurrent_item.id(), concurrent_path.clone(), "concurrent")
+                        .unwrap();
+                })
+                .unwrap();
+            state.sync_catalog_projection();
+        });
+        cx.update_window(settings, |_, window, cx| {
+            window.render_frame(cx);
+            window.scroll("settings-controls", ScrollDelta::Lines(point(0., -40.)), cx);
+            window.render_frame(cx);
+            window.click("settings-clear-recent-locations", cx);
+        })
+        .unwrap();
+
+        app.update(cx, |state, _| {
+            let snapshot = state.catalog_binding.snapshot();
+            assert!(snapshot.recents().entries().is_empty());
+            assert_eq!(snapshot.pins().entries().len(), 2);
+            assert_eq!(
+                snapshot.tags().tag_names(),
+                [Box::<str>::from("concurrent"), Box::<str>::from("work")].into()
+            );
+            assert!(
+                state
+                    .catalog_binding
+                    .home_sections(&[])
+                    .iter()
+                    .filter(|section| section.kind() == musheen_desktop::HomeItemKind::Recent)
+                    .all(|section| section.items().is_empty())
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |window, _| {
+            window
+                .try_find("home-item-recent-0")
+                .is_none_or(|item| !item.visible())
+        })
+        .await;
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("home-section-pin").visible());
+            assert!(window.find("home-section-tag").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     async fn successful_properties_tag_edit_refreshes_sidebar_and_home_projection(
         cx: &mut TestAppContext,
     ) {
@@ -11033,14 +11235,37 @@ mod tests {
                 .assign_tag(&target.0, &target.1, &target.2, "old")
                 .unwrap();
             state.sync_catalog_projection();
+            state.apply_tag_filter("fresh", cx);
+            let tab = state.navigation.focused_tab().id();
+            assert!(
+                state.filters[&tab]
+                    .filter
+                    .as_ref()
+                    .unwrap()
+                    .apply(state.focused_directory().view())
+                    .is_empty()
+            );
             state
                 .apply_properties_tags(
                     &[target],
-                    &[Box::<str>::from("fresh")].into_iter().collect(),
+                    &TagDelta {
+                        added: [Box::<str>::from("fresh")].into_iter().collect(),
+                        removed: [Box::<str>::from("old")].into_iter().collect(),
+                    },
                 )
                 .unwrap();
 
-            let tab = state.navigation.focused_tab().id();
+            assert_eq!(
+                state.filters[&tab]
+                    .filter
+                    .as_ref()
+                    .unwrap()
+                    .apply(state.focused_directory().view())
+                    .iter()
+                    .map(|visible| visible.id())
+                    .collect::<Vec<_>>(),
+                [item.id()]
+            );
             let sidebar_tags = state
                 .sidebars
                 .get(&tab)
@@ -11088,6 +11313,14 @@ mod tests {
             assert!(cx.windows().len() >= 2);
 
             state.rename_catalog_tag("fresh", "renamed").unwrap();
+            assert!(
+                state.filters[&tab]
+                    .filter
+                    .as_ref()
+                    .unwrap()
+                    .apply(state.focused_directory().view())
+                    .is_empty()
+            );
             let tag_target = CommandTargetRef::new(
                 ItemId::new(provider.clone(), b"renamed".to_vec()).unwrap(),
                 StorePath::from_provider_key(provider, b"renamed".to_vec()).unwrap(),
@@ -11508,11 +11741,13 @@ mod tests {
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let view = cx.new(|cx| {
-                MusheenApp::new_with_provider_runtime(
+                let mut state = MusheenApp::new_with_provider_runtime(
                     temporary.path().to_path_buf(),
                     providers.clone(),
                     cx,
-                )
+                );
+                state.catalog = Catalog::load(Locale::EnXa).unwrap();
+                state
             });
             app = Some(view.clone());
             Root::new(view, window, cx)
@@ -11545,18 +11780,34 @@ mod tests {
             .find(|window| *window != browser)
             .unwrap();
         cx.update_window(properties, |_, window, cx| {
+            window.set_scale_factor(2.0);
             window.render_frame(cx);
+            assert_eq!(window.scale_factor(), 2.0);
             assert!(window.find("provider-properties").visible());
             assert!(window.find("properties-tags-page").visible());
             assert!(window.try_find("properties-permissions-page").is_none());
             assert!(window.find("provider-properties-page-general").visible());
             assert!(window.find("provider-properties-page-tags").visible());
+            assert_eq!(
+                window.find("provider-properties-page-general").label(),
+                Some("⟦Geeneeraal··⟧")
+            );
+            assert_eq!(
+                window.find("provider-properties-page-tags").label(),
+                Some("⟦Taags··⟧")
+            );
             window.click("provider-properties-page-general", cx);
             window.render_frame(cx);
             assert!(window.find("provider-properties-general-page").visible());
             assert!(window.find("provider-properties-provider-0").visible());
             assert!(window.find("provider-properties-identity-0").visible());
             assert!(window.find("provider-properties-location-0").visible());
+            let provider_row = window.find("provider-properties-provider-0");
+            let provider_label = provider_row.label();
+            assert!(
+                provider_label.is_some_and(|label| label.starts_with("⟦Prooviideer··⟧:")),
+                "unexpected provider row: {provider_label:?}"
+            );
             window.click("provider-properties-page-tags", cx);
             window.render_frame(cx);
             window.click("provider-properties-tag-input", cx);
