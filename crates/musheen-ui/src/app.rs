@@ -1785,9 +1785,9 @@ struct HubVolumeUsage {
     hub: OperationHub,
 }
 
-struct HubVolumeReservation<'a>(crate::operations::OperationMountReservation<'a>);
+struct HubVolumeReservation(crate::operations::OperationMountReservation);
 
-impl OperationReservation for HubVolumeReservation<'_> {
+impl OperationReservation for HubVolumeReservation {
     fn operations_using(&self) -> Vec<OperationUse> {
         self.0
             .operations()

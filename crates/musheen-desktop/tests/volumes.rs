@@ -846,10 +846,15 @@ fn udisks_smoke_is_bounded_and_optional_on_unsupported_hosts() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
-struct SlowBackend;
+struct SlowBackend {
+    entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+}
 
 impl UDisksBackend for SlowBackend {
     fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
         std::thread::sleep(Duration::from_millis(250));
         Err(UDisksError::Timeout("fixture deadline".into()))
     }
@@ -866,15 +871,20 @@ impl UDisksBackend for SlowBackend {
 
 #[test]
 fn runtime_snapshots_never_wait_for_a_slow_service_call() {
+    let (entered, snapshot_entered) = std::sync::mpsc::sync_channel(1);
     let runtime = VolumeRuntime::from_service(VolumeService::new(
-        Arc::new(SlowBackend),
+        Arc::new(SlowBackend {
+            entered: Mutex::new(Some(entered)),
+        }),
         Arc::new(FakeMounts::default()),
         Arc::new(FakeUsage::default()),
     ));
     let updates = runtime.subscribe();
     let _initial = updates.recv_blocking().unwrap();
     runtime.refresh(VolumeTrigger::UDisksChanged).unwrap();
-    std::thread::sleep(Duration::from_millis(25));
+    snapshot_entered
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
 
     let started = Instant::now();
     let _snapshot = runtime.snapshot();
@@ -904,7 +914,9 @@ fn runtime_shutdown_joins_worker_and_releases_service_dependencies() {
     assert!(mounts_weak.upgrade().is_none());
 }
 
-struct CooperativeSlowBackend;
+struct CooperativeSlowBackend {
+    entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+}
 
 impl UDisksBackend for CooperativeSlowBackend {
     fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
@@ -915,6 +927,9 @@ impl UDisksBackend for CooperativeSlowBackend {
         &self,
         request: &UDisksRequest,
     ) -> Result<BackendSnapshot, UDisksError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
         loop {
             request.check()?;
             std::thread::sleep(Duration::from_millis(5));
@@ -933,6 +948,7 @@ impl UDisksBackend for CooperativeSlowBackend {
 
 #[test]
 fn listener_enabled_shutdown_preempts_a_slow_snapshot_and_queued_refreshes() {
+    let (entered, snapshot_entered) = std::sync::mpsc::sync_channel(1);
     let (sender, receiver) = async_channel::bounded(32);
     let listener = std::thread::spawn(move || {
         while !sender.is_closed() {
@@ -943,13 +959,17 @@ fn listener_enabled_shutdown_preempts_a_slow_snapshot_and_queued_refreshes() {
     let subscription = VolumeSubscription::from_parts(receiver, vec![listener]);
     let runtime = VolumeRuntime::from_service_with_subscription(
         VolumeService::new(
-            Arc::new(CooperativeSlowBackend),
+            Arc::new(CooperativeSlowBackend {
+                entered: Mutex::new(Some(entered)),
+            }),
             Arc::new(FakeMounts::default()),
             Arc::new(FakeUsage::default()),
         ),
         subscription,
     );
-    std::thread::sleep(Duration::from_millis(20));
+    snapshot_entered
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
 
     let started = Instant::now();
     drop(runtime);
@@ -1018,6 +1038,54 @@ fn drive_wide_actions_include_sibling_partition_jobs() {
         vec![PathBuf::from("/media/a"), PathBuf::from("/media/b")]
     );
     assert!(backend.actions.lock().unwrap().is_empty());
+}
+
+struct SiblingOnlyUsage;
+
+impl OperationUsage for SiblingOnlyUsage {
+    fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
+        mounts
+            .iter()
+            .any(|mount| mount == Path::new("/media/b"))
+            .then(|| OperationUse::new(MountOperation::new(12), "writing sibling"))
+            .into_iter()
+            .collect()
+    }
+
+    fn cancel(&self, _operations: &[OperationUse]) -> Result<(), VolumeError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn unmount_ignores_jobs_on_a_sibling_partition() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let drive = "/org/freedesktop/UDisks2/drives/shared";
+    let first = device("sdb1", Some("/media/a")).with_drive_path(drive);
+    let second = device("sdb2", Some("/media/b")).with_drive_path(drive);
+    backend.queue_snapshot(Ok(snapshot("owner", [first, second])));
+    backend.queue_action(Err(UDisksError::Unsupported("stop after dispatch".into())));
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/media/b", false),
+    ]);
+    let mut service = VolumeService::new(backend.clone(), mounts, Arc::new(SiblingOnlyUsage));
+    service.refresh().unwrap();
+
+    assert!(matches!(
+        service.perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::Refuse,
+            None,
+        ),
+        Err(VolumeError::Unsupported(_))
+    ));
+    assert_eq!(
+        backend.actions.lock().unwrap().as_slice(),
+        &[(id("sdb1"), VolumeAction::Unmount)]
+    );
 }
 
 #[test]
@@ -1113,7 +1181,7 @@ fn listener_shutdown_is_not_blocked_by_a_stalled_capacity_probe() {
 }
 
 #[test]
-fn stalled_capacity_probes_are_globally_bounded_across_services() {
+fn capacity_probe_limiters_are_isolated_between_test_services() {
     let make_runtime = |name: &str,
                         entered: std::sync::mpsc::SyncSender<()>,
                         blocked: std::sync::mpsc::Receiver<()>| {
@@ -1141,17 +1209,14 @@ fn stalled_capacity_probes_are_globally_bounded_across_services() {
     let (entered_first, first_entered) = std::sync::mpsc::sync_channel(1);
     let first = make_runtime("sdb1", entered_first, blocked_first);
     first_entered.recv_timeout(Duration::from_secs(1)).unwrap();
-    let (_release_second, blocked_second) = std::sync::mpsc::channel();
+    let (release_second, blocked_second) = std::sync::mpsc::channel();
     let (entered_second, second_entered) = std::sync::mpsc::sync_channel(1);
     let second = make_runtime("sdc1", entered_second, blocked_second);
-    assert!(
-        second_entered
-            .recv_timeout(Duration::from_millis(100))
-            .is_err()
-    );
+    second_entered.recv_timeout(Duration::from_secs(1)).unwrap();
     drop(first);
     drop(second);
     release_first.send(()).unwrap();
+    release_second.send(()).unwrap();
 }
 
 #[test]

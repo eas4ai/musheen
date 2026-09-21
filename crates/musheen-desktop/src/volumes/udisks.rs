@@ -641,13 +641,20 @@ impl UDisksBackend for ZbusUDisksBackend {
         {
             return Err(UDisksError::StaleObject);
         }
-        let drive = current.drive_path();
+        let drive = if matches!(action, VolumeAction::Eject | VolumeAction::PowerOff) {
+            Some(current.drive_path().ok_or(UDisksError::ActionUnavailable)?)
+        } else {
+            None
+        };
         Ok(snapshot
             .devices()
             .iter()
             .filter(|candidate| {
-                !matches!(action, VolumeAction::Eject | VolumeAction::PowerOff)
-                    || candidate.drive_path() == drive
+                if matches!(action, VolumeAction::Eject | VolumeAction::PowerOff) {
+                    candidate.drive_path() == drive
+                } else {
+                    candidate.id() == current.id()
+                }
             })
             .flat_map(|candidate| candidate.mount_points().iter().cloned())
             .collect())

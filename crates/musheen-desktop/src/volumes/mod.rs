@@ -16,12 +16,12 @@ pub use udisks::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 const VOLUME_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-static CAPACITY_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SYSTEM_CAPACITY_PROBE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 pub struct VolumeSubscription {
     receiver: async_channel::Receiver<VolumeTrigger>,
@@ -381,6 +381,7 @@ pub struct VolumeService {
     mounts: Arc<dyn MountProvider>,
     usage: Arc<dyn OperationUsage>,
     model: VolumeModel,
+    capacity_probe_active: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for VolumeService {
@@ -404,6 +405,7 @@ impl VolumeService {
             mounts,
             usage,
             model: VolumeModel::default(),
+            capacity_probe_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -412,11 +414,14 @@ impl VolumeService {
     }
 
     pub fn system_with_usage(usage: Arc<dyn OperationUsage>) -> Result<Self, VolumeError> {
-        Ok(Self::new(
-            Arc::new(ReconnectingUDisksBackend),
+        let mut service = Self::new(
+            Arc::new(ReconnectingUDisksBackend::new(UDisksBusConfig::system())),
             Arc::new(ProcMountProvider::system()),
             usage,
-        ))
+        );
+        service.capacity_probe_active =
+            Arc::clone(SYSTEM_CAPACITY_PROBE.get_or_init(|| Arc::new(AtomicBool::new(false))));
+        Ok(service)
     }
 
     #[must_use]
@@ -695,7 +700,7 @@ impl VolumeService {
             Arc::clone(&self.mounts),
             path,
             request,
-            &CAPACITY_PROBE_ACTIVE,
+            Arc::clone(&self.capacity_probe_active),
         )
     }
 }
@@ -704,17 +709,18 @@ fn probe_capacity(
     provider: Arc<dyn MountProvider>,
     path: &std::path::Path,
     request: &UDisksRequest,
-    active: &'static AtomicBool,
+    active: Arc<AtomicBool>,
 ) -> Option<Capacity> {
     if active.swap(true, Ordering::AcqRel) {
         return None;
     }
     let path = path.to_path_buf();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let probe_active = Arc::clone(&active);
     if std::thread::Builder::new()
         .name("musheen-capacity-probe".into())
         .spawn(move || {
-            let _lease = CapacityProbeLease(active);
+            let _lease = CapacityProbeLease(probe_active);
             let result = provider.capacity(&path).ok();
             let _ = sender.send(result);
         })
@@ -735,7 +741,7 @@ fn probe_capacity(
     }
 }
 
-struct CapacityProbeLease(&'static AtomicBool);
+struct CapacityProbeLease(Arc<AtomicBool>);
 
 impl Drop for CapacityProbeLease {
     fn drop(&mut self) {
@@ -743,12 +749,26 @@ impl Drop for CapacityProbeLease {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ReconnectingUDisksBackend;
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct ReconnectingUDisksBackend {
+    config: UDisksBusConfig,
+}
+
+impl ReconnectingUDisksBackend {
+    #[must_use]
+    pub const fn new(config: UDisksBusConfig) -> Self {
+        Self { config }
+    }
+
+    fn connect(&self, request: &UDisksRequest) -> Result<ZbusUDisksBackend, UDisksError> {
+        ZbusUDisksBackend::connect(self.config.clone(), request.remaining())
+    }
+}
 
 impl UDisksBackend for ReconnectingUDisksBackend {
     fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
-        ZbusUDisksBackend::connect_system()?.snapshot()
+        ZbusUDisksBackend::connect(self.config.clone(), VOLUME_REQUEST_TIMEOUT)?.snapshot()
     }
 
     fn perform(
@@ -757,7 +777,11 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         action: VolumeAction,
         unlock_secret: Option<&str>,
     ) -> Result<(), UDisksError> {
-        ZbusUDisksBackend::connect_system()?.perform(volume, action, unlock_secret)
+        ZbusUDisksBackend::connect(self.config.clone(), VOLUME_REQUEST_TIMEOUT)?.perform(
+            volume,
+            action,
+            unlock_secret,
+        )
     }
 
     fn snapshot_with_request(
@@ -765,7 +789,7 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         request: &UDisksRequest,
     ) -> Result<BackendSnapshot, UDisksError> {
         request.check()?;
-        let backend = ZbusUDisksBackend::connect(UDisksBusConfig::system(), request.remaining())?;
+        let backend = self.connect(request)?;
         backend.snapshot_with_request(request)
     }
 
@@ -777,7 +801,7 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         request: &UDisksRequest,
     ) -> Result<(), UDisksError> {
         request.check()?;
-        let backend = ZbusUDisksBackend::connect(UDisksBusConfig::system(), request.remaining())?;
+        let backend = self.connect(request)?;
         backend.perform_with_request(volume, action, unlock_secret, request)
     }
 
@@ -790,7 +814,7 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         request: &UDisksRequest,
     ) -> Result<(), UDisksError> {
         request.check()?;
-        let backend = ZbusUDisksBackend::connect(UDisksBusConfig::system(), request.remaining())?;
+        let backend = self.connect(request)?;
         backend.perform_validated_with_request(
             volume,
             expected_owner,
@@ -798,6 +822,17 @@ impl UDisksBackend for ReconnectingUDisksBackend {
             unlock_secret,
             request,
         )
+    }
+
+    fn validate_action(
+        &self,
+        volume: &DeviceDescriptor,
+        expected_owner: Option<&str>,
+        action: VolumeAction,
+        request: &UDisksRequest,
+    ) -> Result<Vec<PathBuf>, UDisksError> {
+        self.connect(request)?
+            .validate_action(volume, expected_owner, action, request)
     }
 }
 

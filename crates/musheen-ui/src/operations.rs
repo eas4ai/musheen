@@ -12,19 +12,35 @@ use musheen_desktop::StatusStore;
 use musheen_ops::{
     ConflictDecision, ConflictRecord, JobId, JobState, MetadataChange, MetadataScope, OperationKind,
 };
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
-pub(crate) struct OperationMountReservation<'a> {
-    queue: MutexGuard<'a, LocalOperationQueue>,
+pub(crate) struct OperationMountReservation {
+    queue: Arc<Mutex<LocalOperationQueue>>,
+    reservations: Arc<Mutex<BTreeMap<u64, Vec<std::path::PathBuf>>>>,
+    id: u64,
     mounts: Vec<std::path::PathBuf>,
 }
 
-impl OperationMountReservation<'_> {
+impl OperationMountReservation {
     pub(crate) fn operations(&self) -> Vec<(JobId, OperationKind)> {
-        operations_using_mounts(&self.queue, &self.mounts)
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        operations_using_mounts(&queue, &self.mounts)
+    }
+}
+
+impl Drop for OperationMountReservation {
+    fn drop(&mut self) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 
@@ -35,6 +51,8 @@ pub struct OperationHub {
     store: Option<StatusStore>,
     persistence_error: Arc<Mutex<Option<Box<str>>>>,
     status_revision: Arc<AtomicU64>,
+    reservations: Arc<Mutex<BTreeMap<u64, Vec<std::path::PathBuf>>>>,
+    next_reservation: Arc<AtomicU64>,
 }
 
 impl OperationHub {
@@ -97,6 +115,8 @@ impl OperationHub {
             store: None,
             persistence_error: Arc::new(Mutex::new(None)),
             status_revision: Arc::new(AtomicU64::new(0)),
+            reservations: Arc::new(Mutex::new(BTreeMap::new())),
+            next_reservation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -137,6 +157,8 @@ impl OperationHub {
             store: Some(store),
             persistence_error: Arc::new(Mutex::new(None)),
             status_revision: Arc::new(AtomicU64::new(0)),
+            reservations: Arc::new(Mutex::new(BTreeMap::new())),
+            next_reservation: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -196,13 +218,16 @@ impl OperationHub {
     pub(crate) fn reserve_mounts(
         &self,
         mounts: &[std::path::PathBuf],
-    ) -> Result<OperationMountReservation<'_>, OperationHubError> {
-        let queue = self
-            .queue
+    ) -> Result<OperationMountReservation, OperationHubError> {
+        let id = self.next_reservation.fetch_add(1, Ordering::Relaxed);
+        self.reservations
             .lock()
-            .map_err(|_| OperationHubError::QueueLock)?;
+            .map_err(|_| OperationHubError::QueueLock)?
+            .insert(id, mounts.to_vec());
         Ok(OperationMountReservation {
-            queue,
+            queue: Arc::clone(&self.queue),
+            reservations: Arc::clone(&self.reservations),
+            id,
             mounts: mounts.to_vec(),
         })
     }
@@ -253,11 +278,11 @@ impl OperationHub {
             DropAction::Move => OperationKind::Move,
         };
         let sources = payload.sources().to_vec();
+        let submitted_target = target.clone();
         let ids = self
-            .queue
-            .lock()
-            .map_err(|_| OperationHubError::QueueLock)?
-            .submit_drop_resolved(payload, target, decisions)?;
+            .with_unreserved_queue(sources.iter().chain(std::iter::once(&target)), |queue| {
+                queue.submit_drop_resolved(payload, submitted_target, decisions)
+            })?;
         let mut status = self
             .status
             .lock()
@@ -288,11 +313,10 @@ impl OperationHub {
         } else {
             OperationKind::SetOwnership
         };
-        let ids = self
-            .queue
-            .lock()
-            .map_err(|_| OperationHubError::QueueLock)?
-            .submit_metadata_changes(roots, scope, change)?;
+        let submitted_roots = roots.clone();
+        let ids = self.with_unreserved_queue(roots.iter(), |queue| {
+            queue.submit_metadata_changes(submitted_roots, scope, change)
+        })?;
         let mut status = self
             .status
             .lock()
@@ -451,6 +475,31 @@ impl OperationHub {
         }
     }
 
+    fn with_unreserved_queue<'a, T>(
+        &self,
+        paths: impl IntoIterator<Item = &'a StorePath>,
+        submit: impl FnOnce(&mut LocalOperationQueue) -> Result<T, DropError>,
+    ) -> Result<T, OperationHubError> {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let reserved = self
+            .reservations
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?;
+        if reserved.values().flatten().any(|mount| {
+            paths.iter().any(|path| {
+                path.as_unix_path()
+                    .is_some_and(|path| path.starts_with(mount))
+            })
+        }) {
+            return Err(OperationHubError::MountReserved);
+        }
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?;
+        submit(&mut queue).map_err(Into::into)
+    }
+
     fn queue(&self) -> Arc<Mutex<LocalOperationQueue>> {
         Arc::clone(&self.queue)
     }
@@ -496,6 +545,7 @@ pub enum OperationHubError {
     Status(crate::StatusCenterError),
     Mutation(musheen_ops::MutationError),
     Storage(Box<str>),
+    MountReserved,
 }
 
 impl fmt::Display for OperationHubError {
@@ -507,6 +557,7 @@ impl fmt::Display for OperationHubError {
             Self::Status(error) => error.fmt(formatter),
             Self::Mutation(error) => error.fmt(formatter),
             Self::Storage(error) => formatter.write_str(error),
+            Self::MountReserved => formatter.write_str("the destination volume is reserved"),
         }
     }
 }
@@ -517,7 +568,7 @@ impl Error for OperationHubError {
             Self::Queue(error) => Some(error),
             Self::Status(error) => Some(error),
             Self::Mutation(error) => Some(error),
-            Self::QueueLock | Self::StatusLock | Self::Storage(_) => None,
+            Self::QueueLock | Self::StatusLock | Self::Storage(_) | Self::MountReserved => None,
         }
     }
 }
@@ -711,6 +762,8 @@ mod tests {
     use musheen_ops::{EventGeneration, StagingPath};
     use standard_library::fs as filesystem;
     use std as standard_library;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn recoverable_hub() -> (tempfile::TempDir, OperationHub, JobId, StorePath) {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
@@ -792,5 +845,38 @@ mod tests {
             hub.status.lock().unwrap().entry(id).unwrap().status(),
             crate::OperationStatus::Failed
         );
+    }
+
+    #[test]
+    fn mount_reservation_refuses_new_jobs_without_holding_the_queue_lock() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mount = temporary.path().join("mounted");
+        let source = temporary.path().join("source.txt");
+        filesystem::create_dir(&mount).unwrap();
+        filesystem::write(&source, b"source").unwrap();
+        let target = StorePath::from_unix_path(mount.clone().into_os_string());
+        let payload = FileDragPayload::new(
+            vec![StorePath::from_unix_path(source.into_os_string())],
+            DropAction::Copy,
+        )
+        .unwrap();
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let reservation = hub.reserve_mounts(std::slice::from_ref(&mount)).unwrap();
+
+        assert!(matches!(
+            hub.submit_drop(payload.clone(), target.clone()),
+            Err(OperationHubError::MountReserved)
+        ));
+
+        let (finished, receiver) = mpsc::sync_channel(1);
+        let probe = hub.clone();
+        std::thread::spawn(move || {
+            let _ = finished.send(probe.can_accept_drop(&payload, &target));
+        });
+        receiver
+            .recv_timeout(Duration::from_millis(250))
+            .expect("queue access remains responsive while a mount is reserved");
+
+        drop(reservation);
     }
 }

@@ -1,9 +1,9 @@
 #![cfg(unix)]
 
 use musheen_desktop::{
-    Capacity, MountProvider, MountRecord, NoOperationUsage, UDisksBackend, UDisksBusConfig,
-    UDisksError, UDisksRequest, VolumeAction, VolumeError, VolumeRuntime, VolumeService,
-    VolumeSubscription, VolumeTrigger, ZbusUDisksBackend,
+    Capacity, MountProvider, MountRecord, NoOperationUsage, ReconnectingUDisksBackend,
+    UDisksBackend, UDisksBusConfig, UDisksError, UDisksRequest, VolumeAction, VolumeError,
+    VolumeRuntime, VolumeService, VolumeSubscription, VolumeTrigger, ZbusUDisksBackend,
 };
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader};
@@ -20,7 +20,6 @@ const ROOT: &str = "/org/freedesktop/UDisks2";
 const BLOCK_PATH: &str = "/org/freedesktop/UDisks2/block_devices/fake1";
 const ADDED_PATH: &str = "/org/freedesktop/UDisks2/block_devices/added";
 const DRIVE_PATH: &str = "/org/freedesktop/UDisks2/drives/fake";
-static SLOW_PROPERTIES_ENTERED: AtomicUsize = AtomicUsize::new(0);
 
 struct EmptyMounts;
 
@@ -73,6 +72,7 @@ impl Drop for PrivateBus {
 
 struct FakeBlock {
     slow: Arc<AtomicBool>,
+    slow_entered: Arc<AtomicUsize>,
 }
 
 struct IdentityBlock {
@@ -164,7 +164,7 @@ impl FakePartition {
 impl FakeBlock {
     fn pause(&self) {
         if self.slow.load(Ordering::SeqCst) {
-            SLOW_PROPERTIES_ENTERED.fetch_add(1, Ordering::AcqRel);
+            self.slow_entered.fetch_add(1, Ordering::AcqRel);
             std::thread::sleep(Duration::from_millis(80));
         }
     }
@@ -216,6 +216,18 @@ struct FakeFilesystem {
     unmount_calls: Arc<AtomicUsize>,
     error_mode: Arc<AtomicUsize>,
     actions: Arc<Mutex<Vec<String>>>,
+}
+
+struct StaticFilesystem {
+    mount_point: &'static [u8],
+}
+
+#[zbus::interface(name = "org.freedesktop.UDisks2.Filesystem")]
+impl StaticFilesystem {
+    #[zbus(property)]
+    fn mount_points(&self) -> Vec<Vec<u8>> {
+        vec![self.mount_point.to_vec()]
+    }
 }
 
 #[zbus::interface(name = "org.freedesktop.UDisks2.Filesystem")]
@@ -302,6 +314,7 @@ fn start_service(
     address: &str,
     calls: Arc<AtomicUsize>,
     slow: Arc<AtomicBool>,
+    slow_entered: Arc<AtomicUsize>,
     error_mode: Arc<AtomicUsize>,
     actions: Arc<Mutex<Vec<String>>>,
 ) -> zbus::Connection {
@@ -312,7 +325,7 @@ fn start_service(
             .unwrap()
             .serve_at(ROOT, ObjectManager)
             .unwrap()
-            .serve_at(BLOCK_PATH, FakeBlock { slow })
+            .serve_at(BLOCK_PATH, FakeBlock { slow, slow_entered })
             .unwrap()
             .serve_at(
                 BLOCK_PATH,
@@ -447,6 +460,108 @@ fn start_duplicate_hardware_service(
     })
 }
 
+fn start_action_scope_service(address: &str) -> zbus::Connection {
+    const FIRST: &str = "/org/freedesktop/UDisks2/block_devices/scope_a";
+    const SECOND: &str = "/org/freedesktop/UDisks2/block_devices/scope_b";
+    futures_lite::future::block_on(async {
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        zbus::connection::Builder::address(address)
+            .unwrap()
+            .name(SERVICE)
+            .unwrap()
+            .serve_at(ROOT, ObjectManager)
+            .unwrap()
+            .serve_at(DRIVE_PATH, FakeDrive { actions })
+            .unwrap()
+            .serve_at(
+                FIRST,
+                IdentityBlock {
+                    device: b"/dev/sda1\0".to_vec(),
+                    uuid: "scope-a",
+                    drive: DRIVE_PATH,
+                    symlinks: vec![b"/dev/disk/by-id/scope-a\0".to_vec()],
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FIRST,
+                StaticFilesystem {
+                    mount_point: b"/media/a\0",
+                },
+            )
+            .unwrap()
+            .serve_at(
+                SECOND,
+                IdentityBlock {
+                    device: b"/dev/sda2\0".to_vec(),
+                    uuid: "scope-b",
+                    drive: DRIVE_PATH,
+                    symlinks: vec![b"/dev/disk/by-id/scope-b\0".to_vec()],
+                },
+            )
+            .unwrap()
+            .serve_at(
+                SECOND,
+                StaticFilesystem {
+                    mount_point: b"/media/b\0",
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    })
+}
+
+#[test]
+fn production_validation_scopes_unmount_to_selected_and_drive_actions_to_siblings() {
+    let bus = PrivateBus::start();
+    let _service = start_action_scope_service(&bus.address);
+    let backend =
+        ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
+            .unwrap();
+    let snapshot = backend.snapshot().unwrap();
+    let selected = snapshot
+        .devices()
+        .iter()
+        .find(|device| {
+            device
+                .mount_points()
+                .iter()
+                .any(|path| path == std::path::Path::new("/media/a"))
+        })
+        .unwrap();
+    let request = UDisksRequest::with_timeout(Duration::from_millis(500));
+
+    assert_eq!(
+        backend
+            .validate_action(
+                selected,
+                Some(snapshot.owner()),
+                VolumeAction::Unmount,
+                &request,
+            )
+            .unwrap(),
+        vec![std::path::PathBuf::from("/media/a")]
+    );
+    let mut drive_mounts = backend
+        .validate_action(
+            selected,
+            Some(snapshot.owner()),
+            VolumeAction::Eject,
+            &request,
+        )
+        .unwrap();
+    drive_mounts.sort();
+    assert_eq!(
+        drive_mounts,
+        ["/media/a", "/media/b"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>()
+    );
+}
+
 fn assert_duplicate_hardware_is_visible_but_unsafe(backend: ZbusUDisksBackend) {
     let snapshot = backend.snapshot().unwrap();
     assert_eq!(snapshot.devices().len(), 2);
@@ -564,12 +679,14 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
     let mut bus = PrivateBus::start();
     let calls = Arc::new(AtomicUsize::new(0));
     let slow = Arc::new(AtomicBool::new(false));
+    let slow_entered = Arc::new(AtomicUsize::new(0));
     let error_mode = Arc::new(AtomicUsize::new(1));
     let actions = Arc::new(Mutex::new(Vec::new()));
     let first_service = start_service(
         &bus.address,
         Arc::clone(&calls),
         Arc::clone(&slow),
+        Arc::clone(&slow_entered),
         Arc::clone(&error_mode),
         Arc::clone(&actions),
     );
@@ -640,6 +757,7 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
         &bus.address,
         Arc::clone(&calls),
         Arc::clone(&slow),
+        Arc::clone(&slow_entered),
         Arc::clone(&error_mode),
         Arc::clone(&actions),
     );
@@ -660,7 +778,7 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
     assert_eq!(actions.lock().unwrap().len(), actions_before);
 
     slow.store(true, Ordering::SeqCst);
-    SLOW_PROPERTIES_ENTERED.store(0, Ordering::Release);
+    slow_entered.store(0, Ordering::Release);
     let started = std::time::Instant::now();
     match backend.snapshot() {
         Err(UDisksError::DeadlineExceeded) => {}
@@ -680,13 +798,74 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
 }
 
 #[test]
+fn reconnecting_production_adapter_delegates_owner_bound_validation() {
+    let bus = PrivateBus::start();
+    let service = start_service(
+        &bus.address,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let backend = ReconnectingUDisksBackend::new(UDisksBusConfig::address(bus.address.as_str()));
+    let snapshot = backend.snapshot().unwrap();
+    let request = UDisksRequest::with_timeout(Duration::from_millis(500));
+    assert_eq!(
+        backend
+            .validate_action(
+                &snapshot.devices()[0],
+                Some(snapshot.owner()),
+                VolumeAction::Unmount,
+                &request,
+            )
+            .unwrap(),
+        vec![std::path::PathBuf::from("/media/fake")]
+    );
+
+    futures_lite::future::block_on(service.release_name(SERVICE)).unwrap();
+    let _replacement = start_service(
+        &bus.address,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    assert!(matches!(
+        backend.validate_action(
+            &snapshot.devices()[0],
+            Some(snapshot.owner()),
+            VolumeAction::Unmount,
+            &request,
+        ),
+        Err(UDisksError::StaleObject)
+    ));
+    let restarted = backend.snapshot().unwrap();
+    assert_ne!(restarted.owner(), snapshot.owner());
+    assert_eq!(
+        backend
+            .validate_action(
+                &restarted.devices()[0],
+                Some(restarted.owner()),
+                VolumeAction::Unmount,
+                &request,
+            )
+            .unwrap(),
+        vec![std::path::PathBuf::from("/media/fake")]
+    );
+}
+
+#[test]
 fn same_owner_replacement_at_the_same_object_path_is_rejected() {
     let bus = PrivateBus::start();
     let slow = Arc::new(AtomicBool::new(false));
+    let slow_entered = Arc::new(AtomicUsize::new(0));
     let service = start_service(
         &bus.address,
         Arc::new(AtomicUsize::new(0)),
         Arc::clone(&slow),
+        slow_entered,
         Arc::new(AtomicUsize::new(0)),
         Arc::new(Mutex::new(Vec::new())),
     );
@@ -752,9 +931,17 @@ fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
     let bus = PrivateBus::start();
     let calls = Arc::new(AtomicUsize::new(0));
     let slow = Arc::new(AtomicBool::new(false));
+    let slow_entered = Arc::new(AtomicUsize::new(0));
     let error_mode = Arc::new(AtomicUsize::new(0));
     let actions = Arc::new(Mutex::new(Vec::new()));
-    let service = start_service(&bus.address, calls, Arc::clone(&slow), error_mode, actions);
+    let service = start_service(
+        &bus.address,
+        calls,
+        Arc::clone(&slow),
+        Arc::clone(&slow_entered),
+        error_mode,
+        actions,
+    );
     let subscription =
         VolumeSubscription::with_udisks(UDisksBusConfig::address(bus.address.as_str()), false);
     wait_for_trigger(&subscription, VolumeTrigger::MountTableChanged);
@@ -769,6 +956,7 @@ fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
                 ADDED_PATH,
                 FakeBlock {
                     slow: Arc::clone(&slow),
+                    slow_entered: Arc::clone(&slow_entered),
                 },
             )
             .await
@@ -814,12 +1002,10 @@ fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
     );
     runtime.refresh(VolumeTrigger::UDisksChanged).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while SLOW_PROPERTIES_ENTERED.load(Ordering::Acquire) == 0
-        && std::time::Instant::now() < deadline
-    {
+    while slow_entered.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
         std::thread::yield_now();
     }
-    assert!(SLOW_PROPERTIES_ENTERED.load(Ordering::Acquire) > 0);
+    assert!(slow_entered.load(Ordering::Acquire) > 0);
     let runtime_shutdown = std::time::Instant::now();
     drop(runtime);
     assert!(runtime_shutdown.elapsed() < Duration::from_millis(500));
@@ -847,7 +1033,7 @@ fn listener_drop_cancels_stalled_bus_setup_without_leaking_threads() {
             match listener.accept() {
                 Ok((stream, _)) => connections.push(stream),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::yield_now();
                 }
                 Err(error) => panic!("stalled bus accept failed: {error}"),
             }
