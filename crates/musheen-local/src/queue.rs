@@ -624,6 +624,11 @@ impl LocalOperationQueue {
             )
     }
 
+    #[must_use]
+    pub fn operation_paths(&self, id: JobId) -> Option<Vec<StorePath>> {
+        self.operations.get(&id).map(LocalOperation::affected_paths)
+    }
+
     pub fn interrupt(&mut self, id: JobId) -> Result<(), DropError> {
         self.scheduler.interrupt(id)?;
         Ok(())

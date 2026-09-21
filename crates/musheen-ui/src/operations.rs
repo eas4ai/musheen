@@ -381,11 +381,7 @@ impl OperationHub {
     }
 
     pub fn retry(&self, id: JobId) -> Result<(), OperationHubError> {
-        let generation = self
-            .queue
-            .lock()
-            .map_err(|_| OperationHubError::QueueLock)?
-            .retry(id)?;
+        let generation = self.with_unreserved_job(id, |queue| queue.retry(id))?;
         self.status
             .lock()
             .map_err(|_| OperationHubError::StatusLock)?
@@ -396,12 +392,12 @@ impl OperationHub {
 
     #[must_use]
     pub fn can_retry(&self, id: JobId) -> bool {
-        self.queue.lock().is_ok_and(|queue| queue.can_retry(id))
+        self.job_is_unreserved(id)
     }
 
     #[must_use]
     pub fn can_resume_recovery(&self, id: JobId) -> bool {
-        self.queue.lock().is_ok_and(|queue| queue.can_retry(id))
+        self.can_retry(id)
             && self
                 .recovery_staging(id)
                 .is_ok_and(|staging| LocalStore::new().recovery_staging_available(&staging))
@@ -415,17 +411,13 @@ impl OperationHub {
 
     pub fn resume_recovery(&self, id: JobId) -> Result<(), OperationHubError> {
         let staging = self.recovery_staging(id)?;
-        let generation = {
-            let mut queue = self
-                .queue
-                .lock()
-                .map_err(|_| OperationHubError::QueueLock)?;
+        let generation = self.with_unreserved_job(id, |queue| {
             if !queue.can_retry(id) {
-                return Err(DropError::MissingOperation(id).into());
+                return Err(DropError::MissingOperation(id));
             }
             LocalStore::new().discard_recovery_staging(&staging)?;
-            queue.retry(id)?
-        };
+            queue.retry(id)
+        })?;
         self.status
             .lock()
             .map_err(|_| OperationHubError::StatusLock)?
@@ -500,6 +492,41 @@ impl OperationHub {
         submit(&mut queue).map_err(Into::into)
     }
 
+    fn with_unreserved_job<T>(
+        &self,
+        id: JobId,
+        transition: impl FnOnce(&mut LocalOperationQueue) -> Result<T, DropError>,
+    ) -> Result<T, OperationHubError> {
+        let reserved = self
+            .reservations
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?;
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?;
+        let paths = queue
+            .operation_paths(id)
+            .ok_or(DropError::MissingOperation(id))?;
+        if operation_paths_are_reserved(reserved.values().flatten(), &paths) {
+            return Err(OperationHubError::MountReserved);
+        }
+        transition(&mut queue).map_err(Into::into)
+    }
+
+    fn job_is_unreserved(&self, id: JobId) -> bool {
+        let Ok(reserved) = self.reservations.lock() else {
+            return false;
+        };
+        let Ok(queue) = self.queue.lock() else {
+            return false;
+        };
+        queue.can_retry(id)
+            && queue.operation_paths(id).is_some_and(|paths| {
+                !operation_paths_are_reserved(reserved.values().flatten(), &paths)
+            })
+    }
+
     fn queue(&self) -> Arc<Mutex<LocalOperationQueue>> {
         Arc::clone(&self.queue)
     }
@@ -518,6 +545,18 @@ impl OperationHub {
             .find_map(|failure| failure.recovery_staging().cloned())
             .ok_or_else(|| crate::StatusCenterError::InvalidState(id).into())
     }
+}
+
+fn operation_paths_are_reserved<'a>(
+    mounts: impl IntoIterator<Item = &'a std::path::PathBuf>,
+    paths: &[StorePath],
+) -> bool {
+    mounts.into_iter().any(|mount| {
+        paths.iter().any(|path| {
+            path.as_unix_path()
+                .is_some_and(|path| path.starts_with(mount))
+        })
+    })
 }
 
 fn operations_using_mounts(
@@ -817,10 +856,54 @@ mod tests {
         (temporary, hub, id, staging)
     }
 
+    fn failed_copy(hub: &OperationHub, source: StorePath, target: StorePath) -> JobId {
+        let id = hub
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Copy).unwrap(),
+                target,
+            )
+            .unwrap()[0];
+        let operation = hub
+            .queue
+            .lock()
+            .unwrap()
+            .start_ready()
+            .unwrap()
+            .pop()
+            .unwrap();
+        let affected_path = operation.affected_path().clone();
+        hub.status.lock().unwrap().mark_running(id).unwrap();
+        hub.queue
+            .lock()
+            .unwrap()
+            .finish(id, Err("forced failure".into()))
+            .unwrap();
+        record_finished_operation(
+            &mut hub.status.lock().unwrap(),
+            id,
+            Some(JobState::Failed),
+            affected_path,
+            None,
+        )
+        .unwrap();
+        id
+    }
+
     #[test]
     fn recoverable_jobs_resume_only_after_owned_staging_is_discarded() {
-        let (_temporary, hub, id, staging) = recoverable_hub();
+        let (temporary, hub, id, staging) = recoverable_hub();
         assert!(hub.can_resume_recovery(id));
+
+        let reservation = hub
+            .reserve_mounts(&[temporary.path().to_path_buf()])
+            .unwrap();
+        assert!(!hub.can_resume_recovery(id));
+        assert!(matches!(
+            hub.resume_recovery(id),
+            Err(OperationHubError::MountReserved)
+        ));
+        assert!(staging.as_unix_path().unwrap().exists());
+        drop(reservation);
 
         hub.resume_recovery(id).unwrap();
 
@@ -878,5 +961,53 @@ mod tests {
             .expect("queue access remains responsive while a mount is reserved");
 
         drop(reservation);
+    }
+
+    #[test]
+    fn mount_reservation_blocks_failed_job_retry_but_not_unrelated_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let reserved = temporary.path().join("reserved");
+        let unrelated = temporary.path().join("unrelated");
+        let target = temporary.path().join("target");
+        filesystem::create_dir_all(&reserved).unwrap();
+        filesystem::create_dir_all(&unrelated).unwrap();
+        filesystem::create_dir_all(&target).unwrap();
+        let reserved_source = reserved.join("reserved.txt");
+        let unrelated_source = unrelated.join("unrelated.txt");
+        filesystem::write(&reserved_source, b"reserved").unwrap();
+        filesystem::write(&unrelated_source, b"unrelated").unwrap();
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let target = StorePath::from_unix_path(target.into_os_string());
+        let reserved_id = failed_copy(
+            &hub,
+            StorePath::from_unix_path(reserved_source.into_os_string()),
+            target.clone(),
+        );
+        let unrelated_id = failed_copy(
+            &hub,
+            StorePath::from_unix_path(unrelated_source.into_os_string()),
+            target,
+        );
+        let reservation = hub.reserve_mounts(std::slice::from_ref(&reserved)).unwrap();
+
+        assert!(!hub.can_retry(reserved_id));
+        assert!(matches!(
+            hub.retry(reserved_id),
+            Err(OperationHubError::MountReserved)
+        ));
+        assert!(hub.can_retry(unrelated_id));
+        hub.retry(unrelated_id).unwrap();
+        let ready = hub.queue.lock().unwrap().start_ready().unwrap();
+        assert_eq!(
+            ready
+                .iter()
+                .map(ReadyLocalOperation::id)
+                .collect::<Vec<_>>(),
+            vec![unrelated_id]
+        );
+
+        drop(reservation);
+        assert!(hub.can_retry(reserved_id));
+        hub.retry(reserved_id).unwrap();
     }
 }

@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+type AliasSubmission = (
+    Arc<PathReservationUsage>,
+    PathBuf,
+    Arc<std::sync::atomic::AtomicBool>,
+);
+
 #[derive(Default)]
 struct FakeBackend {
     snapshots: Mutex<VecDeque<Result<BackendSnapshot, UDisksError>>>,
@@ -24,6 +30,7 @@ struct FakeBackend {
             Arc<std::sync::atomic::AtomicBool>,
         )>,
     >,
+    alias_submission: Mutex<Option<AliasSubmission>>,
 }
 
 impl FakeBackend {
@@ -88,6 +95,12 @@ impl UDisksBackend for FakeBackend {
         {
             accepted.store(true, std::sync::atomic::Ordering::Release);
         }
+        if let Some((usage, path, accepted)) = self.alias_submission.lock().unwrap().take() {
+            accepted.store(
+                usage.try_submit(&path),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         self.actions
             .lock()
             .unwrap()
@@ -115,6 +128,56 @@ impl UDisksBackend for FakeBackend {
             .pop_front()
             .unwrap_or(Ok(()))
             .map(|()| volume.mount_points().to_vec())
+    }
+}
+
+#[derive(Default)]
+struct PathReservationUsage {
+    reserved: Arc<Mutex<Vec<PathBuf>>>,
+    scopes: Mutex<Vec<Vec<PathBuf>>>,
+}
+
+impl PathReservationUsage {
+    fn try_submit(&self, path: &Path) -> bool {
+        !self
+            .reserved
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|mount| path.starts_with(mount))
+    }
+}
+
+struct PathReservationGuard(Arc<Mutex<Vec<PathBuf>>>);
+
+impl Drop for PathReservationGuard {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().clear();
+    }
+}
+
+impl musheen_desktop::OperationReservation for PathReservationGuard {
+    fn operations_using(&self) -> Vec<OperationUse> {
+        Vec::new()
+    }
+}
+
+impl OperationUsage for PathReservationUsage {
+    fn operations_using(&self, _mounts: &[PathBuf]) -> Vec<OperationUse> {
+        Vec::new()
+    }
+
+    fn cancel(&self, _operations: &[OperationUse]) -> Result<(), VolumeError> {
+        Ok(())
+    }
+
+    fn reserve<'a>(
+        &'a self,
+        mounts: &[PathBuf],
+    ) -> Result<Box<dyn musheen_desktop::OperationReservation + 'a>, VolumeError> {
+        *self.reserved.lock().unwrap() = mounts.to_vec();
+        self.scopes.lock().unwrap().push(mounts.to_vec());
+        Ok(Box::new(PathReservationGuard(Arc::clone(&self.reserved))))
     }
 }
 
@@ -617,6 +680,116 @@ fn operation_reservation_blocks_new_jobs_through_backend_dispatch() {
         .unwrap();
     assert!(!accepted.load(std::sync::atomic::Ordering::Acquire));
     assert!(!reserved.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn final_reservation_tracks_fresh_bind_alias_addition_and_removal() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let usage = Arc::new(PathReservationUsage::default());
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
+    service.refresh().unwrap();
+
+    let alias_accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *backend.alias_submission.lock().unwrap() = Some((
+        usage.clone(),
+        PathBuf::from("/bind/a"),
+        Arc::clone(&alias_accepted),
+    ));
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/proc-only", false),
+        mount("/proc-only", "/bind/a", false),
+    ]);
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/proc-only", false),
+        mount("/proc-only", "/bind/a", false),
+    ]);
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap();
+    assert!(
+        !alias_accepted.load(std::sync::atomic::Ordering::Acquire),
+        "a job through a newly-added bind alias must be refused during dispatch"
+    );
+    assert!(usage.scopes.lock().unwrap()[0].contains(&PathBuf::from("/proc-only")));
+    assert!(usage.scopes.lock().unwrap()[0].contains(&PathBuf::from("/bind/a")));
+
+    let removed_alias_accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *backend.alias_submission.lock().unwrap() = Some((
+        usage.clone(),
+        PathBuf::from("/bind/a"),
+        Arc::clone(&removed_alias_accepted),
+    ));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap();
+    assert!(
+        removed_alias_accepted.load(std::sync::atomic::Ordering::Acquire),
+        "a removed bind alias must not remain reserved"
+    );
+    assert!(!usage.scopes.lock().unwrap()[1].contains(&PathBuf::from("/bind/a")));
+}
+
+#[test]
+fn drive_wide_reservation_tracks_procfs_only_sibling_aliases() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let usage = Arc::new(PathReservationUsage::default());
+    let drive = "/org/freedesktop/UDisks2/drives/shared";
+    let first = device("sdb1", Some("/media/a")).with_drive_path(drive);
+    let second = device("sdb2", Some("/media/b")).with_drive_path(drive);
+    backend.queue_snapshot(Ok(snapshot("owner", [first.clone(), second.clone()])));
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/media/b", false),
+    ]);
+    let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
+    service.refresh().unwrap();
+
+    let alias_accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *backend.alias_submission.lock().unwrap() = Some((
+        usage.clone(),
+        PathBuf::from("/bind/b"),
+        Arc::clone(&alias_accepted),
+    ));
+    let live = vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/proc-b", false),
+        mount("/proc-b", "/bind/b", false),
+    ];
+    mounts.queue(live.clone());
+    mounts.queue(live);
+    backend.queue_snapshot(Ok(snapshot("owner", [first, second])));
+    service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Eject,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap();
+
+    assert!(
+        !alias_accepted.load(std::sync::atomic::Ordering::Acquire),
+        "drive-wide action must reserve procfs-only aliases of sibling partitions"
+    );
+    assert!(usage.scopes.lock().unwrap()[0].contains(&PathBuf::from("/bind/b")));
 }
 
 #[test]
@@ -1346,10 +1519,20 @@ fn subscription_registration_cannot_miss_removal_between_snapshot_and_insert() {
         }
     });
     let final_update = futures_lite::future::block_on(async {
-        futures_lite::future::race(async { updates.recv().await.unwrap() }, async {
-            async_io::Timer::after(Duration::from_secs(1)).await;
-            panic!("atomic subscriber missed the final removal")
-        })
+        futures_lite::future::race(
+            async {
+                loop {
+                    let update = updates.recv().await.unwrap();
+                    if update.model().volumes().is_empty() {
+                        return update;
+                    }
+                }
+            },
+            async {
+                async_io::Timer::after(Duration::from_secs(1)).await;
+                panic!("atomic subscriber missed the final removal")
+            },
+        )
         .await
     });
     assert!(final_update.model().volumes().is_empty());

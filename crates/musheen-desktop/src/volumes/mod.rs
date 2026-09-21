@@ -609,7 +609,13 @@ impl VolumeService {
                 action,
                 request,
             )?;
-            let reservation = self.usage.reserve(&validated_mounts)?;
+            request.check()?;
+            let live_mounts = self.mounts.snapshot()?;
+            request.check()?;
+            let affected_devices = self.model.devices_affected_by(id, action);
+            let reservation_mounts =
+                reconcile_mount_aliases(&validated_mounts, &affected_devices, &live_mounts);
+            let reservation = self.usage.reserve(&reservation_mounts)?;
             let newly_active = reservation.operations_using();
             if !newly_active.is_empty() {
                 return Err(VolumeError::InUse(newly_active));
@@ -844,6 +850,34 @@ fn deduplicate_mounts(records: Vec<MountRecord>) -> BTreeMap<PathBuf, MountRecor
             .or_insert(record);
     }
     unique
+}
+
+fn reconcile_mount_aliases(
+    validated: &[PathBuf],
+    devices: &[PathBuf],
+    records: &[MountRecord],
+) -> Vec<PathBuf> {
+    let mut affected = validated.iter().cloned().collect::<BTreeSet<_>>();
+    let mut sources = devices.iter().cloned().collect::<BTreeSet<_>>();
+    loop {
+        let mut changed = false;
+        for record in records {
+            let destination_is_affected = affected
+                .iter()
+                .any(|mount| record.destination().starts_with(mount));
+            let source_is_affected = sources.contains(record.source())
+                || affected
+                    .iter()
+                    .any(|mount| record.source().starts_with(mount));
+            if destination_is_affected || source_is_affected {
+                changed |= sources.insert(record.source().to_path_buf());
+                changed |= affected.insert(record.destination().to_path_buf());
+            }
+        }
+        if !changed {
+            return affected.into_iter().collect();
+        }
+    }
 }
 
 fn reconcile_anonymous_mount_ids(

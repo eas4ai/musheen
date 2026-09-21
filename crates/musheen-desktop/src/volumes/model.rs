@@ -530,17 +530,36 @@ impl VolumeModel {
 
     #[must_use]
     pub fn mounts_affected_by(&self, id: &VolumeId, action: VolumeAction) -> Vec<PathBuf> {
+        self.volumes_affected_by(id, action)
+            .into_iter()
+            .flat_map(|volume| volume.mount_points().iter().cloned())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn devices_affected_by(&self, id: &VolumeId, action: VolumeAction) -> Vec<PathBuf> {
+        self.volumes_affected_by(id, action)
+            .into_iter()
+            .filter_map(Volume::descriptor)
+            .map(|descriptor| descriptor.device().to_path_buf())
+            .collect()
+    }
+
+    fn volumes_affected_by(&self, id: &VolumeId, action: VolumeAction) -> Vec<&Volume> {
         let Some(selected) = self.get(id) else {
             return Vec::new();
         };
         if !matches!(action, VolumeAction::Eject | VolumeAction::PowerOff) {
-            return selected.mount_points().to_vec();
+            return vec![selected];
         }
-        let drive = selected.descriptor().and_then(DeviceDescriptor::drive_path);
+        let Some(drive) = selected.descriptor().and_then(DeviceDescriptor::drive_path) else {
+            return vec![selected];
+        };
         self.volumes
             .values()
-            .filter(|volume| volume.descriptor().and_then(DeviceDescriptor::drive_path) == drive)
-            .flat_map(|volume| volume.mount_points().iter().cloned())
+            .filter(|volume| {
+                volume.descriptor().and_then(DeviceDescriptor::drive_path) == Some(drive)
+            })
             .collect()
     }
 }
