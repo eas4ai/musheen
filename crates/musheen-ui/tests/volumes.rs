@@ -6,6 +6,7 @@ use musheen_desktop::{
 };
 use musheen_ui::dialogs::VolumePropertiesModel;
 use musheen_ui::sidebar::{PinStore, SidebarModel, SidebarSectionKind};
+use musheen_ui::{Catalog, Locale};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -123,6 +124,26 @@ fn sidebar_projection_uses_live_mount_location_capacity_and_read_only_state() {
     let entry = &storage.items()[0];
     assert_eq!(entry.volume_capacity(), Some(Capacity::new(1_000, 100)));
     assert!(entry.volume_read_only());
+}
+
+#[test]
+fn unmounted_sidebar_refusal_is_a_localizable_reason_key() {
+    let mounts = Arc::new(Mounts::default());
+    let mut service = build_service(mounts);
+    service.refresh().unwrap();
+    let mut sidebar = SidebarModel::new(PinStore::default());
+    sidebar.sync_volumes(service.model());
+    let storage = sidebar
+        .sections()
+        .into_iter()
+        .find(|section| section.kind() == SidebarSectionKind::Mounts)
+        .unwrap();
+    let entry = &storage.items()[0];
+
+    let reason = entry.unavailable_reason().unwrap();
+    assert_eq!(reason, "volume-mount-before-opening");
+    let arabic = Catalog::load(Locale::Ar).unwrap().localize_reason(reason);
+    assert!(!arabic.contains("mount the volume"));
 }
 
 #[test]

@@ -218,7 +218,7 @@ impl VolumeRuntime {
         self.0
             .commands
             .send(RuntimeCommand::Refresh(trigger))
-            .map_err(|_| VolumeError::Disconnected("the volume worker stopped".into()))
+            .map_err(|_| VolumeError::WorkerStopped)
     }
 
     pub fn perform(
@@ -238,10 +238,8 @@ impl VolumeRuntime {
                 secret,
                 reply,
             })
-            .map_err(|_| VolumeError::Disconnected("the volume worker stopped".into()))?;
-        result
-            .recv()
-            .map_err(|_| VolumeError::Disconnected("the volume worker stopped".into()))?
+            .map_err(|_| VolumeError::WorkerStopped)?;
+        result.recv().map_err(|_| VolumeError::WorkerStopped)?
     }
 }
 

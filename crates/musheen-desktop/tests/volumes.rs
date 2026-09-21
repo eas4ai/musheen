@@ -502,17 +502,37 @@ fn generic_mount_reconciliation_never_overwrites_a_new_identity_collision() {
         Arc::new(FakeUsage::default()),
     );
     backend.queue_snapshot(Err(UDisksError::Unavailable("absent".into())));
-    mounts.queue(vec![generic_mount("tmpfs", "/run/z", "tmpfs")]);
-    service.refresh().unwrap();
-
-    backend.queue_snapshot(Err(UDisksError::Unavailable("absent".into())));
     mounts.queue(vec![
         generic_mount("tmpfs", "/run/a", "tmpfs"),
         generic_mount("tmpfs", "/run/z", "tmpfs"),
     ]);
     service.refresh().unwrap();
+    let initial = service
+        .model()
+        .volumes()
+        .into_iter()
+        .map(|volume| (volume.mount_points()[0].clone(), volume.id().clone()))
+        .collect::<BTreeMap<_, _>>();
+    let a_id = initial[Path::new("/run/a")].clone();
+    let z_id = initial[Path::new("/run/z")].clone();
+
+    backend.queue_snapshot(Err(UDisksError::Unavailable("absent".into())));
+    mounts.queue(vec![
+        generic_mount("tmpfs", "/run/b", "tmpfs"),
+        generic_mount("tmpfs", "/run/z", "tmpfs"),
+    ]);
+    service.refresh().unwrap();
 
     assert_eq!(service.model().volumes().len(), 2);
+    let by_destination = service
+        .model()
+        .volumes()
+        .into_iter()
+        .map(|volume| (volume.mount_points()[0].clone(), volume.id().clone()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(by_destination[Path::new("/run/z")], z_id);
+    assert_ne!(by_destination[Path::new("/run/b")], a_id);
+    assert_ne!(by_destination[Path::new("/run/b")], z_id);
     assert_eq!(
         service
             .model()

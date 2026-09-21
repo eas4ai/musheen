@@ -12,7 +12,7 @@ use crate::dialogs::{
     properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
-use crate::i18n::Catalog;
+use crate::i18n::{Catalog, Locale};
 use crate::icons::{ApplicationIdentity, ContentIdentity, freedesktop_icon_name};
 use crate::info_pane::{
     InfoPaneDetails, InfoPaneModel, InfoPaneResult, InfoPaneState, InfoPaneWork,
@@ -9604,12 +9604,19 @@ fn volume_capability_state(
 }
 
 fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
+    if let Some(key) = local_volume_error_key(error) {
+        return catalog
+            .message(key)
+            .expect("the app-owned volume error is localized")
+            .into();
+    }
     let with_detail = |key: &'static str, detail: &str| -> Box<str> {
-        format!(
-            "{}: {detail}",
-            catalog.message(key).expect("the volume error is localized")
-        )
-        .into()
+        let message = catalog.message(key).expect("the volume error is localized");
+        if catalog.locale() == Locale::EnUs {
+            format!("{message}: {detail}").into()
+        } else {
+            message.into()
+        }
     };
     match error {
         VolumeError::MountTable(reason) => with_detail("volume-error-mount-table", reason),
@@ -9635,6 +9642,11 @@ fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
         }
         VolumeError::Busy(reason) => with_detail("volume-error-busy", reason),
         VolumeError::Unsupported(reason) => with_detail("volume-error-unsupported", reason),
+        VolumeError::DeadlineExceeded
+        | VolumeError::WorkerStopped
+        | VolumeError::UnlockSecretRequired
+        | VolumeError::ActionUnavailable
+        | VolumeError::MountNotExposed => unreachable!("handled by local_volume_error_key"),
         VolumeError::StaleObject => catalog
             .message("volume-error-stale")
             .expect("the stale-volume error is localized")
@@ -9649,6 +9661,17 @@ fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
         .into(),
         VolumeError::CancellationFailed(reason) => with_detail("volume-error-cancellation", reason),
         VolumeError::Protocol(reason) => with_detail("volume-error-protocol", reason),
+    }
+}
+
+const fn local_volume_error_key(error: &VolumeError) -> Option<&'static str> {
+    match error {
+        VolumeError::DeadlineExceeded => Some("volume-error-deadline"),
+        VolumeError::WorkerStopped => Some("volume-error-worker-stopped"),
+        VolumeError::UnlockSecretRequired => Some("volume-error-unlock-secret"),
+        VolumeError::ActionUnavailable => Some("volume-error-action-unavailable"),
+        VolumeError::MountNotExposed => Some("volume-error-mount-not-exposed"),
+        _ => None,
     }
 }
 
@@ -9926,22 +9949,38 @@ mod tests {
     #[test]
     fn every_typed_volume_error_and_capacity_suffix_is_localized() {
         let errors = [
-            VolumeError::MountTable("detail".into()),
+            VolumeError::MountTable("the mount table is unavailable".into()),
             VolumeError::Capacity {
                 path: PathBuf::from("/media/test"),
                 reason: "detail".into(),
             },
-            VolumeError::ServiceUnavailable("detail".into()),
-            VolumeError::Timeout("detail".into()),
-            VolumeError::Disconnected("detail".into()),
-            VolumeError::AuthorizationRequired("detail".into()),
-            VolumeError::Busy("detail".into()),
-            VolumeError::Unsupported("detail".into()),
+            VolumeError::ServiceUnavailable("UDisks2 is unavailable".into()),
+            VolumeError::Timeout("operation deadline exceeded".into()),
+            VolumeError::Disconnected("the volume worker stopped".into()),
+            VolumeError::AuthorizationRequired("an unlock secret is required".into()),
+            VolumeError::Busy("the volume is busy".into()),
+            VolumeError::Unsupported("UDisks2 did not advertise this action".into()),
+            VolumeError::DeadlineExceeded,
+            VolumeError::WorkerStopped,
+            VolumeError::UnlockSecretRequired,
+            VolumeError::ActionUnavailable,
+            VolumeError::MountNotExposed,
             VolumeError::StaleObject,
             VolumeError::Disappeared(VolumeId::new("gone").unwrap()),
             VolumeError::InUse(vec![OperationUse::new(MountOperation::new(1), "copy")]),
-            VolumeError::CancellationFailed("detail".into()),
-            VolumeError::Protocol("detail".into()),
+            VolumeError::CancellationFailed("could not cancel volume users".into()),
+            VolumeError::Protocol("invalid desktop-service response".into()),
+        ];
+        let forbidden = [
+            "mount table",
+            "UDisks2",
+            "deadline exceeded",
+            "worker stopped",
+            "unlock secret",
+            "volume is busy",
+            "advertise this action",
+            "cancel volume users",
+            "desktop-service response",
         ];
         for locale in [Locale::EnUs, Locale::EnXa, Locale::Ar] {
             let catalog = Catalog::load(locale).unwrap();
@@ -9955,6 +9994,12 @@ mod tests {
                         error.to_string(),
                         "{locale:?}: {error:?}"
                     );
+                    for phrase in forbidden {
+                        assert!(
+                            !rendered.contains(phrase),
+                            "{locale:?} leaked app-owned English `{phrase}` in `{rendered}`"
+                        );
+                    }
                 }
             }
         }

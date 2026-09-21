@@ -143,7 +143,7 @@ impl SidebarEntry {
             identity: Some(identity),
             tag_name: None,
             unavailable_reason: (!volume.is_mounted())
-                .then(|| Box::<str>::from("mount the volume before opening it")),
+                .then(|| Box::<str>::from("volume-mount-before-opening")),
             volume_id: Some(volume.id().clone()),
             volume_capacity: volume.capacity(),
             volume_read_only: volume.is_read_only(),

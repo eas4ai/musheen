@@ -231,6 +231,11 @@ pub enum VolumeError {
     AuthorizationRequired(Box<str>),
     Busy(Box<str>),
     Unsupported(Box<str>),
+    DeadlineExceeded,
+    WorkerStopped,
+    UnlockSecretRequired,
+    ActionUnavailable,
+    MountNotExposed,
     StaleObject,
     Disappeared(VolumeId),
     InUse(Vec<OperationUse>),
@@ -265,6 +270,11 @@ impl fmt::Display for VolumeError {
             Self::Unsupported(reason) => {
                 write!(formatter, "the volume action is unsupported: {reason}")
             }
+            Self::DeadlineExceeded => formatter.write_str("operation deadline exceeded"),
+            Self::WorkerStopped => formatter.write_str("the volume worker stopped"),
+            Self::UnlockSecretRequired => formatter.write_str("an unlock secret is required"),
+            Self::ActionUnavailable => formatter.write_str("UDisks2 did not advertise this action"),
+            Self::MountNotExposed => formatter.write_str("UDisks2 does not expose this mount"),
             Self::StaleObject => formatter.write_str("the UDisks2 object is stale"),
             Self::Disappeared(id) => write!(formatter, "volume {id} disappeared"),
             Self::InUse(operations) => write!(
@@ -293,6 +303,10 @@ impl From<UDisksError> for VolumeError {
             UDisksError::AuthorizationRequired(reason) => Self::AuthorizationRequired(reason),
             UDisksError::Busy(reason) => Self::Busy(reason),
             UDisksError::Unsupported(reason) => Self::Unsupported(reason),
+            UDisksError::DeadlineExceeded => Self::DeadlineExceeded,
+            UDisksError::WorkerStopped => Self::WorkerStopped,
+            UDisksError::UnlockSecretRequired => Self::UnlockSecretRequired,
+            UDisksError::ActionUnavailable => Self::ActionUnavailable,
             UDisksError::StaleObject => Self::StaleObject,
             UDisksError::Protocol(reason) => Self::Protocol(reason),
         }
@@ -417,7 +431,9 @@ impl VolumeService {
                 let state = match error {
                     UDisksError::Unavailable(_) => ServiceState::Unavailable,
                     UDisksError::Timeout(_) => ServiceState::Slow,
+                    UDisksError::DeadlineExceeded => ServiceState::Slow,
                     UDisksError::Disconnected(_) => ServiceState::Disconnected,
+                    UDisksError::WorkerStopped => ServiceState::Disconnected,
                     _ => ServiceState::Unavailable,
                 };
                 (None, state, Some(VolumeError::from(error)))
@@ -469,7 +485,8 @@ impl VolumeService {
             .filter(|volume| volume.descriptor().is_none())
             .cloned()
             .collect::<Vec<_>>();
-        let mut reused_mount_ids = BTreeSet::new();
+        let reconciled_mount_ids =
+            reconcile_anonymous_mount_ids(&mounts, &consumed, &prior_mount_only);
         let mut mount_only = BTreeMap::<VolumeId, Volume>::new();
         for (destination, record) in &mounts {
             if !consumed.contains(destination) {
@@ -481,21 +498,19 @@ impl VolumeService {
                         .and_modify(|volume| volume.attach_mount(record, capacity))
                         .or_insert_with(|| Volume::from_mount(record, capacity, service_state));
                 } else {
-                    let mut reconciled = prior_mount_only
-                        .iter()
-                        .find(|volume| {
-                            volume.device() == record.source()
-                                && volume.filesystem_type() == Some(record.filesystem_type())
-                                && !reused_mount_ids.contains(volume.id())
-                        })
-                        .map(|volume| volume.id().clone())
+                    // A destination is the only stable identity signal exposed
+                    // by procfs for anonymous mounts. Preserve an unchanged
+                    // destination (including a renamed source), but never let a
+                    // new mount steal a removed mount's ID by iteration order.
+                    let mut reconciled = reconciled_mount_ids
+                        .get(destination)
+                        .cloned()
                         .unwrap_or_else(|| VolumeId::from_mount(record));
                     let mut occurrence = 1;
                     while mount_only.contains_key(&reconciled) {
                         reconciled = VolumeId::from_mount_occurrence(record, occurrence);
                         occurrence += 1;
                     }
-                    reused_mount_ids.insert(reconciled.clone());
                     mount_only.insert(
                         reconciled.clone(),
                         Volume::from_mount_with_id(reconciled, record, capacity, service_state),
@@ -552,7 +567,7 @@ impl VolumeService {
         let descriptor = volume
             .descriptor()
             .cloned()
-            .ok_or_else(|| VolumeError::Unsupported("UDisks2 does not expose this mount".into()))?;
+            .ok_or(VolumeError::MountNotExposed)?;
         ensure_supported(&volume, action, unlock_secret)?;
 
         self.resolve_usage(&volume, action, usage_resolution)?;
@@ -653,6 +668,76 @@ fn deduplicate_mounts(records: Vec<MountRecord>) -> BTreeMap<PathBuf, MountRecor
     unique
 }
 
+fn reconcile_anonymous_mount_ids(
+    mounts: &BTreeMap<PathBuf, MountRecord>,
+    consumed: &BTreeSet<PathBuf>,
+    prior: &[Volume],
+) -> BTreeMap<PathBuf, VolumeId> {
+    let prior_by_destination = prior
+        .iter()
+        .flat_map(|volume| {
+            volume
+                .mount_points()
+                .iter()
+                .map(move |destination| (destination.clone(), volume))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut reconciled = mounts
+        .iter()
+        .filter(|(destination, record)| {
+            !consumed.contains(*destination) && !record.source().starts_with("/dev/")
+        })
+        .filter_map(|(destination, record)| {
+            prior_by_destination
+                .get(destination)
+                .filter(|volume| volume.filesystem_type() == Some(record.filesystem_type()))
+                .map(|volume| (destination.clone(), volume.id().clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut current_by_source = BTreeMap::<(PathBuf, Box<str>), Vec<PathBuf>>::new();
+    for (destination, record) in mounts {
+        if !consumed.contains(destination) && !record.source().starts_with("/dev/") {
+            current_by_source
+                .entry((
+                    record.source().to_path_buf(),
+                    record.filesystem_type().into(),
+                ))
+                .or_default()
+                .push(destination.clone());
+        }
+    }
+    for ((source, filesystem_type), destinations) in current_by_source {
+        // Preserve unchanged destinations first. If none survive, a complete
+        // source group can migrate by a deterministic destination pairing.
+        if destinations
+            .iter()
+            .any(|destination| reconciled.contains_key(destination))
+        {
+            continue;
+        }
+        let mut previous = prior
+            .iter()
+            .filter(|volume| {
+                volume.device() == source
+                    && volume.filesystem_type() == Some(filesystem_type.as_ref())
+            })
+            .filter_map(|volume| {
+                volume
+                    .mount_points()
+                    .first()
+                    .map(|destination| (destination, volume.id()))
+            })
+            .collect::<Vec<_>>();
+        previous.sort_by(|left, right| left.0.cmp(right.0));
+        if previous.len() == destinations.len() {
+            for (destination, (_, id)) in destinations.into_iter().zip(previous) {
+                reconciled.insert(destination, id.clone());
+            }
+        }
+    }
+    reconciled
+}
+
 fn ensure_supported(
     volume: &Volume,
     action: VolumeAction,
@@ -667,14 +752,10 @@ fn ensure_supported(
         VolumeAction::PowerOff => capabilities.can_power_off,
     };
     if !supported {
-        return Err(VolumeError::Unsupported(
-            "UDisks2 did not advertise this action".into(),
-        ));
+        return Err(VolumeError::ActionUnavailable);
     }
     if action == VolumeAction::Unlock && unlock_secret.is_none() {
-        return Err(VolumeError::AuthorizationRequired(
-            "an unlock secret is required".into(),
-        ));
+        return Err(VolumeError::UnlockSecretRequired);
     }
     Ok(())
 }

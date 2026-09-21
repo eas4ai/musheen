@@ -96,6 +96,9 @@ impl Catalog {
     /// Translate owned domain refusals without changing provider error detail.
     #[must_use]
     pub fn localize_reason(&self, reason: &str) -> String {
+        if let Ok(message) = self.message(reason) {
+            return message.to_owned();
+        }
         static ENGLISH: std::sync::LazyLock<BTreeMap<Box<str>, Box<str>>> =
             std::sync::LazyLock::new(|| parse_catalog(EN_US).expect("English catalog is valid"));
         ENGLISH

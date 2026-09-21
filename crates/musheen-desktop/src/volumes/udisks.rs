@@ -81,10 +81,10 @@ impl UDisksRequest {
 
     pub fn check(&self) -> Result<(), UDisksError> {
         if self.cancelled.load(Ordering::Acquire) {
-            return Err(UDisksError::Disconnected("volume service stopped".into()));
+            return Err(UDisksError::WorkerStopped);
         }
         if Instant::now() >= self.deadline {
-            return Err(UDisksError::Timeout("operation deadline exceeded".into()));
+            return Err(UDisksError::DeadlineExceeded);
         }
         Ok(())
     }
@@ -92,11 +92,11 @@ impl UDisksRequest {
     async fn expiry(&self) -> UDisksError {
         loop {
             if self.cancelled.load(Ordering::Acquire) {
-                return UDisksError::Disconnected("volume service stopped".into());
+                return UDisksError::WorkerStopped;
             }
             let remaining = self.remaining();
             if remaining.is_zero() {
-                return UDisksError::Timeout("operation deadline exceeded".into());
+                return UDisksError::DeadlineExceeded;
             }
             async_io::Timer::after(remaining.min(Duration::from_millis(20))).await;
         }
@@ -142,6 +142,10 @@ pub enum UDisksError {
     AuthorizationRequired(Box<str>),
     Busy(Box<str>),
     Unsupported(Box<str>),
+    DeadlineExceeded,
+    WorkerStopped,
+    UnlockSecretRequired,
+    ActionUnavailable,
     StaleObject,
     Protocol(Box<str>),
 }
@@ -161,6 +165,10 @@ impl fmt::Display for UDisksError {
             Self::Unsupported(reason) => {
                 write!(formatter, "the volume action is unsupported: {reason}")
             }
+            Self::DeadlineExceeded => formatter.write_str("operation deadline exceeded"),
+            Self::WorkerStopped => formatter.write_str("the volume worker stopped"),
+            Self::UnlockSecretRequired => formatter.write_str("an unlock secret is required"),
+            Self::ActionUnavailable => formatter.write_str("UDisks2 did not advertise this action"),
             Self::StaleObject => formatter.write_str("the UDisks2 object no longer exists"),
             Self::Protocol(reason) => write!(formatter, "invalid UDisks2 response: {reason}"),
         }
@@ -491,9 +499,7 @@ impl UDisksBackend for ZbusUDisksBackend {
                         .map_err(map_zbus_error)?;
                 }
                 VolumeAction::Eject => {
-                    let drive = volume.drive_path().ok_or_else(|| {
-                        UDisksError::Unsupported("the volume has no drive object".into())
-                    })?;
+                    let drive = volume.drive_path().ok_or(UDisksError::ActionUnavailable)?;
                     let _: () = self
                         .proxy(drive, DRIVE)
                         .await?
@@ -502,9 +508,7 @@ impl UDisksBackend for ZbusUDisksBackend {
                         .map_err(map_zbus_error)?;
                 }
                 VolumeAction::Unlock => {
-                    let secret = unlock_secret.ok_or_else(|| {
-                        UDisksError::AuthorizationRequired("an unlock secret is required".into())
-                    })?;
+                    let secret = unlock_secret.ok_or(UDisksError::UnlockSecretRequired)?;
                     let _: OwnedObjectPath = self
                         .proxy(volume.object_path(), ENCRYPTED)
                         .await?
@@ -513,9 +517,7 @@ impl UDisksBackend for ZbusUDisksBackend {
                         .map_err(map_zbus_error)?;
                 }
                 VolumeAction::PowerOff => {
-                    let drive = volume.drive_path().ok_or_else(|| {
-                        UDisksError::Unsupported("the volume has no drive object".into())
-                    })?;
+                    let drive = volume.drive_path().ok_or(UDisksError::ActionUnavailable)?;
                     let _: () = self
                         .proxy(drive, DRIVE)
                         .await?
@@ -552,12 +554,14 @@ fn stable_device_id(uuid: &str, drive: &str, device: &std::path::Path, object: &
     let mut bytes = Vec::new();
     bytes.extend_from_slice(uuid.as_bytes());
     bytes.push(0);
-    bytes.extend_from_slice(drive.as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(device.as_os_str().as_bytes());
     // A by-id symlink, WWN, or serial survives reconnects, kernel device-name
     // changes, and UDisks object recreation. Only truly anonymous devices need
     // the volatile object path as a last-resort collision discriminator.
+    if !drive.is_empty() {
+        bytes.extend_from_slice(drive.as_bytes());
+    } else {
+        bytes.extend_from_slice(device.as_os_str().as_bytes());
+    }
     if drive.is_empty() && !device.starts_with("/dev/disk/by-id") {
         bytes.push(0);
         bytes.extend_from_slice(object.as_bytes());
@@ -666,7 +670,7 @@ pub(crate) fn spawn_udisks_event_listener_with_config(
                 }
                 // This delay only bounds reconnect attempts after a broken bus;
                 // volume changes themselves are delivered by D-Bus signals.
-                thread::sleep(Duration::from_secs(1));
+                wait_for_reconnect_or_shutdown(&sender);
             }
         })
     {
@@ -687,7 +691,11 @@ fn spawn_name_owner_listener(
                     use futures_lite::StreamExt as _;
                     use zbus::message::Type;
 
-                    let connection = connect_async(&config).await?;
+                    let Some(connection) =
+                        until_listener_shutdown(&sender, connect_async(&config)).await?
+                    else {
+                        return Ok::<(), UDisksError>(());
+                    };
                     let rule = zbus::MatchRule::builder()
                         .msg_type(Type::Signal)
                         .interface("org.freedesktop.DBus")
@@ -697,10 +705,15 @@ fn spawn_name_owner_listener(
                         .add_arg(config.service())
                         .map_err(map_zbus_error)?
                         .build();
-                    let mut messages =
+                    let Some(mut messages) = until_listener_shutdown(&sender, async {
                         zbus::MessageStream::for_match_rule(rule, &connection, Some(8))
                             .await
-                            .map_err(map_zbus_error)?;
+                            .map_err(map_zbus_error)
+                    })
+                    .await?
+                    else {
+                        return Ok::<(), UDisksError>(());
+                    };
                     loop {
                         let message =
                             futures_lite::future::race(async { messages.next().await }, async {
@@ -725,7 +738,7 @@ fn spawn_name_owner_listener(
                     let _ = sender.try_send(super::VolumeTrigger::ServiceOwnerChanged);
                 }
                 if !sender.is_closed() {
-                    thread::sleep(Duration::from_secs(1));
+                    wait_for_reconnect_or_shutdown(&sender);
                 }
             }
         })
@@ -739,15 +752,23 @@ async fn listen_for_udisks_events(
     use futures_lite::StreamExt as _;
     use zbus::message::Type;
 
-    let connection = connect_async(config).await?;
+    let Some(connection) = until_listener_shutdown(sender, connect_async(config)).await? else {
+        return Ok(());
+    };
     let rule = zbus::MatchRule::builder()
         .msg_type(Type::Signal)
         .path_namespace(config.root())
         .map_err(map_zbus_error)?
         .build();
-    let mut messages = zbus::MessageStream::for_match_rule(rule, &connection, Some(32))
-        .await
-        .map_err(map_zbus_error)?;
+    let Some(mut messages) = until_listener_shutdown(sender, async {
+        zbus::MessageStream::for_match_rule(rule, &connection, Some(32))
+            .await
+            .map_err(map_zbus_error)
+    })
+    .await?
+    else {
+        return Ok(());
+    };
     loop {
         let message = futures_lite::future::race(async { messages.next().await }, async {
             sender.closed().await;
@@ -766,6 +787,26 @@ async fn listen_for_udisks_events(
             return Ok(());
         }
     }
+}
+
+async fn until_listener_shutdown<T>(
+    sender: &async_channel::Sender<super::VolumeTrigger>,
+    operation: impl Future<Output = Result<T, UDisksError>>,
+) -> Result<Option<T>, UDisksError> {
+    futures_lite::future::race(async { operation.await.map(Some) }, async {
+        sender.closed().await;
+        Ok(None)
+    })
+    .await
+}
+
+fn wait_for_reconnect_or_shutdown(sender: &async_channel::Sender<super::VolumeTrigger>) {
+    futures_lite::future::block_on(futures_lite::future::race(
+        async { sender.closed().await },
+        async {
+            async_io::Timer::after(Duration::from_secs(1)).await;
+        },
+    ));
 }
 
 async fn connect_async(config: &UDisksBusConfig) -> Result<zbus::Connection, UDisksError> {
@@ -813,14 +854,14 @@ mod tests {
         let before = stable_device_id(
             "same-uuid",
             "wwn-123",
-            std::path::Path::new("/dev/disk/by-id/wwn-123-part1"),
+            std::path::Path::new("/dev/sdb1"),
             "/org/freedesktop/UDisks2/block_devices/sdb1",
         );
         let after = stable_device_id(
             "same-uuid",
             "wwn-123",
-            std::path::Path::new("/dev/disk/by-id/wwn-123-part1"),
-            "/org/freedesktop/UDisks2/block_devices/sdz9",
+            std::path::Path::new("/dev/sdz1"),
+            "/org/freedesktop/UDisks2/block_devices/sdz1",
         );
         assert_eq!(before, after);
     }

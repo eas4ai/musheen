@@ -7,9 +7,10 @@ use musheen_desktop::{
 };
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader};
+use std::os::unix::net::UnixListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use zbus::fdo::ObjectManager;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
@@ -338,7 +339,7 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
     slow.store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
     match backend.snapshot() {
-        Err(UDisksError::Timeout(_)) => {}
+        Err(UDisksError::DeadlineExceeded) => {}
         other => panic!("slow property must hit the production deadline, got {other:?}"),
     }
     assert!(started.elapsed() < Duration::from_secs(1));
@@ -347,7 +348,9 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
     bus.child.kill().unwrap();
     let _ = bus.child.wait();
     match backend.snapshot() {
-        Err(UDisksError::Disconnected(_) | UDisksError::Timeout(_)) => {}
+        Err(
+            UDisksError::Disconnected(_) | UDisksError::Timeout(_) | UDisksError::DeadlineExceeded,
+        ) => {}
         other => panic!("dead private bus must be a connection error, got {other:?}"),
     }
 }
@@ -446,6 +449,62 @@ fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
 
     futures_lite::future::block_on(service.release_name(SERVICE)).unwrap();
     wait_for_trigger(&subscription, VolumeTrigger::ServiceOwnerChanged);
+    let started = std::time::Instant::now();
+    drop(subscription);
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn listener_drop_cancels_stalled_bus_setup_without_leaking_threads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let socket = temporary.path().join("stalled-bus.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (release, released) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let mut connections = Vec::new();
+        let started = std::time::Instant::now();
+        while connections.len() < 2 && started.elapsed() < Duration::from_secs(1) {
+            match listener.accept() {
+                Ok((stream, _)) => connections.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("stalled bus accept failed: {error}"),
+            }
+        }
+        let _ = released.recv_timeout(Duration::from_secs(2));
+        drop(connections);
+    });
+    let config = UDisksBusConfig::address(format!("unix:path={}", socket.display()));
+    let subscription = VolumeSubscription::with_udisks(config, false);
+    wait_for_trigger(&subscription, VolumeTrigger::MountTableChanged);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = std::time::Instant::now();
+    drop(subscription);
+    let elapsed = started.elapsed();
+    let _ = release.send(());
+    server.join().unwrap();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "listener shutdown waited {elapsed:?} for stalled authentication"
+    );
+}
+
+#[test]
+fn listener_disconnect_reconnect_loop_remains_cancellable() {
+    let Some(mut bus) = PrivateBus::start() else {
+        return;
+    };
+    let subscription =
+        VolumeSubscription::with_udisks(UDisksBusConfig::address(bus.address.as_str()), false);
+    wait_for_trigger(&subscription, VolumeTrigger::MountTableChanged);
+    std::thread::sleep(Duration::from_millis(100));
+    bus.child.kill().unwrap();
+    let _ = bus.child.wait();
+    std::thread::sleep(Duration::from_millis(100));
+
     let started = std::time::Instant::now();
     drop(subscription);
     assert!(started.elapsed() < Duration::from_millis(500));
