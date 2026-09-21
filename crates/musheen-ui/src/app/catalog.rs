@@ -149,15 +149,31 @@ impl CatalogBinding {
         let mut document = self.document.lock().expect("catalog lock is not poisoned");
         if let Some(store) = &self.store {
             let previous_visible = document.clone();
-            let (changed, current) = store
-                .update(|current| {
-                    let changed = change(current)?;
-                    Ok((changed, current.clone()))
-                })
-                .map_err(|error| match error {
-                    musheen_desktop::CatalogError::Update(error) => error,
-                    error => Box::<str>::from(error.to_string()),
-                })?;
+            let update = store.update(|current| {
+                let changed = change(current)?;
+                Ok((changed, current.clone()))
+            });
+            let (changed, current) = match update {
+                Ok(updated) => updated,
+                Err(musheen_desktop::CatalogError::UpdateConflict) => {
+                    let current = store
+                        .load()
+                        .map_err(|error| Box::<str>::from(error.to_string()))?;
+                    if current != *document {
+                        *document = current;
+                        self.revision.fetch_add(1, Ordering::AcqRel);
+                    }
+                    return Err(Box::<str>::from(
+                        musheen_desktop::CatalogError::UpdateConflict.to_string(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(match error {
+                        musheen_desktop::CatalogError::Update(error) => error,
+                        error => Box::<str>::from(error.to_string()),
+                    });
+                }
+            };
             *document = current;
             if *document != previous_visible {
                 self.revision.fetch_add(1, Ordering::AcqRel);
@@ -1519,6 +1535,7 @@ mod tests {
         store.save(&document).unwrap();
         let first_binding = CatalogBinding::persistent(store.clone(), document.clone());
         let second_binding = CatalogBinding::persistent(store.clone(), document);
+        let initial_revision = first_binding.revision();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let stale_binding = first_binding.clone();
         let first = std::thread::spawn(move || {
@@ -1553,6 +1570,13 @@ mod tests {
             "catalog changed before the update could be committed safely; retry the action"
         );
         second.join().unwrap().unwrap();
+        assert!(first_binding.revision() > initial_revision);
+        let winner = first_binding.snapshot();
+        assert_eq!(winner.pins().entries().len(), 1);
+        assert_eq!(
+            winner.pins().entries()[0].item().opaque_key(),
+            b"second-binding"
+        );
 
         first_binding
             .update(|document| {
