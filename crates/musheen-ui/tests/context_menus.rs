@@ -342,6 +342,41 @@ fn send_to_rows_capture_exact_sources_destinations_and_policy() {
 }
 
 #[test]
+fn multi_selection_rows_capture_every_target_in_typed_payloads() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let targets = vec![
+        target(b"multi-a", "/work/a.txt"),
+        target(b"multi-b", "/work/b.txt"),
+    ];
+    let menu = surface.compose(
+        request(
+            supported_context(CommandTarget::MultiSelection, targets.len()),
+            MenuTarget::Item,
+            targets.clone(),
+        )
+        .with_send_to(&[SendToDestination::pinned("Archive", path("/archive"), true)]),
+    );
+
+    assert_eq!(
+        menu.entry("clipboard.copy")
+            .unwrap()
+            .generated_parameters()
+            .unwrap(),
+        CommandParameters::Targets(targets.clone()),
+    );
+    assert_eq!(
+        menu.entry("clipboard.send_to")
+            .unwrap()
+            .generated_parameters()
+            .unwrap(),
+        CommandParameters::Destination {
+            targets,
+            destination: path("/archive"),
+        },
+    );
+}
+
+#[test]
 fn open_with_rows_capture_exact_sources_and_association_intents() {
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
     let selected = target(b"open-with", "/work/open-with");
@@ -984,6 +1019,22 @@ fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
             ),
         ),
         (
+            "multi-selection",
+            request(
+                supported_context(CommandTarget::MultiSelection, 2),
+                MenuTarget::Item,
+                vec![
+                    target(b"multi-a", "/work/a.txt"),
+                    target(b"multi-b", "/work/b.txt"),
+                ],
+            )
+            .with_send_to(&[SendToDestination::pinned(
+                "Archive",
+                path("/archive"),
+                true,
+            )]),
+        ),
+        (
             "pinned-directory",
             request(
                 pinned,
@@ -1110,7 +1161,7 @@ type ApplicabilityOracle = (
     &'static [&'static str],
 );
 
-fn applicability_oracles() -> ([ApplicabilityOracle; 14], BTreeSet<&'static str>) {
+fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>) {
     const BACKGROUND: &[&str] = &[
         "clipboard.paste_into",
         "selection.select_all",
@@ -1186,6 +1237,26 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 14], BTreeSet<&'static str>
         "item.copy_location",
         "directory.open_terminal",
         "directory.properties",
+    ];
+    const MULTI_SELECTION: &[&str] = &[
+        "actions.custom",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.cut",
+        "clipboard.move_to",
+        "clipboard.paste_into",
+        "clipboard.send_to",
+        "file.compress",
+        "file.create_hard_link",
+        "file.create_symbolic_link",
+        "file.delete_permanently",
+        "file.duplicate",
+        "file.hide",
+        "file.move_to_trash",
+        "file.rename",
+        "item.permissions",
+        "item.properties",
+        "item.tags",
     ];
     const ARCHIVE: &[&str] = &[
         "file.open",
@@ -1436,6 +1507,12 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 14], BTreeSet<&'static str>
         "item.tags",
     ];
     const DIRECTORY_DISABLED: &[&str] = &["clipboard.paste_into", "clipboard.send_to"];
+    const MULTI_SELECTION_DISABLED: &[&str] = &[
+        "clipboard.paste_into",
+        "file.create_hard_link",
+        "file.create_symbolic_link",
+        "file.rename",
+    ];
 
     let expected = [
         ("background", BACKGROUND, &["clipboard.paste_into"][..]),
@@ -1446,6 +1523,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 14], BTreeSet<&'static str>
         ("archive", ARCHIVE, SEND_TO_DISABLED),
         ("executable", EXECUTABLE, SEND_TO_DISABLED),
         ("directory", DIRECTORY, DIRECTORY_DISABLED),
+        ("multi-selection", MULTI_SELECTION, MULTI_SELECTION_DISABLED),
         ("pinned-directory", PINNED_DIRECTORY, DIRECTORY_DISABLED),
         ("sidebar", SIDEBAR, NONE),
         ("mount", MOUNT, NONE),
@@ -1563,10 +1641,10 @@ fn live_surface_inventory(registry: &CommandRegistry) -> BTreeMap<String, BTreeS
             .map(|binding| binding.command.as_str()),
     );
     for command in registry.commands() {
-        let resolved = resolve_command_mode(registry, command.id().as_str())
-            .expect("command mode resolves every registered command ID");
-        assert!(std::ptr::eq(resolved, command));
-        add_surface_ids(&mut surfaces, "command-mode", [command.id().as_str()]);
+        if let Some(resolved) = resolve_command_mode(registry, command.id().as_str()) {
+            assert!(std::ptr::eq(resolved, command));
+            add_surface_ids(&mut surfaces, "command-mode", [command.id().as_str()]);
+        }
     }
     surfaces
 }
@@ -1654,6 +1732,47 @@ fn every_command_surface_uses_one_registry_definition_and_policy() {
 
 #[test]
 fn omnibar_modes_and_static_handlers_are_complete_live_surface_inventories() {
+    let expected = [
+        ("navigation.back", "alt-left", CommandAction::NavigateBack),
+        (
+            "navigation.forward",
+            "alt-right",
+            CommandAction::NavigateForward,
+        ),
+        ("navigation.parent", "alt-up", CommandAction::NavigateParent),
+        ("navigation.refresh", "f5", CommandAction::Refresh),
+        (
+            "navigation.location",
+            "ctrl-l",
+            CommandAction::FocusLocation,
+        ),
+        ("view.search", "ctrl-f", CommandAction::Search),
+        ("view.filter", "ctrl-shift-f", CommandAction::Filter),
+        ("view.command", "ctrl-shift-p", CommandAction::FocusCommand),
+        ("tab.new", "ctrl-t", CommandAction::NewTab),
+        ("tab.close", "ctrl-w", CommandAction::CloseTab),
+        (
+            "tab.reopen_closed",
+            "ctrl-shift-t",
+            CommandAction::ReopenClosedTab,
+        ),
+        ("pane.split", "f3", CommandAction::SplitPane),
+        ("pane.focus_next", "f6", CommandAction::FocusNextPane),
+        ("selection.select_all", "ctrl-a", CommandAction::SelectAll),
+        ("view.hidden", "ctrl-h", CommandAction::ToggleHidden),
+        ("view.details", "ctrl-1", CommandAction::ViewDetails),
+        ("view.list", "ctrl-2", CommandAction::ViewList),
+        ("view.cards", "ctrl-3", CommandAction::ViewCards),
+        ("view.grid", "ctrl-4", CommandAction::ViewGrid),
+        ("view.columns", "ctrl-5", CommandAction::ViewColumns),
+        ("view.adaptive", "ctrl-6", CommandAction::ViewAdaptive),
+        ("view.sidebar", "ctrl-b", CommandAction::ToggleSidebar),
+        (
+            "item.properties",
+            "alt-enter",
+            CommandAction::OpenProperties,
+        ),
+    ];
     assert_eq!(
         OMNIBAR_COMMANDS
             .iter()
@@ -1682,6 +1801,14 @@ fn omnibar_modes_and_static_handlers_are_complete_live_surface_inventories() {
     );
     assert_eq!(installed.len(), STATIC_SHORTCUTS.len());
     assert_eq!(
+        STATIC_SHORTCUTS
+            .iter()
+            .map(|shortcut| (shortcut.command_id(), shortcut.chord(), shortcut.action()))
+            .collect::<Vec<_>>(),
+        expected,
+        "the static shortcut contract must match its independent product specification",
+    );
+    assert_eq!(
         installed_static_shortcut_bindings(),
         STATIC_SHORTCUTS
             .iter()
@@ -1689,6 +1816,34 @@ fn omnibar_modes_and_static_handlers_are_complete_live_surface_inventories() {
             .collect::<Vec<_>>(),
         "installed chord, command ID, and action coverage must share one declaration",
     );
+}
+
+#[test]
+fn direct_command_surfaces_exclude_parameterized_submenu_containers() {
+    let registry = CommandRegistry::built_in();
+    let customizable = customizable_commands(&registry)
+        .map(|command| command.id().as_str())
+        .collect::<BTreeSet<_>>();
+    for id in [
+        "file.open_with",
+        "file.set_default_application",
+        "clipboard.send_to",
+        "actions.custom",
+    ] {
+        assert!(
+            !customizable.contains(id),
+            "{id} requires a dynamic child and cannot be a direct toolbar command",
+        );
+        assert!(
+            resolve_command_mode(&registry, id).is_none(),
+            "{id} requires a dynamic child and cannot resolve in command mode",
+        );
+    }
+    assert!(
+        customizable.contains("item.tags"),
+        "the Tags parent remains directly actionable even when it has children",
+    );
+    assert!(resolve_command_mode(&registry, "item.tags").is_some());
 }
 
 #[test]

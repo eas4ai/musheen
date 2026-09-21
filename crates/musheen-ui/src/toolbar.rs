@@ -72,21 +72,14 @@ pub struct OmnibarCommand {
     command_id: &'static str,
     mode: OmnibarMode,
     button_id: &'static str,
-    label: &'static str,
 }
 
 impl OmnibarCommand {
-    const fn new(
-        command_id: &'static str,
-        mode: OmnibarMode,
-        button_id: &'static str,
-        label: &'static str,
-    ) -> Self {
+    const fn new(command_id: &'static str, mode: OmnibarMode, button_id: &'static str) -> Self {
         Self {
             command_id,
             mode,
             button_id,
-            label,
         }
     }
 
@@ -104,38 +97,13 @@ impl OmnibarCommand {
     pub const fn button_id(self) -> &'static str {
         self.button_id
     }
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        self.label
-    }
 }
 
 pub const OMNIBAR_COMMANDS: [OmnibarCommand; 4] = [
-    OmnibarCommand::new(
-        "navigation.location",
-        OmnibarMode::Path,
-        "omnibar-path",
-        "Path",
-    ),
-    OmnibarCommand::new(
-        "view.search",
-        OmnibarMode::Search,
-        "omnibar-search",
-        "Search",
-    ),
-    OmnibarCommand::new(
-        "view.filter",
-        OmnibarMode::Filter,
-        "omnibar-filter",
-        "Filter",
-    ),
-    OmnibarCommand::new(
-        "view.command",
-        OmnibarMode::Command,
-        "omnibar-command",
-        "Command",
-    ),
+    OmnibarCommand::new("navigation.location", OmnibarMode::Path, "omnibar-path"),
+    OmnibarCommand::new("view.search", OmnibarMode::Search, "omnibar-search"),
+    OmnibarCommand::new("view.filter", OmnibarMode::Filter, "omnibar-filter"),
+    OmnibarCommand::new("view.command", OmnibarMode::Command, "omnibar-command"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -277,7 +245,21 @@ pub fn project_custom_toolbar(layout: &ToolbarLayout) -> CustomToolbarProjection
 pub fn customizable_commands(
     registry: &CommandRegistry,
 ) -> impl Iterator<Item = &CommandDefinition> {
-    registry.commands().iter()
+    registry
+        .commands()
+        .iter()
+        .filter(|command| is_direct_surface_command(command))
+}
+
+#[must_use]
+pub fn is_direct_surface_command(command: &CommandDefinition) -> bool {
+    !matches!(
+        command.action(),
+        CommandAction::OpenWith
+            | CommandAction::SetDefaultApplication
+            | CommandAction::SendTo
+            | CommandAction::CustomAction
+    )
 }
 
 #[must_use]
@@ -286,13 +268,17 @@ pub fn resolve_command_mode<'a>(
     query: &str,
 ) -> Option<&'a CommandDefinition> {
     let query = query.trim();
-    registry.get(query).or_else(|| {
-        registry.commands().iter().find(|command| {
-            command
-                .label_key()
-                .rsplit('.')
-                .next()
-                .is_some_and(|label| label == query)
+    registry
+        .get(query)
+        .filter(|command| is_direct_surface_command(command))
+        .or_else(|| {
+            registry.commands().iter().find(|command| {
+                is_direct_surface_command(command)
+                    && command
+                        .label_key()
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|label| label == query)
+            })
         })
-    })
 }

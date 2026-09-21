@@ -38,30 +38,30 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `pane.focus_next` | `CanFocusNextPane` | — | command-mode, customizable, navigation-toolbar, shortcut-default, static-shortcut |
 | `selection.select_all` | `HasItems` | background | command-mode, customizable, shortcut-default, static-shortcut |
 | `selection.clear` | `HasSelection` | — | command-mode, customizable, shortcut-default |
-| `item.properties` | `HasSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, trash-item, unsupported-file | command-mode, customizable, shortcut-default, static-shortcut |
+| `item.properties` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, trash-item, unsupported-file | command-mode, customizable, shortcut-default, static-shortcut |
 | `app.settings` | `Always` | — | command-mode, custom-visible, customizable, navigation-toolbar, shortcut-default |
 | `file.open` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, mount, pinned-directory, read-only-file, sidebar, unsupported-file | command-mode, customizable |
-| `file.open_with` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `file.open_with` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | — |
 | `file.choose_application` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `file.set_default_application` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `clipboard.send_to` | `WritableDestination` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `clipboard.cut` | `HasSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
-| `clipboard.copy` | `HasSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
-| `clipboard.copy_to` | `DestinationCopy` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `clipboard.move_to` | `DestinationMove` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `clipboard.paste_into` | `PasteInto` | background, directory, pinned-directory | command-mode, custom-visible, customizable, shortcut-default |
-| `file.rename` | `WritableExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
-| `file.duplicate` | `WritableSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `file.create_symbolic_link` | `WritableExactlyOneSelectionCapability(SymbolicLinks)` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `file.create_hard_link` | `WritableExactlyOneFileCapability(HardLinks)` | archive, executable, file, hidden-file, read-only-file, unsupported-file | command-mode, customizable |
-| `file.compress` | `WritableNonArchive` | directory, executable, file, hidden-file, pinned-directory | command-mode, customizable |
+| `file.set_default_application` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | — |
+| `clipboard.send_to` | `WritableDestination` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | — |
+| `clipboard.cut` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
+| `clipboard.copy` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
+| `clipboard.copy_to` | `DestinationCopy` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `clipboard.move_to` | `DestinationMove` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `clipboard.paste_into` | `PasteInto` | background, directory, multi-selection, pinned-directory | command-mode, custom-visible, customizable, shortcut-default |
+| `file.rename` | `WritableExactlyOneSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
+| `file.duplicate` | `WritableSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `file.create_symbolic_link` | `WritableExactlyOneSelectionCapability(SymbolicLinks)` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `file.create_hard_link` | `WritableExactlyOneFileCapability(HardLinks)` | archive, executable, file, hidden-file, multi-selection, read-only-file, unsupported-file | command-mode, customizable |
+| `file.compress` | `WritableNonArchive` | directory, executable, file, hidden-file, multi-selection, pinned-directory | command-mode, customizable |
 | `archive.extract` | `DestinationExtract` | archive | command-mode, customizable |
 | `archive.extract_here` | `WritableArchive` | archive | command-mode, customizable |
-| `file.hide` | `Hide` | archive, directory, executable, file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `file.hide` | `Hide` | archive, directory, executable, file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
 | `file.unhide` | `Unhide` | hidden-file | command-mode, customizable |
-| `file.move_to_trash` | `WritableSelectionCapability(Trash)` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
-| `file.delete_permanently` | `WritableSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, trash-item, unsupported-file | command-mode, customizable, shortcut-default |
-| `item.permissions` | `Capability(Permissions)` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `file.move_to_trash` | `WritableSelectionCapability(Trash)` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `file.delete_permanently` | `WritableSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, trash-item, unsupported-file | command-mode, customizable, shortcut-default |
+| `item.permissions` | `Capability(Permissions)` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
 | `directory.open_as_administrator` | `LocalDirectory` | directory, pinned-directory | command-mode, customizable |
 | `file.run_as_administrator` | `LocalExecutable` | executable | command-mode, customizable |
 | `create.directory` | `WritableLocation` | background | command-mode, customizable |
@@ -75,7 +75,7 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `directory.pin` | `UnpinnedDirectory` | directory, sidebar | command-mode, customizable |
 | `directory.unpin` | `PinnedDirectory` | pinned-directory | command-mode, customizable |
 | `item.copy_location` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, sidebar, trash-item, unsupported-file | command-mode, customizable |
-| `item.tags` | `Capability(Tags)` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `item.tags` | `Capability(Tags)` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
 | `tag.rename` | `Tag` | tag | command-mode, customizable |
 | `tag.delete` | `Tag` | tag | command-mode, customizable |
 | `directory.share` | `ProviderAction(Share)` | directory, pinned-directory | command-mode, customizable |
@@ -87,4 +87,4 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `mount.power_off` | `ProviderAction(PowerOff)` | mount | command-mode, customizable |
 | `trash.restore` | `TrashItem` | trash-item | command-mode, customizable |
 | `trash.empty` | `TrashBackground` | trash-background | command-mode, customizable |
-| `actions.custom` | `CustomActionSupportsRemote` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
+| `actions.custom` | `CustomActionSupportsRemote` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | — |

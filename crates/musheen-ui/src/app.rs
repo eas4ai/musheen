@@ -31,8 +31,8 @@ use crate::status_bar::status_text_with_size;
 use crate::status_center::{OperationStatus, OperationStatusEntry, TrashItem, TrashSurfaceModel};
 use crate::toolbar::{
     NAVIGATION_LEADING_IDS, NAVIGATION_TRAILING_IDS, OMNIBAR_COMMANDS, SEARCH_COMMAND_ID,
-    TAB_STRIP_COMMAND_IDS, VIEW_COMMAND_IDS, omnibar_command_for_action, project_custom_toolbar,
-    resolve_command_mode, static_shortcut_declarations,
+    TAB_STRIP_COMMAND_IDS, VIEW_COMMAND_IDS, is_direct_surface_command, omnibar_command_for_action,
+    project_custom_toolbar, resolve_command_mode, static_shortcut_declarations,
 };
 use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
@@ -132,6 +132,9 @@ const GRID_GAP: f32 = 8.0;
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(250);
 const OPERATION_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
 const XATTR_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+type CommandDispatchProbe = Arc<Mutex<Vec<(Box<str>, bool)>>>;
 
 gpui_kit::actions!(
     musheen,
@@ -1126,6 +1129,10 @@ struct MusheenApp {
     trash_states: HashMap<TabId, TrashState>,
     trash_focus: HashMap<TabId, CommandTargetRef>,
     pending_empty_trash: Option<MenuInvocation>,
+    #[cfg(test)]
+    trash_purge_probe: Option<Arc<Mutex<Vec<Vec<musheen_ops::TrashReceipt>>>>>,
+    #[cfg(test)]
+    command_dispatch_probe: Option<CommandDispatchProbe>,
     pending_restores: HashMap<WindowId, PendingRestore>,
     pending_drop: Option<PendingDrop>,
     pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
@@ -1347,6 +1354,10 @@ impl MusheenApp {
             trash_states: HashMap::new(),
             trash_focus: HashMap::new(),
             pending_empty_trash: None,
+            #[cfg(test)]
+            trash_purge_probe: None,
+            #[cfg(test)]
+            command_dispatch_probe: None,
             pending_restores: HashMap::new(),
             pending_drop: None,
             pending_catalog_moves: HashMap::new(),
@@ -1836,7 +1847,27 @@ impl MusheenApp {
             return;
         };
         let request = self.active_command_request(command.action());
-        if !command.state(request.context()).is_enabled() {
+        let state = command
+            .state(request.context())
+            .map_disabled_reason(|reason| self.catalog.localize_reason(reason));
+        #[cfg(test)]
+        if let Some(probe) = &self.command_dispatch_probe {
+            probe
+                .lock()
+                .expect("command dispatch probe lock is not poisoned")
+                .push((command_id.into(), state.is_enabled()));
+            if state.is_enabled() {
+                return;
+            }
+        }
+        if !state.is_enabled() {
+            self.operation_error = Some(
+                state
+                    .disabled_reason()
+                    .unwrap_or("the command is unavailable")
+                    .into(),
+            );
+            cx.notify();
             return;
         }
         let action = command.action();
@@ -2631,6 +2662,57 @@ impl MusheenApp {
         request.with_catalog_tag_names(self.catalog_binding.tag_names())
     }
 
+    fn send_to_destinations(&self, tab_id: TabId) -> Vec<crate::SendToDestination> {
+        let Some(sidebar) = self.sidebars.get(&tab_id) else {
+            return Vec::new();
+        };
+        let mut destinations = Vec::new();
+        for section in sidebar.sections().into_iter().filter(|section| {
+            matches!(
+                section.kind(),
+                SidebarSectionKind::Pinned
+                    | SidebarSectionKind::Mounts
+                    | SidebarSectionKind::Remote
+            )
+        }) {
+            for entry in section.items() {
+                if destinations
+                    .iter()
+                    .any(|destination: &crate::SendToDestination| {
+                        destination.path() == entry.location()
+                    })
+                {
+                    continue;
+                }
+                let writable = entry.is_available()
+                    && matches!(
+                        self.store.location_writable(entry.location()),
+                        Ok(CapabilityState::Supported)
+                    );
+                let destination = match section.kind() {
+                    SidebarSectionKind::Pinned => crate::SendToDestination::pinned(
+                        entry.label(),
+                        entry.location().clone(),
+                        writable,
+                    ),
+                    SidebarSectionKind::Mounts => crate::SendToDestination::removable(
+                        entry.label(),
+                        entry.location().clone(),
+                        writable,
+                    ),
+                    SidebarSectionKind::Remote => crate::SendToDestination::remote(
+                        entry.label(),
+                        entry.location().clone(),
+                        writable,
+                    ),
+                    _ => unreachable!("only Send To sidebar sections are selected"),
+                };
+                destinations.push(destination);
+            }
+        }
+        destinations
+    }
+
     fn compose_context_menu_at(
         &self,
         tab_id: TabId,
@@ -2638,7 +2720,11 @@ impl MusheenApp {
         location: StorePath,
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
-        self.compose_context_request(self.context_menu_request(tab_id, target, location, selection))
+        let send_to = self.send_to_destinations(tab_id);
+        let request = self
+            .context_menu_request(tab_id, target, location, selection)
+            .with_send_to(&send_to);
+        self.compose_context_request(request)
     }
 
     fn compose_context_request(&self, request: crate::ContextMenuRequest) -> ContextMenu {
@@ -2913,7 +2999,11 @@ impl MusheenApp {
             MenuInvocation::NeedsDestinationChooser(pending) => {
                 self.open_context_destination_chooser(pending, cx);
             }
-            MenuInvocation::Cancelled | MenuInvocation::Rejected(_) => {}
+            MenuInvocation::Rejected(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+            }
+            MenuInvocation::Cancelled => {}
         }
     }
 
@@ -3272,7 +3362,7 @@ impl MusheenApp {
                     cx.notify();
                 }
             }
-            (CommandAction::EmptyTrash, CommandParameters::None) => {
+            (CommandAction::EmptyTrash, CommandParameters::Location(_)) => {
                 if let Some(tab_id) = origin_tab
                     && let Some(targets) = captured_targets
                     && let Some(items) = self.trash_items_for_targets(tab_id, targets)
@@ -3293,7 +3383,7 @@ impl MusheenApp {
                 }
             }
             (
-                CommandAction::CopyTo | CommandAction::MoveTo,
+                CommandAction::CopyTo | CommandAction::MoveTo | CommandAction::SendTo,
                 CommandParameters::Destination {
                     targets,
                     destination,
@@ -3304,7 +3394,8 @@ impl MusheenApp {
                     cx.notify();
                     return;
                 }
-                let drop_action = if action == CommandAction::CopyTo {
+                let drop_action = if matches!(action, CommandAction::CopyTo | CommandAction::SendTo)
+                {
                     DropAction::Copy
                 } else {
                     DropAction::Move
@@ -3562,6 +3653,7 @@ impl MusheenApp {
                 | CommandAction::DirectoryProperties
                 | CommandAction::CopyTo
                 | CommandAction::MoveTo
+                | CommandAction::SendTo
                 | CommandAction::Restore
                 | CommandAction::EmptyTrash
                 | CommandAction::Pin
@@ -4644,7 +4736,7 @@ impl MusheenApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        self.context_menu_request(
+        let request = self.context_menu_request(
             tab.id(),
             if selection.is_empty() {
                 MenuTarget::Background
@@ -4653,7 +4745,13 @@ impl MusheenApp {
             },
             tab.location().clone(),
             selection,
-        )
+        );
+        if action == CommandAction::SendTo {
+            let send_to = self.send_to_destinations(tab.id());
+            request.with_send_to(&send_to)
+        } else {
+            request
+        }
     }
 
     fn render_omnibar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -4724,10 +4822,20 @@ impl MusheenApp {
             })
             .collect::<Vec<_>>();
         let mode_buttons = OMNIBAR_COMMANDS.map(|binding| {
+            let command = self
+                .shell
+                .commands()
+                .get(binding.command_id())
+                .expect("an omnibar command is registered");
+            let label = self
+                .catalog
+                .message(command.label_key())
+                .expect("an omnibar command label is localized")
+                .to_owned();
             Button::new(binding.button_id())
-                .label(binding.label())
-                .accessibility_label(format!("{} mode", binding.label()))
-                .tooltip(format!("Use {} mode", binding.label()))
+                .label(label.clone())
+                .accessibility_label(label.clone())
+                .tooltip(label)
                 .ghost()
                 .small()
                 .compact()
@@ -4892,7 +5000,17 @@ impl MusheenApp {
             .map(|settings| crate::settings::toolbar::toolbar_from_document(&settings.0))
             .unwrap_or_default();
         let projection = project_custom_toolbar(&layout);
-        let overflow = projection.overflow().to_vec();
+        let overflow = projection
+            .overflow()
+            .iter()
+            .filter(|id| {
+                self.shell
+                    .commands()
+                    .get(id.as_str())
+                    .is_some_and(is_direct_surface_command)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let host = cx.entity();
         let overflow_items = overflow
             .iter()
@@ -4947,7 +5065,12 @@ impl MusheenApp {
                 projection
                     .visible()
                     .iter()
-                    .filter(|id| self.shell.commands().get(id.as_str()).is_some())
+                    .filter(|id| {
+                        self.shell
+                            .commands()
+                            .get(id.as_str())
+                            .is_some_and(is_direct_surface_command)
+                    })
                     .map(|id| {
                         self.named_toolbar_button(
                             id.as_str(),
@@ -5959,6 +6082,15 @@ impl MusheenApp {
             .is_some_and(|challenge| challenge.confirm(receipts.len(), true).is_ok());
         if !confirmed {
             self.operation_error = Some("Trash changed before it could be emptied".into());
+            cx.notify();
+            return;
+        }
+        #[cfg(test)]
+        if let Some(probe) = &self.trash_purge_probe {
+            probe
+                .lock()
+                .expect("trash purge probe lock is not poisoned")
+                .push(receipts);
             cx.notify();
             return;
         }
@@ -8092,6 +8224,253 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    async fn every_static_shortcut_reaches_its_live_handler_in_browser_and_input_contexts(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let probe = Arc::clone(&probe);
+            let view = cx.new(|cx| {
+                let mut state = MusheenApp::new_with_session_store(fixture, None, cx);
+                state.command_dispatch_probe = Some(probe);
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let expected = [
+            ("navigation.back", "alt-left", true, false),
+            ("navigation.forward", "alt-right", true, false),
+            ("navigation.parent", "alt-up", true, true),
+            ("navigation.refresh", "f5", true, true),
+            ("navigation.location", "ctrl-l", true, true),
+            ("view.search", "ctrl-f", false, true),
+            ("view.filter", "ctrl-shift-f", true, true),
+            ("view.command", "ctrl-shift-p", true, true),
+            ("tab.new", "ctrl-t", true, true),
+            ("tab.close", "ctrl-w", true, false),
+            ("tab.reopen_closed", "ctrl-shift-t", true, false),
+            ("pane.split", "f3", true, true),
+            ("pane.focus_next", "f6", true, false),
+            ("selection.select_all", "ctrl-a", false, true),
+            ("view.hidden", "ctrl-h", false, true),
+            ("view.details", "ctrl-1", true, true),
+            ("view.list", "ctrl-2", true, true),
+            ("view.cards", "ctrl-3", true, true),
+            ("view.grid", "ctrl-4", true, true),
+            ("view.columns", "ctrl-5", true, true),
+            ("view.adaptive", "ctrl-6", true, true),
+            ("view.sidebar", "ctrl-b", true, true),
+            ("item.properties", "alt-enter", true, false),
+        ];
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            for (id, chord, runs_in_input, enabled) in expected {
+                probe.lock().unwrap().clear();
+                app.update(cx, |state, _| state.operation_error = None);
+                let content_focus = app.read(cx).content_focus.clone();
+                content_focus.focus(window, cx);
+                window.press(chord, cx);
+                assert_eq!(
+                    probe
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .map(|attempt| (attempt.0.as_ref(), attempt.1)),
+                    Some((id, enabled)),
+                    "{chord} must reach the browser handler and policy for {id}",
+                );
+                assert_eq!(
+                    app.read(cx).operation_error.is_some(),
+                    !enabled,
+                    "{chord} must surface its Browser-context refusal for {id}",
+                );
+
+                probe.lock().unwrap().clear();
+                app.update(cx, |state, _| state.operation_error = None);
+                let input = app.read(cx).omnibar_input.as_ref().unwrap().clone();
+                input.update(cx, |input, cx| input.focus(window, cx));
+                window.press(chord, cx);
+                assert_eq!(
+                    probe
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .map(|attempt| (attempt.0.as_ref(), attempt.1)),
+                    runs_in_input.then_some((id, enabled)),
+                    "{chord} Input-context routing drifted for {id}",
+                );
+                assert_eq!(
+                    app.read(cx).operation_error.is_some(),
+                    runs_in_input && !enabled,
+                    "{chord} must surface its Input-context refusal for {id}",
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn live_send_to_uses_exact_destination_and_open_with_refusal_is_visible(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("send-me.txt");
+        let destination = temporary.path().join("archive");
+        filesystem::write(&source, b"send-to payload").unwrap();
+        filesystem::create_dir(&destination).unwrap();
+        let destination_path = StorePath::from_unix_path(destination.as_os_str());
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(browser, |_, window, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                let item = state
+                    .focused_directory()
+                    .view()
+                    .items()
+                    .iter()
+                    .find(|item| item.path().as_unix_path() == Some(source.as_path()))
+                    .unwrap()
+                    .clone();
+                state.select_item(tab, item.id().clone(), cx);
+                state.sidebars.get_mut(&tab).unwrap().set_section_items(
+                    SidebarSectionKind::Pinned,
+                    [SidebarEntry::new("Archive", destination_path.clone())],
+                );
+                let request = state.active_command_request(CommandAction::SendTo);
+                let menu = state.compose_context_request(request);
+                let entry = MusheenApp::menu_entry_by_id(&menu, "clipboard.send_to")
+                    .unwrap()
+                    .clone();
+                assert_eq!(
+                    entry.generated_parameters().unwrap(),
+                    CommandParameters::Destination {
+                        targets: vec![
+                            CommandTargetRef::new(item.id().clone(), item.path().clone(),).unwrap()
+                        ],
+                        destination: destination_path.clone(),
+                    }
+                );
+                let destination_entry = entry
+                    .submenu()
+                    .and_then(|submenu| submenu.destination(destination.to_str().unwrap()))
+                    .expect("Send To exposes the writable sidebar destination")
+                    .clone();
+                state.dispatch_context_entry(destination_entry, cx);
+                assert!(
+                    state.operation_error.is_none(),
+                    "Send To dispatch failed: {:?}",
+                    state.operation_error
+                );
+
+                let open_with = MusheenApp::menu_entry_by_id(&menu, "file.open_with")
+                    .unwrap()
+                    .clone();
+                state.dispatch_context_entry(open_with, cx);
+                assert!(
+                    state
+                        .operation_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("association backend")),
+                    "Open With refusal must be visible: {:?}",
+                    state.operation_error,
+                );
+
+                let registry = musheen_core::CommandRegistry::built_in();
+                let mut toolbar = musheen_core::ToolbarLayout::default();
+                toolbar.add("clipboard.send_to", &registry).unwrap();
+                toolbar.add("file.open_with", &registry).unwrap();
+                let mut document = musheen_desktop::SettingsDocument::default();
+                document
+                    .set_value("layout.toolbar", &toolbar.export())
+                    .unwrap();
+                cx.set_global(crate::settings::RuntimeSettings(document));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("custom-toolbar-clipboard.send_to")
+                    .is_none()
+            );
+            assert!(window.try_find("custom-toolbar-file.open_with").is_none());
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            destination.join("send-me.txt").exists()
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn arabic_omnibar_mode_buttons_use_registry_localized_labels(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"fixture").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut state =
+                    MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx);
+                state.catalog = Catalog::load(Locale::Ar).unwrap();
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let state = app.read(cx);
+            for binding in OMNIBAR_COMMANDS {
+                let command = state.shell.commands().get(binding.command_id()).unwrap();
+                let localized = state.catalog.message(command.label_key()).unwrap();
+                assert_eq!(
+                    window.find(binding.button_id()).label(),
+                    Some(localized),
+                    "{} visible and accessibility label drifted from the registry catalog",
+                    binding.command_id(),
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     async fn customization_tab_toolbar_tracks_live_navigation_state(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -10051,6 +10430,10 @@ mod tests {
                     )
                 })
                 .collect();
+            let expected_receipts = items
+                .iter()
+                .map(|item| item.receipt().clone())
+                .collect::<Vec<_>>();
             let targets: Vec<_> = items.iter().map(trash_command_target).collect();
             for trash_state in [
                 TrashState::Loading,
@@ -10147,14 +10530,70 @@ mod tests {
                 .tab_mut(tab_id)
                 .unwrap()
                 .set_selection(vec![targets[0].id().clone()]);
+            let purge_probe = Arc::new(Mutex::new(Vec::new()));
+            state.trash_purge_probe = Some(Arc::clone(&purge_probe));
             state.dispatch_command("trash.empty", cx);
             assert!(matches!(
                 &state.pending_empty_trash,
                 Some(MenuInvocation::NeedsConfirmation(pending)) if pending.selection() == targets
             ));
+            // Cancellation must retain every captured receipt and invoke no purge.
             state.pending_empty_trash = None;
+            assert!(purge_probe.lock().unwrap().is_empty());
+
+            state.dispatch_command("trash.empty", cx);
+            state.confirm_empty_trash(cx);
+            assert_eq!(
+                purge_probe.lock().unwrap().as_slice(),
+                std::slice::from_ref(&expected_receipts),
+                "confirmation must invoke one purge with every captured receipt",
+            );
+
+            state.dispatch_command("trash.empty", cx);
+            state.trash_states.insert(
+                tab_id,
+                TrashState::Ready(TrashSurfaceModel::new(Vec::new())),
+            );
+            state.confirm_empty_trash(cx);
+            assert_eq!(purge_probe.lock().unwrap().len(), 1);
+            assert_eq!(
+                state.operation_error.as_deref(),
+                Some(state.catalog.message("context.target-changed").unwrap()),
+            );
+
+            state.trash_states.insert(
+                tab_id,
+                TrashState::Ready(TrashSurfaceModel::new(
+                    expected_receipts
+                        .iter()
+                        .cloned()
+                        .map(|receipt| TrashItem::new(receipt, 1))
+                        .collect(),
+                )),
+            );
+            state.dispatch_command("trash.empty", cx);
+            state
+                .navigation
+                .navigate_focused(StorePath::from_unix_path(temporary.path().as_os_str()));
+            state.confirm_empty_trash(cx);
+            assert_eq!(
+                purge_probe.lock().unwrap().len(),
+                1,
+                "confirmation must refuse a changed origin location",
+            );
+            assert_eq!(
+                state.operation_error.as_deref(),
+                Some(state.catalog.message("context.target-changed").unwrap()),
+            );
+            state.navigation.navigate_focused(trash_store_path());
+            state
+                .navigation
+                .tab_mut(tab_id)
+                .unwrap()
+                .set_selection(vec![targets[0].id().clone()]);
             // The synthetic receipt cannot restore a real file. A backend error
             // proves shared dispatch reached Restore rather than silently refusing it.
+            state.operation_error = None;
             state.dispatch_command("trash.restore", cx);
         });
         cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
