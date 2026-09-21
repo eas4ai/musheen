@@ -15,6 +15,7 @@ mod session;
 mod settings;
 mod status;
 mod thumbnail;
+mod volumes;
 
 pub use apps::*;
 pub use catalog::*;
@@ -31,3 +32,4 @@ pub use session::*;
 pub use settings::*;
 pub use status::*;
 pub use thumbnail::*;
+pub use volumes::*;

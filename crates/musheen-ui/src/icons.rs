@@ -122,7 +122,7 @@ pub fn lucide_icon(icon_key: &str) -> Option<LucideIcon> {
         "eye" => LucideIcon::Eye,
         "eye-off" => LucideIcon::EyeOff,
         "shield" => LucideIcon::Shield,
-        "shield-check" => LucideIcon::ShieldCheck,
+        "shield-check" | "lock-keyhole" => LucideIcon::ShieldCheck,
         "pin" => LucideIcon::Pin,
         "pin-off" => LucideIcon::PinOff,
         "map-pin" => LucideIcon::MapPin,

@@ -4401,16 +4401,20 @@ dependencies = [
 name = "musheen-desktop"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "blake3",
  "fast_image_resize",
  "freedesktop",
+ "futures-lite",
  "image",
  "md-5",
  "musheen-core",
  "musheen-ops",
+ "nix",
  "open",
  "png 0.18.1",
  "posix-acl",
+ "proc-mounts",
  "rustix",
  "serde",
  "serde_json",
@@ -4421,6 +4425,7 @@ dependencies = [
  "wax",
  "xattr",
  "xdg-mime",
+ "zbus",
 ]
 
 [[package]]

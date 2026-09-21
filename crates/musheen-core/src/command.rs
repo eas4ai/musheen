@@ -233,16 +233,20 @@ fn paste_state(context: &CommandContext) -> CommandState {
 fn provider_action_state(context: &CommandContext, action: ProviderAction) -> CommandState {
     let expected_target = match action {
         ProviderAction::Share => CommandTarget::Directory,
-        ProviderAction::Unmount | ProviderAction::Eject | ProviderAction::PowerOff => {
-            CommandTarget::Mount
-        }
+        ProviderAction::Mount
+        | ProviderAction::Unmount
+        | ProviderAction::Eject
+        | ProviderAction::Unlock
+        | ProviderAction::PowerOff => CommandTarget::Mount,
     };
     if context.selection_count != 1 || context.target != expected_target {
         return CommandState::disabled(match action {
             ProviderAction::Share => "exactly one directory must be selected",
-            ProviderAction::Unmount | ProviderAction::Eject | ProviderAction::PowerOff => {
-                "exactly one mount must be selected"
-            }
+            ProviderAction::Mount
+            | ProviderAction::Unmount
+            | ProviderAction::Eject
+            | ProviderAction::Unlock
+            | ProviderAction::PowerOff => "exactly one mount must be selected",
         });
     }
     match context.provider_action(action) {
@@ -405,8 +409,10 @@ pub enum CommandAction {
     Preview,
     BrowseArchive,
     Run,
+    Mount,
     Unmount,
     Eject,
+    Unlock,
     PowerOff,
     Restore,
     EmptyTrash,
@@ -414,7 +420,7 @@ pub enum CommandAction {
     ExtractHere,
 }
 impl CommandAction {
-    pub const ALL: [Self; 82] = [
+    pub const ALL: [Self; 84] = [
         Self::NavigateBack,
         Self::NavigateForward,
         Self::NavigateParent,
@@ -490,8 +496,10 @@ impl CommandAction {
         Self::Preview,
         Self::BrowseArchive,
         Self::Run,
+        Self::Mount,
         Self::Unmount,
         Self::Eject,
+        Self::Unlock,
         Self::PowerOff,
         Self::Restore,
         Self::EmptyTrash,
@@ -2075,6 +2083,16 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             D::Review,
         ),
         command(
+            "mount.mount",
+            "command.mount",
+            "hard-drive",
+            &[],
+            P::ProviderAction(ProviderAction::Mount),
+            A::Mount,
+            G::Open,
+            D::None,
+        ),
+        command(
             "mount.unmount",
             "command.unmount",
             "eject",
@@ -2092,6 +2110,16 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             P::ProviderAction(ProviderAction::Eject),
             A::Eject,
             G::Destructive,
+            D::Review,
+        ),
+        command(
+            "mount.unlock",
+            "command.unlock",
+            "lock-keyhole",
+            &[],
+            P::ProviderAction(ProviderAction::Unlock),
+            A::Unlock,
+            G::Open,
             D::Review,
         ),
         command(

@@ -16,9 +16,9 @@ use musheen_core::{
     DisplayPath, ItemKind, Store, StorePath,
 };
 use musheen_desktop::{
-    AclEntry, AclQualifier, AclState, AggregateValue, ChecksumAlgorithm, ChecksumResult,
+    AclEntry, AclQualifier, AclState, AggregateValue, Capacity, ChecksumAlgorithm, ChecksumResult,
     ChecksumService, PropertyError, PropertyRefresh, PropertySnapshot, PropertyTimestamp,
-    RecursiveSize, TagError, XattrState,
+    RecursiveSize, TagError, Volume, VolumeCapabilities, VolumeId, XattrState,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{JobId, MetadataChange, MetadataScope};
@@ -31,6 +31,225 @@ use std::time::Duration;
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 type RefreshWorkResult = Result<(PropertyRefresh, Option<PropertySnapshot>), PropertyError>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumePropertiesModel {
+    id: VolumeId,
+    label: Box<str>,
+    device: PathBuf,
+    mount_points: Vec<PathBuf>,
+    filesystem_type: Option<Box<str>>,
+    capacity: Option<Capacity>,
+    read_only: bool,
+    capabilities: VolumeCapabilities,
+}
+
+impl VolumePropertiesModel {
+    #[must_use]
+    pub fn new(volume: &Volume) -> Self {
+        Self {
+            id: volume.id().clone(),
+            label: volume.label().into(),
+            device: volume.device().to_path_buf(),
+            mount_points: volume.mount_points().to_vec(),
+            filesystem_type: volume.filesystem_type().map(Into::into),
+            capacity: volume.capacity(),
+            read_only: volume.is_read_only(),
+            capabilities: volume.capabilities(),
+        }
+    }
+
+    /// Replace live device facts while preserving the dialog identity.
+    /// Returns `false` for a different volume or an unchanged snapshot.
+    pub fn update(&mut self, volume: &Volume) -> bool {
+        if volume.id() != &self.id {
+            return false;
+        }
+        let replacement = Self::new(volume);
+        if *self == replacement {
+            return false;
+        }
+        *self = replacement;
+        true
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &VolumeId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    #[must_use]
+    pub fn device(&self) -> &std::path::Path {
+        &self.device
+    }
+
+    #[must_use]
+    pub fn mount_points(&self) -> &[PathBuf] {
+        &self.mount_points
+    }
+
+    #[must_use]
+    pub fn filesystem_type(&self) -> Option<&str> {
+        self.filesystem_type.as_deref()
+    }
+
+    #[must_use]
+    pub const fn capacity(&self) -> Option<Capacity> {
+        self.capacity
+    }
+
+    #[must_use]
+    pub const fn available_bytes(&self) -> Option<u64> {
+        match self.capacity {
+            Some(capacity) => Some(capacity.available_bytes()),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    #[must_use]
+    pub const fn capabilities(&self) -> VolumeCapabilities {
+        self.capabilities
+    }
+}
+
+/// A device Properties surface whose identity survives mount-table and
+/// UDisks2 updates. The application owns the subscription and pushes each
+/// changed `Volume` into every open window; this view never polls.
+pub(crate) struct VolumePropertiesWindow {
+    model: VolumePropertiesModel,
+    catalog: Catalog,
+}
+
+impl VolumePropertiesWindow {
+    #[must_use]
+    pub(crate) fn new(model: VolumePropertiesModel, catalog: Catalog) -> Self {
+        Self { model, catalog }
+    }
+
+    pub(crate) fn update_volume(&mut self, volume: &Volume, cx: &mut Context<Self>) {
+        self.update_model(VolumePropertiesModel::new(volume), cx);
+    }
+
+    fn update_model(&mut self, replacement: VolumePropertiesModel, cx: &mut Context<Self>) {
+        if replacement.id() == self.model.id() && replacement != self.model {
+            self.model = replacement;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    fn model(&self) -> &VolumePropertiesModel {
+        &self.model
+    }
+
+    fn row(&self, id: &'static str, label: &'static str, value: String) -> AnyElement {
+        let label = self.catalog.message(label).unwrap_or(label);
+        let accessible_label = format!("{label}: {value}");
+        div()
+            .id(id)
+            .test_support()
+            .aria_label(accessible_label)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(label.to_owned())
+            .child(value)
+            .into_any_element()
+    }
+}
+
+impl Render for VolumePropertiesWindow {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let mounts = if self.model.mount_points().is_empty() {
+            self.catalog
+                .message("properties-unavailable")
+                .unwrap_or("Unavailable")
+                .to_owned()
+        } else {
+            self.model
+                .mount_points()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let capacity = self.model.capacity().map_or_else(
+            || {
+                self.catalog
+                    .message("properties-unavailable")
+                    .unwrap_or("Unavailable")
+                    .to_owned()
+            },
+            |capacity| {
+                format!(
+                    "{} / {}",
+                    format_size(capacity.available_bytes()),
+                    format_size(capacity.total_bytes())
+                )
+            },
+        );
+        let access = self
+            .catalog
+            .message(if self.model.is_read_only() {
+                "properties-read-only"
+            } else {
+                "properties-read-write"
+            })
+            .unwrap_or(if self.model.is_read_only() {
+                "Read only"
+            } else {
+                "Read and write"
+            })
+            .to_owned();
+        let filesystem = self
+            .model
+            .filesystem_type()
+            .unwrap_or_else(|| {
+                self.catalog
+                    .message("properties-unavailable")
+                    .unwrap_or("Unavailable")
+            })
+            .to_owned();
+
+        div()
+            .id("volume-properties")
+            .test_support()
+            .key_context("PropertiesWindow")
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_xl().child(self.model.label().to_owned()))
+            .child(self.row(
+                "volume-properties-device",
+                "properties-mount-source",
+                self.model.device().display().to_string(),
+            ))
+            .child(self.row("volume-properties-mounts", "properties-mount-point", mounts))
+            .child(self.row(
+                "volume-properties-filesystem",
+                "properties-filesystem",
+                filesystem,
+            ))
+            .child(self.row(
+                "volume-properties-capacity",
+                "properties-available",
+                capacity,
+            ))
+            .child(self.row("volume-properties-access", "properties-mount-mode", access))
+    }
+}
 
 gpui_kit::actions!(properties, [CancelProperties, ConfirmProperties]);
 
@@ -2782,6 +3001,71 @@ mod tests {
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use standard_library::fs as filesystem;
     use std as standard_library;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn volume_properties_fixture(available_bytes: u64, read_only: bool) -> VolumePropertiesModel {
+        VolumePropertiesModel {
+            id: VolumeId::new("fixture-volume").unwrap(),
+            label: "Fixture volume".into(),
+            device: "/dev/sdz1".into(),
+            mount_points: vec!["/media/fixture".into()],
+            filesystem_type: Some("ext4".into()),
+            capacity: Some(Capacity::new(1_000, available_bytes)),
+            read_only,
+            capabilities: VolumeCapabilities::default(),
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn open_volume_properties_window_updates_live_without_reopening(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let slot = Rc::new(RefCell::new(None));
+        let opened = Rc::clone(&slot);
+        let handle = cx.open_window(size(px(760.), px(620.)), move |window, cx| {
+            let view = cx.new(|_| {
+                VolumePropertiesWindow::new(
+                    volume_properties_fixture(400, false),
+                    Catalog::system().unwrap(),
+                )
+            });
+            opened.borrow_mut().replace(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow().clone().expect("the volume view opened");
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("volume-properties-capacity").label(),
+                Some("Available: 400 B / 1000 B")
+            );
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            view.update(cx, |window, cx| {
+                window.update_model(volume_properties_fixture(125, true), cx);
+            });
+        });
+        cx.update(|cx| {
+            assert_eq!(view.read(cx).model().available_bytes(), Some(125));
+            assert!(view.read(cx).model().is_read_only());
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("volume-properties-capacity").label(),
+                Some("Available: 125 B / 1000 B")
+            );
+            assert_eq!(
+                window.find("volume-properties-access").label(),
+                Some("Mount mode: Read only")
+            );
+        })
+        .unwrap();
+    }
 
     #[gpui_kit::test]
     async fn properties_failure_window_localizes_aria_and_close_at_200_percent(

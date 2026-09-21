@@ -7,8 +7,9 @@ use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, OpenWithDialog, OpenWithDialogEvent,
     OpenWithIntent as DialogOpenWithIntent, OpenWithModel, PropertiesFailureWindow, PropertiesPage,
     PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow, ProviderPropertiesWindowData,
-    TagDelta, TagWriter, conflict_window_options, install_open_with_key_bindings,
-    install_properties_key_bindings, open_with_window_options, properties_window_options,
+    TagDelta, TagWriter, VolumePropertiesModel, VolumePropertiesWindow, conflict_window_options,
+    install_open_with_key_bindings, install_properties_key_bindings, open_with_window_options,
+    properties_window_options,
 };
 use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
 use crate::i18n::Catalog;
@@ -45,7 +46,7 @@ use crate::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
+use gpui_kit::component::input::{Escape, Input, InputContentType, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Root, Selectable, Sizable};
@@ -68,9 +69,11 @@ use musheen_desktop::{
     ApplicationIconProvider, CatalogDocument, CatalogStore, ConflictDecisionStore,
     DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths, FolderIdentity,
     FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
-    MimeAppsSnapshot, MimeDetector, PreviewDocument, ProcessRunner, SessionStore,
-    SystemProcessRunner, TagMoveOutcome, TerminalCommand, ThumbnailCache, ThumbnailLimits,
-    ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
+    MimeAppsSnapshot, MimeDetector, MountOperation, OperationUsage, OperationUse, PreviewDocument,
+    ProcessRunner, SessionStore, SystemProcessRunner, TagMoveOutcome, TerminalCommand,
+    ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest,
+    ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError, VolumeId,
+    VolumeService, VolumeSubscription,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -1101,6 +1104,7 @@ struct ContextReviewDialog {
     command: String,
     move_operation: bool,
     targets: Vec<String>,
+    cancellation_warning: Option<String>,
     strings: ContextDialogStrings,
     focus: FocusHandle,
     pending_focus: bool,
@@ -1113,6 +1117,7 @@ impl ContextReviewDialog {
         command: String,
         move_operation: bool,
         targets: Vec<String>,
+        cancellation_warning: Option<String>,
         strings: ContextDialogStrings,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1120,6 +1125,7 @@ impl ContextReviewDialog {
             command,
             move_operation,
             targets,
+            cancellation_warning,
             strings,
             focus: cx.focus_handle(),
             pending_focus: true,
@@ -1187,6 +1193,16 @@ impl Render for ContextReviewDialog {
                     .aria_label(reversible.clone())
                     .child(reversible),
             )
+            .when_some(self.cancellation_warning.clone(), |dialog, warning| {
+                dialog.child(
+                    div()
+                        .id("context-review-cancellation-warning")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(warning.clone())
+                        .child(warning),
+                )
+            })
             .child(self.strings.authorization_unavailable.clone())
             .child(
                 div()
@@ -1209,6 +1225,139 @@ impl Render for ContextReviewDialog {
                                 window.defer(cx, |window, _| window.remove_window());
                             })),
                     ),
+            )
+    }
+}
+
+#[derive(Clone)]
+enum VolumeUnlockEvent {
+    Submitted(Box<str>),
+    Cancelled,
+}
+
+struct VolumeUnlockDialog {
+    volume_label: Box<str>,
+    secret: Entity<InputState>,
+    focus: FocusHandle,
+    pending_focus: bool,
+    empty: bool,
+    catalog: Catalog,
+}
+
+impl EventEmitter<VolumeUnlockEvent> for VolumeUnlockDialog {}
+
+impl VolumeUnlockDialog {
+    fn new(
+        volume_label: impl Into<Box<str>>,
+        catalog: Catalog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let placeholder = catalog
+            .message("volume-unlock-passphrase")
+            .expect("the unlock passphrase prompt is localized")
+            .to_owned();
+        Self {
+            volume_label: volume_label.into(),
+            secret: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .masked(true)
+            }),
+            focus: cx.focus_handle(),
+            pending_focus: true,
+            empty: false,
+            catalog,
+        }
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let secret = self.secret.read(cx).value().to_string();
+        if secret.is_empty() {
+            self.empty = true;
+            cx.notify();
+            return;
+        }
+        cx.emit(VolumeUnlockEvent::Submitted(secret.into()));
+        window.defer(cx, |window, _| window.remove_window());
+    }
+}
+
+impl Render for VolumeUnlockDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.secret
+                .update(cx, |secret, cx| secret.focus(window, cx));
+            self.pending_focus = false;
+        }
+        let title = self
+            .catalog
+            .message("volume-unlock-title")
+            .expect("the unlock title is localized")
+            .to_owned();
+        div()
+            .id("volume-unlock-dialog")
+            .test_support()
+            .key_context("VolumeUnlockDialog")
+            .role(Role::Dialog)
+            .aria_label(title.clone())
+            .track_focus(&self.focus)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .on_action(cx.listener(|_, _: &Escape, window, cx| {
+                cx.emit(VolumeUnlockEvent::Cancelled);
+                window.defer(cx, |window, _| window.remove_window());
+            }))
+            .child(div().text_lg().child(title))
+            .child(format!(
+                "{}: {}",
+                self.catalog
+                    .message("volume-unlock-volume")
+                    .expect("the unlock volume label is localized"),
+                self.volume_label
+            ))
+            .child(
+                Input::new(&self.secret)
+                    .id("volume-unlock-passphrase")
+                    .content_type(InputContentType::Password)
+                    .mask_toggle(),
+            )
+            .when(self.empty, |dialog| {
+                dialog.child(
+                    div()
+                        .id("volume-unlock-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .child(
+                            self.catalog
+                                .message("volume-unlock-empty")
+                                .expect("the empty-passphrase error is localized")
+                                .to_owned(),
+                        ),
+                )
+            })
+            .child(
+                Button::new("volume-unlock-submit")
+                    .label(
+                        self.catalog
+                            .message("command-unlock")
+                            .expect("the unlock command is localized"),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+            )
+            .child(
+                Button::new("volume-unlock-cancel")
+                    .label(
+                        self.catalog
+                            .message("dialog.cancel")
+                            .expect("the cancel action is localized"),
+                    )
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        cx.emit(VolumeUnlockEvent::Cancelled);
+                        window.defer(cx, |window, _| window.remove_window());
+                    })),
             )
     }
 }
@@ -1624,6 +1773,51 @@ impl SessionBinding {
     }
 }
 
+#[derive(Clone, Debug)]
+struct HubVolumeUsage {
+    hub: OperationHub,
+}
+
+impl OperationUsage for HubVolumeUsage {
+    fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
+        let status_model = self.hub.status();
+        let Ok(status) = status_model.lock() else {
+            return Vec::new();
+        };
+        status
+            .visible_entries()
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.status(),
+                    OperationStatus::Pending | OperationStatus::Running | OperationStatus::Paused
+                ) && entry
+                    .location()
+                    .as_unix_path()
+                    .is_some_and(|path| mounts.iter().any(|mount| path.starts_with(mount)))
+            })
+            .map(|entry| {
+                OperationUse::new(
+                    MountOperation::new(entry.id().get()),
+                    format!("{:?}", entry.kind()),
+                )
+            })
+            .collect()
+    }
+
+    fn cancel(&self, operations: &[OperationUse]) -> Result<(), VolumeError> {
+        for operation in operations {
+            let id = musheen_ops::JobId::new(operation.id().get()).ok_or_else(|| {
+                VolumeError::CancellationFailed("the operation ID is invalid".into())
+            })?;
+            self.hub
+                .cancel(id)
+                .map_err(|error| VolumeError::CancellationFailed(error.to_string().into()))?;
+        }
+        Ok(())
+    }
+}
+
 struct MusheenApp {
     directories: HashMap<TabId, DirectoryModel>,
     searches: HashMap<TabId, ActiveSearch>,
@@ -1668,6 +1862,9 @@ struct MusheenApp {
     operation_hub: OperationHub,
     operation_status_revision: u64,
     operation_error: Option<Box<str>>,
+    volumes: Arc<Mutex<VolumeService>>,
+    volume_revision: u64,
+    volume_properties_windows: Vec<(VolumeId, gpui_kit::WeakEntity<VolumePropertiesWindow>)>,
     application_notice: Option<&'static str>,
     desktop_paths: Option<DesktopPaths>,
     desktop_applications: DesktopApplicationService,
@@ -1852,6 +2049,12 @@ impl MusheenApp {
             .unwrap_or_else(|| OperationHub::new_with_provider_runtime(&limits, &providers));
         let operation_error = operation_hub.persistence_error();
         let operation_status_revision = operation_hub.status_revision();
+        let volumes = Arc::new(Mutex::new(
+            VolumeService::system_with_usage(Arc::new(HubVolumeUsage {
+                hub: operation_hub.clone(),
+            }))
+            .expect("the system volume service has no fallible construction"),
+        ));
         let catalog_projection_revision = catalog_binding.revision();
         let mut this = Self {
             custom_actions: custom_actions::from_settings(settings.as_ref()),
@@ -1901,6 +2104,9 @@ impl MusheenApp {
             operation_hub,
             operation_status_revision,
             operation_error,
+            volumes,
+            volume_revision: 0,
+            volume_properties_windows: Vec::new(),
             application_notice: None,
             desktop_paths: DesktopPaths::from_environment().ok(),
             desktop_applications: DesktopApplicationService::default(),
@@ -1929,6 +2135,12 @@ impl MusheenApp {
         this.start_load(location, cx);
         this.start_operation_status_refresh(cx);
         this.start_pending_xattr_reconciliation(cx);
+        // Production windows enable filesystem watching and consume the same
+        // event channel for volume changes. Deterministic test windows keep all
+        // host watchers disabled and inject model changes explicitly.
+        if this.watch_directories {
+            this.start_volume_refresh(cx);
+        }
         this
     }
 
@@ -1985,6 +2197,69 @@ impl MusheenApp {
             }
         })
         .detach();
+    }
+
+    fn start_volume_refresh(&mut self, cx: &mut Context<Self>) {
+        let volumes = Arc::clone(&self.volumes);
+        let subscription = VolumeSubscription::system();
+        cx.spawn(async move |this, cx| {
+            while let Ok(trigger) = subscription.recv().await {
+                let worker = Arc::clone(&volumes);
+                let work = cx.background_spawn(async move {
+                    let mut service = worker.lock().map_err(|_| {
+                        VolumeError::Protocol("the volume model lock is poisoned".into())
+                    })?;
+                    let report = service.handle(trigger)?;
+                    Ok::<_, VolumeError>((service.model().revision(), report.warning().cloned()))
+                });
+                let result = work.await;
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |state, cx| match result {
+                    Ok((revision, warning)) => {
+                        if revision != state.volume_revision {
+                            state.volume_revision = revision;
+                            state.sync_volume_projection(cx);
+                            cx.notify();
+                        }
+                        if let Some(warning) = warning
+                            && !matches!(
+                                warning,
+                                VolumeError::ServiceUnavailable(_) | VolumeError::Disconnected(_)
+                            )
+                        {
+                            state.operation_error = Some(warning.to_string().into());
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        state.operation_error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn sync_volume_projection(&mut self, cx: &mut Context<Self>) {
+        let model = match self.volumes.lock() {
+            Ok(service) => service.model().clone(),
+            Err(_) => return,
+        };
+        for sidebar in self.sidebars.values_mut() {
+            sidebar.sync_volumes(&model);
+        }
+        self.volume_properties_windows.retain(|(id, weak)| {
+            let Some(window) = weak.upgrade() else {
+                return false;
+            };
+            if let Some(volume) = model.get(id) {
+                window.update(cx, |window, cx| window.update_volume(volume, cx));
+            }
+            true
+        });
     }
 
     fn start_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
@@ -2488,6 +2763,9 @@ impl MusheenApp {
         if targets.is_empty() {
             return;
         }
+        if targets.len() == 1 && self.open_volume_properties_target(&targets[0], cx) {
+            return;
+        }
         let tag_targets = targets
             .iter()
             .map(|target| {
@@ -2566,6 +2844,38 @@ impl MusheenApp {
             })
             .expect("Musheen could not open a provider Properties window");
         }
+    }
+
+    fn open_volume_properties_target(
+        &mut self,
+        target: &CommandTargetRef,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(id) = volume_id_from_target(target) else {
+            return false;
+        };
+        let volume = self
+            .volumes
+            .lock()
+            .ok()
+            .and_then(|service| service.model().get(&id).cloned());
+        let Some(volume) = volume else {
+            self.operation_error = Some("the selected volume is no longer available".into());
+            cx.notify();
+            return true;
+        };
+        let title = properties_window_title(&self.catalog, volume.label(), 1);
+        let options = properties_window_options(title, cx);
+        let view = cx.new(|_| {
+            VolumePropertiesWindow::new(VolumePropertiesModel::new(&volume), self.catalog.clone())
+        });
+        let weak = view.downgrade();
+        cx.open_window(options, move |window, cx| {
+            cx.new(|cx| Root::new(view, window, cx))
+        })
+        .expect("Musheen could not open a volume Properties window");
+        self.volume_properties_windows.push((id, weak));
+        true
     }
 
     fn open_properties_paths(
@@ -3551,6 +3861,15 @@ impl MusheenApp {
                 .pins()
                 .contains(selected.id())
         });
+        let selected_volume = selection
+            .first()
+            .and_then(volume_id_from_target)
+            .and_then(|id| {
+                self.volumes
+                    .lock()
+                    .ok()
+                    .and_then(|service| service.model().get(&id).cloned())
+            });
         let item_target = if target == MenuTarget::Mount {
             CommandTarget::Mount
         } else if target == MenuTarget::SidebarLocation
@@ -3585,16 +3904,22 @@ impl MusheenApp {
         };
         // Location commands use the exact selected directory (or the pane
         // background), never the currently focused pane after the menu opens.
-        let command_location =
-            if matches!(item_target, CommandTarget::Directory | CommandTarget::Mount) {
-                selection
-                    .first()
-                    .map_or_else(|| location.clone(), |target| target.path().clone())
-            } else {
-                location.clone()
-            };
+        let command_location = if item_target == CommandTarget::Mount {
+            selected_volume
+                .as_ref()
+                .and_then(|volume| volume.mount_points().first())
+                .map(|path| StorePath::from_unix_path(path.as_os_str()))
+                .or_else(|| selection.first().map(|target| target.path().clone()))
+                .unwrap_or_else(|| location.clone())
+        } else if item_target == CommandTarget::Directory {
+            selection
+                .first()
+                .map_or_else(|| location.clone(), |target| target.path().clone())
+        } else {
+            location.clone()
+        };
         let capabilities = self.store.capabilities(&command_location);
-        let is_local = location.as_unix_path().is_some();
+        let is_local = command_location.as_unix_path().is_some();
         let writable_state = self
             .store
             .location_writable(&command_location)
@@ -3625,6 +3950,38 @@ impl MusheenApp {
         );
         let pane = self.navigation.focused_pane();
         let active_tab = pane.active_tab().id();
+        let provider_actions = selected_volume.as_ref().map_or_else(
+            || {
+                ProviderActionMatrix::from_volume_states(
+                    unsupported_provider_action.clone(),
+                    unsupported_provider_action.clone(),
+                    unsupported_provider_action.clone(),
+                    unsupported_provider_action.clone(),
+                    unsupported_provider_action.clone(),
+                    unsupported_provider_action.clone(),
+                )
+            },
+            |volume| {
+                let capabilities = volume.capabilities();
+                ProviderActionMatrix::from_volume_states(
+                    unsupported_provider_action.clone(),
+                    volume_capability_state(
+                        capabilities.can_mount,
+                        "this volume cannot be mounted",
+                    ),
+                    volume_capability_state(
+                        capabilities.can_unmount,
+                        "this volume cannot be unmounted",
+                    ),
+                    volume_capability_state(capabilities.can_eject, "this drive cannot be ejected"),
+                    volume_capability_state(capabilities.can_unlock, "this volume is not locked"),
+                    volume_capability_state(
+                        capabilities.can_power_off,
+                        "this drive cannot be powered off",
+                    ),
+                )
+            },
+        );
         CommandContext {
             can_go_back: self
                 .navigation
@@ -3681,12 +4038,7 @@ impl MusheenApp {
             target_is_pinned: selected_is_pinned,
             executable_run_enabled: matches!(executable_state, Some(CapabilityState::Supported)),
             capabilities,
-            provider_actions: ProviderActionMatrix::from_states(
-                unsupported_provider_action.clone(),
-                unsupported_provider_action.clone(),
-                unsupported_provider_action.clone(),
-                unsupported_provider_action,
-            ),
+            provider_actions,
             show_hidden: self
                 .directories
                 .get(&tab_id)
@@ -4099,6 +4451,8 @@ impl MusheenApp {
                     .to_owned()
             })
             .collect();
+        let cancellation_warning = self.volume_cancellation_warning(pending.selection());
+        let cancel_volume_users = cancellation_warning.is_some();
         let strings = ContextDialogStrings::from_catalog(&self.catalog);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(580.), px(360.)), cx)),
@@ -4113,7 +4467,14 @@ impl MusheenApp {
         let dialog_window = cx
             .open_window(options, |window, cx| {
                 let view = cx.new(|cx| {
-                    ContextReviewDialog::new(command, move_operation, targets, strings, cx)
+                    ContextReviewDialog::new(
+                        command,
+                        move_operation,
+                        targets,
+                        cancellation_warning,
+                        strings,
+                        cx,
+                    )
                 });
                 dialog = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
@@ -4122,7 +4483,9 @@ impl MusheenApp {
         self.track_context_dialog_window(dialog_window.window_id(), pending.origin_tab(), cx);
         let dialog = dialog.expect("the context review dialog constructs its view");
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
-            ContextReviewEvent::Confirmed => this.confirm_context_review(invocation.clone(), cx),
+            ContextReviewEvent::Confirmed => {
+                this.confirm_context_review(invocation.clone(), cancel_volume_users, cx);
+            }
             ContextReviewEvent::Cancelled => {
                 cx.notify();
             }
@@ -4130,7 +4493,45 @@ impl MusheenApp {
         self.conflict_subscriptions.push(subscription);
     }
 
-    fn confirm_context_review(&mut self, invocation: MenuInvocation, cx: &mut Context<Self>) {
+    fn volume_cancellation_warning(&self, targets: &[CommandTargetRef]) -> Option<String> {
+        let id = targets
+            .first()
+            .filter(|_| targets.len() == 1)
+            .and_then(volume_id_from_target)?;
+        let mounts = self
+            .volumes
+            .lock()
+            .ok()?
+            .model()
+            .get(&id)?
+            .mount_points()
+            .to_vec();
+        let operations = HubVolumeUsage {
+            hub: self.operation_hub.clone(),
+        }
+        .operations_using(&mounts);
+        if operations.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "{} {}",
+            self.catalog
+                .message("volume-operation-cancel-warning")
+                .expect("the volume cancellation warning is localized"),
+            operations
+                .iter()
+                .map(OperationUse::label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+
+    fn confirm_context_review(
+        &mut self,
+        invocation: MenuInvocation,
+        cancel_volume_users: bool,
+        cx: &mut Context<Self>,
+    ) {
         let surface = self.shell.context_menus().clone();
         let mut dispatcher = AppMenuDispatcher::default();
         let origin_tab = match &invocation {
@@ -4147,12 +4548,20 @@ impl MusheenApp {
         match surface.confirm(invocation, &mut dispatcher) {
             Ok(()) => {
                 if let Some((action, parameters)) = dispatcher.dispatched {
+                    // A normal destructive-action confirmation is not consent
+                    // to cancel an operation that started after the dialog
+                    // opened. Only a dialog that named active users grants it.
+                    let confirmed = if volume_action_for_command(action).is_some() {
+                        cancel_volume_users
+                    } else {
+                        true
+                    };
                     self.dispatch_typed_context_command(
                         action,
                         parameters,
                         origin_tab,
                         captured_targets.as_deref(),
-                        true,
+                        confirmed,
                         cx,
                     );
                 }
@@ -4243,6 +4652,16 @@ impl MusheenApp {
                         cx.notify();
                     }
                 }
+            }
+            (
+                action @ (CommandAction::Mount
+                | CommandAction::Unmount
+                | CommandAction::Eject
+                | CommandAction::Unlock
+                | CommandAction::PowerOff),
+                CommandParameters::Targets(targets),
+            ) => {
+                self.dispatch_volume_action(*action, targets, confirmed, cx);
             }
             (
                 action @ (CommandAction::Open
@@ -4425,6 +4844,121 @@ impl MusheenApp {
             }
             _ => unreachable!("the caller pairs each local command with typed parameters"),
         }
+    }
+
+    fn dispatch_volume_action(
+        &mut self,
+        action: CommandAction,
+        targets: &[CommandTargetRef],
+        confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = targets
+            .first()
+            .filter(|_| targets.len() == 1)
+            .and_then(volume_id_from_target)
+        else {
+            self.operation_error = Some("the selected volume changed".into());
+            cx.notify();
+            return;
+        };
+        let Some(volume_action) = volume_action_for_command(action) else {
+            return;
+        };
+        if volume_action == VolumeAction::Unlock {
+            self.open_volume_unlock(id, cx);
+            return;
+        }
+        let usage = if confirmed {
+            UsageResolution::CancelThenProceed
+        } else {
+            UsageResolution::Refuse
+        };
+        self.perform_volume_action(id, volume_action, usage, None, cx);
+    }
+
+    fn open_volume_unlock(&mut self, id: VolumeId, cx: &mut Context<Self>) {
+        let label: Option<Box<str>> = self.volumes.lock().ok().and_then(|service| {
+            service
+                .model()
+                .get(&id)
+                .map(|volume| Box::<str>::from(volume.label()))
+        });
+        let Some(label) = label else {
+            self.operation_error = Some("the selected volume is no longer available".into());
+            cx.notify();
+            return;
+        };
+        let title = self
+            .catalog
+            .message("volume-unlock-title")
+            .expect("the unlock title is localized")
+            .to_owned();
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(520.), px(300.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.into()),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(420.), px(260.))),
+            ..WindowOptions::default()
+        };
+        let catalog = self.catalog.clone();
+        let mut dialog = None;
+        let handle = cx
+            .open_window(options, |window, cx| {
+                let view = cx.new(|cx| VolumeUnlockDialog::new(label, catalog, window, cx));
+                dialog = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("Musheen could not open a volume unlock dialog");
+        self.track_context_dialog_window(handle.window_id(), None, cx);
+        let dialog = dialog.expect("the unlock dialog constructs its view");
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
+            VolumeUnlockEvent::Submitted(secret) => this.perform_volume_action(
+                id.clone(),
+                VolumeAction::Unlock,
+                UsageResolution::Refuse,
+                Some(secret.clone()),
+                cx,
+            ),
+            VolumeUnlockEvent::Cancelled => cx.notify(),
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    fn perform_volume_action(
+        &mut self,
+        id: VolumeId,
+        volume_action: VolumeAction,
+        usage: UsageResolution,
+        secret: Option<Box<str>>,
+        cx: &mut Context<Self>,
+    ) {
+        let volumes = Arc::clone(&self.volumes);
+        let work = cx.background_spawn(async move {
+            volumes
+                .lock()
+                .map_err(|_| VolumeError::Protocol("the volume model lock is poisoned".into()))?
+                .perform(&id, volume_action, usage, secret.as_deref())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                match result {
+                    Ok(_) => {
+                        state.sync_volume_projection(cx);
+                        state.operation_error = None;
+                    }
+                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn replay_pending_application_commands(
@@ -4913,6 +5447,11 @@ impl MusheenApp {
                 | CommandAction::ChooseApplication
                 | CommandAction::SetDefaultApplication
                 | CommandAction::CustomAction
+                | CommandAction::Mount
+                | CommandAction::Unmount
+                | CommandAction::Eject
+                | CommandAction::Unlock
+                | CommandAction::PowerOff
         ) {
             return CapabilityState::Supported;
         }
@@ -6514,14 +7053,23 @@ impl MusheenApp {
                                 .enumerate()
                                 .map(|(entry_index, entry)| {
                                     let location = entry.location().clone();
-                                    let navigation_location = location.clone();
+                                    let navigation_location = entry.navigation_location().clone();
                                     let can_drop_location = location.clone();
                                     let drop_location = location.clone();
                                     let context_location = location.clone();
                                     let context_identity = entry.identity().cloned();
                                     let operation_hub = self.operation_hub.clone();
                                     let selected = current.as_ref() == Some(&location);
-                                    let label = entry.label().to_owned();
+                                    let label = entry.volume_capacity().map_or_else(
+                                        || entry.label().to_owned(),
+                                        |capacity| {
+                                            format!(
+                                                "{} · {} free",
+                                                entry.label(),
+                                                format_size(capacity.available_bytes())
+                                            )
+                                        },
+                                    );
                                     let activation_tag = entry.tag_name().map(str::to_owned);
                                     let available = entry.is_available();
                                     let unavailable_reason =
@@ -7286,7 +7834,7 @@ impl MusheenApp {
         let Some(invocation) = self.pending_empty_trash.take() else {
             return;
         };
-        self.confirm_context_review(invocation, cx);
+        self.confirm_context_review(invocation, false, cx);
     }
 
     fn empty_trash(
@@ -8992,6 +9540,34 @@ fn is_trash_location(path: &StorePath) -> bool {
     path == &trash_store_path()
 }
 
+fn volume_id_from_target(target: &CommandTargetRef) -> Option<VolumeId> {
+    (target.id().provider().as_str() == "musheen.volume")
+        .then(|| std::str::from_utf8(target.id().opaque_key()).ok())
+        .flatten()
+        .and_then(|value| VolumeId::new(value).ok())
+}
+
+const fn volume_action_for_command(action: CommandAction) -> Option<VolumeAction> {
+    match action {
+        CommandAction::Mount => Some(VolumeAction::Mount),
+        CommandAction::Unmount => Some(VolumeAction::Unmount),
+        CommandAction::Eject => Some(VolumeAction::Eject),
+        CommandAction::Unlock => Some(VolumeAction::Unlock),
+        CommandAction::PowerOff => Some(VolumeAction::PowerOff),
+        _ => None,
+    }
+}
+
+fn volume_capability_state(supported: bool, refusal: &'static str) -> CapabilityState {
+    if supported {
+        CapabilityState::Supported
+    } else {
+        CapabilityState::Unsupported(
+            CapabilityReason::new(refusal).expect("the volume refusal is nonempty"),
+        )
+    }
+}
+
 fn is_contextual_command(action: CommandAction) -> bool {
     matches!(
         action,
@@ -9031,8 +9607,10 @@ fn is_contextual_command(action: CommandAction) -> bool {
             | CommandAction::DirectoryProperties
             | CommandAction::Permissions
             | CommandAction::CopyLocation
+            | CommandAction::Mount
             | CommandAction::Unmount
             | CommandAction::Eject
+            | CommandAction::Unlock
             | CommandAction::PowerOff
             | CommandAction::Pin
             | CommandAction::Unpin

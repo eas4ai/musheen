@@ -369,8 +369,10 @@ fn registry_audit_snapshots_stable_public_ids() {
         "file.preview",
         "archive.browse",
         "file.run",
+        "mount.mount",
         "mount.unmount",
         "mount.eject",
+        "mount.unlock",
         "mount.power_off",
         "trash.restore",
         "trash.empty",
@@ -596,12 +598,14 @@ fn provider_actions_expose_supported_unsupported_and_unknown_states() {
             "directory.share",
             CommandTarget::Directory,
         ),
+        (ProviderAction::Mount, "mount.mount", CommandTarget::Mount),
         (
             ProviderAction::Unmount,
             "mount.unmount",
             CommandTarget::Mount,
         ),
         (ProviderAction::Eject, "mount.eject", CommandTarget::Mount),
+        (ProviderAction::Unlock, "mount.unlock", CommandTarget::Mount),
         (
             ProviderAction::PowerOff,
             "mount.power_off",
@@ -647,13 +651,15 @@ fn provider_actions_expose_supported_unsupported_and_unknown_states() {
 }
 
 fn provider_actions(action: ProviderAction, state: CapabilityState) -> ProviderActionMatrix {
-    let mut states: [CapabilityState; 4] = std::array::from_fn(|_| CapabilityState::Supported);
+    let mut states: [CapabilityState; 6] = std::array::from_fn(|_| CapabilityState::Supported);
     states[action as usize] = state;
-    ProviderActionMatrix::from_states(
+    ProviderActionMatrix::from_volume_states(
         states[0].clone(),
         states[1].clone(),
         states[2].clone(),
         states[3].clone(),
+        states[4].clone(),
+        states[5].clone(),
     )
 }
 
@@ -1255,6 +1261,35 @@ fn every_single_target_contract_rejects_multiple_targets_before_dispatch() {
         );
     }
     assert!(dispatcher.actions.is_empty());
+}
+
+#[test]
+fn mount_and_unlock_are_registry_owned_provider_actions() {
+    let registry = CommandRegistry::built_in();
+    let context = CommandContext {
+        target: CommandTarget::Mount,
+        selection_count: 1,
+        provider_actions: ProviderActionMatrix::from_volume_states(
+            CapabilityState::Unsupported(CapabilityReason::new("not shareable").unwrap()),
+            CapabilityState::Supported,
+            CapabilityState::Supported,
+            CapabilityState::Supported,
+            CapabilityState::Supported,
+            CapabilityState::Supported,
+        ),
+        ..CommandContext::default()
+    };
+    for (id, action) in [
+        ("mount.mount", CommandAction::Mount),
+        ("mount.unlock", CommandAction::Unlock),
+        ("mount.unmount", CommandAction::Unmount),
+        ("mount.eject", CommandAction::Eject),
+        ("mount.power_off", CommandAction::PowerOff),
+    ] {
+        let command = registry.get(id).expect("volume command is registered");
+        assert_eq!(command.handler().action(), action);
+        assert!(command.state(&context).is_enabled(), "{id}");
+    }
 }
 
 #[derive(Default)]

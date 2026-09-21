@@ -1,5 +1,7 @@
 use musheen_core::{ItemId, ProviderId, StorePath};
-use musheen_desktop::{PinCatalog, PinState};
+use musheen_desktop::{
+    Capacity, PinCatalog, PinState, Volume, VolumeCapabilities, VolumeId, VolumeModel,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -33,20 +35,31 @@ impl SidebarSectionKind {
 pub struct SidebarEntry {
     label: Box<str>,
     location: StorePath,
+    navigation_location: StorePath,
     identity: Option<ItemId>,
     tag_name: Option<Box<str>>,
     unavailable_reason: Option<Box<str>>,
+    volume_id: Option<VolumeId>,
+    volume_capacity: Option<Capacity>,
+    volume_read_only: bool,
+    volume_capabilities: Option<VolumeCapabilities>,
 }
 
 impl SidebarEntry {
     #[must_use]
     pub fn new(label: impl Into<Box<str>>, location: StorePath) -> Self {
+        let navigation_location = location.clone();
         Self {
             label: label.into(),
             location,
+            navigation_location,
             identity: None,
             tag_name: None,
             unavailable_reason: None,
+            volume_id: None,
+            volume_capacity: None,
+            volume_read_only: false,
+            volume_capabilities: None,
         }
     }
 
@@ -56,12 +69,18 @@ impl SidebarEntry {
         location: StorePath,
         reason: impl Into<Box<str>>,
     ) -> Self {
+        let navigation_location = location.clone();
         Self {
             label: label.into(),
             location,
+            navigation_location,
             identity: None,
             tag_name: None,
             unavailable_reason: Some(reason.into()),
+            volume_id: None,
+            volume_capacity: None,
+            volume_read_only: false,
+            volume_capabilities: None,
         }
     }
 
@@ -72,12 +91,18 @@ impl SidebarEntry {
         location: StorePath,
         unavailable_reason: Option<Box<str>>,
     ) -> Self {
+        let navigation_location = location.clone();
         Self {
             label: label.into(),
             location,
+            navigation_location,
             identity: Some(item),
             tag_name: None,
             unavailable_reason,
+            volume_id: None,
+            volume_capacity: None,
+            volume_read_only: false,
+            volume_capabilities: None,
         }
     }
 
@@ -87,9 +112,42 @@ impl SidebarEntry {
         Self {
             tag_name: Some(label.clone()),
             label,
+            navigation_location: location.clone(),
             location,
             identity: Some(item),
             unavailable_reason: None,
+            volume_id: None,
+            volume_capacity: None,
+            volume_read_only: false,
+            volume_capabilities: None,
+        }
+    }
+
+    #[must_use]
+    pub fn volume(volume: &Volume) -> Self {
+        let provider =
+            ProviderId::new("musheen.volume").expect("the built-in volume provider ID is valid");
+        let key = volume.id().as_str().as_bytes().to_vec();
+        let location = StorePath::from_provider_key(provider.clone(), key.clone())
+            .expect("the volume ID is a valid provider key");
+        let identity = ItemId::new(provider, key).expect("the volume ID is a valid item ID");
+        let navigation_location = volume
+            .mount_points()
+            .first()
+            .map(|path| StorePath::from_unix_path(path.as_os_str()))
+            .unwrap_or_else(|| location.clone());
+        Self {
+            label: volume.label().into(),
+            location,
+            navigation_location,
+            identity: Some(identity),
+            tag_name: None,
+            unavailable_reason: (!volume.is_mounted())
+                .then(|| Box::<str>::from("mount the volume before opening it")),
+            volume_id: Some(volume.id().clone()),
+            volume_capacity: volume.capacity(),
+            volume_read_only: volume.is_read_only(),
+            volume_capabilities: Some(volume.capabilities()),
         }
     }
 
@@ -101,6 +159,11 @@ impl SidebarEntry {
     #[must_use]
     pub fn location(&self) -> &StorePath {
         &self.location
+    }
+
+    #[must_use]
+    pub fn navigation_location(&self) -> &StorePath {
+        &self.navigation_location
     }
 
     #[must_use]
@@ -121,6 +184,26 @@ impl SidebarEntry {
     #[must_use]
     pub fn unavailable_reason(&self) -> Option<&str> {
         self.unavailable_reason.as_deref()
+    }
+
+    #[must_use]
+    pub const fn volume_id(&self) -> Option<&VolumeId> {
+        self.volume_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn volume_capacity(&self) -> Option<Capacity> {
+        self.volume_capacity
+    }
+
+    #[must_use]
+    pub const fn volume_read_only(&self) -> bool {
+        self.volume_read_only
+    }
+
+    #[must_use]
+    pub const fn volume_capabilities(&self) -> Option<VolumeCapabilities> {
+        self.volume_capabilities
     }
 }
 
@@ -224,6 +307,13 @@ impl SidebarModel {
                 let item = ItemId::new(provider.clone(), key).ok()?;
                 Some(SidebarEntry::tag(item, tag, location))
             }),
+        );
+    }
+
+    pub fn sync_volumes(&mut self, volumes: &VolumeModel) {
+        self.set_section_items(
+            SidebarSectionKind::Mounts,
+            volumes.volumes().into_iter().map(SidebarEntry::volume),
         );
     }
 

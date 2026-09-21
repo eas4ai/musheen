@@ -40,7 +40,7 @@ native-theme = { version = "0.5", features = ["watch"] }
 native-theme-gpui = { version = "0.5", default-features = false, features = ["svg-rasterize"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 md-5 = "0.10"
-nix = { version = "0.31", features = ["fs"] }
+nix = { version = "0.31", features = ["fs", "poll"] }
 notify = "8"
 open = "5"
 proc-mounts = "0.3"
@@ -59,6 +59,7 @@ walkdir = "2"
 wax = "0.7"
 xattr = "1"
 xdg-mime = "0.4"
+zbus = "5"
 
 [dependencies]
 musheen-desktop = { path = "crates/musheen-desktop" }

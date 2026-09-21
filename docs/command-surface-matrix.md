@@ -82,8 +82,10 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `file.preview` | `ExactlyOneFile` | archive, executable, file, hidden-file, read-only-file, unsupported-file | command-mode, customizable |
 | `archive.browse` | `Archive` | archive | command-mode, customizable |
 | `file.run` | `ExecutableRun` | executable | command-mode, customizable |
+| `mount.mount` | `ProviderAction(Mount)` | — | command-mode, customizable |
 | `mount.unmount` | `ProviderAction(Unmount)` | mount | command-mode, customizable |
 | `mount.eject` | `ProviderAction(Eject)` | mount | command-mode, customizable |
+| `mount.unlock` | `ProviderAction(Unlock)` | — | command-mode, customizable |
 | `mount.power_off` | `ProviderAction(PowerOff)` | mount | command-mode, customizable |
 | `trash.restore` | `TrashItem` | trash-item | command-mode, customizable |
 | `trash.empty` | `TrashBackground` | trash-background | command-mode, customizable |

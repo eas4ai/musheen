@@ -39,13 +39,22 @@ pub enum ActiveLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderAction {
     Share,
+    Mount,
     Unmount,
     Eject,
+    Unlock,
     PowerOff,
 }
 
 impl ProviderAction {
-    pub const ALL: [Self; 4] = [Self::Share, Self::Unmount, Self::Eject, Self::PowerOff];
+    pub const ALL: [Self; 6] = [
+        Self::Share,
+        Self::Mount,
+        Self::Unmount,
+        Self::Eject,
+        Self::Unlock,
+        Self::PowerOff,
+    ];
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +68,26 @@ impl ProviderActionMatrix {
         eject: CapabilityState,
         power_off: CapabilityState,
     ) -> Self {
-        Self([share, unmount, eject, power_off])
+        Self([
+            share,
+            unknown_provider_action(),
+            unmount,
+            eject,
+            unknown_provider_action(),
+            power_off,
+        ])
+    }
+
+    #[must_use]
+    pub fn from_volume_states(
+        share: CapabilityState,
+        mount: CapabilityState,
+        unmount: CapabilityState,
+        eject: CapabilityState,
+        unlock: CapabilityState,
+        power_off: CapabilityState,
+    ) -> Self {
+        Self([share, mount, unmount, eject, unlock, power_off])
     }
 
     #[must_use]
