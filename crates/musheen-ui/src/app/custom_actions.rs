@@ -57,7 +57,8 @@ pub(super) struct LiveActionPopup {
     pub window: gpui_kit::AnyWindowHandle,
     pub menu: ContextMenu,
     pub path: String,
-    pub projection: Vec<usize>,
+    pub projection: Vec<crate::menus::MenuProjectionSegment>,
+    pub target: MenuTarget,
 }
 
 impl LiveActionPopup {

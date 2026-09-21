@@ -22,7 +22,45 @@ pub struct ContextMenuRenderer;
 #[derive(Clone)]
 struct MenuRenderPath {
     id: String,
-    projection: Vec<usize>,
+    projection: Vec<MenuProjectionSegment>,
+}
+
+/// Stable identity for one submenu edge. Generated entries can share command
+/// IDs, so the visible identity and sibling occurrence disambiguate them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MenuProjectionSegment {
+    command_id: Option<Box<str>>,
+    label: Box<str>,
+    occurrence: usize,
+}
+
+impl MenuProjectionSegment {
+    pub(crate) fn for_entry(entries: &[MenuEntry], index: usize) -> Self {
+        let entry = &entries[index];
+        let command_id = entry.command_id().map(Box::<str>::from);
+        let label = Box::<str>::from(entry.label());
+        let occurrence = entries[..index]
+            .iter()
+            .filter(|candidate| {
+                candidate.command_id() == entry.command_id() && candidate.label() == entry.label()
+            })
+            .count();
+        Self {
+            command_id,
+            label,
+            occurrence,
+        }
+    }
+
+    pub(crate) fn resolve<'a>(&self, entries: &'a [MenuEntry]) -> Option<&'a MenuEntry> {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.command_id() == self.command_id.as_deref()
+                    && entry.label() == self.label.as_ref()
+            })
+            .nth(self.occurrence)
+    }
 }
 
 impl MenuRenderPath {
@@ -33,9 +71,9 @@ impl MenuRenderPath {
         }
     }
 
-    fn child(&self, index: usize) -> Self {
+    fn child(&self, segment: MenuProjectionSegment, index: usize) -> Self {
         let mut projection = self.projection.clone();
-        projection.push(index);
+        projection.push(segment);
         Self {
             id: format!("{}-{index}", self.id),
             projection,
@@ -79,7 +117,9 @@ impl ContextMenuRenderer {
     ) -> PopupMenu
     where
         F: Fn(MenuEntry, &mut Window, &mut App) + Clone + 'static,
-        G: Fn(&ContextMenu, &str, &[usize], &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
+        G: Fn(&ContextMenu, &str, &[MenuProjectionSegment], &mut Window, &mut Context<PopupMenu>)
+            + Clone
+            + 'static,
     {
         Self::populate_with_direction(
             popup,
@@ -103,7 +143,9 @@ impl ContextMenuRenderer {
     ) -> PopupMenu
     where
         F: Fn(MenuEntry, &mut Window, &mut App) + Clone + 'static,
-        G: Fn(&ContextMenu, &str, &[usize], &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
+        G: Fn(&ContextMenu, &str, &[MenuProjectionSegment], &mut Window, &mut Context<PopupMenu>)
+            + Clone
+            + 'static,
     {
         on_built(&menu, &path.id, &path.projection, window, cx);
         let direction = menu.locale_direction();
@@ -126,7 +168,10 @@ impl ContextMenuRenderer {
                     let Some(submenu) = entry.submenu().cloned() else {
                         continue;
                     };
-                    let child_path = path.child(index);
+                    let child_path = path.child(
+                        MenuProjectionSegment::for_entry(menu.entries(), index),
+                        index,
+                    );
                     let activate = on_activate.clone();
                     let built = on_built.clone();
                     let submenu = PopupMenu::build(window, cx, move |popup, window, cx| {

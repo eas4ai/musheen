@@ -1,7 +1,6 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::Button;
-use gpui_kit::component::radio::Radio;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -224,6 +223,12 @@ pub struct OpenWithDialog {
     scroll: UniformListScrollHandle,
 }
 
+struct ApplicationRow {
+    application: ApplicationChoice,
+    index: usize,
+    item_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpenWithDialogEvent {
     Chosen {
@@ -256,7 +261,7 @@ impl OpenWithDialog {
         Self {
             model,
             catalog,
-            focus: cx.focus_handle(),
+            focus: cx.focus_handle().tab_stop(true).tab_index(0),
             pending_focus: true,
             decision: None,
             scroll: UniformListScrollHandle::new(),
@@ -283,20 +288,19 @@ impl OpenWithDialog {
         if applications.is_empty() {
             return;
         }
-        let current = self
-            .model
-            .selected()
-            .and_then(|selected| {
-                applications
-                    .iter()
-                    .position(|application| application.desktop_id() == selected)
-            })
-            .unwrap_or(0);
-        let next = match position {
-            SelectionPosition::Previous => current.saturating_sub(1),
-            SelectionPosition::Next => (current + 1).min(applications.len() - 1),
-            SelectionPosition::First => 0,
-            SelectionPosition::Last => applications.len() - 1,
+        let current = self.model.selected().and_then(|selected| {
+            applications
+                .iter()
+                .position(|application| application.desktop_id() == selected)
+        });
+        let next = match (position, current) {
+            (SelectionPosition::Previous | SelectionPosition::First, None) => 0,
+            (SelectionPosition::Next, None) => 0,
+            (SelectionPosition::Last, None) => applications.len() - 1,
+            (SelectionPosition::Previous, Some(current)) => current.saturating_sub(1),
+            (SelectionPosition::Next, Some(current)) => (current + 1).min(applications.len() - 1),
+            (SelectionPosition::First, Some(_)) => 0,
+            (SelectionPosition::Last, Some(_)) => applications.len() - 1,
         };
         let desktop_id = Box::<str>::from(applications[next].desktop_id());
         let _ = self.model.select(&desktop_id);
@@ -304,12 +308,13 @@ impl OpenWithDialog {
         cx.notify();
     }
 
-    fn render_application(
-        &mut self,
-        application: ApplicationChoice,
-        is_selected: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_application(&mut self, row: ApplicationRow, cx: &mut Context<Self>) -> AnyElement {
+        let ApplicationRow {
+            application,
+            index,
+            item_count,
+        } = row;
+        let is_selected = self.model.selected() == Some(application.desktop_id());
         let desktop_id = application.desktop_id.clone();
         let view = cx.entity().downgrade();
         let icon_id = format!("open-with-icon-{}", application.desktop_id());
@@ -334,34 +339,34 @@ impl OpenWithDialog {
         );
         div()
             .id(SharedString::from(format!(
-                "open-with-row-{}",
+                "open-with-application-{}",
                 application.desktop_id()
             )))
             .test_support()
-            .role(Role::ListItem)
+            .role(Role::RadioButton)
             .aria_label(application.name())
+            .aria_toggled(if is_selected {
+                gpui_kit::accesskit::Toggled::True
+            } else {
+                gpui_kit::accesskit::Toggled::False
+            })
+            .aria_position_in_set(index + 1)
+            .aria_size_of_set(item_count)
+            .when(is_selected, |row| row.aria_active_descendant())
             .h(px(40.))
             .flex()
             .items_center()
             .gap_2()
             .child(icon)
-            .child(
-                Radio::new(SharedString::from(format!(
-                    "open-with-application-{}",
-                    application.desktop_id()
-                )))
-                .label(application.name())
-                .checked(is_selected)
-                .on_click(move |checked, _, cx| {
-                    if *checked {
-                        let _ = view.update(cx, |this, cx| {
-                            if this.model.select(&desktop_id).is_ok() {
-                                cx.notify();
-                            }
-                        });
+            .child(if is_selected { "◉" } else { "○" })
+            .child(application.name().to_owned())
+            .on_click(move |_, _, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if this.model.select(&desktop_id).is_ok() {
+                        cx.notify();
                     }
-                }),
-            )
+                });
+            })
             .into_any_element()
     }
 }
@@ -418,12 +423,17 @@ impl Render for OpenWithDialog {
             "open-with-applications",
             item_count,
             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                let selected = this.model.selected().map(str::to_owned);
                 range
-                    .filter_map(|index| list_items.get(index).cloned())
-                    .map(|application| {
-                        let is_selected = selected.as_deref() == Some(application.desktop_id());
-                        this.render_application(application, is_selected, cx)
+                    .filter_map(|index| list_items.get(index).cloned().map(|item| (index, item)))
+                    .map(|(index, application)| {
+                        this.render_application(
+                            ApplicationRow {
+                                application,
+                                index,
+                                item_count,
+                            },
+                            cx,
+                        )
                     })
                     .collect::<Vec<_>>()
             }),
@@ -438,17 +448,8 @@ impl Render for OpenWithDialog {
             .test_support()
             .role(Role::RadioGroup)
             .aria_label(title.clone())
-            .flex_grow(1.0)
-            .min_h(px(40.))
-            .max_h(px(320.))
-            .w_full()
-            .child(applications);
-        div()
-            .id("open-with-dialog")
-            .test_support()
-            .role(Role::Dialog)
-            .aria_label(title.clone())
             .tab_index(0)
+            .tab_stop(true)
             .key_context("OpenWithDialog")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
@@ -466,6 +467,17 @@ impl Render for OpenWithDialog {
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
                 this.choose(OpenWithIntent::OpenOnce, window, cx);
             }))
+            .flex_grow(1.0)
+            .min_h(px(40.))
+            .max_h(px(320.))
+            .w_full()
+            .child(applications);
+        div()
+            .id("open-with-dialog")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label(title.clone())
+            .key_context("OpenWithDialog")
             .on_action(cx.listener(|_, _: &Cancel, window, cx| {
                 cx.emit(OpenWithDialogEvent::Cancelled);
                 window.remove_window();
@@ -572,14 +584,13 @@ impl std::error::Error for OpenWithExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_kit::TestAppContext;
     use gpui_kit::component::Root;
     use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{Entity, TestAppContext};
 
-    #[gpui_kit::test]
-    async fn many_applications_are_virtualized_accessible_and_focused_at_200_percent(
+    fn open_many_applications_dialog(
         cx: &mut TestAppContext,
-    ) {
+    ) -> (gpui_kit::AnyWindowHandle, Entity<OpenWithDialog>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_open_with_key_bindings(cx);
@@ -605,12 +616,23 @@ mod tests {
             dialog = Some(view.clone());
             Root::new(view, window, cx)
         });
-        let dialog = dialog.unwrap();
-        cx.update_window(handle.into(), |_, window, cx| {
+        (handle.into(), dialog.unwrap())
+    }
+
+    #[gpui_kit::test]
+    async fn many_applications_are_virtualized_and_actions_stay_reachable_at_200_percent(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, dialog) = open_many_applications_dialog(cx);
+        cx.update_window(handle, |_, window, cx| {
             window.set_scale_factor(2.0);
+            window.activate_accessibility_for_test();
             window.render_frame(cx);
             assert_eq!(window.scale_factor(), 2.0);
-            assert_eq!(window.find("open-with-dialog").focused(), Some(true));
+            assert_eq!(
+                window.find("open-with-application-list").focused(),
+                Some(true)
+            );
             assert!(window.find("open-with-application-list").visible());
             window.press("end", cx);
             window.render_frame(cx);
@@ -620,12 +642,65 @@ mod tests {
                     .checked(),
                 Some(true)
             );
+            let tree: serde_json::Value =
+                serde_json::from_str(&window.debug_a11y_tree_json().unwrap()).unwrap();
+            let (last_id, _) = tree["nodes"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, node)| node["aria"]["label"] == "Example 499")
+                .unwrap();
+            assert_eq!(tree["active_descendant_focus"], last_id.as_str());
             assert!(window.find("open-with-open-once").visible());
             assert!(window.find("open-with-set-default").visible());
             window.press("enter", cx);
             assert_eq!(
                 dialog.read(cx).decision(),
                 Some(("example-499.desktop", OpenWithIntent::OpenOnce))
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn chooser_roves_from_first_row_through_footer_with_accessible_set_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, _) = open_many_applications_dialog(cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.set_scale_factor(2.0);
+            window.activate_accessibility_for_test();
+            window.render_frame(cx);
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window
+                    .find("open-with-application-example-0.desktop")
+                    .checked(),
+                Some(true),
+                "the first Down from no selection chooses the first row"
+            );
+            let tree: serde_json::Value =
+                serde_json::from_str(&window.debug_a11y_tree_json().unwrap()).unwrap();
+            let (first_id, first) = tree["nodes"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, node)| node["aria"]["label"] == "Example 0")
+                .unwrap();
+            assert_eq!(first["aria"]["role"], "RadioButton");
+            assert_eq!(first["aria"]["toggled"], "True");
+            assert_eq!(first["aria"]["position_in_set"], 1);
+            assert_eq!(first["aria"]["size_of_set"], 500);
+            assert_eq!(tree["active_descendant_focus"], first_id.as_str());
+            window.press("tab", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("open-with-cancel").focused(), Some(true));
+            window.press("shift-tab", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("open-with-application-list").focused(),
+                Some(true)
             );
         })
         .unwrap();

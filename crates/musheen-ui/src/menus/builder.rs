@@ -441,6 +441,7 @@ pub(crate) struct InvocationData {
     pub(crate) location: StorePath,
     pub(crate) destination: Option<StorePath>,
     pub(crate) origin_tab: Option<crate::navigation::TabId>,
+    pub(crate) menu_target: MenuTarget,
     pub(crate) custom_action: Option<musheen_desktop::CustomAction>,
 }
 
@@ -658,6 +659,7 @@ fn plain_command_entry(
             location: selected_directory_location(command.action(), context, request),
             destination: None,
             origin_tab: request.origin_tab(),
+            menu_target: request.target(),
             custom_action: None,
         }),
     }
@@ -710,9 +712,14 @@ fn add_open_with_submenu(
             disabled_context.selection_count = 0;
             let mut child = plain_command_entry(open_with, catalog, request, &disabled_context);
             child.label = application.label().into();
+            child.command_id = None;
+            child.state = child
+                .state
+                .map_disabled_reason(|_| application.label().to_owned());
             child
         })
         .collect::<Vec<_>>();
+    let default_status_entries = status_entries.clone();
     let mut app_entries = compatible
         .iter()
         .map(|application| {
@@ -744,16 +751,13 @@ fn add_open_with_submenu(
         ));
     }
     if let Some(set_default) = registry.get("file.set_default_application") {
-        let mut defaults = compatible
-            .iter()
-            .map(|application| {
-                let mut child =
-                    plain_command_entry(set_default, catalog, request, request.context());
-                child.label = application.label().into();
-                child.application = Some((*application).clone());
-                child
-            })
-            .collect::<Vec<_>>();
+        let mut defaults = default_status_entries;
+        defaults.extend(compatible.iter().map(|application| {
+            let mut child = plain_command_entry(set_default, catalog, request, request.context());
+            child.label = application.label().into();
+            child.application = Some((*application).clone());
+            child
+        }));
         let overflow = defaults.split_off(defaults.len().min(MAX_VARIABLE_CONTRIBUTIONS));
         append_overflow_submenu(
             &mut defaults,

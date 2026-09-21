@@ -546,7 +546,17 @@ struct QueuedApplicationSelection {
 struct PendingApplicationCommand {
     action: CommandAction,
     parameters: CommandParameters,
-    origin_tab: Option<TabId>,
+    origin: Option<PendingApplicationOrigin>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingApplicationOrigin {
+    tab: TabId,
+    location: StorePath,
+    directory_generation: u64,
+    selected: Vec<ItemId>,
+    focused: Option<ItemId>,
+    targets_absent_from_directory: bool,
 }
 
 struct DesktopApplicationService {
@@ -586,7 +596,6 @@ impl DesktopApplicationService {
     }
 
     fn begin_refresh(&mut self, selection: &[CommandTargetRef]) -> bool {
-        self.expire_catalog();
         let key = Self::key(selection);
         if matches!(
             self.entries.get(&key).map(|(_, state)| state),
@@ -619,7 +628,7 @@ impl DesktopApplicationService {
         true
     }
 
-    fn expire_catalog(&mut self) {
+    fn expire_catalog(&mut self) -> bool {
         let expired = matches!(
             &self.catalog,
             DesktopCatalogState::Ready { loaded_at, .. }
@@ -628,6 +637,7 @@ impl DesktopApplicationService {
         if expired {
             self.invalidate();
         }
+        expired
     }
 
     fn begin_catalog_refresh(&mut self) -> Option<u64> {
@@ -878,15 +888,15 @@ fn resolve_application_targets(
 
 fn context_menu_projection<'a>(
     root: &'a ContextMenu,
-    projection: &[usize],
+    projection: &[crate::menus::MenuProjectionSegment],
     template: &ContextMenu,
 ) -> Option<&'a ContextMenu> {
     if projection.is_empty() {
         return matching_context_menu_projection(root, template);
     }
     let mut menu = root;
-    for index in projection {
-        menu = menu.entries().get(*index)?.submenu()?;
+    for segment in projection {
+        menu = segment.resolve(menu.entries())?.submenu()?;
     }
     Some(menu)
 }
@@ -895,7 +905,17 @@ fn matching_context_menu_projection<'a>(
     candidate: &'a ContextMenu,
     template: &ContextMenu,
 ) -> Option<&'a ContextMenu> {
-    if context_menu_command_ids(candidate) == context_menu_command_ids(template) {
+    if candidate.entries().len() == template.entries().len()
+        && candidate
+            .entries()
+            .iter()
+            .zip(template.entries())
+            .all(|(left, right)| {
+                left.command_id() == right.command_id()
+                    && left.label() == right.label()
+                    && left.kind() == right.kind()
+            })
+    {
         return Some(candidate);
     }
     candidate.entries().iter().find_map(|entry| {
@@ -903,13 +923,6 @@ fn matching_context_menu_projection<'a>(
             .submenu()
             .and_then(|submenu| matching_context_menu_projection(submenu, template))
     })
-}
-
-fn context_menu_command_ids(menu: &ContextMenu) -> Vec<&str> {
-    menu.entries()
-        .iter()
-        .filter_map(|entry| entry.command_id())
-        .collect()
 }
 
 impl ContextDialogStrings {
@@ -2699,7 +2712,7 @@ impl MusheenApp {
                 }
             }
             CommandAction::Refresh => {
-                self.desktop_applications.invalidate();
+                self.invalidate_application_service();
                 if let Some(location) = self.focused_directory().location().cloned() {
                     self.start_load(location, cx);
                 }
@@ -3233,10 +3246,35 @@ impl MusheenApp {
         selection: &[CommandTargetRef],
         cx: &mut Context<Self>,
     ) {
+        self.expire_application_service();
         if !self.desktop_applications.begin_refresh(selection) {
             return;
         }
         self.drive_application_service(cx);
+    }
+
+    fn expire_application_service(&mut self) {
+        if self.desktop_applications.expire_catalog() {
+            self.refuse_invalidated_pending_application_commands();
+        }
+    }
+
+    fn invalidate_application_service(&mut self) {
+        self.desktop_applications.invalidate();
+        self.refuse_invalidated_pending_application_commands();
+    }
+
+    fn refuse_invalidated_pending_application_commands(&mut self) {
+        if self.pending_application_commands.is_empty() {
+            return;
+        }
+        self.pending_application_commands.clear();
+        self.operation_error = Some(
+            self.catalog
+                .message("context.target-changed")
+                .expect("stale application commands are localized")
+                .into(),
+        );
     }
 
     fn drive_application_service(&mut self, cx: &mut Context<Self>) {
@@ -3373,7 +3411,7 @@ impl MusheenApp {
                 }
                 let menu = self.compose_context_menu_at(
                     tab,
-                    MenuTarget::Item,
+                    popup.target,
                     invocation.location.clone(),
                     invocation.selection.clone(),
                 );
@@ -3703,7 +3741,7 @@ impl MusheenApp {
         owner: gpui_kit::WeakEntity<Self>,
         menu: &ContextMenu,
         path: &str,
-        projection: &[usize],
+        projection: &[crate::menus::MenuProjectionSegment],
         window: &Window,
         cx: &mut Context<PopupMenu>,
     ) {
@@ -3721,6 +3759,11 @@ impl MusheenApp {
             menu: menu.clone(),
             path: path.to_owned(),
             projection: projection.to_vec(),
+            target: menu
+                .entries()
+                .iter()
+                .find_map(|entry| entry.invocation.as_ref())
+                .map_or(MenuTarget::Item, |invocation| invocation.menu_target),
         };
         cx.defer(move |cx| {
             let _ = owner.update(cx, |this, _| {
@@ -4286,7 +4329,7 @@ impl MusheenApp {
             cx.notify();
             return;
         }
-        self.desktop_applications.expire_catalog();
+        self.expire_application_service();
 
         if matches!(
             action,
@@ -4301,12 +4344,12 @@ impl MusheenApp {
             let pending = PendingApplicationCommand {
                 action: *action,
                 parameters: parameters.clone(),
-                origin_tab,
+                origin: self.pending_application_origin(origin_tab, targets),
             };
             if !self.pending_application_commands.iter().any(|existing| {
                 existing.action == pending.action
                     && existing.parameters == pending.parameters
-                    && existing.origin_tab == pending.origin_tab
+                    && existing.origin == pending.origin
             }) {
                 if self.pending_application_commands.len() >= MAX_DESKTOP_APPLICATION_SNAPSHOTS {
                     self.operation_error = Some(self.application_error("application-open-busy"));
@@ -4399,7 +4442,8 @@ impl MusheenApp {
                 | CommandParameters::Targets(targets) => targets,
                 _ => continue,
             };
-            if !self.application_selection_is_still_active(pending.origin_tab, pending_targets) {
+            if !self.application_selection_is_still_active(pending.origin.as_ref(), pending_targets)
+            {
                 self.operation_error = Some(
                     self.catalog
                         .message("context.target-changed")
@@ -4411,7 +4455,7 @@ impl MusheenApp {
             self.dispatch_local_target_command(
                 &pending.action,
                 &pending.parameters,
-                pending.origin_tab,
+                pending.origin.as_ref().map(|origin| origin.tab),
                 cx,
             );
         }
@@ -4447,27 +4491,66 @@ impl MusheenApp {
         });
     }
 
-    fn application_selection_is_still_active(
+    fn pending_application_origin(
         &self,
         origin_tab: Option<TabId>,
         targets: &[CommandTargetRef],
+    ) -> Option<PendingApplicationOrigin> {
+        let tab = origin_tab?;
+        let directory = self.directories.get(&tab)?;
+        Some(PendingApplicationOrigin {
+            tab,
+            location: directory.location()?.clone(),
+            directory_generation: directory.generation(),
+            selected: directory.view().selected_ids().to_vec(),
+            focused: directory.view().focused_item_id().cloned(),
+            targets_absent_from_directory: targets
+                .iter()
+                .all(|target| directory.view().item(target.id()).is_none()),
+        })
+    }
+
+    fn application_selection_is_still_active(
+        &self,
+        origin: Option<&PendingApplicationOrigin>,
+        targets: &[CommandTargetRef],
     ) -> bool {
-        let Some(tab) = origin_tab else {
+        let Some(origin) = origin else {
             return self.revalidate_context_targets(None, targets).is_ok();
         };
-        let Some(directory) = self.directories.get(&tab) else {
+        let Some(directory) = self.directories.get(&origin.tab) else {
             return false;
         };
-        let selected = directory.view().selected_ids();
-        let selection_matches = if selected.is_empty() {
-            targets
-                .iter()
-                .all(|target| directory.view().item(target.id()).is_none())
+        if directory.location() != Some(&origin.location)
+            || directory.generation() != origin.directory_generation
+            || directory.view().selected_ids() != origin.selected
+            || directory.view().focused_item_id() != origin.focused.as_ref()
+        {
+            return false;
+        }
+        let semantic_targets_match = if origin.targets_absent_from_directory {
+            origin.selected.is_empty()
+                && origin.focused.is_none()
+                && targets
+                    .iter()
+                    .all(|target| directory.view().item(target.id()).is_none())
         } else {
-            selected.len() == targets.len()
-                && targets.iter().all(|target| selected.contains(target.id()))
+            let visible = directory
+                .view()
+                .visible_items()
+                .into_iter()
+                .map(|item| item.id())
+                .collect::<Vec<_>>();
+            origin.selected.len() == targets.len()
+                && targets
+                    .iter()
+                    .all(|target| origin.selected.contains(target.id()))
+                && targets.iter().all(|target| visible.contains(&target.id()))
         };
-        selection_matches && self.revalidate_context_targets(Some(tab), targets).is_ok()
+        semantic_targets_match
+            && self
+                .revalidate_context_targets(Some(origin.tab), targets)
+                .is_ok()
     }
 
     fn execute_open_with(
@@ -4578,7 +4661,7 @@ impl MusheenApp {
                     .err()
                     .map(|error| state.application_action_error(&app_name, item_count, &error));
                 if set_default {
-                    state.desktop_applications.invalidate();
+                    state.invalidate_application_service();
                 }
                 cx.notify();
             });
@@ -9257,6 +9340,10 @@ mod tests {
             *loaded_at = Instant::now() - DESKTOP_APPLICATION_TTL;
         }
         service.expire_catalog();
+        assert_eq!(
+            service.active_jobs, MAX_DESKTOP_APPLICATION_JOBS,
+            "invalidation keeps the two in-flight jobs counted until completion"
+        );
         assert!(matches!(service.catalog, DesktopCatalogState::Empty));
         assert!(service.entries.is_empty());
         assert!(service.queue.is_empty());
@@ -9385,6 +9472,9 @@ mod tests {
                 assert!(open_with.submenu().unwrap().entries().iter().any(|entry| {
                     entry.label() == state.catalog.message("application-open-loading").unwrap()
                         && !entry.state().is_enabled()
+                        && entry.accessible_disabled_reason()
+                            == Some(state.catalog.message("application-open-loading").unwrap())
+                        && entry.command_id().is_none()
                 }));
                 assert!(
                     state
@@ -9442,6 +9532,170 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    async fn open_nested_set_default_popup_rebuilds_in_place_from_loading_to_ready(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        let mut selection = Vec::new();
+        let mut nested_menu = None;
+        let mut projection = Vec::new();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                let item = state.focused_directory().view().items()[0].clone();
+                state.select_item(tab, item.id().clone(), cx);
+                state.focus_directory_item(tab, Some(item.id().clone()), cx);
+                selection
+                    .push(CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap());
+                let trash_menu =
+                    state.compose_context_menu(tab, MenuTarget::TrashItem, selection.clone());
+                assert_eq!(
+                    trash_menu
+                        .entries()
+                        .iter()
+                        .find_map(|entry| entry.invocation.as_ref())
+                        .map(|invocation| invocation.menu_target),
+                    Some(MenuTarget::TrashItem),
+                    "popup recomposition retains the originating target surface"
+                );
+                state.desktop_applications.entries.insert(
+                    DesktopApplicationService::key(&selection),
+                    (1, DesktopApplicationSnapshotState::Loading),
+                );
+                let menu = state.compose_context_menu(tab, MenuTarget::Item, selection.clone());
+                let open_index = menu
+                    .entries()
+                    .iter()
+                    .position(|entry| entry.command_id() == Some("file.open_with"))
+                    .unwrap();
+                let open_segment =
+                    crate::menus::MenuProjectionSegment::for_entry(menu.entries(), open_index);
+                let open_menu = menu.entries()[open_index].submenu().unwrap();
+                let default_index = open_menu
+                    .entries()
+                    .iter()
+                    .position(|entry| entry.command_id() == Some("file.set_default_application"))
+                    .unwrap();
+                projection.push(open_segment);
+                projection.push(crate::menus::MenuProjectionSegment::for_entry(
+                    open_menu.entries(),
+                    default_index,
+                ));
+                nested_menu = open_menu.entries()[default_index].submenu().cloned();
+            });
+        })
+        .unwrap();
+
+        let nested_menu = nested_menu.unwrap();
+        assert_eq!(nested_menu.entries().len(), 1);
+        let mut popup = None;
+        let popup_window = cx.open_window(size(px(420.), px(360.)), |window, cx| {
+            let menu = nested_menu.clone();
+            let built = PopupMenu::build(window, cx, move |popup, window, cx| {
+                crate::menus::ContextMenuRenderer::populate(
+                    popup,
+                    menu,
+                    "set-default-live",
+                    window,
+                    cx,
+                    |_, _, _| {},
+                )
+            });
+            built.update(cx, |popup, cx| popup.focus_handle(cx).focus(window, cx));
+            popup = Some(built.clone());
+            Root::new(built, window, cx)
+        });
+        let popup = popup.unwrap();
+        let popup_id = popup.entity_id();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
+                state
+                    .live_application_popups
+                    .push(custom_actions::LiveActionPopup {
+                        popup: popup.downgrade(),
+                        window: popup_window.into(),
+                        menu: nested_menu,
+                        path: "set-default-live".into(),
+                        projection,
+                        target: MenuTarget::Item,
+                    });
+            });
+        })
+        .unwrap();
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.desktop_applications.entries.insert(
+                    DesktopApplicationService::key(&selection),
+                    (
+                        2,
+                        DesktopApplicationSnapshotState::Ready(Arc::new(
+                            DesktopApplicationSnapshot {
+                                selection: ResolvedApplicationSelection {
+                                    mime_type: "text/plain".into(),
+                                },
+                                choices: vec![
+                                    crate::dialogs::ApplicationChoice::new(
+                                        "org.example.Alpha.desktop",
+                                        "Alpha Viewer",
+                                        true,
+                                    ),
+                                    crate::dialogs::ApplicationChoice::new(
+                                        "org.example.Beta.desktop",
+                                        "Beta Viewer",
+                                        true,
+                                    ),
+                                ],
+                                applications: HashMap::new(),
+                                default_application: None,
+                            },
+                        )),
+                    ),
+                );
+                state.refresh_application_popups(cx);
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            popup.entity_id(),
+            popup_id,
+            "the open popup entity is reused"
+        );
+        cx.update_window(popup_window.into(), |_, window, cx| {
+            window.activate_accessibility_for_test();
+            window.render_frame(cx);
+            let tree: serde_json::Value =
+                serde_json::from_str(&window.debug_a11y_tree_json().unwrap()).unwrap();
+            let labels = tree["nodes"]
+                .as_object()
+                .unwrap()
+                .values()
+                .filter_map(|node| node["aria"]["label"].as_str())
+                .collect::<Vec<_>>();
+            assert!(labels.contains(&"Alpha Viewer"));
+            assert!(labels.contains(&"Beta Viewer"));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     async fn pending_application_command_refuses_a_cleared_local_selection(
         cx: &mut TestAppContext,
     ) {
@@ -9468,13 +9722,16 @@ mod tests {
                 let item = state.focused_directory().view().items()[0].clone();
                 let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
                 state.select_item(tab, item.id().clone(), cx);
+                let origin = state
+                    .pending_application_origin(Some(tab), std::slice::from_ref(&target))
+                    .unwrap();
                 assert!(state.application_selection_is_still_active(
-                    Some(tab),
+                    Some(&origin),
                     std::slice::from_ref(&target),
                 ));
                 state.focused_directory_mut().view_mut().clear_selection();
                 assert!(!state.application_selection_is_still_active(
-                    Some(tab),
+                    Some(&origin),
                     std::slice::from_ref(&target),
                 ));
 
@@ -9504,7 +9761,8 @@ mod tests {
                 let queued = PendingApplicationCommand {
                     action: CommandAction::OpenWith,
                     parameters: CommandParameters::targets(vec![target.clone()]),
-                    origin_tab: Some(tab),
+                    origin: state
+                        .pending_application_origin(Some(tab), std::slice::from_ref(&target)),
                 };
                 state.pending_application_commands =
                     vec![queued; MAX_DESKTOP_APPLICATION_SNAPSHOTS];
@@ -9524,6 +9782,121 @@ mod tests {
                     state.operation_error.as_deref(),
                     Some(state.catalog.message("application-open-busy").unwrap())
                 );
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn invalidation_drains_pending_commands_and_origin_rejects_filter_or_navigation_changes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        filesystem::write(temporary.path().join(".hidden.txt"), b"hidden").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                let visible = state.focused_directory().view().visible_items()[0].clone();
+                let target =
+                    CommandTargetRef::new(visible.id().clone(), visible.path().clone()).unwrap();
+                state.select_item(tab, visible.id().clone(), cx);
+                let queued = PendingApplicationCommand {
+                    action: CommandAction::OpenWith,
+                    parameters: CommandParameters::targets(vec![target.clone()]),
+                    origin: state
+                        .pending_application_origin(Some(tab), std::slice::from_ref(&target)),
+                };
+                state.pending_application_commands =
+                    vec![queued; MAX_DESKTOP_APPLICATION_SNAPSHOTS];
+                state.desktop_applications.active_jobs = MAX_DESKTOP_APPLICATION_JOBS;
+                state.invalidate_application_service();
+                assert!(state.pending_application_commands.is_empty());
+                assert_eq!(
+                    state.desktop_applications.active_jobs,
+                    MAX_DESKTOP_APPLICATION_JOBS
+                );
+                assert_eq!(
+                    state.operation_error.as_deref(),
+                    Some(state.catalog.message("context.target-changed").unwrap())
+                );
+
+                state.focused_directory_mut().view_mut().clear_selection();
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .show_hidden = true;
+                let hidden = state
+                    .focused_directory()
+                    .view()
+                    .items()
+                    .iter()
+                    .find(|item| item.display_name().as_str() == ".hidden.txt")
+                    .unwrap()
+                    .clone();
+                let hidden_target =
+                    CommandTargetRef::new(hidden.id().clone(), hidden.path().clone()).unwrap();
+                state.select_item(tab, hidden.id().clone(), cx);
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .focus_item(Some(hidden.id().clone()));
+                let focused_origin = state
+                    .pending_application_origin(Some(tab), std::slice::from_ref(&hidden_target))
+                    .unwrap();
+                state.focused_directory_mut().view_mut().focus_item(None);
+                assert!(!state.application_selection_is_still_active(
+                    Some(&focused_origin),
+                    std::slice::from_ref(&hidden_target),
+                ));
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .focus_item(Some(hidden.id().clone()));
+                let hidden_origin = state
+                    .pending_application_origin(Some(tab), std::slice::from_ref(&hidden_target))
+                    .unwrap();
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .show_hidden = false;
+                assert!(!state.application_selection_is_still_active(
+                    Some(&hidden_origin),
+                    std::slice::from_ref(&hidden_target),
+                ));
+
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .show_hidden = true;
+                let navigation_origin = state
+                    .pending_application_origin(Some(tab), std::slice::from_ref(&hidden_target))
+                    .unwrap();
+                state
+                    .focused_directory_mut()
+                    .begin_navigation(StorePath::from_unix_path("/different-directory"));
+                assert!(!state.application_selection_is_still_active(
+                    Some(&navigation_origin),
+                    std::slice::from_ref(&hidden_target),
+                ));
             });
         })
         .unwrap();

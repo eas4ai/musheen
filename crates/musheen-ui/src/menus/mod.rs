@@ -17,6 +17,7 @@ pub use builder::{
 pub use context::{ContextMenuRequest, ContextMenuSource, MenuTarget, PreparedContextTarget};
 pub use open_with::OpenWithApplication;
 pub use render::ContextMenuRenderer;
+pub(crate) use render::MenuProjectionSegment;
 pub use send_to::{SendToDestination, SendToDestinationKind};
 
 use builder::InvocationData;

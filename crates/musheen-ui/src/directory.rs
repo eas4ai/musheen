@@ -86,6 +86,13 @@ impl DirectoryModel {
         self.active.as_ref().map(DirectoryLoad::location)
     }
 
+    /// Monotonically identifies the active directory load. Delayed work
+    /// captures this value so it cannot replay after navigation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
     #[must_use]
     pub fn state(&self) -> &DirectoryState {
         &self.state
