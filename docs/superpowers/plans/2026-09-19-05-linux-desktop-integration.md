@@ -35,16 +35,16 @@ create `crates/musheen-desktop/tests/{mimeapps,launch}.rs`; connect
 **Files:** Create `crates/musheen-desktop/src/volumes/{mod,model,udisks,mounts}.rs`;
 modify sidebar; create `crates/musheen-desktop/tests/volumes.rs`.
 
-- [ ] Test insert/remove, mount, unmount, eject, unlock, busy errors, duplicate
+- [x] Test insert/remove, mount, unmount, eject, unlock, busy errors, duplicate
   mount records, stale D-Bus objects, capability updates, and disappearance
   during an operation.
-- [ ] Run the volume test against a fake D-Bus service; expect failure.
-- [ ] Implement an event-driven volume model using UDisks2 through zbus and
+- [x] Run the volume test against a fake D-Bus service; expect failure.
+- [x] Implement an event-driven volume model using UDisks2 through zbus and
   proc-mounts reconciliation. Never invoke command-line mount tools as fallback.
-- [ ] Route all actions through commands and reflect mounted/read-only/free-space
+- [x] Route all actions through commands and reflect mounted/read-only/free-space
   changes in sidebar and Properties.
-- [ ] Run fake-service tests and one supported-desktop integration smoke test.
-- [ ] Commit with `feat(desktop): add volume and device integration`.
+- [x] Run fake-service tests and one supported-desktop integration smoke test.
+- [x] Commit with `feat(desktop): add volume and device integration`.
 
 ### Task 3: Export desktop services and portal behavior
 
