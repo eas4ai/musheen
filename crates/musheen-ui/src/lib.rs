@@ -17,7 +17,7 @@ pub mod sidebar;
 mod status_bar;
 mod status_center;
 pub mod theme;
-mod toolbar;
+pub mod toolbar;
 pub mod views;
 
 pub use app::run;

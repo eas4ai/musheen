@@ -131,9 +131,9 @@ modify sidebar and views; create `crates/musheen-desktop/tests/catalog.rs`.
 
 ### Task 7: Close the phase
 
-- [x] Generate a command-surface matrix and verify every context/toolbar/menu/
+- [ ] Generate a command-surface matrix and verify every context/toolbar/menu/
   shortcut entry resolves to one registry command with one capability policy.
-- [x] Run format, Clippy, workspace tests, locked release build, license audit,
+- [ ] Run format, Clippy, workspace tests, locked release build, license audit,
   accessibility checks, and deterministic visual baselines.
-- [x] Perform the rule 13 self-review and commit with
+- [ ] Perform the rule 13 self-review and commit with
   `test: close commands and customization evidence`.

@@ -73,9 +73,7 @@ impl SettingsWindow {
             panel = panel.child(row.child(actions));
         }
         panel = panel.child(self.label("customization-add"));
-        for command in registry
-            .commands()
-            .iter()
+        for command in crate::toolbar::customizable_commands(&registry)
             .filter(|command| !layout.ids().contains(command.id()))
         {
             let id = command.id().clone();

@@ -402,6 +402,26 @@ impl MenuEntry {
             .map(|invocation| invocation.selection.as_slice())
             .unwrap_or_default()
     }
+
+    /// Re-evaluates the registry predicate against the exact context captured
+    /// for this row. Surface audits use this to prove that nested and variable
+    /// menu entries cannot substitute their own enabled, checked, or refusal
+    /// state for the command registry's policy.
+    #[must_use]
+    pub fn registry_policy_state(
+        &self,
+        registry: &CommandRegistry,
+        locale: Locale,
+    ) -> Option<CommandState> {
+        let invocation = self.invocation.as_ref()?;
+        let command = registry.get(invocation.id.as_str())?;
+        let catalog = Catalog::load(locale).expect("built-in menu locale is valid");
+        Some(
+            command
+                .state(&invocation.context)
+                .map_disabled_reason(|reason| catalog.localize_reason(reason)),
+        )
+    }
 }
 
 impl ContextMenu {
@@ -795,7 +815,15 @@ fn add_send_to_submenu(
         .find(|destination| destination.writable())
     {
         let context = request.context_with_destination(destination.path().clone(), true);
-        entry.state = send_to.state(&context);
+        entry.state = send_to
+            .state(&context)
+            .map_disabled_reason(|reason| catalog.localize_reason(reason));
+        let invocation = entry
+            .invocation
+            .as_mut()
+            .expect("command rows are invokable");
+        invocation.context = context;
+        invocation.destination = Some(destination.path().clone());
     }
     entry.kind = MenuEntryKind::Submenu;
     entry.submenu = Some(Box::new(ContextMenu {

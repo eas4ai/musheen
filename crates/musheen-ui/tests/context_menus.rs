@@ -1,8 +1,12 @@
 use musheen_core::{
     CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, CommandAction,
-    CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters,
-    CommandPresentation, CommandRegistry, CommandTarget, CommandTargetRef, ItemId, OpenWithIntent,
-    ProviderActionMatrix, ProviderId, ShortcutMap, StorePath, ToolbarLayout,
+    CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters, CommandRegistry,
+    CommandTarget, CommandTargetRef, ItemId, OpenWithIntent, ProviderActionMatrix, ProviderId,
+    ShortcutMap, StorePath, ToolbarLayout, canonical_chord,
+};
+use musheen_ui::toolbar::{
+    FixedCommandSurface, STATIC_SHORTCUTS, customizable_commands, fixed_surface_ids,
+    project_custom_toolbar, resolve_command_mode,
 };
 use musheen_ui::{
     AppearanceMode, ContextMenu, ContextMenuDestinationResolver, ContextMenuRequest,
@@ -158,7 +162,8 @@ fn right_click_and_keyboard_target_the_current_pane_without_stale_selection() {
 
 #[test]
 fn disabled_provider_limits_remain_accessible_but_inapplicable_actions_are_absent() {
-    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let registry = CommandRegistry::built_in();
+    let surface = ContextMenuSurface::new(registry.clone());
     let refusal = CapabilityReason::new("links are unavailable on this provider").unwrap();
     let context = CommandContext {
         capabilities: CapabilityMatrix::new(|kind| match kind {
@@ -179,6 +184,29 @@ fn disabled_provider_limits_remain_accessible_but_inapplicable_actions_are_absen
         Some("links are unavailable on this provider")
     );
     assert!(menu.entry("directory.open_as_administrator").is_none());
+
+    let mutation_menu = surface.compose(request(
+        CommandContext {
+            mutation_is_supported: false,
+            ..supported_context(CommandTarget::File, 1)
+        },
+        MenuTarget::Item,
+        vec![target(b"policy", "/remote/policy.txt")],
+    ));
+    let mutation_link = mutation_menu
+        .entry("file.create_symbolic_link")
+        .expect("applicable unsupported mutation remains explainable");
+    assert_eq!(
+        mutation_link.state(),
+        &mutation_link
+            .registry_policy_state(&registry, Locale::EnUs)
+            .expect("command row captures its registry context")
+    );
+    assert_eq!(
+        mutation_link.state().disabled_reason(),
+        Some("the provider does not support this mutation")
+    );
+    assert!(mutation_menu.entry("file.compress").is_none());
 }
 
 #[test]
@@ -758,6 +786,21 @@ fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
     hidden.target_is_hidden = true;
     let mut pinned = supported_context(CommandTarget::Directory, 1);
     pinned.target_is_pinned = true;
+    let mut read_only = supported_context(CommandTarget::File, 1);
+    read_only.location_is_writable = false;
+    let unsupported_reason =
+        CapabilityReason::new("the provider does not implement this operation").unwrap();
+    let unsupported_state = CapabilityState::Unsupported(unsupported_reason.clone());
+    let mut unsupported = supported_context(CommandTarget::File, 1);
+    unsupported.mutation_is_supported = false;
+    unsupported.capabilities =
+        CapabilityMatrix::new(|_| CapabilityState::Unsupported(unsupported_reason.clone()));
+    unsupported.provider_actions = ProviderActionMatrix::from_states(
+        unsupported_state.clone(),
+        unsupported_state.clone(),
+        unsupported_state.clone(),
+        unsupported_state,
+    );
 
     vec![
         (
@@ -770,6 +813,22 @@ fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
         ),
         ("file", variable_rows),
         ("hidden-file", request(hidden, MenuTarget::Item, vec![file])),
+        (
+            "read-only-file",
+            request(
+                read_only,
+                MenuTarget::Item,
+                vec![target(b"read-only", "/work/read-only.txt")],
+            ),
+        ),
+        (
+            "unsupported-file",
+            request(
+                unsupported,
+                MenuTarget::Item,
+                vec![target(b"unsupported", "/remote/unsupported.txt")],
+            ),
+        ),
         (
             "archive",
             request(
@@ -867,6 +926,14 @@ fn audit_matrix_menu(
                 .get(id)
                 .unwrap_or_else(|| panic!("{surface_name} bypasses the registry with {id}"));
             assert_eq!(entry.icon_key(), Some(command.icon_key()));
+            let expected = entry
+                .registry_policy_state(registry, Locale::EnUs)
+                .unwrap_or_else(|| panic!("{surface_name}:{id} has no captured registry policy"));
+            assert_eq!(
+                entry.state(),
+                &expected,
+                "{surface_name}:{id} bypasses its registry policy"
+            );
             contexts
                 .entry(id.to_owned())
                 .or_default()
@@ -883,42 +950,102 @@ fn audit_matrix_menu(
     }
 }
 
-fn matrix_marker(value: bool) -> &'static str {
-    if value { "yes" } else { "—" }
+fn add_surface_ids(
+    surfaces: &mut BTreeMap<String, BTreeSet<&'static str>>,
+    surface: &'static str,
+    ids: impl IntoIterator<Item = impl AsRef<str>>,
+) {
+    for id in ids {
+        surfaces
+            .entry(id.as_ref().to_owned())
+            .or_default()
+            .insert(surface);
+    }
+}
+
+fn live_surface_inventory(registry: &CommandRegistry) -> BTreeMap<String, BTreeSet<&'static str>> {
+    let mut surfaces = BTreeMap::new();
+    for surface in [
+        FixedCommandSurface::NavigationToolbar,
+        FixedCommandSurface::WideViewControls,
+        FixedCommandSurface::CompactOverflow,
+        FixedCommandSurface::TabStrip,
+        FixedCommandSurface::StaticShortcut,
+    ] {
+        add_surface_ids(&mut surfaces, surface.id(), fixed_surface_ids(surface));
+    }
+
+    let default_layout = ToolbarLayout::default();
+    let default_projection = project_custom_toolbar(&default_layout);
+    add_surface_ids(
+        &mut surfaces,
+        "custom-visible",
+        default_projection.visible().iter().map(|id| id.as_str()),
+    );
+    assert!(default_projection.overflow().is_empty());
+
+    let mut overflow_layout = default_layout;
+    overflow_layout
+        .add("navigation.refresh", registry)
+        .expect("eighth custom command");
+    overflow_layout
+        .add("tab.new", registry)
+        .expect("ninth custom command");
+    let overflow_projection = project_custom_toolbar(&overflow_layout);
+    add_surface_ids(
+        &mut surfaces,
+        "custom-overflow",
+        overflow_projection.overflow().iter().map(|id| id.as_str()),
+    );
+    add_surface_ids(
+        &mut surfaces,
+        "customizable",
+        customizable_commands(registry).map(|command| command.id().as_str()),
+    );
+    add_surface_ids(
+        &mut surfaces,
+        "shortcut-default",
+        ShortcutMap::default()
+            .bindings(registry)
+            .iter()
+            .map(|binding| binding.command.as_str()),
+    );
+    for command in registry.commands() {
+        let resolved = resolve_command_mode(registry, command.id().as_str())
+            .expect("command mode resolves every registered command ID");
+        assert!(std::ptr::eq(resolved, command));
+        add_surface_ids(&mut surfaces, "command-mode", [command.id().as_str()]);
+    }
+    surfaces
 }
 
 fn render_surface_matrix(
     registry: &CommandRegistry,
     contexts: &BTreeMap<String, BTreeSet<&'static str>>,
+    surfaces: &BTreeMap<String, BTreeSet<&'static str>>,
 ) -> String {
-    let toolbar = ToolbarLayout::default()
-        .ids()
-        .iter()
-        .map(|id| id.as_str().to_owned())
-        .collect::<BTreeSet<_>>();
-    let shortcuts = ShortcutMap::default()
-        .bindings(registry)
-        .into_iter()
-        .map(|binding| binding.command.as_str().to_owned())
-        .collect::<BTreeSet<_>>();
     let mut output = String::from(
         "# Command Surface Matrix\n\n\
-         Generated by `cargo test -p musheen-ui --test context_menus`. Each row names the one registry predicate used by every projection. `Context` lists canonical menus; `Toolbar` and `Shortcut` describe defaults. All commands project to the menu and palette.\n\n\
-         | Command ID | Capability policy | Context | Toolbar | Menu | Shortcut | Palette |\n\
-         |---|---|---|---:|---:|---:|---:|\n",
+         Generated by `cargo test -p musheen-ui --test context_menus`. Each row names the one registry predicate used by every live projection. `Context` lists canonical menu compositions, including read-only and unsupported providers.\n\n\
+         Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overflow**, **Tab strip**, default **Custom visible** commands, a deterministic **Custom overflow** layout, all customizable commands, each **Static shortcut**, default configurable shortcuts, and **Command mode**.\n\n\
+         | Command ID | Capability policy | Context | Live surfaces |\n\
+         |---|---|---|---|\n",
     );
     for command in registry.commands() {
         let context = contexts
             .get(command.id().as_str())
             .map(|values| values.iter().copied().collect::<Vec<_>>().join(", "))
             .unwrap_or_else(|| "—".to_owned());
+        let live_surfaces = surfaces
+            .get(command.id().as_str())
+            .map(|values| values.iter().copied().collect::<Vec<_>>().join(", "))
+            .unwrap_or_else(|| "—".to_owned());
         output.push_str(&format!(
-            "| `{}` | `{:?}` | {} | {} | yes | {} | yes |\n",
+            "| `{}` | `{:?}` | {} | {} |\n",
             command.id().as_str(),
             command.predicate(),
             context,
-            matrix_marker(toolbar.contains(command.id().as_str())),
-            matrix_marker(shortcuts.contains(command.id().as_str())),
+            live_surfaces,
         ));
     }
     output
@@ -933,46 +1060,86 @@ fn every_command_surface_uses_one_registry_definition_and_policy() {
     for (name, request) in surface_matrix_requests() {
         audit_matrix_menu(&surface.compose(request), &registry, name, &mut contexts);
     }
-
-    for command in registry.commands() {
-        for presentation in CommandPresentation::ALL {
-            let projection = registry
-                .project(command.id(), presentation)
-                .expect("every command projects to every generic command surface");
-            assert!(
-                std::ptr::eq(projection.command(), command),
-                "{} has a forked {presentation:?} definition",
-                command.id().as_str()
-            );
-            for context in [
-                CommandContext::default(),
-                supported_context(CommandTarget::File, 1),
-                supported_context(CommandTarget::Directory, 1),
-            ] {
-                assert_eq!(
-                    projection.command().state(&context),
-                    command.state(&context)
-                );
-            }
-        }
-    }
-    for id in ToolbarLayout::default().ids() {
-        assert!(registry.project(id, CommandPresentation::Toolbar).is_some());
-    }
-    for binding in ShortcutMap::default().bindings(&registry) {
+    let surfaces = live_surface_inventory(&registry);
+    for (id, memberships) in &surfaces {
         assert!(
-            registry
-                .project(&binding.command, CommandPresentation::Menu)
-                .is_some()
+            registry.get(id).is_some(),
+            "live surfaces {memberships:?} reference unregistered command {id}"
+        );
+    }
+    assert_eq!(
+        ShellModel::new(false).toolbar_command_ids(),
+        fixed_surface_ids(FixedCommandSurface::NavigationToolbar)
+    );
+    for binding in STATIC_SHORTCUTS {
+        let command = registry
+            .get(binding.command_id())
+            .expect("static shortcut command is registered");
+        assert_eq!(
+            command.action(),
+            binding.action(),
+            "{} handler action drifted from the registry",
+            binding.command_id()
+        );
+        let chord = canonical_chord(binding.chord()).expect("static chord is canonicalizable");
+        assert!(
+            command.shortcuts().iter().any(|shortcut| {
+                canonical_chord(shortcut.chord()).as_deref() == Ok(chord.as_str())
+            }),
+            "{} installed chord {} drifted from its registry definition",
+            binding.command_id(),
+            binding.chord()
         );
     }
 
-    let expected = render_surface_matrix(&registry, &contexts);
+    let expected = render_surface_matrix(&registry, &contexts, &surfaces);
     let actual =
         std::fs::read_to_string("../../docs/command-surface-matrix.md").unwrap_or_else(|error| {
             panic!("the checked-in command-surface matrix exists: {error}\n\n{expected}")
         });
     assert_eq!(actual, expected, "regenerate the command-surface matrix");
+}
+
+#[test]
+fn command_surface_matrix_names_every_live_shell_projection() {
+    let matrix = std::fs::read_to_string("../../docs/command-surface-matrix.md").unwrap();
+    for heading in [
+        "Navigation toolbar",
+        "Compact overflow",
+        "Tab strip",
+        "Custom visible",
+        "Custom overflow",
+        "Static shortcut",
+        "Command mode",
+    ] {
+        assert!(matrix.contains(heading), "matrix is missing {heading}");
+    }
+    for id in ShellModel::new(false).toolbar_command_ids() {
+        let row = matrix
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{id}` |")))
+            .unwrap_or_else(|| panic!("matrix is missing live toolbar command {id}"));
+        assert!(
+            row.contains("navigation-toolbar"),
+            "matrix omits live toolbar command {id}: {row}"
+        );
+    }
+    for (id, surface) in [
+        ("tab.new", "tab-strip"),
+        ("view.details", "compact-overflow"),
+        ("tab.close", "static-shortcut"),
+        ("app.settings", "custom-visible"),
+        ("view.command", "command-mode"),
+    ] {
+        let row = matrix
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{id}` |")))
+            .unwrap_or_else(|| panic!("matrix is missing {id}"));
+        assert!(
+            row.contains(surface),
+            "matrix omits {id} from {surface}: {row}"
+        );
+    }
 }
 
 #[derive(Default)]
