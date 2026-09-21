@@ -1,11 +1,15 @@
 #![cfg(unix)]
 
-use musheen_desktop::{UDisksBackend, UDisksError, VolumeAction, ZbusUDisksBackend};
+use musheen_desktop::{
+    Capacity, MountProvider, MountRecord, NoOperationUsage, UDisksBackend, UDisksBusConfig,
+    UDisksError, VolumeAction, VolumeError, VolumeRuntime, VolumeService, VolumeSubscription,
+    VolumeTrigger, ZbusUDisksBackend,
+};
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zbus::fdo::ObjectManager;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
@@ -13,6 +17,22 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 const SERVICE: &str = "org.freedesktop.UDisks2";
 const ROOT: &str = "/org/freedesktop/UDisks2";
 const BLOCK_PATH: &str = "/org/freedesktop/UDisks2/block_devices/fake1";
+const ADDED_PATH: &str = "/org/freedesktop/UDisks2/block_devices/added";
+const DRIVE_PATH: &str = "/org/freedesktop/UDisks2/drives/fake";
+
+struct EmptyMounts;
+
+impl MountProvider for EmptyMounts {
+    fn snapshot(&self) -> Result<Vec<MountRecord>, VolumeError> {
+        Ok(Vec::new())
+    }
+    fn capacity(&self, path: &std::path::Path) -> Result<Capacity, VolumeError> {
+        Err(VolumeError::Capacity {
+            path: path.to_path_buf(),
+            reason: "unused".into(),
+        })
+    }
+}
 
 struct PrivateBus {
     child: Child,
@@ -51,47 +71,59 @@ struct FakeBlock {
 
 #[zbus::interface(name = "org.freedesktop.UDisks2.Block")]
 impl FakeBlock {
+    fn pause(&self) {
+        if self.slow.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(80));
+        }
+    }
+
     #[zbus(property)]
     fn device(&self) -> Vec<u8> {
-        if self.slow.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_secs(2));
-        }
+        self.pause();
         b"/dev/fake1\0".to_vec()
     }
 
     #[zbus(property)]
     fn symlinks(&self) -> Vec<Vec<u8>> {
+        self.pause();
         vec![b"/dev/disk/by-id/fake-drive\0".to_vec()]
     }
 
     #[zbus(property)]
     fn id_uuid(&self) -> &str {
+        self.pause();
         "cloneable-uuid"
     }
 
     #[zbus(property)]
     fn id_label(&self) -> &str {
+        self.pause();
         "Fake disk"
     }
 
     #[zbus(property)]
     fn size(&self) -> u64 {
+        self.pause();
         4096
     }
 
     #[zbus(property)]
     fn read_only(&self) -> bool {
+        self.pause();
         false
     }
 
     #[zbus(property)]
     fn drive(&self) -> OwnedObjectPath {
-        OwnedObjectPath::try_from("/").unwrap()
+        self.pause();
+        OwnedObjectPath::try_from(DRIVE_PATH).unwrap()
     }
 }
 
 struct FakeFilesystem {
     unmount_calls: Arc<AtomicUsize>,
+    error_mode: Arc<AtomicUsize>,
+    actions: Arc<Mutex<Vec<String>>>,
 }
 
 #[zbus::interface(name = "org.freedesktop.UDisks2.Filesystem")]
@@ -101,13 +133,76 @@ impl FakeFilesystem {
         vec![b"/media/fake\0".to_vec()]
     }
 
+    fn mount(&self, options: HashMap<String, OwnedValue>) -> zbus::fdo::Result<String> {
+        assert!(options.is_empty());
+        self.actions.lock().unwrap().push("mount".into());
+        Ok("/media/fake".into())
+    }
+
     fn unmount(&self, options: HashMap<String, OwnedValue>) -> zbus::fdo::Result<()> {
         assert!(
             options.is_empty(),
             "UDisks options must be explicit and empty"
         );
         self.unmount_calls.fetch_add(1, Ordering::SeqCst);
-        Err(zbus::fdo::Error::Failed("DeviceBusy fixture".into()))
+        self.actions.lock().unwrap().push("unmount".into());
+        match self.error_mode.load(Ordering::SeqCst) {
+            1 => Err(zbus::fdo::Error::Failed("DeviceBusy fixture".into())),
+            2 => Err(zbus::fdo::Error::Failed("NotAuthorized fixture".into())),
+            3 => Err(zbus::fdo::Error::Failed("NotSupported fixture".into())),
+            4 => Err(zbus::fdo::Error::Failed("UnknownObject fixture".into())),
+            _ => Ok(()),
+        }
+    }
+}
+
+struct FakeDrive {
+    actions: Arc<Mutex<Vec<String>>>,
+}
+
+#[zbus::interface(name = "org.freedesktop.UDisks2.Drive")]
+impl FakeDrive {
+    #[zbus(property)]
+    fn ejectable(&self) -> bool {
+        true
+    }
+    #[zbus(property)]
+    fn can_power_off(&self) -> bool {
+        true
+    }
+    #[zbus(property)]
+    fn wwn(&self) -> &str {
+        "wwn-fake"
+    }
+    #[zbus(property)]
+    fn serial(&self) -> &str {
+        "serial-fake"
+    }
+    fn eject(&self, options: HashMap<String, OwnedValue>) {
+        assert!(options.is_empty());
+        self.actions.lock().unwrap().push("eject".into());
+    }
+    fn power_off(&self, options: HashMap<String, OwnedValue>) {
+        assert!(options.is_empty());
+        self.actions.lock().unwrap().push("power-off".into());
+    }
+}
+
+struct FakeEncrypted {
+    actions: Arc<Mutex<Vec<String>>>,
+}
+
+#[zbus::interface(name = "org.freedesktop.UDisks2.Encrypted")]
+impl FakeEncrypted {
+    #[zbus(property)]
+    fn cleartext_device(&self) -> OwnedObjectPath {
+        OwnedObjectPath::try_from("/").unwrap()
+    }
+    fn unlock(&self, secret: &str, options: HashMap<String, OwnedValue>) -> OwnedObjectPath {
+        assert_eq!(secret, "secret");
+        assert!(options.is_empty());
+        self.actions.lock().unwrap().push("unlock".into());
+        OwnedObjectPath::try_from(BLOCK_PATH).unwrap()
     }
 }
 
@@ -115,6 +210,8 @@ fn start_service(
     address: &str,
     calls: Arc<AtomicUsize>,
     slow: Arc<AtomicBool>,
+    error_mode: Arc<AtomicUsize>,
+    actions: Arc<Mutex<Vec<String>>>,
 ) -> zbus::Connection {
     futures_lite::future::block_on(async {
         zbus::connection::Builder::address(address)
@@ -127,10 +224,21 @@ fn start_service(
             .unwrap()
             .serve_at(
                 BLOCK_PATH,
-                FakeFilesystem {
-                    unmount_calls: calls,
+                FakeEncrypted {
+                    actions: actions.clone(),
                 },
             )
+            .unwrap()
+            .serve_at(
+                BLOCK_PATH,
+                FakeFilesystem {
+                    unmount_calls: calls,
+                    error_mode,
+                    actions: actions.clone(),
+                },
+            )
+            .unwrap()
+            .serve_at(DRIVE_PATH, FakeDrive { actions })
             .unwrap()
             .build()
             .await
@@ -145,7 +253,15 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
     };
     let calls = Arc::new(AtomicUsize::new(0));
     let slow = Arc::new(AtomicBool::new(false));
-    let first_service = start_service(&bus.address, Arc::clone(&calls), Arc::clone(&slow));
+    let error_mode = Arc::new(AtomicUsize::new(1));
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let first_service = start_service(
+        &bus.address,
+        Arc::clone(&calls),
+        Arc::clone(&slow),
+        Arc::clone(&error_mode),
+        Arc::clone(&actions),
+    );
     let backend =
         ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
             .unwrap();
@@ -162,13 +278,60 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
         Err(UDisksError::Busy(_))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    for (mode, expected) in [(2, "authorization"), (3, "unsupported"), (4, "stale")] {
+        error_mode.store(mode, Ordering::SeqCst);
+        let error = backend
+            .perform(&first.devices()[0], VolumeAction::Unmount, None)
+            .unwrap_err();
+        assert!(
+            matches!(
+                (expected, error),
+                ("authorization", UDisksError::AuthorizationRequired(_))
+                    | ("unsupported", UDisksError::Unsupported(_))
+                    | ("stale", UDisksError::StaleObject)
+            ),
+            "expected {expected}"
+        );
+    }
+    error_mode.store(0, Ordering::SeqCst);
+    for (action, secret) in [
+        (VolumeAction::Mount, None),
+        (VolumeAction::Unmount, None),
+        (VolumeAction::Eject, None),
+        (VolumeAction::Unlock, Some("secret")),
+        (VolumeAction::PowerOff, None),
+    ] {
+        backend
+            .perform(&first.devices()[0], action, secret)
+            .unwrap();
+    }
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [
+            "unmount",
+            "unmount",
+            "unmount",
+            "unmount",
+            "mount",
+            "unmount",
+            "eject",
+            "unlock",
+            "power-off"
+        ]
+    );
 
     futures_lite::future::block_on(first_service.release_name(SERVICE)).unwrap();
     assert!(matches!(
         backend.snapshot(),
         Err(UDisksError::Unavailable(_))
     ));
-    let second_service = start_service(&bus.address, Arc::clone(&calls), Arc::clone(&slow));
+    let second_service = start_service(
+        &bus.address,
+        Arc::clone(&calls),
+        Arc::clone(&slow),
+        Arc::clone(&error_mode),
+        Arc::clone(&actions),
+    );
     let restarted = backend.snapshot().unwrap();
     assert_ne!(first.owner(), restarted.owner());
 
@@ -187,4 +350,103 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
         Err(UDisksError::Disconnected(_) | UDisksError::Timeout(_)) => {}
         other => panic!("dead private bus must be a connection error, got {other:?}"),
     }
+}
+
+fn wait_for_trigger(subscription: &VolumeSubscription, expected: VolumeTrigger) {
+    futures_lite::future::block_on(async {
+        let deadline = async {
+            async_io::Timer::after(Duration::from_secs(2)).await;
+            panic!("timed out waiting for {expected:?}");
+        };
+        futures_lite::future::race(
+            async {
+                loop {
+                    if subscription.recv().await.unwrap() == expected {
+                        return;
+                    }
+                }
+            },
+            deadline,
+        )
+        .await
+    });
+}
+
+#[test]
+fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
+    let Some(bus) = PrivateBus::start() else {
+        return;
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let slow = Arc::new(AtomicBool::new(false));
+    let error_mode = Arc::new(AtomicUsize::new(0));
+    let actions = Arc::new(Mutex::new(Vec::new()));
+    let service = start_service(&bus.address, calls, Arc::clone(&slow), error_mode, actions);
+    let subscription =
+        VolumeSubscription::with_udisks(UDisksBusConfig::address(bus.address.as_str()), false);
+    wait_for_trigger(&subscription, VolumeTrigger::MountTableChanged);
+    std::thread::sleep(Duration::from_millis(100));
+
+    futures_lite::future::block_on(async {
+        service
+            .object_server()
+            .at(
+                ADDED_PATH,
+                FakeBlock {
+                    slow: Arc::clone(&slow),
+                },
+            )
+            .await
+            .unwrap();
+    });
+    wait_for_trigger(&subscription, VolumeTrigger::UDisksChanged);
+
+    futures_lite::future::block_on(async {
+        let interface = service
+            .object_server()
+            .interface::<_, FakeBlock>(BLOCK_PATH)
+            .await
+            .unwrap();
+        interface
+            .get()
+            .await
+            .id_label_changed(interface.signal_emitter())
+            .await
+            .unwrap();
+    });
+    wait_for_trigger(&subscription, VolumeTrigger::UDisksChanged);
+
+    futures_lite::future::block_on(async {
+        service
+            .object_server()
+            .remove::<FakeBlock, _>(ADDED_PATH)
+            .await
+            .unwrap();
+    });
+    wait_for_trigger(&subscription, VolumeTrigger::UDisksChanged);
+
+    let backend =
+        ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_secs(5))
+            .unwrap();
+    slow.store(true, Ordering::SeqCst);
+    let runtime = VolumeRuntime::from_service_with_subscription(
+        VolumeService::new(
+            Arc::new(backend),
+            Arc::new(EmptyMounts),
+            Arc::new(NoOperationUsage),
+        ),
+        VolumeSubscription::with_udisks(UDisksBusConfig::address(bus.address.as_str()), false),
+    );
+    runtime.refresh(VolumeTrigger::UDisksChanged).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let runtime_shutdown = std::time::Instant::now();
+    drop(runtime);
+    assert!(runtime_shutdown.elapsed() < Duration::from_millis(500));
+    slow.store(false, Ordering::SeqCst);
+
+    futures_lite::future::block_on(service.release_name(SERVICE)).unwrap();
+    wait_for_trigger(&subscription, VolumeTrigger::ServiceOwnerChanged);
+    let started = std::time::Instant::now();
+    drop(subscription);
+    assert!(started.elapsed() < Duration::from_millis(500));
 }

@@ -30,6 +30,7 @@ unsafe_code = "forbid"
 
 [workspace.dependencies]
 async-channel = "2"
+async-io = "2"
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "backend", "frontend"] }
 blake3 = "1"
 camino = "1"

@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 async-channel.workspace = true
+async-io.workspace = true
 ashpd.workspace = true
 blake3.workspace = true
 fast_image_resize.workspace = true

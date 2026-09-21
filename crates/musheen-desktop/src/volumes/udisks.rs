@@ -2,11 +2,13 @@ use super::{DeviceDescriptor, VolumeAction, VolumeId};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
+use std::future::Future;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
-use zbus::blocking::{Connection, Proxy, connection::Builder};
+use std::time::{Duration, Instant};
 use zbus::names::BusName;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
@@ -17,6 +19,89 @@ const FILESYSTEM: &str = "org.freedesktop.UDisks2.Filesystem";
 const DRIVE: &str = "org.freedesktop.UDisks2.Drive";
 const ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
 const DEFAULT_METHOD_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UDisksBusConfig {
+    address: Option<Box<str>>,
+    service: Box<str>,
+    root: Box<str>,
+}
+
+impl UDisksBusConfig {
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            address: None,
+            service: SERVICE.into(),
+            root: ROOT.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn address(address: impl Into<Box<str>>) -> Self {
+        Self {
+            address: Some(address.into()),
+            ..Self::system()
+        }
+    }
+
+    fn service(&self) -> &str {
+        &self.service
+    }
+
+    fn root(&self) -> &str {
+        &self.root
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UDisksRequest {
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl UDisksRequest {
+    #[must_use]
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self::with_cancel(timeout, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[must_use]
+    pub(crate) fn with_cancel(timeout: Duration, cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            cancelled,
+        }
+    }
+
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub fn check(&self) -> Result<(), UDisksError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(UDisksError::Disconnected("volume service stopped".into()));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(UDisksError::Timeout("operation deadline exceeded".into()));
+        }
+        Ok(())
+    }
+
+    async fn expiry(&self) -> UDisksError {
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return UDisksError::Disconnected("volume service stopped".into());
+            }
+            let remaining = self.remaining();
+            if remaining.is_zero() {
+                return UDisksError::Timeout("operation deadline exceeded".into());
+            }
+            async_io::Timer::after(remaining.min(Duration::from_millis(20))).await;
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendSnapshot {
@@ -92,11 +177,36 @@ pub trait UDisksBackend: Send + Sync {
         action: VolumeAction,
         unlock_secret: Option<&str>,
     ) -> Result<(), UDisksError>;
+
+    fn snapshot_with_request(
+        &self,
+        request: &UDisksRequest,
+    ) -> Result<BackendSnapshot, UDisksError> {
+        request.check()?;
+        let result = self.snapshot();
+        request.check()?;
+        result
+    }
+
+    fn perform_with_request(
+        &self,
+        volume: &DeviceDescriptor,
+        action: VolumeAction,
+        unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        request.check()?;
+        let result = self.perform(volume, action, unlock_secret);
+        request.check()?;
+        result
+    }
 }
 
 #[derive(Clone)]
 pub struct ZbusUDisksBackend {
-    connection: Connection,
+    connection: zbus::Connection,
+    config: UDisksBusConfig,
+    default_timeout: Duration,
 }
 
 impl fmt::Debug for ZbusUDisksBackend {
@@ -113,10 +223,7 @@ impl ZbusUDisksBackend {
     }
 
     pub fn connect_system_with_timeout(timeout: Duration) -> Result<Self, UDisksError> {
-        Builder::system()
-            .and_then(|builder| builder.method_timeout(timeout).build())
-            .map(|connection| Self { connection })
-            .map_err(map_connection_error)
+        Self::connect(UDisksBusConfig::system(), timeout)
     }
 
     /// Connect to an explicit bus address. This is primarily useful for an
@@ -126,37 +233,62 @@ impl ZbusUDisksBackend {
         address: &str,
         timeout: Duration,
     ) -> Result<Self, UDisksError> {
-        Builder::address(address)
-            .and_then(|builder| builder.method_timeout(timeout).build())
-            .map(|connection| Self { connection })
-            .map_err(map_connection_error)
+        Self::connect(UDisksBusConfig::address(address), timeout)
     }
 
-    fn proxy<'a>(&'a self, path: &'a str, interface: &'a str) -> Result<Proxy<'a>, UDisksError> {
-        Proxy::new(&self.connection, SERVICE, path, interface).map_err(map_zbus_error)
+    pub fn connect(config: UDisksBusConfig, timeout: Duration) -> Result<Self, UDisksError> {
+        let request = UDisksRequest::with_timeout(timeout);
+        let builder = match config.address.as_deref() {
+            Some(address) => zbus::connection::Builder::address(address),
+            None => zbus::connection::Builder::system(),
+        }
+        .map_err(map_connection_error)?;
+        let connection = block_on_request(&request, async move {
+            builder.build().await.map_err(map_connection_error)
+        })?;
+        Ok(Self {
+            connection,
+            config,
+            default_timeout: timeout,
+        })
     }
 
-    fn managed_objects(&self) -> Result<zbus::fdo::ManagedObjects, UDisksError> {
-        let proxy = zbus::blocking::fdo::ObjectManagerProxy::builder(&self.connection)
-            .destination(SERVICE)
-            .and_then(|builder| builder.path(ROOT))
-            .and_then(|builder| builder.build())
+    async fn proxy<'a>(
+        &'a self,
+        path: &'a str,
+        interface: &'a str,
+    ) -> Result<zbus::Proxy<'a>, UDisksError> {
+        zbus::Proxy::new(&self.connection, self.config.service(), path, interface)
+            .await
+            .map_err(map_zbus_error)
+    }
+
+    async fn managed_objects(&self) -> Result<zbus::fdo::ManagedObjects, UDisksError> {
+        let proxy = zbus::fdo::ObjectManagerProxy::builder(&self.connection)
+            .destination(self.config.service())
+            .map_err(map_zbus_error)?
+            .path(self.config.root())
+            .map_err(map_zbus_error)?
+            .build()
+            .await
             .map_err(map_zbus_error)?;
-        proxy.get_managed_objects().map_err(map_fdo_error)
+        proxy.get_managed_objects().await.map_err(map_fdo_error)
     }
 
-    fn service_owner(&self) -> Result<String, UDisksError> {
-        let proxy =
-            zbus::blocking::fdo::DBusProxy::new(&self.connection).map_err(map_zbus_error)?;
-        let name = BusName::try_from(SERVICE)
+    async fn service_owner(&self) -> Result<String, UDisksError> {
+        let proxy = zbus::fdo::DBusProxy::new(&self.connection)
+            .await
+            .map_err(map_zbus_error)?;
+        let name = BusName::try_from(self.config.service())
             .map_err(|error| UDisksError::Protocol(error.to_string().into()))?;
         proxy
             .get_name_owner(name)
+            .await
             .map(|owner| owner.to_string())
             .map_err(map_fdo_error)
     }
 
-    fn read_device(
+    async fn read_device(
         &self,
         path: &str,
         interfaces: &HashMap<
@@ -167,27 +299,39 @@ impl ZbusUDisksBackend {
         if !interfaces.keys().any(|name| name.as_str() == BLOCK) {
             return Ok(None);
         }
-        let block = self.proxy(path, BLOCK)?;
+        let block = self.proxy(path, BLOCK).await?;
         let mut device = block
             .get_property::<Vec<u8>>("Device")
+            .await
             .map(bytes_to_path)
             .map_err(map_zbus_error)?;
         if device.as_os_str().is_empty() {
             device = PathBuf::from(path.rsplit('/').next().unwrap_or("volume"));
         }
-        let uuid = block.get_property::<String>("IdUUID").unwrap_or_default();
-        let label = block.get_property::<String>("IdLabel").unwrap_or_default();
-        let size = block.get_property::<u64>("Size").ok();
-        let read_only = block.get_property::<bool>("ReadOnly").unwrap_or(false);
-        let drive_path = block.get_property::<OwnedObjectPath>("Drive").ok();
+        let uuid = block
+            .get_property::<String>("IdUUID")
+            .await
+            .unwrap_or_default();
+        let label = block
+            .get_property::<String>("IdLabel")
+            .await
+            .unwrap_or_default();
+        let size = block.get_property::<u64>("Size").await.ok();
+        let read_only = block
+            .get_property::<bool>("ReadOnly")
+            .await
+            .unwrap_or(false);
+        let drive_path = block.get_property::<OwnedObjectPath>("Drive").await.ok();
         let symlinks = block
             .get_property::<Vec<Vec<u8>>>("Symlinks")
+            .await
             .unwrap_or_default();
         let has_filesystem = interfaces.keys().any(|name| name.as_str() == FILESYSTEM);
-        let mount_points = self.mount_points(path, has_filesystem)?;
+        let mount_points = self.mount_points(path, has_filesystem).await?;
         let has_encrypted = interfaces.keys().any(|name| name.as_str() == ENCRYPTED);
-        let locked = self.is_locked(path, has_encrypted)?;
-        let (can_eject, can_power_off, drive_identity) = self.drive_facts(drive_path.as_ref());
+        let locked = self.is_locked(path, has_encrypted).await?;
+        let (can_eject, can_power_off, drive_identity) =
+            self.drive_facts(drive_path.as_ref()).await;
         let persistent_hint = symlinks
             .iter()
             .map(|bytes| bytes_to_path(bytes.clone()))
@@ -230,56 +374,63 @@ impl ZbusUDisksBackend {
         Ok(Some(descriptor))
     }
 
-    fn mount_points(&self, path: &str, present: bool) -> Result<Vec<PathBuf>, UDisksError> {
+    async fn mount_points(&self, path: &str, present: bool) -> Result<Vec<PathBuf>, UDisksError> {
         if !present {
             return Ok(Vec::new());
         }
-        self.proxy(path, FILESYSTEM)?
+        self.proxy(path, FILESYSTEM)
+            .await?
             .get_property::<Vec<Vec<u8>>>("MountPoints")
+            .await
             .map(|points| points.into_iter().map(bytes_to_path).collect())
             .map_err(map_zbus_error)
     }
 
-    fn is_locked(&self, path: &str, encrypted: bool) -> Result<bool, UDisksError> {
+    async fn is_locked(&self, path: &str, encrypted: bool) -> Result<bool, UDisksError> {
         if !encrypted {
             return Ok(false);
         }
         Ok(self
-            .proxy(path, ENCRYPTED)?
+            .proxy(path, ENCRYPTED)
+            .await?
             .get_property::<OwnedObjectPath>("CleartextDevice")
+            .await
             .map(|cleartext| cleartext.as_str() == "/")
             .unwrap_or(true))
     }
 
-    fn drive_facts(&self, path: Option<&OwnedObjectPath>) -> (bool, bool, String) {
-        path.filter(|drive| drive.as_str() != "/")
-            .and_then(|drive| self.proxy(drive.as_str(), DRIVE).ok())
-            .map_or((false, false, String::new()), |drive| {
-                (
-                    drive.get_property::<bool>("Ejectable").unwrap_or(false),
-                    drive.get_property::<bool>("CanPowerOff").unwrap_or(false),
-                    drive
-                        .get_property::<String>("WWN")
-                        .ok()
-                        .filter(|value| !value.is_empty())
-                        .or_else(|| drive.get_property::<String>("Serial").ok())
-                        .unwrap_or_default(),
-                )
-            })
+    async fn drive_facts(&self, path: Option<&OwnedObjectPath>) -> (bool, bool, String) {
+        let Some(path) = path.filter(|drive| drive.as_str() != "/") else {
+            return (false, false, String::new());
+        };
+        let Ok(drive) = self.proxy(path.as_str(), DRIVE).await else {
+            return (false, false, String::new());
+        };
+        let ejectable = drive
+            .get_property::<bool>("Ejectable")
+            .await
+            .unwrap_or(false);
+        let can_power_off = drive
+            .get_property::<bool>("CanPowerOff")
+            .await
+            .unwrap_or(false);
+        let mut identity = drive
+            .get_property::<String>("WWN")
+            .await
+            .unwrap_or_default();
+        if identity.is_empty() {
+            identity = drive
+                .get_property::<String>("Serial")
+                .await
+                .unwrap_or_default();
+        }
+        (ejectable, can_power_off, identity)
     }
 }
 
 impl UDisksBackend for ZbusUDisksBackend {
     fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
-        let owner = self.service_owner()?;
-        let objects = self.managed_objects()?;
-        let mut devices = Vec::new();
-        for (path, interfaces) in objects {
-            if let Some(device) = self.read_device(path.as_str(), &interfaces)? {
-                devices.push(device);
-            }
-        }
-        Ok(BackendSnapshot::new(owner, devices))
+        self.snapshot_with_request(&UDisksRequest::with_timeout(self.default_timeout))
     }
 
     fn perform(
@@ -288,50 +439,104 @@ impl UDisksBackend for ZbusUDisksBackend {
         action: VolumeAction,
         unlock_secret: Option<&str>,
     ) -> Result<(), UDisksError> {
-        let options: HashMap<&str, Value<'_>> = HashMap::new();
-        match action {
-            VolumeAction::Mount => {
-                let _: String = self
-                    .proxy(volume.object_path(), FILESYSTEM)?
-                    .call("Mount", &(options,))
-                    .map_err(map_zbus_error)?;
-            }
-            VolumeAction::Unmount => {
-                let _: () = self
-                    .proxy(volume.object_path(), FILESYSTEM)?
-                    .call("Unmount", &(options,))
-                    .map_err(map_zbus_error)?;
-            }
-            VolumeAction::Eject => {
-                let drive = volume.drive_path().ok_or_else(|| {
-                    UDisksError::Unsupported("the volume has no drive object".into())
-                })?;
-                let _: () = self
-                    .proxy(drive, DRIVE)?
-                    .call("Eject", &(options,))
-                    .map_err(map_zbus_error)?;
-            }
-            VolumeAction::Unlock => {
-                let secret = unlock_secret.ok_or_else(|| {
-                    UDisksError::AuthorizationRequired("an unlock secret is required".into())
-                })?;
-                let _: OwnedObjectPath = self
-                    .proxy(volume.object_path(), ENCRYPTED)?
-                    .call("Unlock", &(secret, options))
-                    .map_err(map_zbus_error)?;
-            }
-            VolumeAction::PowerOff => {
-                let drive = volume.drive_path().ok_or_else(|| {
-                    UDisksError::Unsupported("the volume has no drive object".into())
-                })?;
-                let _: () = self
-                    .proxy(drive, DRIVE)?
-                    .call("PowerOff", &(options,))
-                    .map_err(map_zbus_error)?;
-            }
-        }
-        Ok(())
+        self.perform_with_request(
+            volume,
+            action,
+            unlock_secret,
+            &UDisksRequest::with_timeout(self.default_timeout),
+        )
     }
+
+    fn snapshot_with_request(
+        &self,
+        request: &UDisksRequest,
+    ) -> Result<BackendSnapshot, UDisksError> {
+        block_on_request(request, async {
+            let owner = self.service_owner().await?;
+            let objects = self.managed_objects().await?;
+            let mut devices = Vec::new();
+            for (path, interfaces) in objects {
+                if let Some(device) = self.read_device(path.as_str(), &interfaces).await? {
+                    devices.push(device);
+                }
+            }
+            Ok(BackendSnapshot::new(owner, devices))
+        })
+    }
+
+    fn perform_with_request(
+        &self,
+        volume: &DeviceDescriptor,
+        action: VolumeAction,
+        unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        block_on_request(request, async {
+            let options: HashMap<&str, Value<'_>> = HashMap::new();
+            match action {
+                VolumeAction::Mount => {
+                    let _: String = self
+                        .proxy(volume.object_path(), FILESYSTEM)
+                        .await?
+                        .call("Mount", &(options,))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+                VolumeAction::Unmount => {
+                    let _: () = self
+                        .proxy(volume.object_path(), FILESYSTEM)
+                        .await?
+                        .call("Unmount", &(options,))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+                VolumeAction::Eject => {
+                    let drive = volume.drive_path().ok_or_else(|| {
+                        UDisksError::Unsupported("the volume has no drive object".into())
+                    })?;
+                    let _: () = self
+                        .proxy(drive, DRIVE)
+                        .await?
+                        .call("Eject", &(options,))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+                VolumeAction::Unlock => {
+                    let secret = unlock_secret.ok_or_else(|| {
+                        UDisksError::AuthorizationRequired("an unlock secret is required".into())
+                    })?;
+                    let _: OwnedObjectPath = self
+                        .proxy(volume.object_path(), ENCRYPTED)
+                        .await?
+                        .call("Unlock", &(secret, options))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+                VolumeAction::PowerOff => {
+                    let drive = volume.drive_path().ok_or_else(|| {
+                        UDisksError::Unsupported("the volume has no drive object".into())
+                    })?;
+                    let _: () = self
+                        .proxy(drive, DRIVE)
+                        .await?
+                        .call("PowerOff", &(options,))
+                        .await
+                        .map_err(map_zbus_error)?;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+fn block_on_request<T>(
+    request: &UDisksRequest,
+    operation: impl Future<Output = Result<T, UDisksError>>,
+) -> Result<T, UDisksError> {
+    request.check()?;
+    futures_lite::future::block_on(futures_lite::future::race(operation, async {
+        Err(request.expiry().await)
+    }))
 }
 
 fn bytes_to_path(mut bytes: Vec<u8>) -> PathBuf {
@@ -350,8 +555,13 @@ fn stable_device_id(uuid: &str, drive: &str, device: &std::path::Path, object: &
     bytes.extend_from_slice(drive.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(device.as_os_str().as_bytes());
-    bytes.push(0);
-    bytes.extend_from_slice(object.as_bytes());
+    // A by-id symlink, WWN, or serial survives reconnects, kernel device-name
+    // changes, and UDisks object recreation. Only truly anonymous devices need
+    // the volatile object path as a last-resort collision discriminator.
+    if drive.is_empty() && !device.starts_with("/dev/disk/by-id") {
+        bytes.push(0);
+        bytes.extend_from_slice(object.as_bytes());
+    }
     let mut encoded = String::with_capacity(bytes.len() * 2 + 7);
     encoded.push_str("device-");
     for byte in bytes {
@@ -393,7 +603,11 @@ fn map_zbus_error(error: zbus::Error) -> UDisksError {
     if let zbus::Error::MethodError(name, detail, _) = &error {
         let name = name.as_str();
         let detail = detail.as_deref().unwrap_or(name);
-        if name.contains("NotAuthorized") || name.contains("Auth") {
+        if name.contains("NotAuthorized")
+            || name.contains("Auth")
+            || detail.contains("NotAuthorized")
+            || detail.contains("Auth")
+        {
             return UDisksError::AuthorizationRequired(detail.into());
         }
         if name.contains("DeviceBusy")
@@ -403,10 +617,18 @@ fn map_zbus_error(error: zbus::Error) -> UDisksError {
         {
             return UDisksError::Busy(detail.into());
         }
-        if name.contains("NotSupported") || name.contains("Unsupported") {
+        if name.contains("NotSupported")
+            || name.contains("Unsupported")
+            || detail.contains("NotSupported")
+            || detail.contains("Unsupported")
+        {
             return UDisksError::Unsupported(detail.into());
         }
-        if name.contains("UnknownObject") || name.contains("UnknownMethod") {
+        if name.contains("UnknownObject")
+            || name.contains("UnknownMethod")
+            || detail.contains("UnknownObject")
+            || detail.contains("UnknownMethod")
+        {
             return UDisksError::StaleObject;
         }
     }
@@ -422,18 +644,21 @@ fn map_zbus_error(error: zbus::Error) -> UDisksError {
     }
 }
 
-pub(crate) fn spawn_udisks_event_listener(
+pub(crate) fn spawn_udisks_event_listener_with_config(
     sender: async_channel::Sender<super::VolumeTrigger>,
+    config: UDisksBusConfig,
 ) -> Vec<thread::JoinHandle<()>> {
     let mut threads = Vec::new();
-    if let Some(thread) = spawn_name_owner_listener(sender.clone()) {
+    if let Some(thread) = spawn_name_owner_listener(sender.clone(), config.clone()) {
         threads.push(thread);
     }
     if let Ok(thread) = thread::Builder::new()
         .name("musheen-udisks-events".into())
         .spawn(move || {
             while !sender.is_closed() {
-                if futures_lite::future::block_on(listen_for_udisks_events(&sender)).is_err() {
+                if futures_lite::future::block_on(listen_for_udisks_events(&sender, &config))
+                    .is_err()
+                {
                     let _ = sender.try_send(super::VolumeTrigger::ServiceOwnerChanged);
                 }
                 if sender.is_closed() {
@@ -452,6 +677,7 @@ pub(crate) fn spawn_udisks_event_listener(
 
 fn spawn_name_owner_listener(
     sender: async_channel::Sender<super::VolumeTrigger>,
+    config: UDisksBusConfig,
 ) -> Option<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("musheen-udisks-owner-events".into())
@@ -461,16 +687,14 @@ fn spawn_name_owner_listener(
                     use futures_lite::StreamExt as _;
                     use zbus::message::Type;
 
-                    let connection = zbus::Connection::system()
-                        .await
-                        .map_err(map_connection_error)?;
+                    let connection = connect_async(&config).await?;
                     let rule = zbus::MatchRule::builder()
                         .msg_type(Type::Signal)
                         .interface("org.freedesktop.DBus")
                         .map_err(map_zbus_error)?
                         .member("NameOwnerChanged")
                         .map_err(map_zbus_error)?
-                        .add_arg(SERVICE)
+                        .add_arg(config.service())
                         .map_err(map_zbus_error)?
                         .build();
                     let mut messages =
@@ -510,16 +734,15 @@ fn spawn_name_owner_listener(
 
 async fn listen_for_udisks_events(
     sender: &async_channel::Sender<super::VolumeTrigger>,
+    config: &UDisksBusConfig,
 ) -> Result<(), UDisksError> {
     use futures_lite::StreamExt as _;
     use zbus::message::Type;
 
-    let connection = zbus::Connection::system()
-        .await
-        .map_err(map_connection_error)?;
+    let connection = connect_async(config).await?;
     let rule = zbus::MatchRule::builder()
         .msg_type(Type::Signal)
-        .path_namespace(ROOT)
+        .path_namespace(config.root())
         .map_err(map_zbus_error)?
         .build();
     let mut messages = zbus::MessageStream::for_match_rule(rule, &connection, Some(32))
@@ -543,6 +766,15 @@ async fn listen_for_udisks_events(
             return Ok(());
         }
     }
+}
+
+async fn connect_async(config: &UDisksBusConfig) -> Result<zbus::Connection, UDisksError> {
+    let builder = match config.address.as_deref() {
+        Some(address) => zbus::connection::Builder::address(address),
+        None => zbus::connection::Builder::system(),
+    }
+    .map_err(map_connection_error)?;
+    builder.build().await.map_err(map_connection_error)
 }
 
 #[cfg(test)]
@@ -574,6 +806,23 @@ mod tests {
                 "/org/freedesktop/UDisks2/block_devices/sdb1",
             )
         );
+    }
+
+    #[test]
+    fn persistent_hardware_identity_survives_object_and_kernel_path_changes() {
+        let before = stable_device_id(
+            "same-uuid",
+            "wwn-123",
+            std::path::Path::new("/dev/disk/by-id/wwn-123-part1"),
+            "/org/freedesktop/UDisks2/block_devices/sdb1",
+        );
+        let after = stable_device_id(
+            "same-uuid",
+            "wwn-123",
+            std::path::Path::new("/dev/disk/by-id/wwn-123-part1"),
+            "/org/freedesktop/UDisks2/block_devices/sdz9",
+        );
+        assert_eq!(before, after);
     }
 
     #[test]

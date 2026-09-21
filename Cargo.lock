@@ -4404,6 +4404,7 @@ version = "0.1.0"
 dependencies = [
  "ashpd",
  "async-channel",
+ "async-io",
  "blake3",
  "fast_image_resize",
  "freedesktop",

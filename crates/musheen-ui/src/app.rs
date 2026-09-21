@@ -7089,10 +7089,10 @@ impl MusheenApp {
                                     let label = entry.volume_capacity().map_or_else(
                                         || entry.label().to_owned(),
                                         |capacity| {
-                                            format!(
-                                                "{} · {} free",
+                                            localized_volume_capacity(
+                                                &self.catalog,
                                                 entry.label(),
-                                                format_size(capacity.available_bytes())
+                                                capacity.available_bytes(),
                                             )
                                         },
                                     );
@@ -9604,7 +9604,15 @@ fn volume_capability_state(
 }
 
 fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
+    let with_detail = |key: &'static str, detail: &str| -> Box<str> {
+        format!(
+            "{}: {detail}",
+            catalog.message(key).expect("the volume error is localized")
+        )
+        .into()
+    };
     match error {
+        VolumeError::MountTable(reason) => with_detail("volume-error-mount-table", reason),
         VolumeError::Capacity { path, .. } => format!(
             "{} {}",
             catalog
@@ -9617,8 +9625,42 @@ fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
             .message("volume-selected-unavailable")
             .expect("the volume disappearance message is localized")
             .into(),
-        _ => error.to_string().into(),
+        VolumeError::ServiceUnavailable(reason) => {
+            with_detail("volume-error-service-unavailable", reason)
+        }
+        VolumeError::Timeout(reason) => with_detail("volume-error-timeout", reason),
+        VolumeError::Disconnected(reason) => with_detail("volume-error-disconnected", reason),
+        VolumeError::AuthorizationRequired(reason) => {
+            with_detail("volume-error-authorization", reason)
+        }
+        VolumeError::Busy(reason) => with_detail("volume-error-busy", reason),
+        VolumeError::Unsupported(reason) => with_detail("volume-error-unsupported", reason),
+        VolumeError::StaleObject => catalog
+            .message("volume-error-stale")
+            .expect("the stale-volume error is localized")
+            .into(),
+        VolumeError::InUse(operations) => format!(
+            "{} ({})",
+            catalog
+                .message("volume-error-in-use")
+                .expect("the in-use volume error is localized"),
+            operations.len()
+        )
+        .into(),
+        VolumeError::CancellationFailed(reason) => with_detail("volume-error-cancellation", reason),
+        VolumeError::Protocol(reason) => with_detail("volume-error-protocol", reason),
     }
+}
+
+fn localized_volume_capacity(catalog: &Catalog, label: &str, available_bytes: u64) -> String {
+    format!(
+        "{} · {} {}",
+        label,
+        format_size(available_bytes),
+        catalog
+            .message("volume-capacity-free")
+            .expect("the free-capacity suffix is localized")
+    )
 }
 
 fn is_contextual_command(action: CommandAction) -> bool {
@@ -9880,6 +9922,43 @@ mod tests {
     use musheen_desktop::{PreparedLaunch, ProcessRunner, TagBackend, XattrTagBackend};
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[test]
+    fn every_typed_volume_error_and_capacity_suffix_is_localized() {
+        let errors = [
+            VolumeError::MountTable("detail".into()),
+            VolumeError::Capacity {
+                path: PathBuf::from("/media/test"),
+                reason: "detail".into(),
+            },
+            VolumeError::ServiceUnavailable("detail".into()),
+            VolumeError::Timeout("detail".into()),
+            VolumeError::Disconnected("detail".into()),
+            VolumeError::AuthorizationRequired("detail".into()),
+            VolumeError::Busy("detail".into()),
+            VolumeError::Unsupported("detail".into()),
+            VolumeError::StaleObject,
+            VolumeError::Disappeared(VolumeId::new("gone").unwrap()),
+            VolumeError::InUse(vec![OperationUse::new(MountOperation::new(1), "copy")]),
+            VolumeError::CancellationFailed("detail".into()),
+            VolumeError::Protocol("detail".into()),
+        ];
+        for locale in [Locale::EnUs, Locale::EnXa, Locale::Ar] {
+            let catalog = Catalog::load(locale).unwrap();
+            assert!(!catalog.message("volume-capacity-free").unwrap().is_empty());
+            for error in &errors {
+                let rendered = localized_volume_error(&catalog, error);
+                assert!(!rendered.is_empty(), "{locale:?}: {error:?}");
+                if locale != Locale::EnUs {
+                    assert_ne!(
+                        rendered.as_ref(),
+                        error.to_string(),
+                        "{locale:?}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn local_and_provider_properties_titles_use_the_active_catalog() {

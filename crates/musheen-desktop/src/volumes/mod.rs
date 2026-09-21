@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+const VOLUME_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct VolumeSubscription {
     receiver: async_channel::Receiver<VolumeTrigger>,
@@ -33,13 +36,27 @@ impl fmt::Debug for VolumeSubscription {
 }
 
 impl VolumeSubscription {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_parts(
+        receiver: async_channel::Receiver<VolumeTrigger>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        Self { receiver, threads }
+    }
+
     #[must_use]
     pub fn system() -> Self {
+        Self::with_udisks(UDisksBusConfig::system(), true)
+    }
+
+    #[must_use]
+    pub fn with_udisks(config: UDisksBusConfig, include_mount_table: bool) -> Self {
         let (sender, receiver) = async_channel::bounded(32);
         // UDisks2 is the primary device-event source. The procfs listener
         // independently covers kernel mounts that UDisks2 does not own.
-        let mut threads = spawn_udisks_event_listener(sender.clone());
-        if let Some(thread) = spawn_mount_table_listener(sender.clone()) {
+        let mut threads = spawn_udisks_event_listener_with_config(sender.clone(), config);
+        if include_mount_table && let Some(thread) = spawn_mount_table_listener(sender.clone()) {
             threads.push(thread);
         }
         let _ = sender.try_send(VolumeTrigger::MountTableChanged);
@@ -214,6 +231,7 @@ pub enum VolumeError {
     AuthorizationRequired(Box<str>),
     Busy(Box<str>),
     Unsupported(Box<str>),
+    StaleObject,
     Disappeared(VolumeId),
     InUse(Vec<OperationUse>),
     CancellationFailed(Box<str>),
@@ -247,6 +265,7 @@ impl fmt::Display for VolumeError {
             Self::Unsupported(reason) => {
                 write!(formatter, "the volume action is unsupported: {reason}")
             }
+            Self::StaleObject => formatter.write_str("the UDisks2 object is stale"),
             Self::Disappeared(id) => write!(formatter, "volume {id} disappeared"),
             Self::InUse(operations) => write!(
                 formatter,
@@ -274,7 +293,7 @@ impl From<UDisksError> for VolumeError {
             UDisksError::AuthorizationRequired(reason) => Self::AuthorizationRequired(reason),
             UDisksError::Busy(reason) => Self::Busy(reason),
             UDisksError::Unsupported(reason) => Self::Unsupported(reason),
-            UDisksError::StaleObject => Self::Protocol("the UDisks2 object is stale".into()),
+            UDisksError::StaleObject => Self::StaleObject,
             UDisksError::Protocol(reason) => Self::Protocol(reason),
         }
     }
@@ -375,8 +394,24 @@ impl VolumeService {
     }
 
     pub fn refresh(&mut self) -> Result<RefreshReport, VolumeError> {
+        self.refresh_with_request(&UDisksRequest::with_timeout(VOLUME_REQUEST_TIMEOUT))
+    }
+
+    pub(crate) fn handle_with_request(
+        &mut self,
+        _trigger: VolumeTrigger,
+        request: &UDisksRequest,
+    ) -> Result<RefreshReport, VolumeError> {
+        self.refresh_with_request(request)
+    }
+
+    fn refresh_with_request(
+        &mut self,
+        request: &UDisksRequest,
+    ) -> Result<RefreshReport, VolumeError> {
+        request.check()?;
         let mounts = deduplicate_mounts(self.mounts.snapshot()?);
-        let (snapshot, service_state, warning) = match self.backend.snapshot() {
+        let (snapshot, service_state, warning) = match self.backend.snapshot_with_request(request) {
             Ok(snapshot) => (Some(snapshot), ServiceState::Available, None),
             Err(error) => {
                 let state = match error {
@@ -398,6 +433,18 @@ impl VolumeService {
             .cloned()
             .map(|device| Volume::from_device(device, service_state))
             .collect::<Vec<_>>();
+        if snapshot.is_none() {
+            // A service restart must not turn a known UDisks device into a
+            // different mount-only volume. Retain its stable descriptor while
+            // disabling capabilities until the owner returns.
+            volumes.extend(
+                self.model
+                    .volumes()
+                    .into_iter()
+                    .filter_map(|volume| volume.descriptor().cloned())
+                    .map(|descriptor| Volume::from_device(descriptor, service_state)),
+            );
+        }
         let mut consumed = BTreeSet::new();
         for volume in &mut volumes {
             let Some(descriptor) = volume.descriptor().cloned() else {
@@ -415,14 +462,45 @@ impl VolumeService {
                 }
             }
         }
-        let mut mount_only = BTreeMap::<PathBuf, Volume>::new();
+        let prior_mount_only = self
+            .model
+            .volumes()
+            .into_iter()
+            .filter(|volume| volume.descriptor().is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reused_mount_ids = BTreeSet::new();
+        let mut mount_only = BTreeMap::<VolumeId, Volume>::new();
         for (destination, record) in &mounts {
             if !consumed.contains(destination) {
                 let capacity = self.mounts.capacity(record.destination()).ok();
-                mount_only
-                    .entry(record.source().to_path_buf())
-                    .and_modify(|volume| volume.attach_mount(record, capacity))
-                    .or_insert_with(|| Volume::from_mount(record, capacity, service_state));
+                if record.source().starts_with("/dev/") {
+                    let id = VolumeId::from_mount(record);
+                    mount_only
+                        .entry(id)
+                        .and_modify(|volume| volume.attach_mount(record, capacity))
+                        .or_insert_with(|| Volume::from_mount(record, capacity, service_state));
+                } else {
+                    let mut reconciled = prior_mount_only
+                        .iter()
+                        .find(|volume| {
+                            volume.device() == record.source()
+                                && volume.filesystem_type() == Some(record.filesystem_type())
+                                && !reused_mount_ids.contains(volume.id())
+                        })
+                        .map(|volume| volume.id().clone())
+                        .unwrap_or_else(|| VolumeId::from_mount(record));
+                    let mut occurrence = 1;
+                    while mount_only.contains_key(&reconciled) {
+                        reconciled = VolumeId::from_mount_occurrence(record, occurrence);
+                        occurrence += 1;
+                    }
+                    reused_mount_ids.insert(reconciled.clone());
+                    mount_only.insert(
+                        reconciled.clone(),
+                        Volume::from_mount_with_id(reconciled, record, capacity, service_state),
+                    );
+                }
             }
         }
         volumes.extend(mount_only.into_values());
@@ -448,6 +526,24 @@ impl VolumeService {
         usage_resolution: UsageResolution,
         unlock_secret: Option<&str>,
     ) -> Result<OperationOutcome, VolumeError> {
+        self.perform_with_request(
+            id,
+            action,
+            usage_resolution,
+            unlock_secret,
+            &UDisksRequest::with_timeout(VOLUME_REQUEST_TIMEOUT),
+        )
+    }
+
+    pub(crate) fn perform_with_request(
+        &mut self,
+        id: &VolumeId,
+        action: VolumeAction,
+        usage_resolution: UsageResolution,
+        unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<OperationOutcome, VolumeError> {
+        request.check()?;
         let volume = self
             .model
             .get(id)
@@ -461,16 +557,19 @@ impl VolumeService {
 
         self.resolve_usage(&volume, action, usage_resolution)?;
 
-        if let Err(error) = self.backend.perform(&descriptor, action, unlock_secret) {
+        if let Err(error) =
+            self.backend
+                .perform_with_request(&descriptor, action, unlock_secret, request)
+        {
             if error == UDisksError::StaleObject {
-                let _ = self.refresh()?;
+                let _ = self.refresh_with_request(request)?;
                 if self.model.get(id).is_none() {
                     return Err(VolumeError::Disappeared(id.clone()));
                 }
             }
             return Err(error.into());
         }
-        let refresh = self.refresh()?;
+        let refresh = self.refresh_with_request(request)?;
         Ok(OperationOutcome {
             volume_present: self.model.get(id).is_some(),
             refresh,
@@ -520,6 +619,27 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         unlock_secret: Option<&str>,
     ) -> Result<(), UDisksError> {
         ZbusUDisksBackend::connect_system()?.perform(volume, action, unlock_secret)
+    }
+
+    fn snapshot_with_request(
+        &self,
+        request: &UDisksRequest,
+    ) -> Result<BackendSnapshot, UDisksError> {
+        request.check()?;
+        let backend = ZbusUDisksBackend::connect(UDisksBusConfig::system(), request.remaining())?;
+        backend.snapshot_with_request(request)
+    }
+
+    fn perform_with_request(
+        &self,
+        volume: &DeviceDescriptor,
+        action: VolumeAction,
+        unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        request.check()?;
+        let backend = ZbusUDisksBackend::connect(UDisksBusConfig::system(), request.remaining())?;
+        backend.perform_with_request(volume, action, unlock_secret, request)
     }
 }
 

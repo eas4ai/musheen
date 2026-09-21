@@ -2,9 +2,9 @@
 
 use musheen_desktop::{
     BackendSnapshot, Capacity, DeviceDescriptor, MountOperation, MountProvider, MountRecord,
-    OperationUsage, OperationUse, ServiceState, UDisksBackend, UDisksError, UsageResolution,
-    VolumeAction, VolumeChange, VolumeError, VolumeEvent, VolumeId, VolumeRuntime, VolumeService,
-    VolumeTrigger, ZbusUDisksBackend,
+    OperationUsage, OperationUse, ServiceState, UDisksBackend, UDisksError, UDisksRequest,
+    UsageResolution, VolumeAction, VolumeChange, VolumeError, VolumeEvent, VolumeId, VolumeRuntime,
+    VolumeService, VolumeSubscription, VolumeTrigger, ZbusUDisksBackend,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -139,6 +139,10 @@ fn snapshot(owner: &str, devices: impl IntoIterator<Item = DeviceDescriptor>) ->
 
 fn mount(source: &str, destination: &str, read_only: bool) -> MountRecord {
     MountRecord::new(source, destination, "ext4", read_only)
+}
+
+fn generic_mount(source: &str, destination: &str, filesystem: &str) -> MountRecord {
+    MountRecord::new(source, destination, filesystem, false)
 }
 
 fn service(
@@ -451,6 +455,98 @@ fn mount_only_identity_survives_remount_and_groups_bind_mounts() {
 }
 
 #[test]
+fn equal_generic_mount_sources_remain_distinct_and_stable_across_remount() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let mut service = service(
+        backend.clone(),
+        mounts.clone(),
+        Arc::new(FakeUsage::default()),
+    );
+    backend.queue_snapshot(Err(UDisksError::Unavailable("absent".into())));
+    mounts.queue(vec![
+        generic_mount("tmpfs", "/run/first", "tmpfs"),
+        generic_mount("tmpfs", "/run/second", "tmpfs"),
+    ]);
+    service.refresh().unwrap();
+    let first_ids = service
+        .model()
+        .volumes()
+        .into_iter()
+        .map(|volume| volume.id().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(first_ids.len(), 2, "equal generic sources must not merge");
+
+    backend.queue_snapshot(Err(UDisksError::Unavailable("absent".into())));
+    mounts.queue(vec![
+        generic_mount("tmpfs", "/run/remounted-first", "tmpfs"),
+        generic_mount("tmpfs", "/run/remounted-second", "tmpfs"),
+    ]);
+    service.refresh().unwrap();
+    let remounted_ids = service
+        .model()
+        .volumes()
+        .into_iter()
+        .map(|volume| volume.id().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(remounted_ids, first_ids);
+}
+
+#[test]
+fn generic_mount_reconciliation_never_overwrites_a_new_identity_collision() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let mut service = service(
+        backend.clone(),
+        mounts.clone(),
+        Arc::new(FakeUsage::default()),
+    );
+    backend.queue_snapshot(Err(UDisksError::Unavailable("absent".into())));
+    mounts.queue(vec![generic_mount("tmpfs", "/run/z", "tmpfs")]);
+    service.refresh().unwrap();
+
+    backend.queue_snapshot(Err(UDisksError::Unavailable("absent".into())));
+    mounts.queue(vec![
+        generic_mount("tmpfs", "/run/a", "tmpfs"),
+        generic_mount("tmpfs", "/run/z", "tmpfs"),
+    ]);
+    service.refresh().unwrap();
+
+    assert_eq!(service.model().volumes().len(), 2);
+    assert_eq!(
+        service
+            .model()
+            .volumes()
+            .into_iter()
+            .flat_map(|volume| volume.mount_points())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn temporary_udisks_absence_preserves_the_known_device_identity() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let mut service = service(
+        backend.clone(),
+        mounts.clone(),
+        Arc::new(FakeUsage::default()),
+    );
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    service.refresh().unwrap();
+
+    backend.queue_snapshot(Err(UDisksError::Unavailable("restarting".into())));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    service.refresh().unwrap();
+
+    assert!(service.model().get(&id("sdb1")).is_some());
+    assert_eq!(service.model().volumes().len(), 1);
+}
+
+#[test]
 fn duplicate_device_id_is_rejected_without_overwriting_the_model() {
     let backend = Arc::new(FakeBackend::default());
     let mounts = Arc::new(FakeMounts::default());
@@ -595,4 +691,59 @@ fn runtime_shutdown_joins_worker_and_releases_service_dependencies() {
     drop(runtime);
     assert!(backend_weak.upgrade().is_none());
     assert!(mounts_weak.upgrade().is_none());
+}
+
+struct CooperativeSlowBackend;
+
+impl UDisksBackend for CooperativeSlowBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        unreachable!("runtime must use the request-bounded entry point")
+    }
+
+    fn snapshot_with_request(
+        &self,
+        request: &UDisksRequest,
+    ) -> Result<BackendSnapshot, UDisksError> {
+        loop {
+            request.check()?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn listener_enabled_shutdown_preempts_a_slow_snapshot_and_queued_refreshes() {
+    let (sender, receiver) = async_channel::bounded(32);
+    let listener = std::thread::spawn(move || {
+        while !sender.is_closed() {
+            let _ = sender.try_send(VolumeTrigger::UDisksChanged);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let subscription = VolumeSubscription::from_parts(receiver, vec![listener]);
+    let runtime = VolumeRuntime::from_service_with_subscription(
+        VolumeService::new(
+            Arc::new(CooperativeSlowBackend),
+            Arc::new(FakeMounts::default()),
+            Arc::new(FakeUsage::default()),
+        ),
+        subscription,
+    );
+    std::thread::sleep(Duration::from_millis(20));
+
+    let started = Instant::now();
+    drop(runtime);
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "shutdown must cancel an in-flight snapshot instead of draining refresh FIFO"
+    );
 }

@@ -23,9 +23,18 @@ impl VolumeId {
     pub(crate) fn from_mount(record: &MountRecord) -> Self {
         use std::os::unix::ffi::OsStrExt;
 
-        // The kernel source is stable when the same filesystem is remounted at
-        // another path. Mount destinations are intentionally excluded.
-        let bytes = record.source().as_os_str().as_bytes();
+        let mut identity = record.source().as_os_str().as_bytes().to_vec();
+        // Device-backed bind mounts share one device identity. Anonymous
+        // sources such as tmpfs and overlay are not identities at all, so the
+        // first observation also includes the destination to prevent merging.
+        // VolumeService reconciles those generated IDs one-to-one on remount.
+        if !record.source().starts_with("/dev/") {
+            identity.push(0);
+            identity.extend_from_slice(record.filesystem_type().as_bytes());
+            identity.push(0);
+            identity.extend_from_slice(record.destination().as_os_str().as_bytes());
+        }
+        let bytes = identity;
         let mut encoded = String::with_capacity(bytes.len() * 2 + 6);
         encoded.push_str("mount-");
         for byte in bytes {
@@ -33,6 +42,11 @@ impl VolumeId {
             write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
         }
         Self(encoded.into())
+    }
+
+    pub(crate) fn from_mount_occurrence(record: &MountRecord, occurrence: usize) -> Self {
+        let base = Self::from_mount(record);
+        Self(format!("{}-{occurrence:x}", base.as_str()).into())
     }
 }
 
@@ -253,6 +267,15 @@ impl Volume {
         capacity: Option<Capacity>,
         state: ServiceState,
     ) -> Self {
+        Self::from_mount_with_id(VolumeId::from_mount(record), record, capacity, state)
+    }
+
+    pub(crate) fn from_mount_with_id(
+        id: VolumeId,
+        record: &MountRecord,
+        capacity: Option<Capacity>,
+        state: ServiceState,
+    ) -> Self {
         let label = record
             .destination()
             .file_name()
@@ -268,7 +291,7 @@ impl Volume {
                 |name| name.to_string_lossy().into_owned(),
             );
         Self {
-            id: VolumeId::from_mount(record),
+            id,
             descriptor: None,
             label: label.into(),
             device: record.source().to_path_buf(),

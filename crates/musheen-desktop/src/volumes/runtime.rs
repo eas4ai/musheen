@@ -1,6 +1,6 @@
 use super::{
-    OperationOutcome, OperationUsage, UsageResolution, VolumeAction, VolumeError, VolumeId,
-    VolumeModel, VolumeService, VolumeSubscription, VolumeTrigger,
+    OperationOutcome, OperationUsage, UDisksRequest, UsageResolution, VolumeAction, VolumeError,
+    VolumeId, VolumeModel, VolumeService, VolumeSubscription, VolumeTrigger,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -89,22 +89,45 @@ impl VolumeRuntime {
         Self::spawn(service, None)
     }
 
+    #[must_use]
+    pub fn from_service_with_subscription(
+        service: VolumeService,
+        subscription: VolumeSubscription,
+    ) -> Self {
+        Self::spawn(service, Some(subscription))
+    }
+
     fn spawn(mut service: VolumeService, events: Option<VolumeSubscription>) -> Self {
-        let (commands, receiver) = mpsc::sync_channel(32);
+        // One pending command is enough: event refreshes coalesce and shutdown
+        // is an out-of-band cancellation flag, never the tail of a FIFO.
+        let (commands, receiver) = mpsc::sync_channel(1);
         let model = Arc::new(RwLock::new(service.model().clone()));
         let subscribers = Arc::new(Mutex::new(Vec::<async_channel::Sender<VolumeUpdate>>::new()));
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_model = Arc::clone(&model);
         let worker_subscribers = Arc::clone(&subscribers);
+        let worker_stopped = Arc::clone(&stopped);
         let worker = thread::Builder::new()
             .name("musheen-volume-service".into())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
+                while !worker_stopped.load(Ordering::Acquire) {
+                    let Ok(command) = receiver.recv() else {
+                        break;
+                    };
+                    if worker_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let request = UDisksRequest::with_cancel(
+                        Duration::from_secs(2),
+                        Arc::clone(&worker_stopped),
+                    );
                     let warning = match command {
-                        RuntimeCommand::Refresh(trigger) => match service.handle(trigger) {
-                            Ok(report) => report.warning().cloned(),
-                            Err(error) => Some(error),
-                        },
+                        RuntimeCommand::Refresh(trigger) => {
+                            match service.handle_with_request(trigger, &request) {
+                                Ok(report) => report.warning().cloned(),
+                                Err(error) => Some(error),
+                            }
+                        }
                         RuntimeCommand::Perform {
                             id,
                             action,
@@ -112,7 +135,13 @@ impl VolumeRuntime {
                             secret,
                             reply,
                         } => {
-                            let result = service.perform(&id, action, usage, secret.as_deref());
+                            let result = service.perform_with_request(
+                                &id,
+                                action,
+                                usage,
+                                secret.as_deref(),
+                                &request,
+                            );
                             let warning = result.as_ref().err().cloned();
                             let _ = reply.send(result.clone());
                             warning
@@ -224,7 +253,9 @@ impl Drop for RuntimeInner {
         {
             let _ = thread.join();
         }
-        let _ = self.commands.send(RuntimeCommand::Shutdown);
+        // Cancellation preempts an in-flight request. A nonblocking wake-up is
+        // sufficient when the worker is idle and never waits behind refreshes.
+        let _ = self.commands.try_send(RuntimeCommand::Shutdown);
         if let Ok(mut worker) = self.worker.lock()
             && let Some(thread) = worker.take()
         {
