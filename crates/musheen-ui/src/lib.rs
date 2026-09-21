@@ -20,7 +20,7 @@ pub mod theme;
 pub mod toolbar;
 pub mod views;
 
-pub use app::{installed_static_command_actions, run};
+pub use app::{installed_static_command_actions, installed_static_shortcut_bindings, run};
 pub use dialogs::*;
 pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,

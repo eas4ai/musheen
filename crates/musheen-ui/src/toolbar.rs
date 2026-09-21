@@ -6,6 +6,38 @@
 use crate::navigation::OmnibarMode;
 use musheen_core::{CommandAction, CommandDefinition, CommandId, CommandRegistry, ToolbarLayout};
 
+macro_rules! static_shortcut_declarations {
+    ($consumer:ident $(, $argument:ident)*) => {
+        $consumer! {$($argument,)* [
+            NavigateBack => ("navigation.back", "alt-left", GoBack, GoBack, None),
+            NavigateForward => ("navigation.forward", "alt-right", GoForward, GoForward, None),
+            NavigateParent => ("navigation.parent", "alt-up", GoParent, GoParent, None),
+            Refresh => ("navigation.refresh", "f5", Reload, Reload, None),
+            FocusLocation => ("navigation.location", "ctrl-l", EditLocation, EditLocation, None),
+            Search => ("view.search", "ctrl-f", SearchLocation, SearchLocation, Some("!Input")),
+            Filter => ("view.filter", "ctrl-shift-f", FilterLocation, FilterLocation, None),
+            FocusCommand => ("view.command", "ctrl-shift-p", OpenCommandMode, OpenCommandMode, None),
+            NewTab => ("tab.new", "ctrl-t", NewTabShortcut, NewTabShortcut, None),
+            CloseTab => ("tab.close", "ctrl-w", CloseTabShortcut, CloseTabShortcut, None),
+            ReopenClosedTab => ("tab.reopen_closed", "ctrl-shift-t", ReopenClosedTabShortcut, ReopenClosedTabShortcut, None),
+            SplitPane => ("pane.split", "f3", SplitPaneShortcut, SplitPaneShortcut, None),
+            FocusNextPane => ("pane.focus_next", "f6", FocusNextPaneShortcut, FocusNextPaneShortcut, None),
+            SelectAll => ("selection.select_all", "ctrl-a", SelectAllShortcut, SelectAllShortcut, Some("!Input")),
+            ToggleHidden => ("view.hidden", "ctrl-h", ToggleHiddenShortcut, ToggleHiddenShortcut, Some("!Input")),
+            ViewDetails => ("view.details", "ctrl-1", ViewDetailsShortcut, ViewDetailsShortcut, None),
+            ViewList => ("view.list", "ctrl-2", ViewListShortcut, ViewListShortcut, None),
+            ViewCards => ("view.cards", "ctrl-3", ViewCardsShortcut, ViewCardsShortcut, None),
+            ViewGrid => ("view.grid", "ctrl-4", ViewGridShortcut, ViewGridShortcut, None),
+            ViewColumns => ("view.columns", "ctrl-5", ViewColumnsShortcut, ViewColumnsShortcut, None),
+            ViewAdaptive => ("view.adaptive", "ctrl-6", ViewAdaptiveShortcut, ViewAdaptiveShortcut, None),
+            ToggleSidebar => ("view.sidebar", "ctrl-b", ToggleSidebarShortcut, ToggleSidebarShortcut, None),
+            OpenProperties => ("item.properties", "alt-enter", OpenPropertiesShortcut, OpenPropertiesShortcut, None),
+        ]}
+    };
+}
+
+pub(crate) use static_shortcut_declarations;
+
 pub const NAVIGATION_LEADING_IDS: [&str; 4] = [
     "navigation.back",
     "navigation.forward",
@@ -136,14 +168,6 @@ pub struct StaticShortcut {
 }
 
 impl StaticShortcut {
-    const fn new(chord: &'static str, command_id: &'static str, action: CommandAction) -> Self {
-        Self {
-            chord,
-            command_id,
-            action,
-        }
-    }
-
     #[must_use]
     pub const fn chord(self) -> &'static str {
         self.chord
@@ -160,47 +184,19 @@ impl StaticShortcut {
     }
 }
 
-pub const STATIC_SHORTCUTS: [StaticShortcut; 23] = [
-    StaticShortcut::new("alt-left", "navigation.back", CommandAction::NavigateBack),
-    StaticShortcut::new(
-        "alt-right",
-        "navigation.forward",
-        CommandAction::NavigateForward,
-    ),
-    StaticShortcut::new("alt-up", "navigation.parent", CommandAction::NavigateParent),
-    StaticShortcut::new("f5", "navigation.refresh", CommandAction::Refresh),
-    StaticShortcut::new(
-        "ctrl-l",
-        "navigation.location",
-        CommandAction::FocusLocation,
-    ),
-    StaticShortcut::new("ctrl-f", "view.search", CommandAction::Search),
-    StaticShortcut::new("ctrl-shift-f", "view.filter", CommandAction::Filter),
-    StaticShortcut::new("ctrl-shift-p", "view.command", CommandAction::FocusCommand),
-    StaticShortcut::new("ctrl-t", "tab.new", CommandAction::NewTab),
-    StaticShortcut::new("ctrl-w", "tab.close", CommandAction::CloseTab),
-    StaticShortcut::new(
-        "ctrl-shift-t",
-        "tab.reopen_closed",
-        CommandAction::ReopenClosedTab,
-    ),
-    StaticShortcut::new("f3", "pane.split", CommandAction::SplitPane),
-    StaticShortcut::new("f6", "pane.focus_next", CommandAction::FocusNextPane),
-    StaticShortcut::new("ctrl-a", "selection.select_all", CommandAction::SelectAll),
-    StaticShortcut::new("ctrl-h", "view.hidden", CommandAction::ToggleHidden),
-    StaticShortcut::new("ctrl-1", "view.details", CommandAction::ViewDetails),
-    StaticShortcut::new("ctrl-2", "view.list", CommandAction::ViewList),
-    StaticShortcut::new("ctrl-3", "view.cards", CommandAction::ViewCards),
-    StaticShortcut::new("ctrl-4", "view.grid", CommandAction::ViewGrid),
-    StaticShortcut::new("ctrl-5", "view.columns", CommandAction::ViewColumns),
-    StaticShortcut::new("ctrl-6", "view.adaptive", CommandAction::ViewAdaptive),
-    StaticShortcut::new("ctrl-b", "view.sidebar", CommandAction::ToggleSidebar),
-    StaticShortcut::new(
-        "alt-enter",
-        "item.properties",
-        CommandAction::OpenProperties,
-    ),
-];
+macro_rules! define_static_shortcuts {
+    ([$($command:ident => ($command_id:literal, $chord:literal, $action_type:ident, $action:expr, $context:expr),)*]) => {
+        pub const STATIC_SHORTCUTS: [StaticShortcut; 23] = [
+            $(StaticShortcut {
+                chord: $chord,
+                command_id: $command_id,
+                action: CommandAction::$command,
+            },)*
+        ];
+    };
+}
+
+static_shortcut_declarations!(define_static_shortcuts);
 
 #[must_use]
 pub fn fixed_surface_ids(surface: FixedCommandSurface) -> Vec<&'static str> {
@@ -229,14 +225,6 @@ pub fn fixed_surface_ids(surface: FixedCommandSurface) -> Vec<&'static str> {
             .map(|binding| binding.command_id())
             .collect(),
     }
-}
-
-#[must_use]
-pub fn static_shortcut(action: CommandAction) -> Option<StaticShortcut> {
-    STATIC_SHORTCUTS
-        .iter()
-        .copied()
-        .find(|binding| binding.action == action)
 }
 
 #[must_use]

@@ -13,7 +13,7 @@ use musheen_ui::{
     ContextMenuSource, ContextMenuSurface, Locale, MenuContribution, MenuDirection, MenuEntryKind,
     MenuFocus, MenuInvocation, MenuKeyRoute, MenuPresentation, MenuTarget, OmnibarMode,
     OpenWithApplication, SendToDestination, ShellModel, ThemeProfile,
-    installed_static_command_actions,
+    installed_static_command_actions, installed_static_shortcut_bindings,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -299,12 +299,18 @@ fn send_to_rows_capture_exact_sources_destinations_and_policy() {
         ]),
     );
     let submenu = menu.entry("clipboard.send_to").unwrap().submenu().unwrap();
+    let send_to_parent = menu.entry("clipboard.send_to").unwrap();
     let writable_send = submenu.destination("/archive").unwrap();
     let read_only_send = submenu.destination("/remote").unwrap();
     let writable_parameters = CommandParameters::Destination {
         targets: vec![selected.clone()],
         destination: path("/archive"),
     };
+    assert_eq!(
+        send_to_parent.generated_parameters().unwrap(),
+        writable_parameters,
+        "the Send To parent must carry the first writable destination and exact sources",
+    );
     assert_eq!(
         writable_send.generated_parameters().unwrap(),
         writable_parameters
@@ -1074,21 +1080,37 @@ fn audit_matrix_menu(
     }
 }
 
-fn recursive_command_ids(menu: &ContextMenu) -> BTreeSet<&str> {
-    let mut ids = BTreeSet::new();
-    for entry in menu.entries() {
-        if let Some(id) = entry.command_id() {
-            ids.insert(id);
-        }
-        if let Some(submenu) = entry.submenu() {
-            ids.extend(recursive_command_ids(submenu));
-        }
-    }
-    ids
+#[derive(Default)]
+struct RecursivePolicy<'a> {
+    present: BTreeSet<&'a str>,
+    disabled: BTreeSet<&'a str>,
 }
 
-#[test]
-fn independent_target_applicability_matches_recursive_menu_composition() {
+fn recursive_policy(menu: &ContextMenu) -> RecursivePolicy<'_> {
+    let mut policy = RecursivePolicy::default();
+    for entry in menu.entries() {
+        if let Some(id) = entry.command_id() {
+            policy.present.insert(id);
+            if !entry.state().is_enabled() {
+                policy.disabled.insert(id);
+            }
+        }
+        if let Some(submenu) = entry.submenu() {
+            let nested = recursive_policy(submenu);
+            policy.present.extend(nested.present);
+            policy.disabled.extend(nested.disabled);
+        }
+    }
+    policy
+}
+
+type ApplicabilityOracle = (
+    &'static str,
+    &'static [&'static str],
+    &'static [&'static str],
+);
+
+fn applicability_oracles() -> ([ApplicabilityOracle; 14], BTreeSet<&'static str>) {
     const BACKGROUND: &[&str] = &[
         "clipboard.paste_into",
         "selection.select_all",
@@ -1216,67 +1238,266 @@ fn independent_target_applicability_matches_recursive_menu_composition() {
         "item.permissions",
         "item.copy_location",
     ];
-
-    let refusal = CapabilityReason::new("unsupported by provider").unwrap();
-    let cases = [
-        (
-            "background",
-            request(
-                supported_context(CommandTarget::Background, 0),
-                MenuTarget::Background,
-                vec![],
-            ),
-            BACKGROUND,
-        ),
-        (
-            "file",
-            request(
-                supported_context(CommandTarget::File, 1),
-                MenuTarget::Item,
-                vec![target(b"expected-file", "/work/file")],
-            ),
-            FILE,
-        ),
-        (
-            "directory",
-            request(
-                supported_context(CommandTarget::Directory, 1),
-                MenuTarget::Item,
-                vec![target(b"expected-directory", "/work/directory")],
-            ),
-            DIRECTORY,
-        ),
-        (
-            "archive",
-            request(
-                supported_context(CommandTarget::Archive, 1),
-                MenuTarget::Item,
-                vec![target(b"expected-archive", "/work/archive.tar")],
-            ),
-            ARCHIVE,
-        ),
-        (
-            "unsupported-file",
-            request(
-                CommandContext {
-                    mutation_is_supported: false,
-                    capabilities: CapabilityMatrix::new(|_| {
-                        CapabilityState::Unsupported(refusal.clone())
-                    }),
-                    ..supported_context(CommandTarget::File, 1)
-                },
-                MenuTarget::Item,
-                vec![target(b"unsupported-file", "/remote/file")],
-            ),
-            UNSUPPORTED_FILE,
-        ),
+    const HIDDEN_FILE: &[&str] = &[
+        "file.open",
+        "file.open_with",
+        "file.choose_application",
+        "file.set_default_application",
+        "clipboard.send_to",
+        "clipboard.cut",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.move_to",
+        "file.preview",
+        "file.compress",
+        "file.rename",
+        "file.duplicate",
+        "file.create_symbolic_link",
+        "file.create_hard_link",
+        "file.unhide",
+        "item.tags",
+        "actions.custom",
+        "file.move_to_trash",
+        "file.delete_permanently",
+        "item.properties",
+        "item.permissions",
+        "item.copy_location",
     ];
+    const EXECUTABLE: &[&str] = &[
+        "file.open",
+        "file.open_with",
+        "file.choose_application",
+        "file.set_default_application",
+        "clipboard.send_to",
+        "clipboard.cut",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.move_to",
+        "file.preview",
+        "file.run",
+        "file.run_as_administrator",
+        "file.compress",
+        "file.rename",
+        "file.duplicate",
+        "file.create_symbolic_link",
+        "file.create_hard_link",
+        "file.hide",
+        "item.tags",
+        "actions.custom",
+        "file.move_to_trash",
+        "file.delete_permanently",
+        "item.properties",
+        "item.permissions",
+        "item.copy_location",
+    ];
+    const PINNED_DIRECTORY: &[&str] = &[
+        "file.open",
+        "file.open_with",
+        "file.choose_application",
+        "file.set_default_application",
+        "directory.open_as_administrator",
+        "directory.open_new_tab",
+        "directory.open_new_window",
+        "directory.open_other_pane",
+        "clipboard.cut",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.move_to",
+        "clipboard.paste_into",
+        "clipboard.send_to",
+        "file.compress",
+        "file.rename",
+        "file.duplicate",
+        "file.create_symbolic_link",
+        "file.hide",
+        "directory.unpin",
+        "item.tags",
+        "actions.custom",
+        "directory.share",
+        "file.move_to_trash",
+        "file.delete_permanently",
+        "item.properties",
+        "item.permissions",
+        "item.copy_location",
+        "directory.open_terminal",
+        "directory.properties",
+    ];
+    const SIDEBAR: &[&str] = &[
+        "file.open",
+        "directory.open_new_tab",
+        "directory.open_new_window",
+        "directory.pin",
+        "item.copy_location",
+        "directory.properties",
+    ];
+    const MOUNT: &[&str] = &[
+        "file.open",
+        "directory.open_new_tab",
+        "directory.open_new_window",
+        "mount.unmount",
+        "mount.eject",
+        "mount.power_off",
+        "directory.properties",
+    ];
+    const TAG: &[&str] = &["tag.rename", "tag.delete"];
+    const TRASH_ITEM: &[&str] = &[
+        "trash.restore",
+        "file.delete_permanently",
+        "item.properties",
+        "item.copy_location",
+    ];
+    const TRASH_BACKGROUND: &[&str] = &["trash.empty", "view.hidden", "view.sort", "view.group"];
+    const ALL_CONTEXT_COMMANDS: &[&str] = &[
+        "actions.custom",
+        "archive.browse",
+        "archive.extract",
+        "archive.extract_here",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.cut",
+        "clipboard.move_to",
+        "clipboard.paste_into",
+        "clipboard.send_to",
+        "create.directory",
+        "create.empty_file",
+        "create.from_template",
+        "directory.open_as_administrator",
+        "directory.open_new_tab",
+        "directory.open_new_window",
+        "directory.open_other_pane",
+        "directory.open_terminal",
+        "directory.pin",
+        "directory.properties",
+        "directory.share",
+        "directory.unpin",
+        "file.choose_application",
+        "file.compress",
+        "file.create_hard_link",
+        "file.create_symbolic_link",
+        "file.delete_permanently",
+        "file.duplicate",
+        "file.hide",
+        "file.move_to_trash",
+        "file.open",
+        "file.open_with",
+        "file.preview",
+        "file.rename",
+        "file.run",
+        "file.run_as_administrator",
+        "file.set_default_application",
+        "file.unhide",
+        "item.copy_location",
+        "item.permissions",
+        "item.properties",
+        "item.tags",
+        "mount.eject",
+        "mount.power_off",
+        "mount.unmount",
+        "selection.select_all",
+        "tag.delete",
+        "tag.rename",
+        "trash.empty",
+        "trash.restore",
+        "view.adaptive",
+        "view.cards",
+        "view.columns",
+        "view.details",
+        "view.directories_first",
+        "view.grid",
+        "view.group",
+        "view.hidden",
+        "view.list",
+        "view.sort",
+    ];
+    const NONE: &[&str] = &[];
+    const SEND_TO_DISABLED: &[&str] = &["clipboard.send_to"];
+    const READ_ONLY_DISABLED: &[&str] = &[
+        "clipboard.move_to",
+        "clipboard.send_to",
+        "file.create_hard_link",
+        "file.create_symbolic_link",
+        "file.delete_permanently",
+        "file.duplicate",
+        "file.hide",
+        "file.move_to_trash",
+        "file.rename",
+    ];
+    const UNSUPPORTED_DISABLED: &[&str] = &[
+        "clipboard.move_to",
+        "clipboard.send_to",
+        "file.create_hard_link",
+        "file.create_symbolic_link",
+        "file.delete_permanently",
+        "file.duplicate",
+        "file.hide",
+        "file.move_to_trash",
+        "file.rename",
+        "item.permissions",
+        "item.tags",
+    ];
+    const DIRECTORY_DISABLED: &[&str] = &["clipboard.paste_into", "clipboard.send_to"];
+
+    let expected = [
+        ("background", BACKGROUND, &["clipboard.paste_into"][..]),
+        ("file", FILE, NONE),
+        ("hidden-file", HIDDEN_FILE, SEND_TO_DISABLED),
+        ("read-only-file", UNSUPPORTED_FILE, READ_ONLY_DISABLED),
+        ("unsupported-file", UNSUPPORTED_FILE, UNSUPPORTED_DISABLED),
+        ("archive", ARCHIVE, SEND_TO_DISABLED),
+        ("executable", EXECUTABLE, SEND_TO_DISABLED),
+        ("directory", DIRECTORY, DIRECTORY_DISABLED),
+        ("pinned-directory", PINNED_DIRECTORY, DIRECTORY_DISABLED),
+        ("sidebar", SIDEBAR, NONE),
+        ("mount", MOUNT, NONE),
+        ("tag", TAG, NONE),
+        ("trash-item", TRASH_ITEM, NONE),
+        ("trash-background", TRASH_BACKGROUND, NONE),
+    ];
+    let universe = ALL_CONTEXT_COMMANDS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    (expected, universe)
+}
+
+#[test]
+fn independent_target_applicability_matches_recursive_menu_composition() {
+    let (expected, universe) = applicability_oracles();
+    let requests = surface_matrix_requests();
+    assert_eq!(expected.len(), requests.len());
     let surface = ContextMenuSurface::new(CommandRegistry::built_in());
-    for (name, request, expected) in cases {
+    for ((actual_name, request), (expected_name, present, disabled)) in
+        requests.into_iter().zip(expected)
+    {
         assert_eq!(
-            recursive_command_ids(&surface.compose(request)),
-            expected.iter().copied().collect(),
-            "{name} applicability drifted"
+            actual_name, expected_name,
+            "canonical context order drifted"
+        );
+        let menu = surface.compose(request);
+        let actual = recursive_policy(&menu);
+        let actual_present = actual.present;
+        let expected_present = present.iter().copied().collect::<BTreeSet<_>>();
+        let expected_disabled = disabled.iter().copied().collect::<BTreeSet<_>>();
+        let actual_omitted = universe
+            .difference(&actual_present)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let expected_omitted = universe
+            .difference(&expected_present)
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            actual_present, expected_present,
+            "{actual_name} present set"
+        );
+        assert_eq!(
+            actual_omitted, expected_omitted,
+            "{actual_name} omitted set"
+        );
+        assert_eq!(
+            actual.disabled, expected_disabled,
+            "{actual_name} disabled set"
         );
     }
 }
@@ -1460,6 +1681,14 @@ fn omnibar_modes_and_static_handlers_are_complete_live_surface_inventories() {
         "every static shortcut is installed and handled"
     );
     assert_eq!(installed.len(), STATIC_SHORTCUTS.len());
+    assert_eq!(
+        installed_static_shortcut_bindings(),
+        STATIC_SHORTCUTS
+            .iter()
+            .map(|shortcut| (shortcut.command_id(), shortcut.chord(), shortcut.action()))
+            .collect::<Vec<_>>(),
+        "installed chord, command ID, and action coverage must share one declaration",
+    );
 }
 
 #[test]

@@ -32,7 +32,7 @@ use crate::status_center::{OperationStatus, OperationStatusEntry, TrashItem, Tra
 use crate::toolbar::{
     NAVIGATION_LEADING_IDS, NAVIGATION_TRAILING_IDS, OMNIBAR_COMMANDS, SEARCH_COMMAND_ID,
     TAB_STRIP_COMMAND_IDS, VIEW_COMMAND_IDS, omnibar_command_for_action, project_custom_toolbar,
-    resolve_command_mode, static_shortcut,
+    resolve_command_mode, static_shortcut_declarations,
 };
 use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
@@ -165,51 +165,24 @@ gpui_kit::actions!(
     ]
 );
 
-macro_rules! static_command_actions {
-    ($consumer:ident $(, $argument:ident)*) => {
-        $consumer! {$($argument,)* [
-            NavigateBack => (GoBack, GoBack, None),
-            NavigateForward => (GoForward, GoForward, None),
-            NavigateParent => (GoParent, GoParent, None),
-            Refresh => (Reload, Reload, None),
-            FocusLocation => (EditLocation, EditLocation, None),
-            Search => (SearchLocation, SearchLocation, Some("!Input")),
-            Filter => (FilterLocation, FilterLocation, None),
-            FocusCommand => (OpenCommandMode, OpenCommandMode, None),
-            NewTab => (NewTabShortcut, NewTabShortcut, None),
-            CloseTab => (CloseTabShortcut, CloseTabShortcut, None),
-            ReopenClosedTab => (ReopenClosedTabShortcut, ReopenClosedTabShortcut, None),
-            SplitPane => (SplitPaneShortcut, SplitPaneShortcut, None),
-            FocusNextPane => (FocusNextPaneShortcut, FocusNextPaneShortcut, None),
-            SelectAll => (SelectAllShortcut, SelectAllShortcut, Some("!Input")),
-            ToggleHidden => (ToggleHiddenShortcut, ToggleHiddenShortcut, Some("!Input")),
-            ViewDetails => (ViewDetailsShortcut, ViewDetailsShortcut, None),
-            ViewList => (ViewListShortcut, ViewListShortcut, None),
-            ViewCards => (ViewCardsShortcut, ViewCardsShortcut, None),
-            ViewGrid => (ViewGridShortcut, ViewGridShortcut, None),
-            ViewColumns => (ViewColumnsShortcut, ViewColumnsShortcut, None),
-            ViewAdaptive => (ViewAdaptiveShortcut, ViewAdaptiveShortcut, None),
-            ToggleSidebar => (ToggleSidebarShortcut, ToggleSidebarShortcut, None),
-            OpenProperties => (OpenPropertiesShortcut, OpenPropertiesShortcut, None),
-        ]}
-    }
-}
-
 macro_rules! define_static_command_actions {
-    ([$($command:ident => ($action_type:ident, $action:expr, $context:expr),)*]) => {
+    ([$($command:ident => ($command_id:literal, $chord:literal, $action_type:ident, $action:expr, $context:expr),)*]) => {
         const INSTALLED_STATIC_COMMAND_ACTIONS: &[CommandAction] = &[
             $(CommandAction::$command,)*
+        ];
+        const INSTALLED_STATIC_SHORTCUT_BINDINGS: &[(&str, &str, CommandAction)] = &[
+            $(($command_id, $chord, CommandAction::$command),)*
         ];
 
         fn install_static_command_key_bindings(cx: &mut App) {
             cx.bind_keys([
-                $(KeyBinding::new(static_chord(CommandAction::$command), $action, $context),)*
+                $(KeyBinding::new($chord, $action, $context),)*
             ]);
         }
     };
 }
 
-static_command_actions!(define_static_command_actions);
+static_shortcut_declarations!(define_static_command_actions);
 
 #[doc(hidden)]
 #[must_use]
@@ -217,10 +190,17 @@ pub fn installed_static_command_actions() -> &'static [CommandAction] {
     INSTALLED_STATIC_COMMAND_ACTIONS
 }
 
+#[doc(hidden)]
+#[must_use]
+pub fn installed_static_shortcut_bindings() -> &'static [(&'static str, &'static str, CommandAction)]
+{
+    INSTALLED_STATIC_SHORTCUT_BINDINGS
+}
+
 macro_rules! attach_static_command_handlers {
-    ($shell:ident, $cx:ident, [$($command:ident => ($action_type:ident, $action:expr, $context:expr),)*]) => {
+    ($shell:ident, $cx:ident, [$($command:ident => ($command_id:literal, $chord:literal, $action_type:ident, $action:expr, $context:expr),)*]) => {
         $shell$(.on_action($cx.listener(|this, _: &$action_type, _, cx| {
-            this.dispatch_command(static_command_id(CommandAction::$command), cx);
+            this.dispatch_command($command_id, cx);
         })))*
     };
 }
@@ -235,18 +215,6 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("down", FocusNextDirectoryItem, Some("DirectoryContent")),
         KeyBinding::new("up", FocusPreviousDirectoryItem, Some("DirectoryContent")),
     ]);
-}
-
-fn static_chord(action: CommandAction) -> &'static str {
-    static_shortcut(action)
-        .expect("every installed static action has a command-surface descriptor")
-        .chord()
-}
-
-fn static_command_id(action: CommandAction) -> &'static str {
-    static_shortcut(action)
-        .expect("every static action handler has a command-surface descriptor")
-        .command_id()
 }
 
 #[derive(Clone, Copy)]
@@ -7493,7 +7461,7 @@ impl Render for MusheenApp {
             .text_color(colors.foreground)
             .border_color(boundary)
             .when(high_contrast, |shell| shell.border_2());
-        static_command_actions!(attach_static_command_handlers, shell, cx)
+        static_shortcut_declarations!(attach_static_command_handlers, shell, cx)
             .on_action(
                 cx.listener(|this, _: &OpenContextMenuShortcut, window, cx| {
                     this.open_keyboard_context_menu(window, cx);
