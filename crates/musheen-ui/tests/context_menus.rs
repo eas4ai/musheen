@@ -968,6 +968,37 @@ fn custom_actions_parent_is_omitted_without_a_valid_action_contribution() {
     )]);
     assert!(surface.compose(invalid).entry("actions.custom").is_none());
 
+    let mut malformed = Vec::new();
+    let mut invalid_id = custom_action();
+    invalid_id.id = "not a valid id".into();
+    malformed.push(("invalid ID", invalid_id));
+    let mut invalid_executable = custom_action();
+    invalid_executable.execution = ActionExecution::Direct {
+        executable: "relative-program".into(),
+    };
+    malformed.push(("relative executable", invalid_executable));
+    let mut invalid_timeout = custom_action();
+    invalid_timeout.timeout_ms = 0;
+    malformed.push(("zero timeout", invalid_timeout));
+    let mut invalid_policy = custom_action();
+    invalid_policy.execution = ActionExecution::Shell {
+        script: "printf safe".into(),
+        opted_in: false,
+    };
+    malformed.push(("shell without opt-in", invalid_policy));
+    for (case, action) in malformed {
+        let invalid = request(
+            supported_context(CommandTarget::File, 1),
+            MenuTarget::Item,
+            vec![target(case.as_bytes(), "/work/file.txt")],
+        )
+        .with_actions(&[MenuContribution::custom_action(action)]);
+        assert!(
+            surface.compose(invalid).entry("actions.custom").is_none(),
+            "malformed typed action remained visible: {case}",
+        );
+    }
+
     let valid = request(
         supported_context(CommandTarget::File, 1),
         MenuTarget::Item,
@@ -982,23 +1013,62 @@ fn custom_actions_parent_is_omitted_without_a_valid_action_contribution() {
     let child = &parent.submenu().unwrap().entries()[0];
     assert_eq!(child.label(), "Inspect");
     assert!(!child.state().is_enabled());
-    assert!(child.accessible_disabled_reason().is_some());
+    assert_eq!(
+        child.accessible_disabled_reason(),
+        Some("Checking action availability…")
+    );
+}
+
+#[test]
+fn arabic_send_to_read_only_refusal_is_localized_for_parent_and_child() {
+    let menu = ContextMenuSurface::new(CommandRegistry::built_in())
+        .with_locale(Locale::Ar)
+        .compose(
+            request(
+                supported_context(CommandTarget::File, 1),
+                MenuTarget::Item,
+                vec![target(b"arabic-read-only", "/work/file.txt")],
+            )
+            .with_send_to(&[SendToDestination::pinned(
+                "Archive",
+                path("/archive"),
+                false,
+            )]),
+        );
+    let parent = menu.entry("clipboard.send_to").expect("Send To parent");
+    let child = parent
+        .submenu()
+        .and_then(|submenu| submenu.destination("/archive"))
+        .expect("read-only destination child");
+    assert_eq!(
+        parent.accessible_disabled_reason(),
+        Some("الوجهة للقراءة فقط")
+    );
+    assert_eq!(
+        child.accessible_disabled_reason(),
+        Some("الوجهة للقراءة فقط")
+    );
 }
 
 fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
+    let production_dynamic = |request: ContextMenuRequest| {
+        request
+            .with_send_to(&[SendToDestination::pinned("Archive", path("/archive"), true)])
+            .with_actions(&[MenuContribution::custom_action(custom_action())])
+    };
     let file = target(b"file", "/work/file.txt");
-    let variable_rows = request(
-        supported_context(CommandTarget::File, 1),
-        MenuTarget::Item,
-        vec![file.clone()],
-    )
-    .with_open_with(&[OpenWithApplication::compatible(
-        "Editor",
-        "org.example.Editor",
-    )])
-    .with_send_to(&[SendToDestination::pinned("Archive", path("/archive"), true)])
-    .with_tags(&[MenuContribution::new("Work", "item.tags")])
-    .with_actions(&[MenuContribution::custom_action(custom_action())]);
+    let variable_rows = production_dynamic(
+        request(
+            supported_context(CommandTarget::File, 1),
+            MenuTarget::Item,
+            vec![file.clone()],
+        )
+        .with_open_with(&[OpenWithApplication::compatible(
+            "Editor",
+            "org.example.Editor",
+        )])
+        .with_tags(&[MenuContribution::new("Work", "item.tags")]),
+    );
     let mut hidden = supported_context(CommandTarget::File, 1);
     hidden.target_is_hidden = true;
     let mut pinned = supported_context(CommandTarget::Directory, 1);
@@ -1029,70 +1099,68 @@ fn surface_matrix_requests() -> Vec<(&'static str, ContextMenuRequest)> {
             ),
         ),
         ("file", variable_rows),
-        ("hidden-file", request(hidden, MenuTarget::Item, vec![file])),
+        (
+            "hidden-file",
+            production_dynamic(request(hidden, MenuTarget::Item, vec![file])),
+        ),
         (
             "read-only-file",
-            request(
+            production_dynamic(request(
                 read_only,
                 MenuTarget::Item,
                 vec![target(b"read-only", "/work/read-only.txt")],
-            ),
+            )),
         ),
         (
             "unsupported-file",
-            request(
+            production_dynamic(request(
                 unsupported,
                 MenuTarget::Item,
                 vec![target(b"unsupported", "/remote/unsupported.txt")],
-            ),
+            )),
         ),
         (
             "archive",
-            request(
+            production_dynamic(request(
                 supported_context(CommandTarget::Archive, 1),
                 MenuTarget::Item,
                 vec![target(b"archive", "/work/archive.tar")],
-            ),
+            )),
         ),
         (
             "executable",
-            request(
+            production_dynamic(request(
                 supported_context(CommandTarget::ExecutableFile, 1),
                 MenuTarget::Item,
                 vec![target(b"executable", "/work/tool")],
-            ),
+            )),
         ),
         (
             "directory",
-            request(
+            production_dynamic(request(
                 supported_context(CommandTarget::Directory, 1),
                 MenuTarget::Item,
                 vec![target(b"directory", "/work/folder")],
-            ),
+            )),
         ),
         (
             "multi-selection",
-            request(
+            production_dynamic(request(
                 supported_context(CommandTarget::MultiSelection, 2),
                 MenuTarget::Item,
                 vec![
                     target(b"multi-a", "/work/a.txt"),
                     target(b"multi-b", "/work/b.txt"),
                 ],
-            )
-            .with_send_to(&[SendToDestination::pinned(
-                "Archive",
-                path("/archive"),
-                true,
-            )]),
+            )),
         ),
         (
             "pinned-directory",
-            request(
+            production_dynamic(request(
                 pinned,
                 MenuTarget::Item,
                 vec![target(b"pinned", "/work/pinned")],
-            ),
+            )),
         ),
         (
             "sidebar",
@@ -1272,6 +1340,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "clipboard.copy_to",
         "clipboard.move_to",
         "clipboard.paste_into",
+        "clipboard.send_to",
         "file.compress",
         "file.rename",
         "file.duplicate",
@@ -1279,6 +1348,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.hide",
         "directory.pin",
         "item.tags",
+        "actions.custom",
         "directory.share",
         "file.move_to_trash",
         "file.delete_permanently",
@@ -1289,6 +1359,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "directory.properties",
     ];
     const MULTI_SELECTION: &[&str] = &[
+        "actions.custom",
         "clipboard.copy",
         "clipboard.copy_to",
         "clipboard.cut",
@@ -1312,6 +1383,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
+        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1326,6 +1398,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.hide",
         "item.tags",
+        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1337,6 +1410,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
+        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1348,6 +1422,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.hide",
         "item.tags",
+        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1359,6 +1434,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
+        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1371,6 +1447,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.unhide",
         "item.tags",
+        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1382,6 +1459,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.open_with",
         "file.choose_application",
         "file.set_default_application",
+        "clipboard.send_to",
         "clipboard.cut",
         "clipboard.copy",
         "clipboard.copy_to",
@@ -1396,6 +1474,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.create_hard_link",
         "file.hide",
         "item.tags",
+        "actions.custom",
         "file.move_to_trash",
         "file.delete_permanently",
         "item.properties",
@@ -1416,6 +1495,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "clipboard.copy_to",
         "clipboard.move_to",
         "clipboard.paste_into",
+        "clipboard.send_to",
         "file.compress",
         "file.rename",
         "file.duplicate",
@@ -1423,6 +1503,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.hide",
         "directory.unpin",
         "item.tags",
+        "actions.custom",
         "directory.share",
         "file.move_to_trash",
         "file.delete_permanently",
@@ -1522,6 +1603,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
     const NONE: &[&str] = &[];
     const FILE_DISABLED: &[&str] = &["actions.custom"];
     const READ_ONLY_DISABLED: &[&str] = &[
+        "actions.custom",
         "clipboard.move_to",
         "file.create_hard_link",
         "file.create_symbolic_link",
@@ -1532,7 +1614,9 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.rename",
     ];
     const UNSUPPORTED_DISABLED: &[&str] = &[
+        "actions.custom",
         "clipboard.move_to",
+        "clipboard.send_to",
         "file.create_hard_link",
         "file.create_symbolic_link",
         "file.delete_permanently",
@@ -1543,8 +1627,9 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "item.permissions",
         "item.tags",
     ];
-    const DIRECTORY_DISABLED: &[&str] = &["clipboard.paste_into"];
+    const DIRECTORY_DISABLED: &[&str] = &["actions.custom", "clipboard.paste_into"];
     const MULTI_SELECTION_DISABLED: &[&str] = &[
+        "actions.custom",
         "clipboard.paste_into",
         "file.create_hard_link",
         "file.create_symbolic_link",
@@ -1554,11 +1639,11 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
     let expected = [
         ("background", BACKGROUND, &["clipboard.paste_into"][..]),
         ("file", FILE, FILE_DISABLED),
-        ("hidden-file", HIDDEN_FILE, NONE),
+        ("hidden-file", HIDDEN_FILE, FILE_DISABLED),
         ("read-only-file", UNSUPPORTED_FILE, READ_ONLY_DISABLED),
         ("unsupported-file", UNSUPPORTED_FILE, UNSUPPORTED_DISABLED),
-        ("archive", ARCHIVE, NONE),
-        ("executable", EXECUTABLE, NONE),
+        ("archive", ARCHIVE, FILE_DISABLED),
+        ("executable", EXECUTABLE, FILE_DISABLED),
         ("directory", DIRECTORY, DIRECTORY_DISABLED),
         ("multi-selection", MULTI_SELECTION, MULTI_SELECTION_DISABLED),
         ("pinned-directory", PINNED_DIRECTORY, DIRECTORY_DISABLED),

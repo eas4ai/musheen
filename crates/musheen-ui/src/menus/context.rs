@@ -159,15 +159,13 @@ impl ContextMenuRequest {
         &self,
         destination: StorePath,
         writable: bool,
+        read_only_reason: &str,
     ) -> CommandContext {
         let mut context = self.context.clone();
         context.resolved_destination = Some(if writable {
             musheen_core::ResolvedDestination::writable(destination)
         } else {
-            musheen_core::ResolvedDestination::read_only(
-                destination,
-                "the destination is read-only",
-            )
+            musheen_core::ResolvedDestination::read_only(destination, read_only_reason)
         });
         context
     }

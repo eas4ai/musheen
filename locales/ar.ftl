@@ -24,6 +24,7 @@ context-destination-refused = رفض موفر الوجهة هذه العملية
 context-no-destinations = لا توجد وجهات قابلة للكتابة
 context-workflow-unavailable = إجراء اختيار الوجهة غير متاح
 context-dispatch-unavailable = لا توجد خدمة سطح مكتب مسجلة لهذا الأمر
+command-refusal-6 = الوجهة للقراءة فقط
 view-options = خيارات العرض
 settings-title = الإعدادات
 settings-search = البحث في الإعدادات

@@ -808,12 +808,18 @@ fn add_send_to_submenu(
     let Some(send_to) = registry.get("clipboard.send_to") else {
         return;
     };
+    let read_only_reason = catalog
+        .message("command-refusal-6")
+        .expect("the read-only destination refusal is localized");
     let mut destination_entries = request
         .send_to
         .iter()
         .map(|destination| {
-            let context = request
-                .context_with_destination(destination.path().clone(), destination.writable());
+            let context = request.context_with_destination(
+                destination.path().clone(),
+                destination.writable(),
+                read_only_reason,
+            );
             let mut child = plain_command_entry(send_to, catalog, request, &context);
             child.label = destination.label().into();
             child.destination = Some(destination.clone());
@@ -841,8 +847,11 @@ fn add_send_to_submenu(
         .find(|destination| destination.writable())
         .or_else(|| request.send_to.first())
     {
-        let context =
-            request.context_with_destination(destination.path().clone(), destination.writable());
+        let context = request.context_with_destination(
+            destination.path().clone(),
+            destination.writable(),
+            read_only_reason,
+        );
         entry.state = send_to
             .state(&context)
             .map_disabled_reason(|reason| catalog.localize_reason(reason));
@@ -916,7 +925,11 @@ fn valid_contribution_command<'a>(
 ) -> Option<&'a CommandDefinition> {
     let command = registry.get(contribution.command_id())?;
     (command.submenu() == Some(expected_submenu)
-        && (expected_submenu != CommandSubmenu::Actions || contribution.custom_action.is_some()))
+        && (expected_submenu != CommandSubmenu::Actions
+            || contribution
+                .custom_action
+                .as_ref()
+                .is_some_and(|action| action.validate().is_ok())))
     .then_some(command)
 }
 

@@ -44,7 +44,7 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `file.open_with` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | — |
 | `file.choose_application` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
 | `file.set_default_application` | `ExactlyOneSelection` | archive, directory, executable, file, hidden-file, pinned-directory, read-only-file, unsupported-file | — |
-| `clipboard.send_to` | `WritableDestination` | file, multi-selection | — |
+| `clipboard.send_to` | `WritableDestination` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | — |
 | `clipboard.cut` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
 | `clipboard.copy` | `HasSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, custom-visible, customizable, shortcut-default |
 | `clipboard.copy_to` | `DestinationCopy` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
@@ -87,4 +87,4 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `mount.power_off` | `ProviderAction(PowerOff)` | mount | command-mode, customizable |
 | `trash.restore` | `TrashItem` | trash-item | command-mode, customizable |
 | `trash.empty` | `TrashBackground` | trash-background | command-mode, customizable |
-| `actions.custom` | `CustomActionSupportsRemote` | file | — |
+| `actions.custom` | `CustomActionSupportsRemote` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | — |
