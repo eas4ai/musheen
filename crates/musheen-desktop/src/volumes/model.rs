@@ -172,6 +172,13 @@ impl DeviceDescriptor {
     }
 
     #[must_use]
+    pub(crate) fn with_ambiguous_identity(mut self, id: VolumeId) -> Self {
+        self.id = id;
+        self.capabilities = VolumeCapabilities::default();
+        self
+    }
+
+    #[must_use]
     pub const fn id(&self) -> &VolumeId {
         &self.id
     }

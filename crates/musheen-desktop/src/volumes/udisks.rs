@@ -1,5 +1,5 @@
 use super::{DeviceDescriptor, VolumeAction, VolumeId};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
@@ -304,7 +304,7 @@ impl ZbusUDisksBackend {
             zbus::names::OwnedInterfaceName,
             HashMap<String, zbus::zvariant::OwnedValue>,
         >,
-    ) -> Result<Option<DeviceDescriptor>, UDisksError> {
+    ) -> Result<Option<ObservedDevice>, UDisksError> {
         if !interfaces.keys().any(|name| name.as_str() == BLOCK) {
             return Ok(None);
         }
@@ -355,6 +355,7 @@ impl ZbusUDisksBackend {
         let identity_stable = identity.stable;
         let id = VolumeId::new(identity.value)
             .map_err(|error| UDisksError::Protocol(error.to_string().into()))?;
+        let fallback_id = ambiguous_device_id(&uuid, &device, path);
         let display_label = if label.is_empty() {
             device
                 .file_name()
@@ -377,13 +378,21 @@ impl ZbusUDisksBackend {
             )
             .with_read_only(read_only)
             .with_locked(locked);
-        if let Some(path) = drive_path.filter(|path| path.as_str() != "/") {
+        if let Some(path) = drive_path.as_ref().filter(|path| path.as_str() != "/") {
             descriptor = descriptor.with_drive_path(path.to_string());
         }
         if let Some(size) = size {
             descriptor = descriptor.with_size_bytes(size);
         }
-        Ok(Some(descriptor))
+        Ok(Some(ObservedDevice {
+            descriptor,
+            fallback_id,
+            hardware_identity: identity.hardware_identity,
+            drive_object: drive_path
+                .as_ref()
+                .filter(|path| path.as_str() != "/")
+                .map(|path| path.to_string().into_boxed_str()),
+        }))
     }
 
     async fn mount_points(&self, path: &str, present: bool) -> Result<Vec<PathBuf>, UDisksError> {
@@ -514,7 +523,10 @@ impl UDisksBackend for ZbusUDisksBackend {
                     devices.push(device);
                 }
             }
-            Ok(BackendSnapshot::new(owner, devices))
+            Ok(BackendSnapshot::new(
+                owner,
+                reconcile_device_identities(devices),
+            ))
         })
     }
 
@@ -606,6 +618,15 @@ enum BlockIdentity<'a> {
 struct DeviceIdentity {
     value: String,
     stable: bool,
+    hardware_identity: Option<Box<str>>,
+}
+
+#[derive(Debug)]
+struct ObservedDevice {
+    descriptor: DeviceDescriptor,
+    fallback_id: VolumeId,
+    hardware_identity: Option<Box<str>>,
+    drive_object: Option<Box<str>>,
 }
 
 fn stable_device_id(
@@ -615,48 +636,107 @@ fn stable_device_id(
     device: &std::path::Path,
     object: &str,
 ) -> DeviceIdentity {
+    let stable = match block {
+        BlockIdentity::Link(_) => true,
+        BlockIdentity::WholeDevice | BlockIdentity::Partition(_) => !drive.is_empty(),
+        BlockIdentity::Ambiguous => false,
+    };
+    let value = if stable {
+        encode_device_id("device-", stable_identity_bytes(drive, block))
+    } else {
+        ambiguous_device_id(uuid, device, object)
+            .as_str()
+            .to_owned()
+    };
+    DeviceIdentity {
+        value,
+        stable,
+        hardware_identity: if stable
+            && matches!(
+                block,
+                BlockIdentity::WholeDevice | BlockIdentity::Partition(_)
+            ) {
+            Some(drive.into())
+        } else {
+            None
+        },
+    }
+}
+
+fn stable_identity_bytes(drive: &str, block: BlockIdentity<'_>) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    let mut bytes = Vec::new();
-    let stable = !matches!(block, BlockIdentity::Ambiguous);
-    if stable {
-        bytes.extend_from_slice(drive.as_bytes());
-        match block {
-            BlockIdentity::WholeDevice => {}
-            BlockIdentity::Link(path) => {
-                bytes.push(0);
-                bytes.extend_from_slice(path.as_os_str().as_bytes());
-            }
-            BlockIdentity::Partition(partition) => {
-                bytes.push(0);
-                bytes.extend_from_slice(partition.as_bytes());
-            }
-            BlockIdentity::Ambiguous => unreachable!(),
+    match block {
+        BlockIdentity::WholeDevice => drive.as_bytes().to_vec(),
+        BlockIdentity::Link(path) => path.as_os_str().as_bytes().to_vec(),
+        BlockIdentity::Partition(partition) => {
+            let mut bytes = drive.as_bytes().to_vec();
+            bytes.push(0);
+            bytes.extend_from_slice(partition.as_bytes());
+            bytes
         }
-    } else {
-        // There is no stable per-block discriminator. Keep the object visible
-        // and collision-free for this snapshot, but disable actions because the
-        // identity cannot be reconciled safely after object or kernel churn.
-        bytes.extend_from_slice(uuid.as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(device.as_os_str().as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(object.as_bytes());
+        BlockIdentity::Ambiguous => unreachable!("ambiguous identities are encoded separately"),
     }
-    let mut encoded = String::with_capacity(bytes.len() * 2 + 7);
-    encoded.push_str(if stable {
-        "device-"
-    } else {
-        "device-ambiguous-"
-    });
+}
+
+fn ambiguous_device_id(uuid: &str, device: &std::path::Path, object: &str) -> VolumeId {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // There is no stable per-block discriminator. Keep the object visible and
+    // collision-free for this session, but disable actions because it cannot be
+    // reconciled safely after object or kernel churn.
+    let mut bytes = uuid.as_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend_from_slice(device.as_os_str().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(object.as_bytes());
+    VolumeId::new(encode_device_id("device-ambiguous-", bytes))
+        .expect("hex-encoded device identities are always valid")
+}
+
+fn encode_device_id(prefix: &str, bytes: Vec<u8>) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2 + prefix.len());
+    encoded.push_str(prefix);
     for byte in bytes {
         use std::fmt::Write as _;
         write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    DeviceIdentity {
-        value: encoded,
-        stable,
+    encoded
+}
+
+fn reconcile_device_identities(devices: Vec<ObservedDevice>) -> Vec<DeviceDescriptor> {
+    let mut id_counts = BTreeMap::<VolumeId, usize>::new();
+    let mut hardware_drives = BTreeMap::<Box<str>, BTreeSet<Box<str>>>::new();
+    for device in &devices {
+        *id_counts.entry(device.descriptor.id().clone()).or_default() += 1;
+        if let Some(identity) = &device.hardware_identity {
+            let drives = hardware_drives.entry(identity.clone()).or_default();
+            if let Some(drive) = &device.drive_object {
+                drives.insert(drive.clone());
+            }
+        }
     }
+
+    devices
+        .into_iter()
+        .map(|device| {
+            let duplicate_id = id_counts
+                .get(device.descriptor.id())
+                .is_some_and(|count| *count > 1);
+            let duplicated_hardware = device.hardware_identity.as_ref().is_some_and(|identity| {
+                hardware_drives
+                    .get(identity)
+                    .is_none_or(|drives| drives.len() != 1)
+            });
+            if duplicate_id || duplicated_hardware {
+                device
+                    .descriptor
+                    .with_ambiguous_identity(device.fallback_id)
+            } else {
+                device.descriptor
+            }
+        })
+        .collect()
 }
 
 fn is_stable_block_link(path: &std::path::Path) -> bool {
@@ -993,6 +1073,7 @@ mod tests {
         assert_eq!(first_before, first_after);
         assert_ne!(first_before, second);
         assert_ne!(second, blank);
+        assert_stable_link_ignores_hardware_metadata();
 
         let mut model = crate::volumes::VolumeModel::default();
         let volumes = [first_before, second, blank].map(|value| {
@@ -1003,6 +1084,26 @@ mod tests {
         });
         assert!(model.replace(Some(":1.42".into()), volumes).is_ok());
         assert_eq!(model.volumes().len(), 3);
+    }
+
+    fn assert_stable_link_ignores_hardware_metadata() {
+        let trusted_link = std::path::Path::new("/dev/disk/by-id/usb-trusted-part1");
+        let with_serial = stable_device_id(
+            "same-uuid",
+            "sometimes-present",
+            BlockIdentity::Link(trusted_link),
+            std::path::Path::new("/dev/sdb1"),
+            "/org/freedesktop/UDisks2/block_devices/sdb1",
+        );
+        let without_serial = stable_device_id(
+            "same-uuid",
+            "",
+            BlockIdentity::Link(trusted_link),
+            std::path::Path::new("/dev/sdz1"),
+            "/org/freedesktop/UDisks2/block_devices/sdz1",
+        );
+        assert!(with_serial.stable && without_serial.stable);
+        assert_eq!(with_serial, without_serial);
     }
 
     #[test]

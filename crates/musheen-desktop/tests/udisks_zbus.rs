@@ -73,6 +73,8 @@ struct FakeBlock {
 struct IdentityBlock {
     device: Vec<u8>,
     uuid: &'static str,
+    drive: &'static str,
+    symlinks: Vec<Vec<u8>>,
 }
 
 #[zbus::interface(name = "org.freedesktop.UDisks2.Block")]
@@ -83,7 +85,7 @@ impl IdentityBlock {
     }
     #[zbus(property)]
     fn symlinks(&self) -> Vec<Vec<u8>> {
-        Vec::new()
+        self.symlinks.clone()
     }
     #[zbus(property)]
     fn id_uuid(&self) -> &str {
@@ -103,7 +105,31 @@ impl IdentityBlock {
     }
     #[zbus(property)]
     fn drive(&self) -> OwnedObjectPath {
-        OwnedObjectPath::try_from(DRIVE_PATH).unwrap()
+        OwnedObjectPath::try_from(self.drive).unwrap()
+    }
+}
+
+struct IdentityDrive {
+    identity: &'static str,
+}
+
+#[zbus::interface(name = "org.freedesktop.UDisks2.Drive")]
+impl IdentityDrive {
+    #[zbus(property)]
+    fn ejectable(&self) -> bool {
+        true
+    }
+    #[zbus(property)]
+    fn can_power_off(&self) -> bool {
+        true
+    }
+    #[zbus(property)]
+    fn wwn(&self) -> &str {
+        self.identity
+    }
+    #[zbus(property)]
+    fn serial(&self) -> &str {
+        self.identity
     }
 }
 
@@ -327,6 +353,8 @@ fn start_identity_service(
                     IdentityBlock {
                         device: device.to_vec(),
                         uuid: if index == 2 { "" } else { "same-uuid" },
+                        drive: DRIVE_PATH,
+                        symlinks: Vec::new(),
                     },
                 )
                 .unwrap()
@@ -342,6 +370,127 @@ fn start_identity_service(
         }
         builder.build().await.unwrap()
     })
+}
+
+fn start_duplicate_hardware_service(
+    address: &str,
+    hardware_identity: &'static str,
+    partitions: bool,
+) -> zbus::Connection {
+    const DRIVE_A: &str = "/org/freedesktop/UDisks2/drives/duplicate_a";
+    const DRIVE_B: &str = "/org/freedesktop/UDisks2/drives/duplicate_b";
+    const BLOCK_A: &str = "/org/freedesktop/UDisks2/block_devices/duplicate_a1";
+    const BLOCK_B: &str = "/org/freedesktop/UDisks2/block_devices/duplicate_b1";
+
+    futures_lite::future::block_on(async {
+        let mut builder = zbus::connection::Builder::address(address)
+            .unwrap()
+            .name(SERVICE)
+            .unwrap()
+            .serve_at(ROOT, ObjectManager)
+            .unwrap()
+            .serve_at(
+                DRIVE_A,
+                IdentityDrive {
+                    identity: hardware_identity,
+                },
+            )
+            .unwrap()
+            .serve_at(
+                DRIVE_B,
+                IdentityDrive {
+                    identity: hardware_identity,
+                },
+            )
+            .unwrap()
+            .serve_at(
+                BLOCK_A,
+                IdentityBlock {
+                    device: b"/dev/sdb1\0".to_vec(),
+                    uuid: "",
+                    drive: DRIVE_A,
+                    symlinks: Vec::new(),
+                },
+            )
+            .unwrap()
+            .serve_at(
+                BLOCK_B,
+                IdentityBlock {
+                    device: b"/dev/sdc1\0".to_vec(),
+                    uuid: "",
+                    drive: DRIVE_B,
+                    symlinks: Vec::new(),
+                },
+            )
+            .unwrap();
+        if partitions {
+            for path in [BLOCK_A, BLOCK_B] {
+                builder = builder
+                    .serve_at(
+                        path,
+                        FakePartition {
+                            uuid: "",
+                            number: 1,
+                            offset: 4096,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        builder.build().await.unwrap()
+    })
+}
+
+fn assert_duplicate_hardware_is_visible_but_unsafe(backend: ZbusUDisksBackend) {
+    let snapshot = backend.snapshot().unwrap();
+    assert_eq!(snapshot.devices().len(), 2);
+    let ids = snapshot
+        .devices()
+        .iter()
+        .map(|device| device.id().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), 2, "ambiguous devices need session-safe IDs");
+    for device in snapshot.devices() {
+        assert!(device.id().as_str().starts_with("device-ambiguous-"));
+        let capabilities = device.capabilities();
+        assert!(!capabilities.can_mount);
+        assert!(!capabilities.can_unmount);
+        assert!(!capabilities.can_eject);
+        assert!(!capabilities.can_unlock);
+        assert!(!capabilities.can_power_off);
+    }
+
+    let mut service = VolumeService::new(
+        Arc::new(backend),
+        Arc::new(EmptyMounts),
+        Arc::new(NoOperationUsage),
+    );
+    service.refresh().unwrap();
+    assert_eq!(service.model().volumes().len(), 2);
+}
+
+#[test]
+fn empty_hardware_identity_does_not_trust_duplicate_partition_layouts() {
+    let Some(bus) = PrivateBus::start() else {
+        return;
+    };
+    let _service = start_duplicate_hardware_service(&bus.address, "", true);
+    let backend =
+        ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
+            .unwrap();
+    assert_duplicate_hardware_is_visible_but_unsafe(backend);
+}
+
+#[test]
+fn duplicated_serial_does_not_trust_whole_device_identity() {
+    let Some(bus) = PrivateBus::start() else {
+        return;
+    };
+    let _service = start_duplicate_hardware_service(&bus.address, "duplicate-serial", false);
+    let backend =
+        ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
+            .unwrap();
+    assert_duplicate_hardware_is_visible_but_unsafe(backend);
 }
 
 #[test]
@@ -377,6 +526,10 @@ fn same_drive_partition_identities_survive_object_and_kernel_path_churn() {
         .map(|device| device.id().clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(before_ids.len(), 3);
+    assert!(before.devices().iter().all(|device| {
+        let capabilities = device.capabilities();
+        capabilities.can_eject && capabilities.can_power_off
+    }));
 
     drop(first_service);
     let second_service = start_identity_service(
