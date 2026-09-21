@@ -1158,6 +1158,91 @@ struct ScriptedUsage {
     queried_mounts: Mutex<Vec<Vec<PathBuf>>>,
 }
 
+#[derive(Default)]
+struct AliasUsage {
+    active: Mutex<Vec<(PathBuf, OperationUse)>>,
+    queried_mounts: Mutex<Vec<Vec<PathBuf>>>,
+    canceled: Mutex<Vec<MountOperation>>,
+}
+
+impl OperationUsage for AliasUsage {
+    fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
+        self.queried_mounts.lock().unwrap().push(mounts.to_vec());
+        self.active
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| mounts.contains(path))
+            .map(|(_, operation)| operation.clone())
+            .collect()
+    }
+
+    fn cancel(&self, operations: &[OperationUse]) -> Result<(), VolumeError> {
+        let canceled = operations
+            .iter()
+            .map(OperationUse::id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.canceled
+            .lock()
+            .unwrap()
+            .extend(canceled.iter().copied());
+        self.active
+            .lock()
+            .unwrap()
+            .retain(|(_, operation)| !canceled.contains(&operation.id()));
+        Ok(())
+    }
+}
+
+#[test]
+fn usage_consent_uses_fresh_aliases_and_ignores_removed_aliases() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let usage = Arc::new(AliasUsage::default());
+    let removed = OperationUse::new(MountOperation::new(20), "removed alias write");
+    let added = OperationUse::new(MountOperation::new(21), "new alias write");
+    usage.active.lock().unwrap().extend([
+        (PathBuf::from("/bind/removed"), removed),
+        (PathBuf::from("/bind/added"), added.clone()),
+    ]);
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    mounts.queue(vec![mount("/dev/sdb1", "/bind/removed", false)]);
+    let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
+    service.refresh().unwrap();
+
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    mounts.queue(vec![mount("/dev/sdb1", "/bind/added", false)]);
+    mounts.queue(vec![mount("/dev/sdb1", "/bind/added", false)]);
+    service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::CancelApproved(vec![added]),
+            None,
+        )
+        .unwrap();
+
+    let scopes = usage.queried_mounts.lock().unwrap();
+    assert!(
+        scopes
+            .iter()
+            .all(|scope| !scope.contains(&PathBuf::from("/bind/removed")))
+    );
+    assert!(
+        scopes
+            .iter()
+            .all(|scope| scope.contains(&PathBuf::from("/bind/added")))
+    );
+    assert_eq!(
+        usage.canceled.lock().unwrap().as_slice(),
+        &[MountOperation::new(21)]
+    );
+    assert_eq!(
+        backend.actions.lock().unwrap().as_slice(),
+        &[(id("sdb1"), VolumeAction::Unmount)]
+    );
+}
+
 impl OperationUsage for ScriptedUsage {
     fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
         self.queried_mounts.lock().unwrap().push(mounts.to_vec());
@@ -1194,8 +1279,12 @@ fn drive_wide_actions_include_sibling_partition_jobs() {
         mount("/dev/sdb1", "/media/a", false),
         mount("/dev/sdb2", "/media/b", false),
     ]);
-    let mut service = VolumeService::new(backend.clone(), mounts, usage.clone());
+    let mut service = VolumeService::new(backend.clone(), mounts.clone(), usage.clone());
     service.refresh().unwrap();
+    mounts.queue(vec![
+        mount("/dev/sdb1", "/media/a", false),
+        mount("/dev/sdb2", "/media/b", false),
+    ]);
 
     let error = service
         .perform(

@@ -596,9 +596,6 @@ impl VolumeService {
             .ok_or(VolumeError::MountNotExposed)?;
         ensure_supported(&volume, action, unlock_secret)?;
 
-        let affected_mounts = self.model.mounts_affected_by(id, action);
-        self.resolve_usage(&affected_mounts, action, usage_resolution, request)?;
-
         if matches!(
             action,
             VolumeAction::Unmount | VolumeAction::Eject | VolumeAction::PowerOff
@@ -613,8 +610,17 @@ impl VolumeService {
             let live_mounts = self.mounts.snapshot()?;
             request.check()?;
             let affected_devices = self.model.devices_affected_by(id, action);
-            let reservation_mounts =
+            let usage_mounts =
                 reconcile_mount_aliases(&validated_mounts, &affected_devices, &live_mounts);
+            let canceled = self.resolve_usage(&usage_mounts, action, usage_resolution, request)?;
+            let reservation_mounts = if canceled {
+                request.check()?;
+                let live_mounts = self.mounts.snapshot()?;
+                request.check()?;
+                reconcile_mount_aliases(&validated_mounts, &affected_devices, &live_mounts)
+            } else {
+                usage_mounts
+            };
             let reservation = self.usage.reserve(&reservation_mounts)?;
             let newly_active = reservation.operations_using();
             if !newly_active.is_empty() {
@@ -668,16 +674,16 @@ impl VolumeService {
         action: VolumeAction,
         resolution: UsageResolution,
         request: &UDisksRequest,
-    ) -> Result<(), VolumeError> {
+    ) -> Result<bool, VolumeError> {
         if !matches!(
             action,
             VolumeAction::Unmount | VolumeAction::Eject | VolumeAction::PowerOff
         ) {
-            return Ok(());
+            return Ok(false);
         }
         let operations = self.usage.operations_using(mounts);
         if operations.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let UsageResolution::CancelApproved(approved) = resolution else {
             return Err(VolumeError::InUse(operations));
@@ -692,7 +698,7 @@ impl VolumeService {
             request.check()?;
             let active = self.usage.operations_using(mounts);
             if active.is_empty() {
-                return Ok(());
+                return Ok(true);
             }
             if !ids(&active).is_subset(&ids(&approved)) {
                 return Err(VolumeError::InUse(active));

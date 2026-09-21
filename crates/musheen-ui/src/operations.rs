@@ -405,8 +405,10 @@ impl OperationHub {
 
     #[must_use]
     pub fn can_discard_recovery(&self, id: JobId) -> bool {
-        self.recovery_staging(id)
-            .is_ok_and(|staging| LocalStore::new().recovery_staging_available(&staging))
+        self.recovery_staging(id).is_ok_and(|staging| {
+            self.recovery_is_unreserved(id, &staging)
+                && LocalStore::new().recovery_staging_available(&staging)
+        })
     }
 
     pub fn resume_recovery(&self, id: JobId) -> Result<(), OperationHubError> {
@@ -429,7 +431,10 @@ impl OperationHub {
     pub fn discard_recovery(&self, id: JobId) -> Result<(), OperationHubError> {
         let staging = self.recovery_staging(id)?;
         let retry_available = self.can_retry(id);
-        LocalStore::new().discard_recovery_staging(&staging)?;
+        self.with_unreserved_recovery(id, &staging, || {
+            LocalStore::new().discard_recovery_staging(&staging)?;
+            Ok(())
+        })?;
         self.status
             .lock()
             .map_err(|_| OperationHubError::StatusLock)?
@@ -525,6 +530,41 @@ impl OperationHub {
             && queue.operation_paths(id).is_some_and(|paths| {
                 !operation_paths_are_reserved(reserved.values().flatten(), &paths)
             })
+    }
+
+    fn recovery_is_unreserved(&self, id: JobId, staging: &StorePath) -> bool {
+        let Ok(reserved) = self.reservations.lock() else {
+            return false;
+        };
+        let Ok(queue) = self.queue.lock() else {
+            return false;
+        };
+        let mut paths = queue.operation_paths(id).unwrap_or_default();
+        paths.push(staging.clone());
+        !operation_paths_are_reserved(reserved.values().flatten(), &paths)
+    }
+
+    fn with_unreserved_recovery<T>(
+        &self,
+        id: JobId,
+        staging: &StorePath,
+        transition: impl FnOnce() -> Result<T, DropError>,
+    ) -> Result<T, OperationHubError> {
+        let reserved = self
+            .reservations
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?;
+        let mut paths = self
+            .queue
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?
+            .operation_paths(id)
+            .unwrap_or_default();
+        paths.push(staging.clone());
+        if operation_paths_are_reserved(reserved.values().flatten(), &paths) {
+            return Err(OperationHubError::MountReserved);
+        }
+        transition().map_err(Into::into)
     }
 
     fn queue(&self) -> Arc<Mutex<LocalOperationQueue>> {
@@ -806,13 +846,22 @@ mod tests {
 
     fn recoverable_hub() -> (tempfile::TempDir, OperationHub, JobId, StorePath) {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
-        let source = temporary.path().join("source.txt");
-        let target = temporary.path().join("target");
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let (id, staging) = recoverable_copy(&hub, temporary.path(), "source");
+        (temporary, hub, id, staging)
+    }
+
+    fn recoverable_copy(
+        hub: &OperationHub,
+        root: &std::path::Path,
+        name: &str,
+    ) -> (JobId, StorePath) {
+        let source = root.join(format!("{name}.txt"));
+        let target = root.join(format!("{name}-target"));
         filesystem::write(&source, b"source").unwrap();
         filesystem::create_dir(&target).unwrap();
         let source = StorePath::from_unix_path(source.into_os_string());
         let target = StorePath::from_unix_path(target.into_os_string());
-        let hub = OperationHub::new(&ResourceLimits::default());
         let id = hub
             .submit_drop(
                 FileDragPayload::new(vec![source.clone()], DropAction::Copy).unwrap(),
@@ -823,7 +872,7 @@ mod tests {
             target
                 .as_unix_path()
                 .unwrap()
-                .join("source.txt")
+                .join(format!("{name}.txt"))
                 .into_os_string(),
         );
         let staging = StagingPath::for_destination(&destination, id, EventGeneration::new(0))
@@ -853,7 +902,7 @@ mod tests {
             .unwrap();
         status.mark_recoverable(id).unwrap();
         drop(status);
-        (temporary, hub, id, staging)
+        (id, staging)
     }
 
     fn failed_copy(hub: &OperationHub, source: StorePath, target: StorePath) -> JobId {
@@ -928,6 +977,46 @@ mod tests {
             hub.status.lock().unwrap().entry(id).unwrap().status(),
             crate::OperationStatus::Failed
         );
+    }
+
+    #[test]
+    fn mount_reservation_blocks_only_matching_recovery_discard() {
+        let temporary = tempfile::tempdir().unwrap();
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let (reserved_id, reserved_staging) = recoverable_copy(&hub, temporary.path(), "reserved");
+        let unrelated_root = tempfile::tempdir().unwrap();
+        let (unrelated_id, unrelated_staging) =
+            recoverable_copy(&hub, unrelated_root.path(), "unrelated");
+        let reservation = hub
+            .reserve_mounts(&[temporary.path().to_path_buf()])
+            .unwrap();
+
+        assert!(!hub.can_discard_recovery(reserved_id));
+        assert!(matches!(
+            hub.discard_recovery(reserved_id),
+            Err(OperationHubError::MountReserved)
+        ));
+        assert!(reserved_staging.as_unix_path().unwrap().exists());
+
+        assert!(hub.can_discard_recovery(unrelated_id));
+        hub.discard_recovery(unrelated_id).unwrap();
+        assert!(!unrelated_staging.as_unix_path().unwrap().exists());
+
+        drop(reservation);
+        let source_reservation = hub
+            .reserve_mounts(&[temporary.path().join("reserved.txt")])
+            .unwrap();
+        assert!(!hub.can_discard_recovery(reserved_id));
+        assert!(matches!(
+            hub.discard_recovery(reserved_id),
+            Err(OperationHubError::MountReserved)
+        ));
+        assert!(reserved_staging.as_unix_path().unwrap().exists());
+        drop(source_reservation);
+
+        assert!(hub.can_discard_recovery(reserved_id));
+        hub.discard_recovery(reserved_id).unwrap();
+        assert!(!reserved_staging.as_unix_path().unwrap().exists());
     }
 
     #[test]
