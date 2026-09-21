@@ -19,6 +19,30 @@ use gpui_kit::{App, Context, Role, SharedString, TestSupportExt, Window, div, px
 /// can capture focus before opening a confirmation or chooser dialog.
 pub struct ContextMenuRenderer;
 
+#[derive(Clone)]
+struct MenuRenderPath {
+    id: String,
+    projection: Vec<usize>,
+}
+
+impl MenuRenderPath {
+    fn root(id: String) -> Self {
+        Self {
+            id,
+            projection: Vec::new(),
+        }
+    }
+
+    fn child(&self, index: usize) -> Self {
+        let mut projection = self.projection.clone();
+        projection.push(index);
+        Self {
+            id: format!("{}-{index}", self.id),
+            projection,
+        }
+    }
+}
+
 impl ContextMenuRenderer {
     /// Populates the same native popup type the app stores for keyboard menus.
     /// Every nested popup inherits the root locale direction and theme tokens.
@@ -36,11 +60,11 @@ impl ContextMenuRenderer {
         Self::populate_with_direction(
             popup.direction(popup_direction(menu.locale_direction())),
             menu,
-            path.into(),
+            MenuRenderPath::root(path.into()),
             window,
             cx,
             on_activate,
-            |_, _, _, _| {},
+            |_, _, _, _, _| {},
         )
     }
 
@@ -55,15 +79,23 @@ impl ContextMenuRenderer {
     ) -> PopupMenu
     where
         F: Fn(MenuEntry, &mut Window, &mut App) + Clone + 'static,
-        G: Fn(&ContextMenu, &str, &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
+        G: Fn(&ContextMenu, &str, &[usize], &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
     {
-        Self::populate_with_direction(popup, menu, path, window, cx, on_activate, on_built)
+        Self::populate_with_direction(
+            popup,
+            menu,
+            MenuRenderPath::root(path),
+            window,
+            cx,
+            on_activate,
+            on_built,
+        )
     }
 
     fn populate_with_direction<F, G>(
         mut popup: PopupMenu,
         menu: ContextMenu,
-        path: String,
+        path: MenuRenderPath,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
         on_activate: F,
@@ -71,9 +103,9 @@ impl ContextMenuRenderer {
     ) -> PopupMenu
     where
         F: Fn(MenuEntry, &mut Window, &mut App) + Clone + 'static,
-        G: Fn(&ContextMenu, &str, &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
+        G: Fn(&ContextMenu, &str, &[usize], &mut Window, &mut Context<PopupMenu>) + Clone + 'static,
     {
-        on_built(&menu, &path, window, cx);
+        on_built(&menu, &path.id, &path.projection, window, cx);
         let direction = menu.locale_direction();
         let theme_tokens = menu.theme_tokens();
         let viewport_height = window.viewport_size().height;
@@ -87,14 +119,14 @@ impl ContextMenuRenderer {
             .scrollable(true)
             .max_h(available_height);
         for (index, entry) in menu.entries().iter().cloned().enumerate() {
-            let row_path = format!("{path}-{index}");
+            let row_path = format!("{}-{index}", path.id);
             popup = match entry.kind() {
                 MenuEntryKind::Separator => popup.separator(),
                 MenuEntryKind::Submenu => {
                     let Some(submenu) = entry.submenu().cloned() else {
                         continue;
                     };
-                    let child_path = row_path.clone();
+                    let child_path = path.child(index);
                     let activate = on_activate.clone();
                     let built = on_built.clone();
                     let submenu = PopupMenu::build(window, cx, move |popup, window, cx| {

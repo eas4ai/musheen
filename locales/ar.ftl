@@ -16,6 +16,7 @@ application-open-application-unavailable = التطبيق المحدد لم يع
 application-open-launch-failed = تعذّر تشغيل التطبيق.
 application-open-dialog-unavailable = تعذّر فتح نافذة اختيار التطبيق.
 application-open-loading = لا تزال التطبيقات قيد التحميل. حاول مرة أخرى بعد قليل.
+application-open-busy = البحث عن التطبيقات مشغول. حاول مرة أخرى.
 application-open-terminal-unavailable = يتطلب هذا التطبيق طرفية مُعدّة.
 application-open-unrepresentable-target = لا يمكن تمرير العنصر المحدد عبر حد المسار أو عنوان URI الخاص بالتطبيق.
 application-open-try-exec-unavailable = الملف التنفيذي المطلوب للتطبيق غير متاح.

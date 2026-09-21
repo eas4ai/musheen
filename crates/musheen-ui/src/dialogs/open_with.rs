@@ -6,8 +6,8 @@ use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, Context, EventEmitter, FocusHandle, ImageSource, IntoElement, Render, Role,
-    SharedString, TestSupportExt, TitlebarOptions, Window, WindowBounds, WindowOptions, div, img,
-    px, size, uniform_list,
+    ScrollStrategy, SharedString, TestSupportExt, TitlebarOptions, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions, div, img, px, size, uniform_list,
 };
 use musheen_desktop::{
     ApplicationIconProvider, DesktopApplication, DesktopEntryCatalog, DesktopEntryLauncher,
@@ -16,6 +16,30 @@ use musheen_desktop::{
 use std::path::{Path, PathBuf};
 
 use crate::Catalog;
+
+gpui_kit::actions!(
+    open_with,
+    [
+        SelectPrevious,
+        SelectNext,
+        SelectFirst,
+        SelectLast,
+        Confirm,
+        Cancel
+    ]
+);
+
+pub(crate) fn install_open_with_key_bindings(cx: &mut App) {
+    use gpui_kit::KeyBinding;
+    cx.bind_keys([
+        KeyBinding::new("up", SelectPrevious, Some("OpenWithDialog")),
+        KeyBinding::new("down", SelectNext, Some("OpenWithDialog")),
+        KeyBinding::new("home", SelectFirst, Some("OpenWithDialog")),
+        KeyBinding::new("end", SelectLast, Some("OpenWithDialog")),
+        KeyBinding::new("enter", Confirm, Some("OpenWithDialog")),
+        KeyBinding::new("escape", Cancel, Some("OpenWithDialog")),
+    ]);
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationChoice {
@@ -197,6 +221,7 @@ pub struct OpenWithDialog {
     focus: FocusHandle,
     pending_focus: bool,
     decision: Option<(Box<str>, OpenWithIntent)>,
+    scroll: UniformListScrollHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,6 +259,7 @@ impl OpenWithDialog {
             focus: cx.focus_handle(),
             pending_focus: true,
             decision: None,
+            scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -250,6 +276,32 @@ impl OpenWithDialog {
         self.decision = Some((desktop_id.clone(), intent));
         cx.emit(OpenWithDialogEvent::Chosen { desktop_id, intent });
         window.remove_window();
+    }
+
+    fn move_selection(&mut self, position: SelectionPosition, cx: &mut Context<Self>) {
+        let applications = self.model.compatible_applications();
+        if applications.is_empty() {
+            return;
+        }
+        let current = self
+            .model
+            .selected()
+            .and_then(|selected| {
+                applications
+                    .iter()
+                    .position(|application| application.desktop_id() == selected)
+            })
+            .unwrap_or(0);
+        let next = match position {
+            SelectionPosition::Previous => current.saturating_sub(1),
+            SelectionPosition::Next => (current + 1).min(applications.len() - 1),
+            SelectionPosition::First => 0,
+            SelectionPosition::Last => applications.len() - 1,
+        };
+        let desktop_id = Box::<str>::from(applications[next].desktop_id());
+        let _ = self.model.select(&desktop_id);
+        self.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+        cx.notify();
     }
 
     fn render_application(
@@ -314,6 +366,14 @@ impl OpenWithDialog {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SelectionPosition {
+    Previous,
+    Next,
+    First,
+    Last,
+}
+
 impl Render for OpenWithDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending_focus {
@@ -368,14 +428,19 @@ impl Render for OpenWithDialog {
                     .collect::<Vec<_>>()
             }),
         )
-        .h(px(320.))
+        .track_scroll(&self.scroll)
+        .flex_grow(1.0)
+        .min_h(px(40.))
+        .h_full()
         .w_full();
         let applications = div()
             .id("open-with-application-list")
             .test_support()
-            .role(Role::List)
+            .role(Role::RadioGroup)
             .aria_label(title.clone())
-            .h(px(320.))
+            .flex_grow(1.0)
+            .min_h(px(40.))
+            .max_h(px(320.))
             .w_full()
             .child(applications);
         div()
@@ -384,16 +449,40 @@ impl Render for OpenWithDialog {
             .role(Role::Dialog)
             .aria_label(title.clone())
             .tab_index(0)
+            .key_context("OpenWithDialog")
             .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| {
+                this.move_selection(SelectionPosition::Previous, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
+                this.move_selection(SelectionPosition::Next, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| {
+                this.move_selection(SelectionPosition::First, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, _, cx| {
+                this.move_selection(SelectionPosition::Last, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                this.choose(OpenWithIntent::OpenOnce, window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &Cancel, window, cx| {
+                cx.emit(OpenWithDialogEvent::Cancelled);
+                window.remove_window();
+            }))
+            .size_full()
+            .min_h(px(0.))
             .flex()
             .flex_col()
             .gap_3()
             .p_4()
-            .child(div().text_lg().child(title))
+            .child(div().flex_shrink_0().text_lg().child(title))
             .child(applications)
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         Button::new("open-with-cancel")
@@ -491,7 +580,10 @@ mod tests {
     async fn many_applications_are_virtualized_accessible_and_focused_at_200_percent(
         cx: &mut TestAppContext,
     ) {
-        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_open_with_key_bindings(cx);
+        });
         let choices = (0..500)
             .map(|index| {
                 ApplicationChoice::new(
@@ -501,7 +593,8 @@ mod tests {
                 )
             })
             .collect();
-        let handle = cx.open_window(size(px(560.), px(480.)), |window, cx| {
+        let mut dialog = None;
+        let handle = cx.open_window(size(px(420.), px(360.)), |window, cx| {
             let view = cx.new(|cx| {
                 OpenWithDialog::new(
                     OpenWithModel::new("text/plain", choices),
@@ -509,26 +602,30 @@ mod tests {
                     cx,
                 )
             });
+            dialog = Some(view.clone());
             Root::new(view, window, cx)
         });
+        let dialog = dialog.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.set_scale_factor(2.0);
             window.render_frame(cx);
             assert_eq!(window.scale_factor(), 2.0);
             assert_eq!(window.find("open-with-dialog").focused(), Some(true));
             assert!(window.find("open-with-application-list").visible());
-            window.click("open-with-application-example-0.desktop", cx);
+            window.press("end", cx);
             window.render_frame(cx);
             assert_eq!(
                 window
-                    .find("open-with-application-example-0.desktop")
+                    .find("open-with-application-example-499.desktop")
                     .checked(),
                 Some(true)
             );
-            assert!(
-                window
-                    .try_find("open-with-row-example-499.desktop")
-                    .is_none()
+            assert!(window.find("open-with-open-once").visible());
+            assert!(window.find("open-with-set-default").visible());
+            window.press("enter", cx);
+            assert_eq!(
+                dialog.read(cx).decision(),
+                Some(("example-499.desktop", OpenWithIntent::OpenOnce))
             );
         })
         .unwrap();

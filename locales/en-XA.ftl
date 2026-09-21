@@ -78,6 +78,7 @@ application-open-application-unavailable = ⟦The selected application is no lon
 application-open-launch-failed = ⟦The application could not be started.··⟧
 application-open-dialog-unavailable = ⟦The application chooser could not be opened.··⟧
 application-open-loading = ⟦Applications are still loading. Try again in a moment.··⟧
+application-open-busy = ⟦Application lookup is busy. Try again.··⟧
 application-open-terminal-unavailable = ⟦This application requires a configured terminal.··⟧
 application-open-unrepresentable-target = ⟦The selected item cannot cross the application's path or URI boundary.··⟧
 application-open-try-exec-unavailable = ⟦The application's required executable is unavailable.··⟧

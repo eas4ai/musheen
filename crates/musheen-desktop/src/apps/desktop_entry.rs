@@ -152,6 +152,14 @@ pub(crate) struct DesktopEntryIndex {
 }
 
 impl DesktopEntryIndex {
+    pub(crate) fn all(&self) -> impl Iterator<Item = DesktopApplication> + '_ {
+        self.records.values().filter_map(|record| {
+            (!record.hidden)
+                .then(|| record.application.clone())
+                .flatten()
+        })
+    }
+
     pub(crate) fn load(&self, desktop_id: &str) -> Option<DesktopApplication> {
         self.records
             .get(desktop_id)

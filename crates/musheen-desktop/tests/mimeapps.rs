@@ -270,6 +270,72 @@ fn additions_removals_entry_precedence_and_visibility_follow_the_spec() {
 }
 
 #[test]
+fn immutable_snapshot_keeps_hidden_default_separate_and_refresh_observes_external_changes() {
+    let fixture = Fixture::new();
+    desktop(
+        &fixture.user_app("hidden.desktop"),
+        "Hidden default",
+        &["text/plain"],
+        "NoDisplay=true\n",
+    );
+    desktop(
+        &fixture.user_app("visible.desktop"),
+        "Visible choice",
+        &["text/plain"],
+        "",
+    );
+    let mimeapps = fixture.config_home.join("mimeapps.list");
+    write(
+        &mimeapps,
+        "[Default Applications]\ntext/plain=hidden.desktop;\n",
+    );
+    let paths = fixture.paths();
+    let catalog = DesktopEntryCatalog::new(paths.clone());
+    let resolver = MimeAppsResolver::new(paths);
+    let original = resolver.snapshot(&catalog).unwrap();
+    assert_eq!(
+        original
+            .default_for("text/plain")
+            .unwrap()
+            .unwrap()
+            .desktop_id(),
+        "hidden.desktop"
+    );
+    assert!(
+        original
+            .visible_applications_for("text/plain")
+            .unwrap()
+            .iter()
+            .all(|application| application.desktop_id() != "hidden.desktop")
+    );
+
+    write(
+        &mimeapps,
+        "[Default Applications]\ntext/plain=visible.desktop;\n",
+    );
+    assert_eq!(
+        original
+            .default_for("text/plain")
+            .unwrap()
+            .unwrap()
+            .desktop_id(),
+        "hidden.desktop",
+        "an in-flight snapshot remains internally consistent"
+    );
+    assert_eq!(
+        resolver
+            .snapshot(&catalog)
+            .unwrap()
+            .default_for("text/plain")
+            .unwrap()
+            .unwrap()
+            .desktop_id(),
+        "visible.desktop",
+        "a refreshed snapshot observes a noncooperating external writer"
+    );
+}
+
+#[test]
 fn setting_a_default_is_explicit_idempotent_and_preserves_other_associations() {
     let fixture = Fixture::new();
     desktop(&fixture.user_app("writer.desktop"), "Writer", &[], "");

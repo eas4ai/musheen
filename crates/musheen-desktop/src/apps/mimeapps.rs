@@ -9,6 +9,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rustix::fs::{CWD, RenameFlags, renameat_with};
+
 const MAX_MIMEAPPS_BYTES: u64 = 1024 * 1024;
 const MAX_ASSOCIATIONS: usize = 16_384;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -34,57 +36,25 @@ impl MimeAppsResolver {
         mime_type: &str,
         catalog: &DesktopEntryCatalog,
     ) -> Result<Vec<DesktopApplication>, MimeAppsError> {
-        validate_mime_type(mime_type)?;
+        self.snapshot(catalog)?.associations_for(mime_type)
+    }
+
+    /// Read the desktop-entry catalog and MIME association cascade once.
+    /// Selection-specific lookups on the returned immutable value perform no I/O.
+    pub fn snapshot(
+        &self,
+        catalog: &DesktopEntryCatalog,
+    ) -> Result<MimeAppsSnapshot, MimeAppsError> {
         let index = catalog.index()?;
-        let mut result = Vec::<DesktopApplication>::new();
-        let mut included = BTreeSet::<Box<str>>::new();
-        let mut blacklist = BTreeSet::<Box<str>>::new();
-
-        for location in self.locations() {
-            let document = MimeAppsDocument::read_optional(&location.path)?;
-            if !location.desktop_specific {
-                for id in document.values(ADDED_ASSOCIATIONS, mime_type) {
-                    if result.len() >= MAX_ASSOCIATIONS {
-                        return Err(MimeAppsError::AssociationLimitExceeded);
-                    }
-                    if blacklist.contains(id)
-                        || included.contains(id)
-                        || !association_applies(&location, id, &index)
-                    {
-                        continue;
-                    }
-                    if let Some(application) = usable_application(&index, id) {
-                        included.insert(id.clone());
-                        result.push(application);
-                    }
-                }
-                for id in document.values(REMOVED_ASSOCIATIONS, mime_type) {
-                    if association_applies(&location, id, &index) {
-                        blacklist.insert(id.clone());
-                    }
-                }
-            }
-
-            let Some(rank) = location.scan_application_rank else {
-                continue;
-            };
-            for id in index.ids_at_rank(rank) {
-                if !included.contains(id.as_ref())
-                    && !blacklist.contains(id.as_ref())
-                    && let Some(application) = usable_application(&index, id)
-                    && application.source_rank() == rank
-                    && application
-                        .mime_types()
-                        .iter()
-                        .any(|candidate| candidate.as_ref() == mime_type)
-                {
-                    included.insert(id.clone());
-                    result.push(application);
-                }
-                blacklist.insert(id.clone());
-            }
-        }
-        Ok(result)
+        let locations = self
+            .locations()
+            .into_iter()
+            .map(|location| {
+                let document = MimeAppsDocument::read_optional(&location.path)?;
+                Ok((location, document))
+            })
+            .collect::<Result<Vec<_>, MimeAppsError>>()?;
+        Ok(MimeAppsSnapshot { index, locations })
     }
 
     pub fn visible_applications_for(
@@ -92,11 +62,7 @@ impl MimeAppsResolver {
         mime_type: &str,
         catalog: &DesktopEntryCatalog,
     ) -> Result<Vec<DesktopApplication>, MimeAppsError> {
-        Ok(self
-            .associations_for(mime_type, catalog)?
-            .into_iter()
-            .filter(DesktopApplication::visible)
-            .collect())
+        self.snapshot(catalog)?.visible_applications_for(mime_type)
     }
 
     pub fn default_for(
@@ -104,25 +70,7 @@ impl MimeAppsResolver {
         mime_type: &str,
         catalog: &DesktopEntryCatalog,
     ) -> Result<Option<DesktopApplication>, MimeAppsError> {
-        validate_mime_type(mime_type)?;
-        let associations = self.associations_for(mime_type, catalog)?;
-        let associated = associations
-            .iter()
-            .map(|application| Box::<str>::from(application.desktop_id()))
-            .collect::<BTreeSet<_>>();
-        for location in self.locations() {
-            let document = MimeAppsDocument::read_optional(&location.path)?;
-            for id in document.values(DEFAULT_APPLICATIONS, mime_type) {
-                if associated.contains(id.as_ref())
-                    && let Some(application) = associations
-                        .iter()
-                        .find(|application| application.desktop_id() == id.as_ref())
-                {
-                    return Ok(Some(application.clone()));
-                }
-            }
-        }
-        Ok(associations.into_iter().next())
+        self.snapshot(catalog)?.default_for(mime_type)
     }
 
     /// Atomically record a user default and the association required by the spec.
@@ -182,6 +130,115 @@ impl MimeAppsResolver {
             );
         }
         locations
+    }
+}
+
+/// Immutable, internally consistent view of desktop entries and `mimeapps.list`.
+pub struct MimeAppsSnapshot {
+    index: DesktopEntryIndex,
+    locations: Vec<(MimeAppsLocation, MimeAppsDocument)>,
+}
+
+impl MimeAppsSnapshot {
+    pub fn applications(&self) -> Vec<DesktopApplication> {
+        self.index
+            .all()
+            .filter(|application| self.index.is_available(application))
+            .collect()
+    }
+
+    pub fn associations_for(
+        &self,
+        mime_type: &str,
+    ) -> Result<Vec<DesktopApplication>, MimeAppsError> {
+        validate_mime_type(mime_type)?;
+        let mut result = Vec::<DesktopApplication>::new();
+        let mut included = BTreeSet::<Box<str>>::new();
+        let mut blacklist = BTreeSet::<Box<str>>::new();
+
+        for (location, document) in &self.locations {
+            if !location.desktop_specific {
+                for id in document.values(ADDED_ASSOCIATIONS, mime_type) {
+                    if result.len() >= MAX_ASSOCIATIONS {
+                        return Err(MimeAppsError::AssociationLimitExceeded);
+                    }
+                    if blacklist.contains(id)
+                        || included.contains(id)
+                        || !association_applies(location, id, &self.index)
+                    {
+                        continue;
+                    }
+                    if let Some(application) = usable_application(&self.index, id) {
+                        included.insert(id.clone());
+                        result.push(application);
+                    }
+                }
+                for id in document.values(REMOVED_ASSOCIATIONS, mime_type) {
+                    if association_applies(location, id, &self.index) {
+                        blacklist.insert(id.clone());
+                    }
+                }
+            }
+
+            let Some(rank) = location.scan_application_rank else {
+                continue;
+            };
+            for id in self.index.ids_at_rank(rank) {
+                if !included.contains(id.as_ref())
+                    && !blacklist.contains(id.as_ref())
+                    && let Some(application) = usable_application(&self.index, id)
+                    && application.source_rank() == rank
+                    && application
+                        .mime_types()
+                        .iter()
+                        .any(|candidate| candidate.as_ref() == mime_type)
+                {
+                    included.insert(id.clone());
+                    result.push(application);
+                }
+                blacklist.insert(id.clone());
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn visible_applications_for(
+        &self,
+        mime_type: &str,
+    ) -> Result<Vec<DesktopApplication>, MimeAppsError> {
+        Ok(self
+            .associations_for(mime_type)?
+            .into_iter()
+            .filter(DesktopApplication::visible)
+            .collect())
+    }
+
+    pub fn default_for(
+        &self,
+        mime_type: &str,
+    ) -> Result<Option<DesktopApplication>, MimeAppsError> {
+        validate_mime_type(mime_type)?;
+        let associations = self.associations_for(mime_type)?;
+        let associated = associations
+            .iter()
+            .map(|application| Box::<str>::from(application.desktop_id()))
+            .collect::<BTreeSet<_>>();
+        for (_, document) in &self.locations {
+            for id in document.values(DEFAULT_APPLICATIONS, mime_type) {
+                if associated.contains(id.as_ref())
+                    && let Some(application) = associations
+                        .iter()
+                        .find(|application| application.desktop_id() == id.as_ref())
+                {
+                    return Ok(Some(application.clone()));
+                }
+            }
+        }
+        Ok(associations.into_iter().next())
+    }
+
+    pub fn application(&self, desktop_id: &str) -> Option<DesktopApplication> {
+        usable_application(&self.index, desktop_id)
     }
 }
 
@@ -411,6 +468,7 @@ struct TemporaryFile {
 }
 
 impl TemporaryFile {
+    #[cfg(test)]
     fn replace(mut self, target: &Path) -> io::Result<()> {
         fs::rename(&self.path, target)?;
         self.path.clear();
@@ -432,20 +490,105 @@ fn persist_default_locked(
     desktop_id: &str,
     post_write_check: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), MimeAppsError> {
-    let mut document = MimeAppsDocument::read_optional(target)?;
-    document.prepend(DEFAULT_APPLICATIONS, mime_type, desktop_id);
-    document.prepend(ADDED_ASSOCIATIONS, mime_type, desktop_id);
-    document.remove(REMOVED_ASSOCIATIONS, mime_type, desktop_id);
-    let bytes = document.render();
-    if bytes.len() > usize::try_from(MAX_MIMEAPPS_BYTES).expect("limit fits usize") {
-        return Err(MimeAppsError::FileTooLarge(target.to_path_buf()));
+    let mut post_write_check = Some(post_write_check);
+    let mut merge_base = read_optional_bytes(target)?;
+    let mut expected_target = merge_base.clone();
+    for _ in 0..8 {
+        let mut document = merge_base
+            .as_deref()
+            .map(|bytes| {
+                std::str::from_utf8(bytes)
+                    .map(MimeAppsDocument::parse)
+                    .map_err(|source| {
+                        MimeAppsError::io(
+                            target,
+                            io::Error::new(io::ErrorKind::InvalidData, source),
+                        )
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        document.prepend(DEFAULT_APPLICATIONS, mime_type, desktop_id);
+        document.prepend(ADDED_ASSOCIATIONS, mime_type, desktop_id);
+        document.remove(REMOVED_ASSOCIATIONS, mime_type, desktop_id);
+        let candidate = document.render().into_bytes();
+        if candidate.len() > usize::try_from(MAX_MIMEAPPS_BYTES).expect("limit fits usize") {
+            return Err(MimeAppsError::FileTooLarge(target.to_path_buf()));
+        }
+        let temporary = write_temporary(target, &candidate)?;
+        if let Some(check) = post_write_check.take() {
+            check(target).map_err(|source| MimeAppsError::io(target, source))?;
+        }
+
+        match publish_if_unchanged(temporary, target, expected_target.as_deref())? {
+            PublishOutcome::Published => return sync_parent(target),
+            PublishOutcome::Displaced(displaced) => {
+                merge_base = Some(displaced);
+                expected_target = Some(candidate);
+            }
+            PublishOutcome::RetryRead => {
+                merge_base = read_optional_bytes(target)?;
+                expected_target.clone_from(&merge_base);
+            }
+        }
     }
-    let temporary = write_temporary(target, bytes.as_bytes())?;
-    post_write_check(target).map_err(|source| MimeAppsError::io(target, source))?;
-    temporary
-        .replace(target)
-        .map_err(|source| MimeAppsError::io(target, source))?;
-    sync_parent(target)
+    Err(MimeAppsError::ConcurrentModification)
+}
+
+enum PublishOutcome {
+    Published,
+    Displaced(Vec<u8>),
+    RetryRead,
+}
+
+fn publish_if_unchanged(
+    temporary: TemporaryFile,
+    target: &Path,
+    baseline: Option<&[u8]>,
+) -> Result<PublishOutcome, MimeAppsError> {
+    publish_if_unchanged_with(temporary, target, baseline, |_| {})
+}
+
+fn publish_if_unchanged_with(
+    temporary: TemporaryFile,
+    target: &Path,
+    baseline: Option<&[u8]>,
+    after_exchange: impl FnOnce(&Path),
+) -> Result<PublishOutcome, MimeAppsError> {
+    if baseline.is_none() {
+        return match renameat_with(CWD, &temporary.path, CWD, target, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(PublishOutcome::Published),
+            Err(rustix::io::Errno::EXIST) => Ok(PublishOutcome::RetryRead),
+            Err(source) => Err(MimeAppsError::io(target, io::Error::from(source))),
+        };
+    }
+
+    match renameat_with(CWD, &temporary.path, CWD, target, RenameFlags::EXCHANGE) {
+        Ok(()) => {
+            after_exchange(target);
+            let displaced = read_optional_bytes(&temporary.path)?
+                .ok_or(MimeAppsError::TemporaryFileUnavailable)?;
+            if Some(displaced.as_slice()) == baseline {
+                Ok(PublishOutcome::Published)
+            } else {
+                Ok(PublishOutcome::Displaced(displaced))
+            }
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(PublishOutcome::RetryRead),
+        Err(source) => Err(MimeAppsError::io(target, io::Error::from(source))),
+    }
+}
+
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, MimeAppsError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(MimeAppsError::io(path, source)),
+    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MIMEAPPS_BYTES {
+        return Err(MimeAppsError::FileTooLarge(path.to_path_buf()));
+    }
+    Ok(Some(bytes))
 }
 
 fn write_temporary(target: &Path, bytes: &[u8]) -> Result<TemporaryFile, MimeAppsError> {
@@ -496,6 +639,7 @@ pub enum MimeAppsError {
     AssociationLimitExceeded,
     InvalidPersistencePath,
     TemporaryFileUnavailable,
+    ConcurrentModification,
 }
 
 impl MimeAppsError {
@@ -538,6 +682,9 @@ impl std::fmt::Display for MimeAppsError {
             Self::TemporaryFileUnavailable => {
                 formatter.write_str("cannot allocate mimeapps temporary file")
             }
+            Self::ConcurrentModification => {
+                formatter.write_str("mimeapps file kept changing during update")
+            }
         }
     }
 }
@@ -554,7 +701,10 @@ impl std::error::Error for MimeAppsError {
 
 #[cfg(test)]
 mod tests {
-    use super::{TemporaryFile, persist_default_locked};
+    use super::{
+        PublishOutcome, TemporaryFile, persist_default_locked, publish_if_unchanged_with,
+        write_temporary,
+    };
     use std::fs;
 
     #[test]
@@ -585,5 +735,52 @@ mod tests {
                 .contains("injected post-write stat failure")
         );
         assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn noncooperating_external_writer_is_merged_instead_of_silently_overwritten() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("mimeapps.list");
+        fs::write(
+            &target,
+            "[Default Applications]\nimage/png=image.desktop;\n",
+        )
+        .unwrap();
+
+        persist_default_locked(&target, "text/plain", "writer.desktop", |target| {
+            fs::write(
+                target,
+                "[Default Applications]\nimage/png=image.desktop;\napplication/pdf=external.desktop;\n",
+            )
+        })
+        .unwrap();
+
+        let saved = fs::read_to_string(&target).unwrap();
+        assert!(saved.contains("text/plain=writer.desktop;"));
+        assert!(saved.contains("image/png=image.desktop;"));
+        assert!(saved.contains("application/pdf=external.desktop;"));
+    }
+
+    #[test]
+    fn exchange_mismatch_never_rolls_back_over_a_later_external_writer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("mimeapps.list");
+        let expected = b"[Default Applications]\nimage/png=expected.desktop;\n";
+        let displaced = b"[Default Applications]\nimage/png=displaced.desktop;\n";
+        let external = b"[Default Applications]\nimage/png=external.desktop;\n";
+        fs::write(&target, displaced).unwrap();
+        let candidate = write_temporary(
+            &target,
+            b"[Default Applications]\ntext/plain=writer.desktop;\n",
+        )
+        .unwrap();
+
+        let outcome = publish_if_unchanged_with(candidate, &target, Some(expected), |target| {
+            fs::write(target, external).unwrap();
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, PublishOutcome::Displaced(bytes) if bytes == displaced));
+        assert_eq!(fs::read(&target).unwrap(), external);
     }
 }

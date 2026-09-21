@@ -143,34 +143,6 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub(crate) fn refresh_custom_actions(
-        &mut self,
-        registry: &CommandRegistry,
-        catalog: &Catalog,
-        availability: impl Fn(
-            &musheen_desktop::CustomAction,
-            &[CommandTargetRef],
-            &StorePath,
-        ) -> Result<(), &'static str>,
-    ) {
-        for entry in &mut self.entries {
-            let Some(data) = &entry.invocation else {
-                continue;
-            };
-            let Some(action) = &data.custom_action else {
-                continue;
-            };
-            let mut context = data.context.clone();
-            set_custom_action_availability(
-                &mut context,
-                catalog,
-                availability(action, &data.selection, &data.location),
-            );
-            if let Some(command) = registry.get(data.id.as_str()) {
-                entry.state = command.state(&context);
-            }
-        }
-    }
     #[must_use]
     pub fn entries(&self) -> &[MenuEntry] {
         &self.entries
@@ -729,6 +701,18 @@ fn add_open_with_submenu(
         .iter()
         .filter(|application| application.is_compatible())
         .collect::<Vec<_>>();
+    let mut status_entries = request
+        .open_with
+        .iter()
+        .filter(|application| !application.is_compatible())
+        .map(|application| {
+            let mut disabled_context = request.context().clone();
+            disabled_context.selection_count = 0;
+            let mut child = plain_command_entry(open_with, catalog, request, &disabled_context);
+            child.label = application.label().into();
+            child
+        })
+        .collect::<Vec<_>>();
     let mut app_entries = compatible
         .iter()
         .map(|application| {
@@ -739,7 +723,8 @@ fn add_open_with_submenu(
         })
         .collect::<Vec<_>>();
     let overflow = app_entries.split_off(app_entries.len().min(MAX_VARIABLE_CONTRIBUTIONS));
-    let mut entries = app_entries;
+    status_entries.extend(app_entries);
+    let mut entries = status_entries;
     append_overflow_submenu(
         &mut entries,
         overflow,

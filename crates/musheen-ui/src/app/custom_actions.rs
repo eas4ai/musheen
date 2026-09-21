@@ -49,31 +49,19 @@ impl ActionPreflight {
             && &self.location == location
             && &self.definitions == definitions
     }
-
-    fn availability(&self, action: &CustomAction) -> Result<(), &'static str> {
-        let index = self
-            .definitions
-            .actions()
-            .iter()
-            .position(|current| current == action)
-            .ok_or("custom-action-invalid")?;
-        self.results
-            .as_ref()
-            .and_then(|results| results.get(index))
-            .copied()
-            .unwrap_or(Err("custom-action-checking"))
-    }
 }
 
+#[derive(Clone)]
 pub(super) struct LiveActionPopup {
     pub popup: gpui_kit::WeakEntity<PopupMenu>,
     pub window: gpui_kit::AnyWindowHandle,
     pub menu: ContextMenu,
     pub path: String,
+    pub projection: Vec<usize>,
 }
 
 impl LiveActionPopup {
-    fn rebuild(&self, menu: ContextMenu, cx: &mut Context<MusheenApp>) {
+    pub(super) fn rebuild(&self, menu: ContextMenu, cx: &mut Context<MusheenApp>) {
         let Some(popup) = self.popup.upgrade() else {
             return;
         };
@@ -191,36 +179,6 @@ impl MusheenApp {
             .collect()
     }
 
-    pub(super) fn track_live_action_popup(
-        owner: gpui_kit::WeakEntity<Self>,
-        menu: &ContextMenu,
-        path: &str,
-        window: &Window,
-        cx: &mut Context<PopupMenu>,
-    ) {
-        if !menu.entries().iter().any(|entry| {
-            entry
-                .invocation
-                .as_ref()
-                .is_some_and(|data| data.custom_action.is_some())
-        }) {
-            return;
-        }
-        let popup = LiveActionPopup {
-            popup: cx.entity().downgrade(),
-            window: window.window_handle(),
-            menu: menu.clone(),
-            path: path.to_owned(),
-        };
-        cx.defer(move |cx| {
-            let _ = owner.update(cx, |this, _| {
-                this.live_action_popups
-                    .retain(|popup| popup.popup.upgrade().is_some());
-                this.live_action_popups.push(popup);
-            });
-        });
-    }
-
     pub(super) fn custom_action_review_label(&self, id: Option<&str>) -> Option<String> {
         let action = self.custom_actions.get(id?)?;
         let kind = if matches!(
@@ -238,26 +196,6 @@ impl MusheenApp {
         ))
     }
 
-    fn refresh_action_popups(&self, cx: &mut Context<Self>) {
-        for live in &self.live_action_popups {
-            let mut menu = live.menu.clone();
-            menu.refresh_custom_actions(
-                self.shell.commands(),
-                &self.catalog,
-                |action, selection, location| {
-                    let checked = self
-                        .custom_preflight
-                        .as_ref()
-                        .filter(|checked| {
-                            checked.matches(selection, location, &self.custom_actions)
-                        })
-                        .ok_or("custom-action-checking")?;
-                    checked.availability(action)
-                },
-            );
-            live.rebuild(menu, cx);
-        }
-    }
     pub(super) fn custom_action_contributions(
         &self,
         selection: &[CommandTargetRef],
@@ -336,7 +274,7 @@ impl MusheenApp {
             if let Some(this) = this.upgrade() {
                 this.update(cx, |this, cx| {
                     this.custom_preflight = Some(result);
-                    this.refresh_action_popups(cx);
+                    this.refresh_application_popups(cx);
                     cx.notify();
                 });
             }
