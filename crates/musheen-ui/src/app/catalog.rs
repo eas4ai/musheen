@@ -205,6 +205,31 @@ impl CatalogBinding {
         path: &StorePath,
         capabilities: &CapabilityMatrix,
     ) -> Result<BTreeSet<Box<str>>, Box<str>> {
+        self.tags_for_with_xattr_io(
+            item,
+            path,
+            capabilities,
+            |item, path| {
+                BackendTagService::new(XattrTagBackend::new(true, true))
+                    .tags(item, path)
+                    .map_err(|error| Box::<str>::from(error.to_string()))
+            },
+            |item, path, tags| {
+                XattrTagBackend::new(true, true)
+                    .write_tags(item, path, tags)
+                    .map_err(|error| Box::<str>::from(error.to_string()))
+            },
+        )
+    }
+
+    fn tags_for_with_xattr_io(
+        &self,
+        item: &ItemId,
+        path: &StorePath,
+        capabilities: &CapabilityMatrix,
+        reader: impl FnOnce(&ItemId, &StorePath) -> Result<BTreeSet<Box<str>>, Box<str>>,
+        mut writer: impl FnMut(&ItemId, &StorePath, &BTreeSet<Box<str>>) -> Result<(), Box<str>>,
+    ) -> Result<BTreeSet<Box<str>>, Box<str>> {
         let mut snapshot = self.snapshot();
         let storage = TagService::new(snapshot.tags_mut(), self.xattr_opt_in)
             .storage_for(path, capabilities)
@@ -214,45 +239,43 @@ impl CatalogBinding {
             return Ok(catalog_tags);
         }
         if snapshot.tags().is_xattr_pending(item) {
-            self.reconcile_pending_xattrs()?;
+            self.reconcile_pending_xattrs_with(writer)?;
             return Ok(self.snapshot().tags().tags_for(item));
         }
 
-        let xattr_tags = BackendTagService::new(XattrTagBackend::new(true, true))
-            .tags(item, path)
-            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        let xattr_tags = reader(item, path)?;
         let mut merged = catalog_tags.clone();
         merged.extend(xattr_tags.iter().cloned());
-        if merged != xattr_tags {
-            XattrTagBackend::new(true, true)
-                .write_tags(item, path, &merged)
-                .map_err(|error| Box::<str>::from(error.to_string()))?;
+        if merged == catalog_tags && merged == xattr_tags {
+            return Ok(merged);
         }
 
         let expected_path = snapshot.tags().path_hint(item).cloned();
-        let needs_rewrite = self.update_result(|document| {
+        let expected_orphaned = snapshot.tags().is_orphaned(item);
+        let staged = self.update_result(|document| {
             let current_path = document.tags().path_hint(item).cloned();
             let current_tags = document.tags().tags_for(item);
             let current_pending = document.tags().is_xattr_pending(item);
-            if current_path != expected_path || current_tags != catalog_tags || current_pending {
-                document.tags_mut().stage_xattr_tags(
-                    item,
-                    current_path.unwrap_or_else(|| path.clone()),
-                    current_tags,
-                );
-                return Ok(true);
+            let current_orphaned = document.tags().is_orphaned(item);
+            if current_path != expected_path
+                || current_tags != catalog_tags
+                || current_pending
+                || current_orphaned != expected_orphaned
+            {
+                return Ok(false);
             }
             document
                 .tags_mut()
-                .write_tags(item, path, &merged)
-                .expect("the app-owned tag catalog is infallible");
-            Ok(false)
+                .stage_xattr_tags(item, path.clone(), merged.clone());
+            Ok(true)
         })?;
-        if needs_rewrite {
-            self.reconcile_pending_xattrs()?;
-            return Ok(self.snapshot().tags().tags_for(item));
+        if !staged {
+            return Err(Box::<str>::from(
+                "catalog tags changed while importing extended attributes; retry the action",
+            ));
         }
-        Ok(merged)
+        self.reconcile_pending_xattrs_with(&mut writer)?;
+        Ok(self.snapshot().tags().tags_for(item))
     }
 
     pub(super) fn tag_states(&self, targets: &[TagTarget]) -> Result<TagStates, Box<str>> {
@@ -1628,6 +1651,171 @@ mod tests {
             [Box::<str>::from("new")].into_iter().collect()
         );
         assert!(!binding.snapshot().tags().is_xattr_pending(&target));
+    }
+
+    #[test]
+    fn stale_xattr_import_never_writes_after_a_concurrent_delete_wins_cas() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let target = item("local", b"stale-import");
+        let path = StorePath::from_unix_path(temporary.path().join("stale-import"));
+        filesystem::write(path.as_unix_path().unwrap(), b"fixture").unwrap();
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document
+            .tags_mut()
+            .assign(&target, path.clone(), "catalog-only")
+            .unwrap();
+        store.save(&document).unwrap();
+        let stale_binding =
+            CatalogBinding::persistent_with_xattr_opt_in(store.clone(), document.clone(), true);
+        let stale_observer = stale_binding.clone();
+        let delete_binding =
+            CatalogBinding::persistent_with_xattr_opt_in(store.clone(), document, true);
+        let stale_target = target.clone();
+        let stale_path = path.clone();
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stale_writes = std::sync::Arc::clone(&writes);
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stale = std::thread::spawn(move || {
+            stale_binding.tags_for_with_xattr_io(
+                &stale_target,
+                &stale_path,
+                &capabilities(true, true),
+                |_, _| {
+                    read_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok([Box::<str>::from("deleted")].into_iter().collect())
+                },
+                |_, _, tags| {
+                    stale_writes.lock().unwrap().push(tags.clone());
+                    Ok(())
+                },
+            )
+        });
+        read_rx.recv().unwrap();
+        delete_binding
+            .update(|document| {
+                document.tags_mut().remove(&target, "catalog-only");
+            })
+            .unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(stale.join().unwrap().is_err());
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(
+            stale_observer
+                .snapshot()
+                .tags()
+                .tags_for(&target)
+                .is_empty()
+        );
+        let durable = store.load().unwrap();
+        assert!(durable.tags().tags_for(&target).is_empty());
+        assert!(!durable.tags().is_xattr_pending(&target));
+    }
+
+    #[test]
+    fn interrupted_durable_delete_intent_replays_empty_xattrs_after_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let target = item("local", b"restart-delete");
+        let path = StorePath::from_unix_path(temporary.path().join("restart-delete"));
+        filesystem::write(path.as_unix_path().unwrap(), b"fixture").unwrap();
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document
+            .tags_mut()
+            .assign(&target, path.clone(), "deleted")
+            .unwrap();
+        store.save(&document).unwrap();
+        let binding = CatalogBinding::persistent_with_xattr_opt_in(store.clone(), document, true);
+
+        let error = binding
+            .apply_tag_delta_with_xattr_writer(
+                &[(target.clone(), path, capabilities(true, true))],
+                &BTreeSet::new(),
+                &[Box::<str>::from("deleted")].into_iter().collect(),
+                |_, _, _| {
+                    Err(Box::<str>::from(
+                        "simulated interruption before xattr write",
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.as_ref(), "simulated interruption before xattr write");
+        let pending = store.load().unwrap();
+        assert!(pending.tags().tags_for(&target).is_empty());
+        assert!(pending.tags().is_xattr_pending(&target));
+
+        let restarted = CatalogBinding::persistent_with_xattr_opt_in(store.clone(), pending, true);
+        let mut replayed = Vec::new();
+        restarted
+            .reconcile_pending_xattrs_with(|_, _, tags| {
+                replayed.push(tags.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(replayed, vec![BTreeSet::new()]);
+        let durable = store.load().unwrap();
+        assert!(durable.tags().tags_for(&target).is_empty());
+        assert!(!durable.tags().is_xattr_pending(&target));
+    }
+
+    #[test]
+    fn interrupted_xattr_import_persists_intent_before_write_and_replays_after_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store =
+            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
+        let target = item("local", b"restart-import");
+        let path = StorePath::from_unix_path(temporary.path().join("restart-import"));
+        filesystem::write(path.as_unix_path().unwrap(), b"fixture").unwrap();
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document
+            .tags_mut()
+            .assign(&target, path.clone(), "catalog-only")
+            .unwrap();
+        store.save(&document).unwrap();
+        let binding = CatalogBinding::persistent_with_xattr_opt_in(store.clone(), document, true);
+        let expected = ["catalog-only", "disk-only"]
+            .into_iter()
+            .map(Box::<str>::from)
+            .collect::<BTreeSet<_>>();
+        let inspection_store = store.clone();
+
+        let error = binding
+            .tags_for_with_xattr_io(
+                &target,
+                &path,
+                &capabilities(true, true),
+                |_, _| Ok([Box::<str>::from("disk-only")].into_iter().collect()),
+                |_, _, tags| {
+                    let durable = inspection_store.load().unwrap();
+                    assert!(durable.tags().is_xattr_pending(&target));
+                    assert_eq!(durable.tags().tags_for(&target), expected);
+                    assert_eq!(tags, &expected);
+                    Err(Box::<str>::from(
+                        "simulated interruption before xattr write",
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.as_ref(), "simulated interruption before xattr write");
+
+        let pending = store.load().unwrap();
+        let restarted = CatalogBinding::persistent_with_xattr_opt_in(store.clone(), pending, true);
+        let mut replayed = Vec::new();
+        restarted
+            .reconcile_pending_xattrs_with(|_, _, tags| {
+                replayed.push(tags.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(replayed, vec![expected.clone()]);
+        let durable = store.load().unwrap();
+        assert_eq!(durable.tags().tags_for(&target), expected);
+        assert!(!durable.tags().is_xattr_pending(&target));
     }
 
     #[test]
