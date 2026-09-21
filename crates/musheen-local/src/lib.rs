@@ -23,9 +23,9 @@ use std::path::PathBuf;
 pub use mutation::LocalTrashEntry;
 pub use probe::LocalFilesystemInfo;
 pub use queue::{
-    DropAction, DropError, FileDragPayload, LocalFailureDisposition, LocalOperationFailure,
-    LocalOperationOutcome, LocalOperationQueue, ProviderTransferExecution, ProviderTransferRoute,
-    ReadyLocalOperation, TransferOutcome,
+    ActiveOperationPaths, DropAction, DropError, FileDragPayload, LocalFailureDisposition,
+    LocalOperationFailure, LocalOperationOutcome, LocalOperationQueue, ProviderTransferExecution,
+    ProviderTransferRoute, ReadyLocalOperation, TransferOutcome,
 };
 pub use traverse::{LocalTraversal, TraversalOptions};
 

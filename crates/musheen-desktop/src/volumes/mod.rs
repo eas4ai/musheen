@@ -5,10 +5,12 @@
 
 mod model;
 mod mounts;
+mod runtime;
 mod udisks;
 
 pub use model::*;
 pub use mounts::*;
+pub use runtime::*;
 pub use udisks::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +20,7 @@ use std::sync::Arc;
 
 pub struct VolumeSubscription {
     receiver: async_channel::Receiver<VolumeTrigger>,
+    threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl fmt::Debug for VolumeSubscription {
@@ -35,25 +38,49 @@ impl VolumeSubscription {
         let (sender, receiver) = async_channel::bounded(32);
         // UDisks2 is the primary device-event source. The procfs listener
         // independently covers kernel mounts that UDisks2 does not own.
-        spawn_udisks_event_listener(sender.clone());
-        spawn_mount_table_listener(sender.clone());
+        let mut threads = spawn_udisks_event_listener(sender.clone());
+        if let Some(thread) = spawn_mount_table_listener(sender.clone()) {
+            threads.push(thread);
+        }
         let _ = sender.try_send(VolumeTrigger::MountTableChanged);
-        Self { receiver }
+        Self { receiver, threads }
     }
 
     pub async fn recv(&self) -> Result<VolumeTrigger, async_channel::RecvError> {
         self.receiver.recv().await
     }
+
+    pub(crate) fn recv_timeout(&self, timeout: std::time::Duration) -> Option<VolumeTrigger> {
+        futures_lite::future::block_on(futures_lite::future::race(
+            async { self.receiver.recv().await.ok() },
+            async {
+                futures_lite::future::yield_now().await;
+                std::thread::sleep(timeout);
+                None
+            },
+        ))
+    }
 }
 
-fn spawn_mount_table_listener(sender: async_channel::Sender<VolumeTrigger>) {
+impl Drop for VolumeSubscription {
+    fn drop(&mut self) {
+        self.receiver.close();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_mount_table_listener(
+    sender: async_channel::Sender<VolumeTrigger>,
+) -> Option<std::thread::JoinHandle<()>> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::fs::File;
     use std::io::{Read as _, Seek as _};
     use std::os::fd::AsFd as _;
     use std::thread;
 
-    let _ = thread::Builder::new()
+    thread::Builder::new()
         .name("musheen-mount-events".into())
         .spawn(move || {
             let Ok(mut mountinfo) = File::open("/proc/self/mountinfo") else {
@@ -91,7 +118,8 @@ fn spawn_mount_table_listener(sender: async_channel::Sender<VolumeTrigger>) {
                     return;
                 }
             }
-        });
+        })
+        .ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,10 +190,11 @@ impl OperationUsage for NoOperationUsage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UsageResolution {
     Refuse,
-    CancelThenProceed,
+    /// Cancel only the operations the user reviewed and approved.
+    CancelApproved(Vec<OperationUse>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,17 +415,25 @@ impl VolumeService {
                 }
             }
         }
+        let mut mount_only = BTreeMap::<PathBuf, Volume>::new();
         for (destination, record) in &mounts {
             if !consumed.contains(destination) {
                 let capacity = self.mounts.capacity(record.destination()).ok();
-                volumes.push(Volume::from_mount(record, capacity, service_state));
+                mount_only
+                    .entry(record.source().to_path_buf())
+                    .and_modify(|volume| volume.attach_mount(record, capacity))
+                    .or_insert_with(|| Volume::from_mount(record, capacity, service_state));
             }
         }
+        volumes.extend(mount_only.into_values());
         for volume in &mut volumes {
             volume.reconcile_mount_capabilities();
             volume.mark_service_state(service_state);
         }
-        let events = self.model.replace(owner, volumes);
+        let events = self
+            .model
+            .replace(owner, volumes)
+            .map_err(|error| VolumeError::Protocol(error.to_string().into()))?;
         Ok(RefreshReport {
             events,
             service_state,
@@ -422,18 +459,7 @@ impl VolumeService {
             .ok_or_else(|| VolumeError::Unsupported("UDisks2 does not expose this mount".into()))?;
         ensure_supported(&volume, action, unlock_secret)?;
 
-        if matches!(
-            action,
-            VolumeAction::Unmount | VolumeAction::Eject | VolumeAction::PowerOff
-        ) {
-            let operations = self.usage.operations_using(volume.mount_points());
-            if !operations.is_empty() {
-                match usage_resolution {
-                    UsageResolution::Refuse => return Err(VolumeError::InUse(operations)),
-                    UsageResolution::CancelThenProceed => self.usage.cancel(&operations)?,
-                }
-            }
-        }
+        self.resolve_usage(&volume, action, usage_resolution)?;
 
         if let Err(error) = self.backend.perform(&descriptor, action, unlock_secret) {
             if error == UDisksError::StaleObject {
@@ -449,6 +475,33 @@ impl VolumeService {
             volume_present: self.model.get(id).is_some(),
             refresh,
         })
+    }
+
+    fn resolve_usage(
+        &self,
+        volume: &Volume,
+        action: VolumeAction,
+        resolution: UsageResolution,
+    ) -> Result<(), VolumeError> {
+        if !matches!(
+            action,
+            VolumeAction::Unmount | VolumeAction::Eject | VolumeAction::PowerOff
+        ) {
+            return Ok(());
+        }
+        let operations = self.usage.operations_using(volume.mount_points());
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let UsageResolution::CancelApproved(approved) = resolution else {
+            return Err(VolumeError::InUse(operations));
+        };
+        let ids =
+            |uses: &[OperationUse]| uses.iter().map(OperationUse::id).collect::<BTreeSet<_>>();
+        if ids(&operations) != ids(&approved) {
+            return Err(VolumeError::InUse(operations));
+        }
+        self.usage.cancel(&approved)
     }
 }
 

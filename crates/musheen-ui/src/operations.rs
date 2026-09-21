@@ -172,6 +172,29 @@ impl OperationHub {
         self.status_revision.load(Ordering::Acquire)
     }
 
+    pub(crate) fn operations_using_mounts(
+        &self,
+        mounts: &[std::path::PathBuf],
+    ) -> Vec<(JobId, OperationKind)> {
+        self.queue.lock().map_or_else(
+            |_| Vec::new(),
+            |queue| {
+                queue
+                    .active_operation_paths()
+                    .into_iter()
+                    .filter(|operation| {
+                        operation.paths.iter().any(|path| {
+                            path.as_unix_path().is_some_and(|path| {
+                                mounts.iter().any(|mount| path.starts_with(mount))
+                            })
+                        })
+                    })
+                    .map(|operation| (operation.id, operation.kind))
+                    .collect()
+            },
+        )
+    }
+
     pub fn can_accept_drop(&self, payload: &FileDragPayload, target: &StorePath) -> bool {
         self.queue
             .lock()

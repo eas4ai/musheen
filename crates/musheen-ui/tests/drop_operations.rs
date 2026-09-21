@@ -84,6 +84,31 @@ fn sidebar_and_content_drops_use_one_copy_move_queue() {
 }
 
 #[test]
+fn active_operation_usage_includes_transfer_destination() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("outside.txt");
+    let destination = temporary.path().join("mounted-destination");
+    fs::write(&source, b"write").unwrap();
+    fs::create_dir(&destination).unwrap();
+    let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+    let payload = FileDragPayload::new(
+        vec![StorePath::from_unix_path(source.as_os_str())],
+        DropAction::Copy,
+    )
+    .unwrap();
+    queue
+        .submit_drop(payload, StorePath::from_unix_path(&destination))
+        .unwrap();
+
+    let paths = queue.active_operation_paths();
+    assert_eq!(paths.len(), 1);
+    assert!(paths[0].paths.iter().any(|path| {
+        path.as_unix_path()
+            .is_some_and(|path| path.starts_with(&destination))
+    }));
+}
+
+#[test]
 fn identity_bound_transfer_rejects_a_same_path_replacement_before_queueing() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("captured.txt");

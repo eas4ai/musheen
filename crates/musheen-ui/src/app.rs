@@ -73,7 +73,7 @@ use musheen_desktop::{
     ProcessRunner, SessionStore, SystemProcessRunner, TagMoveOutcome, TerminalCommand,
     ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest,
     ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError, VolumeId,
-    VolumeService, VolumeSubscription,
+    VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -1444,6 +1444,10 @@ pub fn run(initial_path: PathBuf) {
             )));
             let operation_hub =
                 OperationHub::for_current_user_with_provider_runtime(&limits, &providers);
+            let volume_runtime = VolumeRuntime::system_with_usage(Arc::new(HubVolumeUsage {
+                hub: operation_hub.clone(),
+            }))
+            .expect("the system volume runtime has no fallible construction");
             let catalog_store = CatalogStore::for_current_user();
             let catalog_document = catalog_store
                 .update(|catalog| {
@@ -1474,6 +1478,7 @@ pub fn run(initial_path: PathBuf) {
                             coordinator: Arc::clone(&coordinator),
                             window_id,
                             operation_hub: operation_hub.clone(),
+                            volume_runtime: Some(volume_runtime.clone()),
                             catalog: catalog_binding.clone(),
                             providers: providers.clone(),
                         },
@@ -1710,6 +1715,7 @@ struct SessionBinding {
     coordinator: Arc<Mutex<SessionCoordinator>>,
     window_id: u64,
     operation_hub: OperationHub,
+    volume_runtime: Option<VolumeRuntime>,
     catalog: CatalogBinding,
     providers: ProviderRuntime,
 }
@@ -1767,6 +1773,7 @@ impl SessionBinding {
             coordinator: Arc::clone(&self.coordinator),
             window_id,
             operation_hub: self.operation_hub.clone(),
+            volume_runtime: self.volume_runtime.clone(),
             catalog: self.catalog.clone(),
             providers: self.providers.clone(),
         })
@@ -1780,28 +1787,10 @@ struct HubVolumeUsage {
 
 impl OperationUsage for HubVolumeUsage {
     fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
-        let status_model = self.hub.status();
-        let Ok(status) = status_model.lock() else {
-            return Vec::new();
-        };
-        status
-            .visible_entries()
+        self.hub
+            .operations_using_mounts(mounts)
             .into_iter()
-            .filter(|entry| {
-                matches!(
-                    entry.status(),
-                    OperationStatus::Pending | OperationStatus::Running | OperationStatus::Paused
-                ) && entry
-                    .location()
-                    .as_unix_path()
-                    .is_some_and(|path| mounts.iter().any(|mount| path.starts_with(mount)))
-            })
-            .map(|entry| {
-                OperationUse::new(
-                    MountOperation::new(entry.id().get()),
-                    format!("{:?}", entry.kind()),
-                )
-            })
+            .map(|(id, kind)| OperationUse::new(MountOperation::new(id.get()), format!("{kind:?}")))
             .collect()
     }
 
@@ -1862,7 +1851,7 @@ struct MusheenApp {
     operation_hub: OperationHub,
     operation_status_revision: u64,
     operation_error: Option<Box<str>>,
-    volumes: Arc<Mutex<VolumeService>>,
+    volumes: VolumeRuntime,
     volume_revision: u64,
     volume_properties_windows: Vec<(VolumeId, gpui_kit::WeakEntity<VolumePropertiesWindow>)>,
     application_notice: Option<&'static str>,
@@ -1967,6 +1956,7 @@ impl MusheenApp {
                     coordinator,
                     window_id,
                     operation_hub: OperationHub::new_with_provider_runtime(&limits, &providers),
+                    volume_runtime: None,
                     catalog: CatalogBinding::in_memory(),
                     providers,
                 }),
@@ -2049,12 +2039,19 @@ impl MusheenApp {
             .unwrap_or_else(|| OperationHub::new_with_provider_runtime(&limits, &providers));
         let operation_error = operation_hub.persistence_error();
         let operation_status_revision = operation_hub.status_revision();
-        let volumes = Arc::new(Mutex::new(
-            VolumeService::system_with_usage(Arc::new(HubVolumeUsage {
-                hub: operation_hub.clone(),
-            }))
-            .expect("the system volume service has no fallible construction"),
-        ));
+        let volumes = session_binding
+            .as_ref()
+            .and_then(|binding| binding.volume_runtime.clone())
+            .unwrap_or_else(|| {
+                if watch_directories {
+                    VolumeRuntime::system_with_usage(Arc::new(HubVolumeUsage {
+                        hub: operation_hub.clone(),
+                    }))
+                    .expect("the system volume runtime has no fallible construction")
+                } else {
+                    VolumeRuntime::inert()
+                }
+            });
         let catalog_projection_revision = catalog_binding.revision();
         let mut this = Self {
             custom_actions: custom_actions::from_settings(settings.as_ref()),
@@ -2200,41 +2197,26 @@ impl MusheenApp {
     }
 
     fn start_volume_refresh(&mut self, cx: &mut Context<Self>) {
-        let volumes = Arc::clone(&self.volumes);
-        let subscription = VolumeSubscription::system();
+        let subscription = self.volumes.subscribe();
         cx.spawn(async move |this, cx| {
-            while let Ok(trigger) = subscription.recv().await {
-                let worker = Arc::clone(&volumes);
-                let work = cx.background_spawn(async move {
-                    let mut service = worker.lock().map_err(|_| {
-                        VolumeError::Protocol("the volume model lock is poisoned".into())
-                    })?;
-                    let report = service.handle(trigger)?;
-                    Ok::<_, VolumeError>((service.model().revision(), report.warning().cloned()))
-                });
-                let result = work.await;
+            while let Ok(update) = subscription.recv().await {
                 let Some(this) = this.upgrade() else {
                     return;
                 };
-                this.update(cx, |state, cx| match result {
-                    Ok((revision, warning)) => {
-                        if revision != state.volume_revision {
-                            state.volume_revision = revision;
-                            state.sync_volume_projection(cx);
-                            cx.notify();
-                        }
-                        if let Some(warning) = warning
-                            && !matches!(
-                                warning,
-                                VolumeError::ServiceUnavailable(_) | VolumeError::Disconnected(_)
-                            )
-                        {
-                            state.operation_error = Some(warning.to_string().into());
-                            cx.notify();
-                        }
+                this.update(cx, |state, cx| {
+                    if update.model().revision() != state.volume_revision {
+                        state.volume_revision = update.model().revision();
+                        state.sync_volume_projection_from(update.model(), cx);
+                        cx.notify();
                     }
-                    Err(error) => {
-                        state.operation_error = Some(error.to_string().into());
+                    if let Some(warning) = update.warning().cloned()
+                        && !matches!(
+                            warning,
+                            VolumeError::ServiceUnavailable(_) | VolumeError::Disconnected(_)
+                        )
+                    {
+                        state.operation_error =
+                            Some(localized_volume_error(&state.catalog, &warning));
                         cx.notify();
                     }
                 });
@@ -2244,12 +2226,17 @@ impl MusheenApp {
     }
 
     fn sync_volume_projection(&mut self, cx: &mut Context<Self>) {
-        let model = match self.volumes.lock() {
-            Ok(service) => service.model().clone(),
-            Err(_) => return,
-        };
+        let model = self.volumes.snapshot();
+        self.sync_volume_projection_from(&model, cx);
+    }
+
+    fn sync_volume_projection_from(
+        &mut self,
+        model: &musheen_desktop::VolumeModel,
+        cx: &mut Context<Self>,
+    ) {
         for sidebar in self.sidebars.values_mut() {
-            sidebar.sync_volumes(&model);
+            sidebar.sync_volumes(model);
         }
         self.volume_properties_windows.retain(|(id, weak)| {
             let Some(window) = weak.upgrade() else {
@@ -2257,6 +2244,8 @@ impl MusheenApp {
             };
             if let Some(volume) = model.get(id) {
                 window.update(cx, |window, cx| window.update_volume(volume, cx));
+            } else {
+                window.update(cx, |window, cx| window.mark_unavailable(cx));
             }
             true
         });
@@ -2854,20 +2843,25 @@ impl MusheenApp {
         let Some(id) = volume_id_from_target(target) else {
             return false;
         };
-        let volume = self
-            .volumes
-            .lock()
-            .ok()
-            .and_then(|service| service.model().get(&id).cloned());
+        let volume = self.volumes.snapshot().get(&id).cloned();
         let Some(volume) = volume else {
-            self.operation_error = Some("the selected volume is no longer available".into());
+            self.operation_error = Some(
+                self.catalog
+                    .message("volume-selected-unavailable")
+                    .expect("the volume disappearance message is localized")
+                    .into(),
+            );
             cx.notify();
             return true;
         };
         let title = properties_window_title(&self.catalog, volume.label(), 1);
         let options = properties_window_options(title, cx);
-        let view = cx.new(|_| {
-            VolumePropertiesWindow::new(VolumePropertiesModel::new(&volume), self.catalog.clone())
+        let view = cx.new(|cx| {
+            VolumePropertiesWindow::new(
+                VolumePropertiesModel::new(&volume),
+                self.catalog.clone(),
+                cx,
+            )
         });
         let weak = view.downgrade();
         cx.open_window(options, move |window, cx| {
@@ -3864,12 +3858,7 @@ impl MusheenApp {
         let selected_volume = selection
             .first()
             .and_then(volume_id_from_target)
-            .and_then(|id| {
-                self.volumes
-                    .lock()
-                    .ok()
-                    .and_then(|service| service.model().get(&id).cloned())
-            });
+            .and_then(|id| self.volumes.snapshot().get(&id).cloned());
         let item_target = if target == MenuTarget::Mount {
             CommandTarget::Mount
         } else if target == MenuTarget::SidebarLocation
@@ -3966,18 +3955,29 @@ impl MusheenApp {
                 ProviderActionMatrix::from_volume_states(
                     unsupported_provider_action.clone(),
                     volume_capability_state(
+                        &self.catalog,
                         capabilities.can_mount,
-                        "this volume cannot be mounted",
+                        "volume-capability-mount-refusal",
                     ),
                     volume_capability_state(
+                        &self.catalog,
                         capabilities.can_unmount,
-                        "this volume cannot be unmounted",
+                        "volume-capability-unmount-refusal",
                     ),
-                    volume_capability_state(capabilities.can_eject, "this drive cannot be ejected"),
-                    volume_capability_state(capabilities.can_unlock, "this volume is not locked"),
                     volume_capability_state(
+                        &self.catalog,
+                        capabilities.can_eject,
+                        "volume-capability-eject-refusal",
+                    ),
+                    volume_capability_state(
+                        &self.catalog,
+                        capabilities.can_unlock,
+                        "volume-capability-unlock-refusal",
+                    ),
+                    volume_capability_state(
+                        &self.catalog,
                         capabilities.can_power_off,
-                        "this drive cannot be powered off",
+                        "volume-capability-power-off-refusal",
                     ),
                 )
             },
@@ -4451,8 +4451,13 @@ impl MusheenApp {
                     .to_owned()
             })
             .collect();
-        let cancellation_warning = self.volume_cancellation_warning(pending.selection());
-        let cancel_volume_users = cancellation_warning.is_some();
+        let cancellation_review = self.volume_cancellation_warning(pending.selection());
+        let cancellation_warning = cancellation_review
+            .as_ref()
+            .map(|(warning, _)| warning.clone());
+        let approved_volume_users = cancellation_review
+            .map(|(_, operations)| operations)
+            .unwrap_or_default();
         let strings = ContextDialogStrings::from_catalog(&self.catalog);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(580.), px(360.)), cx)),
@@ -4484,7 +4489,7 @@ impl MusheenApp {
         let dialog = dialog.expect("the context review dialog constructs its view");
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
             ContextReviewEvent::Confirmed => {
-                this.confirm_context_review(invocation.clone(), cancel_volume_users, cx);
+                this.confirm_context_review(invocation.clone(), approved_volume_users.clone(), cx);
             }
             ContextReviewEvent::Cancelled => {
                 cx.notify();
@@ -4493,19 +4498,15 @@ impl MusheenApp {
         self.conflict_subscriptions.push(subscription);
     }
 
-    fn volume_cancellation_warning(&self, targets: &[CommandTargetRef]) -> Option<String> {
+    fn volume_cancellation_warning(
+        &self,
+        targets: &[CommandTargetRef],
+    ) -> Option<(String, Vec<OperationUse>)> {
         let id = targets
             .first()
             .filter(|_| targets.len() == 1)
             .and_then(volume_id_from_target)?;
-        let mounts = self
-            .volumes
-            .lock()
-            .ok()?
-            .model()
-            .get(&id)?
-            .mount_points()
-            .to_vec();
+        let mounts = self.volumes.snapshot().get(&id)?.mount_points().to_vec();
         let operations = HubVolumeUsage {
             hub: self.operation_hub.clone(),
         }
@@ -4513,7 +4514,7 @@ impl MusheenApp {
         if operations.is_empty() {
             return None;
         }
-        Some(format!(
+        let warning = format!(
             "{} {}",
             self.catalog
                 .message("volume-operation-cancel-warning")
@@ -4523,13 +4524,14 @@ impl MusheenApp {
                 .map(OperationUse::label)
                 .collect::<Vec<_>>()
                 .join(", ")
-        ))
+        );
+        Some((warning, operations))
     }
 
     fn confirm_context_review(
         &mut self,
         invocation: MenuInvocation,
-        cancel_volume_users: bool,
+        approved_volume_users: Vec<OperationUse>,
         cx: &mut Context<Self>,
     ) {
         let surface = self.shell.context_menus().clone();
@@ -4548,20 +4550,30 @@ impl MusheenApp {
         match surface.confirm(invocation, &mut dispatcher) {
             Ok(()) => {
                 if let Some((action, parameters)) = dispatcher.dispatched {
+                    if volume_action_for_command(action).is_some()
+                        && let CommandParameters::Targets(targets) = &parameters
+                    {
+                        self.dispatch_volume_action_with_usage(
+                            action,
+                            targets,
+                            if approved_volume_users.is_empty() {
+                                UsageResolution::Refuse
+                            } else {
+                                UsageResolution::CancelApproved(approved_volume_users)
+                            },
+                            cx,
+                        );
+                        return;
+                    }
                     // A normal destructive-action confirmation is not consent
                     // to cancel an operation that started after the dialog
                     // opened. Only a dialog that named active users grants it.
-                    let confirmed = if volume_action_for_command(action).is_some() {
-                        cancel_volume_users
-                    } else {
-                        true
-                    };
                     self.dispatch_typed_context_command(
                         action,
                         parameters,
                         origin_tab,
                         captured_targets.as_deref(),
-                        confirmed,
+                        true,
                         cx,
                     );
                 }
@@ -4850,7 +4862,17 @@ impl MusheenApp {
         &mut self,
         action: CommandAction,
         targets: &[CommandTargetRef],
-        confirmed: bool,
+        _confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch_volume_action_with_usage(action, targets, UsageResolution::Refuse, cx);
+    }
+
+    fn dispatch_volume_action_with_usage(
+        &mut self,
+        action: CommandAction,
+        targets: &[CommandTargetRef],
+        usage: UsageResolution,
         cx: &mut Context<Self>,
     ) {
         let Some(id) = targets
@@ -4858,7 +4880,12 @@ impl MusheenApp {
             .filter(|_| targets.len() == 1)
             .and_then(volume_id_from_target)
         else {
-            self.operation_error = Some("the selected volume changed".into());
+            self.operation_error = Some(
+                self.catalog
+                    .message("volume-selected-changed")
+                    .expect("the changed-volume message is localized")
+                    .into(),
+            );
             cx.notify();
             return;
         };
@@ -4869,23 +4896,22 @@ impl MusheenApp {
             self.open_volume_unlock(id, cx);
             return;
         }
-        let usage = if confirmed {
-            UsageResolution::CancelThenProceed
-        } else {
-            UsageResolution::Refuse
-        };
         self.perform_volume_action(id, volume_action, usage, None, cx);
     }
 
     fn open_volume_unlock(&mut self, id: VolumeId, cx: &mut Context<Self>) {
-        let label: Option<Box<str>> = self.volumes.lock().ok().and_then(|service| {
-            service
-                .model()
+        let label: Option<Box<str>> = Some(self.volumes.snapshot()).and_then(|model| {
+            model
                 .get(&id)
                 .map(|volume| Box::<str>::from(volume.label()))
         });
         let Some(label) = label else {
-            self.operation_error = Some("the selected volume is no longer available".into());
+            self.operation_error = Some(
+                self.catalog
+                    .message("volume-selected-unavailable")
+                    .expect("the volume disappearance message is localized")
+                    .into(),
+            );
             cx.notify();
             return;
         };
@@ -4935,13 +4961,9 @@ impl MusheenApp {
         secret: Option<Box<str>>,
         cx: &mut Context<Self>,
     ) {
-        let volumes = Arc::clone(&self.volumes);
-        let work = cx.background_spawn(async move {
-            volumes
-                .lock()
-                .map_err(|_| VolumeError::Protocol("the volume model lock is poisoned".into()))?
-                .perform(&id, volume_action, usage, secret.as_deref())
-        });
+        let volumes = self.volumes.clone();
+        let work =
+            cx.background_spawn(async move { volumes.perform(id, volume_action, usage, secret) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let Some(this) = this.upgrade() else {
@@ -4953,7 +4975,10 @@ impl MusheenApp {
                         state.sync_volume_projection(cx);
                         state.operation_error = None;
                     }
-                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                    Err(error) => {
+                        state.operation_error =
+                            Some(localized_volume_error(&state.catalog, &error));
+                    }
                 }
                 cx.notify();
             });
@@ -6114,6 +6139,7 @@ impl MusheenApp {
         self.navigation = retained;
         self.schedule_session_save(cx);
         self.load_focused_tab(cx);
+        let watch_directories = self.watch_directories;
         cx.spawn(async move |_, cx| {
             cx.open_window(detached_window_options(), move |window, cx| {
                 let view = cx.new(|cx| {
@@ -6122,7 +6148,7 @@ impl MusheenApp {
                         Some(binding),
                         None,
                         ResourceLimits::default(),
-                        true,
+                        watch_directories,
                         cx,
                     )
                 });
@@ -7834,7 +7860,7 @@ impl MusheenApp {
         let Some(invocation) = self.pending_empty_trash.take() else {
             return;
         };
-        self.confirm_context_review(invocation, false, cx);
+        self.confirm_context_review(invocation, Vec::new(), cx);
     }
 
     fn empty_trash(
@@ -9558,13 +9584,40 @@ const fn volume_action_for_command(action: CommandAction) -> Option<VolumeAction
     }
 }
 
-fn volume_capability_state(supported: bool, refusal: &'static str) -> CapabilityState {
+fn volume_capability_state(
+    catalog: &Catalog,
+    supported: bool,
+    key: &'static str,
+) -> CapabilityState {
     if supported {
         CapabilityState::Supported
     } else {
         CapabilityState::Unsupported(
-            CapabilityReason::new(refusal).expect("the volume refusal is nonempty"),
+            CapabilityReason::new(
+                catalog
+                    .message(key)
+                    .expect("the volume refusal is localized"),
+            )
+            .expect("the volume refusal is nonempty"),
         )
+    }
+}
+
+fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
+    match error {
+        VolumeError::Capacity { path, .. } => format!(
+            "{} {}",
+            catalog
+                .message("volume-capacity-error")
+                .expect("the volume capacity error is localized"),
+            path.display()
+        )
+        .into(),
+        VolumeError::Disappeared(_) => catalog
+            .message("volume-selected-unavailable")
+            .expect("the volume disappearance message is localized")
+            .into(),
+        _ => error.to_string().into(),
     }
 }
 
@@ -12233,6 +12286,7 @@ mod tests {
             coordinator,
             window_id: first_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
+            volume_runtime: None,
             catalog: CatalogBinding::in_memory(),
             providers: ProviderRuntime::for_current_user(),
         };
@@ -12270,10 +12324,14 @@ mod tests {
             .expect("coordinator lock is available")
             .entries()[0]
             .0;
+        let volume_runtime = VolumeRuntime::from_service(
+            musheen_desktop::VolumeService::system().expect("volume service constructs"),
+        );
         let binding = SessionBinding {
             coordinator,
             window_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
+            volume_runtime: Some(volume_runtime),
             catalog: CatalogBinding::in_memory(),
             providers: ProviderRuntime::for_current_user(),
         };
@@ -12286,6 +12344,13 @@ mod tests {
             &binding.operation_hub.status(),
             &detached.operation_hub.status()
         ));
+        assert!(
+            binding
+                .volume_runtime
+                .as_ref()
+                .unwrap()
+                .shares_worker_with(detached.volume_runtime.as_ref().unwrap())
+        );
     }
 
     #[test]
@@ -12304,6 +12369,7 @@ mod tests {
             coordinator,
             window_id,
             operation_hub: OperationHub::new(&ResourceLimits::default()),
+            volume_runtime: None,
             catalog: CatalogBinding::in_memory(),
             providers: ProviderRuntime::for_current_user(),
         };
@@ -14415,6 +14481,7 @@ mod tests {
             coordinator,
             window_id,
             operation_hub: OperationHub::new_with_provider_runtime(&limits, &providers),
+            volume_runtime: None,
             catalog: CatalogBinding::persistent_with_xattr_opt_in(
                 catalog_store.clone(),
                 document,
@@ -14781,6 +14848,7 @@ mod tests {
             coordinator: Arc::clone(&coordinator),
             window_id,
             operation_hub: operation_hub.clone(),
+            volume_runtime: None,
             catalog: catalog.clone(),
             providers: providers.clone(),
         };

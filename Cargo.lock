@@ -270,6 +270,7 @@ version = "0.13.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb8421aaa9644a5faf26735f258b669b15f063313ef8f8e2bdb28912a1a6f111"
 dependencies = [
+ "async-trait",
  "enumflags2",
  "futures-channel",
  "futures-util",
@@ -4401,6 +4402,7 @@ dependencies = [
 name = "musheen-desktop"
 version = "0.1.0"
 dependencies = [
+ "ashpd",
  "async-channel",
  "blake3",
  "fast_image_resize",
@@ -4411,6 +4413,7 @@ dependencies = [
  "musheen-core",
  "musheen-ops",
  "nix",
+ "notify-rust",
  "open",
  "png 0.18.1",
  "posix-acl",

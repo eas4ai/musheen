@@ -118,6 +118,24 @@ impl LocalOperation {
             Self::Metadata(plan) => plan.root(),
         }
     }
+
+    fn affected_paths(&self) -> Vec<StorePath> {
+        match self {
+            Self::Transfer {
+                source,
+                destination,
+                ..
+            } => vec![source.clone(), destination.clone()],
+            Self::Metadata(plan) => vec![plan.root().clone()],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveOperationPaths {
+    pub id: JobId,
+    pub kind: OperationKind,
+    pub paths: Vec<StorePath>,
 }
 
 #[derive(Debug)]
@@ -632,6 +650,29 @@ impl LocalOperationQueue {
                 )
             })
             .count()
+    }
+
+    #[must_use]
+    pub fn active_operation_paths(&self) -> Vec<ActiveOperationPaths> {
+        self.operations
+            .iter()
+            .filter(|(id, _)| {
+                matches!(
+                    self.scheduler.state(**id),
+                    Some(
+                        JobState::Queued
+                            | JobState::Running
+                            | JobState::Paused
+                            | JobState::Cancelling
+                    )
+                )
+            })
+            .map(|(id, operation)| ActiveOperationPaths {
+                id: *id,
+                kind: operation.kind(),
+                paths: operation.affected_paths(),
+            })
+            .collect()
     }
 
     #[must_use]

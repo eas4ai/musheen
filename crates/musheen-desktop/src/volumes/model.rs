@@ -23,9 +23,9 @@ impl VolumeId {
     pub(crate) fn from_mount(record: &MountRecord) -> Self {
         use std::os::unix::ffi::OsStrExt;
 
-        let mut bytes = record.source().as_os_str().as_bytes().to_vec();
-        bytes.push(0);
-        bytes.extend_from_slice(record.destination().as_os_str().as_bytes());
+        // The kernel source is stable when the same filesystem is remounted at
+        // another path. Mount destinations are intentionally excluded.
+        let bytes = record.source().as_os_str().as_bytes();
         let mut encoded = String::with_capacity(bytes.len() * 2 + 6);
         encoded.push_str("mount-");
         for byte in bytes {
@@ -442,11 +442,14 @@ impl VolumeModel {
         &mut self,
         owner: Option<Box<str>>,
         volumes: impl IntoIterator<Item = Volume>,
-    ) -> Vec<VolumeEvent> {
-        let replacement = volumes
-            .into_iter()
-            .map(|volume| (volume.id().clone(), volume))
-            .collect::<BTreeMap<_, _>>();
+    ) -> Result<Vec<VolumeEvent>, DuplicateVolumeId> {
+        let mut replacement = BTreeMap::new();
+        for volume in volumes {
+            let id = volume.id().clone();
+            if replacement.insert(id.clone(), volume).is_some() {
+                return Err(DuplicateVolumeId(id));
+            }
+        }
         let mut events = Vec::new();
         for id in self.volumes.keys() {
             if !replacement.contains_key(id) {
@@ -472,7 +475,7 @@ impl VolumeModel {
         }
         self.volumes = replacement;
         self.service_owner = owner;
-        events
+        Ok(events)
     }
 
     #[must_use]
@@ -493,5 +496,14 @@ impl VolumeModel {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DuplicateVolumeId(VolumeId);
+
+impl fmt::Display for DuplicateVolumeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "duplicate volume identity {}", self.0)
     }
 }

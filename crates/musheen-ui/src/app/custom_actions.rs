@@ -1024,7 +1024,7 @@ mod tests {
                     app.running_custom_actions, 0,
                     "typed dispatch cannot bypass confirmation"
                 );
-                app.confirm_context_review(invocation, false, cx);
+                app.confirm_context_review(invocation, Vec::new(), cx);
                 assert_eq!(app.running_custom_actions, 1);
             });
         })
@@ -1045,7 +1045,7 @@ mod tests {
         cx.update_window(handle.into(), |_, _, cx| {
             cx.set_global(crate::settings::RuntimeSettings(settings));
             app.update(cx, |app, cx| {
-                app.confirm_context_review(pending.unwrap(), false, cx)
+                app.confirm_context_review(pending.unwrap(), Vec::new(), cx)
             });
             assert_eq!(app.read(cx).running_custom_actions, 0);
             assert!(

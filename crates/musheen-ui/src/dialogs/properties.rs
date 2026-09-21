@@ -42,6 +42,7 @@ pub struct VolumePropertiesModel {
     capacity: Option<Capacity>,
     read_only: bool,
     capabilities: VolumeCapabilities,
+    available: bool,
 }
 
 impl VolumePropertiesModel {
@@ -56,6 +57,7 @@ impl VolumePropertiesModel {
             capacity: volume.capacity(),
             read_only: volume.is_read_only(),
             capabilities: volume.capabilities(),
+            available: true,
         }
     }
 
@@ -120,6 +122,20 @@ impl VolumePropertiesModel {
     pub const fn capabilities(&self) -> VolumeCapabilities {
         self.capabilities
     }
+
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        self.available
+    }
+
+    pub fn mark_unavailable(&mut self) -> bool {
+        if !self.available {
+            return false;
+        }
+        self.available = false;
+        self.capabilities = VolumeCapabilities::default();
+        true
+    }
 }
 
 /// A device Properties surface whose identity survives mount-table and
@@ -128,16 +144,40 @@ impl VolumePropertiesModel {
 pub(crate) struct VolumePropertiesWindow {
     model: VolumePropertiesModel,
     catalog: Catalog,
+    focus: FocusHandle,
+    pending_focus: bool,
+}
+
+struct VolumePropertyValues {
+    mounts: String,
+    capacity: String,
+    access: String,
+    filesystem: String,
 }
 
 impl VolumePropertiesWindow {
     #[must_use]
-    pub(crate) fn new(model: VolumePropertiesModel, catalog: Catalog) -> Self {
-        Self { model, catalog }
+    pub(crate) fn new(
+        model: VolumePropertiesModel,
+        catalog: Catalog,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            model,
+            catalog,
+            focus: cx.focus_handle(),
+            pending_focus: true,
+        }
     }
 
     pub(crate) fn update_volume(&mut self, volume: &Volume, cx: &mut Context<Self>) {
         self.update_model(VolumePropertiesModel::new(volume), cx);
+    }
+
+    pub(crate) fn mark_unavailable(&mut self, cx: &mut Context<Self>) {
+        if self.model.mark_unavailable() {
+            cx.notify();
+        }
     }
 
     fn update_model(&mut self, replacement: VolumePropertiesModel, cx: &mut Context<Self>) {
@@ -167,15 +207,16 @@ impl VolumePropertiesWindow {
             .child(value)
             .into_any_element()
     }
-}
 
-impl Render for VolumePropertiesWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let mounts = if self.model.mount_points().is_empty() {
+    fn values(&self) -> VolumePropertyValues {
+        let unavailable = || {
             self.catalog
                 .message("properties-unavailable")
                 .unwrap_or("Unavailable")
                 .to_owned()
+        };
+        let mounts = if self.model.mount_points().is_empty() {
+            unavailable()
         } else {
             self.model
                 .mount_points()
@@ -184,70 +225,102 @@ impl Render for VolumePropertiesWindow {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let capacity = self.model.capacity().map_or_else(
-            || {
-                self.catalog
-                    .message("properties-unavailable")
-                    .unwrap_or("Unavailable")
-                    .to_owned()
-            },
-            |capacity| {
-                format!(
-                    "{} / {}",
-                    format_size(capacity.available_bytes()),
-                    format_size(capacity.total_bytes())
-                )
-            },
-        );
-        let access = self
-            .catalog
-            .message(if self.model.is_read_only() {
-                "properties-read-only"
-            } else {
-                "properties-read-write"
-            })
-            .unwrap_or(if self.model.is_read_only() {
-                "Read only"
-            } else {
-                "Read and write"
-            })
-            .to_owned();
-        let filesystem = self
-            .model
-            .filesystem_type()
-            .unwrap_or_else(|| {
-                self.catalog
-                    .message("properties-unavailable")
-                    .unwrap_or("Unavailable")
-            })
-            .to_owned();
+        let capacity = self.model.capacity().map_or_else(unavailable, |capacity| {
+            format!(
+                "{} / {}",
+                format_size(capacity.available_bytes()),
+                format_size(capacity.total_bytes())
+            )
+        });
+        let access_key = if self.model.is_read_only() {
+            "properties-read-only"
+        } else {
+            "properties-read-write"
+        };
+        VolumePropertyValues {
+            mounts,
+            capacity,
+            access: self
+                .catalog
+                .message(access_key)
+                .unwrap_or(access_key)
+                .to_owned(),
+            filesystem: self
+                .model
+                .filesystem_type()
+                .map_or_else(unavailable, str::to_owned),
+        }
+    }
+}
+
+impl Render for VolumePropertiesWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.focus.focus(window, cx);
+            self.pending_focus = false;
+        }
+        let values = self.values();
 
         div()
             .id("volume-properties")
             .test_support()
             .key_context("PropertiesWindow")
+            .role(Role::Dialog)
+            .aria_label(
+                self.catalog
+                    .message("volume-properties-dialog")
+                    .expect("the volume Properties dialog is localized"),
+            )
+            .track_focus(&self.focus)
+            .tab_index(0)
+            .on_action(|_: &ConfirmProperties, window, _| window.remove_window())
+            .on_action(|_: &CancelProperties, window, _| window.remove_window())
+            .on_action(|_: &Escape, window, _| window.remove_window())
             .p_4()
             .flex()
             .flex_col()
             .gap_3()
             .child(div().text_xl().child(self.model.label().to_owned()))
+            .when(!self.model.is_available(), |dialog| {
+                let message = self
+                    .catalog
+                    .message("volume-properties-disappeared")
+                    .expect("the disappeared-volume message is localized")
+                    .to_owned();
+                dialog.child(
+                    div()
+                        .id("volume-properties-unavailable")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(message.clone())
+                        .child(message),
+                )
+            })
             .child(self.row(
                 "volume-properties-device",
                 "properties-mount-source",
                 self.model.device().display().to_string(),
             ))
-            .child(self.row("volume-properties-mounts", "properties-mount-point", mounts))
+            .child(self.row(
+                "volume-properties-mounts",
+                "properties-mount-point",
+                values.mounts,
+            ))
             .child(self.row(
                 "volume-properties-filesystem",
                 "properties-filesystem",
-                filesystem,
+                values.filesystem,
             ))
             .child(self.row(
                 "volume-properties-capacity",
                 "properties-available",
-                capacity,
+                values.capacity,
             ))
-            .child(self.row("volume-properties-access", "properties-mount-mode", access))
+            .child(self.row(
+                "volume-properties-access",
+                "properties-mount-mode",
+                values.access,
+            ))
     }
 }
 
@@ -3014,6 +3087,7 @@ mod tests {
             capacity: Some(Capacity::new(1_000, available_bytes)),
             read_only,
             capabilities: VolumeCapabilities::default(),
+            available: true,
         }
     }
 
@@ -3023,10 +3097,11 @@ mod tests {
         let slot = Rc::new(RefCell::new(None));
         let opened = Rc::clone(&slot);
         let handle = cx.open_window(size(px(760.), px(620.)), move |window, cx| {
-            let view = cx.new(|_| {
+            let view = cx.new(|cx| {
                 VolumePropertiesWindow::new(
                     volume_properties_fixture(400, false),
                     Catalog::system().unwrap(),
+                    cx,
                 )
             });
             opened.borrow_mut().replace(view.clone());
@@ -3065,6 +3140,40 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn open_volume_properties_window_reports_removal_and_closes_with_escape(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let slot = Rc::new(RefCell::new(None));
+        let opened = Rc::clone(&slot);
+        let handle = cx.open_window(size(px(760.), px(620.)), move |window, cx| {
+            let view = cx.new(|cx| {
+                VolumePropertiesWindow::new(
+                    volume_properties_fixture(400, false),
+                    Catalog::system().unwrap(),
+                    cx,
+                )
+            });
+            opened.borrow_mut().replace(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow().clone().expect("the volume view opened");
+        cx.update(|cx| view.update(cx, |window, cx| window.mark_unavailable(cx)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("volume-properties").role(), Some(Role::Dialog));
+            assert_eq!(
+                window.find("volume-properties-unavailable").role(),
+                Some(Role::Alert)
+            );
+            window.dispatch_action(Box::new(CancelProperties), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(cx.update_window(handle.into(), |_, _, _| ()).is_err());
     }
 
     #[gpui_kit::test]
