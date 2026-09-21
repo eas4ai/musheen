@@ -211,6 +211,7 @@ mod tests {
             "application-open-launch-failed",
             "application-open-dialog-unavailable",
             "application-open-loading",
+            "application-pending-canceled",
             "application-open-terminal-unavailable",
             "application-open-unrepresentable-target",
             "application-open-try-exec-unavailable",

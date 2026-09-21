@@ -549,6 +549,30 @@ struct PendingApplicationCommand {
     origin: Option<PendingApplicationOrigin>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PendingApplicationCancellation {
+    open: usize,
+    open_with: usize,
+    choose: usize,
+    set_default: usize,
+}
+
+impl PendingApplicationCancellation {
+    fn record(&mut self, action: CommandAction) {
+        match action {
+            CommandAction::Open => self.open += 1,
+            CommandAction::OpenWith => self.open_with += 1,
+            CommandAction::ChooseApplication => self.choose += 1,
+            CommandAction::SetDefaultApplication => self.set_default += 1,
+            _ => {}
+        }
+    }
+
+    const fn total(self) -> usize {
+        self.open + self.open_with + self.choose + self.set_default
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingApplicationOrigin {
     tab: TabId,
@@ -1644,6 +1668,7 @@ struct MusheenApp {
     operation_hub: OperationHub,
     operation_status_revision: u64,
     operation_error: Option<Box<str>>,
+    application_notice: Option<&'static str>,
     desktop_paths: Option<DesktopPaths>,
     desktop_applications: DesktopApplicationService,
     pending_application_commands: Vec<PendingApplicationCommand>,
@@ -1876,6 +1901,7 @@ impl MusheenApp {
             operation_hub,
             operation_status_revision,
             operation_error,
+            application_notice: None,
             desktop_paths: DesktopPaths::from_environment().ok(),
             desktop_applications: DesktopApplicationService::default(),
             pending_application_commands: Vec::new(),
@@ -3255,26 +3281,24 @@ impl MusheenApp {
 
     fn expire_application_service(&mut self) {
         if self.desktop_applications.expire_catalog() {
-            self.refuse_invalidated_pending_application_commands();
+            self.cancel_pending_application_commands();
         }
     }
 
-    fn invalidate_application_service(&mut self) {
+    fn invalidate_application_service(&mut self) -> PendingApplicationCancellation {
         self.desktop_applications.invalidate();
-        self.refuse_invalidated_pending_application_commands();
+        self.cancel_pending_application_commands()
     }
 
-    fn refuse_invalidated_pending_application_commands(&mut self) {
-        if self.pending_application_commands.is_empty() {
-            return;
+    fn cancel_pending_application_commands(&mut self) -> PendingApplicationCancellation {
+        let mut canceled = PendingApplicationCancellation::default();
+        for pending in self.pending_application_commands.drain(..) {
+            canceled.record(pending.action);
         }
-        self.pending_application_commands.clear();
-        self.operation_error = Some(
-            self.catalog
-                .message("context.target-changed")
-                .expect("stale application commands are localized")
-                .into(),
-        );
+        if canceled.total() > 0 {
+            self.application_notice = Some("application-pending-canceled");
+        }
+        canceled
     }
 
     fn drive_application_service(&mut self, cx: &mut Context<Self>) {
@@ -4329,6 +4353,15 @@ impl MusheenApp {
             cx.notify();
             return;
         }
+        if matches!(
+            action,
+            CommandAction::Open
+                | CommandAction::OpenWith
+                | CommandAction::SetDefaultApplication
+                | CommandAction::ChooseApplication
+        ) {
+            self.application_notice = None;
+        }
         self.expire_application_service();
 
         if matches!(
@@ -4571,6 +4604,23 @@ impl MusheenApp {
         self.execute_application(targets, None, CoreOpenWithIntent::OpenOnce, cx);
     }
 
+    fn complete_application_action(
+        &mut self,
+        application_name: &str,
+        item_count: usize,
+        result: Result<(), ApplicationActionError>,
+        set_default: bool,
+    ) -> PendingApplicationCancellation {
+        self.operation_error = result
+            .err()
+            .map(|error| self.application_action_error(application_name, item_count, &error));
+        if set_default {
+            self.invalidate_application_service()
+        } else {
+            PendingApplicationCancellation::default()
+        }
+    }
+
     fn execute_application(
         &mut self,
         targets: &[CommandTargetRef],
@@ -4657,12 +4707,7 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| {
-                state.operation_error = result
-                    .err()
-                    .map(|error| state.application_action_error(&app_name, item_count, &error));
-                if set_default {
-                    state.invalidate_application_service();
-                }
+                state.complete_application_action(&app_name, item_count, result, set_default);
                 cx.notify();
             });
         })
@@ -8672,6 +8717,32 @@ impl MusheenApp {
             .children(self.custom_action_status_rows(cx))
             .into_any_element()
     }
+
+    fn application_notice_row(
+        &self,
+        background: gpui_kit::Hsla,
+        boundary: gpui_kit::Hsla,
+    ) -> Option<AnyElement> {
+        let message = self
+            .application_notice
+            .and_then(|key| self.catalog.message(key).ok())?;
+        let message = SharedString::from(message);
+        Some(
+            div()
+                .id("application-notice")
+                .test_support()
+                .role(Role::Status)
+                .aria_label(message.clone())
+                .px_3()
+                .py_2()
+                .text_sm()
+                .bg(background)
+                .border_b_1()
+                .border_color(boundary)
+                .child(message)
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for MusheenApp {
@@ -8806,6 +8877,7 @@ impl Render for MusheenApp {
                         .child(message),
                 )
             })
+            .children(self.application_notice_row(colors.background, boundary))
             .child(
                 div()
                     .flex_grow(1.0)
@@ -9268,6 +9340,104 @@ mod tests {
         );
         assert!(!pseudo.contains("/private/untranslated/path"));
         assert!(!pseudo.contains("failed at"));
+    }
+
+    #[gpui_kit::test]
+    async fn failed_set_default_retains_its_actionable_error_when_invalidation_cancels_pending_commands(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("item.txt");
+        filesystem::write(&path, b"test").unwrap();
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(path.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+
+        app.update(cx, |state, _| {
+            let application = musheen_core::DesktopApplicationId::new("viewer.desktop").unwrap();
+            state.pending_application_commands = vec![
+                PendingApplicationCommand {
+                    action: CommandAction::Open,
+                    parameters: CommandParameters::targets(vec![target.clone()]),
+                    origin: None,
+                },
+                PendingApplicationCommand {
+                    action: CommandAction::OpenWith,
+                    parameters: CommandParameters::open_with(
+                        vec![target.clone()],
+                        application,
+                        CoreOpenWithIntent::OpenOnce,
+                    ),
+                    origin: None,
+                },
+                PendingApplicationCommand {
+                    action: CommandAction::ChooseApplication,
+                    parameters: CommandParameters::targets(vec![target]),
+                    origin: None,
+                },
+            ];
+            let expected = state.application_action_error(
+                "Image Viewer",
+                1,
+                &ApplicationActionError::Persistence(MimeAppsError::TemporaryFileUnavailable),
+            );
+
+            let canceled = state.complete_application_action(
+                "Image Viewer",
+                1,
+                Err(ApplicationActionError::Persistence(
+                    MimeAppsError::TemporaryFileUnavailable,
+                )),
+                true,
+            );
+
+            assert_eq!(state.operation_error.as_deref(), Some(expected.as_ref()));
+            assert!(state.pending_application_commands.is_empty());
+            assert_eq!(
+                canceled,
+                PendingApplicationCancellation {
+                    open: 1,
+                    open_with: 1,
+                    choose: 1,
+                    set_default: 0,
+                }
+            );
+            assert_eq!(
+                state.application_notice,
+                Some("application-pending-canceled")
+            );
+            assert_eq!(
+                state
+                    .catalog
+                    .message(state.application_notice.unwrap())
+                    .unwrap(),
+                "Pending application commands were canceled because application associations changed."
+            );
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let notice = window.find("application-notice");
+            assert!(notice.visible());
+            assert_eq!(
+                notice.label(),
+                Some(
+                    "Pending application commands were canceled because application associations changed."
+                )
+            );
+        })
+        .unwrap();
     }
 
     #[test]
@@ -9825,15 +9995,17 @@ mod tests {
                 state.pending_application_commands =
                     vec![queued; MAX_DESKTOP_APPLICATION_SNAPSHOTS];
                 state.desktop_applications.active_jobs = MAX_DESKTOP_APPLICATION_JOBS;
-                state.invalidate_application_service();
+                let canceled = state.invalidate_application_service();
                 assert!(state.pending_application_commands.is_empty());
                 assert_eq!(
                     state.desktop_applications.active_jobs,
                     MAX_DESKTOP_APPLICATION_JOBS
                 );
+                assert_eq!(canceled.open_with, MAX_DESKTOP_APPLICATION_SNAPSHOTS);
+                assert!(state.operation_error.is_none());
                 assert_eq!(
-                    state.operation_error.as_deref(),
-                    Some(state.catalog.message("context.target-changed").unwrap())
+                    state.application_notice,
+                    Some("application-pending-canceled")
                 );
 
                 state.focused_directory_mut().view_mut().clear_selection();
