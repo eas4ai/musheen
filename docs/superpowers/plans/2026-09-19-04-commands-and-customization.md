@@ -117,17 +117,17 @@ create `crates/musheen-desktop/src/custom_action.rs`; create
 **Files:** Create `crates/musheen-desktop/src/catalog/{mod,tags,pins,home,folder_prefs}.rs`;
 modify sidebar and views; create `crates/musheen-desktop/tests/catalog.rs`.
 
-- [ ] Test stable item identity, missing/moved targets, duplicate pins, tag
+- [x] Test stable item identity, missing/moved targets, duplicate pins, tag
   rename/delete, Home aggregation, per-folder view/sort inheritance, removable
   media, inaccessible paths, and catalog recovery after interrupted writes.
-- [ ] Run the catalog test; expect failure.
-- [ ] Implement a versioned XDG-data catalog keyed by provider/item identity
+- [x] Run the catalog test; expect failure.
+- [x] Implement a versioned XDG-data catalog keyed by provider/item identity
   with path hints for repair. Never write Musheen metadata into user folders
   unless that provider explicitly supports and the user enables it.
-- [ ] Integrate tags and pins into sidebar, search filters, Properties, and
+- [x] Integrate tags and pins into sidebar, search filters, Properties, and
   context menus through registry commands.
-- [ ] Run catalog, search, and navigation regression suites.
-- [ ] Commit with `feat(catalog): add tags pins and folder preferences`.
+- [x] Run catalog, search, and navigation regression suites.
+- [x] Commit with `feat(catalog): add tags pins and folder preferences`.
 
 ### Task 7: Close the phase
 
