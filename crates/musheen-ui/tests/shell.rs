@@ -74,6 +74,8 @@ fn toolbar_uses_stable_command_registry_ids() {
             "navigation.refresh",
             "navigation.location",
             "view.search",
+            "view.filter",
+            "view.command",
             "view.details",
             "view.list",
             "view.cards",

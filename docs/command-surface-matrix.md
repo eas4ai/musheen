@@ -12,8 +12,8 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `navigation.refresh` | `Always` | — | command-mode, customizable, navigation-toolbar, shortcut-default, static-shortcut |
 | `navigation.location` | `Always` | — | command-mode, custom-visible, customizable, navigation-toolbar, shortcut-default, static-shortcut |
 | `view.search` | `Always` | — | command-mode, customizable, navigation-toolbar, shortcut-default, static-shortcut |
-| `view.filter` | `Always` | — | command-mode, customizable, shortcut-default, static-shortcut |
-| `view.command` | `Always` | — | command-mode, customizable, shortcut-default, static-shortcut |
+| `view.filter` | `Always` | — | command-mode, customizable, navigation-toolbar, shortcut-default, static-shortcut |
+| `view.command` | `Always` | — | command-mode, customizable, navigation-toolbar, shortcut-default, static-shortcut |
 | `view.details` | `Always` | background | command-mode, compact-overflow, customizable, navigation-toolbar, shortcut-default, static-shortcut, wide-view-controls |
 | `view.list` | `Always` | background | command-mode, compact-overflow, customizable, navigation-toolbar, shortcut-default, static-shortcut, wide-view-controls |
 | `view.cards` | `Always` | background | command-mode, compact-overflow, customizable, navigation-toolbar, shortcut-default, static-shortcut, wide-view-controls |

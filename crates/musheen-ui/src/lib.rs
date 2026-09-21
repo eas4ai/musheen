@@ -20,7 +20,7 @@ pub mod theme;
 pub mod toolbar;
 pub mod views;
 
-pub use app::run;
+pub use app::{installed_static_command_actions, run};
 pub use dialogs::*;
 pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
@@ -32,6 +32,7 @@ pub use icons::{
 };
 pub use info_pane::*;
 pub use menus::*;
+pub use navigation::OmnibarMode;
 pub use operations::*;
 pub use shell::{FocusTarget, SemanticRegion, ShellModel};
 pub use status_center::{

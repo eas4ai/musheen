@@ -30,8 +30,9 @@ use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
 use crate::status_center::{OperationStatus, OperationStatusEntry, TrashItem, TrashSurfaceModel};
 use crate::toolbar::{
-    NAVIGATION_LEADING_IDS, NAVIGATION_TRAILING_IDS, SEARCH_COMMAND_ID, TAB_STRIP_COMMAND_IDS,
-    VIEW_COMMAND_IDS, project_custom_toolbar, resolve_command_mode, static_shortcut,
+    NAVIGATION_LEADING_IDS, NAVIGATION_TRAILING_IDS, OMNIBAR_COMMANDS, SEARCH_COMMAND_ID,
+    TAB_STRIP_COMMAND_IDS, VIEW_COMMAND_IDS, omnibar_command_for_action, project_custom_toolbar,
+    resolve_command_mode, static_shortcut,
 };
 use crate::views::{
     AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
@@ -164,38 +165,71 @@ gpui_kit::actions!(
     ]
 );
 
-fn install_navigation_key_bindings(cx: &mut App) {
-    macro_rules! command_key {
-        ($command:ident, $action:expr, $context:expr) => {
-            KeyBinding::new(static_chord(CommandAction::$command), $action, $context)
-        };
+macro_rules! static_command_actions {
+    ($consumer:ident $(, $argument:ident)*) => {
+        $consumer! {$($argument,)* [
+            NavigateBack => (GoBack, GoBack, None),
+            NavigateForward => (GoForward, GoForward, None),
+            NavigateParent => (GoParent, GoParent, None),
+            Refresh => (Reload, Reload, None),
+            FocusLocation => (EditLocation, EditLocation, None),
+            Search => (SearchLocation, SearchLocation, Some("!Input")),
+            Filter => (FilterLocation, FilterLocation, None),
+            FocusCommand => (OpenCommandMode, OpenCommandMode, None),
+            NewTab => (NewTabShortcut, NewTabShortcut, None),
+            CloseTab => (CloseTabShortcut, CloseTabShortcut, None),
+            ReopenClosedTab => (ReopenClosedTabShortcut, ReopenClosedTabShortcut, None),
+            SplitPane => (SplitPaneShortcut, SplitPaneShortcut, None),
+            FocusNextPane => (FocusNextPaneShortcut, FocusNextPaneShortcut, None),
+            SelectAll => (SelectAllShortcut, SelectAllShortcut, Some("!Input")),
+            ToggleHidden => (ToggleHiddenShortcut, ToggleHiddenShortcut, Some("!Input")),
+            ViewDetails => (ViewDetailsShortcut, ViewDetailsShortcut, None),
+            ViewList => (ViewListShortcut, ViewListShortcut, None),
+            ViewCards => (ViewCardsShortcut, ViewCardsShortcut, None),
+            ViewGrid => (ViewGridShortcut, ViewGridShortcut, None),
+            ViewColumns => (ViewColumnsShortcut, ViewColumnsShortcut, None),
+            ViewAdaptive => (ViewAdaptiveShortcut, ViewAdaptiveShortcut, None),
+            ToggleSidebar => (ToggleSidebarShortcut, ToggleSidebarShortcut, None),
+            OpenProperties => (OpenPropertiesShortcut, OpenPropertiesShortcut, None),
+        ]}
     }
+}
+
+macro_rules! define_static_command_actions {
+    ([$($command:ident => ($action_type:ident, $action:expr, $context:expr),)*]) => {
+        const INSTALLED_STATIC_COMMAND_ACTIONS: &[CommandAction] = &[
+            $(CommandAction::$command,)*
+        ];
+
+        fn install_static_command_key_bindings(cx: &mut App) {
+            cx.bind_keys([
+                $(KeyBinding::new(static_chord(CommandAction::$command), $action, $context),)*
+            ]);
+        }
+    };
+}
+
+static_command_actions!(define_static_command_actions);
+
+#[doc(hidden)]
+#[must_use]
+pub fn installed_static_command_actions() -> &'static [CommandAction] {
+    INSTALLED_STATIC_COMMAND_ACTIONS
+}
+
+macro_rules! attach_static_command_handlers {
+    ($shell:ident, $cx:ident, [$($command:ident => ($action_type:ident, $action:expr, $context:expr),)*]) => {
+        $shell$(.on_action($cx.listener(|this, _: &$action_type, _, cx| {
+            this.dispatch_command(static_command_id(CommandAction::$command), cx);
+        })))*
+    };
+}
+
+fn install_navigation_key_bindings(cx: &mut App) {
     install_properties_key_bindings(cx);
+    install_static_command_key_bindings(cx);
     cx.bind_keys([
-        command_key!(NavigateBack, GoBack, None),
-        command_key!(NavigateForward, GoForward, None),
-        command_key!(NavigateParent, GoParent, None),
-        command_key!(Refresh, Reload, None),
-        command_key!(FocusLocation, EditLocation, None),
-        command_key!(Search, SearchLocation, Some("!Input")),
-        command_key!(Filter, FilterLocation, None),
-        command_key!(FocusCommand, OpenCommandMode, None),
-        command_key!(NewTab, NewTabShortcut, None),
-        command_key!(CloseTab, CloseTabShortcut, None),
-        command_key!(ReopenClosedTab, ReopenClosedTabShortcut, None),
-        command_key!(SplitPane, SplitPaneShortcut, None),
-        command_key!(FocusNextPane, FocusNextPaneShortcut, None),
-        command_key!(SelectAll, SelectAllShortcut, Some("!Input")),
         KeyBinding::new("escape", Escape, None),
-        command_key!(ToggleHidden, ToggleHiddenShortcut, Some("!Input")),
-        command_key!(ViewDetails, ViewDetailsShortcut, None),
-        command_key!(ViewList, ViewListShortcut, None),
-        command_key!(ViewCards, ViewCardsShortcut, None),
-        command_key!(ViewGrid, ViewGridShortcut, None),
-        command_key!(ViewColumns, ViewColumnsShortcut, None),
-        command_key!(ViewAdaptive, ViewAdaptiveShortcut, None),
-        command_key!(ToggleSidebar, ToggleSidebarShortcut, None),
-        command_key!(OpenProperties, OpenPropertiesShortcut, None),
         KeyBinding::new("shift-f10", OpenContextMenuShortcut, None),
         KeyBinding::new("menu", OpenContextMenuShortcut, None),
         KeyBinding::new("down", FocusNextDirectoryItem, Some("DirectoryContent")),
@@ -2143,13 +2177,8 @@ impl MusheenApp {
     }
 
     fn dispatch_omnibar_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
-        self.requested_omnibar_mode = match action {
-            CommandAction::FocusLocation => Some(OmnibarMode::Path),
-            CommandAction::Search => Some(OmnibarMode::Search),
-            CommandAction::Filter => Some(OmnibarMode::Filter),
-            CommandAction::FocusCommand => Some(OmnibarMode::Command),
-            _ => None,
-        };
+        self.requested_omnibar_mode =
+            omnibar_command_for_action(self.shell.commands(), action).map(|binding| binding.mode());
         cx.notify();
     }
 
@@ -4726,21 +4755,19 @@ impl MusheenApp {
                     }))
             })
             .collect::<Vec<_>>();
-        let mode_button =
-            |id: &'static str, label: &'static str, target: OmnibarMode, cx: &mut Context<Self>| {
-                Button::new(id)
-                    .label(label)
-                    .accessibility_label(format!("{label} mode"))
-                    .tooltip(format!("Use {label} mode"))
-                    .ghost()
-                    .small()
-                    .compact()
-                    .selected(mode == target)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.requested_omnibar_mode = Some(target);
-                        cx.notify();
-                    }))
-            };
+        let mode_buttons = OMNIBAR_COMMANDS.map(|binding| {
+            Button::new(binding.button_id())
+                .label(binding.label())
+                .accessibility_label(format!("{} mode", binding.label()))
+                .tooltip(format!("Use {} mode", binding.label()))
+                .ghost()
+                .small()
+                .compact()
+                .selected(mode == binding.mode())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.dispatch_command(binding.command_id(), cx);
+                }))
+        });
 
         div()
             .id("omnibar")
@@ -4764,25 +4791,7 @@ impl MusheenApp {
                     .children(hidden_crumbs)
                     .children(visible_crumbs),
             )
-            .child(mode_button("omnibar-path", "Path", OmnibarMode::Path, cx))
-            .child(mode_button(
-                "omnibar-search",
-                "Search",
-                OmnibarMode::Search,
-                cx,
-            ))
-            .child(mode_button(
-                "omnibar-filter",
-                "Filter",
-                OmnibarMode::Filter,
-                cx,
-            ))
-            .child(mode_button(
-                "omnibar-command",
-                "Command",
-                OmnibarMode::Command,
-                cx,
-            ))
+            .children(mode_buttons)
             .child(
                 Input::new(input)
                     .id("omnibar-input")
@@ -7449,7 +7458,7 @@ impl Render for MusheenApp {
             .as_deref()
             .map(|error| self.catalog.localize_reason(error))
             .map(|error| SharedString::from(format!("File operation failed: {error}")));
-        div()
+        let shell = div()
             .id("musheen-shell")
             .test_support()
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
@@ -7483,76 +7492,8 @@ impl Render for MusheenApp {
             .bg(colors.background)
             .text_color(colors.foreground)
             .border_color(boundary)
-            .when(high_contrast, |shell| shell.border_2())
-            .on_action(cx.listener(|this, _: &GoBack, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::NavigateBack), cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoForward, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::NavigateForward), cx);
-            }))
-            .on_action(cx.listener(|this, _: &GoParent, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::NavigateParent), cx);
-            }))
-            .on_action(cx.listener(|this, _: &Reload, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::Refresh), cx);
-            }))
-            .on_action(cx.listener(|this, _: &EditLocation, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::FocusLocation), cx);
-            }))
-            .on_action(cx.listener(|this, _: &SearchLocation, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::Search), cx);
-            }))
-            .on_action(cx.listener(|this, _: &FilterLocation, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::Filter), cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenCommandMode, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::FocusCommand), cx);
-            }))
-            .on_action(cx.listener(|this, _: &NewTabShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::NewTab), cx);
-            }))
-            .on_action(cx.listener(|this, _: &CloseTabShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::CloseTab), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ReopenClosedTabShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ReopenClosedTab), cx);
-            }))
-            .on_action(cx.listener(|this, _: &SplitPaneShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::SplitPane), cx);
-            }))
-            .on_action(cx.listener(|this, _: &FocusNextPaneShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::FocusNextPane), cx);
-            }))
-            .on_action(cx.listener(|this, _: &SelectAllShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::SelectAll), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleHiddenShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ToggleHidden), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ViewDetailsShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ViewDetails), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ViewListShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ViewList), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ViewCardsShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ViewCards), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ViewGridShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ViewGrid), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ViewColumnsShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ViewColumns), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ViewAdaptiveShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ViewAdaptive), cx);
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSidebarShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::ToggleSidebar), cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenPropertiesShortcut, _, cx| {
-                this.dispatch_command(static_command_id(CommandAction::OpenProperties), cx);
-            }))
+            .when(high_contrast, |shell| shell.border_2());
+        static_command_actions!(attach_static_command_handlers, shell, cx)
             .on_action(
                 cx.listener(|this, _: &OpenContextMenuShortcut, window, cx| {
                     this.open_keyboard_context_menu(window, cx);

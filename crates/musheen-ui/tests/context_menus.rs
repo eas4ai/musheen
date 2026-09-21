@@ -5,14 +5,15 @@ use musheen_core::{
     ShortcutMap, StorePath, ToolbarLayout, canonical_chord,
 };
 use musheen_ui::toolbar::{
-    FixedCommandSurface, STATIC_SHORTCUTS, customizable_commands, fixed_surface_ids,
-    project_custom_toolbar, resolve_command_mode,
+    FixedCommandSurface, OMNIBAR_COMMANDS, STATIC_SHORTCUTS, customizable_commands,
+    fixed_surface_ids, project_custom_toolbar, resolve_command_mode,
 };
 use musheen_ui::{
     AppearanceMode, ContextMenu, ContextMenuDestinationResolver, ContextMenuRequest,
     ContextMenuSource, ContextMenuSurface, Locale, MenuContribution, MenuDirection, MenuEntryKind,
-    MenuFocus, MenuInvocation, MenuKeyRoute, MenuPresentation, MenuTarget, OpenWithApplication,
-    SendToDestination, ShellModel, ThemeProfile,
+    MenuFocus, MenuInvocation, MenuKeyRoute, MenuPresentation, MenuTarget, OmnibarMode,
+    OpenWithApplication, SendToDestination, ShellModel, ThemeProfile,
+    installed_static_command_actions,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -276,8 +277,131 @@ fn open_with_and_send_to_keep_one_time_association_and_copy_only_destinations_se
     );
 
     let send_to = menu.entry("clipboard.send_to").unwrap().submenu().unwrap();
-    assert!(send_to.destination("/archive").unwrap().copy_only());
-    assert!(!send_to.destination("/remote").unwrap().state().is_enabled());
+    let writable_send = send_to.destination("/archive").unwrap();
+    let read_only_send = send_to.destination("/remote").unwrap();
+    assert!(writable_send.copy_only());
+    assert!(!read_only_send.state().is_enabled());
+}
+
+#[test]
+fn send_to_rows_capture_exact_sources_destinations_and_policy() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let selected = target(b"send", "/work/send");
+    let menu = surface.compose(
+        request(
+            supported_context(CommandTarget::File, 1),
+            MenuTarget::Item,
+            vec![selected.clone()],
+        )
+        .with_send_to(&[
+            SendToDestination::pinned("Archive", path("/archive"), true),
+            SendToDestination::remote("Read only", path("/remote"), false),
+        ]),
+    );
+    let submenu = menu.entry("clipboard.send_to").unwrap().submenu().unwrap();
+    let writable_send = submenu.destination("/archive").unwrap();
+    let read_only_send = submenu.destination("/remote").unwrap();
+    let writable_parameters = CommandParameters::Destination {
+        targets: vec![selected.clone()],
+        destination: path("/archive"),
+    };
+    assert_eq!(
+        writable_send.generated_parameters().unwrap(),
+        writable_parameters
+    );
+    assert_eq!(
+        read_only_send.generated_parameters().unwrap(),
+        CommandParameters::Destination {
+            targets: vec![selected.clone()],
+            destination: path("/remote"),
+        }
+    );
+
+    let mut dispatcher = RecordingDispatcher::default();
+    assert!(
+        surface
+            .invoke(writable_send, &mut dispatcher)
+            .is_dispatched()
+    );
+    assert_eq!(
+        dispatcher.calls,
+        vec![(CommandAction::SendTo, writable_parameters,)]
+    );
+    assert!(
+        surface
+            .invoke(read_only_send, &mut dispatcher)
+            .is_rejected()
+    );
+    assert_eq!(dispatcher.calls.len(), 1);
+}
+
+#[test]
+fn open_with_rows_capture_exact_sources_and_association_intents() {
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    let selected = target(b"open-with", "/work/open-with");
+    let menu = surface.compose(
+        request(
+            supported_context(CommandTarget::File, 1),
+            MenuTarget::Item,
+            vec![selected.clone()],
+        )
+        .with_open_with(&[OpenWithApplication::compatible(
+            "Text Editor",
+            "org.example.Text",
+        )]),
+    );
+    let open_with = menu.entry("file.open_with").unwrap();
+    let mut dispatcher = RecordingDispatcher::default();
+    let open_once = open_with
+        .submenu()
+        .unwrap()
+        .application("org.example.Text")
+        .expect("compatible application row");
+    assert_eq!(
+        open_once.generated_parameters().unwrap(),
+        CommandParameters::OpenWith {
+            targets: vec![selected.clone()],
+            application: musheen_core::DesktopApplicationId::new("org.example.Text").unwrap(),
+            intent: OpenWithIntent::OpenOnce,
+        }
+    );
+    assert!(surface.invoke(open_once, &mut dispatcher).is_dispatched());
+    assert_eq!(
+        dispatcher.calls[0].1,
+        CommandParameters::OpenWith {
+            targets: vec![selected.clone()],
+            application: musheen_core::DesktopApplicationId::new("org.example.Text").unwrap(),
+            intent: OpenWithIntent::OpenOnce,
+        }
+    );
+    let set_default = open_with
+        .submenu()
+        .unwrap()
+        .entry("file.set_default_application")
+        .unwrap()
+        .submenu()
+        .unwrap()
+        .application("org.example.Text")
+        .expect("set-default application row");
+    assert_eq!(
+        set_default.generated_parameters().unwrap(),
+        CommandParameters::OpenWith {
+            targets: vec![selected.clone()],
+            application: musheen_core::DesktopApplicationId::new("org.example.Text").unwrap(),
+            intent: OpenWithIntent::SetAsDefault,
+        }
+    );
+    let confirmation = surface.invoke(set_default, &mut dispatcher);
+    assert!(confirmation.needs_confirmation());
+    surface.confirm(confirmation, &mut dispatcher).unwrap();
+    assert_eq!(
+        dispatcher.calls[1].1,
+        CommandParameters::OpenWith {
+            targets: vec![selected],
+            application: musheen_core::DesktopApplicationId::new("org.example.Text").unwrap(),
+            intent: OpenWithIntent::SetAsDefault,
+        }
+    );
 }
 
 #[test]
@@ -950,6 +1074,213 @@ fn audit_matrix_menu(
     }
 }
 
+fn recursive_command_ids(menu: &ContextMenu) -> BTreeSet<&str> {
+    let mut ids = BTreeSet::new();
+    for entry in menu.entries() {
+        if let Some(id) = entry.command_id() {
+            ids.insert(id);
+        }
+        if let Some(submenu) = entry.submenu() {
+            ids.extend(recursive_command_ids(submenu));
+        }
+    }
+    ids
+}
+
+#[test]
+fn independent_target_applicability_matches_recursive_menu_composition() {
+    const BACKGROUND: &[&str] = &[
+        "clipboard.paste_into",
+        "selection.select_all",
+        "create.directory",
+        "create.empty_file",
+        "create.from_template",
+        "directory.open_terminal",
+        "view.hidden",
+        "view.details",
+        "view.list",
+        "view.cards",
+        "view.grid",
+        "view.columns",
+        "view.adaptive",
+        "view.sort",
+        "view.group",
+        "view.directories_first",
+        "directory.properties",
+    ];
+    const FILE: &[&str] = &[
+        "file.open",
+        "file.open_with",
+        "file.choose_application",
+        "file.set_default_application",
+        "clipboard.send_to",
+        "clipboard.cut",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.move_to",
+        "file.preview",
+        "file.compress",
+        "file.rename",
+        "file.duplicate",
+        "file.create_symbolic_link",
+        "file.create_hard_link",
+        "file.hide",
+        "item.tags",
+        "actions.custom",
+        "file.move_to_trash",
+        "file.delete_permanently",
+        "item.properties",
+        "item.permissions",
+        "item.copy_location",
+    ];
+    const DIRECTORY: &[&str] = &[
+        "file.open",
+        "file.open_with",
+        "file.choose_application",
+        "file.set_default_application",
+        "directory.open_as_administrator",
+        "directory.open_new_tab",
+        "directory.open_new_window",
+        "directory.open_other_pane",
+        "clipboard.cut",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.move_to",
+        "clipboard.paste_into",
+        "clipboard.send_to",
+        "file.compress",
+        "file.rename",
+        "file.duplicate",
+        "file.create_symbolic_link",
+        "file.hide",
+        "directory.pin",
+        "item.tags",
+        "actions.custom",
+        "directory.share",
+        "file.move_to_trash",
+        "file.delete_permanently",
+        "item.properties",
+        "item.permissions",
+        "item.copy_location",
+        "directory.open_terminal",
+        "directory.properties",
+    ];
+    const ARCHIVE: &[&str] = &[
+        "file.open",
+        "file.open_with",
+        "file.choose_application",
+        "file.set_default_application",
+        "clipboard.send_to",
+        "clipboard.cut",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.move_to",
+        "file.preview",
+        "archive.browse",
+        "archive.extract",
+        "archive.extract_here",
+        "file.rename",
+        "file.duplicate",
+        "file.create_symbolic_link",
+        "file.create_hard_link",
+        "file.hide",
+        "item.tags",
+        "actions.custom",
+        "file.move_to_trash",
+        "file.delete_permanently",
+        "item.properties",
+        "item.permissions",
+        "item.copy_location",
+    ];
+    const UNSUPPORTED_FILE: &[&str] = &[
+        "file.open",
+        "file.open_with",
+        "file.choose_application",
+        "file.set_default_application",
+        "clipboard.send_to",
+        "clipboard.cut",
+        "clipboard.copy",
+        "clipboard.copy_to",
+        "clipboard.move_to",
+        "file.preview",
+        "file.rename",
+        "file.duplicate",
+        "file.create_symbolic_link",
+        "file.create_hard_link",
+        "file.hide",
+        "item.tags",
+        "actions.custom",
+        "file.move_to_trash",
+        "file.delete_permanently",
+        "item.properties",
+        "item.permissions",
+        "item.copy_location",
+    ];
+
+    let refusal = CapabilityReason::new("unsupported by provider").unwrap();
+    let cases = [
+        (
+            "background",
+            request(
+                supported_context(CommandTarget::Background, 0),
+                MenuTarget::Background,
+                vec![],
+            ),
+            BACKGROUND,
+        ),
+        (
+            "file",
+            request(
+                supported_context(CommandTarget::File, 1),
+                MenuTarget::Item,
+                vec![target(b"expected-file", "/work/file")],
+            ),
+            FILE,
+        ),
+        (
+            "directory",
+            request(
+                supported_context(CommandTarget::Directory, 1),
+                MenuTarget::Item,
+                vec![target(b"expected-directory", "/work/directory")],
+            ),
+            DIRECTORY,
+        ),
+        (
+            "archive",
+            request(
+                supported_context(CommandTarget::Archive, 1),
+                MenuTarget::Item,
+                vec![target(b"expected-archive", "/work/archive.tar")],
+            ),
+            ARCHIVE,
+        ),
+        (
+            "unsupported-file",
+            request(
+                CommandContext {
+                    mutation_is_supported: false,
+                    capabilities: CapabilityMatrix::new(|_| {
+                        CapabilityState::Unsupported(refusal.clone())
+                    }),
+                    ..supported_context(CommandTarget::File, 1)
+                },
+                MenuTarget::Item,
+                vec![target(b"unsupported-file", "/remote/file")],
+            ),
+            UNSUPPORTED_FILE,
+        ),
+    ];
+    let surface = ContextMenuSurface::new(CommandRegistry::built_in());
+    for (name, request, expected) in cases {
+        assert_eq!(
+            recursive_command_ids(&surface.compose(request)),
+            expected.iter().copied().collect(),
+            "{name} applicability drifted"
+        );
+    }
+}
+
 fn add_surface_ids(
     surfaces: &mut BTreeMap<String, BTreeSet<&'static str>>,
     surface: &'static str,
@@ -1098,6 +1429,37 @@ fn every_command_surface_uses_one_registry_definition_and_policy() {
             panic!("the checked-in command-surface matrix exists: {error}\n\n{expected}")
         });
     assert_eq!(actual, expected, "regenerate the command-surface matrix");
+}
+
+#[test]
+fn omnibar_modes_and_static_handlers_are_complete_live_surface_inventories() {
+    assert_eq!(
+        OMNIBAR_COMMANDS
+            .iter()
+            .map(|command| (command.command_id(), command.mode()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("navigation.location", OmnibarMode::Path),
+            ("view.search", OmnibarMode::Search),
+            ("view.filter", OmnibarMode::Filter),
+            ("view.command", OmnibarMode::Command),
+        ]
+    );
+    let navigation = fixed_surface_ids(FixedCommandSurface::NavigationToolbar);
+    for command in OMNIBAR_COMMANDS {
+        assert!(navigation.contains(&command.command_id()));
+    }
+
+    let declared = STATIC_SHORTCUTS
+        .iter()
+        .map(|shortcut| shortcut.action())
+        .collect::<Vec<_>>();
+    let installed = installed_static_command_actions().to_vec();
+    assert_eq!(
+        installed, declared,
+        "every static shortcut is installed and handled"
+    );
+    assert_eq!(installed.len(), STATIC_SHORTCUTS.len());
 }
 
 #[test]

@@ -1,4 +1,7 @@
-use crate::{ContextMenuSurface, toolbar::COMMAND_IDS};
+use crate::{
+    ContextMenuSurface,
+    toolbar::{FixedCommandSurface, fixed_surface_ids},
+};
 use musheen_core::CommandRegistry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,8 +119,8 @@ impl ShellModel {
     }
 
     #[must_use]
-    pub fn toolbar_command_ids(&self) -> &'static [&'static str] {
-        &COMMAND_IDS
+    pub fn toolbar_command_ids(&self) -> Vec<&'static str> {
+        fixed_surface_ids(FixedCommandSurface::NavigationToolbar)
     }
 
     #[must_use]

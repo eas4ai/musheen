@@ -1,9 +1,10 @@
 use super::context::ContextMenuRequest;
-use super::{MenuTarget, OpenWithApplication, SendToDestination};
+use super::{MenuInvocationError, MenuTarget, OpenWithApplication, SendToDestination};
 use crate::{Catalog, Locale};
 use musheen_core::{
-    CommandAction, CommandContext, CommandDefinition, CommandGroup, CommandId, CommandPredicate,
-    CommandRegistry, CommandState, CommandTarget, CommandTargetRef, DangerLevel, StorePath,
+    CommandAction, CommandContext, CommandDefinition, CommandGroup, CommandId, CommandParameters,
+    CommandPredicate, CommandRegistry, CommandState, CommandTarget, CommandTargetRef, DangerLevel,
+    StorePath,
 };
 use std::fmt;
 
@@ -421,6 +422,18 @@ impl MenuEntry {
                 .state(&invocation.context)
                 .map_disabled_reason(|reason| catalog.localize_reason(reason)),
         )
+    }
+
+    /// Generates the exact typed payload this nested row will dispatch without
+    /// bypassing enablement or confirmation policy. Audits can therefore prove
+    /// that variable submenu labels retain their captured targets, destination,
+    /// application, and association intent.
+    pub fn generated_parameters(&self) -> Result<CommandParameters, MenuInvocationError> {
+        let invocation = self
+            .invocation
+            .clone()
+            .ok_or(MenuInvocationError::NotInvokable)?;
+        Ok(super::pending_with_parameters(invocation, self.application())?.parameters)
     }
 }
 

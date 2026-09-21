@@ -3,31 +3,8 @@
 //! Renderers and input handlers use this inventory directly. It is therefore
 //! independent evidence of which registry commands each surface projects.
 
+use crate::navigation::OmnibarMode;
 use musheen_core::{CommandAction, CommandDefinition, CommandId, CommandRegistry, ToolbarLayout};
-
-pub const COMMAND_IDS: [&str; 21] = [
-    "navigation.back",
-    "navigation.forward",
-    "navigation.parent",
-    "navigation.refresh",
-    "navigation.location",
-    "view.search",
-    "view.details",
-    "view.list",
-    "view.cards",
-    "view.grid",
-    "view.columns",
-    "view.adaptive",
-    "view.sort",
-    "view.group",
-    "view.directories_first",
-    "view.hidden",
-    "view.sidebar",
-    "view.info",
-    "pane.split",
-    "pane.focus_next",
-    "app.settings",
-];
 
 pub const NAVIGATION_LEADING_IDS: [&str; 4] = [
     "navigation.back",
@@ -35,7 +12,6 @@ pub const NAVIGATION_LEADING_IDS: [&str; 4] = [
     "navigation.parent",
     "navigation.refresh",
 ];
-pub const OMNIBAR_COMMAND_ID: &str = "navigation.location";
 pub const SEARCH_COMMAND_ID: &str = "view.search";
 pub const VIEW_COMMAND_IDS: [&str; 10] = [
     "view.details",
@@ -58,6 +34,77 @@ pub const NAVIGATION_TRAILING_IDS: [&str; 5] = [
 ];
 pub const TAB_STRIP_COMMAND_IDS: [&str; 1] = ["tab.new"];
 pub const CUSTOM_TOOLBAR_VISIBLE_LIMIT: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OmnibarCommand {
+    command_id: &'static str,
+    mode: OmnibarMode,
+    button_id: &'static str,
+    label: &'static str,
+}
+
+impl OmnibarCommand {
+    const fn new(
+        command_id: &'static str,
+        mode: OmnibarMode,
+        button_id: &'static str,
+        label: &'static str,
+    ) -> Self {
+        Self {
+            command_id,
+            mode,
+            button_id,
+            label,
+        }
+    }
+
+    #[must_use]
+    pub const fn command_id(self) -> &'static str {
+        self.command_id
+    }
+
+    #[must_use]
+    pub const fn mode(self) -> OmnibarMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn button_id(self) -> &'static str {
+        self.button_id
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        self.label
+    }
+}
+
+pub const OMNIBAR_COMMANDS: [OmnibarCommand; 4] = [
+    OmnibarCommand::new(
+        "navigation.location",
+        OmnibarMode::Path,
+        "omnibar-path",
+        "Path",
+    ),
+    OmnibarCommand::new(
+        "view.search",
+        OmnibarMode::Search,
+        "omnibar-search",
+        "Search",
+    ),
+    OmnibarCommand::new(
+        "view.filter",
+        OmnibarMode::Filter,
+        "omnibar-filter",
+        "Filter",
+    ),
+    OmnibarCommand::new(
+        "view.command",
+        OmnibarMode::Command,
+        "omnibar-command",
+        "Command",
+    ),
+];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FixedCommandSurface {
@@ -158,12 +205,21 @@ pub const STATIC_SHORTCUTS: [StaticShortcut; 23] = [
 #[must_use]
 pub fn fixed_surface_ids(surface: FixedCommandSurface) -> Vec<&'static str> {
     match surface {
-        FixedCommandSurface::NavigationToolbar => NAVIGATION_LEADING_IDS
-            .into_iter()
-            .chain([OMNIBAR_COMMAND_ID, SEARCH_COMMAND_ID])
-            .chain(VIEW_COMMAND_IDS)
-            .chain(NAVIGATION_TRAILING_IDS)
-            .collect(),
+        FixedCommandSurface::NavigationToolbar => {
+            let mut ids = Vec::new();
+            for id in NAVIGATION_LEADING_IDS
+                .into_iter()
+                .chain(OMNIBAR_COMMANDS.map(OmnibarCommand::command_id))
+                .chain([SEARCH_COMMAND_ID])
+                .chain(VIEW_COMMAND_IDS)
+                .chain(NAVIGATION_TRAILING_IDS)
+            {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            ids
+        }
         FixedCommandSurface::WideViewControls | FixedCommandSurface::CompactOverflow => {
             VIEW_COMMAND_IDS.to_vec()
         }
@@ -181,6 +237,18 @@ pub fn static_shortcut(action: CommandAction) -> Option<StaticShortcut> {
         .iter()
         .copied()
         .find(|binding| binding.action == action)
+}
+
+#[must_use]
+pub fn omnibar_command_for_action(
+    registry: &CommandRegistry,
+    action: CommandAction,
+) -> Option<OmnibarCommand> {
+    OMNIBAR_COMMANDS.iter().copied().find(|binding| {
+        registry
+            .get(binding.command_id())
+            .is_some_and(|command| command.action() == action)
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
