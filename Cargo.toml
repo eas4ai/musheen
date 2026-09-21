@@ -32,6 +32,7 @@ unsafe_code = "forbid"
 async-channel = "2"
 async-io = "2"
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "backend", "frontend"] }
+base64 = "0.22"
 blake3 = "1"
 camino = "1"
 freedesktop = "0.0"
@@ -50,6 +51,7 @@ proc-mounts = "0.3"
 posix-acl = "1.2"
 png = "0.18"
 reflink-copy = "0.1"
+ring = "0.17"
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -57,6 +59,7 @@ sha2 = "0.11"
 trybuild = "1"
 tempfile = "3"
 tree_magic_mini = { version = "3.2", default-features = false }
+ureq = { version = "3.1.4", default-features = false, features = ["rustls"] }
 trash = "5"
 walkdir = "2"
 wax = "0.7"

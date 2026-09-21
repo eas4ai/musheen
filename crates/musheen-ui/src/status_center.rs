@@ -107,6 +107,11 @@ impl OperationStatusEntry {
     }
 
     #[must_use]
+    pub const fn generation(&self) -> EventGeneration {
+        self.generation
+    }
+
+    #[must_use]
     pub const fn kind(&self) -> OperationKind {
         self.kind
     }
