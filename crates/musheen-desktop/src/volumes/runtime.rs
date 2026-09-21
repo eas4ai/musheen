@@ -2,8 +2,8 @@ use super::{
     OperationOutcome, OperationUsage, UDisksRequest, UsageResolution, VolumeAction, VolumeError,
     VolumeId, VolumeModel, VolumeService, VolumeSubscription, VolumeTrigger,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -32,6 +32,7 @@ enum RuntimeCommand {
         action: VolumeAction,
         usage: UsageResolution,
         secret: Option<Box<str>>,
+        request: UDisksRequest,
         reply: mpsc::SyncSender<Result<OperationOutcome, VolumeError>>,
     },
     Shutdown,
@@ -44,14 +45,64 @@ struct RuntimeInner {
     commands: mpsc::SyncSender<RuntimeCommand>,
     model: Arc<RwLock<VolumeModel>>,
     subscribers: Arc<Mutex<Vec<LatestSubscriber>>>,
+    next_subscriber: AtomicU64,
+    refresh_pending: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     event_thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 struct LatestSubscriber {
-    sender: async_channel::Sender<VolumeUpdate>,
-    receiver: async_channel::Receiver<VolumeUpdate>,
+    id: u64,
+    notify: async_channel::Sender<()>,
+    latest: Arc<Mutex<VolumeUpdate>>,
+}
+
+pub struct VolumeUpdates {
+    id: u64,
+    notify: async_channel::Receiver<()>,
+    latest: Arc<Mutex<VolumeUpdate>>,
+    subscribers: Weak<Mutex<Vec<LatestSubscriber>>>,
+}
+
+impl VolumeUpdates {
+    pub async fn recv(&self) -> Result<VolumeUpdate, async_channel::RecvError> {
+        self.notify.recv().await?;
+        Ok(self
+            .latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone())
+    }
+
+    pub fn recv_blocking(&self) -> Result<VolumeUpdate, async_channel::RecvError> {
+        self.notify.recv_blocking()?;
+        Ok(self
+            .latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone())
+    }
+
+    pub fn try_recv(&self) -> Result<VolumeUpdate, async_channel::TryRecvError> {
+        self.notify.try_recv()?;
+        Ok(self
+            .latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone())
+    }
+}
+
+impl Drop for VolumeUpdates {
+    fn drop(&mut self) {
+        if let Some(subscribers) = self.subscribers.upgrade()
+            && let Ok(mut subscribers) = subscribers.lock()
+        {
+            subscribers.retain(|subscriber| subscriber.id != self.id);
+        }
+        self.notify.close();
+    }
 }
 
 impl std::fmt::Debug for VolumeRuntime {
@@ -71,6 +122,8 @@ impl VolumeRuntime {
             commands,
             model: Arc::new(RwLock::new(VolumeModel::default())),
             subscribers: Arc::new(Mutex::new(Vec::new())),
+            next_subscriber: AtomicU64::new(1),
+            refresh_pending: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             worker: Mutex::new(None),
             event_thread: Mutex::new(None),
@@ -124,12 +177,12 @@ impl VolumeRuntime {
                     if worker_stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    let request = UDisksRequest::with_cancel(
-                        Duration::from_secs(2),
-                        Arc::clone(&worker_stopped),
-                    );
                     let warning = match command {
                         RuntimeCommand::Refresh(trigger) => {
+                            let request = UDisksRequest::with_cancel(
+                                Duration::from_secs(2),
+                                Arc::clone(&worker_stopped),
+                            );
                             match service.handle_with_request(trigger, &request) {
                                 Ok(report) => report.warning().cloned(),
                                 Err(error) => Some(error),
@@ -140,6 +193,7 @@ impl VolumeRuntime {
                             action,
                             usage,
                             secret,
+                            request,
                             reply,
                         } => {
                             let result = service.perform_with_request(
@@ -156,14 +210,11 @@ impl VolumeRuntime {
                         RuntimeCommand::Shutdown => break,
                     };
                     let snapshot = service.model().clone();
-                    if let Ok(mut current) = worker_model.write() {
-                        *current = snapshot.clone();
-                    }
                     let update = VolumeUpdate {
                         model: snapshot,
                         warning,
                     };
-                    publish_update(&worker_subscribers, update);
+                    publish_update(&worker_model, &worker_subscribers, update);
                 }
             })
             .expect("volume service worker starts");
@@ -192,6 +243,8 @@ impl VolumeRuntime {
             commands,
             model,
             subscribers,
+            next_subscriber: AtomicU64::new(1),
+            refresh_pending,
             stopped,
             worker: Mutex::new(Some(worker)),
             event_thread: Mutex::new(event_thread),
@@ -207,27 +260,60 @@ impl VolumeRuntime {
     }
 
     #[must_use]
-    pub fn subscribe(&self) -> async_channel::Receiver<VolumeUpdate> {
-        let (sender, receiver) = async_channel::bounded(8);
-        let initial = VolumeUpdate {
-            model: self.snapshot(),
-            warning: None,
-        };
-        let _ = sender.try_send(initial);
+    pub fn subscribe(&self) -> VolumeUpdates {
+        self.subscribe_with_registration_hook(|| {})
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn subscribe_with_registration_hook(&self, hook: impl FnOnce()) -> VolumeUpdates {
+        let (notify, receiver) = async_channel::bounded(1);
+        let id = self.0.next_subscriber.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut subscribers) = self.0.subscribers.lock() {
+            hook();
+            let latest = Arc::new(Mutex::new(VolumeUpdate {
+                model: self.snapshot(),
+                warning: None,
+            }));
+            let _ = notify.try_send(());
             subscribers.push(LatestSubscriber {
-                sender,
-                receiver: receiver.clone(),
+                id,
+                notify,
+                latest: Arc::clone(&latest),
             });
+            return VolumeUpdates {
+                id,
+                notify: receiver,
+                latest,
+                subscribers: Arc::downgrade(&self.0.subscribers),
+            };
         }
-        receiver
+        VolumeUpdates {
+            id,
+            notify: receiver,
+            latest: Arc::new(Mutex::new(VolumeUpdate {
+                model: VolumeModel::default(),
+                warning: Some(VolumeError::WorkerStopped),
+            })),
+            subscribers: Weak::new(),
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        self.0.subscribers.lock().map_or(0, |items| items.len())
     }
 
     pub fn refresh(&self, trigger: VolumeTrigger) -> Result<(), VolumeError> {
-        self.0
-            .commands
-            .send(RuntimeCommand::Refresh(trigger))
-            .map_err(|_| VolumeError::WorkerStopped)
+        match self.0.commands.try_send(RuntimeCommand::Refresh(trigger)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.0.refresh_pending.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(VolumeError::WorkerStopped),
+        }
     }
 
     pub fn perform(
@@ -238,17 +324,38 @@ impl VolumeRuntime {
         secret: Option<Box<str>>,
     ) -> Result<OperationOutcome, VolumeError> {
         let (reply, result) = mpsc::sync_channel(1);
-        self.0
-            .commands
-            .send(RuntimeCommand::Perform {
-                id,
-                action,
-                usage,
-                secret,
-                reply,
-            })
-            .map_err(|_| VolumeError::WorkerStopped)?;
-        result.recv().map_err(|_| VolumeError::WorkerStopped)?
+        let request =
+            UDisksRequest::with_cancel(Duration::from_secs(2), Arc::clone(&self.0.stopped));
+        let deadline = std::time::Instant::now() + request.remaining();
+        let mut command = RuntimeCommand::Perform {
+            id,
+            action,
+            usage,
+            secret,
+            request,
+            reply,
+        };
+        loop {
+            match self.0.commands.try_send(command) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(VolumeError::DeadlineExceeded);
+                    }
+                    command = returned;
+                    thread::yield_now();
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(VolumeError::WorkerStopped);
+                }
+            }
+        }
+        result
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => VolumeError::DeadlineExceeded,
+                mpsc::RecvTimeoutError::Disconnected => VolumeError::WorkerStopped,
+            })?
     }
 }
 
@@ -256,25 +363,30 @@ fn next_command(
     receiver: &mpsc::Receiver<RuntimeCommand>,
     refresh_pending: &AtomicBool,
 ) -> Option<RuntimeCommand> {
-    if refresh_pending.swap(false, Ordering::AcqRel) {
+    if let Ok(command) = receiver.try_recv() {
+        Some(command)
+    } else if refresh_pending.swap(false, Ordering::AcqRel) {
         Some(RuntimeCommand::Refresh(VolumeTrigger::UDisksChanged))
     } else {
         receiver.recv().ok()
     }
 }
 
-fn publish_update(subscribers: &Mutex<Vec<LatestSubscriber>>, update: VolumeUpdate) {
+fn publish_update(
+    model: &RwLock<VolumeModel>,
+    subscribers: &Mutex<Vec<LatestSubscriber>>,
+    update: VolumeUpdate,
+) {
     if let Ok(mut listeners) = subscribers.lock() {
-        listeners.retain(|listener| match listener.sender.try_send(update.clone()) {
-            Ok(()) => true,
-            Err(async_channel::TrySendError::Full(update)) => {
-                let _ = listener.receiver.try_recv();
-                !matches!(
-                    listener.sender.try_send(update),
-                    Err(async_channel::TrySendError::Closed(_))
-                )
-            }
-            Err(async_channel::TrySendError::Closed(_)) => false,
+        if let Ok(mut current) = model.write() {
+            *current = update.model.clone();
+        }
+        listeners.retain(|listener| {
+            *listener.latest.lock().unwrap_or_else(|e| e.into_inner()) = update.clone();
+            !matches!(
+                listener.notify.try_send(()),
+                Err(async_channel::TrySendError::Closed(_))
+            )
         });
     }
 }

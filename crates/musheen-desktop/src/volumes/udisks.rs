@@ -212,22 +212,23 @@ pub trait UDisksBackend: Send + Sync {
 
     fn validate_action(
         &self,
-        _volume: &DeviceDescriptor,
+        volume: &DeviceDescriptor,
         _expected_owner: Option<&str>,
+        _action: VolumeAction,
         request: &UDisksRequest,
-    ) -> Result<(), UDisksError> {
-        request.check()
+    ) -> Result<Vec<PathBuf>, UDisksError> {
+        request.check()?;
+        Ok(volume.mount_points().to_vec())
     }
 
     fn perform_validated_with_request(
         &self,
         volume: &DeviceDescriptor,
-        expected_owner: Option<&str>,
+        _expected_owner: Option<&str>,
         action: VolumeAction,
         unlock_secret: Option<&str>,
         request: &UDisksRequest,
     ) -> Result<(), UDisksError> {
-        self.validate_action(volume, expected_owner, request)?;
         self.perform_with_request(volume, action, unlock_secret, request)
     }
 }
@@ -622,8 +623,9 @@ impl UDisksBackend for ZbusUDisksBackend {
         &self,
         volume: &DeviceDescriptor,
         expected_owner: Option<&str>,
+        action: VolumeAction,
         request: &UDisksRequest,
-    ) -> Result<(), UDisksError> {
+    ) -> Result<Vec<PathBuf>, UDisksError> {
         let snapshot = self.snapshot_with_request(request)?;
         if expected_owner.is_none_or(|owner| owner != snapshot.owner()) {
             return Err(UDisksError::StaleObject);
@@ -631,15 +633,24 @@ impl UDisksBackend for ZbusUDisksBackend {
         let current = snapshot
             .devices()
             .iter()
-            .find(|candidate| candidate.id() == volume.id());
-        if current.is_none_or(|candidate| {
-            candidate.object_path() != volume.object_path()
-                || candidate.device() != volume.device()
-                || candidate.drive_path() != volume.drive_path()
-        }) {
+            .find(|candidate| candidate.id() == volume.id())
+            .ok_or(UDisksError::StaleObject)?;
+        if current.object_path() != volume.object_path()
+            || current.device() != volume.device()
+            || current.drive_path() != volume.drive_path()
+        {
             return Err(UDisksError::StaleObject);
         }
-        Ok(())
+        let drive = current.drive_path();
+        Ok(snapshot
+            .devices()
+            .iter()
+            .filter(|candidate| {
+                !matches!(action, VolumeAction::Eject | VolumeAction::PowerOff)
+                    || candidate.drive_path() == drive
+            })
+            .flat_map(|candidate| candidate.mount_points().iter().cloned())
+            .collect())
     }
 
     fn perform_validated_with_request(
@@ -650,7 +661,7 @@ impl UDisksBackend for ZbusUDisksBackend {
         unlock_secret: Option<&str>,
         request: &UDisksRequest,
     ) -> Result<(), UDisksError> {
-        self.validate_action(volume, expected_owner, request)?;
+        let _ = self.validate_action(volume, expected_owner, action, request)?;
         let owner = expected_owner.ok_or(UDisksError::StaleObject)?.to_owned();
         block_on_request(request, async {
             if self.service_owner().await? != owner {

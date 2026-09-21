@@ -20,6 +20,7 @@ const ROOT: &str = "/org/freedesktop/UDisks2";
 const BLOCK_PATH: &str = "/org/freedesktop/UDisks2/block_devices/fake1";
 const ADDED_PATH: &str = "/org/freedesktop/UDisks2/block_devices/added";
 const DRIVE_PATH: &str = "/org/freedesktop/UDisks2/drives/fake";
+static SLOW_PROPERTIES_ENTERED: AtomicUsize = AtomicUsize::new(0);
 
 struct EmptyMounts;
 
@@ -163,6 +164,7 @@ impl FakePartition {
 impl FakeBlock {
     fn pause(&self) {
         if self.slow.load(Ordering::SeqCst) {
+            SLOW_PROPERTIES_ENTERED.fetch_add(1, Ordering::AcqRel);
             std::thread::sleep(Duration::from_millis(80));
         }
     }
@@ -658,6 +660,7 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
     assert_eq!(actions.lock().unwrap().len(), actions_before);
 
     slow.store(true, Ordering::SeqCst);
+    SLOW_PROPERTIES_ENTERED.store(0, Ordering::Release);
     let started = std::time::Instant::now();
     match backend.snapshot() {
         Err(UDisksError::DeadlineExceeded) => {}
@@ -674,6 +677,54 @@ fn fake_udisks_object_manager_properties_owner_restart_and_errors() {
         ) => {}
         other => panic!("dead private bus must be a connection error, got {other:?}"),
     }
+}
+
+#[test]
+fn same_owner_replacement_at_the_same_object_path_is_rejected() {
+    let bus = PrivateBus::start();
+    let slow = Arc::new(AtomicBool::new(false));
+    let service = start_service(
+        &bus.address,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::clone(&slow),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let backend =
+        ZbusUDisksBackend::connect_address_with_timeout(&bus.address, Duration::from_millis(500))
+            .unwrap();
+    let before = backend.snapshot().unwrap();
+    futures_lite::future::block_on(async {
+        service
+            .object_server()
+            .remove::<FakeBlock, _>(BLOCK_PATH)
+            .await
+            .unwrap();
+        service
+            .object_server()
+            .at(
+                BLOCK_PATH,
+                IdentityBlock {
+                    device: b"/dev/replacement\0".to_vec(),
+                    uuid: "",
+                    drive: DRIVE_PATH,
+                    symlinks: vec![b"/dev/disk/by-id/fake-drive\0".to_vec()],
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let request = UDisksRequest::with_timeout(Duration::from_millis(500));
+    assert_eq!(
+        backend.perform_validated_with_request(
+            &before.devices()[0],
+            Some(before.owner()),
+            VolumeAction::Unmount,
+            None,
+            &request,
+        ),
+        Err(UDisksError::StaleObject)
+    );
 }
 
 fn wait_for_trigger(subscription: &VolumeSubscription, expected: VolumeTrigger) {
@@ -762,7 +813,13 @@ fn injected_listener_delivers_object_property_owner_signals_and_shuts_down() {
         VolumeSubscription::with_udisks(UDisksBusConfig::address(bus.address.as_str()), false),
     );
     runtime.refresh(VolumeTrigger::UDisksChanged).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while SLOW_PROPERTIES_ENTERED.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert!(SLOW_PROPERTIES_ENTERED.load(Ordering::Acquire) > 0);
     let runtime_shutdown = std::time::Instant::now();
     drop(runtime);
     assert!(runtime_shutdown.elapsed() < Duration::from_millis(500));
@@ -795,6 +852,11 @@ fn listener_drop_cancels_stalled_bus_setup_without_leaking_threads() {
                 Err(error) => panic!("stalled bus accept failed: {error}"),
             }
         }
+        assert_eq!(
+            connections.len(),
+            2,
+            "both listener setups reached authentication"
+        );
         ready.send(()).unwrap();
         let _ = released.recv_timeout(Duration::from_secs(2));
         drop(connections);

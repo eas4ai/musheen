@@ -17,6 +17,13 @@ struct FakeBackend {
     actions: Mutex<Vec<(VolumeId, VolumeAction)>>,
     action_results: Mutex<VecDeque<Result<(), UDisksError>>>,
     validation_results: Mutex<VecDeque<Result<(), UDisksError>>>,
+    validation_job: Mutex<Option<(Arc<FakeUsage>, OperationUse)>>,
+    dispatch_job: Mutex<
+        Option<(
+            Arc<std::sync::atomic::AtomicBool>,
+            Arc<std::sync::atomic::AtomicBool>,
+        )>,
+    >,
 }
 
 impl FakeBackend {
@@ -76,6 +83,11 @@ impl UDisksBackend for FakeBackend {
         action: VolumeAction,
         _unlock_secret: Option<&str>,
     ) -> Result<(), UDisksError> {
+        if let Some((reserved, accepted)) = self.dispatch_job.lock().unwrap().take()
+            && !reserved.load(std::sync::atomic::Ordering::Acquire)
+        {
+            accepted.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.actions
             .lock()
             .unwrap()
@@ -89,16 +101,69 @@ impl UDisksBackend for FakeBackend {
 
     fn validate_action(
         &self,
-        _volume: &DeviceDescriptor,
+        volume: &DeviceDescriptor,
         _expected_owner: Option<&str>,
+        _action: VolumeAction,
         _request: &UDisksRequest,
-    ) -> Result<(), UDisksError> {
+    ) -> Result<Vec<PathBuf>, UDisksError> {
+        if let Some((usage, operation)) = self.validation_job.lock().unwrap().take() {
+            usage.active.lock().unwrap().push(operation);
+        }
         self.validation_results
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or(Ok(()))
+            .map(|()| volume.mount_points().to_vec())
     }
+}
+
+struct ReservingUsage {
+    reserved: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ReservingGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ReservingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl musheen_desktop::OperationReservation for ReservingGuard {
+    fn operations_using(&self) -> Vec<OperationUse> {
+        Vec::new()
+    }
+}
+
+impl OperationUsage for ReservingUsage {
+    fn operations_using(&self, _mounts: &[PathBuf]) -> Vec<OperationUse> {
+        Vec::new()
+    }
+    fn cancel(&self, _operations: &[OperationUse]) -> Result<(), VolumeError> {
+        Ok(())
+    }
+    fn reserve<'a>(
+        &'a self,
+        _mounts: &[PathBuf],
+    ) -> Result<Box<dyn musheen_desktop::OperationReservation + 'a>, VolumeError> {
+        self.reserved
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(Box::new(ReservingGuard(Arc::clone(&self.reserved))))
+    }
+}
+
+#[test]
+fn dropped_subscriptions_are_removed_without_future_publication_work() {
+    let runtime = VolumeRuntime::from_service(VolumeService::new(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeMounts::default()),
+        Arc::new(FakeUsage::default()),
+    ));
+    for _ in 0..64 {
+        drop(runtime.subscribe());
+    }
+    assert_eq!(runtime.subscriber_count(), 0);
 }
 
 #[derive(Default)]
@@ -160,6 +225,27 @@ impl OperationUsage for FakeUsage {
             .extend(operations.iter().map(|operation| operation.id()));
         self.active.lock().unwrap().clear();
         Ok(())
+    }
+
+    fn reserve<'a>(
+        &'a self,
+        mounts: &[PathBuf],
+    ) -> Result<Box<dyn musheen_desktop::OperationReservation + 'a>, VolumeError> {
+        Ok(Box::new(FakeReservation {
+            usage: self,
+            mounts: mounts.to_vec(),
+        }))
+    }
+}
+
+struct FakeReservation<'a> {
+    usage: &'a FakeUsage,
+    mounts: Vec<PathBuf>,
+}
+
+impl musheen_desktop::OperationReservation for FakeReservation<'_> {
+    fn operations_using(&self) -> Vec<OperationUse> {
+        self.usage.operations_using(&self.mounts)
     }
 }
 
@@ -472,6 +558,65 @@ fn cancellation_consent_never_applies_to_operations_started_after_review() {
     assert!(matches!(error, VolumeError::InUse(ref active) if active.len() == 2));
     assert!(usage.canceled.lock().unwrap().is_empty());
     assert!(backend.actions.lock().unwrap().is_empty());
+}
+
+#[test]
+fn job_starting_during_backend_validation_is_refused_before_dispatch() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let usage = Arc::new(FakeUsage::default());
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let mut service = service(backend.clone(), mounts, usage.clone());
+    service.refresh().unwrap();
+    *backend.validation_job.lock().unwrap() = Some((
+        usage,
+        OperationUse::new(MountOperation::new(88), "late write"),
+    ));
+
+    let error = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, VolumeError::InUse(ref jobs) if jobs[0].id() == MountOperation::new(88))
+    );
+    assert!(backend.actions.lock().unwrap().is_empty());
+}
+
+#[test]
+fn operation_reservation_blocks_new_jobs_through_backend_dispatch() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/media/a"))])));
+    mounts.queue(vec![mount("/dev/sdb1", "/media/a", false)]);
+    let mut service = VolumeService::new(
+        backend.clone(),
+        mounts.clone(),
+        Arc::new(ReservingUsage {
+            reserved: Arc::clone(&reserved),
+        }),
+    );
+    service.refresh().unwrap();
+    *backend.dispatch_job.lock().unwrap() = Some((Arc::clone(&reserved), Arc::clone(&accepted)));
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", None)])));
+    mounts.queue(Vec::new());
+    service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Unmount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap();
+    assert!(!accepted.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!reserved.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[test]
@@ -907,6 +1052,8 @@ fn cancellation_waits_and_rechecks_for_new_jobs_before_dispatch() {
 struct BlockingCapacity {
     snapshots: Mutex<VecDeque<Result<Vec<MountRecord>, VolumeError>>>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,
+    entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    finished: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 impl MountProvider for BlockingCapacity {
@@ -919,7 +1066,13 @@ impl MountProvider for BlockingCapacity {
     }
 
     fn capacity(&self, _path: &Path) -> Result<Capacity, VolumeError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
         let _ = self.release.lock().unwrap().recv();
+        if let Some(finished) = self.finished.lock().unwrap().take() {
+            let _ = finished.send(());
+        }
         Ok(Capacity::new(1, 1))
     }
 }
@@ -929,6 +1082,8 @@ fn listener_shutdown_is_not_blocked_by_a_stalled_capacity_probe() {
     let backend = Arc::new(FakeBackend::default());
     backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", Some("/hang"))])));
     let (release, blocked) = std::sync::mpsc::channel();
+    let (entered, capacity_entered) = std::sync::mpsc::sync_channel(1);
+    let (finished, capacity_finished) = std::sync::mpsc::sync_channel(1);
     let provider = Arc::new(BlockingCapacity {
         snapshots: Mutex::new(VecDeque::from([Ok(vec![mount(
             "/dev/sdb1",
@@ -936,6 +1091,8 @@ fn listener_shutdown_is_not_blocked_by_a_stalled_capacity_probe() {
             false,
         )])])),
         release: Mutex::new(blocked),
+        entered: Mutex::new(Some(entered)),
+        finished: Mutex::new(Some(finished)),
     });
     let (events, receiver) = async_channel::bounded(1);
     events.try_send(VolumeTrigger::MountTableChanged).unwrap();
@@ -943,11 +1100,58 @@ fn listener_shutdown_is_not_blocked_by_a_stalled_capacity_probe() {
         VolumeService::new(backend, provider, Arc::new(FakeUsage::default())),
         VolumeSubscription::from_parts(receiver, Vec::new()),
     );
-    std::thread::sleep(Duration::from_millis(25));
+    capacity_entered
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
     let started = Instant::now();
     drop(runtime);
     assert!(started.elapsed() < Duration::from_millis(250));
     release.send(()).unwrap();
+    capacity_finished
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+}
+
+#[test]
+fn stalled_capacity_probes_are_globally_bounded_across_services() {
+    let make_runtime = |name: &str,
+                        entered: std::sync::mpsc::SyncSender<()>,
+                        blocked: std::sync::mpsc::Receiver<()>| {
+        let backend = Arc::new(FakeBackend::default());
+        backend.queue_snapshot(Ok(snapshot("owner", [device(name, Some("/hang"))])));
+        let provider = Arc::new(BlockingCapacity {
+            snapshots: Mutex::new(VecDeque::from([Ok(vec![mount(
+                &format!("/dev/{name}"),
+                "/hang",
+                false,
+            )])])),
+            release: Mutex::new(blocked),
+            entered: Mutex::new(Some(entered)),
+            finished: Mutex::new(None),
+        });
+        let runtime = VolumeRuntime::from_service(VolumeService::new(
+            backend,
+            provider,
+            Arc::new(FakeUsage::default()),
+        ));
+        runtime.refresh(VolumeTrigger::MountTableChanged).unwrap();
+        runtime
+    };
+    let (release_first, blocked_first) = std::sync::mpsc::channel();
+    let (entered_first, first_entered) = std::sync::mpsc::sync_channel(1);
+    let first = make_runtime("sdb1", entered_first, blocked_first);
+    first_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (_release_second, blocked_second) = std::sync::mpsc::channel();
+    let (entered_second, second_entered) = std::sync::mpsc::sync_channel(1);
+    let second = make_runtime("sdc1", entered_second, blocked_second);
+    assert!(
+        second_entered
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    drop(first);
+    drop(second);
+    release_first.send(()).unwrap();
 }
 
 #[test]
@@ -1028,4 +1232,117 @@ fn event_overflow_still_reconciles_the_final_device_removal() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(runtime.snapshot().volumes().is_empty());
+}
+
+struct InterleavingBackend {
+    snapshot: Mutex<BackendSnapshot>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl UDisksBackend for InterleavingBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(self.snapshot.lock().unwrap().clone())
+    }
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn subscription_registration_cannot_miss_removal_between_snapshot_and_insert() {
+    let backend = Arc::new(InterleavingBackend {
+        snapshot: Mutex::new(snapshot("owner", [device("sdb1", None)])),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let runtime = VolumeRuntime::from_service(VolumeService::new(
+        backend.clone(),
+        Arc::new(FakeMounts::default()),
+        Arc::new(FakeUsage::default()),
+    ));
+    runtime.refresh(VolumeTrigger::UDisksChanged).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.snapshot().get(&id("sdb1")).is_none() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let updates = runtime.subscribe_with_registration_hook(|| {
+        *backend.snapshot.lock().unwrap() = snapshot("owner", []);
+        runtime.refresh(VolumeTrigger::UDisksChanged).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while backend.calls.load(std::sync::atomic::Ordering::Acquire) < 2
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+    });
+    let final_update = futures_lite::future::block_on(async {
+        futures_lite::future::race(async { updates.recv().await.unwrap() }, async {
+            async_io::Timer::after(Duration::from_secs(1)).await;
+            panic!("atomic subscriber missed the final removal")
+        })
+        .await
+    });
+    assert!(final_update.model().volumes().is_empty());
+}
+
+struct FairBackend;
+
+impl UDisksBackend for FairBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        Ok(snapshot("owner", [device("sdb1", None)]))
+    }
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn queued_action_is_not_starved_by_continuous_refresh_signals() {
+    let (events, receiver) = async_channel::bounded(32);
+    let runtime = VolumeRuntime::from_service_with_subscription(
+        VolumeService::new(
+            Arc::new(FairBackend),
+            Arc::new(FakeMounts::default()),
+            Arc::new(FakeUsage::default()),
+        ),
+        VolumeSubscription::from_parts(receiver, Vec::new()),
+    );
+    events.try_send(VolumeTrigger::UDisksChanged).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while runtime.snapshot().get(&id("sdb1")).is_none() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let flooding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let keep_flooding = Arc::clone(&flooding);
+    let flood = std::thread::spawn(move || {
+        while keep_flooding.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = events.try_send(VolumeTrigger::UDisksChanged);
+            std::thread::yield_now();
+        }
+    });
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    let action_runtime = runtime.clone();
+    std::thread::spawn(move || {
+        let outcome = action_runtime.perform(
+            id("sdb1"),
+            VolumeAction::Mount,
+            UsageResolution::Refuse,
+            None,
+        );
+        let _ = done.send(outcome);
+    });
+    let outcome = result.recv_timeout(Duration::from_millis(500));
+    flooding.store(false, std::sync::atomic::Ordering::Release);
+    flood.join().unwrap();
+    assert!(outcome.is_ok(), "queued action was starved by refreshes");
 }

@@ -69,11 +69,11 @@ use musheen_desktop::{
     ApplicationIconProvider, CatalogDocument, CatalogStore, ConflictDecisionStore,
     DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths, FolderIdentity,
     FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
-    MimeAppsSnapshot, MimeDetector, MountOperation, OperationUsage, OperationUse, PreviewDocument,
-    ProcessRunner, SessionStore, SystemProcessRunner, TagMoveOutcome, TerminalCommand,
-    ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest,
-    ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError, VolumeId,
-    VolumeRuntime,
+    MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation, OperationUsage,
+    OperationUse, PreviewDocument, ProcessRunner, SessionStore, SystemProcessRunner,
+    TagMoveOutcome, TerminalCommand, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
+    ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution,
+    VolumeAction, VolumeError, VolumeId, VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -1785,6 +1785,18 @@ struct HubVolumeUsage {
     hub: OperationHub,
 }
 
+struct HubVolumeReservation<'a>(crate::operations::OperationMountReservation<'a>);
+
+impl OperationReservation for HubVolumeReservation<'_> {
+    fn operations_using(&self) -> Vec<OperationUse> {
+        self.0
+            .operations()
+            .into_iter()
+            .map(|(id, kind)| OperationUse::new(MountOperation::new(id.get()), format!("{kind:?}")))
+            .collect()
+    }
+}
+
 impl OperationUsage for HubVolumeUsage {
     fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse> {
         self.hub
@@ -1804,6 +1816,16 @@ impl OperationUsage for HubVolumeUsage {
                 .map_err(|error| VolumeError::CancellationFailed(error.to_string().into()))?;
         }
         Ok(())
+    }
+
+    fn reserve<'a>(
+        &'a self,
+        mounts: &[PathBuf],
+    ) -> Result<Box<dyn OperationReservation + 'a>, VolumeError> {
+        self.hub
+            .reserve_mounts(mounts)
+            .map(|reservation| Box::new(HubVolumeReservation(reservation)) as Box<_>)
+            .map_err(|error| VolumeError::CancellationFailed(error.to_string().into()))
     }
 }
 

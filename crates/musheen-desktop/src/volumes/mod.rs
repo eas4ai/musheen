@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const VOLUME_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+static CAPACITY_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub struct VolumeSubscription {
     receiver: async_channel::Receiver<VolumeTrigger>,
@@ -193,6 +194,25 @@ impl OperationUse {
 pub trait OperationUsage: Send + Sync {
     fn operations_using(&self, mounts: &[PathBuf]) -> Vec<OperationUse>;
     fn cancel(&self, operations: &[OperationUse]) -> Result<(), VolumeError>;
+
+    fn reserve<'a>(
+        &'a self,
+        _mounts: &[PathBuf],
+    ) -> Result<Box<dyn OperationReservation + 'a>, VolumeError> {
+        Ok(Box::new(NoOperationReservation))
+    }
+}
+
+pub trait OperationReservation {
+    fn operations_using(&self) -> Vec<OperationUse>;
+}
+
+struct NoOperationReservation;
+
+impl OperationReservation for NoOperationReservation {
+    fn operations_using(&self) -> Vec<OperationUse> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -361,7 +381,6 @@ pub struct VolumeService {
     mounts: Arc<dyn MountProvider>,
     usage: Arc<dyn OperationUsage>,
     model: VolumeModel,
-    capacity_probe_active: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for VolumeService {
@@ -385,7 +404,6 @@ impl VolumeService {
             mounts,
             usage,
             model: VolumeModel::default(),
-            capacity_probe_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -580,32 +598,57 @@ impl VolumeService {
             action,
             VolumeAction::Unmount | VolumeAction::Eject | VolumeAction::PowerOff
         ) {
-            let newly_active = self.usage.operations_using(&affected_mounts);
+            let validated_mounts = self.backend.validate_action(
+                &descriptor,
+                self.model.service_owner(),
+                action,
+                request,
+            )?;
+            let reservation = self.usage.reserve(&validated_mounts)?;
+            let newly_active = reservation.operations_using();
             if !newly_active.is_empty() {
                 return Err(VolumeError::InUse(newly_active));
             }
-        }
-
-        if let Err(error) = self.backend.perform_validated_with_request(
+            if let Err(error) = self.backend.perform_validated_with_request(
+                &descriptor,
+                self.model.service_owner(),
+                action,
+                unlock_secret,
+                request,
+            ) {
+                drop(reservation);
+                return self.handle_action_error(id, error, request);
+            }
+            drop(reservation);
+        } else if let Err(error) = self.backend.perform_validated_with_request(
             &descriptor,
             self.model.service_owner(),
             action,
             unlock_secret,
             request,
         ) {
-            if error == UDisksError::StaleObject {
-                let _ = self.refresh_with_request(request)?;
-                if self.model.get(id).is_none() {
-                    return Err(VolumeError::Disappeared(id.clone()));
-                }
-            }
-            return Err(error.into());
+            return self.handle_action_error(id, error, request);
         }
         let refresh = self.refresh_with_request(request)?;
         Ok(OperationOutcome {
             volume_present: self.model.get(id).is_some(),
             refresh,
         })
+    }
+
+    fn handle_action_error(
+        &mut self,
+        id: &VolumeId,
+        error: UDisksError,
+        request: &UDisksRequest,
+    ) -> Result<OperationOutcome, VolumeError> {
+        if error == UDisksError::StaleObject {
+            let _ = self.refresh_with_request(request)?;
+            if self.model.get(id).is_none() {
+                return Err(VolumeError::Disappeared(id.clone()));
+            }
+        }
+        Err(error.into())
     }
 
     fn resolve_usage(
@@ -652,7 +695,7 @@ impl VolumeService {
             Arc::clone(&self.mounts),
             path,
             request,
-            Arc::clone(&self.capacity_probe_active),
+            &CAPACITY_PROBE_ACTIVE,
         )
     }
 }
@@ -661,20 +704,19 @@ fn probe_capacity(
     provider: Arc<dyn MountProvider>,
     path: &std::path::Path,
     request: &UDisksRequest,
-    active: Arc<AtomicBool>,
+    active: &'static AtomicBool,
 ) -> Option<Capacity> {
     if active.swap(true, Ordering::AcqRel) {
         return None;
     }
     let path = path.to_path_buf();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let active_on_exit = Arc::clone(&active);
     if std::thread::Builder::new()
         .name("musheen-capacity-probe".into())
         .spawn(move || {
+            let _lease = CapacityProbeLease(active);
             let result = provider.capacity(&path).ok();
             let _ = sender.send(result);
-            active_on_exit.store(false, Ordering::Release);
         })
         .is_err()
     {
@@ -690,6 +732,14 @@ fn probe_capacity(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
         }
+    }
+}
+
+struct CapacityProbeLease(&'static AtomicBool);
+
+impl Drop for CapacityProbeLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 

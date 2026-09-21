@@ -15,7 +15,18 @@ use musheen_ops::{
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+pub(crate) struct OperationMountReservation<'a> {
+    queue: MutexGuard<'a, LocalOperationQueue>,
+    mounts: Vec<std::path::PathBuf>,
+}
+
+impl OperationMountReservation<'_> {
+    pub(crate) fn operations(&self) -> Vec<(JobId, OperationKind)> {
+        operations_using_mounts(&self.queue, &self.mounts)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OperationHub {
@@ -178,21 +189,22 @@ impl OperationHub {
     ) -> Vec<(JobId, OperationKind)> {
         self.queue.lock().map_or_else(
             |_| Vec::new(),
-            |queue| {
-                queue
-                    .active_operation_paths()
-                    .into_iter()
-                    .filter(|operation| {
-                        operation.paths.iter().any(|path| {
-                            path.as_unix_path().is_some_and(|path| {
-                                mounts.iter().any(|mount| path.starts_with(mount))
-                            })
-                        })
-                    })
-                    .map(|operation| (operation.id, operation.kind))
-                    .collect()
-            },
+            |queue| operations_using_mounts(&queue, mounts),
         )
+    }
+
+    pub(crate) fn reserve_mounts(
+        &self,
+        mounts: &[std::path::PathBuf],
+    ) -> Result<OperationMountReservation<'_>, OperationHubError> {
+        let queue = self
+            .queue
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?;
+        Ok(OperationMountReservation {
+            queue,
+            mounts: mounts.to_vec(),
+        })
     }
 
     pub fn can_accept_drop(&self, payload: &FileDragPayload, target: &StorePath) -> bool {
@@ -457,6 +469,23 @@ impl OperationHub {
             .find_map(|failure| failure.recovery_staging().cloned())
             .ok_or_else(|| crate::StatusCenterError::InvalidState(id).into())
     }
+}
+
+fn operations_using_mounts(
+    queue: &LocalOperationQueue,
+    mounts: &[std::path::PathBuf],
+) -> Vec<(JobId, OperationKind)> {
+    queue
+        .active_operation_paths()
+        .into_iter()
+        .filter(|operation| {
+            operation.paths.iter().any(|path| {
+                path.as_unix_path()
+                    .is_some_and(|path| mounts.iter().any(|mount| path.starts_with(mount)))
+            })
+        })
+        .map(|operation| (operation.id, operation.kind))
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
