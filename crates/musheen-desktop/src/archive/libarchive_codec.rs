@@ -178,9 +178,22 @@ impl ArchiveScanner for LibarchiveScanner {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
-        match self.receive(cancellation)? {
-            WorkerFrame::End => Ok(None),
-            WorkerFrame::Error(error) => Err(error),
+        let frame = match self.receive(cancellation) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.terminate();
+                return Err(error);
+            }
+        };
+        match frame {
+            WorkerFrame::End => {
+                self.terminate();
+                Ok(None)
+            }
+            WorkerFrame::Error(error) => {
+                self.terminate();
+                Err(error)
+            }
             WorkerFrame::Entry {
                 name,
                 kind,
@@ -477,5 +490,79 @@ pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut builder = tar::Builder::new(&mut bytes);
+        let contents = b"contents";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "entry.txt", contents.as_slice())
+            .expect("entry writes");
+        builder.finish().expect("archive closes");
+        drop(builder);
+        bytes
+    }
+
+    fn scanner(bytes: &[u8]) -> LibarchiveScanner {
+        let mut source = tempfile::tempfile().expect("temporary source");
+        source.write_all(bytes).expect("source writes");
+        source.seek(SeekFrom::Start(0)).expect("source rewinds");
+        LibarchiveScanner::new(
+            source,
+            ProviderId::new("archive-libarchive-lifecycle").expect("provider ID"),
+            ArchiveLimits::default(),
+            DecodeCounterState::new(),
+        )
+        .expect("worker starts")
+    }
+
+    fn assert_terminated(scanner: &LibarchiveScanner) {
+        assert!(scanner.child.is_none(), "terminal path must reap the child");
+        assert!(
+            scanner.responses.is_none(),
+            "terminal path must drop the protocol receiver"
+        );
+        assert!(
+            scanner.reader.is_none(),
+            "terminal path must join or detach the completed reader"
+        );
+    }
+
+    #[test]
+    fn normal_completion_reaps_worker_and_reader_immediately() {
+        let mut scanner = scanner(&archive_bytes());
+        while scanner
+            .next_entry(&CancellationToken::new())
+            .expect("entry reads")
+            .is_some()
+        {}
+        assert_terminated(&scanner);
+    }
+
+    #[test]
+    fn worker_error_reaps_worker_and_reader_immediately() {
+        let mut scanner = scanner(b"not an archive");
+        assert!(scanner.next_entry(&CancellationToken::new()).is_err());
+        assert_terminated(&scanner);
+    }
+
+    #[test]
+    fn protocol_disconnect_reaps_worker_and_reader_immediately() {
+        let mut scanner = scanner(&archive_bytes());
+        let mut child = scanner.child.take().expect("live worker");
+        child.kill().expect("worker kills");
+        child.wait().expect("worker reaps");
+        while let Ok(Some(_)) = scanner.next_entry(&CancellationToken::new()) {}
+        assert_terminated(&scanner);
     }
 }

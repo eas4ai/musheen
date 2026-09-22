@@ -134,6 +134,27 @@ fn read_root(
         .map(musheen_core::Page::into_items)
 }
 
+#[cfg(feature = "archive-libarchive")]
+fn cancel_large_read(store: &ArchiveStore) -> (StoreError, Duration) {
+    let cancellation = CancellationToken::new();
+    let cancel_from_thread = cancellation.clone();
+    let cancel = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1));
+        cancel_from_thread.cancel();
+    });
+    let started = Instant::now();
+    let result = block_on(store.read_directory(
+        &store.root_path(),
+        PageRequest::new(2_049, None).expect("large page"),
+        cancellation,
+    ));
+    cancel.join().expect("cancellation thread");
+    (
+        result.expect_err("worker scan must observe cancellation"),
+        started.elapsed(),
+    )
+}
+
 #[test]
 fn archive_paths_reject_platform_escapes_and_nul() {
     for unsafe_name in [
@@ -1084,23 +1105,23 @@ fn libarchive_worker_cancellation_retries_and_drop_is_bounded() {
         ArchiveLimits::default(),
         Arc::new(RecordingPasswords::default()),
     );
-    let cancellation = CancellationToken::new();
-    let cancel_from_thread = cancellation.clone();
-    let cancel = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(1));
-        cancel_from_thread.cancel();
-    });
-    let result = block_on(store.read_directory(
-        &store.root_path(),
-        PageRequest::new(2_049, None).expect("large page"),
-        cancellation,
-    ));
-    cancel.join().expect("cancel thread");
-    assert_eq!(
-        result.expect_err("worker scan must observe cancellation"),
-        StoreError::Cancelled
+    let (error, cancellation_latency) = cancel_large_read(&store);
+    assert_eq!(error, StoreError::Cancelled);
+    assert!(
+        cancellation_latency < Duration::from_millis(500),
+        "a cancelled request must not synchronously rebuild the libarchive scanner"
     );
-    assert_eq!(read_root(&store, 1).expect("fresh token retries").len(), 1);
+    let elapsed_after_cancel = store.counters().elapsed;
+
+    let (replay_error, _) = cancel_large_read(&store);
+    assert_eq!(replay_error, StoreError::Cancelled);
+    assert!(store.counters().elapsed > elapsed_after_cancel);
+    assert_eq!(
+        read_root(&store, 2_049)
+            .expect("a later fresh request replays and completes")
+            .len(),
+        2_048
+    );
 
     let started = Instant::now();
     drop(store);

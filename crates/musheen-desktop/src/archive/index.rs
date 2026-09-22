@@ -31,6 +31,7 @@ pub(crate) struct LazyArchiveIndex {
     failure: Option<ArchiveError>,
     source_bytes: u64,
     accepted_entries: usize,
+    reset_needed: bool,
 }
 
 pub(crate) struct IndexedEntry {
@@ -57,6 +58,7 @@ impl LazyArchiveIndex {
             failure: None,
             source_bytes,
             accepted_entries: 0,
+            reset_needed: false,
         }
     }
 
@@ -118,10 +120,7 @@ impl LazyArchiveIndex {
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
-        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
-        if counters.elapsed() > limits.max_elapsed {
-            return Err(elapsed_limit(counters.elapsed(), limits.max_elapsed));
-        }
+        self.prepare_scanner(cancellation, limits, counters)?;
         let started = Instant::now();
         let raw = self.scanner.next_entry(cancellation);
         counters.add_elapsed(started.elapsed());
@@ -131,9 +130,7 @@ impl LazyArchiveIndex {
         let raw = match raw {
             Ok(raw) => raw,
             Err(ArchiveError::Cancelled) => {
-                if let Err(error) = self.rebuild_scanner() {
-                    return self.fail(error);
-                }
+                self.reset_needed = true;
                 return Err(ArchiveError::Cancelled);
             }
             Err(error) => return self.fail(error),
@@ -162,7 +159,34 @@ impl LazyArchiveIndex {
         }
     }
 
-    fn rebuild_scanner(&mut self) -> Result<(), ArchiveError> {
+    fn prepare_scanner(
+        &mut self,
+        cancellation: &CancellationToken,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<(), ArchiveError> {
+        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        if counters.elapsed() > limits.max_elapsed {
+            return Err(elapsed_limit(counters.elapsed(), limits.max_elapsed));
+        }
+        if !self.reset_needed {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let rebuilt = self.rebuild_scanner(cancellation);
+        counters.add_elapsed(started.elapsed());
+        match rebuilt {
+            Ok(()) => self.reset_needed = false,
+            Err(ArchiveError::Cancelled) => return Err(ArchiveError::Cancelled),
+            Err(error) => return self.fail(error),
+        }
+        if counters.elapsed() > limits.max_elapsed {
+            return self.fail(elapsed_limit(counters.elapsed(), limits.max_elapsed));
+        }
+        Ok(())
+    }
+
+    fn rebuild_scanner(&mut self, cancellation: &CancellationToken) -> Result<(), ArchiveError> {
         // Release codec-retained metadata before constructing the replacement. Otherwise a retry
         // can transiently require twice the configured budget for two copies of the same index.
         drop(std::mem::replace(
@@ -170,10 +194,9 @@ impl LazyArchiveIndex {
             Box::new(ResettingScanner),
         ));
         let mut scanner = (self.scanner_factory)()?;
-        let replay = CancellationToken::new();
         for _ in 0..self.accepted_entries {
             scanner
-                .next_entry(&replay)?
+                .next_entry(cancellation)?
                 .ok_or(ArchiveError::InvalidArchive)?;
         }
         self.scanner = scanner;
@@ -296,5 +319,97 @@ impl LazyArchiveIndex {
             },
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use musheen_core::ProviderId;
+    use std::time::Duration;
+
+    struct SlowScanner {
+        provider: ProviderId,
+        counters: Arc<DecodeCounterState>,
+        next: usize,
+    }
+
+    impl ArchiveScanner for SlowScanner {
+        fn next_entry(
+            &mut self,
+            cancellation: &CancellationToken,
+        ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(1));
+                cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+            }
+            let ordinal = self.next;
+            self.next += 1;
+            Ok(Some(RawArchiveEntry {
+                provider: self.provider.clone(),
+                path: format!("entry-{ordinal:03}").into_bytes(),
+                kind: RawEntryKind::RegularFile,
+                size: Some(1),
+                compressed_size: Some(1),
+                ordinal: ordinal as u64,
+                _allocation: self.counters.reserve(64, usize::MAX)?,
+            }))
+        }
+    }
+
+    #[test]
+    fn cancellation_defers_replay_and_replay_uses_the_fresh_request_token() {
+        let provider = ProviderId::new("archive-cancellation-replay").expect("provider ID");
+        let counters = DecodeCounterState::new();
+        let factory_counters = Arc::clone(&counters);
+        let factory_provider = provider.clone();
+        let factory: ArchiveScannerFactory = Arc::new(move || {
+            Ok(Box::new(SlowScanner {
+                provider: factory_provider.clone(),
+                counters: Arc::clone(&factory_counters),
+                next: 0,
+            }))
+        });
+        let scanner = factory().expect("initial scanner");
+        let mut index = LazyArchiveIndex::new(scanner, factory, 1_024);
+        let limits = ArchiveLimits::default();
+        let root = ArchivePath::root(provider);
+        index
+            .ensure_children(&root, 8, &CancellationToken::new(), &limits, &counters)
+            .expect("initial entries scan");
+
+        let first = CancellationToken::new();
+        let cancel_first = first.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2));
+            cancel_first.cancel();
+        });
+        let started = Instant::now();
+        assert_eq!(
+            index.ensure_children(&root, 9, &first, &limits, &counters),
+            Err(ArchiveError::Cancelled)
+        );
+        cancel.join().expect("first cancellation thread");
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "the cancelled request must not synchronously replay prior entries"
+        );
+
+        let replay = CancellationToken::new();
+        let cancel_replay = replay.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(35));
+            cancel_replay.cancel();
+        });
+        assert_eq!(
+            index.ensure_children(&root, 9, &replay, &limits, &counters),
+            Err(ArchiveError::Cancelled)
+        );
+        cancel.join().expect("replay cancellation thread");
+
+        index
+            .ensure_children(&root, 9, &CancellationToken::new(), &limits, &counters)
+            .expect("a later request can replay and continue");
+        assert!(counters.elapsed() >= Duration::from_millis(300));
     }
 }
