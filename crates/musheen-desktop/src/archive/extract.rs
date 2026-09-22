@@ -4,8 +4,8 @@ use super::budget::{
 };
 use super::create::{
     ArchiveOperationOutcome, append_archive_phase, cleanup_path, file_identity, local_path,
-    path_identity_with_controls, publish_staging, remove_owned_live, remove_owned_with_controls,
-    staging_path, sync_parent,
+    path_identity_with_controls, publish_staging, remove_owned_journaled, staging_path,
+    sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
@@ -144,6 +144,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         Some(&budget),
     )?;
     let mut published = false;
+    let mut transaction_started = false;
     let mut stage_root = None;
     let mut result = (|| {
         std::fs::DirBuilder::new()
@@ -246,41 +247,74 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         let staging_before_publish =
             path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
                 .ok_or(ArchiveOperationError::Conflict)?;
-        append_archive_phase(
-            journal,
-            job_id,
-            generation,
-            JournalPhase::CleanupPlanned,
-            plan,
-            &staging,
-            destination_before,
-            None,
-            Some(&budget),
-        )?;
         begin_commit()?;
-        let outcome = publish_staging(
-            &staging,
-            &destination,
-            &rollback,
-            plan.conflict_policy(),
-            staging_before_publish,
-            destination_before,
-            Some(&budget),
-            Some(cancellation),
-        )?;
+        transaction_started = true;
+        let outcome = {
+            let mut publication_checkpoint = |phase, destination_after| {
+                append_archive_phase(
+                    journal,
+                    job_id,
+                    generation,
+                    phase,
+                    plan,
+                    &staging,
+                    destination_before,
+                    destination_after,
+                    Some(&budget),
+                )
+            };
+            publish_staging(
+                &staging,
+                &destination,
+                &rollback,
+                plan.conflict_policy(),
+                staging_before_publish,
+                destination_before,
+                Some(&budget),
+                Some(cancellation),
+                &mut publication_checkpoint,
+            )?
+        };
         if outcome == ArchiveOperationOutcome::Skipped {
             if path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
                 != Some(staging_before_publish)
             {
                 return Err(ArchiveOperationError::Conflict);
             }
-            remove_owned_with_controls(
+            append_archive_phase(
+                journal,
+                job_id,
+                generation,
+                JournalPhase::CleanupPlanned,
+                plan,
                 &staging,
-                Some(staging_before_publish),
-                &budget,
-                cancellation,
-            )
-            .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
+                destination_before,
+                None,
+                Some(&budget),
+            )?;
+            {
+                let mut quarantined = || {
+                    append_archive_phase(
+                        journal,
+                        job_id,
+                        generation,
+                        JournalPhase::CleanupQuarantined,
+                        plan,
+                        &staging,
+                        destination_before,
+                        None,
+                        Some(&budget),
+                    )
+                };
+                remove_owned_journaled(
+                    &staging,
+                    Some(staging_before_publish),
+                    &budget,
+                    cancellation,
+                    &mut quarantined,
+                )
+                .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
+            }
             append_archive_phase(
                 journal,
                 job_id,
@@ -302,18 +336,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             journal,
             job_id,
             generation,
-            JournalPhase::DestinationPublished,
-            plan,
-            &staging,
-            destination_before,
-            destination_after,
-            Some(&budget),
-        )?;
-        append_archive_phase(
-            journal,
-            job_id,
-            generation,
-            JournalPhase::CleanupQuarantined,
+            JournalPhase::CleanupPlanned,
             plan,
             &staging,
             destination_before,
@@ -326,8 +349,29 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         {
             return Err(ArchiveOperationError::RecoveryRequired);
         }
-        remove_owned_with_controls(&rollback, destination_before, &budget, cancellation)
+        {
+            let mut quarantined = || {
+                append_archive_phase(
+                    journal,
+                    job_id,
+                    generation,
+                    JournalPhase::CleanupQuarantined,
+                    plan,
+                    &staging,
+                    destination_before,
+                    destination_after,
+                    Some(&budget),
+                )
+            };
+            remove_owned_journaled(
+                &rollback,
+                destination_before,
+                &budget,
+                cancellation,
+                &mut quarantined,
+            )
             .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
+        }
         append_archive_phase(
             journal,
             job_id,
@@ -353,27 +397,65 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         Ok(ArchiveOperationOutcome::Published)
     })();
 
-    if matches!(result, Err(ArchiveOperationError::RecoveryRequired)) {
-        let recovery_destination =
-            path_identity_with_controls(&destination, Some(&budget), Some(cancellation))
-                .unwrap_or(None);
-        if append_archive_phase(
+    if !matches!(result, Err(ArchiveOperationError::RecoveryRequired))
+        && result.is_err()
+        && !published
+        && !transaction_started
+        && staging.exists()
+    {
+        let cleanup_cancellation = CancellationToken::new();
+        let cleanup_budget = budget
+            .next_phase()
+            .with_identity_cancellation(cleanup_cancellation.clone());
+        let cleanup_identity = path_identity_with_controls(
+            &staging,
+            Some(&cleanup_budget),
+            Some(&cleanup_cancellation),
+        )
+        .ok()
+        .flatten();
+        let cleanup_owned = stage_root
+            .zip(cleanup_identity)
+            .is_some_and(|(created, current)| {
+                created.device() == current.device() && created.inode() == current.inode()
+            });
+        let cleanup_result = append_archive_phase(
             journal,
             job_id,
             generation,
-            JournalPhase::RecoveryRequired,
+            JournalPhase::CleanupPlanned,
             plan,
             &staging,
             destination_before,
-            recovery_destination,
-            Some(&budget),
+            None,
+            Some(&cleanup_budget),
         )
-        .is_err()
-        {
-            result = Err(ArchiveOperationError::Journal);
-        }
-    } else if result.is_err() && !published && staging.exists() {
-        if remove_owned_live(&staging, stage_root).is_ok() {
+        .and_then(|()| {
+            if !cleanup_owned {
+                return Err(ArchiveOperationError::RecoveryRequired);
+            }
+            let mut quarantined = || {
+                append_archive_phase(
+                    journal,
+                    job_id,
+                    generation,
+                    JournalPhase::CleanupQuarantined,
+                    plan,
+                    &staging,
+                    destination_before,
+                    None,
+                    Some(&cleanup_budget),
+                )
+            };
+            remove_owned_journaled(
+                &staging,
+                cleanup_identity,
+                &cleanup_budget,
+                &cleanup_cancellation,
+                &mut quarantined,
+            )
+        });
+        if cleanup_result.is_ok() {
             if append_archive_phase(
                 journal,
                 job_id,
@@ -383,7 +465,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                 &staging,
                 destination_before,
                 None,
-                Some(&budget),
+                Some(&cleanup_budget),
             )
             .is_err()
             {

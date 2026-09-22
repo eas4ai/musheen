@@ -157,6 +157,30 @@ fn restart_recovery_never_auto_publishes_unfinished_archive_staging() {
 }
 
 #[test]
+fn every_archive_publication_mutation_has_a_distinct_durable_phase() {
+    let phases = [
+        JournalPhase::DestinationQuarantinePlanned,
+        JournalPhase::DestinationQuarantined,
+        JournalPhase::StagePublishPlanned,
+        JournalPhase::PublishRollbackPlanned,
+        JournalPhase::PublishedPayloadQuarantined,
+        JournalPhase::DestinationRestorePlanned,
+        JournalPhase::DestinationRestored,
+        JournalPhase::StageRestorePlanned,
+    ];
+    let context = RecoveryContext {
+        continuation_verified: true,
+        staging_owned: true,
+        destination_verified: true,
+        source_identity_current: true,
+    };
+
+    for phase in phases {
+        assert_ne!(decide_recovery(phase, context), RecoveryDecision::NoAction);
+    }
+}
+
+#[test]
 fn archive_checkpoint_survives_a_fresh_journal_instance() {
     let plan = ArchiveOperationPlan::extract(
         path("/data/in.zip"),
@@ -173,7 +197,10 @@ fn archive_checkpoint_survives_a_fresh_journal_instance() {
         Some(identity),
         None,
         Some(identity),
-    );
+    )
+    .with_stage_deletion(path("/data/.musheen-stage-v1-9-0.delete"))
+    .with_publication_quarantine(path("/data/.musheen-stage-v1-9-0.published"))
+    .with_identity_timeout_millis(17_000);
     let mut first = Journal::open(PersistentMemoryStorage::default()).expect("journal opens");
     first
         .append_archive(
@@ -193,6 +220,15 @@ fn archive_checkpoint_survives_a_fresh_journal_instance() {
     assert_eq!(recovered.plan(), &plan);
     assert_eq!(recovered.staging_identity(), Some(identity));
     assert_eq!(recovered.destination_after(), Some(identity));
+    assert_eq!(
+        recovered.stage_deletion(),
+        Some(&path("/data/.musheen-stage-v1-9-0.delete"))
+    );
+    assert_eq!(
+        recovered.publication_quarantine(),
+        Some(&path("/data/.musheen-stage-v1-9-0.published"))
+    );
+    assert_eq!(recovered.identity_timeout_millis(), 17_000);
 }
 
 #[test]

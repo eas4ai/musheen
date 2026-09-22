@@ -8,9 +8,14 @@ use std::sync::Arc;
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_IDENTITY_MEMORY_LIMIT: u64 = 512 * 1_024 * 1_024;
+const DEFAULT_IDENTITY_TIMEOUT_MILLIS: u64 = 30_000;
 
 const fn default_identity_memory_limit() -> u64 {
     DEFAULT_IDENTITY_MEMORY_LIMIT
+}
+
+const fn default_identity_timeout_millis() -> u64 {
+    DEFAULT_IDENTITY_TIMEOUT_MILLIS
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -20,8 +25,16 @@ pub enum JournalPhase {
     StagingCreated,
     DataCopied,
     MetadataApplied,
+    DestinationQuarantinePlanned,
+    DestinationQuarantined,
+    StagePublishPlanned,
     CleanupPlanned,
     DestinationPublished,
+    PublishRollbackPlanned,
+    PublishedPayloadQuarantined,
+    DestinationRestorePlanned,
+    DestinationRestored,
+    StageRestorePlanned,
     CleanupQuarantined,
     SourceRemoved,
     StagingCleaned,
@@ -126,8 +139,14 @@ pub struct ArchiveCheckpoint {
     cleanup_identity: Option<ArchivePathIdentity>,
     #[serde(default)]
     cleanup_deletion: Option<StorePath>,
+    #[serde(default)]
+    stage_deletion: Option<StorePath>,
+    #[serde(default)]
+    publication_quarantine: Option<StorePath>,
     #[serde(default = "default_identity_memory_limit")]
     identity_memory_limit: u64,
+    #[serde(default = "default_identity_timeout_millis")]
+    identity_timeout_millis: u64,
 }
 
 impl ArchiveCheckpoint {
@@ -153,7 +172,10 @@ impl ArchiveCheckpoint {
             cleanup: None,
             cleanup_identity: None,
             cleanup_deletion: None,
+            stage_deletion: None,
+            publication_quarantine: None,
             identity_memory_limit: DEFAULT_IDENTITY_MEMORY_LIMIT,
+            identity_timeout_millis: DEFAULT_IDENTITY_TIMEOUT_MILLIS,
         }
     }
 
@@ -181,8 +203,26 @@ impl ArchiveCheckpoint {
     }
 
     #[must_use]
+    pub fn with_stage_deletion(mut self, stage_deletion: StorePath) -> Self {
+        self.stage_deletion = Some(stage_deletion);
+        self
+    }
+
+    #[must_use]
+    pub fn with_publication_quarantine(mut self, publication_quarantine: StorePath) -> Self {
+        self.publication_quarantine = Some(publication_quarantine);
+        self
+    }
+
+    #[must_use]
     pub const fn with_identity_memory_limit(mut self, limit: u64) -> Self {
         self.identity_memory_limit = limit;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_identity_timeout_millis(mut self, timeout: u64) -> Self {
+        self.identity_timeout_millis = timeout;
         self
     }
 
@@ -221,7 +261,10 @@ impl ArchiveCheckpoint {
             cleanup: None,
             cleanup_identity: None,
             cleanup_deletion: None,
+            stage_deletion: None,
+            publication_quarantine: None,
             identity_memory_limit: DEFAULT_IDENTITY_MEMORY_LIMIT,
+            identity_timeout_millis: DEFAULT_IDENTITY_TIMEOUT_MILLIS,
         }
     }
     #[must_use]
@@ -257,8 +300,20 @@ impl ArchiveCheckpoint {
         self.cleanup_deletion.as_ref()
     }
     #[must_use]
+    pub const fn stage_deletion(&self) -> Option<&StorePath> {
+        self.stage_deletion.as_ref()
+    }
+    #[must_use]
+    pub const fn publication_quarantine(&self) -> Option<&StorePath> {
+        self.publication_quarantine.as_ref()
+    }
+    #[must_use]
     pub const fn identity_memory_limit(&self) -> u64 {
         self.identity_memory_limit
+    }
+    #[must_use]
+    pub const fn identity_timeout_millis(&self) -> u64 {
+        self.identity_timeout_millis
     }
 }
 
@@ -340,8 +395,14 @@ struct ArchiveCheckpointDocument {
     cleanup_identity: Option<ArchivePathIdentity>,
     #[serde(default)]
     cleanup_deletion: Option<StorePath>,
+    #[serde(default)]
+    stage_deletion: Option<StorePath>,
+    #[serde(default)]
+    publication_quarantine: Option<StorePath>,
     #[serde(default = "default_identity_memory_limit")]
     identity_memory_limit: u64,
+    #[serde(default = "default_identity_timeout_millis")]
+    identity_timeout_millis: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -664,7 +725,10 @@ fn encode_record(record: &JournalRecord, include_plan: bool) -> Result<Vec<u8>, 
                 cleanup: checkpoint.cleanup.clone(),
                 cleanup_identity: checkpoint.cleanup_identity,
                 cleanup_deletion: checkpoint.cleanup_deletion.clone(),
+                stage_deletion: checkpoint.stage_deletion.clone(),
+                publication_quarantine: checkpoint.publication_quarantine.clone(),
                 identity_memory_limit: checkpoint.identity_memory_limit,
+                identity_timeout_millis: checkpoint.identity_timeout_millis,
             })
         })
         .transpose()?;
@@ -739,7 +803,10 @@ fn decode_record(
                 cleanup: checkpoint.cleanup,
                 cleanup_identity: checkpoint.cleanup_identity,
                 cleanup_deletion: checkpoint.cleanup_deletion,
+                stage_deletion: checkpoint.stage_deletion,
+                publication_quarantine: checkpoint.publication_quarantine,
                 identity_memory_limit: checkpoint.identity_memory_limit,
+                identity_timeout_millis: checkpoint.identity_timeout_millis,
             })
         })
         .transpose()?;

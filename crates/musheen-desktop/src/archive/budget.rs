@@ -14,6 +14,7 @@ pub struct ArchiveOperationLimits {
     pub max_path_bytes: usize,
     pub max_memory_bytes: u64,
     pub max_temporary_bytes: u64,
+    pub max_identity_millis: u64,
 }
 
 impl Default for ArchiveOperationLimits {
@@ -26,6 +27,7 @@ impl Default for ArchiveOperationLimits {
             max_path_bytes: 4_096,
             max_memory_bytes: 512 * 1_024 * 1_024,
             max_temporary_bytes: 20 * 1_024 * 1_024 * 1_024,
+            max_identity_millis: 30_000,
         }
     }
 }
@@ -152,7 +154,7 @@ pub struct ArchiveBudget {
     memory: SharedMemoryBudget,
     accounting: ArchiveOperationAccounting,
     identity_cancellation: Option<CancellationToken>,
-    identity_deadline: std::time::Instant,
+    identity_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +223,7 @@ impl ArchiveBudget {
         accounting: ArchiveOperationAccounting,
     ) -> Self {
         let maximum_memory = limits.max_memory_bytes;
+        let identity_timeout = std::time::Duration::from_millis(limits.max_identity_millis);
         Self {
             limits,
             entries: 0,
@@ -229,7 +232,7 @@ impl ArchiveBudget {
             memory: SharedMemoryBudget::new(maximum_memory, Arc::clone(&accounting.evidence)),
             accounting,
             identity_cancellation: None,
-            identity_deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            identity_timeout,
         }
     }
 
@@ -244,7 +247,7 @@ impl ArchiveBudget {
             memory: self.memory.clone(),
             accounting: self.accounting.clone(),
             identity_cancellation: self.identity_cancellation.clone(),
-            identity_deadline: self.identity_deadline,
+            identity_timeout: self.identity_timeout,
         }
     }
 
@@ -254,15 +257,30 @@ impl ArchiveBudget {
         self
     }
 
-    pub(crate) fn identity_checkpoint(&self) -> Result<(), ArchiveOperationError> {
+    pub(crate) fn identity_walk_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.identity_timeout
+    }
+
+    pub(crate) fn identity_checkpoint(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<(), ArchiveOperationError> {
+        self.identity_checkpoint_at(deadline, std::time::Instant::now())
+    }
+
+    fn identity_checkpoint_at(
+        &self,
+        deadline: std::time::Instant,
+        now: std::time::Instant,
+    ) -> Result<(), ArchiveOperationError> {
         if let Some(cancellation) = &self.identity_cancellation {
             cancellation.wait_if_paused()?;
         }
-        if std::time::Instant::now() > self.identity_deadline {
+        if now > deadline {
             return Err(ArchiveOperationError::LimitExceeded {
                 resource: "identity deadline milliseconds",
-                value: 30_001,
-                maximum: 30_000,
+                value: self.limits.max_identity_millis.saturating_add(1),
+                maximum: self.limits.max_identity_millis,
             });
         }
         Ok(())
@@ -271,6 +289,10 @@ impl ArchiveBudget {
     #[must_use]
     pub(crate) const fn max_memory_bytes(&self) -> u64 {
         self.limits.max_memory_bytes
+    }
+
+    pub(crate) const fn max_identity_millis(&self) -> u64 {
+        self.limits.max_identity_millis
     }
 
     pub(crate) fn force_post_publish_failure(&self) -> bool {
@@ -670,4 +692,47 @@ impl From<musheen_core::StoreError> for ArchiveOperationError {
 
 pub(crate) fn map_io(error: &std::io::Error) -> ArchiveOperationError {
     ArchiveOperationError::from_io_error(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArchiveBudget, ArchiveOperationError, ArchiveOperationLimits};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn identity_deadline_starts_when_each_walk_starts() {
+        let limits = ArchiveOperationLimits {
+            max_identity_millis: 100,
+            ..ArchiveOperationLimits::default()
+        };
+        let budget = ArchiveBudget::new(limits);
+        std::thread::sleep(Duration::from_millis(110));
+
+        let deadline = budget.identity_walk_deadline();
+
+        assert!(
+            budget
+                .identity_checkpoint_at(deadline, Instant::now())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn identity_walk_rejects_work_after_its_own_deadline() {
+        let limits = ArchiveOperationLimits {
+            max_identity_millis: 1,
+            ..ArchiveOperationLimits::default()
+        };
+        let budget = ArchiveBudget::new(limits);
+        let deadline = budget.identity_walk_deadline();
+
+        assert!(matches!(
+            budget.identity_checkpoint_at(deadline, deadline + Duration::from_millis(1)),
+            Err(ArchiveOperationError::LimitExceeded {
+                resource: "identity deadline milliseconds",
+                value: 2,
+                maximum: 1,
+            })
+        ));
+    }
 }
