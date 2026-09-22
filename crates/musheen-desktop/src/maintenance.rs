@@ -1,9 +1,12 @@
 use musheen_core::{BoxFuture, CancellationToken};
 use std::error::Error;
 use std::fmt;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::{fs, io};
+
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Clone, Default)]
 pub struct WindowReadiness(Arc<(Mutex<bool>, Condvar)>);
@@ -61,33 +64,88 @@ impl MaintenanceCoordinator {
     pub fn start(self) -> MaintenanceWorker {
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let (failure_sender, failure_receiver) = async_channel::bounded(self.tasks.len().max(1));
         let join = std::thread::Builder::new()
             .name("musheen-maintenance".into())
             .spawn(move || {
-                self.readiness.wait(&worker_cancellation)?;
-                for task in self.tasks {
-                    if worker_cancellation.is_cancelled() {
-                        return Err(MaintenanceError::Cancelled);
+                let report = match self.readiness.wait(&worker_cancellation) {
+                    Ok(()) => {
+                        let mut failures = Vec::new();
+                        for (index, task) in self.tasks.into_iter().enumerate() {
+                            if worker_cancellation.is_cancelled() {
+                                break;
+                            }
+                            if let Err(error) = futures_lite::future::block_on(
+                                task.run(worker_cancellation.clone()),
+                            ) && error != MaintenanceError::Cancelled
+                            {
+                                let failure = MaintenanceFailure { index, error };
+                                let _ = failure_sender.try_send(failure.clone());
+                                failures.push(failure);
+                            }
+                        }
+                        Ok(MaintenanceReport { failures })
                     }
-                    futures_lite::future::block_on(task.run(worker_cancellation.clone()))?;
-                }
-                Ok(())
+                    Err(error) => Err(error),
+                };
+                let _ = completed.send(());
+                report
             })
             .expect("the operating system must create the maintenance worker");
         MaintenanceWorker {
             cancellation,
             join: Some(join),
+            completion,
+            failure_receiver,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceFailure {
+    index: usize,
+    error: MaintenanceError,
+}
+
+impl MaintenanceFailure {
+    #[must_use]
+    pub const fn task_index(&self) -> usize {
+        self.index
+    }
+
+    #[must_use]
+    pub const fn error(&self) -> &MaintenanceError {
+        &self.error
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceReport {
+    failures: Vec<MaintenanceFailure>,
+}
+
+impl MaintenanceReport {
+    #[must_use]
+    pub fn failures(&self) -> &[MaintenanceFailure] {
+        &self.failures
     }
 }
 
 pub struct MaintenanceWorker {
     cancellation: CancellationToken,
-    join: Option<JoinHandle<Result<(), MaintenanceError>>>,
+    join: Option<JoinHandle<Result<MaintenanceReport, MaintenanceError>>>,
+    completion: Receiver<()>,
+    failure_receiver: async_channel::Receiver<MaintenanceFailure>,
 }
 
 impl MaintenanceWorker {
-    pub fn wait(mut self) -> Result<(), MaintenanceError> {
+    #[must_use]
+    pub fn failures(&self) -> async_channel::Receiver<MaintenanceFailure> {
+        self.failure_receiver.clone()
+    }
+
+    pub fn wait(mut self) -> Result<MaintenanceReport, MaintenanceError> {
         self.join
             .take()
             .ok_or(MaintenanceError::Stopped)?
@@ -99,8 +157,17 @@ impl MaintenanceWorker {
 impl Drop for MaintenanceWorker {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        match self.completion.recv_timeout(SHUTDOWN_GRACE) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if let Some(join) = self.join.take() {
+                    let _ = join.join();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // A blocking filesystem or HTTP provider cannot delay application
+                // teardown. Dropping the handle safely detaches the bounded worker.
+                self.join.take();
+            }
         }
     }
 }

@@ -31,6 +31,7 @@ fn disabled_and_not_yet_due_checks_do_not_fetch() {
             calls: Arc::clone(&calls),
         },
         UpdateMetadataVerifier::project_key(),
+        "0.1.0",
     );
 
     let disabled = futures_lite::future::block_on(check.check(
@@ -58,6 +59,7 @@ fn rejects_non_https_metadata_before_fetch() {
             calls: Arc::clone(&calls),
         },
         UpdateMetadataVerifier::project_key(),
+        "0.1.0",
     );
     let result = futures_lite::future::block_on(check.check(
         UpdatePolicy::enabled("http://updates.musheen.test/latest.json", 0),
@@ -66,6 +68,30 @@ fn rejects_non_https_metadata_before_fetch() {
     ));
     assert!(matches!(result, Err(UpdateError::InsecureTransport)));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn only_versions_newer_than_the_running_application_are_offered() {
+    let body: Box<[u8]> = include_bytes!("fixtures/update-valid.json")
+        .as_slice()
+        .into();
+    for (running, expected) in [("0.1.0", true), ("0.2.0", false), ("0.3.0", false)] {
+        let check = UpdateCheck::new(
+            FakeFetcher {
+                body: body.clone(),
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            UpdateMetadataVerifier::project_key(),
+            running,
+        );
+        let offer = futures_lite::future::block_on(check.check(
+            UpdatePolicy::enabled("https://updates.musheen.test/latest.json", 0),
+            2_000_000_000,
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        assert_eq!(matches!(offer, UpdateOffer::Information(_)), expected);
+    }
 }
 
 #[test]

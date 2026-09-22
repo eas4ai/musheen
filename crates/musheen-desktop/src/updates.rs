@@ -98,6 +98,7 @@ impl UpdatePolicy {
 pub enum UpdateOffer {
     Disabled,
     NotDue,
+    Current,
     Information(UpdateInformation),
 }
 
@@ -128,12 +129,18 @@ impl UpdateInformation {
 pub struct UpdateCheck<F> {
     fetcher: F,
     verifier: UpdateMetadataVerifier,
+    running_version: semver::Version,
 }
 
 impl<F: MetadataFetcher> UpdateCheck<F> {
     #[must_use]
-    pub const fn new(fetcher: F, verifier: UpdateMetadataVerifier) -> Self {
-        Self { fetcher, verifier }
+    pub fn new(fetcher: F, verifier: UpdateMetadataVerifier, running_version: &str) -> Self {
+        Self {
+            fetcher,
+            verifier,
+            running_version: semver::Version::parse(running_version)
+                .expect("the application package version is valid semantic versioning"),
+        }
     }
 
     pub async fn check(
@@ -159,9 +166,14 @@ impl<F: MetadataFetcher> UpdateCheck<F> {
             return Err(UpdateError::Cancelled);
         }
         let body = self.fetcher.fetch(url, cancellation).await?;
-        self.verifier
-            .verify(&body, now_unix)
-            .map(UpdateOffer::Information)
+        let information = self.verifier.verify(&body, now_unix)?;
+        let candidate = semver::Version::parse(information.version())
+            .map_err(|_| UpdateError::InvalidMetadata)?;
+        if candidate <= self.running_version {
+            Ok(UpdateOffer::Current)
+        } else {
+            Ok(UpdateOffer::Information(information))
+        }
     }
 }
 
@@ -282,7 +294,11 @@ impl<F: MetadataFetcher + Clone, S: UpdateOfferSink + Clone> crate::MaintenanceT
         &self,
         cancellation: CancellationToken,
     ) -> BoxFuture<'static, Result<(), crate::MaintenanceError>> {
-        let check = UpdateCheck::new(self.check.fetcher.clone(), self.check.verifier.clone());
+        let check = UpdateCheck {
+            fetcher: self.check.fetcher.clone(),
+            verifier: self.check.verifier.clone(),
+            running_version: self.check.running_version.clone(),
+        };
         let policy = self.policy.clone();
         let sink = self.sink.clone();
         Box::pin(async move {
@@ -294,7 +310,7 @@ impl<F: MetadataFetcher + Clone, S: UpdateOfferSink + Clone> crate::MaintenanceT
                 Ok(UpdateOffer::Information(offer)) => {
                     sink.offer(offer).map_err(crate::MaintenanceError::Task)
                 }
-                Ok(UpdateOffer::Disabled | UpdateOffer::NotDue) => Ok(()),
+                Ok(UpdateOffer::Disabled | UpdateOffer::NotDue | UpdateOffer::Current) => Ok(()),
                 Err(UpdateError::Cancelled) => Err(crate::MaintenanceError::Cancelled),
                 Err(error) => Err(crate::MaintenanceError::Task(error.to_string().into())),
             }

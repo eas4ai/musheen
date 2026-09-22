@@ -1,7 +1,8 @@
-use musheen_core::StorePath;
+use musheen_core::{BoxFuture, StorePath};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt as _;
@@ -10,6 +11,7 @@ pub const FILE_MANAGER_NAME: &str = "org.freedesktop.FileManager1";
 pub const FILE_MANAGER_PATH: &str = "/org/freedesktop/FileManager1";
 const MAX_URIS: usize = 256;
 const MAX_URI_BYTES: usize = 16 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileManagerRequest {
@@ -48,14 +50,91 @@ impl FileManagerRequest {
 }
 
 pub trait FileManagerRequestSink: Send + Sync + 'static {
-    fn submit(&self, request: FileManagerRequest) -> Result<(), FileManagerError>;
+    fn submit(
+        &self,
+        request: FileManagerRequest,
+    ) -> BoxFuture<'static, Result<(), FileManagerError>>;
 }
 
-impl FileManagerRequestSink for async_channel::Sender<FileManagerRequest> {
-    fn submit(&self, request: FileManagerRequest) -> Result<(), FileManagerError> {
-        self.try_send(request).map_err(|error| match error {
-            async_channel::TrySendError::Full(_) => FileManagerError::Busy,
-            async_channel::TrySendError::Closed(_) => FileManagerError::Unavailable,
+#[derive(Debug)]
+pub struct FileManagerRequestEnvelope {
+    request: FileManagerRequest,
+    acknowledgement: async_channel::Sender<Result<(), FileManagerError>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FileManagerAcknowledgement(async_channel::Sender<Result<(), FileManagerError>>);
+
+impl FileManagerAcknowledgement {
+    #[must_use]
+    pub fn channel() -> (Self, async_channel::Receiver<Result<(), FileManagerError>>) {
+        let (sender, receiver) = async_channel::bounded(1);
+        (Self(sender), receiver)
+    }
+
+    pub fn complete(&self, result: Result<(), FileManagerError>) {
+        let _ = self.0.try_send(result);
+    }
+}
+
+impl FileManagerRequestEnvelope {
+    #[must_use]
+    pub fn new(
+        request: FileManagerRequest,
+    ) -> (Self, async_channel::Receiver<Result<(), FileManagerError>>) {
+        let (acknowledgement, response) = async_channel::bounded(1);
+        (
+            Self {
+                request,
+                acknowledgement,
+            },
+            response,
+        )
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &FileManagerRequest {
+        &self.request
+    }
+
+    pub fn acknowledge(self, result: Result<(), FileManagerError>) {
+        let _ = self.acknowledgement.try_send(result);
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (FileManagerRequest, FileManagerAcknowledgement) {
+        (
+            self.request,
+            FileManagerAcknowledgement(self.acknowledgement),
+        )
+    }
+}
+
+impl FileManagerRequestSink for async_channel::Sender<FileManagerRequestEnvelope> {
+    fn submit(
+        &self,
+        request: FileManagerRequest,
+    ) -> BoxFuture<'static, Result<(), FileManagerError>> {
+        let sender = self.clone();
+        Box::pin(async move {
+            let (envelope, response) = FileManagerRequestEnvelope::new(request);
+            sender.try_send(envelope).map_err(|error| match error {
+                async_channel::TrySendError::Full(_) => FileManagerError::Busy,
+                async_channel::TrySendError::Closed(_) => FileManagerError::Unavailable,
+            })?;
+            futures_lite::future::race(
+                async {
+                    response
+                        .recv()
+                        .await
+                        .map_err(|_| FileManagerError::Unavailable)?
+                },
+                async {
+                    async_io::Timer::after(REQUEST_TIMEOUT).await;
+                    Err(FileManagerError::TimedOut)
+                },
+            )
+            .await
         })
     }
 }
@@ -71,25 +150,35 @@ impl FileManager1 {
         Self { sink }
     }
 
-    pub fn show_items(&self, uris: &[&str], startup_id: &str) -> Result<(), FileManagerError> {
+    pub async fn show_items(
+        &self,
+        uris: &[&str],
+        startup_id: &str,
+    ) -> Result<(), FileManagerError> {
         self.dispatch(uris, startup_id, |locations, startup_id| {
             FileManagerRequest::ShowItems {
                 locations,
                 startup_id,
             }
         })
+        .await
     }
 
-    pub fn show_folders(&self, uris: &[&str], startup_id: &str) -> Result<(), FileManagerError> {
+    pub async fn show_folders(
+        &self,
+        uris: &[&str],
+        startup_id: &str,
+    ) -> Result<(), FileManagerError> {
         self.dispatch(uris, startup_id, |locations, startup_id| {
             FileManagerRequest::ShowFolders {
                 locations,
                 startup_id,
             }
         })
+        .await
     }
 
-    pub fn show_item_properties(
+    pub async fn show_item_properties(
         &self,
         uris: &[&str],
         startup_id: &str,
@@ -100,9 +189,10 @@ impl FileManager1 {
                 startup_id,
             }
         })
+        .await
     }
 
-    fn dispatch(
+    async fn dispatch(
         &self,
         uris: &[&str],
         startup_id: &str,
@@ -115,7 +205,10 @@ impl FileManager1 {
             .iter()
             .map(|uri| parse_file_uri(uri))
             .collect::<Result<Vec<_>, _>>()?;
-        self.sink.submit(request(locations, startup_id.into()))
+        validate_local_locations(locations.clone()).await?;
+        self.sink
+            .submit(request(locations, startup_id.into()))
+            .await
     }
 }
 
@@ -128,7 +221,9 @@ impl FileManager1 {
         startup_id: String,
     ) -> zbus::fdo::Result<()> {
         let uris = uris.iter().map(String::as_str).collect::<Vec<_>>();
-        self.show_items(&uris, &startup_id).map_err(dbus_error)
+        self.show_items(&uris, &startup_id)
+            .await
+            .map_err(dbus_error)
     }
 
     #[zbus(name = "ShowFolders")]
@@ -138,7 +233,9 @@ impl FileManager1 {
         startup_id: String,
     ) -> zbus::fdo::Result<()> {
         let uris = uris.iter().map(String::as_str).collect::<Vec<_>>();
-        self.show_folders(&uris, &startup_id).map_err(dbus_error)
+        self.show_folders(&uris, &startup_id)
+            .await
+            .map_err(dbus_error)
     }
 
     #[zbus(name = "ShowItemProperties")]
@@ -149,8 +246,40 @@ impl FileManager1 {
     ) -> zbus::fdo::Result<()> {
         let uris = uris.iter().map(String::as_str).collect::<Vec<_>>();
         self.show_item_properties(&uris, &startup_id)
+            .await
             .map_err(dbus_error)
     }
+}
+
+async fn validate_local_locations(locations: Vec<StorePath>) -> Result<(), FileManagerError> {
+    let (completed, result) = async_channel::bounded(1);
+    std::thread::Builder::new()
+        .name("musheen-file-manager1-validation".into())
+        .spawn(move || {
+            let outcome = locations.iter().try_for_each(|location| {
+                let path = location
+                    .as_unix_path()
+                    .ok_or(FileManagerError::UnsupportedUri)?;
+                std::fs::metadata(path)
+                    .map(|_| ())
+                    .map_err(|_| FileManagerError::Unreachable)
+            });
+            let _ = completed.try_send(outcome);
+        })
+        .map_err(|error| FileManagerError::Service(error.to_string().into()))?;
+    futures_lite::future::race(
+        async {
+            result
+                .recv()
+                .await
+                .unwrap_or(Err(FileManagerError::Unavailable))
+        },
+        async {
+            async_io::Timer::after(REQUEST_TIMEOUT).await;
+            Err(FileManagerError::TimedOut)
+        },
+    )
+    .await
 }
 
 pub async fn serve_file_manager1(
@@ -227,9 +356,12 @@ fn dbus_error(error: FileManagerError) -> zbus::fdo::Error {
         FileManagerError::InvalidRequest
         | FileManagerError::InvalidUri
         | FileManagerError::UnsupportedUri => zbus::fdo::Error::InvalidArgs(error.to_string()),
-        FileManagerError::Busy | FileManagerError::Unavailable | FileManagerError::Service(_) => {
-            zbus::fdo::Error::Failed(error.to_string())
-        }
+        FileManagerError::Busy
+        | FileManagerError::Unavailable
+        | FileManagerError::Unreachable
+        | FileManagerError::Blocked
+        | FileManagerError::TimedOut
+        | FileManagerError::Service(_) => zbus::fdo::Error::Failed(error.to_string()),
     }
 }
 
@@ -240,6 +372,9 @@ pub enum FileManagerError {
     UnsupportedUri,
     Busy,
     Unavailable,
+    Unreachable,
+    Blocked,
+    TimedOut,
     Service(Box<str>),
 }
 
@@ -251,6 +386,9 @@ impl fmt::Display for FileManagerError {
             Self::UnsupportedUri => formatter.write_str("only local file URIs are supported"),
             Self::Busy => formatter.write_str("the application request queue is busy"),
             Self::Unavailable => formatter.write_str("the application request receiver is closed"),
+            Self::Unreachable => formatter.write_str("a requested local path is unreachable"),
+            Self::Blocked => formatter.write_str("the target window is blocked by a modal dialog"),
+            Self::TimedOut => formatter.write_str("the FileManager1 request timed out"),
             Self::Service(reason) => write!(formatter, "FileManager1 service failed: {reason}"),
         }
     }

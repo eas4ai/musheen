@@ -10,7 +10,12 @@ use std::sync::Mutex;
 struct RecordingNotifications(Mutex<Vec<NotificationEvent>>);
 
 impl NotificationSink for RecordingNotifications {
-    fn send(&self, event: &NotificationEvent) -> Result<(), Box<str>> {
+    fn send(
+        &self,
+        event: &NotificationEvent,
+        _action_label: &str,
+        _actions: async_channel::Sender<NotificationAction>,
+    ) -> Result<(), Box<str>> {
         self.0.lock().unwrap().push(event.clone());
         Ok(())
     }
@@ -22,23 +27,30 @@ fn only_background_completion_and_failure_notify() {
     let policy = NotificationPolicy::new(sink);
     let job = JobId::new(42).unwrap();
     let command = CommandId::new("file.copy").unwrap();
+    let (actions, _receiver) = async_channel::bounded(4);
 
     policy
         .publish(
             NotificationEvent::completed(job, command.clone(), "Copy complete"),
             OperationVisibility::VisibleWindow,
+            "Show in Musheen",
+            actions.clone(),
         )
         .unwrap();
     policy
         .publish(
             NotificationEvent::progress(job, command.clone(), "Halfway"),
             OperationVisibility::NoVisibleWindow,
+            "Show in Musheen",
+            actions.clone(),
         )
         .unwrap();
     policy
         .publish(
             NotificationEvent::failed(job, command, "Copy failed"),
             OperationVisibility::NoVisibleWindow,
+            "Show in Musheen",
+            actions.clone(),
         )
         .unwrap();
     policy
@@ -49,6 +61,8 @@ fn only_background_completion_and_failure_notify() {
                 "Hidden-window copy complete",
             ),
             OperationVisibility::NoVisibleWindow,
+            "Show in Musheen",
+            actions.clone(),
         )
         .unwrap();
     policy
@@ -59,6 +73,8 @@ fn only_background_completion_and_failure_notify() {
                 "Closed-window copy failed",
             ),
             OperationVisibility::NoVisibleWindow,
+            "Show in Musheen",
+            actions,
         )
         .unwrap();
 

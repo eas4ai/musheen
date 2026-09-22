@@ -11,7 +11,9 @@ use crate::dialogs::{
     install_open_with_key_bindings, install_properties_key_bindings, open_with_window_options,
     properties_window_options,
 };
-use crate::directory::{DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory};
+use crate::directory::{
+    ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
+};
 use crate::i18n::{Catalog, Locale};
 use crate::icons::{ApplicationIdentity, ContentIdentity, freedesktop_icon_name};
 use crate::info_pane::{
@@ -86,6 +88,7 @@ use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::NativeTheme;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1407,8 +1410,8 @@ pub fn run(initial_path: PathBuf) {
                     eprintln!("Musheen could not load settings: {error}");
                     musheen_desktop::SettingsDocument::default()
                 });
+            install_desktop_portals(&settings, cx);
             let maintenance_readiness = install_desktop_maintenance(&settings, cx);
-            install_desktop_notifications(&settings, cx);
             if std::env::var_os("MUSHEEN_THEME_PREVIEW").is_none() {
                 crate::settings::apply_appearance(&settings, cx);
             }
@@ -1448,6 +1451,7 @@ pub fn run(initial_path: PathBuf) {
             )));
             let operation_hub =
                 OperationHub::for_current_user_with_provider_runtime(&limits, &providers);
+            install_desktop_notifications(&settings, operation_hub.clone(), cx);
             let volume_runtime = VolumeRuntime::system_with_usage(Arc::new(HubVolumeUsage {
                 hub: operation_hub.clone(),
             }))
@@ -1517,6 +1521,148 @@ pub fn run(initial_path: PathBuf) {
         });
 }
 
+struct DesktopPortalClient {
+    client: Arc<musheen_desktop::PortalClient<musheen_desktop::AshpdPortalTransport>>,
+    sandboxed: bool,
+}
+
+impl Global for DesktopPortalClient {}
+
+fn install_desktop_portals(settings: &musheen_desktop::SettingsDocument, cx: &mut App) {
+    let sandbox = musheen_desktop::SandboxState::detect();
+    let backend_enabled = settings.value("integrations.portal").as_deref() == Some("musheen");
+    let own_backend = backend_enabled.then(|| musheen_desktop::MUSHEEN_PORTAL_BACKEND.into());
+    cx.set_global(DesktopPortalClient {
+        client: Arc::new(musheen_desktop::PortalClient::new(
+            musheen_desktop::AshpdPortalTransport::default(),
+            sandbox,
+            own_backend,
+        )),
+        sandboxed: sandbox == musheen_desktop::SandboxState::Sandboxed,
+    });
+    #[cfg(feature = "portal-backend")]
+    if backend_enabled {
+        install_portal_backend(cx);
+    }
+    #[cfg(not(feature = "portal-backend"))]
+    if backend_enabled {
+        eprintln!("Musheen's portal backend is enabled in settings but was not built");
+    }
+}
+
+#[cfg(feature = "portal-backend")]
+struct PortalChooserEnvelope {
+    request: musheen_desktop::BackendChooserRequest,
+    response: async_channel::Sender<musheen_desktop::BackendChooserDecision>,
+}
+
+#[cfg(feature = "portal-backend")]
+struct GpuiPortalChooser {
+    requests: async_channel::Sender<PortalChooserEnvelope>,
+}
+
+#[cfg(feature = "portal-backend")]
+impl musheen_desktop::BackendChooserUi for GpuiPortalChooser {
+    fn choose(
+        &self,
+        request: musheen_desktop::BackendChooserRequest,
+        cancellation: CancellationToken,
+    ) -> musheen_core::BoxFuture<
+        'static,
+        Result<musheen_desktop::BackendChooserDecision, musheen_desktop::PortalError>,
+    > {
+        let requests = self.requests.clone();
+        Box::pin(async move {
+            let (response, decision) = async_channel::bounded(1);
+            requests
+                .try_send(PortalChooserEnvelope { request, response })
+                .map_err(|error| {
+                    musheen_desktop::PortalError::Unavailable(error.to_string().into())
+                })?;
+            futures_lite::future::race(
+                async {
+                    decision.recv().await.map_err(|error| {
+                        musheen_desktop::PortalError::Unavailable(error.to_string().into())
+                    })
+                },
+                async {
+                    futures_lite::future::poll_fn(|context| {
+                        if cancellation.is_cancelled() {
+                            std::task::Poll::Ready(())
+                        } else {
+                            cancellation.register_waker(context.waker());
+                            if cancellation.is_cancelled() {
+                                std::task::Poll::Ready(())
+                            } else {
+                                std::task::Poll::Pending
+                            }
+                        }
+                    })
+                    .await;
+                    Err(musheen_desktop::PortalError::Cancelled)
+                },
+            )
+            .await
+        })
+    }
+}
+
+#[cfg(feature = "portal-backend")]
+fn install_portal_backend(cx: &mut App) {
+    let (requests, receiver) = async_channel::bounded(16);
+    cx.spawn(async move |cx| {
+        while let Ok(envelope) = receiver.recv().await {
+            cx.update(|cx| route_portal_chooser(envelope, cx));
+        }
+    })
+    .detach();
+    let retry_executor = cx.background_executor().clone();
+    cx.background_executor()
+        .spawn(async move {
+            let mut retry_delay = Duration::from_secs(1);
+            loop {
+                match musheen_desktop::serve_file_chooser_backend(
+                    None,
+                    Arc::new(GpuiPortalChooser {
+                        requests: requests.clone(),
+                    }),
+                    musheen_desktop::MUSHEEN_PORTAL_BACKEND,
+                    ApplicationIdentity::ID,
+                )
+                .await
+                {
+                    Ok(connection) => {
+                        retry_delay = Duration::from_secs(1);
+                        connection.closed().await;
+                    }
+                    Err(error) => {
+                        eprintln!("Musheen could not export its portal backend: {error}");
+                    }
+                }
+                retry_executor.timer(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+            }
+        })
+        .detach();
+}
+
+#[cfg(feature = "portal-backend")]
+fn route_portal_chooser(envelope: PortalChooserEnvelope, cx: &mut App) {
+    let target = cx
+        .global::<FileManagerWindows>()
+        .entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry.view.upgrade());
+    let Some(view) = target else {
+        let _ = envelope
+            .response
+            .try_send(musheen_desktop::BackendChooserDecision::Cancelled);
+        return;
+    };
+    view.update(cx, |state, cx| state.open_portal_chooser(envelope, cx));
+}
+
 fn install_file_manager1(cx: &mut App) {
     if cx.has_global::<FileManagerWindows>() {
         return;
@@ -1543,35 +1689,73 @@ fn install_file_manager1(cx: &mut App) {
         })
         .detach();
     cx.spawn(async move |cx| {
-        while let Ok(request) = receiver.recv().await {
-            cx.update(|cx| route_file_manager_request(request, cx));
+        while let Ok(envelope) = receiver.recv().await {
+            cx.update(|cx| {
+                route_file_manager_request(envelope, cx);
+            });
         }
     })
     .detach();
 }
 
 fn register_file_manager_window(view: &Entity<MusheenApp>, window: &mut Window, cx: &mut App) {
+    let window_id = window.window_handle().window_id();
+    let release = cx.observe_release(view, move |_, cx| {
+        if cx.has_global::<FileManagerWindows>() {
+            cx.global_mut::<FileManagerWindows>()
+                .entries
+                .retain(|entry| entry.window_id != window_id);
+        }
+    });
+    let close = cx.on_window_closed(move |cx, closed| {
+        if closed == window_id && cx.has_global::<FileManagerWindows>() {
+            cx.global_mut::<FileManagerWindows>()
+                .entries
+                .retain(|entry| entry.window_id != window_id);
+        }
+    });
     let windows = cx.global_mut::<FileManagerWindows>();
-    windows.entries.retain(|(view, _)| view.upgrade().is_some());
     windows
         .entries
-        .push((view.downgrade(), window.window_handle()));
+        .retain(|entry| entry.view.upgrade().is_some() && entry.window_id != window_id);
+    windows.entries.push(RegisteredBrowserWindow {
+        view: view.downgrade(),
+        handle: window.window_handle(),
+        window_id,
+        _release: release,
+        _close: close,
+    });
 }
 
-fn route_file_manager_request(request: musheen_desktop::FileManagerRequest, cx: &mut App) {
+fn route_file_manager_request(envelope: musheen_desktop::FileManagerRequestEnvelope, cx: &mut App) {
+    let (request, acknowledgement) = envelope.into_parts();
     let target = cx
         .global::<FileManagerWindows>()
         .entries
         .iter()
         .rev()
-        .find_map(|(view, handle)| view.upgrade().map(|view| (view, *handle)));
+        .find_map(|entry| entry.view.upgrade().map(|view| (view, entry.handle)));
     let Some((view, handle)) = target else {
+        acknowledgement.complete(Err(musheen_desktop::FileManagerError::Unavailable));
         return;
     };
-    let _ = handle.update(cx, |_, window, _| window.activate_window());
-    view.update(cx, |state, cx| {
-        state.apply_file_manager_request(request, cx);
+    if handle
+        .update(cx, |_, window, _| window.activate_window())
+        .is_err()
+    {
+        acknowledgement.complete(Err(musheen_desktop::FileManagerError::Unavailable));
+        return;
+    }
+    let result = view.update(cx, |state, cx| {
+        if state.browser_input_blocked() {
+            state.activate_context_dialog(cx);
+            return Err(musheen_desktop::FileManagerError::Blocked);
+        }
+        state.apply_file_manager_request(request, acknowledgement.clone(), cx)
     });
+    if let Err(error) = result {
+        acknowledgement.complete(Err(error));
+    }
 }
 
 fn install_desktop_maintenance(
@@ -1588,13 +1772,40 @@ fn install_desktop_maintenance(
             musheen_desktop::UpdateCheck::new(
                 musheen_desktop::HttpsMetadataFetcher::default(),
                 musheen_desktop::UpdateMetadataVerifier::project_key(),
+                env!("CARGO_PKG_VERSION"),
             ),
             musheen_desktop::UpdatePolicy::enabled("https://updates.musheen.app/v1/latest.json", 0),
             offers,
         )));
     }
     let worker = musheen_desktop::MaintenanceCoordinator::new(readiness.clone(), tasks).start();
+    let failures = worker.failures();
     cx.set_global(DesktopMaintenanceOwner { _worker: worker });
+    cx.spawn(async move |cx| {
+        while failures.recv().await.is_ok() {
+            cx.update(|cx| {
+                let target = cx
+                    .global::<FileManagerWindows>()
+                    .entries
+                    .iter()
+                    .rev()
+                    .find_map(|entry| entry.view.upgrade());
+                if let Some(view) = target {
+                    view.update(cx, |state, cx| {
+                        state.operation_error = Some(
+                            state
+                                .catalog
+                                .message("maintenance-task-failed")
+                                .expect("maintenance failure is localized")
+                                .into(),
+                        );
+                        cx.notify();
+                    });
+                }
+            });
+        }
+    })
+    .detach();
     cx.spawn(async move |cx| {
         while let Ok(offer) = receiver.recv().await {
             cx.update(|cx| {
@@ -1603,7 +1814,7 @@ fn install_desktop_maintenance(
                     .entries
                     .iter()
                     .rev()
-                    .find_map(|(view, _)| view.upgrade());
+                    .find_map(|entry| entry.view.upgrade());
                 if let Some(view) = target {
                     view.update(cx, |state, cx| {
                         state.update_offer = Some(offer);
@@ -1618,12 +1829,179 @@ fn install_desktop_maintenance(
     readiness
 }
 
-fn install_desktop_notifications(settings: &musheen_desktop::SettingsDocument, cx: &mut App) {
+fn install_desktop_notifications(
+    settings: &musheen_desktop::SettingsDocument,
+    operation_hub: OperationHub,
+    cx: &mut App,
+) {
     let enabled = settings.value("integrations.notifications").as_deref() != Some("false");
+    let (actions, action_receiver) = async_channel::bounded(32);
     cx.set_global(DesktopNotificationOwner::new(
         enabled,
         Arc::new(musheen_desktop::NotifyRustSink),
+        actions,
     ));
+    cx.spawn(async move |cx| {
+        while let Ok(action) = action_receiver.recv().await {
+            cx.update(|cx| activate_notification_action(action, cx));
+        }
+    })
+    .detach();
+    let catalog = Catalog::system().expect("the installed locale catalogs are valid");
+    let completed_summary = catalog
+        .message("notification-operation-completed")
+        .expect("operation completion notification is localized")
+        .to_owned();
+    let failed_summary = catalog
+        .message("notification-operation-failed")
+        .expect("operation failure notification is localized")
+        .to_owned();
+    let action_label = catalog
+        .message("notification-show-in-musheen")
+        .expect("notification action label is localized")
+        .to_owned();
+    cx.spawn(async move |cx| {
+        let mut revision = operation_hub.status_revision();
+        loop {
+            cx.background_executor()
+                .timer(OPERATION_STATUS_REFRESH_INTERVAL)
+                .await;
+            let next = operation_hub.status_revision();
+            if next == revision {
+                continue;
+            }
+            revision = next;
+            let entries = operation_hub
+                .status()
+                .lock()
+                .map(|status| status.visible_entries().into_iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            cx.update(|cx| {
+                let visible = any_browser_window_visible(cx);
+                for entry in entries {
+                    let outcome = match entry.status() {
+                        OperationStatus::Completed => {
+                            musheen_desktop::NotificationOutcome::Completed
+                        }
+                        OperationStatus::Failed
+                        | OperationStatus::Recoverable
+                        | OperationStatus::NeedsAttention
+                        | OperationStatus::PartialSuccess => {
+                            musheen_desktop::NotificationOutcome::Failed
+                        }
+                        _ => continue,
+                    };
+                    let marker = NotificationMarker {
+                        job: entry.id(),
+                        generation: entry.generation(),
+                    };
+                    if visible {
+                        cx.global_mut::<DesktopNotificationOwner>().suppress(marker);
+                        continue;
+                    }
+                    if !cx.global_mut::<DesktopNotificationOwner>().claim(marker) {
+                        continue;
+                    }
+                    let command = operation_command_id(entry.kind());
+                    let summary: Box<str> = match outcome {
+                        musheen_desktop::NotificationOutcome::Completed => &completed_summary,
+                        musheen_desktop::NotificationOutcome::Failed => &failed_summary,
+                        musheen_desktop::NotificationOutcome::Progress => unreachable!(),
+                    }
+                    .as_str()
+                    .into();
+                    let action_label = action_label.clone();
+                    cx.spawn(async move |cx| {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        cx.update(|cx| {
+                            let delivery = cx
+                                .global_mut::<DesktopNotificationOwner>()
+                                .finish(marker);
+                            if any_browser_window_visible(cx) {
+                                return;
+                            }
+                            let Some((sink, actions)) = delivery else {
+                                return;
+                            };
+                            let event = match outcome {
+                                musheen_desktop::NotificationOutcome::Completed => {
+                                    musheen_desktop::NotificationEvent::completed(
+                                        marker.job,
+                                        command,
+                                        summary,
+                                    )
+                                }
+                                musheen_desktop::NotificationOutcome::Failed => {
+                                    musheen_desktop::NotificationEvent::failed(
+                                        marker.job,
+                                        command,
+                                        summary,
+                                    )
+                                }
+                                musheen_desktop::NotificationOutcome::Progress => unreachable!(),
+                            };
+                            cx.background_executor()
+                                .spawn(async move {
+                                    let policy = musheen_desktop::NotificationPolicy::new(sink);
+                                    if let Err(error) = policy.publish(
+                                        event,
+                                        musheen_desktop::OperationVisibility::NoVisibleWindow,
+                                        &action_label,
+                                        actions,
+                                    ) {
+                                        eprintln!(
+                                            "Musheen could not send an operation notification: {error}"
+                                        );
+                                    }
+                                })
+                                .detach();
+                        });
+                    })
+                    .detach();
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+fn any_browser_window_visible(cx: &mut App) -> bool {
+    let handles = cx
+        .global::<FileManagerWindows>()
+        .entries
+        .iter()
+        .filter(|entry| entry.view.upgrade().is_some())
+        .map(|entry| entry.handle)
+        .collect::<Vec<_>>();
+    handles.into_iter().any(|handle| {
+        handle
+            .update(cx, |_, window, _| window.is_visible())
+            .unwrap_or(false)
+    })
+}
+
+fn activate_notification_action(action: musheen_desktop::NotificationAction, cx: &mut App) {
+    let target = cx
+        .global::<FileManagerWindows>()
+        .entries
+        .iter()
+        .rev()
+        .find_map(|entry| entry.view.upgrade().map(|view| (view, entry.handle)));
+    let Some((view, handle)) = target else {
+        return;
+    };
+    let _ = handle.update(cx, |_, window, _| window.activate_window());
+    view.update(cx, |state, cx| {
+        if state
+            .operation_hub
+            .status()
+            .lock()
+            .is_ok_and(|status| status.entry(action.job_id()).is_some())
+        {
+            state.status_center_open = true;
+            cx.notify();
+        }
+    });
 }
 
 fn operation_command_id(kind: OperationKind) -> CommandId {
@@ -1647,87 +2025,6 @@ fn operation_command_id(kind: OperationKind) -> CommandId {
         OperationKind::Preview => "file.preview",
     };
     CommandId::new(id).expect("built-in operation command IDs are valid")
-}
-
-fn schedule_terminal_notification(
-    entry: &OperationStatusEntry,
-    completed_summary: &str,
-    failed_summary: &str,
-    cx: &mut Context<MusheenApp>,
-) {
-    let outcome = match entry.status() {
-        OperationStatus::Completed => musheen_desktop::NotificationOutcome::Completed,
-        OperationStatus::Failed
-        | OperationStatus::Recoverable
-        | OperationStatus::NeedsAttention
-        | OperationStatus::PartialSuccess => musheen_desktop::NotificationOutcome::Failed,
-        OperationStatus::Pending
-        | OperationStatus::Running
-        | OperationStatus::Paused
-        | OperationStatus::Cancelled
-        | OperationStatus::Interrupted => return,
-    };
-    if !cx.has_global::<DesktopNotificationOwner>() {
-        return;
-    }
-    let marker = NotificationMarker {
-        job: entry.id(),
-        generation: entry.generation(),
-    };
-    if !cx.global_mut::<DesktopNotificationOwner>().claim(marker) {
-        return;
-    }
-    let command = operation_command_id(entry.kind());
-    let summary: Box<str> = match outcome {
-        musheen_desktop::NotificationOutcome::Completed => completed_summary,
-        musheen_desktop::NotificationOutcome::Failed => failed_summary,
-        musheen_desktop::NotificationOutcome::Progress => unreachable!(),
-    }
-    .into();
-    cx.spawn(async move |_, cx| {
-        cx.background_executor().timer(Duration::from_secs(2)).await;
-        cx.update(|cx| {
-            let handles = cx
-                .global::<FileManagerWindows>()
-                .entries
-                .iter()
-                .filter(|(view, _)| view.upgrade().is_some())
-                .map(|(_, handle)| *handle)
-                .collect::<Vec<_>>();
-            let visible = handles.into_iter().any(|handle| {
-                handle
-                    .update(cx, |_, window, _| window.is_visible())
-                    .unwrap_or(false)
-            });
-            let sink = cx.global_mut::<DesktopNotificationOwner>().finish(marker);
-            if visible {
-                return;
-            }
-            let Some(sink) = sink else {
-                return;
-            };
-            let event = match outcome {
-                musheen_desktop::NotificationOutcome::Completed => {
-                    musheen_desktop::NotificationEvent::completed(marker.job, command, summary)
-                }
-                musheen_desktop::NotificationOutcome::Failed => {
-                    musheen_desktop::NotificationEvent::failed(marker.job, command, summary)
-                }
-                musheen_desktop::NotificationOutcome::Progress => unreachable!(),
-            };
-            cx.background_executor()
-                .spawn(async move {
-                    let policy = musheen_desktop::NotificationPolicy::new(sink);
-                    if let Err(error) =
-                        policy.publish(event, musheen_desktop::OperationVisibility::NoVisibleWindow)
-                    {
-                        eprintln!("Musheen could not send an operation notification: {error}");
-                    }
-                })
-                .detach();
-        });
-    })
-    .detach();
 }
 
 fn application_window_options(width: f32, height: f32, cx: &App) -> WindowOptions {
@@ -2011,7 +2308,53 @@ struct HubVolumeReservation(crate::operations::OperationMountReservation);
 
 #[derive(Default)]
 struct FileManagerWindows {
-    entries: Vec<(WeakEntity<MusheenApp>, AnyWindowHandle)>,
+    entries: Vec<RegisteredBrowserWindow>,
+}
+
+struct RegisteredBrowserWindow {
+    view: WeakEntity<MusheenApp>,
+    handle: AnyWindowHandle,
+    window_id: WindowId,
+    _release: Subscription,
+    _close: Subscription,
+}
+
+struct PendingFileManagerCompletion {
+    remaining: AtomicUsize,
+    finished: AtomicBool,
+    acknowledgement: musheen_desktop::FileManagerAcknowledgement,
+}
+
+impl PendingFileManagerCompletion {
+    fn new(
+        remaining: usize,
+        acknowledgement: musheen_desktop::FileManagerAcknowledgement,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: AtomicUsize::new(remaining),
+            finished: AtomicBool::new(false),
+            acknowledgement,
+        })
+    }
+
+    fn complete_one(&self, result: Result<(), musheen_desktop::FileManagerError>) {
+        if let Err(error) = result {
+            if !self.finished.swap(true, Ordering::AcqRel) {
+                self.acknowledgement.complete(Err(error));
+            }
+            return;
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && !self.finished.swap(true, Ordering::AcqRel)
+        {
+            self.acknowledgement.complete(Ok(()));
+        }
+    }
+}
+
+struct PendingFileManagerSelection {
+    paths: Vec<StorePath>,
+    completion: Arc<PendingFileManagerCompletion>,
 }
 
 impl Global for FileManagerWindows {}
@@ -2033,15 +2376,21 @@ struct DesktopNotificationOwner {
     sink: Arc<dyn musheen_desktop::NotificationSink>,
     pending: BTreeSet<NotificationMarker>,
     handled: BTreeSet<NotificationMarker>,
+    actions: async_channel::Sender<musheen_desktop::NotificationAction>,
 }
 
 impl DesktopNotificationOwner {
-    fn new(enabled: bool, sink: Arc<dyn musheen_desktop::NotificationSink>) -> Self {
+    fn new(
+        enabled: bool,
+        sink: Arc<dyn musheen_desktop::NotificationSink>,
+        actions: async_channel::Sender<musheen_desktop::NotificationAction>,
+    ) -> Self {
         Self {
             enabled,
             sink,
             pending: BTreeSet::new(),
             handled: BTreeSet::new(),
+            actions,
         }
     }
 
@@ -2049,10 +2398,18 @@ impl DesktopNotificationOwner {
         self.enabled && !self.handled.contains(&marker) && self.pending.insert(marker)
     }
 
+    fn suppress(&mut self, marker: NotificationMarker) {
+        self.pending.remove(&marker);
+        self.handled.insert(marker);
+    }
+
     fn finish(
         &mut self,
         marker: NotificationMarker,
-    ) -> Option<Arc<dyn musheen_desktop::NotificationSink>> {
+    ) -> Option<(
+        Arc<dyn musheen_desktop::NotificationSink>,
+        async_channel::Sender<musheen_desktop::NotificationAction>,
+    )> {
         self.pending.remove(&marker);
         self.handled.insert(marker);
         while self.handled.len() > 4_096 {
@@ -2061,7 +2418,8 @@ impl DesktopNotificationOwner {
             };
             self.handled.remove(&oldest);
         }
-        self.enabled.then(|| Arc::clone(&self.sink))
+        self.enabled
+            .then(|| (Arc::clone(&self.sink), self.actions.clone()))
     }
 }
 
@@ -2129,7 +2487,8 @@ struct MusheenApp {
     pending_omnibar_value: Option<String>,
     content_focus: FocusHandle,
     pending_content_focus: bool,
-    pending_file_manager_selection: Option<Vec<StorePath>>,
+    pending_file_manager_selections: HashMap<TabId, PendingFileManagerSelection>,
+    last_file_manager_startup_id: Option<Box<str>>,
     pending_restored_focus: Option<FocusHandle>,
     browser_focus: Option<FocusHandle>,
     context_menu_focus: Option<FocusHandle>,
@@ -2394,7 +2753,8 @@ impl MusheenApp {
             pending_omnibar_value: None,
             content_focus: cx.focus_handle(),
             pending_content_focus: true,
-            pending_file_manager_selection: None,
+            pending_file_manager_selections: HashMap::new(),
+            last_file_manager_startup_id: None,
             pending_restored_focus: None,
             browser_focus: None,
             context_menu_focus: None,
@@ -2468,7 +2828,6 @@ impl MusheenApp {
                     let revision = state.operation_hub.status_revision();
                     if revision != state.operation_status_revision {
                         state.operation_status_revision = revision;
-                        state.schedule_operation_notifications(cx);
                         changed = true;
                     }
                     let revision = state.catalog_binding.revision();
@@ -2483,22 +2842,6 @@ impl MusheenApp {
             }
         })
         .detach();
-    }
-
-    fn schedule_operation_notifications(&self, cx: &mut Context<Self>) {
-        let completed_summary = self
-            .catalog
-            .message("notification-operation-completed")
-            .expect("operation completion notification is localized")
-            .to_owned();
-        let failed_summary = self
-            .catalog
-            .message("notification-operation-failed")
-            .expect("operation failure notification is localized")
-            .to_owned();
-        for entry in self.operation_status_entries() {
-            schedule_terminal_notification(&entry, &completed_summary, &failed_summary, cx);
-        }
     }
 
     fn install_volume_properties_cleanup(&mut self, cx: &mut Context<Self>) {
@@ -2798,7 +3141,9 @@ impl MusheenApp {
         match result {
             Ok(pages) => {
                 for page in pages {
-                    directory.apply_page(load, page);
+                    if directory.apply_page(load, page) == ApplyPageResult::Stale {
+                        return;
+                    }
                 }
                 let items = directory.items().to_vec();
                 let observation = if directory.view().is_complete() {
@@ -2816,28 +3161,44 @@ impl MusheenApp {
                 self.apply_pending_file_manager_selection(tab_id);
             }
             Err(error) => {
-                directory.apply_error(load, error.to_string());
+                if !directory.apply_error(load, error.to_string()) {
+                    return;
+                }
+                if let Some(pending) = self.pending_file_manager_selections.remove(&tab_id) {
+                    pending
+                        .completion
+                        .complete_one(Err(musheen_desktop::FileManagerError::Unreachable));
+                }
             }
         }
     }
 
     fn apply_pending_file_manager_selection(&mut self, tab_id: TabId) {
-        if self.navigation.focused_tab().id() != tab_id {
-            return;
-        }
-        let Some(paths) = self.pending_file_manager_selection.as_ref() else {
+        let Some(pending) = self.pending_file_manager_selections.remove(&tab_id) else {
             return;
         };
         let Some(directory) = self.directories.get_mut(&tab_id) else {
+            pending
+                .completion
+                .complete_one(Err(musheen_desktop::FileManagerError::Unavailable));
             return;
         };
         let ids = directory
             .items()
             .iter()
-            .filter(|item| paths.contains(item.path()))
+            .filter(|item| pending.paths.contains(item.path()))
             .map(|item| item.id().clone())
             .collect::<Vec<_>>();
-        if ids.is_empty() && !directory.view().is_complete() {
+        if ids.len() != pending.paths.len() {
+            self.operation_error = Some(
+                self.catalog
+                    .message("file-manager-items-not-found")
+                    .expect("the FileManager1 not-found error is localized")
+                    .into(),
+            );
+            pending
+                .completion
+                .complete_one(Err(musheen_desktop::FileManagerError::Unreachable));
             return;
         }
         directory.view_mut().clear_selection();
@@ -2852,48 +3213,93 @@ impl MusheenApp {
             );
         }
         directory.view_mut().focus_item(ids.first().cloned());
-        self.navigation.focused_tab_mut().set_selection(ids);
-        self.pending_file_manager_selection = None;
+        if let Some(tab) = self.navigation.tab_mut(tab_id) {
+            tab.set_selection(ids);
+        }
+        pending.completion.complete_one(Ok(()));
     }
 
     fn apply_file_manager_request(
         &mut self,
         request: musheen_desktop::FileManagerRequest,
+        acknowledgement: musheen_desktop::FileManagerAcknowledgement,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), musheen_desktop::FileManagerError> {
+        self.last_file_manager_startup_id = Some(request.startup_id().into());
         match request {
-            musheen_desktop::FileManagerRequest::ShowFolders { locations, .. } => {
-                if let Some(location) = locations.into_iter().next() {
-                    self.pending_file_manager_selection = None;
-                    self.navigate(location, true, cx);
+            musheen_desktop::FileManagerRequest::ShowFolders {
+                locations,
+                startup_id: _,
+            } => {
+                for (index, location) in locations.into_iter().enumerate() {
+                    if index == 0 {
+                        self.navigate(location, true, cx);
+                    } else {
+                        let tab_id = self
+                            .navigation
+                            .new_tab(location.clone())
+                            .map_err(|_| musheen_desktop::FileManagerError::Busy)?;
+                        self.start_load_for_tab(tab_id, location, cx);
+                    }
+                }
+                acknowledgement.complete(Ok(()));
+            }
+            musheen_desktop::FileManagerRequest::ShowItems {
+                locations,
+                startup_id: _,
+            } => {
+                let mut groups = Vec::<(StorePath, Vec<StorePath>)>::new();
+                for location in locations {
+                    let parent = location
+                        .as_unix_path()
+                        .and_then(Path::parent)
+                        .map(|path| StorePath::from_unix_path(path.as_os_str().to_owned()))
+                        .ok_or(musheen_desktop::FileManagerError::Unreachable)?;
+                    if let Some((_, items)) = groups.iter_mut().find(|(key, _)| key == &parent) {
+                        items.push(location);
+                    } else {
+                        groups.push((parent, vec![location]));
+                    }
+                }
+                let completion = PendingFileManagerCompletion::new(groups.len(), acknowledgement);
+                for (index, (parent, items)) in groups.into_iter().enumerate() {
+                    if index == 0 {
+                        let tab_id = self.navigation.focused_tab().id();
+                        self.pending_file_manager_selections.insert(
+                            tab_id,
+                            PendingFileManagerSelection {
+                                paths: items,
+                                completion: Arc::clone(&completion),
+                            },
+                        );
+                        self.navigate(parent, true, cx);
+                    } else {
+                        let tab_id = self
+                            .navigation
+                            .new_tab(parent.clone())
+                            .map_err(|_| musheen_desktop::FileManagerError::Busy)?;
+                        self.pending_file_manager_selections.insert(
+                            tab_id,
+                            PendingFileManagerSelection {
+                                paths: items,
+                                completion: Arc::clone(&completion),
+                            },
+                        );
+                        self.start_load_for_tab(tab_id, parent, cx);
+                    }
                 }
             }
-            musheen_desktop::FileManagerRequest::ShowItems { locations, .. } => {
-                let parent = locations
-                    .first()
-                    .and_then(StorePath::as_unix_path)
-                    .and_then(Path::parent)
-                    .map(|path| StorePath::from_unix_path(path.as_os_str().to_owned()));
-                if let Some(parent) = parent {
-                    self.pending_file_manager_selection = Some(locations);
-                    self.navigate(parent, true, cx);
-                } else {
-                    self.operation_error = Some(
-                        self.catalog
-                            .message("file-manager-item-parent-unavailable")
-                            .expect("the FileManager1 item error is localized")
-                            .into(),
-                    );
-                    cx.notify();
-                }
-            }
-            musheen_desktop::FileManagerRequest::ShowItemProperties { locations, .. } => {
+            musheen_desktop::FileManagerRequest::ShowItemProperties {
+                locations,
+                startup_id: _,
+            } => {
                 let paths = locations
                     .iter()
                     .filter_map(|location| location.as_unix_path().map(Path::to_path_buf))
                     .collect::<Vec<_>>();
                 if paths.len() == locations.len() {
                     self.open_properties_paths(paths, PropertiesPage::General, cx);
+                    acknowledgement.complete(Ok(()));
                 } else {
                     self.operation_error = Some(
                         self.catalog
@@ -2902,9 +3308,11 @@ impl MusheenApp {
                             .into(),
                     );
                     cx.notify();
+                    return Err(musheen_desktop::FileManagerError::Unreachable);
                 }
             }
         }
+        Ok(())
     }
 
     fn navigate(&mut self, location: StorePath, remember: bool, cx: &mut Context<Self>) {
@@ -4828,6 +5236,43 @@ impl MusheenApp {
         pending: PendingInvocation,
         cx: &mut Context<Self>,
     ) {
+        if let Some(portal) = cx.try_global::<DesktopPortalClient>()
+            && portal.sandboxed
+        {
+            let client = Arc::clone(&portal.client);
+            let pending_request = pending.clone();
+            cx.spawn(async move |this, cx| {
+                let result = client
+                    .choose(
+                        musheen_desktop::PortalRequest::open("Choose destination"),
+                        CancellationToken::new(),
+                    )
+                    .await;
+                let _ = this.update(cx, |state, cx| match result {
+                    Ok(selection) => {
+                        if let Some(path) = selection.paths().first() {
+                            let destination = if path.is_dir() {
+                                path.clone()
+                            } else {
+                                path.parent().unwrap_or(path).to_path_buf()
+                            };
+                            state.resolve_context_destination(
+                                pending_request,
+                                StorePath::from_unix_path(destination.into_os_string()),
+                                cx,
+                            );
+                        }
+                    }
+                    Err(musheen_desktop::PortalError::Cancelled) => {}
+                    Err(error) => {
+                        state.operation_error = Some(error.to_string().into());
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
         let tab_id = pending
             .origin_tab()
             .unwrap_or_else(|| self.navigation.focused_tab().id());
@@ -4857,6 +5302,62 @@ impl MusheenApp {
                 this.resolve_context_destination(pending.clone(), destination.clone(), cx);
             }
             ContextDestinationEvent::Cancelled => this.cancel_context_destination(cx),
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    #[cfg(feature = "portal-backend")]
+    fn open_portal_chooser(&mut self, envelope: PortalChooserEnvelope, cx: &mut Context<Self>) {
+        if self.browser_input_blocked() {
+            let _ = envelope
+                .response
+                .try_send(musheen_desktop::BackendChooserDecision::Cancelled);
+            return;
+        }
+        let tab_id = self.navigation.focused_tab().id();
+        let choices = self.context_destination_choices(tab_id);
+        let strings = ContextDialogStrings::from_catalog(&self.catalog);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(520.), px(540.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from(envelope.request.title().to_owned())),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(440.), px(300.))),
+            ..WindowOptions::default()
+        };
+        let mut dialog = None;
+        let dialog_window = match cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ContextDestinationDialog::new(choices, strings, window, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        }) {
+            Ok(window) => window,
+            Err(_) => {
+                let _ = envelope
+                    .response
+                    .try_send(musheen_desktop::BackendChooserDecision::Cancelled);
+                return;
+            }
+        };
+        self.track_context_dialog_window(dialog_window.window_id(), Some(tab_id), cx);
+        let dialog = dialog.expect("the portal chooser constructs its view");
+        let response = envelope.response;
+        let subscription = cx.subscribe(&dialog, move |_, _, event, _| {
+            let decision = match event {
+                ContextDestinationEvent::Chosen(destination) => {
+                    let paths = destination
+                        .as_unix_path()
+                        .map(Path::to_path_buf)
+                        .into_iter()
+                        .collect();
+                    musheen_desktop::BackendChooserDecision::Confirmed(paths)
+                }
+                ContextDestinationEvent::Cancelled => {
+                    musheen_desktop::BackendChooserDecision::Cancelled
+                }
+            };
+            let _ = response.try_send(decision);
         });
         self.conflict_subscriptions.push(subscription);
     }
@@ -6594,6 +7095,7 @@ impl MusheenApp {
                         cx,
                     )
                 });
+                register_file_manager_window(&view, window, cx);
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("Musheen could not open a detached tab window");
@@ -9778,8 +10280,26 @@ impl MusheenApp {
                                     .expect("the update information action is localized"),
                             )
                             .small()
-                            .on_click(cx.listener(move |_, _, _, _| {
-                                let _ = open::that(&url);
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                let url = url.clone();
+                                let launch = cx.background_spawn(async move {
+                                    open::that(url).map_err(|error| error.to_string())
+                                });
+                                cx.spawn(async move |this, cx| {
+                                    if launch.await.is_err() {
+                                        let _ = this.update(cx, |state, cx| {
+                                            state.operation_error = Some(
+                                                state
+                                                    .catalog
+                                                    .message("update-link-failed")
+                                                    .expect("the update-link error is localized")
+                                                    .into(),
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                })
+                                .detach();
                             })),
                     )
                 })
@@ -10418,14 +10938,21 @@ mod tests {
     struct NoopNotificationSink;
 
     impl musheen_desktop::NotificationSink for NoopNotificationSink {
-        fn send(&self, _event: &musheen_desktop::NotificationEvent) -> Result<(), Box<str>> {
+        fn send(
+            &self,
+            _event: &musheen_desktop::NotificationEvent,
+            _action_label: &str,
+            _actions: async_channel::Sender<musheen_desktop::NotificationAction>,
+        ) -> Result<(), Box<str>> {
             Ok(())
         }
     }
 
     #[test]
     fn terminal_notification_markers_are_global_and_generation_deduplicated() {
-        let mut owner = DesktopNotificationOwner::new(true, Arc::new(NoopNotificationSink));
+        let (actions, _) = async_channel::bounded(1);
+        let mut owner =
+            DesktopNotificationOwner::new(true, Arc::new(NoopNotificationSink), actions.clone());
         let marker = NotificationMarker {
             job: JobId::new(7).unwrap(),
             generation: EventGeneration::new(4),
@@ -10440,7 +10967,7 @@ mod tests {
             ..marker
         }));
         assert!(
-            !DesktopNotificationOwner::new(false, Arc::new(NoopNotificationSink)).claim(
+            !DesktopNotificationOwner::new(false, Arc::new(NoopNotificationSink), actions,).claim(
                 NotificationMarker {
                     generation: EventGeneration::new(6),
                     ..marker
@@ -12305,6 +12832,7 @@ mod tests {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
+            cx.set_global(FileManagerWindows::default());
         });
         let temporary = tempfile::tempdir().unwrap();
         filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
@@ -12318,6 +12846,7 @@ mod tests {
                     cx,
                 )
             });
+            register_file_manager_window(&view, window, cx);
             app = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -12448,6 +12977,18 @@ mod tests {
             window.remove_window();
         })
         .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(cx.global::<FileManagerWindows>().entries.len(), 1);
+            let (envelope, response) = musheen_desktop::FileManagerRequestEnvelope::new(
+                musheen_desktop::FileManagerRequest::ShowFolders {
+                    locations: vec![location],
+                    startup_id: "surviving-detached-window".into(),
+                },
+            );
+            route_file_manager_request(envelope, cx);
+            assert_eq!(response.try_recv().unwrap(), Ok(()));
+        });
     }
 
     struct ImmediateSearchStream(Option<SearchBatch>);
@@ -16663,11 +17204,13 @@ mod tests {
         .await;
 
         app.update(cx, |state, cx| {
-            state.apply_file_manager_request(
+            let (acknowledgement, _) = musheen_desktop::FileManagerAcknowledgement::channel();
+            let _ = state.apply_file_manager_request(
                 musheen_desktop::FileManagerRequest::ShowItems {
                     locations: vec![StorePath::from_unix_path(item.clone().into_os_string())],
                     startup_id: "test-activation".into(),
                 },
+                acknowledgement,
                 cx,
             );
         });
@@ -16680,11 +17223,13 @@ mod tests {
         assert_eq!(cx.windows(), vec![browser]);
 
         app.update(cx, |state, cx| {
-            state.apply_file_manager_request(
+            let (acknowledgement, _) = musheen_desktop::FileManagerAcknowledgement::channel();
+            let _ = state.apply_file_manager_request(
                 musheen_desktop::FileManagerRequest::ShowItemProperties {
                     locations: vec![StorePath::from_unix_path(item.into_os_string())],
                     startup_id: "test-properties".into(),
                 },
+                acknowledgement,
                 cx,
             );
         });
@@ -16692,5 +17237,140 @@ mod tests {
             cx.windows().len() == 2
         })
         .await;
+    }
+
+    #[gpui_kit::test]
+    async fn file_manager1_handles_every_item_and_acknowledges_after_selection(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let first_folder = temporary.path().join("first");
+        let second_folder = temporary.path().join("second");
+        filesystem::create_dir(&first_folder).unwrap();
+        filesystem::create_dir(&second_folder).unwrap();
+        let first_item = first_folder.join("first.txt");
+        let second_item = second_folder.join("second.txt");
+        filesystem::write(&first_item, b"first").unwrap();
+        filesystem::write(&second_item, b"second").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        let (acknowledgement, response) = musheen_desktop::FileManagerAcknowledgement::channel();
+        app.update(cx, |state, cx| {
+            state
+                .apply_file_manager_request(
+                    musheen_desktop::FileManagerRequest::ShowItems {
+                        locations: vec![
+                            StorePath::from_unix_path(first_item.into_os_string()),
+                            StorePath::from_unix_path(second_item.into_os_string()),
+                        ],
+                        startup_id: "multi-location-startup".into(),
+                    },
+                    acknowledgement,
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            let state = app.read(cx);
+            state
+                .navigation
+                .panes()
+                .iter()
+                .flat_map(|pane| pane.tabs())
+                .count()
+                == 2
+                && state
+                    .navigation
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.tabs())
+                    .all(|tab| tab.selection().len() == 1)
+        })
+        .await;
+        assert_eq!(response.try_recv().unwrap(), Ok(()));
+        assert_eq!(
+            cx.update(|cx| app.read(cx).last_file_manager_startup_id.clone())
+                .as_deref(),
+            Some("multi-location-startup")
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn file_manager1_refuses_a_request_when_no_browser_window_exists(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(FileManagerWindows::default());
+            let (envelope, response) = musheen_desktop::FileManagerRequestEnvelope::new(
+                musheen_desktop::FileManagerRequest::ShowFolders {
+                    locations: vec![StorePath::from_unix_path("/tmp")],
+                    startup_id: "no-window".into(),
+                },
+            );
+            route_file_manager_request(envelope, cx);
+            assert_eq!(
+                response.try_recv().unwrap(),
+                Err(musheen_desktop::FileManagerError::Unavailable)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn file_manager1_refuses_a_request_while_the_browser_is_modal_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+            cx.set_global(FileManagerWindows::default());
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            register_file_manager_window(&view, window, cx);
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let window_id = handle.window_id();
+        app.update(cx, |state, _| {
+            state.context_dialog_windows.push(ContextDialogWindow {
+                id: window_id,
+                origin_tab: state.navigation.focused_tab().id(),
+                focused_item: None,
+                restore_focus: state.content_focus.clone(),
+            });
+        });
+        cx.update(|cx| {
+            let (envelope, response) = musheen_desktop::FileManagerRequestEnvelope::new(
+                musheen_desktop::FileManagerRequest::ShowFolders {
+                    locations: vec![StorePath::from_unix_path(
+                        temporary.path().as_os_str().to_owned(),
+                    )],
+                    startup_id: "modal-blocked".into(),
+                },
+            );
+            route_file_manager_request(envelope, cx);
+            assert_eq!(
+                response.try_recv().unwrap(),
+                Err(musheen_desktop::FileManagerError::Blocked)
+            );
+        });
     }
 }

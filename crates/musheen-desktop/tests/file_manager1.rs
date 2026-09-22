@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use musheen_core::BoxFuture;
 use musheen_desktop::{FileManager1, FileManagerError, FileManagerRequest, FileManagerRequestSink};
 use std::io::{BufRead as _, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -9,26 +10,38 @@ use std::sync::{Arc, Mutex};
 struct RecordingSink(Mutex<Vec<FileManagerRequest>>);
 
 impl FileManagerRequestSink for RecordingSink {
-    fn submit(&self, request: FileManagerRequest) -> Result<(), FileManagerError> {
+    fn submit(
+        &self,
+        request: FileManagerRequest,
+    ) -> BoxFuture<'static, Result<(), FileManagerError>> {
         self.0.lock().unwrap().push(request);
-        Ok(())
+        Box::pin(async { Ok(()) })
     }
 }
 
 #[test]
 fn routes_standard_methods_to_one_existing_window_sink() {
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let item = folder.join("item.txt");
+    std::fs::write(&item, b"fixture").unwrap();
+    let folder_uri = format!("file://{}", folder.display());
+    let item_uri = format!("file://{}", item.display());
     let sink = Arc::new(RecordingSink::default());
     let service = FileManager1::new(sink.clone());
 
-    service
-        .show_folders(&["file:///tmp/folder"], "startup-a")
-        .unwrap();
-    service
-        .show_items(&["file:///tmp/folder/item.txt"], "startup-b")
-        .unwrap();
-    service
-        .show_item_properties(&["file:///tmp/folder/item.txt"], "startup-c")
-        .unwrap();
+    futures_lite::future::block_on(async {
+        service
+            .show_folders(&[&folder_uri], "startup-a")
+            .await
+            .unwrap();
+        service.show_items(&[&item_uri], "startup-b").await.unwrap();
+        service
+            .show_item_properties(&[&item_uri], "startup-c")
+            .await
+            .unwrap();
+    });
 
     let requests = sink.0.lock().unwrap();
     assert_eq!(requests.len(), 3);
@@ -55,7 +68,10 @@ fn rejects_malformed_remote_and_lossy_file_uris_without_dispatch() {
         "file:///tmp/%GG",
         "file:///tmp/%00name",
     ] {
-        assert!(service.show_items(&[uri], "startup").is_err(), "{uri}");
+        assert!(
+            futures_lite::future::block_on(service.show_items(&[uri], "startup")).is_err(),
+            "{uri}"
+        );
     }
     assert!(sink.0.lock().unwrap().is_empty());
 }
@@ -63,22 +79,32 @@ fn rejects_malformed_remote_and_lossy_file_uris_without_dispatch() {
 #[test]
 fn bounds_empty_and_oversized_requests() {
     let service = FileManager1::new(Arc::new(RecordingSink::default()));
-    assert!(service.show_items(&[], "startup").is_err());
+    assert!(futures_lite::future::block_on(service.show_items(&[], "startup")).is_err());
     let uris = vec!["file:///tmp/item"; 257];
-    assert!(service.show_items(&uris, "startup").is_err());
+    assert!(futures_lite::future::block_on(service.show_items(&uris, "startup")).is_err());
 }
 
 #[test]
 fn bounded_ui_channel_reports_backpressure_without_blocking() {
+    let temporary = tempfile::NamedTempFile::new().unwrap();
+    let uri = format!("file://{}", temporary.path().display());
     let (sender, _receiver) = async_channel::bounded(1);
     let service = FileManager1::new(Arc::new(sender));
-    service
-        .show_items(&["file:///tmp/first"], "startup")
-        .unwrap();
-    assert_eq!(
-        service.show_items(&["file:///tmp/second"], "startup"),
-        Err(FileManagerError::Busy)
+    let first = futures_lite::future::block_on(service.show_items(&[&uri], "startup"));
+    assert_eq!(first, Err(FileManagerError::TimedOut));
+    let second = futures_lite::future::block_on(service.show_items(&[&uri], "startup-again"));
+    assert_eq!(second, Err(FileManagerError::Busy));
+}
+
+#[test]
+fn rejects_missing_local_paths_before_routing() {
+    let sink = Arc::new(RecordingSink::default());
+    let service = FileManager1::new(sink.clone());
+    let result = futures_lite::future::block_on(
+        service.show_items(&["file:///definitely/missing/musheen-fixture"], "startup"),
     );
+    assert_eq!(result, Err(FileManagerError::Unreachable));
+    assert!(sink.0.lock().unwrap().is_empty());
 }
 
 struct PrivateBus {
@@ -116,6 +142,13 @@ impl Drop for PrivateBus {
 #[test]
 fn exports_all_standard_methods_introspection_and_recovers_after_restart() {
     let bus = PrivateBus::start();
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let item = folder.join("item");
+    std::fs::write(&item, b"fixture").unwrap();
+    let folder_uri = format!("file://{}", folder.display());
+    let item_uri = format!("file://{}", item.display());
     let sink = Arc::new(RecordingSink::default());
     futures_lite::future::block_on(async {
         let service = musheen_desktop::serve_file_manager1(Some(&bus.address), sink.clone())
@@ -137,21 +170,18 @@ fn exports_all_standard_methods_introspection_and_recovers_after_restart() {
         proxy
             .call_method(
                 "ShowFolders",
-                &(vec!["file:///tmp/folder"], "startup-private-bus"),
+                &(vec![folder_uri.as_str()], "startup-private-bus"),
             )
             .await
             .unwrap();
         proxy
-            .call_method(
-                "ShowItems",
-                &(vec!["file:///tmp/folder/item"], "startup-item"),
-            )
+            .call_method("ShowItems", &(vec![item_uri.as_str()], "startup-item"))
             .await
             .unwrap();
         proxy
             .call_method(
                 "ShowItemProperties",
-                &(vec!["file:///tmp/folder/item"], "startup-properties"),
+                &(vec![item_uri.as_str()], "startup-properties"),
             )
             .await
             .unwrap();
@@ -183,7 +213,7 @@ fn exports_all_standard_methods_introspection_and_recovers_after_restart() {
         proxy
             .call_method(
                 "ShowFolders",
-                &(vec!["file:///tmp/restarted"], "startup-restarted"),
+                &(vec![folder_uri.as_str()], "startup-restarted"),
             )
             .await
             .unwrap();

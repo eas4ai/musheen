@@ -444,7 +444,7 @@ const SETTINGS: &[SettingSpec] = &[
         group: "settings-group-desktop",
         aliases: "portal",
         default: "system",
-        kind: SettingKind::Choice(&["system"]),
+        kind: SettingKind::Choice(&["system", "musheen"]),
         restart_required: true,
         feature: SettingsFeature::Desktop,
     },

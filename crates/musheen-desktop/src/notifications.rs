@@ -114,12 +114,22 @@ impl NotificationAction {
 }
 
 pub trait NotificationSink: Send + Sync + 'static {
-    fn send(&self, event: &NotificationEvent) -> Result<(), Box<str>>;
+    fn send(
+        &self,
+        event: &NotificationEvent,
+        action_label: &str,
+        actions: async_channel::Sender<NotificationAction>,
+    ) -> Result<(), Box<str>>;
 }
 
 impl<T: NotificationSink + ?Sized> NotificationSink for Arc<T> {
-    fn send(&self, event: &NotificationEvent) -> Result<(), Box<str>> {
-        (**self).send(event)
+    fn send(
+        &self,
+        event: &NotificationEvent,
+        action_label: &str,
+        actions: async_channel::Sender<NotificationAction>,
+    ) -> Result<(), Box<str>> {
+        (**self).send(event, action_label, actions)
     }
 }
 
@@ -137,6 +147,8 @@ impl<S: NotificationSink> NotificationPolicy<S> {
         &self,
         event: NotificationEvent,
         visibility: OperationVisibility,
+        action_label: &str,
+        actions: async_channel::Sender<NotificationAction>,
     ) -> Result<(), NotificationError> {
         if visibility == OperationVisibility::NoVisibleWindow
             && matches!(
@@ -144,7 +156,9 @@ impl<S: NotificationSink> NotificationPolicy<S> {
                 NotificationOutcome::Completed | NotificationOutcome::Failed
             )
         {
-            self.sink.send(&event).map_err(NotificationError::Backend)?;
+            self.sink
+                .send(&event, action_label, actions)
+                .map_err(NotificationError::Backend)?;
         }
         Ok(())
     }
@@ -174,12 +188,28 @@ impl Error for NotificationError {}
 pub struct NotifyRustSink;
 
 impl NotificationSink for NotifyRustSink {
-    fn send(&self, event: &NotificationEvent) -> Result<(), Box<str>> {
-        notify_rust::Notification::new()
+    fn send(
+        &self,
+        event: &NotificationEvent,
+        action_label: &str,
+        actions: async_channel::Sender<NotificationAction>,
+    ) -> Result<(), Box<str>> {
+        let action_id = event.action_id();
+        let handle = notify_rust::Notification::new()
             .appname("Musheen")
             .summary(event.summary())
-            .action(&event.action_id(), "Show in Musheen")
+            .action(&action_id, action_label)
             .show()
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
+        std::thread::Builder::new()
+            .name("musheen-notification-action".into())
+            .spawn(move || {
+                handle.wait_for_action(|response| {
+                    if let Some(action) = NotificationAction::parse(response) {
+                        let _ = actions.try_send(action);
+                    }
+                });
+            })
             .map(|_| ())
             .map_err(|error| error.to_string().into())
     }
