@@ -10,6 +10,7 @@ use musheen_desktop::{
 use std::fs::File;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -39,6 +40,63 @@ fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
         writer.write_all(contents).expect("fixture entry writes");
     }
     writer.finish().expect("fixture closes").into_inner()
+}
+
+fn compressed_zip_fixture(name: &str, contents: &[u8]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            name,
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+        )
+        .expect("fixture entry starts");
+    writer.write_all(contents).expect("fixture entry writes");
+    writer.finish().expect("fixture closes").into_inner()
+}
+
+fn zip64_size_fixture(name: &str, declared_size: u64) -> Vec<u8> {
+    let mut bytes = zip_fixture(&[(name, b"x")]);
+    let central = bytes
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .expect("central header");
+    let eocd = bytes
+        .windows(4)
+        .position(|window| window == b"PK\x05\x06")
+        .expect("end record");
+    bytes[central + 20..central + 28].fill(0xff);
+    bytes[central + 30..central + 32].copy_from_slice(&20_u16.to_le_bytes());
+    let zip64_extra = [
+        0x01,
+        0x00,
+        0x10,
+        0x00,
+        declared_size.to_le_bytes()[0],
+        declared_size.to_le_bytes()[1],
+        declared_size.to_le_bytes()[2],
+        declared_size.to_le_bytes()[3],
+        declared_size.to_le_bytes()[4],
+        declared_size.to_le_bytes()[5],
+        declared_size.to_le_bytes()[6],
+        declared_size.to_le_bytes()[7],
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    bytes.splice(eocd..eocd, zip64_extra);
+    let new_eocd = eocd + 20;
+    let central_size = u32::from_le_bytes(
+        bytes[new_eocd + 12..new_eocd + 16]
+            .try_into()
+            .expect("central size"),
+    ) + 20;
+    bytes[new_eocd + 12..new_eocd + 16].copy_from_slice(&central_size.to_le_bytes());
+    bytes
 }
 
 fn open_bytes(
@@ -196,6 +254,83 @@ fn duplicate_normalized_names_are_rejected() {
     );
     let error = read_root(&store, 10).expect_err("duplicates must be ambiguous");
     assert!(error.to_string().contains("duplicate archive path"));
+
+    let retry = read_root(&store, 10).expect_err("a consumed scan failure must stay terminal");
+    assert_eq!(retry.to_string(), error.to_string());
+}
+
+#[test]
+fn file_directory_namespace_collisions_are_rejected_in_both_orders() {
+    for entries in [
+        [("a", b"file".as_slice()), ("a/b", b"child".as_slice())],
+        [("a/b", b"child".as_slice()), ("a", b"file".as_slice())],
+    ] {
+        let store = open_bytes(
+            &zip_fixture(&entries),
+            ArchiveFormat::Zip,
+            ArchiveLimits::default(),
+            Arc::new(RecordingPasswords::default()),
+        );
+        let error = read_root(&store, 10).expect_err("file/directory collision must fail closed");
+        assert!(error.to_string().contains("duplicate archive path"));
+    }
+}
+
+#[test]
+fn zip64_entry_sizes_are_preserved_and_large_declarations_are_bounded() {
+    let five_gib = 5_u64 * 1_024 * 1_024 * 1_024;
+    let store = open_bytes(
+        &zip64_size_fixture("large.bin", five_gib),
+        ArchiveFormat::Zip,
+        ArchiveLimits {
+            max_expanded_bytes: 6_u64 * 1_024 * 1_024 * 1_024,
+            max_compression_ratio: u64::MAX,
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let item = read_root(&store, 1)
+        .expect("ZIP64 metadata reads")
+        .into_iter()
+        .next()
+        .expect("ZIP64 entry");
+    assert_eq!(item.size(), Some(five_gib));
+
+    let mut header = tar::Header::new_gnu();
+    header.set_path("huge.bin").expect("tar path");
+    header.set_size(21_u64 * 1_024 * 1_024 * 1_024);
+    header.set_mode(0o644);
+    header.set_cksum();
+    let mut tar = header.as_bytes().to_vec();
+    tar.extend_from_slice(&[0_u8; 1_024]);
+    let store = open_bytes(
+        &tar,
+        ArchiveFormat::Tar,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let error = read_root(&store, 1).expect_err("20 GiB expanded limit must apply to browsing");
+    assert!(error.to_string().contains("expanded bytes limit exceeded"));
+}
+
+#[test]
+fn compression_ratio_limit_applies_while_browsing() {
+    let bytes = compressed_zip_fixture("bomb.bin", &vec![0_u8; 1024 * 1024]);
+    let store = open_bytes(
+        &bytes,
+        ArchiveFormat::Zip,
+        ArchiveLimits {
+            max_compression_ratio: 2,
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let error = read_root(&store, 1).expect_err("compression ratio must be bounded");
+    assert!(
+        error
+            .to_string()
+            .contains("compression ratio limit exceeded")
+    );
 }
 
 #[test]
@@ -548,4 +683,256 @@ fn nested_archive_depth_is_limited_to_eight() {
             ..
         }
     ));
+}
+
+#[test]
+fn nested_open_keeps_live_scanner_position_and_stable_identity() {
+    let inner = zip_fixture(&[("leaf.txt", b"leaf")]);
+    let outer = zip_fixture(&[("inner.zip", inner.as_slice()), ("after.txt", b"after")]);
+    let store = open_bytes(
+        &outer,
+        ArchiveFormat::Zip,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let first_request = PageRequest::new(1, None).expect("first request");
+    let first =
+        block_on(store.read_directory(&store.root_path(), first_request, CancellationToken::new()))
+            .expect("first page");
+    let nested_path = first.items()[0].path().clone();
+    let continuation = first.next_request().expect("second request");
+
+    let child_a = store
+        .open_nested(&nested_path, ArchiveFormat::Zip, CancellationToken::new())
+        .expect("first nested open");
+    let child_b = store
+        .open_nested(&nested_path, ArchiveFormat::Zip, CancellationToken::new())
+        .expect("second nested open");
+    assert_eq!(child_a.provider_id(), child_b.provider_id());
+
+    let second =
+        block_on(store.read_directory(&store.root_path(), continuation, CancellationToken::new()))
+            .expect("live scanner keeps its independent cursor");
+    assert_eq!(second.items().len(), 1);
+    assert_eq!(second.items()[0].display_name().as_str(), "after.txt");
+}
+
+#[test]
+fn nested_open_and_paging_can_run_concurrently() {
+    let payload = (0..4 * 1_024 * 1_024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let inner = zip_fixture(&[("payload.bin", payload.as_slice())]);
+    let outer = zip_fixture(&[("inner.zip", inner.as_slice()), ("after.txt", b"after")]);
+    let store = Arc::new(open_bytes(
+        &outer,
+        ArchiveFormat::Zip,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    ));
+    let first = block_on(store.read_directory(
+        &store.root_path(),
+        PageRequest::new(1, None).expect("first request"),
+        CancellationToken::new(),
+    ))
+    .expect("first page");
+    let nested_path = first.items()[0].path().clone();
+    let continuation = first.next_request().expect("continuation");
+    let barrier = Arc::new(Barrier::new(3));
+
+    std::thread::scope(|scope| {
+        let nested_store = Arc::clone(&store);
+        let nested_barrier = Arc::clone(&barrier);
+        let nested = scope.spawn(move || {
+            nested_barrier.wait();
+            nested_store.open_nested(&nested_path, ArchiveFormat::Zip, CancellationToken::new())
+        });
+        let paging_store = Arc::clone(&store);
+        let paging_barrier = Arc::clone(&barrier);
+        let page = scope.spawn(move || {
+            paging_barrier.wait();
+            block_on(paging_store.read_directory(
+                &paging_store.root_path(),
+                continuation,
+                CancellationToken::new(),
+            ))
+        });
+        barrier.wait();
+        nested.join().expect("nested thread").expect("nested open");
+        let page = page.join().expect("paging thread").expect("second page");
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].display_name().as_str(), "after.txt");
+    });
+}
+
+#[test]
+fn nested_byte_limit_preserves_the_typed_limit_error() {
+    let inner = zip_fixture(&[("leaf.txt", &[b'x'; 256])]);
+    let outer = zip_fixture(&[("inner.zip", inner.as_slice())]);
+    let store = open_bytes(
+        &outer,
+        ArchiveFormat::Zip,
+        ArchiveLimits {
+            max_nested_archive_bytes: 32,
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let item = read_root(&store, 1)
+        .expect("outer archive reads")
+        .into_iter()
+        .next()
+        .expect("nested entry");
+    let error = store
+        .open_nested(item.path(), ArchiveFormat::Zip, CancellationToken::new())
+        .expect_err("nested bytes must be bounded");
+    assert!(matches!(
+        error,
+        ArchiveError::LimitExceeded {
+            resource: "nested archive bytes",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn nested_seven_zip_uses_budgeted_sequential_decode() {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+
+    let inner = zip_fixture(&[("leaf.txt", b"leaf")]);
+    let mut outer = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut outer)).expect("7z writer starts");
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file("decoy.bin"),
+                Some(vec![0_u8; 128 * 1024].as_slice()),
+            )
+            .expect("decoy writes");
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("inner.zip"), Some(inner.as_slice()))
+            .expect("nested archive writes");
+        writer.finish().expect("7z writer closes");
+    }
+    let store = open_bytes(
+        &outer,
+        ArchiveFormat::SevenZip,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let nested = read_root(&store, 10)
+        .expect("7z root reads")
+        .into_iter()
+        .find(|item| item.display_name().as_str() == "inner.zip")
+        .expect("nested entry");
+    let retained_before = store.counters().metadata_bytes;
+    let child = store
+        .open_nested(nested.path(), ArchiveFormat::Zip, CancellationToken::new())
+        .expect("nested 7z entry opens");
+    assert_eq!(read_root(&child, 1).expect("inner ZIP reads").len(), 1);
+    assert_eq!(store.counters().metadata_bytes, retained_before);
+    assert!(store.counters().peak_metadata_bytes <= ArchiveLimits::default().max_metadata_bytes);
+}
+
+#[test]
+fn compressed_tar_skip_observes_mid_stream_cancellation() {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        let payload = vec![0_u8; 32 * 1_024 * 1_024];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "large.bin", payload.as_slice())
+            .expect("tar entry writes");
+        builder.finish().expect("tar closes");
+    }
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&tar_bytes).expect("gzip writes");
+    let gzip = gzip.finish().expect("gzip closes");
+    let store = open_bytes(
+        &gzip,
+        ArchiveFormat::TarGzip,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let cancellation = CancellationToken::new();
+    let cancel_from_thread = cancellation.clone();
+    let cancel = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1));
+        cancel_from_thread.cancel();
+    });
+    let error = block_on(store.read_directory(
+        &store.root_path(),
+        PageRequest::new(2, None).expect("page request"),
+        cancellation,
+    ))
+    .expect_err("compressed tar decoding must stop after cancellation");
+    cancel.join().expect("cancel thread");
+    assert_eq!(error, StoreError::Cancelled);
+}
+
+#[test]
+fn compressed_tar_stream_enforces_expanded_limit_before_an_entry() {
+    let extension_size = 256 * 1_024_u64;
+    let mut extension = tar::Header::new_gnu();
+    extension.set_entry_type(tar::EntryType::GNULongName);
+    extension.set_size(extension_size);
+    extension.set_mode(0o644);
+    extension.set_cksum();
+    let mut tar_bytes = extension.as_bytes().to_vec();
+    tar_bytes.resize(512 + extension_size as usize, b'a');
+    tar_bytes.extend_from_slice(&[0_u8; 1_024]);
+
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&tar_bytes).expect("gzip writes");
+    let gzip = gzip.finish().expect("gzip closes");
+    let store = open_bytes(
+        &gzip,
+        ArchiveFormat::TarGzip,
+        ArchiveLimits {
+            max_expanded_bytes: 64 * 1_024,
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let error = read_root(&store, 1).expect_err("stream expansion must be bounded while scanning");
+    assert!(error.to_string().contains("expanded bytes limit exceeded"));
+}
+
+#[cfg(feature = "archive-libarchive")]
+#[test]
+fn libarchive_scanner_advances_linearly() {
+    let entries = (0..64)
+        .map(|index| (format!("entry-{index:03}.txt"), vec![b'x']))
+        .collect::<Vec<_>>();
+    let borrowed = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let bytes = zip_fixture(&borrowed);
+    let store = open_bytes(
+        &bytes,
+        ArchiveFormat::Iso,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let mut request = PageRequest::new(1, None).expect("first request");
+    let mut midpoint = 0;
+    for index in 0..32 {
+        let page =
+            block_on(store.read_directory(&store.root_path(), request, CancellationToken::new()))
+                .expect("libarchive page");
+        request = page.next_request().expect("next page");
+        if index == 15 {
+            midpoint = store.counters().bytes_read;
+        }
+    }
+    let total = store.counters().bytes_read;
+    assert!(
+        total.saturating_sub(midpoint) <= midpoint,
+        "second half reread more bytes than the first: midpoint={midpoint}, total={total}"
+    );
 }

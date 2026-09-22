@@ -1,7 +1,8 @@
 use super::ArchivePath;
+use super::io::{BoundedWriter, DecodeReader, PositionedFile, TimedReader};
 use super::store::{
     AllocationLease, ArchiveError, ArchiveLimits, ArchivePassword, ArchivePasswordProvider,
-    DecodeCounterState, PasswordRequest,
+    DecodeCounterState, PasswordRequest, elapsed_limit,
 };
 use musheen_core::{CancellationToken, ProviderId};
 use std::fs::File;
@@ -37,6 +38,7 @@ pub(crate) struct RawArchiveEntry {
     pub(crate) path: Vec<u8>,
     pub(crate) kind: RawEntryKind,
     pub(crate) size: Option<u64>,
+    pub(crate) compressed_size: Option<u64>,
     pub(crate) ordinal: u64,
     _allocation: AllocationLease,
 }
@@ -56,7 +58,8 @@ pub(crate) fn open_scanner(
     counters: &Arc<DecodeCounterState>,
     passwords: &dyn ArchivePasswordProvider,
 ) -> Result<Box<dyn ArchiveScanner>, ArchiveError> {
-    let source = file.try_clone().map_err(|_| ArchiveError::Io)?;
+    let source_bytes = file.metadata().map_err(|_| ArchiveError::Io)?.len();
+    let source = PositionedFile::new(file).map_err(|_| ArchiveError::Io)?;
     match format {
         ArchiveFormat::Zip => Ok(Box::new(ZipScanner::new(
             source,
@@ -79,6 +82,7 @@ pub(crate) fn open_scanner(
             provider,
             limits.clone(),
             Arc::clone(counters),
+            source_bytes,
         ))),
         ArchiveFormat::TarZstd => {
             let decoder = zstd::stream::read::Decoder::new(TimedReader::new(
@@ -92,6 +96,7 @@ pub(crate) fn open_scanner(
                 provider,
                 limits.clone(),
                 Arc::clone(counters),
+                source_bytes,
             )))
         }
         ArchiveFormat::SevenZip => Ok(Box::new(SevenZipScanner::new(
@@ -107,7 +112,7 @@ pub(crate) fn open_scanner(
             provider,
             limits.clone(),
             Arc::clone(counters),
-        ))),
+        )?)),
     }
 }
 
@@ -116,6 +121,7 @@ pub(crate) struct ArchiveCopyContext<'a> {
     pub(crate) limits: &'a ArchiveLimits,
     pub(crate) counters: &'a Arc<DecodeCounterState>,
     pub(crate) cancellation: &'a CancellationToken,
+    pub(crate) compressed_size: Option<u64>,
 }
 
 pub(crate) fn copy_entry<W: Write>(
@@ -125,36 +131,70 @@ pub(crate) fn copy_entry<W: Write>(
     destination: &mut W,
     context: ArchiveCopyContext<'_>,
 ) -> Result<(), ArchiveError> {
-    let source = file.try_clone().map_err(|_| ArchiveError::Io)?;
-    let reader = TimedReader::new(
+    let source = PositionedFile::new(file).map_err(|_| ArchiveError::Io)?;
+    let reader = TimedReader::new_cancellable(
         source,
         context.limits.max_elapsed,
         Arc::clone(context.counters),
+        context.cancellation.clone(),
     );
+    let compressed_size = context.compressed_size.unwrap_or_else(|| {
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or_default()
+    });
     let mut destination = BoundedWriter::new(
         destination,
         context.limits.max_nested_archive_bytes,
+        context.limits.max_expanded_bytes,
+        compressed_size.saturating_mul(context.limits.max_compression_ratio),
         context.cancellation.clone(),
+        context.limits.max_elapsed,
     );
     let result = match format {
-        ArchiveFormat::Zip => copy_zip(reader, ordinal, context.passwords, &mut destination),
-        ArchiveFormat::Tar => copy_tar(reader, ordinal, &mut destination),
-        ArchiveFormat::TarGzip => copy_tar(
-            flate2::read::GzDecoder::new(reader),
+        ArchiveFormat::Zip => copy_zip(
+            reader,
             ordinal,
+            context.passwords,
             &mut destination,
+            context.limits,
+            context.counters,
         ),
+        ArchiveFormat::Tar => copy_tar(reader, ordinal, &mut destination),
+        ArchiveFormat::TarGzip => {
+            let decoder = flate2::read::GzDecoder::new(reader);
+            copy_guarded_tar(
+                decoder,
+                ordinal,
+                &mut destination,
+                &context,
+                compressed_size,
+            )
+        }
         ArchiveFormat::TarZstd => {
             let decoder = zstd::stream::read::Decoder::new(reader)
                 .map_err(|_| ArchiveError::InvalidArchive)?;
-            copy_tar(decoder, ordinal, &mut destination)
+            copy_guarded_tar(
+                decoder,
+                ordinal,
+                &mut destination,
+                &context,
+                compressed_size,
+            )
         }
-        ArchiveFormat::SevenZip => {
-            copy_seven_zip(reader, ordinal, context.passwords, &mut destination)
-        }
+        ArchiveFormat::SevenZip => copy_seven_zip(
+            reader,
+            ordinal,
+            context.passwords,
+            &mut destination,
+            &context,
+        ),
         #[cfg(feature = "archive-libarchive")]
         ArchiveFormat::Rar | ArchiveFormat::Iso => Err(ArchiveError::UnsupportedNestedFormat),
     };
+    if let Some(error) = destination.take_error() {
+        return Err(error);
+    }
     if context.cancellation.check().is_err() {
         return Err(ArchiveError::Cancelled);
     }
@@ -162,7 +202,7 @@ pub(crate) fn copy_entry<W: Write>(
 }
 
 struct ZipScanner {
-    reader: TimedReader<File>,
+    reader: TimedReader<PositionedFile>,
     provider: ProviderId,
     limits: ArchiveLimits,
     counters: Arc<DecodeCounterState>,
@@ -173,7 +213,7 @@ struct ZipScanner {
 
 impl ZipScanner {
     fn new(
-        source: File,
+        source: PositionedFile,
         provider: ProviderId,
         limits: ArchiveLimits,
         counters: Arc<DecodeCounterState>,
@@ -220,10 +260,10 @@ impl ArchiveScanner for ZipScanner {
             return Err(ArchiveError::InvalidArchive);
         }
         let name_length = le_u16(&header[28..30]) as usize;
-        let extra_length = le_u16(&header[30..32]) as u64;
+        let extra_length = le_u16(&header[30..32]) as usize;
         let comment_length = le_u16(&header[32..34]) as u64;
         let trailing = (name_length as u64)
-            .saturating_add(extra_length)
+            .saturating_add(extra_length as u64)
             .saturating_add(comment_length);
         if position.saturating_add(46).saturating_add(trailing) > self.central_end {
             return Err(ArchiveError::InvalidArchive);
@@ -231,6 +271,7 @@ impl ArchiveScanner for ZipScanner {
         let raw_allocation = self.counters.reserve(
             name_length
                 .saturating_mul(2)
+                .saturating_add(extra_length)
                 .saturating_add(std::mem::size_of::<RawArchiveEntry>()),
             self.limits.max_metadata_bytes,
         )?;
@@ -238,10 +279,13 @@ impl ArchiveScanner for ZipScanner {
         self.reader
             .read_exact(&mut name)
             .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
+        let mut extra = vec![0_u8; extra_length];
+        self.reader
+            .read_exact(&mut extra)
+            .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
         self.reader
             .seek(SeekFrom::Current(
-                i64::try_from(extra_length.saturating_add(comment_length))
-                    .map_err(|_| ArchiveError::InvalidArchive)?,
+                i64::try_from(comment_length).map_err(|_| ArchiveError::InvalidArchive)?,
             ))
             .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
         let directory_name = name.last() == Some(&b'/');
@@ -256,7 +300,8 @@ impl ArchiveScanner for ZipScanner {
         } else {
             RawEntryKind::RegularFile
         };
-        let size = (kind == RawEntryKind::RegularFile).then_some(le_u32(&header[24..28]) as u64);
+        let (compressed_size, expanded_size) = zip_entry_sizes(&header, &extra)?;
+        let size = (kind == RawEntryKind::RegularFile).then_some(expanded_size);
         let ordinal = self.ordinal;
         self.ordinal = self.ordinal.saturating_add(1);
         self.remaining -= 1;
@@ -265,6 +310,7 @@ impl ArchiveScanner for ZipScanner {
             path: name,
             kind,
             size,
+            compressed_size: (kind == RawEntryKind::RegularFile).then_some(compressed_size),
             ordinal,
             _allocation: raw_allocation,
         }))
@@ -355,37 +401,27 @@ fn preflight_zip64<R: Read + Seek>(
 }
 
 enum TarInput {
-    Seekable(TimedReader<File>),
+    Seekable(TimedReader<PositionedFile>),
     Stream(Box<dyn Read + Send>),
 }
 
 impl TarInput {
-    fn read_exact(&mut self, bytes: &mut [u8]) -> std::io::Result<()> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Self::Seekable(reader) => reader.read_exact(bytes),
-            Self::Stream(reader) => reader.read_exact(bytes),
+            Self::Seekable(reader) => reader.read(bytes),
+            Self::Stream(reader) => reader.read(bytes),
         }
     }
 
-    fn skip(&mut self, count: u64) -> std::io::Result<()> {
+    fn seek_skip(&mut self, count: u64) -> std::io::Result<bool> {
         match self {
             Self::Seekable(reader) => {
                 reader.seek(SeekFrom::Current(i64::try_from(count).map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "tar offset is too large")
                 })?))?;
-                Ok(())
+                Ok(true)
             }
-            Self::Stream(reader) => {
-                let copied = std::io::copy(&mut reader.take(count), &mut std::io::sink())?;
-                if copied == count {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "truncated tar entry",
-                    ))
-                }
-            }
+            Self::Stream(_) => Ok(false),
         }
     }
 }
@@ -399,11 +435,15 @@ struct TarScanner {
     pending_path: Option<(Vec<u8>, AllocationLease)>,
     ordinal: u64,
     finished: bool,
+    started: Instant,
+    compressed: bool,
+    streamed_bytes: u64,
+    compressed_bytes: u64,
 }
 
 impl TarScanner {
     fn new_seekable(
-        source: File,
+        source: PositionedFile,
         provider: ProviderId,
         limits: ArchiveLimits,
         counters: Arc<DecodeCounterState>,
@@ -421,6 +461,10 @@ impl TarScanner {
             pending_path: None,
             ordinal: 0,
             finished: false,
+            started: Instant::now(),
+            compressed: false,
+            streamed_bytes: 0,
+            compressed_bytes: 0,
         }
     }
 
@@ -429,6 +473,7 @@ impl TarScanner {
         provider: ProviderId,
         limits: ArchiveLimits,
         counters: Arc<DecodeCounterState>,
+        compressed_bytes: u64,
     ) -> Self {
         Self {
             input: TarInput::Stream(source),
@@ -439,10 +484,101 @@ impl TarScanner {
             pending_path: None,
             ordinal: 0,
             finished: false,
+            started: Instant::now(),
+            compressed: true,
+            streamed_bytes: 0,
+            compressed_bytes,
         }
     }
 
-    fn read_extension(&mut self, size: u64) -> Result<(Vec<u8>, AllocationLease), ArchiveError> {
+    fn record_stream_read(&mut self, count: usize) -> Result<(), ArchiveError> {
+        if !self.compressed {
+            return Ok(());
+        }
+        self.streamed_bytes = self.streamed_bytes.saturating_add(count as u64);
+        let ratio_limit = self
+            .compressed_bytes
+            .saturating_mul(self.limits.max_compression_ratio);
+        let (resource, maximum) = if self.streamed_bytes > self.limits.max_expanded_bytes {
+            ("expanded bytes", self.limits.max_expanded_bytes)
+        } else if self.streamed_bytes > ratio_limit {
+            ("compression ratio", ratio_limit)
+        } else {
+            return Ok(());
+        };
+        Err(ArchiveError::LimitExceeded {
+            resource,
+            value: usize::try_from(self.streamed_bytes).unwrap_or(usize::MAX),
+            maximum: usize::try_from(maximum).unwrap_or(usize::MAX),
+        })
+    }
+
+    fn check_runtime(&self, cancellation: &CancellationToken) -> Result<(), ArchiveError> {
+        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        if self.started.elapsed() > self.limits.max_elapsed {
+            return Err(elapsed_limit(
+                self.started.elapsed(),
+                self.limits.max_elapsed,
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_exact(
+        &mut self,
+        mut bytes: &mut [u8],
+        cancellation: &CancellationToken,
+    ) -> Result<(), ArchiveError> {
+        while !bytes.is_empty() {
+            self.check_runtime(cancellation)?;
+            let count = self
+                .input
+                .read(bytes)
+                .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
+            if count == 0 {
+                return Err(ArchiveError::InvalidArchive);
+            }
+            self.record_stream_read(count)?;
+            bytes = &mut bytes[count..];
+        }
+        Ok(())
+    }
+
+    fn skip(
+        &mut self,
+        mut count: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ArchiveError> {
+        self.check_runtime(cancellation)?;
+        if self
+            .input
+            .seek_skip(count)
+            .map_err(|_| time_or_invalid(&self.counters, &self.limits))?
+        {
+            return self.check_runtime(cancellation);
+        }
+        let mut buffer = [0_u8; 32 * 1_024];
+        while count > 0 {
+            self.check_runtime(cancellation)?;
+            let requested = usize::try_from(count.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            let read = self
+                .input
+                .read(&mut buffer[..requested])
+                .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
+            if read == 0 {
+                return Err(ArchiveError::InvalidArchive);
+            }
+            self.record_stream_read(read)?;
+            count -= read as u64;
+        }
+        Ok(())
+    }
+
+    fn read_extension(
+        &mut self,
+        size: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<u8>, AllocationLease), ArchiveError> {
         let size = usize::try_from(size).map_err(|_| ArchiveError::LimitExceeded {
             resource: "metadata bytes",
             value: usize::MAX,
@@ -452,13 +588,9 @@ impl TarScanner {
             .counters
             .reserve(size.saturating_mul(2), self.limits.max_metadata_bytes)?;
         let mut bytes = vec![0_u8; size];
-        self.input
-            .read_exact(&mut bytes)
-            .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
+        self.read_exact(&mut bytes, cancellation)?;
         let padding = (512 - (size as u64 % 512)) % 512;
-        self.input
-            .skip(padding)
-            .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
+        self.skip(padding, cancellation)?;
         Ok((bytes, allocation))
     }
 }
@@ -472,15 +604,11 @@ impl ArchiveScanner for TarScanner {
             return Ok(None);
         }
         cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
-        self.input
-            .skip(self.pending_skip)
-            .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
+        self.skip(self.pending_skip, cancellation)?;
         self.pending_skip = 0;
         loop {
             let mut block = [0_u8; 512];
-            self.input
-                .read_exact(&mut block)
-                .map_err(|_| time_or_invalid(&self.counters, &self.limits))?;
+            self.read_exact(&mut block, cancellation)?;
             if block.iter().all(|byte| *byte == 0) {
                 self.finished = true;
                 return Ok(None);
@@ -494,7 +622,7 @@ impl ArchiveScanner for TarScanner {
                 .map_err(|_| ArchiveError::InvalidArchive)?;
             let entry_type = header.entry_type();
             if entry_type.is_gnu_longname() {
-                let (mut path, allocation) = self.read_extension(size)?;
+                let (mut path, allocation) = self.read_extension(size, cancellation)?;
                 while path.last().is_some_and(|byte| matches!(byte, 0 | b'\n')) {
                     path.pop();
                 }
@@ -502,14 +630,14 @@ impl ArchiveScanner for TarScanner {
                 continue;
             }
             if entry_type.is_pax_local_extensions() {
-                let (bytes, allocation) = self.read_extension(size)?;
+                let (bytes, allocation) = self.read_extension(size, cancellation)?;
                 if let Some(path) = pax_path(&bytes)? {
                     self.pending_path = Some((path, allocation));
                 }
                 continue;
             }
             if entry_type.is_pax_global_extensions() || entry_type.is_gnu_longlink() {
-                let _discarded = self.read_extension(size)?;
+                let _discarded = self.read_extension(size, cancellation)?;
                 continue;
             }
             let raw_path = self
@@ -543,6 +671,8 @@ impl ArchiveScanner for TarScanner {
                 path,
                 kind,
                 size: (kind == RawEntryKind::RegularFile).then_some(size),
+                compressed_size: (kind == RawEntryKind::RegularFile && !self.compressed)
+                    .then_some(size),
                 ordinal,
                 _allocation: allocation,
             }));
@@ -576,14 +706,14 @@ impl sevenz_rust2::ArchiveMemoryBudget for SevenZipMemoryBudget {
 
 impl SevenZipScanner {
     fn new(
-        source: File,
+        source: PositionedFile,
         provider: ProviderId,
         limits: ArchiveLimits,
         counters: Arc<DecodeCounterState>,
         passwords: &dyn ArchivePasswordProvider,
     ) -> Result<Self, ArchiveError> {
         let mut reader = TimedReader::new(source, limits.max_elapsed, Arc::clone(&counters));
-        let (archive, codec_allocation) =
+        let (archive, codec_allocation, _password, _budget) =
             read_seven_archive(&mut reader, passwords, &limits, &counters)?;
         if archive.files.len() > limits.max_entries {
             return Err(ArchiveError::LimitExceeded {
@@ -633,6 +763,9 @@ impl ArchiveScanner for SevenZipScanner {
                     RawEntryKind::RegularFile
                 },
                 size: (!entry.is_directory).then_some(entry.size),
+                compressed_size: (!entry.is_directory)
+                    .then(|| self.archive.compressed_size_for_file(self.next_index - 1))
+                    .flatten(),
                 ordinal,
                 _allocation: allocation,
             }));
@@ -643,29 +776,57 @@ impl ArchiveScanner for SevenZipScanner {
 
 #[cfg(feature = "archive-libarchive")]
 struct LibarchiveScanner {
-    source: File,
-    provider: ProviderId,
-    limits: ArchiveLimits,
-    counters: Arc<DecodeCounterState>,
-    next_index: usize,
-    finished: bool,
+    commands: std::sync::mpsc::SyncSender<LibarchiveCommand>,
+    responses: std::sync::mpsc::Receiver<Result<Option<RawArchiveEntry>, ArchiveError>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "archive-libarchive")]
+enum LibarchiveCommand {
+    Next(CancellationToken),
+    Stop,
 }
 
 #[cfg(feature = "archive-libarchive")]
 impl LibarchiveScanner {
     fn new(
-        source: File,
+        source: PositionedFile,
         provider: ProviderId,
         limits: ArchiveLimits,
         counters: Arc<DecodeCounterState>,
-    ) -> Self {
-        Self {
-            source,
-            provider,
-            limits,
-            counters,
-            next_index: 0,
-            finished: false,
+    ) -> Result<Self, ArchiveError> {
+        let (commands, command_receiver) = std::sync::mpsc::sync_channel(1);
+        let (response_sender, responses) = std::sync::mpsc::sync_channel(1);
+        let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("musheen-libarchive-scan".into())
+            .spawn(move || {
+                libarchive_worker(
+                    source,
+                    provider,
+                    limits,
+                    counters,
+                    command_receiver,
+                    response_sender,
+                    ready_sender,
+                );
+            })
+            .map_err(|_| ArchiveError::Io)?;
+        ready_receiver.recv().map_err(|_| ArchiveError::Io)??;
+        Ok(Self {
+            commands,
+            responses,
+            worker: Some(worker),
+        })
+    }
+}
+
+#[cfg(feature = "archive-libarchive")]
+impl Drop for LibarchiveScanner {
+    fn drop(&mut self) {
+        let _ = self.commands.send(LibarchiveCommand::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -676,85 +837,88 @@ impl ArchiveScanner for LibarchiveScanner {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
-        use compress_tools::{ArchiveContents, ArchiveIteratorBuilder};
-        use std::sync::Mutex;
-
-        if self.finished {
-            return Ok(None);
-        }
         cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
-        let found = Arc::new(Mutex::new(None::<(String, compress_tools::stat)>));
-        let filter_found = Arc::clone(&found);
-        let target = self.next_index;
-        let allocation = self.counters.reserve(
-            self.limits
-                .max_path_bytes
-                .saturating_mul(2)
-                .saturating_add(std::mem::size_of::<RawArchiveEntry>())
-                .saturating_add(std::mem::size_of::<compress_tools::stat>()),
-            self.limits.max_metadata_bytes,
-        )?;
-        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let filter_seen = Arc::clone(&seen);
-        let source = TimedReader::new(
-            self.source.try_clone().map_err(|_| ArchiveError::Io)?,
-            self.limits.max_elapsed,
-            Arc::clone(&self.counters),
-        );
-        let filter = move |name: &str, status: &compress_tools::stat| {
-            let index = filter_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if index == target {
-                *filter_found
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some((name.to_owned(), *status));
-                true
-            } else {
-                false
-            }
+        self.commands
+            .send(LibarchiveCommand::Next(cancellation.clone()))
+            .map_err(|_| ArchiveError::Io)?;
+        self.responses.recv().map_err(|_| ArchiveError::Io)?
+    }
+}
+
+#[cfg(feature = "archive-libarchive")]
+fn libarchive_worker(
+    source: PositionedFile,
+    provider: ProviderId,
+    limits: ArchiveLimits,
+    counters: Arc<DecodeCounterState>,
+    commands: std::sync::mpsc::Receiver<LibarchiveCommand>,
+    responses: std::sync::mpsc::SyncSender<Result<Option<RawArchiveEntry>, ArchiveError>>,
+    ready: std::sync::mpsc::SyncSender<Result<(), ArchiveError>>,
+) {
+    use compress_tools::{ArchiveContents, ArchiveIteratorBuilder};
+
+    let iterator = ArchiveIteratorBuilder::new(TimedReader::new(
+        source,
+        limits.max_elapsed,
+        Arc::clone(&counters),
+    ))
+    .mtree_format(false)
+    .build()
+    .map_err(|_| ArchiveError::InvalidArchive);
+    let Ok(mut iterator) = iterator else {
+        let _ = ready.send(Err(ArchiveError::InvalidArchive));
+        return;
+    };
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    let mut ordinal = 0_u64;
+    while let Ok(command) = commands.recv() {
+        let LibarchiveCommand::Next(cancellation) = command else {
+            return;
         };
-        let mut iterator = ArchiveIteratorBuilder::new(source)
-            .filter(filter)
-            .mtree_format(false)
-            .build()
-            .map_err(|_| ArchiveError::InvalidArchive)?;
-        let event = iterator.next();
-        drop(iterator);
-        match event {
-            Some(ArchiveContents::StartOfEntry(_, _)) => {}
-            Some(ArchiveContents::Err(_)) => return Err(ArchiveError::InvalidArchive),
-            None => {
-                self.finished = true;
-                return Ok(None);
-            }
-            _ => return Err(ArchiveError::InvalidArchive),
+        let result = (|| {
+            cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+            let allocation = counters.reserve(
+                limits
+                    .max_path_bytes
+                    .saturating_mul(2)
+                    .saturating_add(std::mem::size_of::<RawArchiveEntry>())
+                    .saturating_add(std::mem::size_of::<compress_tools::stat>()),
+                limits.max_metadata_bytes,
+            )?;
+            let (name, status) = match iterator.next_header() {
+                Some(ArchiveContents::StartOfEntry(name, status)) => (name, status),
+                Some(ArchiveContents::Err(_)) => return Err(ArchiveError::InvalidArchive),
+                None => return Ok(None),
+                _ => return Err(ArchiveError::InvalidArchive),
+            };
+            cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+            let path = ArchivePath::normalize_bytes(name.as_bytes(), limits.max_path_bytes)?;
+            let file_type = status.st_mode & 0o170_000;
+            let kind = match file_type {
+                0o040_000 => RawEntryKind::Directory,
+                0o100_000 if status.st_nlink > 1 => RawEntryKind::HardLink,
+                0o100_000 => RawEntryKind::RegularFile,
+                0o120_000 => RawEntryKind::SymbolicLink,
+                _ => RawEntryKind::Other,
+            };
+            let entry = RawArchiveEntry {
+                provider: provider.clone(),
+                path,
+                kind,
+                size: (kind == RawEntryKind::RegularFile)
+                    .then(|| u64::try_from(status.st_size).unwrap_or(0)),
+                compressed_size: None,
+                ordinal,
+                _allocation: allocation,
+            };
+            ordinal = ordinal.saturating_add(1);
+            Ok(Some(entry))
+        })();
+        if responses.send(result).is_err() {
+            return;
         }
-        let Some((name, status)) = found
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        else {
-            return Err(ArchiveError::InvalidArchive);
-        };
-        self.next_index = self.next_index.saturating_add(1);
-        let path = ArchivePath::normalize_bytes(name.as_bytes(), self.limits.max_path_bytes)?;
-        let file_type = status.st_mode & 0o170_000;
-        let kind = match file_type {
-            0o040_000 => RawEntryKind::Directory,
-            0o100_000 if status.st_nlink > 1 => RawEntryKind::HardLink,
-            0o100_000 => RawEntryKind::RegularFile,
-            0o120_000 => RawEntryKind::SymbolicLink,
-            _ => RawEntryKind::Other,
-        };
-        Ok(Some(RawArchiveEntry {
-            provider: self.provider.clone(),
-            path,
-            kind,
-            size: (kind == RawEntryKind::RegularFile)
-                .then(|| u64::try_from(status.st_size).unwrap_or(0)),
-            ordinal: self.next_index.saturating_sub(1) as u64,
-            _allocation: allocation,
-        }))
     }
 }
 
@@ -763,17 +927,26 @@ fn read_seven_archive<R: Read + Seek>(
     passwords: &dyn ArchivePasswordProvider,
     limits: &ArchiveLimits,
     counters: &Arc<DecodeCounterState>,
-) -> Result<(sevenz_rust2::Archive, sevenz_rust2::ArchiveMemoryLease), ArchiveError> {
+) -> Result<
+    (
+        sevenz_rust2::Archive,
+        sevenz_rust2::ArchiveMemoryLease,
+        sevenz_rust2::Password,
+        Arc<dyn sevenz_rust2::ArchiveMemoryBudget>,
+    ),
+    ArchiveError,
+> {
     let budget: Arc<dyn sevenz_rust2::ArchiveMemoryBudget> = Arc::new(SevenZipMemoryBudget {
         counters: Arc::clone(counters),
         maximum: limits.max_metadata_bytes,
     });
+    let empty_password = sevenz_rust2::Password::empty();
     match sevenz_rust2::Archive::read_with_memory_budget(
         reader,
-        &sevenz_rust2::Password::empty(),
+        &empty_password,
         Arc::clone(&budget),
     ) {
-        Ok(archive) => Ok(archive),
+        Ok((archive, allocation)) => Ok((archive, allocation, empty_password, budget)),
         Err(sevenz_rust2::Error::PasswordRequired) => {
             reader
                 .seek(SeekFrom::Start(0))
@@ -785,10 +958,10 @@ fn read_seven_archive<R: Read + Seek>(
             let result = sevenz_rust2::Archive::read_with_memory_budget(
                 reader,
                 &dependency_password,
-                budget,
+                Arc::clone(&budget),
             )
+            .map(|(archive, allocation)| (archive, allocation, dependency_password, budget))
             .map_err(|error| map_seven_error(error, limits.max_metadata_bytes));
-            drop(dependency_password);
             drop(password);
             result
         }
@@ -809,12 +982,30 @@ fn map_seven_error(error: sevenz_rust2::Error, maximum: usize) -> ArchiveError {
 }
 
 fn copy_zip<R: Read + Seek, W: Write>(
-    reader: R,
+    mut reader: R,
     ordinal: u64,
     passwords: &dyn ArchivePasswordProvider,
     destination: &mut W,
+    limits: &ArchiveLimits,
+    counters: &Arc<DecodeCounterState>,
 ) -> Result<(), ArchiveError> {
     let index = usize::try_from(ordinal).map_err(|_| ArchiveError::NotArchiveEntry)?;
+    let (_, central_size, entries) = preflight_zip(&mut reader, limits, counters)?;
+    let central_bytes = usize::try_from(central_size).map_err(|_| ArchiveError::LimitExceeded {
+        resource: "metadata bytes",
+        value: usize::MAX,
+        maximum: limits.max_metadata_bytes,
+    })?;
+    let entry_bytes = usize::try_from(entries)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(256);
+    let _metadata = counters.reserve(
+        central_bytes.saturating_mul(2).saturating_add(entry_bytes),
+        limits.max_metadata_bytes,
+    )?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ArchiveError::InvalidArchive)?;
     let mut archive = zip::ZipArchive::new(reader).map_err(|_| ArchiveError::InvalidArchive)?;
     let encrypted = archive
         .by_index_raw(index)
@@ -852,46 +1043,132 @@ fn copy_tar<R: Read, W: Write>(
     Ok(())
 }
 
+fn copy_guarded_tar<R: Read, W: Write>(
+    reader: R,
+    ordinal: u64,
+    destination: &mut W,
+    context: &ArchiveCopyContext<'_>,
+    compressed_size: u64,
+) -> Result<(), ArchiveError> {
+    let mut guarded = DecodeReader::new(
+        reader,
+        context.cancellation.clone(),
+        context.limits.max_elapsed,
+        context.limits.max_expanded_bytes,
+        compressed_size.saturating_mul(context.limits.max_compression_ratio),
+    );
+    let result = copy_tar(&mut guarded, ordinal, destination);
+    guarded.take_error().map_or(result, Err)
+}
+
 fn copy_seven_zip<R: Read + Seek, W: Write>(
     mut reader: R,
     ordinal: u64,
     passwords: &dyn ArchivePasswordProvider,
     destination: &mut W,
+    context: &ArchiveCopyContext<'_>,
 ) -> Result<(), ArchiveError> {
-    let password = match sevenz_rust2::Archive::read(&mut reader, &sevenz_rust2::Password::empty())
-    {
-        Ok(_) => sevenz_rust2::Password::empty(),
-        Err(sevenz_rust2::Error::PasswordRequired) => {
-            reader
-                .seek(SeekFrom::Start(0))
-                .map_err(|_| ArchiveError::InvalidArchive)?;
-            let password = require_password(passwords, ArchiveFormat::SevenZip)?;
-            let text = std::str::from_utf8(password.as_bytes())
-                .map_err(|_| ArchiveError::InvalidPassword)?;
-            sevenz_rust2::Password::new(text)
-        }
-        Err(_) => return Err(ArchiveError::InvalidArchive),
-    };
+    let (archive, _metadata, password, budget) =
+        read_seven_archive(&mut reader, passwords, context.limits, context.counters)?;
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|_| ArchiveError::InvalidArchive)?;
-    let mut archive = sevenz_rust2::ArchiveReader::new(reader, password)
-        .map_err(|_| ArchiveError::InvalidPassword)?;
-    let mut current = 0_u64;
+    let mut archive = sevenz_rust2::ArchiveReader::from_archive_sequential_with_memory_budget(
+        archive, reader, password, budget,
+    );
     let mut found = false;
-    archive
-        .for_each_entries(|_entry, contents| {
-            if current == ordinal {
-                std::io::copy(contents, destination)?;
-                found = true;
-                Ok(false)
-            } else {
-                current = current.saturating_add(1);
-                Ok(true)
+    let mut decode_error = None;
+    let decode_started = Instant::now();
+    let mut decoded_bytes = 0_u64;
+    let target = usize::try_from(ordinal).map_err(|_| ArchiveError::NotArchiveEntry)?;
+    let result = archive.for_each_entries_through_index(target, |index, _entry, contents| {
+        if index == target {
+            match copy_with_guards(
+                contents,
+                destination,
+                context,
+                decode_started,
+                &mut decoded_bytes,
+            ) {
+                Ok(()) => {
+                    found = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    decode_error = Some(error);
+                    Err(sevenz_rust2::Error::from(std::io::Error::other(
+                        "archive decode stopped",
+                    )))
+                }
             }
-        })
-        .map_err(|_| ArchiveError::InvalidArchive)?;
+        } else {
+            match copy_with_guards(
+                contents,
+                &mut std::io::sink(),
+                context,
+                decode_started,
+                &mut decoded_bytes,
+            ) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    decode_error = Some(error);
+                    Err(sevenz_rust2::Error::from(std::io::Error::other(
+                        "archive decode stopped",
+                    )))
+                }
+            }
+        }
+    });
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
+    result.map_err(|error| map_seven_error(error, context.limits.max_metadata_bytes))?;
     found.then_some(()).ok_or(ArchiveError::NotArchiveEntry)
+}
+
+fn copy_with_guards<R: Read + ?Sized, W: Write>(
+    reader: &mut R,
+    destination: &mut W,
+    context: &ArchiveCopyContext<'_>,
+    started: Instant,
+    decoded_bytes: &mut u64,
+) -> Result<(), ArchiveError> {
+    let compressed_size = context.compressed_size.unwrap_or(0);
+    let ratio_limit = compressed_size.saturating_mul(context.limits.max_compression_ratio);
+    let mut buffer = [0_u8; 32 * 1_024];
+    loop {
+        context
+            .cancellation
+            .check()
+            .map_err(|_| ArchiveError::Cancelled)?;
+        if started.elapsed() > context.limits.max_elapsed {
+            return Err(elapsed_limit(started.elapsed(), context.limits.max_elapsed));
+        }
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        if count == 0 {
+            return Ok(());
+        }
+        *decoded_bytes = decoded_bytes.saturating_add(count as u64);
+        if *decoded_bytes > context.limits.max_expanded_bytes {
+            return Err(ArchiveError::LimitExceeded {
+                resource: "expanded bytes",
+                value: usize::try_from(*decoded_bytes).unwrap_or(usize::MAX),
+                maximum: usize::try_from(context.limits.max_expanded_bytes).unwrap_or(usize::MAX),
+            });
+        }
+        if *decoded_bytes > ratio_limit {
+            return Err(ArchiveError::LimitExceeded {
+                resource: "compression ratio",
+                value: usize::try_from(*decoded_bytes).unwrap_or(usize::MAX),
+                maximum: usize::try_from(ratio_limit).unwrap_or(usize::MAX),
+            });
+        }
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|_| ArchiveError::Io)?;
+    }
 }
 
 fn require_password(
@@ -901,92 +1178,6 @@ fn require_password(
     passwords
         .request_password(&PasswordRequest { format })?
         .ok_or(ArchiveError::PasswordRequired)
-}
-
-struct TimedReader<R> {
-    inner: R,
-    maximum_elapsed: std::time::Duration,
-    counters: Arc<DecodeCounterState>,
-}
-
-impl<R> TimedReader<R> {
-    fn new(
-        inner: R,
-        maximum_elapsed: std::time::Duration,
-        counters: Arc<DecodeCounterState>,
-    ) -> Self {
-        Self {
-            inner,
-            maximum_elapsed,
-            counters,
-        }
-    }
-
-    fn finish_call<T>(&self, started: Instant, result: std::io::Result<T>) -> std::io::Result<T> {
-        self.counters.add_elapsed(started.elapsed());
-        if self.counters.elapsed() > self.maximum_elapsed {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "archive metadata time limit exceeded",
-            ))
-        } else {
-            result
-        }
-    }
-}
-
-impl<R: Read> Read for TimedReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let started = Instant::now();
-        let result = self.inner.read(buffer);
-        if let Ok(count) = result {
-            self.counters.add_read_bytes(count as u64);
-        }
-        self.finish_call(started, result)
-    }
-}
-
-impl<R: Seek> Seek for TimedReader<R> {
-    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        let started = Instant::now();
-        let result = self.inner.seek(position);
-        self.finish_call(started, result)
-    }
-}
-
-struct BoundedWriter<W> {
-    inner: W,
-    written: u64,
-    maximum: u64,
-    cancellation: CancellationToken,
-}
-
-impl<W> BoundedWriter<W> {
-    fn new(inner: W, maximum: u64, cancellation: CancellationToken) -> Self {
-        Self {
-            inner,
-            written: 0,
-            maximum,
-            cancellation,
-        }
-    }
-}
-
-impl<W: Write> Write for BoundedWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.cancellation.check().map_err(std::io::Error::other)?;
-        let next = self.written.saturating_add(bytes.len() as u64);
-        if next > self.maximum {
-            return Err(std::io::Error::other("nested archive byte limit exceeded"));
-        }
-        let count = self.inner.write(bytes)?;
-        self.written = self.written.saturating_add(count as u64);
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 fn valid_tar_checksum(block: &[u8; 512]) -> bool {
@@ -1052,4 +1243,42 @@ fn le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
+}
+
+fn zip_entry_sizes(header: &[u8; 46], extra: &[u8]) -> Result<(u64, u64), ArchiveError> {
+    let mut compressed = le_u32(&header[20..24]) as u64;
+    let mut expanded = le_u32(&header[24..28]) as u64;
+    if compressed != u32::MAX as u64 && expanded != u32::MAX as u64 {
+        return Ok((compressed, expanded));
+    }
+    let mut offset = 0_usize;
+    while offset.saturating_add(4) <= extra.len() {
+        let field_id = le_u16(&extra[offset..offset + 2]);
+        let length = le_u16(&extra[offset + 2..offset + 4]) as usize;
+        offset = offset.saturating_add(4);
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= extra.len())
+            .ok_or(ArchiveError::InvalidArchive)?;
+        if field_id == 0x0001 {
+            let field = &extra[offset..end];
+            let mut field_offset = 0_usize;
+            if expanded == u32::MAX as u64 {
+                expanded = field
+                    .get(field_offset..field_offset + 8)
+                    .map(le_u64)
+                    .ok_or(ArchiveError::InvalidArchive)?;
+                field_offset += 8;
+            }
+            if compressed == u32::MAX as u64 {
+                compressed = field
+                    .get(field_offset..field_offset + 8)
+                    .map(le_u64)
+                    .ok_or(ArchiveError::InvalidArchive)?;
+            }
+            return Ok((compressed, expanded));
+        }
+        offset = end;
+    }
+    Err(ArchiveError::InvalidArchive)
 }

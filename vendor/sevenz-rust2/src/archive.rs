@@ -71,6 +71,25 @@ impl Archive {
     pub fn pack_sizes(&self) -> &[u64] {
         &self.pack_sizes
     }
+
+    /// Returns the packed byte count for the block that contains `file_index`.
+    pub fn compressed_size_for_file(&self, file_index: usize) -> Option<u64> {
+        let block_index = self
+            .stream_map
+            .file_block_index
+            .get(file_index)
+            .copied()??;
+        let block = self.blocks.get(block_index)?;
+        let first = *self
+            .stream_map
+            .block_first_pack_stream_index
+            .get(block_index)?;
+        let count = block.packed_streams.len();
+        self.pack_sizes
+            .get(first..first.checked_add(count)?)?
+            .iter()
+            .try_fold(0_u64, |total, size| total.checked_add(*size))
+    }
 }
 
 #[derive(Debug, Default, Clone)]

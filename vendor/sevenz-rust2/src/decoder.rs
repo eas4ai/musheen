@@ -209,10 +209,7 @@ pub fn add_decoder<I: Read>(
     }
 }
 
-pub(crate) fn decoder_memory_usage(
-    coder: &Coder,
-    uncompressed_len: usize,
-) -> Result<usize, Error> {
+pub(crate) fn decoder_memory_usage(coder: &Coder, uncompressed_len: usize) -> Result<usize, Error> {
     let method = EncoderMethod::by_id(coder.encoder_method_id()).ok_or_else(|| {
         Error::UnsupportedCompressionMethod(format!("{:?}", coder.encoder_method_id()))
     })?;
@@ -223,9 +220,8 @@ pub(crate) fn decoder_memory_usage(
             }
             let dictionary = get_lzma_dic_size(coder)?;
             let props = coder.properties[0];
-            let effective_dictionary = dictionary.min(
-                u32::try_from(uncompressed_len).unwrap_or(u32::MAX),
-            );
+            let effective_dictionary =
+                dictionary.min(u32::try_from(uncompressed_len).unwrap_or(u32::MAX));
             usize::try_from(
                 lzma_get_memory_usage_by_props(effective_dictionary, props)
                     .map_err(|error| Error::other(error.to_string()))?,
@@ -247,10 +243,9 @@ pub(crate) fn decoder_memory_usage(
         EncoderMethod::ID_AES256_SHA256 => 1,
         _ => 0,
     };
-    kib.checked_mul(1_024)
-        .ok_or(Error::MemoryLimitExceeded {
-            requested: usize::MAX,
-        })
+    kib.checked_mul(1_024).ok_or(Error::MemoryLimitExceeded {
+        requested: usize::MAX,
+    })
 }
 
 #[cfg(feature = "ppmd")]

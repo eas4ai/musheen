@@ -1,6 +1,8 @@
 //! Bounded, read-only archive browsing.
 
 mod format;
+mod index;
+mod io;
 mod path;
 mod store;
 
