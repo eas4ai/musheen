@@ -18,17 +18,17 @@ LIMIT-006, LIMIT-008.
 **Files:** Create `crates/musheen-desktop/src/archive/{mod,path,store,format}.rs`;
 create `crates/musheen-desktop/tests/archive_browse.rs` and archive fixtures.
 
-- [ ] Test absolute paths, `..`, Windows drive/UNC names, NUL, duplicate names,
+- [x] Test absolute paths, `..`, Windows drive/UNC names, NUL, duplicate names,
   non-UTF-8 metadata, symlinks, hard links, encrypted headers, malformed central
   directories, 4,096-byte paths, and eight-level nested archives.
-- [ ] Run `cargo test -p musheen-desktop --test archive_browse`; expect failure.
-- [ ] Implement a provider-owned `ArchivePath` that cannot escape its virtual
+- [x] Run `cargo test -p musheen-desktop --test archive_browse`; expect failure.
+- [x] Implement a provider-owned `ArchivePath` that cannot escape its virtual
   root. Add lazy paged enumeration and explicit read-only capabilities for ZIP,
   tar variants, 7z, and feature-gated RAR/ISO.
-- [ ] Require a password callback through secret-safe memory; errors and logs
+- [x] Require a password callback through secret-safe memory; errors and logs
   reveal neither password nor encrypted filenames beyond user-visible need.
-- [ ] Run the malformed corpus under time and allocation counters.
-- [ ] Commit with `feat(archive): add bounded archive store`.
+- [x] Run the malformed corpus under time and allocation counters.
+- [x] Commit with `feat(archive): add bounded archive store`.
 
 ### Task 2: Create and extract archives through the operation engine
 
