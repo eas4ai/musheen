@@ -1,6 +1,7 @@
 //! Linux desktop-service adapters, including XDG MIME-application integration.
 
 mod apps;
+pub mod archive;
 mod catalog;
 mod checksum;
 mod clipboard;
@@ -26,6 +27,7 @@ mod updates;
 mod volumes;
 
 pub use apps::*;
+pub use archive::*;
 pub use catalog::*;
 pub use checksum::*;
 pub use clipboard::*;

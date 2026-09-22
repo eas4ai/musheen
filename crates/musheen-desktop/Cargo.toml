@@ -8,6 +8,7 @@ publish.workspace = true
 
 [features]
 default = []
+archive-libarchive = ["dep:compress-tools"]
 portal-backend = []
 
 [dependencies]
@@ -17,7 +18,9 @@ async-io.workspace = true
 ashpd.workspace = true
 base64.workspace = true
 blake3.workspace = true
+compress-tools = { workspace = true, optional = true }
 fast_image_resize.workspace = true
+flate2.workspace = true
 freedesktop.workspace = true
 futures-lite.workspace = true
 image.workspace = true
@@ -36,9 +39,11 @@ ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
+sevenz-rust2.workspace = true
 secret-service.workspace = true
 sha2.workspace = true
 tree_magic_mini.workspace = true
+tar.workspace = true
 ureq.workspace = true
 walkdir.workspace = true
 wax.workspace = true
@@ -46,6 +51,8 @@ xattr.workspace = true
 xdg-mime.workspace = true
 zbus.workspace = true
 zeroize.workspace = true
+zip.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
