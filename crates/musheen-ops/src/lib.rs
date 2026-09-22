@@ -28,7 +28,7 @@ pub use delete::{
     PermanentDeleteConfirmation, PermanentDeleteRequest, TrashReceipt, execute_delete,
     execute_permanent_delete, execute_restore,
 };
-pub use event::{JobEvent, Progress, ProgressError, ProgressUnit};
+pub use event::{ArchiveEventPhase, JobEvent, Progress, ProgressError, ProgressUnit};
 pub use job::{EventGeneration, JobId};
 pub use journal::{
     CorruptSource, Durability, Journal, JournalError, JournalPhase, JournalRecord, JournalStorage,
@@ -45,8 +45,8 @@ pub use metadata_copy::{MetadataKind, MetadataReport};
 pub use r#move::{MoveOutcome, MoveStrategy, execute_move};
 pub use mutation::{MutationError, MutationProvider};
 pub use plan::{
-    InverseTemplate, OperationKind, OperationPlan, PlanError, ProviderLimits, ProviderSnapshot,
-    WorkClass,
+    ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, InverseTemplate, OperationKind,
+    OperationPlan, PlanError, ProviderLimits, ProviderSnapshot, WorkClass,
 };
 pub use recovery::{RecoveryContext, RecoveryDecision, decide_recovery};
 pub use rename::{RenameRequest, execute_rename};

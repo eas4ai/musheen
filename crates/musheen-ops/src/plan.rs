@@ -33,6 +33,133 @@ pub enum OperationKind {
     Preview,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArchiveCodec {
+    Zip,
+    Tar,
+    TarGzip,
+    TarZstd,
+    SevenZip,
+}
+
+impl ArchiveCodec {
+    #[must_use]
+    pub const fn supports_encryption(self) -> bool {
+        matches!(self, Self::Zip | Self::SevenZip)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArchiveConflictPolicy {
+    Fail,
+    Skip,
+    Replace,
+}
+
+/// A validated archive request submitted to the operation engine.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveOperationPlan {
+    kind: OperationKind,
+    sources: Vec<StorePath>,
+    destination: StorePath,
+    codec: ArchiveCodec,
+    conflict_policy: ArchiveConflictPolicy,
+    encrypted: bool,
+}
+
+impl ArchiveOperationPlan {
+    pub fn create(
+        sources: Vec<StorePath>,
+        destination: StorePath,
+        codec: ArchiveCodec,
+        conflict_policy: ArchiveConflictPolicy,
+        encrypted: bool,
+    ) -> Result<Self, PlanError> {
+        if sources.is_empty() {
+            return Err(PlanError::EmptyArchiveSources);
+        }
+        Self::new(
+            OperationKind::Compress,
+            sources,
+            destination,
+            codec,
+            conflict_policy,
+            encrypted,
+        )
+    }
+
+    pub fn extract(
+        source: StorePath,
+        destination: StorePath,
+        codec: ArchiveCodec,
+        conflict_policy: ArchiveConflictPolicy,
+        encrypted: bool,
+    ) -> Result<Self, PlanError> {
+        Self::new(
+            OperationKind::Extract,
+            vec![source],
+            destination,
+            codec,
+            conflict_policy,
+            encrypted,
+        )
+    }
+
+    fn new(
+        kind: OperationKind,
+        sources: Vec<StorePath>,
+        destination: StorePath,
+        codec: ArchiveCodec,
+        conflict_policy: ArchiveConflictPolicy,
+        encrypted: bool,
+    ) -> Result<Self, PlanError> {
+        if encrypted && !codec.supports_encryption() {
+            return Err(PlanError::UnsupportedArchiveEncryption(codec));
+        }
+        if sources.iter().any(|source| source == &destination) {
+            return Err(PlanError::ArchiveSourceIsDestination);
+        }
+        Ok(Self {
+            kind,
+            sources,
+            destination,
+            codec,
+            conflict_policy,
+            encrypted,
+        })
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> OperationKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn sources(&self) -> &[StorePath] {
+        &self.sources
+    }
+
+    #[must_use]
+    pub const fn destination(&self) -> &StorePath {
+        &self.destination
+    }
+
+    #[must_use]
+    pub const fn codec(&self) -> ArchiveCodec {
+        self.codec
+    }
+
+    #[must_use]
+    pub const fn conflict_policy(&self) -> ArchiveConflictPolicy {
+        self.conflict_policy
+    }
+
+    #[must_use]
+    pub const fn encrypted(&self) -> bool {
+        self.encrypted
+    }
+}
+
 impl OperationKind {
     #[must_use]
     pub const fn class(self) -> WorkClass {
@@ -337,6 +464,9 @@ pub enum PlanError {
     MissingSource(OperationKind),
     UnexpectedSource(OperationKind),
     InvalidProviderLimit { class: WorkClass, value: usize },
+    EmptyArchiveSources,
+    ArchiveSourceIsDestination,
+    UnsupportedArchiveEncryption(ArchiveCodec),
 }
 
 impl fmt::Display for PlanError {
@@ -349,6 +479,13 @@ impl fmt::Display for PlanError {
                     formatter,
                     "{class:?} provider limit must be positive, got {value}"
                 )
+            }
+            Self::EmptyArchiveSources => formatter.write_str("archive creation requires a source"),
+            Self::ArchiveSourceIsDestination => {
+                formatter.write_str("archive source and destination must differ")
+            }
+            Self::UnsupportedArchiveEncryption(codec) => {
+                write!(formatter, "{codec:?} does not support archive encryption")
             }
         }
     }

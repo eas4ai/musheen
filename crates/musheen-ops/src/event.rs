@@ -9,6 +9,16 @@ pub enum ProgressUnit {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveEventPhase {
+    Preflight,
+    Staging,
+    Encoding,
+    Decoding,
+    Publishing,
+    Cleaning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Progress {
     completed: u64,
     total: Option<u64>,
@@ -76,6 +86,7 @@ pub struct JobEvent {
     occurred_at: u64,
     state: Option<JobState>,
     progress: Option<Progress>,
+    archive_phase: Option<ArchiveEventPhase>,
 }
 
 impl JobEvent {
@@ -92,6 +103,7 @@ impl JobEvent {
             occurred_at,
             state: Some(state),
             progress: None,
+            archive_phase: None,
         }
     }
 
@@ -108,6 +120,24 @@ impl JobEvent {
             occurred_at,
             state: None,
             progress: Some(progress),
+            archive_phase: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn archive_phase(
+        job_id: JobId,
+        generation: EventGeneration,
+        occurred_at: u64,
+        archive_phase: ArchiveEventPhase,
+    ) -> Self {
+        Self {
+            job_id,
+            generation,
+            occurred_at,
+            state: None,
+            progress: None,
+            archive_phase: Some(archive_phase),
         }
     }
 
@@ -134,5 +164,10 @@ impl JobEvent {
     #[must_use]
     pub const fn progress_value(&self) -> Option<Progress> {
         self.progress
+    }
+
+    #[must_use]
+    pub const fn archive_phase_value(&self) -> Option<ArchiveEventPhase> {
+        self.archive_phase
     }
 }
