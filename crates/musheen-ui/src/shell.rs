@@ -11,6 +11,7 @@ pub enum SemanticRegion {
     Sidebar,
     DirectoryContent,
     Info,
+    Terminal,
     StatusBar,
 }
 
@@ -30,6 +31,7 @@ pub enum FocusTarget {
     Sidebar,
     Directory,
     Info,
+    Terminal,
 }
 
 const BASE_REGIONS: [SemanticRegion; 5] = [
@@ -87,35 +89,50 @@ pub struct ShellModel {
     commands: CommandRegistry,
     context_menus: ContextMenuSurface,
     info_visible: bool,
+    terminal_visible: bool,
 }
 
 impl ShellModel {
     #[must_use]
     pub fn new(info_visible: bool) -> Self {
+        Self::with_terminal(info_visible, false)
+    }
+
+    #[must_use]
+    pub fn with_terminal(info_visible: bool, terminal_visible: bool) -> Self {
         let commands = CommandRegistry::built_in();
         Self {
             context_menus: ContextMenuSurface::new(commands.clone()),
             commands,
             info_visible,
+            terminal_visible,
         }
     }
 
     #[must_use]
-    pub fn semantic_regions(&self) -> &'static [SemanticRegion] {
-        if self.info_visible {
-            &INFO_REGIONS
+    pub fn semantic_regions(&self) -> Vec<SemanticRegion> {
+        let mut regions = if self.info_visible {
+            INFO_REGIONS.to_vec()
         } else {
-            &BASE_REGIONS
+            BASE_REGIONS.to_vec()
+        };
+        if self.terminal_visible {
+            regions.insert(regions.len() - 1, SemanticRegion::Terminal);
         }
+        regions
     }
 
     #[must_use]
-    pub fn focus_order(&self) -> &'static [FocusTarget] {
-        if self.info_visible {
-            &INFO_FOCUS
+    pub fn focus_order(&self) -> Vec<FocusTarget> {
+        let mut focus = if self.info_visible {
+            INFO_FOCUS.to_vec()
         } else {
-            &BASE_FOCUS
+            BASE_FOCUS.to_vec()
+        };
+        if self.terminal_visible {
+            focus.push(FocusTarget::Terminal);
         }
+        focus
     }
 
     #[must_use]
@@ -141,6 +158,10 @@ impl ShellModel {
 
     pub fn toggle_info(&mut self) {
         self.info_visible = !self.info_visible;
+    }
+
+    pub fn set_terminal_visible(&mut self, visible: bool) {
+        self.terminal_visible = visible;
     }
 }
 

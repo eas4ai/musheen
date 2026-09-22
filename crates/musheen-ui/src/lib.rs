@@ -17,6 +17,7 @@ mod shell;
 pub mod sidebar;
 mod status_bar;
 mod status_center;
+pub mod terminal;
 pub mod theme;
 pub mod toolbar;
 pub mod views;
@@ -45,4 +46,5 @@ pub use status_center::{
     OperationFailure, OperationStatus, OperationStatusEntry, RecoveryAction, StatusCenterError,
     StatusCenterModel, TrashItem, TrashSurfaceModel,
 };
+pub use terminal::*;
 pub use theme::{AppearanceMode, MotionPolicy, ThemeProfile};

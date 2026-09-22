@@ -155,6 +155,23 @@ impl DesktopEntryLauncher {
         Ok(PreparedLaunches { launches })
     }
 
+    /// Prepare a desktop entry at a caller-selected local working directory.
+    /// The directory remains process metadata and is never interpolated into
+    /// the entry's `Exec` arguments.
+    pub fn prepare_in_working_directory(
+        &self,
+        application: &DesktopApplication,
+        targets: &[LaunchTarget],
+        terminal: Option<&TerminalCommand>,
+        working_directory: &Path,
+    ) -> Result<PreparedLaunches, LaunchError> {
+        let mut prepared = self.prepare(application, targets, terminal)?;
+        for launch in &mut prepared.launches {
+            launch.working_directory = Some(working_directory.to_path_buf());
+        }
+        Ok(prepared)
+    }
+
     pub fn launch(
         &self,
         prepared: &PreparedLaunches,

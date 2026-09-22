@@ -34,6 +34,7 @@ use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, Search
 use crate::sidebar::{PinStore, SidebarEntry, SidebarModel, SidebarSectionKind};
 use crate::status_bar::status_text_with_size;
 use crate::status_center::{OperationStatus, OperationStatusEntry, TrashItem, TrashSurfaceModel};
+use crate::terminal::{TerminalDrawer, TerminalDrawerAction, project_terminal_cells};
 use crate::toolbar::{
     NAVIGATION_LEADING_IDS, NAVIGATION_TRAILING_IDS, OMNIBAR_COMMANDS, SEARCH_COMMAND_ID,
     TAB_STRIP_COMMAND_IDS, VIEW_COMMAND_IDS, omnibar_command_for_action, project_custom_toolbar,
@@ -71,14 +72,16 @@ use musheen_core::{
 };
 use musheen_desktop::{
     ApplicationIconProvider, BrokerError, BrokerOutput, BrokerRequest, CatalogDocument,
-    CatalogStore, ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths,
-    FolderIdentity, FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError,
-    MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation,
-    OperationUsage, OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner,
+    CatalogStore, ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher,
+    DesktopEntryTerminalLauncher, DesktopPaths, ExternalTerminalCommand, FolderIdentity,
+    FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
+    MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation, OperationUsage,
+    OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent,
     RootCapabilityDescriptor, SecretBuffer, SessionStore, SystemClock, SystemProcessRunner,
-    TagMoveOutcome, TerminalCommand, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
-    ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution,
-    VolumeAction, VolumeError, VolumeId, VolumeRuntime,
+    TagMoveOutcome, TerminalCommand, TerminalError, TerminalModel, TerminalProfile,
+    TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
+    ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError,
+    VolumeId, VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -178,6 +181,7 @@ gpui_kit::actions!(
         OpenContextMenuShortcut,
         FocusNextDirectoryItem,
         FocusPreviousDirectoryItem,
+        ToggleTerminalDrawer,
     ]
 );
 
@@ -231,6 +235,7 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("menu", OpenContextMenuShortcut, None),
         KeyBinding::new("down", FocusNextDirectoryItem, Some("DirectoryContent")),
         KeyBinding::new("up", FocusPreviousDirectoryItem, Some("DirectoryContent")),
+        KeyBinding::new("f4", ToggleTerminalDrawer, None),
     ]);
 }
 
@@ -2594,6 +2599,20 @@ struct MusheenApp {
     pending_privilege_authentication: Option<SecretBuffer>,
     elevated_store: Option<Arc<RootedFilesystemStore<SystemClock>>>,
     terminal_command: Option<TerminalCommand>,
+    terminal_profile: TerminalProfile,
+    external_terminal_command: ExternalTerminalCommand,
+    desktop_terminal_launcher: Option<DesktopEntryTerminalLauncher>,
+    open_terminal_embedded: bool,
+    terminal_drawer: TerminalDrawer,
+    terminal_model: TerminalModel,
+    terminal_session: Option<TerminalSession>,
+    terminal_focus: FocusHandle,
+    terminal_generation: u64,
+    terminal_starting: bool,
+    terminal_backend_enabled: bool,
+    pending_terminal_paste: Option<String>,
+    pending_terminal_close: bool,
+    pending_terminal_focus: bool,
     status_center_open: bool,
     trash_states: HashMap<TabId, TrashState>,
     trash_focus: HashMap<TabId, CommandTargetRef>,
@@ -2652,6 +2671,396 @@ impl MusheenApp {
     fn high_contrast(cx: &Context<Self>) -> bool {
         cx.try_global::<NativeTheme>()
             .is_some_and(|theme| theme.accessibility().high_contrast)
+    }
+
+    fn ensure_terminal_session(&mut self, cx: &mut Context<Self>) {
+        if !self.terminal_backend_enabled
+            || self.terminal_session.is_some()
+            || self.terminal_starting
+        {
+            return;
+        }
+        self.terminal_starting = true;
+        self.terminal_generation = self.terminal_generation.wrapping_add(1);
+        let generation = self.terminal_generation;
+        let location = self.navigation.focused_tab().location().clone();
+        self.terminal_drawer.set_active_location(location.clone());
+        let profile = self.terminal_profile.clone();
+        let work = cx.background_spawn(async move {
+            TerminalSession::spawn(profile, &location, TerminalSize::default())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(mut session) if state.terminal_generation != generation => {
+                    let _ = session.terminate();
+                }
+                Ok(session) => {
+                    state.terminal_starting = false;
+                    let events = session.events();
+                    state.terminal_session = Some(session);
+                    state.start_terminal_events(generation, events, cx);
+                    cx.notify();
+                }
+                Err(error) => {
+                    if state.terminal_generation != generation {
+                        return;
+                    }
+                    state.terminal_starting = false;
+                    state.operation_error = Some(localized_terminal_error(&state.catalog, &error));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn start_terminal_events(
+        &self,
+        generation: u64,
+        events: async_channel::Receiver<PtyEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                let keep_listening = this.update(cx, |state, cx| {
+                    if state.terminal_generation != generation {
+                        return false;
+                    }
+                    match event {
+                        PtyEvent::Output(bytes) => state.terminal_model.feed(&bytes),
+                        PtyEvent::Exited(_) | PtyEvent::ReadFailed => {
+                            state.terminal_drawer.mark_child_exited();
+                        }
+                    }
+                    cx.notify();
+                    state.terminal_session.is_some()
+                });
+                if !keep_listening {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_terminal_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.terminal_drawer.toggle() {
+            TerminalDrawerAction::FocusTerminal => {
+                self.shell.set_terminal_visible(true);
+                self.terminal_drawer
+                    .set_active_location(self.navigation.focused_tab().location().clone());
+                self.ensure_terminal_session(cx);
+                self.terminal_focus.focus(window, cx);
+            }
+            TerminalDrawerAction::RestoreBrowserFocus => {
+                self.shell.set_terminal_visible(false);
+                self.pending_restored_focus = self
+                    .browser_focus
+                    .clone()
+                    .or_else(|| Some(self.content_focus.clone()));
+            }
+            TerminalDrawerAction::None | TerminalDrawerAction::ConfirmTerminate => {}
+        }
+        cx.notify();
+    }
+
+    fn sync_terminal_location(&mut self, location: &StorePath, cx: &mut Context<Self>) {
+        if !self.terminal_drawer.is_open() {
+            return;
+        }
+        let next = location.as_unix_path();
+        if next.is_none() || self.terminal_drawer.cwd() == next {
+            return;
+        }
+        self.terminal_drawer.set_active_location(location.clone());
+        if let Some(mut session) = self.terminal_session.take() {
+            let _ = session.terminate();
+        }
+        self.terminal_starting = false;
+        self.terminal_model = TerminalModel::new(TerminalSize::default());
+        self.ensure_terminal_session(cx);
+    }
+
+    fn route_terminal_key(
+        &mut self,
+        key: &gpui_kit::Keystroke,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.terminal_drawer.is_open() || !self.terminal_focus.is_focused(window) {
+            return false;
+        }
+        if key.key == "f4" {
+            return false;
+        }
+        if key.modifiers.control && key.key == "v" {
+            let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                return true;
+            };
+            let request = self.terminal_drawer.request_paste(text);
+            if request.requires_confirmation() {
+                self.pending_terminal_paste = Some(request.text().to_owned());
+                cx.notify();
+            } else if let Some(session) = &self.terminal_session {
+                let bytes = self
+                    .terminal_model
+                    .encode_paste(request.text(), self.terminal_model.bracketed_paste());
+                let _ = session.write(&bytes);
+            }
+            return true;
+        }
+        let bytes = match key.key.as_str() {
+            "enter" => Some(&b"\r"[..]),
+            "backspace" => Some(&b"\x7f"[..]),
+            "tab" => Some(&b"\t"[..]),
+            "escape" => Some(&b"\x1b"[..]),
+            "up" => Some(&b"\x1b[A"[..]),
+            "down" => Some(&b"\x1b[B"[..]),
+            "right" => Some(&b"\x1b[C"[..]),
+            "left" => Some(&b"\x1b[D"[..]),
+            "home" => Some(&b"\x1b[H"[..]),
+            "end" => Some(&b"\x1b[F"[..]),
+            "pageup" => Some(&b"\x1b[5~"[..]),
+            "pagedown" => Some(&b"\x1b[6~"[..]),
+            "delete" => Some(&b"\x1b[3~"[..]),
+            "insert" => Some(&b"\x1b[2~"[..]),
+            _ => None,
+        };
+        let owned;
+        let bytes = if let Some(bytes) = bytes {
+            bytes
+        } else if key.modifiers.control && key.key.len() == 1 {
+            owned = vec![key.key.as_bytes()[0].to_ascii_uppercase() & 0x1f];
+            &owned
+        } else if !key.modifiers.alt && !key.modifiers.platform {
+            owned = key.key_char.clone().unwrap_or_default().into_bytes();
+            &owned
+        } else {
+            return false;
+        };
+        self.terminal_session
+            .as_ref()
+            .is_some_and(|session| session.write(bytes).is_ok())
+    }
+
+    fn render_terminal_drawer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let label = self
+            .catalog
+            .message("terminal-drawer-label")
+            .expect("the terminal drawer label is localized");
+        let title = self.terminal_model.title().unwrap_or(label).to_owned();
+        let rows = project_terminal_cells(&self.terminal_model.cells())
+            .into_iter()
+            .map(|line| {
+                div()
+                    .text_xs()
+                    .child(SharedString::from(line.text().to_owned()))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("terminal-drawer")
+            .test_support()
+            .key_context("TerminalDrawer")
+            .track_focus(&self.terminal_focus)
+            .role(Role::Region)
+            .aria_label(label)
+            .h(px(self.terminal_drawer.height()))
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.background)
+            .child(
+                div()
+                    .id("terminal-drawer-header")
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .py_1()
+                    .child(Icon::new(IconName::Terminal))
+                    .child(SharedString::from(title))
+                    .child(div().flex_grow(1.0))
+                    .when(self.terminal_drawer.restart_available(), |header| {
+                        header.child(
+                            Button::new("terminal-restart")
+                                .label(
+                                    self.catalog
+                                        .message("terminal-restart")
+                                        .expect("the terminal restart label is localized"),
+                                )
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(session) = this.terminal_session.as_mut()
+                                        && session.restart().is_ok()
+                                    {
+                                        this.terminal_model =
+                                            TerminalModel::new(TerminalSize::default());
+                                        this.terminal_drawer.mark_restarted();
+                                        let events = session.events();
+                                        this.terminal_generation =
+                                            this.terminal_generation.wrapping_add(1);
+                                        this.start_terminal_events(
+                                            this.terminal_generation,
+                                            events,
+                                            cx,
+                                        );
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("terminal-close")
+                            .label(
+                                self.catalog
+                                    .message("terminal-close")
+                                    .expect("the terminal close label is localized"),
+                            )
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.terminal_drawer.mark_foreground_job(
+                                    this.terminal_session
+                                        .as_ref()
+                                        .is_some_and(TerminalSession::has_foreground_job),
+                                );
+                                match this.terminal_drawer.request_close() {
+                                    TerminalDrawerAction::RestoreBrowserFocus => {
+                                        this.shell.set_terminal_visible(false);
+                                        this.pending_restored_focus = this
+                                            .browser_focus
+                                            .clone()
+                                            .or_else(|| Some(this.content_focus.clone()));
+                                    }
+                                    TerminalDrawerAction::ConfirmTerminate => {
+                                        this.pending_terminal_close = true;
+                                    }
+                                    TerminalDrawerAction::None
+                                    | TerminalDrawerAction::FocusTerminal => {}
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when_some(self.pending_terminal_paste.clone(), |drawer, text| {
+                drawer.child(
+                    div()
+                        .id("terminal-paste-confirmation")
+                        .test_support()
+                        .role(Role::Alert)
+                        .px_3()
+                        .py_2()
+                        .child(SharedString::from(
+                            self.catalog
+                                .message("terminal-paste-warning")
+                                .expect("the paste warning is localized")
+                                .to_owned(),
+                        ))
+                        .child(
+                            Button::new("terminal-paste-continue")
+                                .label(
+                                    self.catalog
+                                        .message("terminal-paste-continue")
+                                        .expect("the paste confirmation is localized"),
+                                )
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(session) = &this.terminal_session {
+                                        let bytes = this.terminal_model.encode_paste(
+                                            &text,
+                                            this.terminal_model.bracketed_paste(),
+                                        );
+                                        let _ = session.write(&bytes);
+                                    }
+                                    this.pending_terminal_paste = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("terminal-paste-cancel")
+                                .label(
+                                    self.catalog
+                                        .message("dialog-cancel")
+                                        .expect("the cancel label is localized"),
+                                )
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pending_terminal_paste = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when(self.pending_terminal_close, |drawer| {
+                drawer.child(
+                    div()
+                        .id("terminal-close-confirmation")
+                        .test_support()
+                        .role(Role::Alert)
+                        .px_3()
+                        .py_2()
+                        .child(SharedString::from(
+                            self.catalog
+                                .message("terminal-close-warning")
+                                .expect("the close warning is localized")
+                                .to_owned(),
+                        ))
+                        .child(
+                            Button::new("terminal-close-terminate")
+                                .label(
+                                    self.catalog
+                                        .message("terminal-close-terminate")
+                                        .expect("the terminate label is localized"),
+                                )
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(mut session) = this.terminal_session.take() {
+                                        let _ = session.terminate();
+                                    }
+                                    this.pending_terminal_close = false;
+                                    this.terminal_drawer.mark_foreground_job(false);
+                                    let _ = this.terminal_drawer.close();
+                                    this.shell.set_terminal_visible(false);
+                                    this.pending_restored_focus = this
+                                        .browser_focus
+                                        .clone()
+                                        .or_else(|| Some(this.content_focus.clone()));
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("terminal-close-cancel")
+                                .label(
+                                    self.catalog
+                                        .message("dialog-cancel")
+                                        .expect("the cancel label is localized"),
+                                )
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pending_terminal_close = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id("terminal-content")
+                    .test_support()
+                    .flex_grow(1.0)
+                    .overflow_y_scroll()
+                    .px_3()
+                    .font_family("monospace")
+                    .children(rows),
+            )
+            .into_any_element()
     }
 
     #[cfg(test)]
@@ -2794,6 +3203,34 @@ impl MusheenApp {
         } else {
             PrivilegeProvider::Polkit
         };
+        let terminal_open = settings
+            .as_ref()
+            .is_some_and(|settings| settings.value("layout.terminal").as_deref() == Some("true"));
+        let terminal_profile = match settings
+            .as_ref()
+            .and_then(|settings| settings.value("terminal.profile"))
+            .as_deref()
+        {
+            Some("bash") => TerminalProfile::new("bash", "/bin/bash", std::iter::empty::<&str>()),
+            Some("zsh") => TerminalProfile::new("zsh", "/bin/zsh", std::iter::empty::<&str>()),
+            Some("fish") => {
+                TerminalProfile::new("fish", "/usr/bin/fish", std::iter::empty::<&str>())
+            }
+            _ => Ok(TerminalProfile::system()),
+        }
+        .expect("the built-in terminal profile is valid");
+        let open_terminal_embedded = settings.as_ref().is_some_and(|settings| {
+            settings.value("terminal.program").as_deref() == Some("embedded")
+        });
+        let desktop_paths = DesktopPaths::from_environment().ok();
+        let desktop_terminal_launcher = settings
+            .as_ref()
+            .and_then(|settings| settings.value("terminal.program"))
+            .filter(|value| value.ends_with(".desktop"))
+            .zip(desktop_paths.clone())
+            .and_then(|(desktop_id, paths)| {
+                DesktopEntryTerminalLauncher::new(desktop_id, paths).ok()
+            });
         let mut this = Self {
             custom_actions: custom_actions::from_settings(settings.as_ref()),
             custom_action_warning: None,
@@ -2815,9 +3252,12 @@ impl MusheenApp {
             limits,
             store: providers.store(),
             providers,
-            shell: crate::ShellModel::new(settings.as_ref().is_some_and(|settings| {
-                settings.value("layout.info_pane").as_deref() == Some("true")
-            })),
+            shell: crate::ShellModel::with_terminal(
+                settings.as_ref().is_some_and(|settings| {
+                    settings.value("layout.info_pane").as_deref() == Some("true")
+                }),
+                terminal_open,
+            ),
             navigation,
             omnibar: OmnibarState::default(),
             omnibar_input: None,
@@ -2850,7 +3290,7 @@ impl MusheenApp {
             volume_properties_release_subscription: None,
             application_notice: None,
             update_offer: None,
-            desktop_paths: DesktopPaths::from_environment().ok(),
+            desktop_paths,
             desktop_applications: DesktopApplicationService::default(),
             pending_application_commands: Vec::new(),
             application_icons: Arc::new(FreedesktopIconProvider),
@@ -2860,6 +3300,24 @@ impl MusheenApp {
             pending_privilege_authentication: None,
             elevated_store: None,
             terminal_command: TerminalCommand::new("x-terminal-emulator", ["-e"]).ok(),
+            terminal_profile,
+            external_terminal_command: ExternalTerminalCommand::new(
+                "x-terminal-emulator",
+                std::iter::empty::<&str>(),
+            )
+            .expect("the system terminal command is valid"),
+            desktop_terminal_launcher,
+            open_terminal_embedded,
+            terminal_drawer: TerminalDrawer::new(terminal_open, 240.0),
+            terminal_model: TerminalModel::new(TerminalSize::default()),
+            terminal_session: None,
+            terminal_focus: cx.focus_handle(),
+            terminal_generation: 0,
+            terminal_starting: false,
+            terminal_backend_enabled: watch_directories,
+            pending_terminal_paste: None,
+            pending_terminal_close: false,
+            pending_terminal_focus: false,
             status_center_open: false,
             trash_states: HashMap::new(),
             trash_focus: HashMap::new(),
@@ -2887,6 +3345,9 @@ impl MusheenApp {
         // host watchers disabled and inject model changes explicitly.
         if this.watch_directories {
             this.start_volume_refresh(cx);
+        }
+        if terminal_open {
+            this.ensure_terminal_session(cx);
         }
         this
     }
@@ -3414,6 +3875,7 @@ impl MusheenApp {
             self.navigation.navigate_focused(location.clone());
             self.schedule_session_save(cx);
         }
+        self.sync_terminal_location(&location, cx);
         self.remember_folder_location(&location);
         let preferences = self.preferences_with_catalog(
             &location,
@@ -3448,6 +3910,7 @@ impl MusheenApp {
 
     fn load_focused_tab(&mut self, cx: &mut Context<Self>) {
         let location = self.navigation.focused_tab().location().clone();
+        self.sync_terminal_location(&location, cx);
         let display = DisplayPath::from_store_path(&location).as_str().to_owned();
         let tab_id = self.navigation.focused_tab().id();
         if let Some(search) = self.searches.get(&tab_id) {
@@ -5789,6 +6252,9 @@ impl MusheenApp {
                     cx,
                 );
             }
+            (CommandAction::OpenTerminalHere, CommandParameters::Location(location)) => {
+                self.launch_external_terminal(location.clone(), cx);
+            }
             (CommandAction::SelectAll, CommandParameters::None) => {
                 self.dispatch_selection_action_for_tab(origin_tab, CommandAction::SelectAll, cx);
             }
@@ -6105,6 +6571,55 @@ impl MusheenApp {
             }
             _ => unreachable!("the caller pairs each local command with typed parameters"),
         }
+    }
+
+    fn launch_external_terminal(&mut self, location: StorePath, cx: &mut Context<Self>) {
+        if self.open_terminal_embedded {
+            let next = location.as_unix_path().map(Path::to_path_buf);
+            let changed = self.terminal_drawer.cwd() != next.as_deref();
+            self.terminal_drawer.set_active_location(location);
+            if changed {
+                if let Some(mut session) = self.terminal_session.take() {
+                    let _ = session.terminate();
+                }
+                self.terminal_starting = false;
+                self.terminal_model = TerminalModel::new(TerminalSize::default());
+            }
+            if !self.terminal_drawer.is_open() {
+                let _ = self.terminal_drawer.toggle();
+            }
+            self.shell.set_terminal_visible(true);
+            self.pending_terminal_focus = true;
+            self.ensure_terminal_session(cx);
+            cx.notify();
+            return;
+        }
+        let work = if let Some(launcher) = self.desktop_terminal_launcher.clone() {
+            let runner = Arc::clone(&self.application_runner);
+            cx.background_spawn(async move {
+                let prepared = launcher.prepare(&location)?;
+                launcher.launch(&prepared, runner.as_ref())
+            })
+        } else {
+            let command = self.external_terminal_command.clone();
+            cx.background_spawn(async move {
+                let prepared = command.prepare(&location)?;
+                command.launch(&prepared)
+            })
+        };
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            if let Err(error) = result {
+                this.update(cx, |state, cx| {
+                    state.operation_error = Some(localized_terminal_error(&state.catalog, &error));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn dispatch_volume_action(
@@ -6708,6 +7223,7 @@ impl MusheenApp {
                 | CommandAction::OpenProperties
                 | CommandAction::Permissions
                 | CommandAction::DirectoryProperties
+                | CommandAction::OpenTerminalHere
                 | CommandAction::CopyTo
                 | CommandAction::MoveTo
                 | CommandAction::SendTo
@@ -8158,6 +8674,11 @@ impl MusheenApp {
             cx.stop_propagation();
             window.prevent_default();
             self.activate_context_dialog(cx);
+            return;
+        }
+        if self.route_terminal_key(key, window, cx) {
+            cx.stop_propagation();
+            window.prevent_default();
             return;
         }
         if key.key == "escape" || self.keyboard_context_popup.is_some() {
@@ -10643,8 +11164,11 @@ impl Render for MusheenApp {
         } else if self.pending_content_focus {
             self.content_focus.focus(window, cx);
             self.pending_content_focus = false;
+        } else if self.pending_terminal_focus {
+            self.terminal_focus.focus(window, cx);
+            self.pending_terminal_focus = false;
         }
-        if self.keyboard_context_popup.is_none() {
+        if self.keyboard_context_popup.is_none() && !self.terminal_focus.is_focused(window) {
             self.remember_browser_focus(window, cx);
         }
         let colors = cx.theme().colors;
@@ -10722,6 +11246,9 @@ impl Render for MusheenApp {
             .on_action(cx.listener(|this, _: &FocusPreviousDirectoryItem, _, cx| {
                 this.move_directory_focus(-1, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleTerminalDrawer, window, cx| {
+                this.toggle_terminal_drawer(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Escape, _, cx| {
                 this.handle_escape(cx);
             }))
@@ -10777,8 +11304,25 @@ impl Render for MusheenApp {
                     .when(self.sidebar_visible, |content| {
                         content.child(self.render_sidebar(cx))
                     })
-                    .children(panes)
-                    .children(info),
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_grow(1.0)
+                                    .min_h(px(0.))
+                                    .flex()
+                                    .children(panes)
+                                    .children(info),
+                            )
+                            .when(self.terminal_drawer.is_open(), |content| {
+                                content.child(self.render_terminal_drawer(cx))
+                            }),
+                    ),
             )
             .when(self.status_center_open, |shell| {
                 shell.child(self.render_operation_status_center(cx))
@@ -11001,6 +11545,22 @@ fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str>
     catalog
         .message(key)
         .expect("the privilege error is localized")
+        .into()
+}
+
+fn localized_terminal_error(catalog: &Catalog, error: &TerminalError) -> Box<str> {
+    let key = match error {
+        TerminalError::UnrepresentableWorkingDirectory => "terminal-error-unrepresentable-cwd",
+        TerminalError::DesktopEntryUnavailable => "terminal-error-desktop-entry-unavailable",
+        TerminalError::InvalidSize
+        | TerminalError::InvalidProfile
+        | TerminalError::InvalidExternalCommand => "terminal-error-invalid-configuration",
+        TerminalError::NotRunning => "terminal-error-not-running",
+        TerminalError::Spawn(_) | TerminalError::Io(_) => "terminal-error-launch",
+    };
+    catalog
+        .message(key)
+        .expect("the terminal failure is localized")
         .into()
 }
 
@@ -14339,6 +14899,48 @@ mod tests {
             assert!(window.find("info-pane").visible());
             window.click("view.info", cx);
             assert!(window.try_find("info-pane").is_none());
+        })
+        .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn f4_opens_accessible_terminal_without_blocking_directory_and_restores_focus(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("terminal-drawer").is_none());
+            window.press("f4", cx);
+            window.render_frame(cx);
+            assert!(window.find("terminal-drawer").visible());
+            assert_eq!(
+                window.find("terminal-drawer").label(),
+                Some("Embedded terminal")
+            );
+            assert!(window.find("terminal-drawer").focused().unwrap_or(false));
+            assert!(window.find("directory-content").visible());
+            window.press("f4", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("terminal-drawer").is_none());
+            assert!(window.find("directory-content").focused().unwrap_or(false));
         })
         .expect("test window remains open");
     }
