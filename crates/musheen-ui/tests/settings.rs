@@ -1,9 +1,10 @@
 use gpui_kit::test::TestWindowExt;
 use musheen_core::{BoxFuture, CancellationToken, ItemId, ProviderId, StorePath};
 use musheen_desktop::{
-    CatalogDocument, CatalogStore, ConnectionId, ConnectionProfile, ConnectionProfiles,
-    CredentialReference, FolderIdentity, RemoteError, RemoteErrorCategory, SettingsDocument,
-    SettingsPage, SettingsStore, settings_schema,
+    CatalogDocument, CatalogStore, ConnectionId, ConnectionProbe, ConnectionProfile,
+    ConnectionProfiles, CredentialReference, FolderIdentity, ProfileConnectionTester, ProxyKind,
+    RemoteError, RemoteErrorCategory, RemoteHost, SecurityPolicy, SettingsDocument, SettingsPage,
+    SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
 };
 use musheen_ui::settings::{
     ConnectionTestService, SettingsBackends, SettingsState, clear_recent_locations,
@@ -11,6 +12,7 @@ use musheen_ui::settings::{
 use musheen_ui::{AppearanceMode, Catalog, Locale, ThemeProfile};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Mutex};
 
 struct FailingConnectionTester;
 
@@ -27,6 +29,26 @@ impl ConnectionTestService for FailingConnectionTester {
                 Some(profile.host().clone()),
             ))
         })
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingConnectionProbe {
+    calls: Arc<Mutex<Vec<(String, u16)>>>,
+}
+
+impl ConnectionProbe for RecordingConnectionProbe {
+    fn connect<'a>(
+        &'a self,
+        host: &'a RemoteHost,
+        port: u16,
+        _cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RemoteErrorCategory>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((host.as_str().to_owned(), port));
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -353,6 +375,305 @@ async fn remote_connection_editor_tests_before_save_and_confirms_failed_tests(
     assert_eq!(profiles.profiles().len(), 1);
     assert_eq!(profiles.profiles()[0].id().as_str(), "work-sftp");
     assert_eq!(profiles.profiles()[0].credential(), None);
+}
+
+#[gpui_kit::test]
+async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext, ScrollDelta, point, px, size};
+
+    let root = tempfile::tempdir().unwrap();
+    let store = SettingsStore::from_config_home(root.path());
+    cx.update(gpui_kit::init);
+    let probe = RecordingConnectionProbe::default();
+    let mut view = None;
+    let handle = cx.open_window(size(px(900.), px(1400.)), |window, cx| {
+        let settings = cx.new(|cx| {
+            musheen_ui::settings::SettingsWindow::new_with_connection_tester(
+                store.clone(),
+                SettingsBackends::all(),
+                Catalog::load(Locale::EnUs).unwrap(),
+                Arc::new(ProfileConnectionTester::new(probe.clone())),
+                window,
+                cx,
+            )
+        });
+        view = Some(settings.clone());
+        Root::new(settings, window, cx)
+    });
+    let view = view.unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-page-integrations", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-add", cx);
+        window.render_frame(cx);
+        for (id, value) in [
+            ("remote-profile-id", "secure-webdav"),
+            ("remote-profile-name", "Secure WebDAV"),
+            ("remote-profile-host", "dav.example.test"),
+            ("remote-profile-path", "/files"),
+        ] {
+            window.click(id, cx);
+            window.input(value, cx);
+        }
+        window.click("settings-remote-protocol-webdav", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-security-tls-pinned", cx);
+        window.render_frame(cx);
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -40.)), cx);
+        window.render_frame(cx);
+        window.click("remote-security-pin", cx);
+        window.input(&"5a".repeat(TLS_PIN_BYTES), cx);
+        window.click("settings-remote-proxy-socks5", cx);
+        window.render_frame(cx);
+        for (id, value) in [
+            ("remote-proxy-host", "proxy.example.test"),
+            ("remote-proxy-port", "1080"),
+            ("remote-proxy-username", "proxy-user"),
+            ("remote-proxy-credential", "secret-service:proxy-secret"),
+        ] {
+            window.click(id, cx);
+            window.input(value, cx);
+        }
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., 40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+    })
+    .unwrap();
+
+    let encoded = cx.update(|cx| {
+        view.read(cx)
+            .state()
+            .draft()
+            .value("remote.connections")
+            .unwrap()
+    });
+    let profiles = ConnectionProfiles::import(&encoded).unwrap();
+    let profile = &profiles.profiles()[0];
+    assert_eq!(
+        profile.security(),
+        &SecurityPolicy::Tls(TlsPolicy::PinnedSha256([0x5a; TLS_PIN_BYTES]))
+    );
+    let proxy = profile.proxy().unwrap();
+    assert_eq!(proxy.kind(), ProxyKind::Socks5);
+    assert_eq!(proxy.username(), Some("proxy-user"));
+    assert_eq!(
+        proxy.credential().unwrap().to_setting_value().as_deref(),
+        Some("secret-service:proxy-secret")
+    );
+    assert_eq!(
+        &*probe.calls.lock().unwrap(),
+        &[("dav.example.test".to_owned(), 443)]
+    );
+
+    let original = profiles.profiles()[0].clone();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-close-editor", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-edit-secure-webdav", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+    })
+    .unwrap();
+    let preserved = cx.update(|cx| {
+        ConnectionProfiles::import(
+            &view
+                .read(cx)
+                .state()
+                .draft()
+                .value("remote.connections")
+                .unwrap(),
+        )
+        .unwrap()
+        .profiles()[0]
+            .clone()
+    });
+    assert_eq!(preserved, original);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-security-plaintext", cx);
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., 40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+        window.render_frame(cx);
+        assert!(window.find("settings-remote-confirm-save").visible());
+        window.click("settings-remote-confirm-save", cx);
+    })
+    .unwrap();
+
+    let plaintext = cx.update(|cx| {
+        ConnectionProfiles::import(
+            &view
+                .read(cx)
+                .state()
+                .draft()
+                .value("remote.connections")
+                .unwrap(),
+        )
+        .unwrap()
+        .profiles()[0]
+            .clone()
+    });
+    assert_eq!(plaintext.security(), &SecurityPolicy::PlaintextConfirmed);
+    assert_eq!(plaintext.proxy().unwrap().kind(), ProxyKind::Socks5);
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-proxy-none", cx);
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., 40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+    })
+    .unwrap();
+    let without_proxy = cx.update(|cx| {
+        ConnectionProfiles::import(
+            &view
+                .read(cx)
+                .state()
+                .draft()
+                .value("remote.connections")
+                .unwrap(),
+        )
+        .unwrap()
+        .profiles()[0]
+            .clone()
+    });
+    assert!(without_proxy.proxy().is_none());
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-close-editor", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-add", cx);
+        window.render_frame(cx);
+        for (id, value) in [
+            ("remote-profile-id", "secure-sftp"),
+            ("remote-profile-name", "Secure SFTP"),
+            ("remote-profile-host", "sftp.example.test"),
+            ("remote-profile-path", "/home/alice"),
+        ] {
+            window.click(id, cx);
+            window.input(value, cx);
+        }
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-security-ssh-pinned", cx);
+        window.render_frame(cx);
+        window.click("remote-security-pin", cx);
+        window.input(&"6b".repeat(TLS_PIN_BYTES), cx);
+        window.click("settings-remote-proxy-http-connect", cx);
+        window.render_frame(cx);
+        for (id, value) in [
+            ("remote-proxy-host", "connect.example.test"),
+            ("remote-proxy-port", "8443"),
+            ("remote-proxy-username", "connect-user"),
+            ("remote-proxy-credential", "secret-service:connect-secret"),
+        ] {
+            window.click(id, cx);
+            window.input(value, cx);
+        }
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., 40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+    })
+    .unwrap();
+
+    let sftp = cx.update(|cx| {
+        ConnectionProfiles::import(
+            &view
+                .read(cx)
+                .state()
+                .draft()
+                .value("remote.connections")
+                .unwrap(),
+        )
+        .unwrap()
+        .profiles()[1]
+            .clone()
+    });
+    assert_eq!(
+        sftp.security(),
+        &SecurityPolicy::Ssh(musheen_desktop::HostKeyPolicy::PinnedSha256(
+            [0x6b; TLS_PIN_BYTES]
+        ))
+    );
+    let proxy = sftp.proxy().unwrap();
+    assert_eq!(proxy.kind(), ProxyKind::HttpConnect);
+    assert_eq!(proxy.host().as_str(), "connect.example.test");
+    assert_eq!(proxy.port(), 8443);
+    assert_eq!(proxy.username(), Some("connect-user"));
+    assert_eq!(
+        proxy.credential().unwrap().to_setting_value().as_deref(),
+        Some("secret-service:connect-secret")
+    );
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-close-editor", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-edit-secure-sftp", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+    })
+    .unwrap();
+    let preserved_sftp = cx.update(|cx| {
+        ConnectionProfiles::import(
+            &view
+                .read(cx)
+                .state()
+                .draft()
+                .value("remote.connections")
+                .unwrap(),
+        )
+        .unwrap()
+        .profiles()[1]
+            .clone()
+    });
+    assert_eq!(preserved_sftp, sftp);
 }
 
 #[test]

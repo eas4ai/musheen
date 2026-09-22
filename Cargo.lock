@@ -4647,6 +4647,7 @@ dependencies = [
  "ashpd",
  "async-channel",
  "async-io",
+ "async-net",
  "base64 0.22.1",
  "blake3",
  "compress-tools",

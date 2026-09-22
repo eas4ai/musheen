@@ -191,26 +191,19 @@ impl<C: RemoteConnector, R: PoolRuntime> ProviderPool<C, R> {
             return Err(self.inner.error(RemoteErrorCategory::Cancelled));
         }
         let (sender, receiver) = async_channel::bounded(1);
-        let ticket = {
-            let mut state = lock(&self.inner.state);
-            let ticket = state.next_ticket;
-            state.next_ticket = state.next_ticket.wrapping_add(1);
-            state.waiters.push_back(Waiter { ticket, sender });
-            ticket
-        };
+        let mut waiter = self.inner.register_waiter(sender);
 
         loop {
             if cancellation.is_cancelled() {
-                self.inner.remove_waiter(ticket);
                 return Err(self.inner.error(RemoteErrorCategory::Cancelled));
             }
-            match self.inner.claim(ticket) {
+            match self.inner.claim(&mut waiter) {
                 Claim::Lease {
                     slot_id,
                     connection,
                 } => return Ok(self.inner.lease(slot_id, connection)),
-                Claim::Connect => {
-                    let result = self.inner.connect(cancellation.clone()).await;
+                Claim::Connect(permit) => {
+                    let result = self.inner.connect(permit, cancellation.clone()).await;
                     match result {
                         Ok((slot_id, connection)) => {
                             return Ok(self.inner.lease(slot_id, connection));
@@ -260,14 +253,26 @@ struct PoolInner<C: RemoteConnector, R: PoolRuntime> {
 }
 
 impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
-    fn claim(&self, ticket: u64) -> Claim<C::Connection> {
+    fn register_waiter(self: &Arc<Self>, sender: async_channel::Sender<()>) -> WaiterPermit<C, R> {
+        let mut state = lock(&self.state);
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        state.waiters.push_back(Waiter { ticket, sender });
+        WaiterPermit {
+            inner: self.clone(),
+            ticket,
+            active: true,
+        }
+    }
+
+    fn claim(self: &Arc<Self>, waiter: &mut WaiterPermit<C, R>) -> Claim<C, R> {
         let now = self.runtime.now();
         let mut state = lock(&self.state);
         state.slots.retain(|slot| {
             slot.active != 0
                 || (!slot.discard && now.saturating_sub(slot.last_used) < self.limits.idle_timeout)
         });
-        if state.waiters.front().map(|waiter| waiter.ticket) != Some(ticket) {
+        if state.waiters.front().map(|entry| entry.ticket) != Some(waiter.ticket) {
             return Claim::Wait;
         }
         if let Some(slot) = state
@@ -281,24 +286,30 @@ impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
                 connection: slot.connection.clone(),
             };
             state.waiters.pop_front();
-            wake_front(&state);
+            waiter.disarm();
+            wake_front(&mut state);
             return claim;
         }
         if state.slots.len() + state.connecting < self.limits.connections_per_provider {
             state.connecting += 1;
             state.waiters.pop_front();
-            wake_front(&state);
-            return Claim::Connect;
+            waiter.disarm();
+            wake_front(&mut state);
+            return Claim::Connect(ConnectPermit {
+                inner: self.clone(),
+                active: true,
+            });
         }
         Claim::Wait
     }
 
     async fn connect(
         &self,
+        mut permit: ConnectPermit<C, R>,
         cancellation: CancellationToken,
     ) -> Result<(u64, Arc<C::Connection>), RemoteError> {
         let connector_cancellation = CancellationToken::new();
-        let expiry_cancellation = connector_cancellation.clone();
+        let _cancel_connector = CancelOnDrop(connector_cancellation.clone());
         let connect = self
             .connector
             .connect(&self.profile, connector_cancellation.clone());
@@ -313,10 +324,10 @@ impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
             },
         );
         let result = futures_lite::future::race(connect, expiry).await;
-        expiry_cancellation.cancel();
 
         let mut state = lock(&self.state);
         state.connecting = state.connecting.saturating_sub(1);
+        permit.disarm();
         match result {
             Ok(connection) => {
                 let connection = Arc::new(connection);
@@ -329,11 +340,11 @@ impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
                     last_used: self.runtime.now(),
                     discard: false,
                 });
-                wake_front(&state);
+                wake_front(&mut state);
                 Ok((slot_id, connection))
             }
             Err(category) => {
-                wake_front(&state);
+                wake_front(&mut state);
                 Err(self.error(category))
             }
         }
@@ -355,7 +366,7 @@ impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
     fn remove_waiter(&self, ticket: u64) {
         let mut state = lock(&self.state);
         state.waiters.retain(|waiter| waiter.ticket != ticket);
-        wake_front(&state);
+        wake_front(&mut state);
     }
 
     fn error(&self, category: RemoteErrorCategory) -> RemoteError {
@@ -383,7 +394,7 @@ impl<C: RemoteConnector, R: PoolRuntime> LeaseRelease for PoolInner<C, R> {
         state
             .slots
             .retain(|slot| !(slot.discard && slot.active == 0));
-        wake_front(&state);
+        wake_front(&mut state);
     }
 }
 
@@ -455,15 +466,79 @@ impl<T> Default for PoolState<T> {
     }
 }
 
-enum Claim<T> {
-    Lease { slot_id: u64, connection: Arc<T> },
-    Connect,
+enum Claim<C: RemoteConnector, R: PoolRuntime> {
+    Lease {
+        slot_id: u64,
+        connection: Arc<C::Connection>,
+    },
+    Connect(ConnectPermit<C, R>),
     Wait,
 }
 
-fn wake_front<T>(state: &PoolState<T>) {
-    if let Some(waiter) = state.waiters.front() {
-        let _ = waiter.sender.try_send(());
+struct WaiterPermit<C: RemoteConnector, R: PoolRuntime> {
+    inner: Arc<PoolInner<C, R>>,
+    ticket: u64,
+    active: bool,
+}
+
+impl<C: RemoteConnector, R: PoolRuntime> WaiterPermit<C, R> {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl<C: RemoteConnector, R: PoolRuntime> Drop for WaiterPermit<C, R> {
+    fn drop(&mut self) {
+        if self.active {
+            self.inner.remove_waiter(self.ticket);
+        }
+    }
+}
+
+struct ConnectPermit<C: RemoteConnector, R: PoolRuntime> {
+    inner: Arc<PoolInner<C, R>>,
+    active: bool,
+}
+
+impl<C: RemoteConnector, R: PoolRuntime> ConnectPermit<C, R> {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl<C: RemoteConnector, R: PoolRuntime> Drop for ConnectPermit<C, R> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = lock(&self.inner.state);
+            state.connecting = state.connecting.saturating_sub(1);
+            wake_front(&mut state);
+        }
+    }
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+fn wake_front<T>(state: &mut PoolState<T>) {
+    loop {
+        let Some(waiter) = state.waiters.front() else {
+            return;
+        };
+        if waiter.sender.is_closed() {
+            state.waiters.pop_front();
+            continue;
+        }
+        let sent = waiter.sender.try_send(());
+        if sent.is_err() && waiter.sender.is_closed() {
+            state.waiters.pop_front();
+            continue;
+        }
+        return;
     }
 }
 

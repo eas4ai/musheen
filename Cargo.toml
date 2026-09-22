@@ -34,6 +34,7 @@ unsafe_code = "forbid"
 alacritty_terminal = "0.26"
 async-channel = "2"
 async-io = "2"
+async-net = "2"
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "backend", "frontend"] }
 base64 = "0.22"
 blake3 = "1"

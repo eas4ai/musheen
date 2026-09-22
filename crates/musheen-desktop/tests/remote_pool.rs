@@ -1,10 +1,12 @@
 use futures_lite::future::block_on;
+use futures_lite::future::poll_once;
 use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::remote::{
-    CONNECT_TIMEOUT, ConnectionProfile, ConnectionProfiles, HostKeyPolicy, PoolLimits, PoolRuntime,
-    ProviderPool, ProxyKind, ProxySettings, RemoteConnector, RemoteError, RemoteErrorCategory,
-    RemoteHost, RemoteProtocol, SaveConfirmation, SaveRequirement, SecurityPolicy, TLS_PIN_BYTES,
-    TestReport, TlsPolicy,
+    CONNECT_TIMEOUT, ConnectionProbe, ConnectionProfile, ConnectionProfiles, HostKeyPolicy,
+    PoolLimits, PoolRuntime, ProfileConnectionTest, ProfileConnectionTester, ProviderPool,
+    ProxyKind, ProxySettings, RemoteConnector, RemoteError, RemoteErrorCategory, RemoteHost,
+    RemoteProtocol, SaveConfirmation, SaveRequirement, SecurityPolicy, TLS_PIN_BYTES, TestReport,
+    TlsPolicy,
 };
 use musheen_desktop::{ConnectionId, CredentialReference};
 use std::collections::VecDeque;
@@ -24,7 +26,7 @@ fn profile(protocol: RemoteProtocol, security: SecurityPolicy) -> ConnectionProf
         ConnectionId::new(format!("{protocol:?}").to_ascii_lowercase()).unwrap(),
         format!("{protocol:?}"),
         protocol,
-        RemoteHost::new("files.example.test").unwrap(),
+        RemoteHost::new(protocol, "files.example.test").unwrap(),
         None,
         "/share",
         Some("alice"),
@@ -64,7 +66,7 @@ fn every_protocol_validates_and_profiles_never_serialize_inline_secrets() {
         ConnectionId::new("invalid-policy").unwrap(),
         "Invalid policy",
         RemoteProtocol::Sftp,
-        RemoteHost::new("files.example.test").unwrap(),
+        RemoteHost::new(RemoteProtocol::Sftp, "files.example.test").unwrap(),
         None,
         "/",
         None::<&str>,
@@ -85,7 +87,7 @@ fn every_protocol_validates_and_profiles_never_serialize_inline_secrets() {
         ConnectionId::new("session-only").unwrap(),
         "Session only",
         RemoteProtocol::Sftp,
-        RemoteHost::new("files.example.test").unwrap(),
+        RemoteHost::new(RemoteProtocol::Sftp, "files.example.test").unwrap(),
         None,
         "/",
         Some("alice"),
@@ -113,7 +115,10 @@ fn host_tls_host_key_proxy_and_secret_references_are_strictly_validated() {
         "example.test\nforged",
         "",
     ] {
-        assert!(RemoteHost::new(invalid).is_err(), "accepted {invalid:?}");
+        assert!(
+            RemoteHost::new(RemoteProtocol::Http, invalid).is_err(),
+            "accepted {invalid:?}"
+        );
     }
 
     let pin = [0x5a; TLS_PIN_BYTES];
@@ -127,9 +132,11 @@ fn host_tls_host_key_proxy_and_secret_references_are_strictly_validated() {
     );
 
     let proxy = ProxySettings::new(
+        RemoteProtocol::Sftp,
         ProxyKind::Socks5,
-        RemoteHost::new("proxy.example.test").unwrap(),
+        RemoteHost::new(RemoteProtocol::Sftp, "proxy.example.test").unwrap(),
         1080,
+        Some("proxy-user"),
         Some(credential("proxy-secret")),
     )
     .unwrap();
@@ -138,7 +145,7 @@ fn host_tls_host_key_proxy_and_secret_references_are_strictly_validated() {
         ConnectionId::new("proxied").unwrap(),
         "Proxied",
         RemoteProtocol::Sftp,
-        RemoteHost::new("files.example.test").unwrap(),
+        RemoteHost::new(RemoteProtocol::Sftp, "files.example.test").unwrap(),
         Some(22),
         "/",
         Some("alice"),
@@ -161,9 +168,11 @@ fn host_tls_host_key_proxy_and_secret_references_are_strictly_validated() {
     assert!(!debug.contains("proxy-secret"));
     assert!(
         ProxySettings::new(
+            RemoteProtocol::Sftp,
             ProxyKind::HttpConnect,
-            RemoteHost::new("proxy.example.test").unwrap(),
+            RemoteHost::new(RemoteProtocol::Sftp, "proxy.example.test").unwrap(),
             0,
+            None::<&str>,
             None,
         )
         .is_err()
@@ -182,7 +191,7 @@ fn errors_keep_safe_context_without_transport_or_credential_text() {
     let error = RemoteError::new(
         RemoteProtocol::Sftp,
         RemoteErrorCategory::Authentication,
-        Some(RemoteHost::new("files.example.test").unwrap()),
+        Some(RemoteHost::new(RemoteProtocol::Sftp, "files.example.test").unwrap()),
     );
     let rendered = format!("{error:?} {error}");
     assert!(rendered.contains("Sftp"));
@@ -235,6 +244,185 @@ fn save_flow_requires_current_test_and_explicit_risk_confirmations() {
     assert_eq!(
         changed.save_requirement(Some(&old), Some(&stale), SaveConfirmation::all()),
         SaveRequirement::TestRequired
+    );
+}
+
+#[test]
+fn every_security_reduction_and_protocol_switch_requires_confirmation() {
+    let replacement = |protocol, security| {
+        ConnectionProfile::new(
+            ConnectionId::new("same-profile").unwrap(),
+            "Same profile",
+            protocol,
+            RemoteHost::new(protocol, "files.example.test").unwrap(),
+            None,
+            "/",
+            None::<&str>,
+            None,
+            security,
+            None,
+        )
+        .unwrap()
+    };
+    let requires_confirmation = |previous: &ConnectionProfile, next: &ConnectionProfile| {
+        next.save_requirement(
+            Some(previous),
+            Some(&TestReport::passed(next)),
+            SaveConfirmation::default(),
+        )
+    };
+    let pin_a = [0x11; TLS_PIN_BYTES];
+    let pin_b = [0x22; TLS_PIN_BYTES];
+    for (previous, next) in [
+        (
+            replacement(
+                RemoteProtocol::Http,
+                SecurityPolicy::Tls(TlsPolicy::SystemRoots),
+            ),
+            replacement(RemoteProtocol::Http, SecurityPolicy::PlaintextConfirmed),
+        ),
+        (
+            replacement(
+                RemoteProtocol::Http,
+                SecurityPolicy::Tls(TlsPolicy::PinnedSha256(pin_a)),
+            ),
+            replacement(
+                RemoteProtocol::Http,
+                SecurityPolicy::Tls(TlsPolicy::SystemRoots),
+            ),
+        ),
+        (
+            replacement(
+                RemoteProtocol::Sftp,
+                SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(pin_a)),
+            ),
+            replacement(
+                RemoteProtocol::Sftp,
+                SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            ),
+        ),
+        (
+            replacement(
+                RemoteProtocol::Http,
+                SecurityPolicy::Tls(TlsPolicy::PinnedSha256(pin_a)),
+            ),
+            replacement(
+                RemoteProtocol::Http,
+                SecurityPolicy::Tls(TlsPolicy::PinnedSha256(pin_b)),
+            ),
+        ),
+        (
+            replacement(
+                RemoteProtocol::Sftp,
+                SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            ),
+            replacement(RemoteProtocol::Http, SecurityPolicy::PlaintextConfirmed),
+        ),
+        (
+            replacement(RemoteProtocol::Smb, SecurityPolicy::SystemManaged),
+            replacement(RemoteProtocol::Nfs, SecurityPolicy::SystemManaged),
+        ),
+    ] {
+        assert_eq!(
+            requires_confirmation(&previous, &next),
+            SaveRequirement::ConfirmSecurityChange
+        );
+    }
+
+    for (previous, next) in [
+        (
+            replacement(RemoteProtocol::Http, SecurityPolicy::PlaintextConfirmed),
+            replacement(
+                RemoteProtocol::Http,
+                SecurityPolicy::Tls(TlsPolicy::SystemRoots),
+            ),
+        ),
+        (
+            replacement(
+                RemoteProtocol::Ftps,
+                SecurityPolicy::Tls(TlsPolicy::SystemRoots),
+            ),
+            replacement(
+                RemoteProtocol::Ftps,
+                SecurityPolicy::Tls(TlsPolicy::PinnedSha256(pin_a)),
+            ),
+        ),
+        (
+            replacement(
+                RemoteProtocol::Sftp,
+                SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            ),
+            replacement(
+                RemoteProtocol::Sftp,
+                SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(pin_a)),
+            ),
+        ),
+    ] {
+        assert_eq!(
+            requires_confirmation(&previous, &next),
+            SaveRequirement::Ready
+        );
+    }
+}
+
+#[test]
+fn invalid_hosts_retain_the_selected_protocol() {
+    let error = RemoteHost::new(RemoteProtocol::Sftp, "https://bad.example").unwrap_err();
+    assert_eq!(error.protocol(), RemoteProtocol::Sftp);
+
+    let error = ConnectionProfiles::import(
+        r#"{"version":1,"profiles":[{"id":"bad","name":"Bad","protocol":"sftp","host":"bad host","port":null,"path":"/","username":null,"credential":null,"security":{"kind":"ssh","policy":{"policy":"known-hosts"}},"proxy":null}]}"#,
+    )
+    .unwrap_err();
+    assert_eq!(error.protocol(), RemoteProtocol::Sftp);
+}
+
+#[derive(Clone, Default)]
+struct RecordingProbe {
+    calls: Arc<Mutex<Vec<(String, u16)>>>,
+    hang: bool,
+}
+
+impl ConnectionProbe for RecordingProbe {
+    fn connect<'a>(
+        &'a self,
+        host: &'a RemoteHost,
+        port: u16,
+        _cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RemoteErrorCategory>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((host.as_str().to_owned(), port));
+        Box::pin(async move { if self.hang { pending().await } else { Ok(()) } })
+    }
+}
+
+#[test]
+fn production_profile_tester_uses_protocol_ports_and_cancellation() {
+    let probe = RecordingProbe::default();
+    let tester = ProfileConnectionTester::new(probe.clone());
+    let sftp = profile(
+        RemoteProtocol::Sftp,
+        SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+    );
+    block_on(tester.test(&sftp, CancellationToken::new())).unwrap();
+    assert_eq!(
+        &*probe.calls.lock().unwrap(),
+        &[("files.example.test".to_owned(), 22)]
+    );
+
+    let tester = ProfileConnectionTester::new(RecordingProbe {
+        hang: true,
+        ..RecordingProbe::default()
+    });
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        block_on(tester.test(&sftp, cancellation))
+            .unwrap_err()
+            .category(),
+        RemoteErrorCategory::Cancelled
     );
 }
 
@@ -467,6 +655,43 @@ fn pool_waiters_are_fifo_and_cancellation_does_not_consume_the_next_wakeup() {
     drop(held);
     second.join().unwrap();
     assert_eq!(&*order.lock().unwrap(), &[2]);
+}
+
+#[test]
+fn dropping_queued_and_connecting_acquires_restores_fair_capacity() {
+    let runtime = ManualRuntime::default();
+    let connector = FakeConnector::ready();
+    let limits = PoolLimits::new(Duration::from_secs(15), Duration::from_secs(60), 1, 1).unwrap();
+    let bounded_pool = Arc::new(ProviderPool::with_runtime(
+        profile(
+            RemoteProtocol::Sftp,
+            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+        ),
+        connector,
+        runtime,
+        limits,
+    ));
+    let held = block_on(bounded_pool.acquire(CancellationToken::new())).unwrap();
+    let mut dropped_head = Box::pin(bounded_pool.acquire(CancellationToken::new()));
+    assert!(block_on(poll_once(dropped_head.as_mut())).is_none());
+    assert_eq!(bounded_pool.stats().waiting_requests(), 1);
+    drop(dropped_head);
+    assert_eq!(bounded_pool.stats().waiting_requests(), 0);
+    drop(held);
+    assert!(block_on(bounded_pool.acquire(CancellationToken::new())).is_ok());
+
+    let runtime = ManualRuntime::default();
+    let connector = FakeConnector::with_modes([ConnectMode::Hang, ConnectMode::Ready]);
+    let pool = pool(connector.clone(), runtime);
+    let mut dropped_connect = Box::pin(pool.acquire(CancellationToken::new()));
+    assert!(block_on(poll_once(dropped_connect.as_mut())).is_none());
+    assert_eq!(pool.stats().connecting(), 1);
+    drop(dropped_connect);
+    assert_eq!(pool.stats().connecting(), 0);
+    assert_eq!(pool.stats().waiting_requests(), 0);
+    let lease = block_on(pool.acquire(CancellationToken::new())).unwrap();
+    assert_eq!(lease.connection().0, 2);
+    assert_eq!(connector.connects(), 2);
 }
 
 #[test]

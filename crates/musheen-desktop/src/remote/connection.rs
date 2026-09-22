@@ -26,7 +26,7 @@ pub enum RemoteProtocol {
 pub struct RemoteHost(Box<str>);
 
 impl RemoteHost {
-    pub fn new(value: impl Into<Box<str>>) -> Result<Self, RemoteError> {
+    pub fn new(protocol: RemoteProtocol, value: impl Into<Box<str>>) -> Result<Self, RemoteError> {
         let value = value.into();
         let valid = !value.is_empty()
             && value.len() <= 253
@@ -36,13 +36,9 @@ impl RemoteHost {
                 .any(|byte| byte.is_ascii_control() || b"/@\\?#".contains(&byte))
             && !value.chars().any(char::is_whitespace)
             && value.trim() == value.as_ref();
-        valid.then_some(Self(value)).ok_or_else(|| {
-            RemoteError::new(
-                RemoteProtocol::Http,
-                RemoteErrorCategory::InvalidProfile,
-                None,
-            )
-        })
+        valid
+            .then_some(Self(value))
+            .ok_or_else(|| RemoteError::new(protocol, RemoteErrorCategory::InvalidProfile, None))
     }
 
     #[must_use]
@@ -99,12 +95,17 @@ impl SecurityPolicy {
         }
     }
 
-    fn weakens(&self, previous: &Self) -> bool {
+    fn requires_confirmation(&self, previous: &Self) -> bool {
+        if self == previous {
+            return false;
+        }
         match previous {
-            Self::Tls(TlsPolicy::PinnedSha256(_)) | Self::Ssh(HostKeyPolicy::PinnedSha256(_)) => {
-                self != previous
-            }
-            _ => false,
+            Self::PlaintextConfirmed => false,
+            Self::Tls(TlsPolicy::SystemRoots) => matches!(self, Self::PlaintextConfirmed),
+            Self::Ssh(HostKeyPolicy::KnownHosts) => matches!(self, Self::PlaintextConfirmed),
+            Self::Tls(TlsPolicy::PinnedSha256(_))
+            | Self::Ssh(HostKeyPolicy::PinnedSha256(_))
+            | Self::SystemManaged => true,
         }
     }
 }
@@ -121,19 +122,29 @@ pub struct ProxySettings {
     kind: ProxyKind,
     host: RemoteHost,
     port: u16,
+    username: Option<Box<str>>,
     credential: Option<CredentialReference>,
 }
 
 impl ProxySettings {
     pub fn new(
+        protocol: RemoteProtocol,
         kind: ProxyKind,
         host: RemoteHost,
         port: u16,
+        username: Option<impl Into<Box<str>>>,
         credential: Option<CredentialReference>,
     ) -> Result<Self, RemoteError> {
-        if port == 0 {
+        let username = username.map(Into::into);
+        if port == 0
+            || username.as_deref().is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > 256
+                    || value.bytes().any(|byte| byte.is_ascii_control())
+            })
+        {
             return Err(RemoteError::new(
-                RemoteProtocol::Http,
+                protocol,
                 RemoteErrorCategory::InvalidProfile,
                 Some(host),
             ));
@@ -142,6 +153,7 @@ impl ProxySettings {
             kind,
             host,
             port,
+            username,
             credential,
         })
     }
@@ -162,6 +174,11 @@ impl ProxySettings {
     }
 
     #[must_use]
+    pub fn username(&self) -> Option<&str> {
+        self.username.as_deref()
+    }
+
+    #[must_use]
     pub fn credential(&self) -> Option<&CredentialReference> {
         self.credential.as_ref()
     }
@@ -174,6 +191,7 @@ impl fmt::Debug for ProxySettings {
             .field("kind", &self.kind)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .field("credential", &self.credential.as_ref().map(|_| "<stored>"))
             .finish()
     }
@@ -312,8 +330,10 @@ impl ConnectionProfile {
             return SaveRequirement::TestRequired;
         };
         let failed = report.error.is_some() && !confirmation.failed_test;
-        let security = previous.is_some_and(|profile| self.security.weakens(&profile.security))
-            && !confirmation.security_change;
+        let security = previous.is_some_and(|profile| {
+            self.protocol != profile.protocol
+                || self.security.requires_confirmation(&profile.security)
+        }) && !confirmation.security_change;
         match (failed, security) {
             (false, false) => SaveRequirement::Ready,
             (true, false) => SaveRequirement::ConfirmFailedTest,
@@ -479,6 +499,7 @@ struct ProxyWire {
     kind: ProxyKind,
     host: String,
     port: u16,
+    username: Option<String>,
     credential: Option<String>,
 }
 
@@ -499,7 +520,7 @@ impl TryFrom<&ConnectionProfile> for ProfileWire {
             proxy: profile
                 .proxy
                 .as_ref()
-                .map(ProxyWire::try_from)
+                .map(|proxy| ProxyWire::from_settings(profile.protocol, proxy))
                 .transpose()?,
         })
     }
@@ -509,14 +530,17 @@ impl TryFrom<ProfileWire> for ConnectionProfile {
     type Error = RemoteError;
 
     fn try_from(profile: ProfileWire) -> Result<Self, Self::Error> {
-        let host = RemoteHost::new(profile.host)?;
+        let host = RemoteHost::new(profile.protocol, profile.host)?;
         let credential = profile
             .credential
             .as_deref()
             .map(CredentialReference::from_setting_value)
             .transpose()
             .map_err(|_| invalid_profile(profile.protocol, Some(host.clone())))?;
-        let proxy = profile.proxy.map(ProxySettings::try_from).transpose()?;
+        let proxy = profile
+            .proxy
+            .map(|proxy| proxy.into_settings(profile.protocol))
+            .transpose()?;
         let id = ConnectionId::new(profile.id)
             .map_err(|_| invalid_profile(profile.protocol, Some(host.clone())))?;
         Self::new(
@@ -534,31 +558,33 @@ impl TryFrom<ProfileWire> for ConnectionProfile {
     }
 }
 
-impl TryFrom<&ProxySettings> for ProxyWire {
-    type Error = RemoteError;
-
-    fn try_from(proxy: &ProxySettings) -> Result<Self, Self::Error> {
+impl ProxyWire {
+    fn from_settings(protocol: RemoteProtocol, proxy: &ProxySettings) -> Result<Self, RemoteError> {
         Ok(Self {
             kind: proxy.kind,
             host: proxy.host.to_string(),
             port: proxy.port,
-            credential: stored_reference(RemoteProtocol::Http, proxy.credential.as_ref())?,
+            username: proxy.username.as_deref().map(str::to_owned),
+            credential: stored_reference(protocol, proxy.credential.as_ref())?,
         })
     }
-}
 
-impl TryFrom<ProxyWire> for ProxySettings {
-    type Error = RemoteError;
-
-    fn try_from(proxy: ProxyWire) -> Result<Self, Self::Error> {
-        let host = RemoteHost::new(proxy.host)?;
-        let credential = proxy
+    fn into_settings(self, protocol: RemoteProtocol) -> Result<ProxySettings, RemoteError> {
+        let host = RemoteHost::new(protocol, self.host)?;
+        let credential = self
             .credential
             .as_deref()
             .map(CredentialReference::from_setting_value)
             .transpose()
-            .map_err(|_| invalid_profile(RemoteProtocol::Http, Some(host.clone())))?;
-        Self::new(proxy.kind, host, proxy.port, credential)
+            .map_err(|_| invalid_profile(protocol, Some(host.clone())))?;
+        ProxySettings::new(
+            protocol,
+            self.kind,
+            host,
+            self.port,
+            self.username,
+            credential,
+        )
     }
 }
 
