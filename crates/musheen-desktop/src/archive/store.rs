@@ -234,6 +234,21 @@ impl DecodeCounterState {
         })
     }
 
+    pub(crate) fn try_reserve_external(self: &Arc<Self>, count: usize, maximum: usize) -> bool {
+        match self.reserve(count, maximum) {
+            Ok(mut lease) => {
+                lease.counters.take();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) fn release_external(&self, count: usize) {
+        self.metadata_bytes
+            .fetch_sub(u64::try_from(count).unwrap_or(u64::MAX), Ordering::AcqRel);
+    }
+
     fn snapshot(&self) -> ArchiveCounters {
         ArchiveCounters {
             bytes_read: self.bytes_read.load(Ordering::Relaxed),

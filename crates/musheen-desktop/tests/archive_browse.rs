@@ -364,6 +364,42 @@ fn encrypted_seven_zip_header_uses_the_password_callback() {
 }
 
 #[test]
+fn seven_zip_metadata_budget_is_charged_before_header_allocations() {
+    use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
+
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).expect("7z writer starts");
+        for index in 0..128 {
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_directory(&format!("directory-{index:03}")),
+                    None::<std::io::Empty>,
+                )
+                .expect("7z directory writes");
+        }
+        writer.finish().expect("7z writer closes");
+    }
+    let limit = 4_096;
+    let store = open_bytes(
+        &bytes,
+        ArchiveFormat::SevenZip,
+        ArchiveLimits {
+            max_metadata_bytes: limit,
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let error = read_root(&store, 256).expect_err("7z metadata must respect the memory budget");
+    assert!(error.to_string().contains("metadata bytes limit exceeded"));
+    let counters = store.counters();
+    assert!(counters.total_allocated_bytes > 0);
+    assert!(counters.peak_metadata_bytes > 0);
+    assert!(counters.peak_metadata_bytes <= limit);
+    assert_eq!(counters.metadata_bytes, 0);
+}
+
+#[test]
 fn compressed_tar_variants_browse_without_extraction() {
     let mut tar_bytes = Vec::new();
     {

@@ -43,6 +43,11 @@ pub enum Error {
         /// Actual required memory in KB.
         actaul_kb: usize,
     },
+    /// A caller-supplied archive metadata memory budget was exceeded.
+    MemoryLimitExceeded {
+        /// Bytes requested by the allocation that did not fit.
+        requested: usize,
+    },
     /// Password required for encrypted archive.
     PasswordRequired,
     /// Feature or operation not supported.

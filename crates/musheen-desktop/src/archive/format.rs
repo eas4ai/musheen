@@ -554,9 +554,24 @@ struct SevenZipScanner {
     provider: ProviderId,
     limits: ArchiveLimits,
     counters: Arc<DecodeCounterState>,
-    entries: std::vec::IntoIter<sevenz_rust2::ArchiveEntry>,
-    next_index: u64,
-    _codec_allocation: AllocationLease,
+    archive: sevenz_rust2::Archive,
+    next_index: usize,
+    _codec_allocation: sevenz_rust2::ArchiveMemoryLease,
+}
+
+struct SevenZipMemoryBudget {
+    counters: Arc<DecodeCounterState>,
+    maximum: usize,
+}
+
+impl sevenz_rust2::ArchiveMemoryBudget for SevenZipMemoryBudget {
+    fn try_reserve(&self, bytes: usize) -> bool {
+        self.counters.try_reserve_external(bytes, self.maximum)
+    }
+
+    fn release(&self, bytes: usize) {
+        self.counters.release_external(bytes);
+    }
 }
 
 impl SevenZipScanner {
@@ -568,7 +583,8 @@ impl SevenZipScanner {
         passwords: &dyn ArchivePasswordProvider,
     ) -> Result<Self, ArchiveError> {
         let mut reader = TimedReader::new(source, limits.max_elapsed, Arc::clone(&counters));
-        let archive = read_seven_archive(&mut reader, passwords)?;
+        let (archive, codec_allocation) =
+            read_seven_archive(&mut reader, passwords, &limits, &counters)?;
         if archive.files.len() > limits.max_entries {
             return Err(ArchiveError::LimitExceeded {
                 resource: "archive entries",
@@ -576,29 +592,11 @@ impl SevenZipScanner {
                 maximum: limits.max_entries,
             });
         }
-        let allocated = archive
-            .files
-            .capacity()
-            .saturating_mul(std::mem::size_of::<sevenz_rust2::ArchiveEntry>())
-            .saturating_add(
-                archive
-                    .files
-                    .iter()
-                    .map(|entry| entry.name.capacity())
-                    .sum::<usize>(),
-            )
-            .saturating_add(
-                archive
-                    .blocks
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<sevenz_rust2::Block>()),
-            );
-        let codec_allocation = counters.reserve(allocated, limits.max_metadata_bytes)?;
         Ok(Self {
             provider,
             limits,
             counters,
-            entries: archive.files.into_iter(),
+            archive,
             next_index: 0,
             _codec_allocation: codec_allocation,
         })
@@ -611,8 +609,8 @@ impl ArchiveScanner for SevenZipScanner {
         cancellation: &CancellationToken,
     ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
         cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
-        for entry in self.entries.by_ref() {
-            let ordinal = self.next_index;
+        while let Some(entry) = self.archive.files.get(self.next_index) {
+            let ordinal = self.next_index as u64;
             self.next_index = self.next_index.saturating_add(1);
             if entry.is_anti_item {
                 continue;
@@ -763,8 +761,18 @@ impl ArchiveScanner for LibarchiveScanner {
 fn read_seven_archive<R: Read + Seek>(
     reader: &mut R,
     passwords: &dyn ArchivePasswordProvider,
-) -> Result<sevenz_rust2::Archive, ArchiveError> {
-    match sevenz_rust2::Archive::read(reader, &sevenz_rust2::Password::empty()) {
+    limits: &ArchiveLimits,
+    counters: &Arc<DecodeCounterState>,
+) -> Result<(sevenz_rust2::Archive, sevenz_rust2::ArchiveMemoryLease), ArchiveError> {
+    let budget: Arc<dyn sevenz_rust2::ArchiveMemoryBudget> = Arc::new(SevenZipMemoryBudget {
+        counters: Arc::clone(counters),
+        maximum: limits.max_metadata_bytes,
+    });
+    match sevenz_rust2::Archive::read_with_memory_budget(
+        reader,
+        &sevenz_rust2::Password::empty(),
+        Arc::clone(&budget),
+    ) {
         Ok(archive) => Ok(archive),
         Err(sevenz_rust2::Error::PasswordRequired) => {
             reader
@@ -774,18 +782,29 @@ fn read_seven_archive<R: Read + Seek>(
             let text = std::str::from_utf8(password.as_bytes())
                 .map_err(|_| ArchiveError::InvalidPassword)?;
             let dependency_password = sevenz_rust2::Password::new(text);
-            let result =
-                sevenz_rust2::Archive::read(reader, &dependency_password).map_err(|error| {
-                    match error {
-                        sevenz_rust2::Error::MaybeBadPassword(_) => ArchiveError::InvalidPassword,
-                        _ => ArchiveError::InvalidArchive,
-                    }
-                });
+            let result = sevenz_rust2::Archive::read_with_memory_budget(
+                reader,
+                &dependency_password,
+                budget,
+            )
+            .map_err(|error| map_seven_error(error, limits.max_metadata_bytes));
             drop(dependency_password);
             drop(password);
             result
         }
-        Err(_) => Err(ArchiveError::InvalidArchive),
+        Err(error) => Err(map_seven_error(error, limits.max_metadata_bytes)),
+    }
+}
+
+fn map_seven_error(error: sevenz_rust2::Error, maximum: usize) -> ArchiveError {
+    match error {
+        sevenz_rust2::Error::MaybeBadPassword(_) => ArchiveError::InvalidPassword,
+        sevenz_rust2::Error::MemoryLimitExceeded { requested } => ArchiveError::LimitExceeded {
+            resource: "metadata bytes",
+            value: maximum.saturating_add(requested),
+            maximum,
+        },
+        _ => ArchiveError::InvalidArchive,
     }
 }
 

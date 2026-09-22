@@ -7,7 +7,7 @@ use flate2::bufread::DeflateDecoder;
 use lzma_rust2::{
     Lzma2Reader, Lzma2ReaderMt, LzmaReader,
     filter::{bcj::BcjReader, delta::DeltaReader},
-    lzma2_get_memory_usage,
+    lzma_get_memory_usage_by_props, lzma2_get_memory_usage,
 };
 #[cfg(feature = "ppmd")]
 use ppmd_rust::{
@@ -207,6 +207,50 @@ pub fn add_decoder<I: Read>(
             method.name().to_string(),
         )),
     }
+}
+
+pub(crate) fn decoder_memory_usage(
+    coder: &Coder,
+    uncompressed_len: usize,
+) -> Result<usize, Error> {
+    let method = EncoderMethod::by_id(coder.encoder_method_id()).ok_or_else(|| {
+        Error::UnsupportedCompressionMethod(format!("{:?}", coder.encoder_method_id()))
+    })?;
+    let kib = match method.id() {
+        EncoderMethod::ID_LZMA => {
+            if coder.properties.len() < 5 {
+                return Err(Error::Other("LZMA properties too short".into()));
+            }
+            let dictionary = get_lzma_dic_size(coder)?;
+            let props = coder.properties[0];
+            let effective_dictionary = dictionary.min(
+                u32::try_from(uncompressed_len).unwrap_or(u32::MAX),
+            );
+            usize::try_from(
+                lzma_get_memory_usage_by_props(effective_dictionary, props)
+                    .map_err(|error| Error::other(error.to_string()))?,
+            )
+            .unwrap_or(usize::MAX)
+        }
+        EncoderMethod::ID_LZMA2 => {
+            usize::try_from(lzma2_get_memory_usage(get_lzma2_dic_size(coder)?))
+                .unwrap_or(usize::MAX)
+        }
+        #[cfg(feature = "ppmd")]
+        EncoderMethod::ID_PPMD => {
+            let (_, bytes) = get_ppmd_order_memory_size(coder, usize::MAX / 1_024)?;
+            usize::try_from(bytes).unwrap_or(usize::MAX).div_ceil(1_024)
+        }
+        #[cfg(feature = "bzip2")]
+        EncoderMethod::ID_BZIP2 => 900,
+        #[cfg(feature = "aes256")]
+        EncoderMethod::ID_AES256_SHA256 => 1,
+        _ => 0,
+    };
+    kib.checked_mul(1_024)
+        .ok_or(Error::MemoryLimitExceeded {
+            requested: usize::MAX,
+        })
 }
 
 #[cfg(feature = "ppmd")]
