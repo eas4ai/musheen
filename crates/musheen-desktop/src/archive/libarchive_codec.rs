@@ -185,6 +185,15 @@ impl ArchiveScanner for LibarchiveScanner {
                 return Err(error);
             }
         };
+        self.accept_frame(frame)
+    }
+}
+
+impl LibarchiveScanner {
+    fn accept_frame(
+        &mut self,
+        frame: WorkerFrame,
+    ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
         match frame {
             WorkerFrame::End => {
                 self.terminate();
@@ -200,27 +209,33 @@ impl ArchiveScanner for LibarchiveScanner {
                 size,
                 bytes_read,
             } => {
-                let delta = bytes_read.saturating_sub(self.reported_bytes);
-                self.reported_bytes = bytes_read;
-                self.counters.add_read_bytes(delta);
-                let allocation = self.counters.reserve(
-                    name.len()
-                        .saturating_mul(2)
-                        .saturating_add(std::mem::size_of::<RawArchiveEntry>()),
-                    self.limits.max_metadata_bytes,
-                )?;
-                let path = ArchivePath::normalize_bytes(&name, self.limits.max_path_bytes)?;
-                let ordinal = self.ordinal;
-                self.ordinal = self.ordinal.saturating_add(1);
-                Ok(Some(RawArchiveEntry {
-                    provider: self.provider.clone(),
-                    path,
-                    kind,
-                    size,
-                    compressed_size: None,
-                    ordinal,
-                    _allocation: allocation,
-                }))
+                let result = (|| {
+                    let delta = bytes_read.saturating_sub(self.reported_bytes);
+                    self.reported_bytes = bytes_read;
+                    self.counters.add_read_bytes(delta);
+                    let allocation = self.counters.reserve(
+                        name.len()
+                            .saturating_mul(2)
+                            .saturating_add(std::mem::size_of::<RawArchiveEntry>()),
+                        self.limits.max_metadata_bytes,
+                    )?;
+                    let path = ArchivePath::normalize_bytes(&name, self.limits.max_path_bytes)?;
+                    let ordinal = self.ordinal;
+                    self.ordinal = self.ordinal.saturating_add(1);
+                    Ok(Some(RawArchiveEntry {
+                        provider: self.provider.clone(),
+                        path,
+                        kind,
+                        size,
+                        compressed_size: None,
+                        ordinal,
+                        _allocation: allocation,
+                    }))
+                })();
+                if result.is_err() {
+                    self.terminate();
+                }
+                result
             }
         }
     }
@@ -496,6 +511,8 @@ pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::index::{ArchiveScannerFactory, LazyArchiveIndex};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn archive_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -513,17 +530,50 @@ mod tests {
         bytes
     }
 
+    fn duplicate_archive_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut builder = tar::Builder::new(&mut bytes);
+        for contents in [b"first".as_slice(), b"second".as_slice()] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "duplicate.txt", contents)
+                .expect("duplicate entry writes");
+        }
+        builder.finish().expect("archive closes");
+        drop(builder);
+        bytes
+    }
+
     fn scanner(bytes: &[u8]) -> LibarchiveScanner {
+        scanner_with_limits(bytes, ArchiveLimits::default(), DecodeCounterState::new())
+    }
+
+    fn scanner_with_limits(
+        bytes: &[u8],
+        limits: ArchiveLimits,
+        counters: Arc<DecodeCounterState>,
+    ) -> LibarchiveScanner {
+        scanner_for_provider(
+            bytes,
+            ProviderId::new("archive-libarchive-lifecycle").expect("provider ID"),
+            limits,
+            counters,
+        )
+    }
+
+    fn scanner_for_provider(
+        bytes: &[u8],
+        provider: ProviderId,
+        limits: ArchiveLimits,
+        counters: Arc<DecodeCounterState>,
+    ) -> LibarchiveScanner {
         let mut source = tempfile::tempfile().expect("temporary source");
         source.write_all(bytes).expect("source writes");
         source.seek(SeekFrom::Start(0)).expect("source rewinds");
-        LibarchiveScanner::new(
-            source,
-            ProviderId::new("archive-libarchive-lifecycle").expect("provider ID"),
-            ArchiveLimits::default(),
-            DecodeCounterState::new(),
-        )
-        .expect("worker starts")
+        LibarchiveScanner::new(source, provider, limits, counters).expect("worker starts")
     }
 
     fn assert_terminated(scanner: &LibarchiveScanner) {
@@ -564,5 +614,99 @@ mod tests {
         child.wait().expect("worker reaps");
         while let Ok(Some(_)) = scanner.next_entry(&CancellationToken::new()) {}
         assert_terminated(&scanner);
+    }
+
+    #[test]
+    fn post_frame_path_normalization_error_reaps_worker_immediately() {
+        let mut scanner = scanner(&archive_bytes());
+        let result = scanner.accept_frame(WorkerFrame::Entry {
+            name: b"../escape".to_vec(),
+            kind: RawEntryKind::RegularFile,
+            size: Some(1),
+            bytes_read: 1,
+        });
+        assert!(matches!(result, Err(ArchiveError::UnsafePath(_))));
+        assert_terminated(&scanner);
+    }
+
+    #[test]
+    fn post_frame_allocation_error_reaps_worker_immediately() {
+        let limits = ArchiveLimits {
+            max_metadata_bytes: 0,
+            ..ArchiveLimits::default()
+        };
+        let mut scanner = scanner_with_limits(&archive_bytes(), limits, DecodeCounterState::new());
+        let result = scanner.accept_frame(WorkerFrame::Entry {
+            name: b"entry.txt".to_vec(),
+            kind: RawEntryKind::RegularFile,
+            size: Some(1),
+            bytes_read: 1,
+        });
+        assert!(matches!(
+            result,
+            Err(ArchiveError::LimitExceeded {
+                resource: "metadata bytes",
+                ..
+            })
+        ));
+        assert_terminated(&scanner);
+    }
+
+    struct ObservedWorkerScanner {
+        inner: Option<LibarchiveScanner>,
+        drop_completed: Arc<AtomicBool>,
+    }
+
+    impl ArchiveScanner for ObservedWorkerScanner {
+        fn next_entry(
+            &mut self,
+            cancellation: &CancellationToken,
+        ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
+            self.inner
+                .as_mut()
+                .expect("worker remains live")
+                .next_entry(cancellation)
+        }
+    }
+
+    impl Drop for ObservedWorkerScanner {
+        fn drop(&mut self) {
+            drop(self.inner.take());
+            self.drop_completed.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn sticky_index_rejection_reaps_libarchive_worker_before_returning() {
+        let bytes = duplicate_archive_bytes();
+        let provider = ProviderId::new("archive-libarchive-index-rejection").expect("provider ID");
+        let limits = ArchiveLimits::default();
+        let counters = DecodeCounterState::new();
+        let worker = scanner_for_provider(
+            &bytes,
+            provider.clone(),
+            limits.clone(),
+            Arc::clone(&counters),
+        );
+        let drop_completed = Arc::new(AtomicBool::new(false));
+        let observed = ObservedWorkerScanner {
+            inner: Some(worker),
+            drop_completed: Arc::clone(&drop_completed),
+        };
+        let factory: ArchiveScannerFactory = Arc::new(|| Err(ArchiveError::InvalidArchive));
+        let mut index = LazyArchiveIndex::new(Box::new(observed), factory, bytes.len() as u64);
+
+        let result = index.ensure_children(
+            &ArchivePath::root(provider),
+            2,
+            &CancellationToken::new(),
+            &limits,
+            &counters,
+        );
+        assert_eq!(result, Err(ArchiveError::DuplicatePath));
+        assert!(
+            drop_completed.load(Ordering::Acquire),
+            "the sticky index rejection must finish worker teardown before returning"
+        );
     }
 }

@@ -204,6 +204,10 @@ impl LazyArchiveIndex {
     }
 
     fn fail<T>(&mut self, error: ArchiveError) -> Result<T, ArchiveError> {
+        drop(std::mem::replace(
+            &mut self.scanner,
+            Box::new(ResettingScanner),
+        ));
         self.finished = true;
         self.failure = Some(error.clone());
         Err(error)
