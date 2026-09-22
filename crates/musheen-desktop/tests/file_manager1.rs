@@ -3,6 +3,7 @@
 use musheen_core::BoxFuture;
 use musheen_desktop::{FileManager1, FileManagerError, FileManagerRequest, FileManagerRequestSink};
 use std::io::{BufRead as _, BufReader};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -74,6 +75,44 @@ fn rejects_malformed_remote_and_lossy_file_uris_without_dispatch() {
         );
     }
     assert!(sink.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn percent_encoded_non_utf8_file_uri_keeps_exact_path_identity() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut bytes = temporary.path().as_os_str().as_bytes().to_vec();
+    bytes.extend_from_slice(b"/name-");
+    bytes.push(0xff);
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+    std::fs::write(&path, b"fixture").unwrap();
+    let uri = format!(
+        "file://{}",
+        bytes
+            .iter()
+            .map(|byte| match *byte {
+                b'/' => "/".to_owned(),
+                b'-' | b'.' | b'_' | b'~' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                    char::from(*byte).to_string()
+                }
+                byte => format!("%{byte:02X}"),
+            })
+            .collect::<String>()
+    );
+    let sink = Arc::new(RecordingSink::default());
+    let service = FileManager1::new(sink.clone());
+
+    futures_lite::future::block_on(service.show_items(&[&uri], "non-utf8")).unwrap();
+
+    let requests = sink.0.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].locations()[0]
+            .as_unix_path()
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+        bytes
+    );
 }
 
 #[test]

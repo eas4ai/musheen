@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod support;
+
 use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::{
     AuthorizationError, AuthorizationRequest, Authorizer, BrokerOperation, BrokerRequest, Clock,
@@ -11,6 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
+use support::UsableFileManager;
 use zbus::zvariant::OwnedValue;
 
 #[derive(Clone, Copy)]
@@ -210,6 +213,31 @@ fn private_bus_denial_challenge_and_absent_service_are_typed() {
     );
 }
 
+#[test]
+fn production_polkit_recovers_after_owner_disconnect_and_restart() {
+    let bus = PrivateBus::start();
+    let root = tempfile::tempdir().unwrap();
+    let request = authorization_request(root.path());
+    let authorizer =
+        PolkitAuthorizer::with_connection(AddressConnection(bus.address.clone()), ClockAt(100))
+            .with_timeout(Duration::from_millis(250));
+    let first_observed = Arc::new(Mutex::new(Vec::new()));
+    let first = start_authority(&bus.address, (true, false), Arc::clone(&first_observed));
+
+    authorizer.authorize(&request).unwrap();
+    assert_eq!(first_observed.lock().unwrap().len(), 1);
+    drop(first);
+    assert_eq!(
+        authorizer.authorize(&request),
+        Err(AuthorizationError::Unavailable)
+    );
+
+    let restarted_observed = Arc::new(Mutex::new(Vec::new()));
+    let _restarted = start_authority(&bus.address, (true, false), Arc::clone(&restarted_observed));
+    authorizer.authorize(&request).unwrap();
+    assert_eq!(restarted_observed.lock().unwrap().len(), 1);
+}
+
 struct StalledAuthority {
     started: Mutex<Option<mpsc::SyncSender<()>>>,
     cancelled: Arc<AtomicBool>,
@@ -274,6 +302,9 @@ fn production_polkit_cancellation_interrupts_a_pending_prompt_and_sends_cancel()
     started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("the private authority received the pending authorization");
+    let file_manager = UsableFileManager::new();
+    file_manager.show("polkit-slow");
+    assert_eq!(file_manager.calls(), 1);
     token.cancel();
     assert_eq!(worker.join().unwrap(), Err(AuthorizationError::Cancelled));
     assert!(cancelled.load(Ordering::Acquire));

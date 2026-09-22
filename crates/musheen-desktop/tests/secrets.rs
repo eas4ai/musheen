@@ -1,3 +1,5 @@
+mod support;
+
 use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::{
     ConnectionId, CredentialReference, CredentialVault, MutationDispatch, SecretBuffer,
@@ -7,6 +9,7 @@ use musheen_desktop::{
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
+use support::UsableFileManager;
 
 type StoredSecrets = BTreeMap<CredentialReference, (String, Vec<u8>)>;
 
@@ -354,4 +357,130 @@ fn workspace_selects_secret_service_async_io_and_rust_crypto() {
     let desktop = fs::read_to_string(root.join("crates/musheen-desktop/Cargo.toml")).unwrap();
     assert!(workspace.contains("rt-async-io-crypto-rust"));
     assert!(desktop.contains("secret-service.workspace = true"));
+}
+
+#[derive(Clone, Copy)]
+enum SecretServiceMode {
+    Absent,
+    Slow,
+    Disconnected,
+    Restarted,
+}
+
+#[derive(Clone)]
+struct MatrixSecretService {
+    mode: Arc<Mutex<SecretServiceMode>>,
+    started: async_channel::Sender<()>,
+    release: async_channel::Receiver<()>,
+}
+
+fn protocol_failure<'a, T: Send + 'a>() -> BoxFuture<'a, Result<T, SecretError>> {
+    Box::pin(std::future::ready(Err(SecretError::Protocol)))
+}
+
+impl SecretServiceBackend for MatrixSecretService {
+    fn state(&self) -> BoxFuture<'_, Result<SecretServiceState, SecretError>> {
+        let mode = *self.mode.lock().unwrap();
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            match mode {
+                SecretServiceMode::Absent => Err(SecretError::Unavailable),
+                SecretServiceMode::Disconnected => Err(SecretError::Disconnected),
+                SecretServiceMode::Slow => {
+                    started.send(()).await.unwrap();
+                    release.recv().await.unwrap();
+                    Err(SecretError::Timeout)
+                }
+                SecretServiceMode::Restarted => Ok(SecretServiceState::Available),
+            }
+        })
+    }
+
+    fn create<'a>(
+        &'a self,
+        _reference: &'a CredentialReference,
+        _label: &'a str,
+        _secret: &'a SecretBuffer,
+        _dispatch: &'a MutationDispatch,
+    ) -> BoxFuture<'a, Result<(), SecretError>> {
+        protocol_failure()
+    }
+
+    fn read<'a>(
+        &'a self,
+        _reference: &'a CredentialReference,
+    ) -> BoxFuture<'a, Result<SecretBuffer, SecretError>> {
+        protocol_failure()
+    }
+
+    fn update<'a>(
+        &'a self,
+        _reference: &'a CredentialReference,
+        _label: &'a str,
+        _secret: &'a SecretBuffer,
+        _dispatch: &'a MutationDispatch,
+    ) -> BoxFuture<'a, Result<(), SecretError>> {
+        protocol_failure()
+    }
+
+    fn delete<'a>(
+        &'a self,
+        _reference: &'a CredentialReference,
+        _dispatch: &'a MutationDispatch,
+    ) -> BoxFuture<'a, Result<(), SecretError>> {
+        protocol_failure()
+    }
+
+    fn rename<'a>(
+        &'a self,
+        _reference: &'a CredentialReference,
+        _label: &'a str,
+        _dispatch: &'a MutationDispatch,
+    ) -> BoxFuture<'a, Result<(), SecretError>> {
+        protocol_failure()
+    }
+}
+
+#[test]
+fn secret_service_absence_slowness_disconnect_and_restart_leave_file_management_usable() {
+    let (started, started_rx) = async_channel::bounded(1);
+    let (release, release_rx) = async_channel::bounded(1);
+    let mode = Arc::new(Mutex::new(SecretServiceMode::Absent));
+    let vault = Arc::new(CredentialVault::new(MatrixSecretService {
+        mode: Arc::clone(&mode),
+        started,
+        release: release_rx,
+    }));
+    let file_manager = UsableFileManager::new();
+
+    for (service_mode, expected) in [
+        (SecretServiceMode::Absent, SecretError::Unavailable),
+        (SecretServiceMode::Disconnected, SecretError::Disconnected),
+    ] {
+        *mode.lock().unwrap() = service_mode;
+        assert_eq!(
+            futures_lite::future::block_on(vault.state(CancellationToken::new())),
+            Err(expected)
+        );
+        file_manager.show("usable");
+    }
+
+    *mode.lock().unwrap() = SecretServiceMode::Slow;
+    let slow_vault = Arc::clone(&vault);
+    let slow = std::thread::spawn(move || {
+        futures_lite::future::block_on(slow_vault.state(CancellationToken::new()))
+    });
+    started_rx.recv_blocking().unwrap();
+    file_manager.show("still-usable");
+    release.send_blocking(()).unwrap();
+    assert_eq!(slow.join().unwrap(), Err(SecretError::Timeout));
+
+    *mode.lock().unwrap() = SecretServiceMode::Restarted;
+    assert_eq!(
+        futures_lite::future::block_on(vault.state(CancellationToken::new())),
+        Ok(SecretServiceState::Available)
+    );
+    file_manager.show("restarted");
+    assert_eq!(file_manager.calls(), 4);
 }

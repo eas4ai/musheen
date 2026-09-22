@@ -1,9 +1,12 @@
+mod support;
+
 use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::{
     PortalClient, PortalError, PortalRequest, PortalSelection, PortalTransport, SandboxState,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use support::UsableFileManager;
 
 #[cfg(unix)]
 use std::io::{BufRead as _, BufReader};
@@ -59,6 +62,103 @@ impl PortalTransport for FakePortal {
         let result = self.result.lock().unwrap().take().unwrap();
         Box::pin(async move { result })
     }
+}
+
+#[derive(Clone, Copy)]
+enum PortalServiceMode {
+    Absent,
+    Slow,
+    Disconnected,
+    Restarted,
+}
+
+#[derive(Clone)]
+struct MatrixPortal {
+    mode: Arc<Mutex<PortalServiceMode>>,
+    slow_started: async_channel::Sender<()>,
+    slow_release: async_channel::Receiver<()>,
+}
+
+impl PortalTransport for MatrixPortal {
+    fn choose(
+        &self,
+        _request: PortalRequest,
+        _cancellation: CancellationToken,
+    ) -> BoxFuture<'static, Result<PortalSelection, PortalError>> {
+        let mode = *self.mode.lock().unwrap();
+        let slow_started = self.slow_started.clone();
+        let slow_release = self.slow_release.clone();
+        Box::pin(async move {
+            match mode {
+                PortalServiceMode::Absent => Err(PortalError::Unavailable("absent".into())),
+                PortalServiceMode::Disconnected => {
+                    Err(PortalError::Unavailable("disconnected".into()))
+                }
+                PortalServiceMode::Slow => {
+                    slow_started.send(()).await.unwrap();
+                    slow_release.recv().await.unwrap();
+                    Err(PortalError::Unavailable("slow".into()))
+                }
+                PortalServiceMode::Restarted => Ok(PortalSelection::new(
+                    vec![PathBuf::from("/tmp/restarted-selection")],
+                    true,
+                )),
+            }
+        })
+    }
+}
+
+#[test]
+fn portal_absence_slowness_disconnect_and_restart_do_not_block_file_management() {
+    let file_manager = UsableFileManager::new();
+    let (slow_started, slow_ready) = async_channel::bounded(1);
+    let (slow_release, release) = async_channel::bounded(1);
+    let mode = Arc::new(Mutex::new(PortalServiceMode::Absent));
+    let client = Arc::new(PortalClient::new(
+        MatrixPortal {
+            mode: Arc::clone(&mode),
+            slow_started,
+            slow_release: release,
+        },
+        SandboxState::Host,
+        None,
+    ));
+
+    for service_mode in [PortalServiceMode::Absent, PortalServiceMode::Disconnected] {
+        *mode.lock().unwrap() = service_mode;
+        let result = futures_lite::future::block_on(
+            client.choose(PortalRequest::open("Open"), CancellationToken::new()),
+        );
+        assert!(matches!(result, Err(PortalError::Unavailable(_))));
+        file_manager.show("usable");
+    }
+
+    *mode.lock().unwrap() = PortalServiceMode::Slow;
+    let slow_client = Arc::clone(&client);
+    let slow = std::thread::spawn(move || {
+        futures_lite::future::block_on(
+            slow_client.choose(PortalRequest::open("Open"), CancellationToken::new()),
+        )
+    });
+    slow_ready.recv_blocking().unwrap();
+    file_manager.show("still-usable");
+    slow_release.send_blocking(()).unwrap();
+    assert!(matches!(
+        slow.join().unwrap(),
+        Err(PortalError::Unavailable(_))
+    ));
+
+    *mode.lock().unwrap() = PortalServiceMode::Restarted;
+    let selection = futures_lite::future::block_on(
+        client.choose(PortalRequest::open("Open"), CancellationToken::new()),
+    )
+    .unwrap();
+    assert_eq!(
+        selection.paths(),
+        [PathBuf::from("/tmp/restarted-selection")]
+    );
+    file_manager.show("restarted");
+    assert_eq!(file_manager.calls(), 4);
 }
 
 #[test]

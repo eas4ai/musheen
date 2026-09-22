@@ -86,3 +86,30 @@ fn application_and_content_icons_keep_distinct_identity_sources() {
         ApplicationIdentity::ICON_NAME
     );
 }
+
+#[test]
+fn linux_desktop_surfaces_have_localized_accessible_names() {
+    let message_ids = [
+        "terminal-drawer-label",
+        "terminal-close",
+        "terminal-restart",
+        "elevated-browser-warning",
+        "volume-unlock-title",
+        "volume-properties-dialog",
+        "notification-show-in-musheen",
+        "dialog-authorization-provider",
+    ];
+    for locale in [Locale::EnUs, Locale::EnXa, Locale::Ar] {
+        let catalog = Catalog::load(locale).expect("the built-in locale catalog is valid");
+        for id in message_ids {
+            let label = catalog
+                .message(id)
+                .unwrap_or_else(|error| panic!("{} is missing {id}: {error}", locale.tag()));
+            assert!(
+                !label.trim().is_empty(),
+                "{} has an empty {id}",
+                locale.tag()
+            );
+        }
+    }
+}
