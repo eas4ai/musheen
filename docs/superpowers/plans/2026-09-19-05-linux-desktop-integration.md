@@ -89,20 +89,20 @@ create `crates/musheen-desktop/tests/{file_manager1,portals,updates}.rs`.
 create `crates/musheen-desktop/tests/privilege.rs`; add a small broker binary
 under `crates/musheen-desktop/src/bin/musheen-broker.rs`.
 
-- [ ] Test authorization denial/expiry, path replacement after approval,
+- [x] Test authorization denial/expiry, path replacement after approval,
   symlink escape, argument injection, environment scrubbing, allowed operation
   schema, audit record, and broker crash.
-- [ ] Run the privilege tests; expect failure.
-- [ ] Implement Polkit authorization for a narrowly typed broker request. Open
+- [x] Run the privilege tests; expect failure.
+- [x] Implement Polkit authorization for a narrowly typed broker request. Open
   or validate target file descriptors after authorization; allow an optional
   sudo broker transport setting, but never relaunch the GPUI application as root.
-- [ ] Map “Run as Administrator” and “Open as Administrator” to explicit broker
+- [x] Map “Run as Administrator” and “Open as Administrator” to explicit broker
   operations with a confirmation that names command and target.
-- [ ] Restrict elevated browsing to the granted local root and show a permanent
+- [x] Restrict elevated browsing to the granted local root and show a permanent
   warning banner and privilege icon in every theme. A symlink or breadcrumb
   cannot escape the grant without a new authorization.
-- [ ] Run the test suite as an unprivileged user with a fake authorizer.
-- [ ] Commit with `feat(desktop): add scoped administrator actions`.
+- [x] Run the test suite as an unprivileged user with a fake authorizer.
+- [x] Commit with `feat(desktop): add scoped administrator actions`.
 
 ### Task 6: Build open-in-terminal and the terminal drawer
 
