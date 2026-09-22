@@ -82,7 +82,10 @@ fn every_protocol_validates_and_profiles_never_serialize_inline_secrets() {
     assert!(
         ConnectionProfiles::import(r#"{"version":1,"profiles":[],"password":"hunter2"}"#,).is_err()
     );
+}
 
+#[test]
+fn session_credentials_are_rejected_at_every_profile_boundary() {
     let session_only = ConnectionProfile::new(
         ConnectionId::new("session-only").unwrap(),
         "Session only",
@@ -97,12 +100,33 @@ fn every_protocol_validates_and_profiles_never_serialize_inline_secrets() {
         SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
         None,
     )
-    .unwrap();
-    assert!(
-        ConnectionProfiles::new(vec![session_only])
-            .export()
-            .is_err()
+    .unwrap_err();
+    assert_eq!(session_only.category(), RemoteErrorCategory::InvalidProfile);
+
+    let session_proxy = ProxySettings::new(
+        RemoteProtocol::Sftp,
+        ProxyKind::Socks5,
+        RemoteHost::new(RemoteProtocol::Sftp, "proxy.example.test").unwrap(),
+        1080,
+        None::<&str>,
+        Some(CredentialReference::session_only(
+            ConnectionId::new("proxy-session").unwrap(),
+        )),
+    )
+    .unwrap_err();
+    assert_eq!(
+        session_proxy.category(),
+        RemoteErrorCategory::InvalidProfile
     );
+
+    for encoded in [
+        r#"{"version":1,"profiles":[{"id":"bad-direct","name":"Bad direct","protocol":"sftp","host":"files.example.test","port":null,"path":"/","username":null,"credential":"session-only:direct","security":{"kind":"ssh","policy":{"policy":"known-hosts"}},"proxy":null}]}"#,
+        r#"{"version":1,"profiles":[{"id":"bad-proxy","name":"Bad proxy","protocol":"sftp","host":"files.example.test","port":null,"path":"/","username":null,"credential":null,"security":{"kind":"ssh","policy":{"policy":"known-hosts"}},"proxy":{"kind":"socks5","host":"proxy.example.test","port":1080,"username":null,"credential":"session-only:proxy"}}]}"#,
+    ] {
+        let error = ConnectionProfiles::import(encoded).unwrap_err();
+        assert_eq!(error.protocol(), RemoteProtocol::Sftp);
+        assert_eq!(error.category(), RemoteErrorCategory::InvalidProfile);
+    }
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use super::{RemoteError, RemoteErrorCategory};
-use crate::{ConnectionId, CredentialReference};
+use crate::{ConnectionId, CredentialReference, SecretPersistence};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -137,6 +137,9 @@ impl ProxySettings {
     ) -> Result<Self, RemoteError> {
         let username = username.map(Into::into);
         if port == 0
+            || credential
+                .as_ref()
+                .is_some_and(|reference| reference.persistence() != SecretPersistence::Persistent)
             || username.as_deref().is_some_and(|value| {
                 value.is_empty()
                     || value.len() > 256
@@ -233,6 +236,13 @@ impl ConnectionProfile {
                 && value.len() <= maximum
                 && !value.bytes().any(|byte| byte.is_ascii_control())
         };
+        let credentials_are_persistent = credential
+            .as_ref()
+            .is_none_or(|reference| reference.persistence() == SecretPersistence::Persistent)
+            && proxy
+                .as_ref()
+                .and_then(ProxySettings::credential)
+                .is_none_or(|reference| reference.persistence() == SecretPersistence::Persistent);
         let valid = valid_text(&name, 128)
             && path.starts_with('/')
             && valid_text(&path, 4096)
@@ -240,7 +250,8 @@ impl ConnectionProfile {
             && username.as_deref().is_none_or(|value| {
                 value.len() <= 256 && !value.bytes().any(|b| b.is_ascii_control())
             })
-            && security.is_compatible(protocol);
+            && security.is_compatible(protocol)
+            && credentials_are_persistent;
         if !valid {
             return Err(RemoteError::new(
                 protocol,
@@ -314,9 +325,35 @@ impl ConnectionProfile {
 
     #[must_use]
     pub fn fingerprint(&self) -> [u8; 32] {
-        let bytes = serde_json::to_vec(&ProfileWire::try_from(self).expect("validated profile"))
-            .expect("profile serialization cannot fail");
-        *blake3::hash(&bytes).as_bytes()
+        let mut hasher = blake3::Hasher::new();
+        hash_bytes(&mut hasher, b"musheen-connection-profile-v1");
+        hash_bytes(&mut hasher, self.id.as_str().as_bytes());
+        hash_bytes(&mut hasher, self.name.as_bytes());
+        hash_byte(&mut hasher, protocol_tag(self.protocol));
+        hash_bytes(&mut hasher, self.host.as_str().as_bytes());
+        hash_optional_port(&mut hasher, self.port);
+        hash_bytes(&mut hasher, self.path.as_bytes());
+        hash_optional_bytes(&mut hasher, self.username.as_deref().map(str::as_bytes));
+        hash_credential(&mut hasher, self.credential.as_ref());
+        hash_security(&mut hasher, &self.security);
+        match &self.proxy {
+            None => hash_byte(&mut hasher, 0),
+            Some(proxy) => {
+                hash_byte(&mut hasher, 1);
+                hash_byte(
+                    &mut hasher,
+                    match proxy.kind {
+                        ProxyKind::Socks5 => 0,
+                        ProxyKind::HttpConnect => 1,
+                    },
+                );
+                hash_bytes(&mut hasher, proxy.host.as_str().as_bytes());
+                hash_optional_port(&mut hasher, Some(proxy.port));
+                hash_optional_bytes(&mut hasher, proxy.username.as_deref().map(str::as_bytes));
+                hash_credential(&mut hasher, proxy.credential.as_ref());
+            }
+        }
+        *hasher.finalize().as_bytes()
     }
 
     #[must_use]
@@ -340,6 +377,71 @@ impl ConnectionProfile {
             (false, true) => SaveRequirement::ConfirmSecurityChange,
             (true, true) => SaveRequirement::ConfirmFailedTestAndSecurityChange,
         }
+    }
+}
+
+fn hash_byte(hasher: &mut blake3::Hasher, value: u8) {
+    hasher.update(&[value]);
+}
+
+fn hash_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&value.len().to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_optional_bytes(hasher: &mut blake3::Hasher, value: Option<&[u8]>) {
+    match value {
+        None => hash_byte(hasher, 0),
+        Some(value) => {
+            hash_byte(hasher, 1);
+            hash_bytes(hasher, value);
+        }
+    }
+}
+
+fn hash_optional_port(hasher: &mut blake3::Hasher, value: Option<u16>) {
+    match value {
+        None => hash_byte(hasher, 0),
+        Some(value) => {
+            hash_byte(hasher, 1);
+            hasher.update(&value.to_le_bytes());
+        }
+    }
+}
+
+fn hash_credential(hasher: &mut blake3::Hasher, value: Option<&CredentialReference>) {
+    hash_optional_bytes(
+        hasher,
+        value.map(|reference| reference.connection_id().as_str().as_bytes()),
+    );
+}
+
+const fn protocol_tag(protocol: RemoteProtocol) -> u8 {
+    match protocol {
+        RemoteProtocol::Ftp => 0,
+        RemoteProtocol::Ftps => 1,
+        RemoteProtocol::Sftp => 2,
+        RemoteProtocol::WebDav => 3,
+        RemoteProtocol::Http => 4,
+        RemoteProtocol::Smb => 5,
+        RemoteProtocol::Nfs => 6,
+    }
+}
+
+fn hash_security(hasher: &mut blake3::Hasher, security: &SecurityPolicy) {
+    match security {
+        SecurityPolicy::PlaintextConfirmed => hash_byte(hasher, 0),
+        SecurityPolicy::Tls(TlsPolicy::SystemRoots) => hash_byte(hasher, 1),
+        SecurityPolicy::Tls(TlsPolicy::PinnedSha256(pin)) => {
+            hash_byte(hasher, 2);
+            hash_bytes(hasher, pin);
+        }
+        SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts) => hash_byte(hasher, 3),
+        SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(pin)) => {
+            hash_byte(hasher, 4);
+            hash_bytes(hasher, pin);
+        }
+        SecurityPolicy::SystemManaged => hash_byte(hasher, 5),
     }
 }
 
