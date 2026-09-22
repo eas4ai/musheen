@@ -25,12 +25,15 @@ pub(super) fn display_value(spec: &SettingSpec, value: &str, catalog: &Catalog) 
             .message("settings-value-none")
             .expect("empty reference is localized")
             .to_owned(),
-        SettingKind::CredentialReference => value.to_owned(),
+        SettingKind::CredentialReference => catalog
+            .message("settings-value-credential-stored")
+            .expect("stored credential status is localized")
+            .to_owned(),
     }
 }
 
-/// Editable references remain opaque identifiers; localized absence belongs in
-/// the placeholder, never in a value that might be written to the store.
+/// References are managed by the connection editor rather than exposed as
+/// editable settings text. This helper remains for non-secret input controls.
 pub(super) fn input_value(spec: &SettingSpec, value: &str, catalog: &Catalog) -> String {
     if matches!(spec.kind, SettingKind::CredentialReference) {
         value.to_owned()

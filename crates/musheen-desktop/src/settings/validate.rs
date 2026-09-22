@@ -12,14 +12,7 @@ pub(super) fn validate_value(spec: &SettingSpec, value: &str) -> Result<(), Sett
             .parse::<usize>()
             .is_ok_and(|value| (1..=maximum).contains(&value)),
         SettingKind::CredentialReference => {
-            value.is_empty()
-                || value.strip_prefix("secret-service:").is_some_and(|id| {
-                    !id.is_empty()
-                        && id.len() <= 128
-                        && id
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-                })
+            value.is_empty() || crate::CredentialReference::from_setting_value(value).is_ok()
         }
     };
     if valid {

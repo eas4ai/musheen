@@ -194,6 +194,7 @@ impl SettingsWindow {
                     | SettingKind::Shortcuts
                     | SettingKind::Theme
                     | SettingKind::CustomActions
+                    | SettingKind::CredentialReference
             ) {
                 this.choices_focus.insert(spec.key, cx.focus_handle());
                 continue;
@@ -464,6 +465,21 @@ impl SettingsWindow {
                         .disabled(self.blocked())
                         .accessibility_id(spec.key)
                         .aria_label(self.label(spec.label)),
+                );
+            }
+            if matches!(spec.kind, SettingKind::CredentialReference) {
+                let status = display_value(
+                    spec,
+                    &self.state.draft().value(spec.key).expect("schema key"),
+                    &self.catalog,
+                );
+                row = row.child(
+                    div()
+                        .id(spec.key)
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label(status.clone())
+                        .child(status),
                 );
             }
             let values = match spec.kind {
@@ -1007,13 +1023,7 @@ mod tests {
         });
         let view = view.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
-            assert_eq!(
-                view.read(cx).inputs["remote.credential"]
-                    .read(cx)
-                    .value()
-                    .as_ref(),
-                ""
-            );
+            assert!(!view.read(cx).inputs.contains_key("remote.credential"));
             view.update(cx, |this, cx| {
                 this.state.navigate_to("directory_page_items").unwrap();
                 this.focus_pending = true;

@@ -380,6 +380,7 @@ settings-value-error = ⟦Errors ···⟧
 settings-value-warning = ⟦Warnings ···⟧
 settings-value-info = ⟦Information ···⟧
 settings-value-none = ⟦None ···⟧
+settings-value-credential-stored = ⟦Stored securely ···⟧
 settings-credential-hint = ⟦Credential service reference ···⟧
 customization-add = ⟦Aadd coommaand⟧
 customization-up = ⟦Moove uup⟧

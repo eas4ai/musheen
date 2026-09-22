@@ -186,6 +186,7 @@ settings-value-error = أخطاء
 settings-value-warning = تحذيرات
 settings-value-info = معلومات
 settings-value-none = بلا
+settings-value-credential-stored = مخزنة بأمان
 settings-credential-hint = اختر مرجعاً من خدمة بيانات الاعتماد
 customization-add = إضافة أمر
 customization-up = نقل لأعلى
