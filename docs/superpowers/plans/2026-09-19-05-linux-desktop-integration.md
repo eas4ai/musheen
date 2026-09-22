@@ -72,15 +72,15 @@ create `crates/musheen-desktop/tests/{file_manager1,portals,updates}.rs`.
 **Files:** Create `crates/musheen-desktop/src/secrets.rs`; create
 `crates/musheen-desktop/tests/secrets.rs`; modify settings remote models.
 
-- [ ] Test locked collection, unavailable service, create/read/update/delete,
+- [x] Test locked collection, unavailable service, create/read/update/delete,
   cancellation, renamed connection, settings export, and redacted logs/errors.
-- [ ] Run the secrets test with a fake service; expect failure.
-- [ ] Implement credential references keyed by connection ID; settings and
+- [x] Run the secrets test with a fake service; expect failure.
+- [x] Implement credential references keyed by connection ID; settings and
   journals contain references only. When the service is locked or absent,
   offer an explicit session-only secret and never persist it elsewhere. Wipe
   transient secret buffers and exclude credentials from URLs and debug output.
-- [ ] Run repository scans for fixture credentials and serialized secret fields.
-- [ ] Commit with `feat(desktop): integrate Linux secret storage`.
+- [x] Run repository scans for fixture credentials and serialized secret fields.
+- [x] Commit with `feat(desktop): integrate Linux secret storage`.
 
 ### Task 5: Implement operation-scoped privilege
 
