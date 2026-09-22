@@ -51,21 +51,21 @@ modify sidebar; create `crates/musheen-desktop/tests/volumes.rs`.
 **Files:** Create `crates/musheen-desktop/src/{file_manager1,portals,notifications,maintenance,updates}.rs`;
 create `crates/musheen-desktop/tests/{file_manager1,portals,updates}.rs`.
 
-- [ ] Test ShowItems/ShowFolders/ShowItemProperties, activation into an existing
+- [x] Test ShowItems/ShowFolders/ShowItemProperties, activation into an existing
   window, malformed URIs, portal cancellation, document grants, optional
   FileChooser backend recursion prevention, notification actions, nonblocking
   log rotation, disabled/delayed update checks, and tampered/expired/valid
   signed update metadata.
-- [ ] Run the tests; expect failure.
-- [ ] Implement FileManager1 through zbus and portal client/backend through
+- [x] Run the tests; expect failure.
+- [x] Implement FileManager1 through zbus and portal client/backend through
   ashpd. Keep the optional backend behind a feature and refuse to call itself.
-- [ ] Send notifications only for background completion/failure and map actions
+- [x] Send notifications only for background completion/failure and map actions
   back to stable command/job IDs.
-- [ ] Run maintenance only after first-window readiness. Fetch update metadata
+- [x] Run maintenance only after first-window readiness. Fetch update metadata
   over HTTPS, verify it with the pinned project key, and offer information only;
   never auto-install an update.
-- [ ] Run D-Bus introspection checks and sandboxed portal fixtures.
-- [ ] Commit with `feat(desktop): add D-Bus and portal services`.
+- [x] Run D-Bus introspection checks and sandboxed portal fixtures.
+- [x] Commit with `feat(desktop): add D-Bus and portal services`.
 
 ### Task 4: Store credentials through Secret Service
 
