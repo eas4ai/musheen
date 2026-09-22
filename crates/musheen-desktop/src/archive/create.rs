@@ -1,5 +1,6 @@
 use super::budget::{
-    ArchiveBudget, ArchiveMemoryLease, ArchiveOperationError, ArchiveOperationLimits, map_io,
+    ArchiveBudget, ArchiveMemoryLease, ArchiveOperationAccounting, ArchiveOperationError,
+    ArchiveOperationLimits, map_io,
 };
 use super::{ArchivePassword, ArchivePasswordProvider, PasswordRequest};
 use musheen_core::CancellationToken;
@@ -35,6 +36,25 @@ pub fn execute_scheduled_archive_operation<C: Clock, S: JournalStorage>(
     passwords: &dyn ArchivePasswordProvider,
     journal: &mut Journal<S>,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
+    let accounting = ArchiveOperationAccounting::default();
+    execute_scheduled_archive_operation_with_accounting(
+        scheduler,
+        job,
+        limits,
+        passwords,
+        journal,
+        &accounting,
+    )
+}
+
+pub fn execute_scheduled_archive_operation_with_accounting<C: Clock, S: JournalStorage>(
+    scheduler: &mut Scheduler<C>,
+    job: &ScheduledJob,
+    limits: &ArchiveOperationLimits,
+    passwords: &dyn ArchivePasswordProvider,
+    journal: &mut Journal<S>,
+    accounting: &ArchiveOperationAccounting,
+) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     let plan = job
         .archive_plan()
         .ok_or(ArchiveOperationError::InvalidArchive)?
@@ -56,6 +76,7 @@ pub fn execute_scheduled_archive_operation<C: Clock, S: JournalStorage>(
         job_id,
         generation,
         &mut report_phase,
+        accounting,
     );
     match &result {
         Ok(_) => scheduler
@@ -81,6 +102,7 @@ pub(crate) fn execute_archive_operation<S: JournalStorage>(
     job_id: JobId,
     generation: EventGeneration,
     report_phase: &mut dyn FnMut(ArchiveEventPhase) -> Result<(), ArchiveOperationError>,
+    accounting: &ArchiveOperationAccounting,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     match plan.kind() {
         OperationKind::Compress => run_archive_creation(
@@ -92,6 +114,7 @@ pub(crate) fn execute_archive_operation<S: JournalStorage>(
             job_id,
             generation,
             report_phase,
+            accounting,
         ),
         OperationKind::Extract => super::extract::execute_extract(
             plan,
@@ -102,6 +125,7 @@ pub(crate) fn execute_archive_operation<S: JournalStorage>(
             job_id,
             generation,
             report_phase,
+            accounting,
         ),
         _ => Err(ArchiveOperationError::InvalidArchive),
     }
@@ -135,10 +159,14 @@ fn run_archive_creation<S: JournalStorage>(
     job_id: JobId,
     generation: EventGeneration,
     report_phase: &mut dyn FnMut(ArchiveEventPhase) -> Result<(), ArchiveOperationError>,
+    accounting: &ArchiveOperationAccounting,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
     cancellation.check()?;
-    let budget = Rc::new(RefCell::new(ArchiveBudget::new(limits.clone())));
+    let budget = Rc::new(RefCell::new(ArchiveBudget::with_accounting(
+        limits.clone(),
+        accounting.clone(),
+    )));
     let plan_path_bytes = plan
         .sources()
         .iter()
@@ -176,6 +204,7 @@ fn run_archive_creation<S: JournalStorage>(
             .mode(0o600)
             .open(&staging)
             .map_err(|error| map_io(&error))?;
+        sync_parent(&staging)?;
         report_phase(ArchiveEventPhase::Staging)?;
         append_archive_phase(
             journal,
@@ -325,13 +354,13 @@ fn collect_create_entries(
                 .saturating_add(relative_bytes.len());
             budget.check_path_len(archive_name_len)?;
             let allocation_bytes = archive_name_len
+                .saturating_mul(2)
                 .saturating_add(walked.path().as_os_str().as_bytes().len())
-                .saturating_add(std::mem::size_of::<CreateEntry>())
-                .saturating_add(96);
+                .saturating_add(std::mem::size_of::<CreateEntry>());
             let memory =
                 budget.reserve_memory(u64::try_from(allocation_bytes).unwrap_or(u64::MAX))?;
             entries
-                .try_reserve(1)
+                .try_reserve_exact(1)
                 .map_err(|_| ArchiveOperationError::Io)?;
             let mut archive_name = Vec::with_capacity(archive_name_len);
             archive_name.extend_from_slice(root_name.as_bytes());
@@ -395,7 +424,6 @@ fn write_archive(
     cancellation: &CancellationToken,
     budget: Rc<RefCell<ArchiveBudget>>,
 ) -> Result<(), ArchiveOperationError> {
-    let _codec_memory = budget.borrow().reserve_memory(codec_memory_bytes(codec))?;
     let state = Rc::new(RefCell::new(None));
     let stage = BudgetedWriteSeek::new(stage, budget, Rc::clone(&state));
     let result = match codec {
@@ -411,15 +439,6 @@ fn write_archive(
         return Err(error);
     }
     result
-}
-
-const fn codec_memory_bytes(codec: ArchiveCodec) -> u64 {
-    match codec {
-        ArchiveCodec::Zip | ArchiveCodec::Tar => 256 * 1_024,
-        ArchiveCodec::TarGzip => 2 * 1_024 * 1_024,
-        ArchiveCodec::TarZstd => 16 * 1_024 * 1_024,
-        ArchiveCodec::SevenZip => 32 * 1_024 * 1_024,
-    }
 }
 
 fn requested_password(
@@ -462,6 +481,10 @@ impl BudgetedWriteSeek {
     fn sync_all(self) -> Result<(), ArchiveOperationError> {
         self.inner.sync_all().map_err(|error| map_io(&error))
     }
+
+    fn reserve_memory(&self, bytes: u64) -> Result<ArchiveMemoryLease, ArchiveOperationError> {
+        self.budget.borrow().reserve_memory(bytes)
+    }
 }
 
 impl Write for BudgetedWriteSeek {
@@ -502,6 +525,12 @@ fn write_zip(
     passwords: &dyn ArchivePasswordProvider,
     cancellation: &CancellationToken,
 ) -> Result<(), ArchiveOperationError> {
+    let codec_name_bytes = entries.iter().fold(0_u64, |total, entry| {
+        total
+            .saturating_add(u64::try_from(entry.archive_name.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::from(matches!(entry.kind, CreateEntryKind::Directory)))
+    });
+    let _codec_names = stage.reserve_memory(codec_name_bytes)?;
     let password = encrypted
         .then(|| requested_password(ArchiveCodec::Zip, passwords))
         .transpose()?;
@@ -627,6 +656,10 @@ fn write_seven_zip(
     passwords: &dyn ArchivePasswordProvider,
     cancellation: &CancellationToken,
 ) -> Result<(), ArchiveOperationError> {
+    let codec_name_bytes = entries.iter().fold(0_u64, |total, entry| {
+        total.saturating_add(u64::try_from(entry.archive_name.len()).unwrap_or(u64::MAX))
+    });
+    let _codec_names = stage.reserve_memory(codec_name_bytes)?;
     let password = encrypted
         .then(|| requested_password(ArchiveCodec::SevenZip, passwords))
         .transpose()?;
@@ -878,7 +911,8 @@ pub(crate) fn remove_owned(path: &Path) -> Result<(), ArchiveOperationError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(map_io(&error)),
     }
-    .map_err(|error| map_io(&error))
+    .map_err(|error| map_io(&error))?;
+    sync_parent(path)
 }
 
 pub(crate) fn sync_parent(path: &Path) -> Result<(), ArchiveOperationError> {

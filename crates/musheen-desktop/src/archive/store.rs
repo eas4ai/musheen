@@ -1,3 +1,4 @@
+use super::budget::{ArchiveMemoryLease, ArchiveOperationError, SharedMemoryBudget};
 use super::format::{ArchiveCopyContext, copy_entry, open_scanner};
 use super::index::{ArchiveScannerFactory, IndexedEntry, LazyArchiveIndex};
 use super::{ArchiveFormat, ArchivePath};
@@ -176,10 +177,19 @@ pub(crate) struct DecodeCounterState {
     total_allocated_bytes: AtomicU64,
     expanded_bytes: AtomicU64,
     elapsed: Mutex<Duration>,
+    shared_memory: Option<SharedMemoryBudget>,
 }
 
 impl DecodeCounterState {
     pub(crate) fn new() -> Arc<Self> {
+        Self::with_optional_memory_budget(None)
+    }
+
+    pub(crate) fn with_memory_budget(shared_memory: SharedMemoryBudget) -> Arc<Self> {
+        Self::with_optional_memory_budget(Some(shared_memory))
+    }
+
+    fn with_optional_memory_budget(shared_memory: Option<SharedMemoryBudget>) -> Arc<Self> {
         Arc::new(Self {
             bytes_read: AtomicU64::new(0),
             metadata_bytes: AtomicU64::new(0),
@@ -187,6 +197,7 @@ impl DecodeCounterState {
             total_allocated_bytes: AtomicU64::new(0),
             expanded_bytes: AtomicU64::new(0),
             elapsed: Mutex::new(Duration::ZERO),
+            shared_memory,
         })
     }
 
@@ -216,6 +227,12 @@ impl DecodeCounterState {
     ) -> Result<AllocationLease, ArchiveError> {
         let count = u64::try_from(count).unwrap_or(u64::MAX);
         let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
+        let shared = self
+            .shared_memory
+            .as_ref()
+            .map(|memory| memory.reserve(count))
+            .transpose()
+            .map_err(map_shared_memory_error)?;
         let previous = self
             .metadata_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -236,22 +253,46 @@ impl DecodeCounterState {
         Ok(AllocationLease {
             counters: Some(Arc::clone(self)),
             bytes: count,
+            shared,
         })
     }
 
     pub(crate) fn try_reserve_external(self: &Arc<Self>, count: usize, maximum: usize) -> bool {
-        match self.reserve(count, maximum) {
-            Ok(mut lease) => {
-                lease.counters.take();
-                true
-            }
-            Err(_) => false,
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        if self
+            .shared_memory
+            .as_ref()
+            .is_some_and(|memory| memory.reserve_raw(count).is_err())
+        {
+            return false;
         }
+        let maximum = u64::try_from(maximum).unwrap_or(u64::MAX);
+        let reserved = self
+            .metadata_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(count).filter(|next| *next <= maximum)
+            })
+            .is_ok();
+        if !reserved && let Some(memory) = &self.shared_memory {
+            memory.release_raw(count);
+        }
+        if reserved {
+            self.peak_metadata_bytes.fetch_max(
+                self.metadata_bytes.load(Ordering::Acquire),
+                Ordering::AcqRel,
+            );
+            self.total_allocated_bytes
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        reserved
     }
 
     pub(crate) fn release_external(&self, count: usize) {
-        self.metadata_bytes
-            .fetch_sub(u64::try_from(count).unwrap_or(u64::MAX), Ordering::AcqRel);
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.metadata_bytes.fetch_sub(count, Ordering::AcqRel);
+        if let Some(memory) = &self.shared_memory {
+            memory.release_raw(count);
+        }
     }
 
     pub(crate) fn charge_expanded(
@@ -304,6 +345,7 @@ impl DecodeCounterState {
 pub(crate) struct AllocationLease {
     counters: Option<Arc<DecodeCounterState>>,
     bytes: u64,
+    shared: Option<ArchiveMemoryLease>,
 }
 
 impl fmt::Debug for AllocationLease {
@@ -322,6 +364,20 @@ impl Drop for AllocationLease {
                 .metadata_bytes
                 .fetch_sub(self.bytes, Ordering::AcqRel);
         }
+        self.shared.take();
+    }
+}
+
+fn map_shared_memory_error(error: ArchiveOperationError) -> ArchiveError {
+    match error {
+        ArchiveOperationError::LimitExceeded { value, maximum, .. } => {
+            ArchiveError::LimitExceeded {
+                resource: "memory bytes",
+                value: usize::try_from(value).unwrap_or(usize::MAX),
+                maximum: usize::try_from(maximum).unwrap_or(usize::MAX),
+            }
+        }
+        _ => ArchiveError::Io,
     }
 }
 

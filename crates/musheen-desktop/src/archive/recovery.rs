@@ -97,6 +97,7 @@ fn recover_record<S: JournalStorage>(
                 && (current_staging == checkpoint.destination_before()
                     || (checkpoint.destination_before().is_none() && current_staging.is_none()));
             if publish_already_happened {
+                sync_parent(&destination)?;
                 append_archive_phase(
                     journal,
                     record.job_id(),
@@ -153,7 +154,8 @@ fn recover_record<S: JournalStorage>(
         }
         JournalPhase::StagingCleaned => {
             verify_exact(checkpoint.destination_after(), path_identity(&destination)?)?;
-            verify_exact(None, path_identity(&staging)?)?;
+            let _ = path_identity(&staging)?;
+            remove_owned(&staging)?;
             append_archive_phase(
                 journal,
                 record.job_id(),

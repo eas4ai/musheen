@@ -16,10 +16,13 @@ mod tar_codec;
 mod zip_codec;
 
 pub use budget::{
-    ArchiveBudget, ArchiveBudgetCounters, ArchiveMemoryLease, ArchiveOperationError,
-    ArchiveOperationLimits,
+    ArchiveBudget, ArchiveBudgetCounters, ArchiveMemoryLease, ArchiveOperationAccounting,
+    ArchiveOperationError, ArchiveOperationLimits,
 };
-pub use create::{ArchiveOperationOutcome, execute_scheduled_archive_operation};
+pub use create::{
+    ArchiveOperationOutcome, execute_scheduled_archive_operation,
+    execute_scheduled_archive_operation_with_accounting,
+};
 pub use format::ArchiveFormat;
 #[cfg(feature = "archive-libarchive")]
 #[doc(hidden)]

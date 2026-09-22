@@ -2,9 +2,10 @@ use musheen_core::{
     CancellationToken, CapabilityMatrix, CapabilityState, ProviderId, ResourceLimits, StorePath,
 };
 use musheen_desktop::{
-    ArchiveBudget, ArchiveError, ArchiveOperationError, ArchiveOperationLimits,
-    ArchiveOperationOutcome, ArchivePassword, ArchivePasswordProvider, FileJournalStorage,
-    PasswordRequest, execute_scheduled_archive_operation, recover_archive_operations,
+    ArchiveBudget, ArchiveError, ArchiveOperationAccounting, ArchiveOperationError,
+    ArchiveOperationLimits, ArchiveOperationOutcome, ArchivePassword, ArchivePasswordProvider,
+    FileJournalStorage, PasswordRequest, execute_scheduled_archive_operation,
+    execute_scheduled_archive_operation_with_accounting, recover_archive_operations,
 };
 use musheen_ops::{
     ArchiveCheckpoint, ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan,
@@ -143,6 +144,31 @@ fn run(
         .map(|record| record.phase())
         .collect();
     Ok((outcome, phases))
+}
+
+fn run_accounted(
+    plan: &ArchiveOperationPlan,
+    limits: &ArchiveOperationLimits,
+    accounting: &ArchiveOperationAccounting,
+) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
+    let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
+    let mut scheduler = Scheduler::new(&ResourceLimits::default());
+    scheduler
+        .enqueue_archive(plan.clone(), provider())
+        .expect("archive queues");
+    let job = scheduler
+        .start_ready()
+        .expect("archive starts")
+        .pop()
+        .expect("archive job");
+    execute_scheduled_archive_operation_with_accounting(
+        &mut scheduler,
+        &job,
+        limits,
+        &Passwords("unused"),
+        &mut journal,
+        accounting,
+    )
 }
 
 #[test]
@@ -527,6 +553,62 @@ fn reopened_file_journal_rolls_back_or_completes_real_archive_checkpoints() {
 }
 
 #[test]
+fn recovery_recleans_stage_that_reappears_after_staging_cleaned_checkpoint() {
+    let root = tempdir().expect("temporary root");
+    let journal_dir = root.path().join("journal");
+    let source = root.path().join("source.txt");
+    let destination = root.path().join("recovered.zip");
+    let staging = root.path().join(".musheen-stage-v1-73-0");
+    std::fs::write(&source, b"source").expect("source");
+    std::fs::write(&destination, b"published archive").expect("destination");
+    let plan = ArchiveOperationPlan::create(
+        vec![local(&source)],
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("recovery plan");
+    let checkpoint = ArchiveCheckpoint::new(
+        plan,
+        local(&staging),
+        None,
+        None,
+        Some(identity(&destination)),
+    );
+    {
+        let storage = FileJournalStorage::at(&journal_dir).expect("file journal storage");
+        let mut journal = Journal::open(storage).expect("file journal opens");
+        journal
+            .append_archive(
+                JobId::new(73).expect("job id"),
+                EventGeneration::new(0),
+                JournalPhase::StagingCleaned,
+                Durability::CrashDurable,
+                checkpoint,
+            )
+            .expect("clean checkpoint is durable");
+    }
+    std::fs::write(&staging, b"reappeared stale stage").expect("reappeared stage");
+
+    let storage = FileJournalStorage::at(&journal_dir).expect("reopened storage");
+    let mut reopened = Journal::open(storage).expect("journal reopens");
+    assert_eq!(
+        recover_archive_operations(&mut reopened).expect("recovery succeeds"),
+        vec![musheen_desktop::ArchiveRecoveryOutcome::Completed]
+    );
+    assert!(!staging.exists());
+    assert_eq!(
+        std::fs::read(&destination).expect("destination remains"),
+        b"published archive"
+    );
+    assert_eq!(
+        reopened.records().last().map(|record| record.phase()),
+        Some(JournalPhase::Completed)
+    );
+}
+
+#[test]
 fn creation_rejects_symlinks_special_files_and_temporary_space_exhaustion() {
     let root = tempdir().expect("temporary root");
     let regular = root.path().join("regular");
@@ -696,6 +778,87 @@ fn extraction_rejects_traversal_links_special_entries_and_nested_archives_before
         })
     ));
     assert!(!output.exists());
+
+    let mut v7_bytes = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut v7_bytes);
+        let mut header = tar::Header::new_old();
+        header.set_size(4);
+        header.set_mode(0o600);
+        header.set_cksum();
+        tar.append_data(&mut header, "leaf", &b"leaf"[..])
+            .expect("V7 tar entry");
+        tar.finish().expect("V7 tar finish");
+    }
+    assert_ne!(v7_bytes.get(257..262), Some(&b"ustar"[..]));
+
+    let mut prefixed_zip = b"MZ\x90\0self-extracting-stub".to_vec();
+    prefixed_zip.extend_from_slice(&inner_bytes);
+    let mut skippable_zstd = 0x184d_2a50_u32.to_le_bytes().to_vec();
+    skippable_zstd.extend_from_slice(&4_u32.to_le_bytes());
+    skippable_zstd.extend_from_slice(b"skip");
+    skippable_zstd
+        .extend_from_slice(&zstd::stream::encode_all(&v7_bytes[..], 0).expect("zstd V7 tar"));
+    for (label, nested_bytes) in [
+        ("v7-tar", v7_bytes),
+        ("prefixed-zip", prefixed_zip),
+        ("skippable-zstd", skippable_zstd),
+    ] {
+        let source = fixtures.join(format!("{label}-outer.zip"));
+        let mut outer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        outer
+            .start_file("opaque.bin", zip::write::SimpleFileOptions::default())
+            .expect("nested content entry");
+        outer.write_all(&nested_bytes).expect("nested content");
+        std::fs::write(
+            &source,
+            outer.finish().expect("outer zip finish").into_inner(),
+        )
+        .expect("nested content fixture");
+        let output = root.path().join(format!("{label}-output"));
+        let plan = ArchiveOperationPlan::extract(
+            local(&source),
+            local(&output),
+            ArchiveCodec::Zip,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .expect("nested content plan");
+        assert!(matches!(
+            run(
+                &plan,
+                &limits,
+                &Passwords("unused"),
+                &CancellationToken::new(),
+            ),
+            Err(ArchiveOperationError::LimitExceeded {
+                resource: "archive nesting",
+                ..
+            })
+        ));
+        assert!(!output.exists());
+
+        let accepted_output = root.path().join(format!("{label}-accepted"));
+        let accepted_plan = ArchiveOperationPlan::extract(
+            local(&source),
+            local(&accepted_output),
+            ArchiveCodec::Zip,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .expect("accepted nested content plan");
+        run(
+            &accepted_plan,
+            &ArchiveOperationLimits::default(),
+            &Passwords("unused"),
+            &CancellationToken::new(),
+        )
+        .expect("valid nested content is accepted");
+        assert_eq!(
+            std::fs::read(accepted_output.join("opaque.bin")).expect("extracted nested payload"),
+            nested_bytes
+        );
+    }
 }
 
 #[test]
@@ -749,8 +912,13 @@ fn every_archive_budget_trips_independently_and_in_combination() {
         musheen_desktop::ArchiveBudgetCounters {
             entries: 1,
             expanded_bytes: 8,
+            compressed_bytes: 4,
+            compression_ratio_checks: 1,
             temporary_bytes: 9,
             memory_bytes: 8,
+            peak_memory_bytes: 8,
+            max_nesting: 1,
+            max_path_bytes: 4,
         }
     );
     drop(lease);
@@ -884,13 +1052,13 @@ fn every_ceiling_rejects_a_real_archive_operation_before_publication() {
     }
 
     let combined = ArchiveOperationLimits {
-        max_entries: 0,
-        max_expanded_bytes: 0,
-        max_compression_ratio: 0,
-        max_nesting: 0,
-        max_path_bytes: 0,
-        max_memory_bytes: 0,
-        max_temporary_bytes: 0,
+        max_entries: 10,
+        max_expanded_bytes: 100_000,
+        max_compression_ratio: 1_000,
+        max_nesting: 4,
+        max_path_bytes: 100,
+        max_memory_bytes: 1024 * 1024,
+        max_temporary_bytes: 4_200,
     };
     let combined_output = root.path().join("combined-output");
     let combined_plan = ArchiveOperationPlan::extract(
@@ -901,15 +1069,37 @@ fn every_ceiling_rejects_a_real_archive_operation_before_publication() {
         false,
     )
     .expect("combined plan");
+    let accounting = ArchiveOperationAccounting::default();
     assert!(matches!(
-        run(
-            &combined_plan,
-            &combined,
-            &Passwords("unused"),
-            &CancellationToken::new(),
-        ),
-        Err(ArchiveOperationError::LimitExceeded { .. })
+        run_accounted(&combined_plan, &combined, &accounting),
+        Err(ArchiveOperationError::LimitExceeded {
+            resource: "temporary bytes",
+            ..
+        })
     ));
+    let counters = accounting.counters();
+    assert!(counters.entries >= 2, "entry accounting was not exercised");
+    assert!(
+        counters.expanded_bytes > 0,
+        "expanded-byte accounting was not exercised"
+    );
+    assert!(
+        counters.compressed_bytes > 0 && counters.compression_ratio_checks > 0,
+        "compression-ratio accounting was not exercised"
+    );
+    assert!(counters.max_nesting >= 1, "nesting was not exercised");
+    assert!(
+        counters.max_path_bytes >= 4,
+        "path accounting was not exercised"
+    );
+    assert!(
+        counters.peak_memory_bytes > 0,
+        "memory accounting was not exercised"
+    );
+    assert!(
+        counters.temporary_bytes > combined.max_temporary_bytes,
+        "the intended later temporary-space ceiling was not reached: {counters:?}"
+    );
     assert!(!combined_output.exists());
 }
 
@@ -958,6 +1148,53 @@ fn production_archive_ceiling_values_trip_without_large_allocations() {
             .charge_temporary(limits.max_temporary_bytes + 1)
             .is_err()
     );
+}
+
+#[test]
+fn nested_codec_allocations_share_one_live_memory_ceiling() {
+    let root = tempdir().expect("temporary root");
+    let long_name = format!("{}x", "nested/".repeat(120));
+    let mut nested_bytes = b"leaf".to_vec();
+    for _ in 0..8 {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file(&long_name, zip::write::SimpleFileOptions::default())
+            .expect("nested entry");
+        zip.write_all(&nested_bytes).expect("nested bytes");
+        nested_bytes = zip.finish().expect("nested zip finish").into_inner();
+    }
+    let source = root.path().join("shared-memory.zip");
+    std::fs::write(&source, nested_bytes).expect("nested fixture");
+    let output = root.path().join("shared-memory-output");
+    let plan = ArchiveOperationPlan::extract(
+        local(&source),
+        local(&output),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    let limits = ArchiveOperationLimits {
+        max_memory_bytes: 20 * 1024,
+        max_nesting: 10,
+        ..ArchiveOperationLimits::default()
+    };
+    let result = run(
+        &plan,
+        &limits,
+        &Passwords("unused"),
+        &CancellationToken::new(),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(ArchiveOperationError::LimitExceeded {
+                resource: "memory bytes",
+                ..
+            })
+        ),
+        "shared nested allocation did not trip memory: {result:?}"
+    );
+    assert!(!output.exists());
 }
 
 #[test]

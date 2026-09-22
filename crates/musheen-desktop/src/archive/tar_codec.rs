@@ -351,7 +351,7 @@ pub(crate) fn copy_guarded_tar<R: Read, W: Write>(
     guarded.take_error().map_or(result, Err)
 }
 
-fn valid_tar_checksum(block: &[u8; 512]) -> bool {
+pub(crate) fn valid_tar_checksum(block: &[u8; 512]) -> bool {
     let header = tar::Header::from_byte_slice(block);
     let Ok(stored) = header.cksum() else {
         return false;

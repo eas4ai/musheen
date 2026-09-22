@@ -1,13 +1,15 @@
 use super::budget::{
-    ArchiveBudget, ArchiveMemoryLease, ArchiveOperationError, ArchiveOperationLimits, map_io,
+    ArchiveBudget, ArchiveMemoryLease, ArchiveOperationAccounting, ArchiveOperationError,
+    ArchiveOperationLimits, map_io,
 };
 use super::create::{
     ArchiveOperationOutcome, append_archive_phase, local_path, path_identity, publish_staging,
     remove_owned, staging_path, sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
-use super::store::{ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
+use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
 use super::{ArchiveFormat, ArchivePath};
+use super::{tar_codec, zip_codec};
 use musheen_core::{CancellationToken, ProviderId};
 use musheen_ops::{
     ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase, ArchiveOperationPlan, EventGeneration,
@@ -46,10 +48,11 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     job_id: JobId,
     generation: EventGeneration,
     report_phase: &mut dyn FnMut(ArchiveEventPhase) -> Result<(), ArchiveOperationError>,
+    accounting: &ArchiveOperationAccounting,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
     cancellation.check()?;
-    let mut budget = ArchiveBudget::new(limits.clone());
+    let mut budget = ArchiveBudget::with_accounting(limits.clone(), accounting.clone());
     let plan_path_bytes = plan
         .sources()
         .iter()
@@ -61,6 +64,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         .sum::<usize>();
     let _plan_paths_memory =
         budget.reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
+    let counters = DecodeCounterState::with_memory_budget(budget.shared_memory());
     let source = local_path(
         plan.sources()
             .first()
@@ -89,6 +93,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         passwords,
         cancellation,
         &mut budget,
+        &counters,
         destination
             .parent()
             .ok_or(ArchiveOperationError::UnsafePath(
@@ -113,6 +118,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             .mode(0o700)
             .create(&staging)
             .map_err(|error| map_io(&error))?;
+        sync_parent(&staging)?;
         report_phase(ArchiveEventPhase::Staging)?;
         append_archive_phase(
             journal,
@@ -125,9 +131,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             None,
         )?;
         report_phase(ArchiveEventPhase::Decoding)?;
-        let counters = DecodeCounterState::new();
         let mut actual_budget = budget.next_phase();
-        let _codec_memory = actual_budget.reserve_memory(codec_memory_bytes(format))?;
         for entry in &entries {
             cancellation.check()?;
             let _path_memory = actual_budget.reserve_memory(
@@ -280,12 +284,11 @@ fn collect_extract_entries(
     passwords: &dyn ArchivePasswordProvider,
     cancellation: &CancellationToken,
     budget: &mut ArchiveBudget,
+    counters: &std::sync::Arc<DecodeCounterState>,
     temporary_root: &Path,
 ) -> Result<Vec<ExtractEntry>, ArchiveOperationError> {
-    let _codec_memory = budget.reserve_memory(codec_memory_bytes(format))?;
-    let counters = DecodeCounterState::new();
     let provider = ProviderId::new("archive-extract").map_err(|_| ArchiveOperationError::Io)?;
-    let mut scanner = open_scanner(source, provider, format, limits, &counters, passwords)?;
+    let mut scanner = open_scanner(source, provider, format, limits, counters, passwords)?;
     let mut entries = Vec::new();
     let mut total_expanded = 0_u64;
     let mut total_compressed = 0_u64;
@@ -297,13 +300,12 @@ fn collect_extract_entries(
             u64::try_from(
                 raw.path
                     .len()
-                    .saturating_add(std::mem::size_of::<ExtractEntry>())
-                    .saturating_add(96),
+                    .saturating_add(std::mem::size_of::<ExtractEntry>()),
             )
             .unwrap_or(u64::MAX),
         )?;
         entries
-            .try_reserve(1)
+            .try_reserve_exact(1)
             .map_err(|_| ArchiveOperationError::Io)?;
         let kind = match raw.kind {
             RawEntryKind::Directory => ExtractEntryKind::Directory,
@@ -345,6 +347,7 @@ fn collect_extract_entries(
                 passwords,
                 cancellation,
                 budget,
+                counters,
                 temporary_root,
                 1,
             )?;
@@ -370,17 +373,6 @@ fn collect_extract_entries(
     Ok(entries)
 }
 
-const fn codec_memory_bytes(format: ArchiveFormat) -> u64 {
-    match format {
-        ArchiveFormat::Zip | ArchiveFormat::Tar => 256 * 1_024,
-        ArchiveFormat::TarGzip => 2 * 1_024 * 1_024,
-        ArchiveFormat::TarZstd => 16 * 1_024 * 1_024,
-        ArchiveFormat::SevenZip => 32 * 1_024 * 1_024,
-        #[cfg(feature = "archive-libarchive")]
-        ArchiveFormat::Rar | ArchiveFormat::Iso => 32 * 1_024 * 1_024,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn inspect_nested_entry(
     source: &File,
@@ -391,6 +383,7 @@ fn inspect_nested_entry(
     passwords: &dyn ArchivePasswordProvider,
     cancellation: &CancellationToken,
     budget: &mut ArchiveBudget,
+    counters: &std::sync::Arc<DecodeCounterState>,
     temporary_root: &Path,
     depth: usize,
 ) -> Result<(), ArchiveOperationError> {
@@ -402,7 +395,6 @@ fn inspect_nested_entry(
         budget,
         error: std::rc::Rc::clone(&error),
     };
-    let counters = DecodeCounterState::new();
     let copy_result = copy_entry(
         source,
         format,
@@ -411,7 +403,7 @@ fn inspect_nested_entry(
         ArchiveCopyContext {
             passwords,
             limits,
-            counters: &counters,
+            counters,
             cancellation,
             compressed_size,
         },
@@ -425,7 +417,7 @@ fn inspect_nested_entry(
     inner
         .seek(SeekFrom::Start(0))
         .map_err(|error| map_io(&error))?;
-    let Some(nested_format) = detect_archive_format(&mut inner)? else {
+    let Some(nested_format) = detect_archive_format(&mut inner, limits, counters)? else {
         return Ok(());
     };
     budget.check_nesting(depth)?;
@@ -436,6 +428,7 @@ fn inspect_nested_entry(
         passwords,
         cancellation,
         budget,
+        counters,
         temporary_root,
         depth,
     )
@@ -449,12 +442,12 @@ fn scan_nested_archive(
     passwords: &dyn ArchivePasswordProvider,
     cancellation: &CancellationToken,
     budget: &mut ArchiveBudget,
+    counters: &std::sync::Arc<DecodeCounterState>,
     temporary_root: &Path,
     depth: usize,
 ) -> Result<(), ArchiveOperationError> {
-    let counters = DecodeCounterState::new();
     let provider = ProviderId::new("archive-nested").map_err(|_| ArchiveOperationError::Io)?;
-    let mut scanner = open_scanner(source, provider, format, limits, &counters, passwords)?;
+    let mut scanner = open_scanner(source, provider, format, limits, counters, passwords)?;
     let source_bytes = source
         .metadata()
         .map_err(|error| map_io(&error))?
@@ -463,9 +456,6 @@ fn scan_nested_archive(
     let mut expanded = 0_u64;
     let mut compressed = 0_u64;
     while let Some(raw) = scanner.next_entry(cancellation)? {
-        let _entry_memory = budget.reserve_memory(
-            u64::try_from(raw.path.len().saturating_add(256)).unwrap_or(u64::MAX),
-        )?;
         budget.charge_entry()?;
         budget.check_path(&raw.path)?;
         match raw.kind {
@@ -483,6 +473,7 @@ fn scan_nested_archive(
                     passwords,
                     cancellation,
                     budget,
+                    counters,
                     temporary_root,
                     depth.saturating_add(1),
                 )?;
@@ -496,26 +487,47 @@ fn scan_nested_archive(
     budget.charge_expanded_bytes(expanded)
 }
 
-fn detect_archive_format(file: &mut File) -> Result<Option<ArchiveFormat>, ArchiveOperationError> {
+fn detect_archive_format(
+    file: &mut File,
+    limits: &ArchiveLimits,
+    counters: &std::sync::Arc<DecodeCounterState>,
+) -> Result<Option<ArchiveFormat>, ArchiveOperationError> {
+    match zip_codec::preflight(file, limits, counters) {
+        Ok(_) => {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| map_io(&error))?;
+            return Ok(Some(ArchiveFormat::Zip));
+        }
+        Err(ArchiveError::InvalidArchive) => {}
+        Err(error) => return Err(error.into()),
+    }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| map_io(&error))?;
-    let mut prefix = [0_u8; 512];
+    let mut prefix = [0_u8; 1_024];
     let count = file.read(&mut prefix).map_err(|error| map_io(&error))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| map_io(&error))?;
     let bytes = &prefix[..count];
-    let format = if bytes.starts_with(b"PK\x03\x04")
-        || bytes.starts_with(b"PK\x05\x06")
-        || bytes.starts_with(b"PK\x07\x08")
-    {
-        Some(ArchiveFormat::Zip)
-    } else if bytes.starts_with(b"7z\xBC\xAF\x27\x1C") {
+    let format = if bytes.starts_with(b"7z\xBC\xAF\x27\x1C") {
         Some(ArchiveFormat::SevenZip)
     } else if bytes.starts_with(&[0x1f, 0x8b]) {
         Some(ArchiveFormat::TarGzip)
-    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+        || bytes.get(..4).is_some_and(|magic| {
+            (0x184d_2a50..=0x184d_2a5f).contains(&u32::from_le_bytes([
+                magic[0], magic[1], magic[2], magic[3],
+            ]))
+        })
+    {
         Some(ArchiveFormat::TarZstd)
-    } else if bytes.get(257..262) == Some(b"ustar") {
+    } else if count == prefix.len()
+        && (prefix.iter().all(|byte| *byte == 0)
+            || tar_codec::valid_tar_checksum(
+                prefix[..512]
+                    .try_into()
+                    .map_err(|_| ArchiveOperationError::InvalidArchive)?,
+            ))
+    {
         Some(ArchiveFormat::Tar)
     } else {
         None

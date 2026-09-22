@@ -96,7 +96,8 @@ fn find_entry<R: Read + Seek>(
     limits: &ArchiveLimits,
     counters: &Arc<DecodeCounterState>,
 ) -> Result<BudgetedZipEntry, ArchiveError> {
-    let (central_offset, central_size, entries) = preflight(reader, limits, counters)?;
+    let (central_offset, central_size, entries, archive_prefix) =
+        preflight(reader, limits, counters)?;
     if ordinal >= entries {
         return Err(ArchiveError::NotArchiveEntry);
     }
@@ -167,7 +168,9 @@ fn find_entry<R: Read + Seek>(
             decode_cp437(&raw_name)
         };
         let (compressed_size, _expanded_size) = entry_sizes(&header, &extra)?;
-        let local_header_offset = local_header_offset(&header, &extra)?;
+        let local_header_offset = local_header_offset(&header, &extra)?
+            .checked_add(archive_prefix)
+            .ok_or(ArchiveError::InvalidArchive)?;
         let mut central_header = header;
         if local_header_offset > u32::MAX as u64 {
             return Err(ArchiveError::UnsupportedNestedFormat);
@@ -292,7 +295,8 @@ impl ZipScanner {
         counters: Arc<DecodeCounterState>,
     ) -> Result<Self, ArchiveError> {
         let mut reader = TimedReader::new(source, limits.max_elapsed, Arc::clone(&counters));
-        let (central_offset, central_size, entries) = preflight(&mut reader, &limits, &counters)?;
+        let (central_offset, central_size, entries, _) =
+            preflight(&mut reader, &limits, &counters)?;
         reader
             .seek(SeekFrom::Start(central_offset))
             .map_err(|_| invalid_or_time(&counters, &limits))?;
@@ -391,7 +395,7 @@ pub(crate) fn preflight<R: Read + Seek>(
     reader: &mut R,
     limits: &ArchiveLimits,
     counters: &Arc<DecodeCounterState>,
-) -> Result<(u64, u64, u64), ArchiveError> {
+) -> Result<(u64, u64, u64, u64), ArchiveError> {
     let length = reader
         .seek(SeekFrom::End(0))
         .map_err(|_| ArchiveError::Io)?;
@@ -436,10 +440,55 @@ pub(crate) fn preflight<R: Read + Seek>(
             maximum: limits.max_entries,
         });
     }
-    if central_offset.saturating_add(central_size) > length {
-        return Err(ArchiveError::InvalidArchive);
+    let recorded_central_offset = central_offset;
+    let eocd_offset = length
+        .saturating_sub(tail_length as u64)
+        .saturating_add(eocd as u64);
+    let central_offset = resolve_central_offset(
+        reader,
+        central_offset,
+        central_size,
+        entries,
+        eocd_offset,
+        length,
+    )?;
+    let archive_prefix = central_offset.saturating_sub(recorded_central_offset);
+    Ok((central_offset, central_size, entries, archive_prefix))
+}
+
+fn resolve_central_offset<R: Read + Seek>(
+    reader: &mut R,
+    recorded_offset: u64,
+    central_size: u64,
+    entries: u64,
+    eocd_offset: u64,
+    length: u64,
+) -> Result<u64, ArchiveError> {
+    let prefix = eocd_offset
+        .checked_sub(central_size)
+        .and_then(|end| end.checked_sub(recorded_offset));
+    for candidate in [
+        Some(recorded_offset),
+        prefix.map(|value| recorded_offset + value),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if candidate.saturating_add(central_size) > length {
+            continue;
+        }
+        if entries == 0 && central_size == 0 {
+            return Ok(candidate);
+        }
+        reader
+            .seek(SeekFrom::Start(candidate))
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        let mut signature = [0_u8; 4];
+        if reader.read_exact(&mut signature).is_ok() && signature == *b"PK\x01\x02" {
+            return Ok(candidate);
+        }
     }
-    Ok((central_offset, central_size, entries))
+    Err(ArchiveError::InvalidArchive)
 }
 
 fn preflight_zip64<R: Read + Seek>(
