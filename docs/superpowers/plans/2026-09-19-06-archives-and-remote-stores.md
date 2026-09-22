@@ -37,18 +37,18 @@ modify `crates/musheen-ops/src/{plan,event}.rs`; create
 `crates/musheen-desktop/tests/archive_operations.rs` and
 `crates/musheen-ops/tests/archive_recovery.rs`.
 
-- [ ] Test round trips for ZIP/AES, tar.gz, tar.zst, and 7z/encryption; test
+- [x] Test round trips for ZIP/AES, tar.gz, tar.zst, and 7z/encryption; test
   conflict policy, cancellation, ENOSPC, bad password, symlink escape, special
   files, nested bombs, cleanup, and restart recovery.
-- [ ] Independently trip entry-count, 20 GiB expansion, 1,000:1 ratio, nesting,
+- [x] Independently trip entry-count, 20 GiB expansion, 1,000:1 ratio, nesting,
   path, 512 MiB memory, and temporary-space ceilings, then trip them combined.
-- [ ] Run the archive operation test; expect failure.
-- [ ] Implement codecs and budget accounting in `musheen-desktop` before any
+- [x] Run the archive operation test; expect failure.
+- [x] Implement codecs and budget accounting in `musheen-desktop` before any
   allocation/write. Submit typed compress/extract plans to `musheen-ops`, stage
   on the destination filesystem, verify normalized paths below the staging
   root, and publish through the existing journal.
-- [ ] Run round-trip, bomb, crash-point, and cleanup fixtures.
-- [ ] Commit with `feat(ops): add safe archive creation and extraction`.
+- [x] Run round-trip, bomb, crash-point, and cleanup fixtures.
+- [x] Commit with `feat(ops): add safe archive creation and extraction`.
 
 ### Task 3: Model remote connections and provider pools
 
