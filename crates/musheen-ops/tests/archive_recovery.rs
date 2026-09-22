@@ -1,6 +1,6 @@
 use musheen_core::StorePath;
 use musheen_ops::{
-    ArchiveCheckpoint, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
+    ArchiveCheckpoint, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
     ArchiveOperationPlan, ArchivePathIdentity, CorruptSource, Durability, EventGeneration,
     JobEvent, JobId, Journal, JournalPhase, JournalStorage, RecoveryContext, RecoveryDecision,
     decide_recovery,
@@ -151,6 +151,14 @@ fn restart_recovery_never_auto_publishes_unfinished_archive_staging() {
         RecoveryDecision::Resume
     );
     assert_eq!(
+        decide_recovery(JournalPhase::PrepublishStageCleanupPlanned, owned),
+        RecoveryDecision::Rollback
+    );
+    assert_eq!(
+        decide_recovery(JournalPhase::PrepublishStageCleanupQuarantined, owned),
+        RecoveryDecision::Rollback
+    );
+    assert_eq!(
         decide_recovery(JournalPhase::Completed, published),
         RecoveryDecision::NoAction
     );
@@ -167,6 +175,10 @@ fn every_archive_publication_mutation_has_a_distinct_durable_phase() {
         JournalPhase::DestinationRestorePlanned,
         JournalPhase::DestinationRestored,
         JournalPhase::StageRestorePlanned,
+        JournalPhase::PrepublishStageCleanupPlanned,
+        JournalPhase::PrepublishStageCleanupQuarantined,
+        JournalPhase::PublishedDestinationCleanupPlanned,
+        JournalPhase::PublishedDestinationCleanupQuarantined,
     ];
     let context = RecoveryContext {
         continuation_verified: true,
@@ -200,6 +212,12 @@ fn archive_checkpoint_survives_a_fresh_journal_instance() {
     )
     .with_stage_deletion(path("/data/.musheen-stage-v1-9-0.delete"))
     .with_publication_quarantine(path("/data/.musheen-stage-v1-9-0.published"))
+    .with_cleanup_intent(
+        ArchiveCleanupKind::PrepublishStage,
+        path("/data/.musheen-stage-v1-9-0"),
+        path("/data/.musheen-stage-v1-9-0.delete"),
+        Some(identity),
+    )
     .with_identity_timeout_millis(17_000);
     let mut first = Journal::open(PersistentMemoryStorage::default()).expect("journal opens");
     first
@@ -229,6 +247,18 @@ fn archive_checkpoint_survives_a_fresh_journal_instance() {
         Some(&path("/data/.musheen-stage-v1-9-0.published"))
     );
     assert_eq!(recovered.identity_timeout_millis(), 17_000);
+    assert_eq!(
+        recovered.cleanup_kind(),
+        Some(ArchiveCleanupKind::PrepublishStage)
+    );
+    assert_eq!(
+        recovered.cleanup(),
+        Some(&path("/data/.musheen-stage-v1-9-0"))
+    );
+    assert_eq!(
+        recovered.cleanup_deletion(),
+        Some(&path("/data/.musheen-stage-v1-9-0.delete"))
+    );
 }
 
 #[test]

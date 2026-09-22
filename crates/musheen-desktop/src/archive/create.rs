@@ -5,7 +5,7 @@ use super::budget::{
 use super::{ArchivePassword, ArchivePasswordProvider, PasswordRequest};
 use musheen_core::CancellationToken;
 use musheen_ops::{
-    ArchiveCheckpoint, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
+    ArchiveCheckpoint, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
     ArchiveOperationPlan, ArchivePathIdentity, Clock, Durability, EventGeneration, JobId, Journal,
     JournalPhase, JournalStorage, OperationKind, ScheduledJob, Scheduler, SchedulerError,
     StagingPath,
@@ -321,11 +321,18 @@ fn run_archive_creation<S: JournalStorage>(
             {
                 return Err(ArchiveOperationError::Conflict);
             }
+            let stage_deletion = deletion_path(&staging)?;
+            let cleanup = ArchiveCleanupIntent::new(
+                ArchiveCleanupKind::PrepublishStage,
+                &staging,
+                &stage_deletion,
+                Some(staging_before_publish),
+            );
             append_archive_phase(
                 journal,
                 job_id,
                 generation,
-                JournalPhase::CleanupPlanned,
+                cleanup_phase(JournalPhase::PrepublishStageCleanupPlanned, cleanup),
                 plan,
                 &staging,
                 destination_before,
@@ -338,7 +345,7 @@ fn run_archive_creation<S: JournalStorage>(
                         journal,
                         job_id,
                         generation,
-                        JournalPhase::CleanupQuarantined,
+                        cleanup_phase(JournalPhase::PrepublishStageCleanupQuarantined, cleanup),
                         plan,
                         &staging,
                         destination_before,
@@ -348,6 +355,7 @@ fn run_archive_creation<S: JournalStorage>(
                 };
                 remove_owned_journaled(
                     &staging,
+                    &stage_deletion,
                     Some(staging_before_publish),
                     &budget.borrow(),
                     cancellation,
@@ -372,11 +380,18 @@ fn run_archive_creation<S: JournalStorage>(
         sync_parent(&destination)?;
         let destination_after =
             path_identity_with_controls(&destination, Some(&budget.borrow()), Some(cancellation))?;
+        let rollback_deletion = deletion_path(&rollback)?;
+        let cleanup = ArchiveCleanupIntent::new(
+            ArchiveCleanupKind::PublishedDestination,
+            &rollback,
+            &rollback_deletion,
+            destination_before,
+        );
         append_archive_phase(
             journal,
             job_id,
             generation,
-            JournalPhase::CleanupPlanned,
+            cleanup_phase(JournalPhase::PublishedDestinationCleanupPlanned, cleanup),
             plan,
             &staging,
             destination_before,
@@ -395,7 +410,10 @@ fn run_archive_creation<S: JournalStorage>(
                     journal,
                     job_id,
                     generation,
-                    JournalPhase::CleanupQuarantined,
+                    cleanup_phase(
+                        JournalPhase::PublishedDestinationCleanupQuarantined,
+                        cleanup,
+                    ),
                     plan,
                     &staging,
                     destination_before,
@@ -405,6 +423,7 @@ fn run_archive_creation<S: JournalStorage>(
             };
             remove_owned_journaled(
                 &rollback,
+                &rollback_deletion,
                 destination_before,
                 &budget.borrow(),
                 cancellation,
@@ -448,53 +467,62 @@ fn run_archive_creation<S: JournalStorage>(
             .borrow()
             .next_phase()
             .with_identity_cancellation(cleanup_cancellation.clone());
-        let cleanup_identity = path_identity_with_controls(
+        let stage_deletion = deletion_path(&staging)?;
+        let cleanup_result = path_identity_with_controls(
             &staging,
             Some(&cleanup_budget),
             Some(&cleanup_cancellation),
         )
-        .ok()
-        .flatten();
-        let cleanup_owned = stage_root
-            .zip(cleanup_identity)
-            .is_some_and(|(created, current)| {
-                created.device() == current.device() && created.inode() == current.inode()
-            });
-        let cleanup_result = append_archive_phase(
-            journal,
-            job_id,
-            generation,
-            JournalPhase::CleanupPlanned,
-            plan,
-            &staging,
-            destination_before,
-            None,
-            Some(&cleanup_budget),
-        )
-        .and_then(|()| {
+        .and_then(|cleanup_identity| {
+            let cleanup_owned =
+                stage_root
+                    .zip(cleanup_identity)
+                    .is_some_and(|(created, current)| {
+                        created.device() == current.device() && created.inode() == current.inode()
+                    });
             if !cleanup_owned {
                 return Err(ArchiveOperationError::RecoveryRequired);
             }
-            let mut quarantined = || {
-                append_archive_phase(
-                    journal,
-                    job_id,
-                    generation,
-                    JournalPhase::CleanupQuarantined,
-                    plan,
-                    &staging,
-                    destination_before,
-                    None,
-                    Some(&cleanup_budget),
-                )
-            };
-            remove_owned_journaled(
+            let cleanup = ArchiveCleanupIntent::new(
+                ArchiveCleanupKind::PrepublishStage,
                 &staging,
+                &stage_deletion,
                 cleanup_identity,
-                &cleanup_budget,
-                &cleanup_cancellation,
-                &mut quarantined,
+            );
+            append_archive_phase(
+                journal,
+                job_id,
+                generation,
+                cleanup_phase(JournalPhase::PrepublishStageCleanupPlanned, cleanup),
+                plan,
+                &staging,
+                destination_before,
+                None,
+                Some(&cleanup_budget),
             )
+            .and_then(|()| {
+                let mut quarantined = || {
+                    append_archive_phase(
+                        journal,
+                        job_id,
+                        generation,
+                        cleanup_phase(JournalPhase::PrepublishStageCleanupQuarantined, cleanup),
+                        plan,
+                        &staging,
+                        destination_before,
+                        None,
+                        Some(&cleanup_budget),
+                    )
+                };
+                remove_owned_journaled(
+                    &staging,
+                    &stage_deletion,
+                    cleanup_identity,
+                    &cleanup_budget,
+                    &cleanup_cancellation,
+                    &mut quarantined,
+                )
+            })
         });
         if cleanup_result.is_ok() {
             if append_archive_phase(
@@ -1045,18 +1073,81 @@ impl Read for CancellableReader<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ArchiveCleanupIntent<'a> {
+    kind: ArchiveCleanupKind,
+    source: &'a Path,
+    quarantine: &'a Path,
+    identity: Option<ArchivePathIdentity>,
+}
+
+impl<'a> ArchiveCleanupIntent<'a> {
+    pub(crate) const fn new(
+        kind: ArchiveCleanupKind,
+        source: &'a Path,
+        quarantine: &'a Path,
+        identity: Option<ArchivePathIdentity>,
+    ) -> Self {
+        Self {
+            kind,
+            source,
+            quarantine,
+            identity,
+        }
+    }
+
+    pub(crate) const fn source(self) -> &'a Path {
+        self.source
+    }
+
+    pub(crate) const fn quarantine(self) -> &'a Path {
+        self.quarantine
+    }
+
+    pub(crate) const fn identity(self) -> Option<ArchivePathIdentity> {
+        self.identity
+    }
+}
+
+pub(crate) struct ArchiveJournalPhase<'a> {
+    phase: JournalPhase,
+    cleanup: Option<ArchiveCleanupIntent<'a>>,
+}
+
+impl From<JournalPhase> for ArchiveJournalPhase<'_> {
+    fn from(phase: JournalPhase) -> Self {
+        Self {
+            phase,
+            cleanup: None,
+        }
+    }
+}
+
+pub(crate) const fn cleanup_phase(
+    phase: JournalPhase,
+    cleanup: ArchiveCleanupIntent<'_>,
+) -> ArchiveJournalPhase<'_> {
+    ArchiveJournalPhase {
+        phase,
+        cleanup: Some(cleanup),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn append_archive_phase<S: JournalStorage>(
+pub(crate) fn append_archive_phase<'a, S: JournalStorage>(
     journal: &mut Journal<S>,
     job_id: JobId,
     generation: EventGeneration,
-    phase: JournalPhase,
+    phase: impl Into<ArchiveJournalPhase<'a>>,
     plan: &ArchiveOperationPlan,
     staging: &Path,
     destination_before: Option<ArchivePathIdentity>,
     destination_after: Option<ArchivePathIdentity>,
     budget: Option<&ArchiveBudget>,
 ) -> Result<(), ArchiveOperationError> {
+    let phase = phase.into();
+    let cleanup_intent = phase.cleanup;
+    let phase = phase.phase;
     let include_plan = !journal.records().iter().any(|record| {
         record.job_id() == job_id
             && record.generation() == generation
@@ -1089,7 +1180,18 @@ pub(crate) fn append_archive_phase<S: JournalStorage>(
         ArchiveBudget::max_memory_bytes,
     );
     let staging_store = musheen_core::StorePath::from_unix_path(staging.as_os_str());
-    let observed_staging_identity = path_identity_with_controls(staging, budget, None)?;
+    let explicit_cleanup_phase = matches!(
+        phase,
+        JournalPhase::PrepublishStageCleanupPlanned
+            | JournalPhase::PrepublishStageCleanupQuarantined
+            | JournalPhase::PublishedDestinationCleanupPlanned
+            | JournalPhase::PublishedDestinationCleanupQuarantined
+    );
+    let observed_staging_identity = if explicit_cleanup_phase {
+        None
+    } else {
+        path_identity_with_controls(staging, budget, None)?
+    };
     let preserve_staging_identity = matches!(
         phase,
         JournalPhase::DestinationQuarantinePlanned
@@ -1100,7 +1202,10 @@ pub(crate) fn append_archive_phase<S: JournalStorage>(
             | JournalPhase::PublishedPayloadQuarantined
             | JournalPhase::DestinationRestorePlanned
             | JournalPhase::DestinationRestored
-            | JournalPhase::CleanupQuarantined
+            | JournalPhase::PrepublishStageCleanupPlanned
+            | JournalPhase::PrepublishStageCleanupQuarantined
+            | JournalPhase::PublishedDestinationCleanupPlanned
+            | JournalPhase::PublishedDestinationCleanupQuarantined
             | JournalPhase::StagingCleaned
             | JournalPhase::RecoveryRequired
             | JournalPhase::Completed
@@ -1138,60 +1243,33 @@ pub(crate) fn append_archive_phase<S: JournalStorage>(
     let nonce = StagingPath::nonce(&staging_store).ok_or(ArchiveOperationError::UnsafePath(
         "archive staging path has no ownership nonce",
     ))?;
-    let rollback = cleanup_path(staging)?;
     let stage_deletion = deletion_path(staging)?;
     let publication_quarantine = publication_quarantine_path(staging)?;
-    let preserve_cleanup = matches!(
-        phase,
-        JournalPhase::CleanupQuarantined
-            | JournalPhase::StagingCleaned
-            | JournalPhase::Completed
-            | JournalPhase::RolledBack
-    );
-    let (cleanup, cleanup_identity) = if phase == JournalPhase::CleanupPlanned {
-        let rollback_identity = path_identity_with_controls(&rollback, budget, None)?;
-        let publication_identity =
-            path_identity_with_controls(&publication_quarantine, budget, None)?;
-        if rollback_identity.is_some() {
-            (rollback, rollback_identity)
-        } else if publication_identity.is_some() {
-            (publication_quarantine.clone(), publication_identity)
-        } else {
-            (staging.to_path_buf(), observed_staging_identity)
+    let required_cleanup_kind = match phase {
+        JournalPhase::PrepublishStageCleanupPlanned
+        | JournalPhase::PrepublishStageCleanupQuarantined => {
+            Some(ArchiveCleanupKind::PrepublishStage)
         }
-    } else if preserve_cleanup
-        && let Some(prior_cleanup) = prior_checkpoint.and_then(ArchiveCheckpoint::cleanup)
+        JournalPhase::PublishedDestinationCleanupPlanned
+        | JournalPhase::PublishedDestinationCleanupQuarantined => {
+            Some(ArchiveCleanupKind::PublishedDestination)
+        }
+        _ => None,
+    };
+    if required_cleanup_kind != cleanup_intent.map(|intent| intent.kind) {
+        return Err(ArchiveOperationError::InvalidArchive);
+    }
+    if let Some(intent) = cleanup_intent
+        && (intent.source == intent.quarantine
+            || intent.source.parent().is_none()
+            || intent.source.parent() != intent.quarantine.parent())
     {
-        (
-            local_path(prior_cleanup)?,
-            prior_checkpoint.and_then(ArchiveCheckpoint::cleanup_identity),
-        )
-    } else {
-        (
-            rollback,
-            prior_checkpoint
-                .and_then(ArchiveCheckpoint::cleanup_identity)
-                .or(destination_before),
-        )
-    };
-    let cleanup_deletion = if preserve_cleanup {
-        prior_checkpoint
-            .and_then(ArchiveCheckpoint::cleanup_deletion)
-            .map(local_path)
-            .transpose()?
-            .unwrap_or(deletion_path(&cleanup)?)
-    } else {
-        deletion_path(&cleanup)?
-    };
+        return Err(ArchiveOperationError::UnsafePath(
+            "archive cleanup source and quarantine must be distinct siblings",
+        ));
+    }
     let checkpoint = checkpoint
         .with_staging_nonce(nonce)
-        .with_cleanup(
-            musheen_core::StorePath::from_unix_path(cleanup.as_os_str()),
-            cleanup_identity,
-        )
-        .with_cleanup_deletion(musheen_core::StorePath::from_unix_path(
-            cleanup_deletion.as_os_str(),
-        ))
         .with_stage_deletion(musheen_core::StorePath::from_unix_path(
             stage_deletion.as_os_str(),
         ))
@@ -1203,6 +1281,29 @@ pub(crate) fn append_archive_phase<S: JournalStorage>(
             || prior_checkpoint.map_or(30_000, |checkpoint| checkpoint.identity_timeout_millis()),
             ArchiveBudget::max_identity_millis,
         ));
+    let checkpoint = if let Some(intent) = cleanup_intent {
+        checkpoint.with_cleanup_intent(
+            intent.kind,
+            musheen_core::StorePath::from_unix_path(intent.source.as_os_str()),
+            musheen_core::StorePath::from_unix_path(intent.quarantine.as_os_str()),
+            intent.identity,
+        )
+    } else if let Some(prior) = prior_checkpoint
+        && let (Some(kind), Some(source), Some(quarantine)) = (
+            prior.cleanup_kind(),
+            prior.cleanup(),
+            prior.cleanup_deletion(),
+        )
+    {
+        checkpoint.with_cleanup_intent(
+            kind,
+            source.clone(),
+            quarantine.clone(),
+            prior.cleanup_identity(),
+        )
+    } else {
+        checkpoint
+    };
     journal
         .append_archive(
             job_id,
@@ -1788,17 +1889,9 @@ pub(crate) fn map_errno(error: rustix::io::Errno) -> ArchiveOperationError {
     map_io(&io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
-pub(crate) fn remove_owned_with_controls(
-    path: &Path,
-    expected: Option<ArchivePathIdentity>,
-    budget: &ArchiveBudget,
-    cancellation: &CancellationToken,
-) -> Result<(), ArchiveOperationError> {
-    remove_owned_with_identity(path, expected, true, Some(budget), Some(cancellation), None)
-}
-
 pub(crate) fn remove_owned_journaled(
     path: &Path,
+    quarantine: &Path,
     expected: Option<ArchivePathIdentity>,
     budget: &ArchiveBudget,
     cancellation: &CancellationToken,
@@ -1806,6 +1899,7 @@ pub(crate) fn remove_owned_journaled(
 ) -> Result<(), ArchiveOperationError> {
     remove_owned_with_identity(
         path,
+        Some(quarantine),
         expected,
         true,
         Some(budget),
@@ -1816,6 +1910,7 @@ pub(crate) fn remove_owned_journaled(
 
 fn remove_owned_with_identity(
     path: &Path,
+    quarantine: Option<&Path>,
     expected: Option<ArchivePathIdentity>,
     require_exact_content: bool,
     budget: Option<&ArchiveBudget>,
@@ -1826,7 +1921,12 @@ fn remove_owned_with_identity(
     if let Some(budget) = budget {
         budget.check_cleanup()?;
     }
-    let deletion = deletion_path(path)?;
+    let deletion = quarantine.map_or_else(|| deletion_path(path), |path| Ok(path.to_path_buf()))?;
+    if path == deletion || path.parent().is_none() || path.parent() != deletion.parent() {
+        return Err(ArchiveOperationError::UnsafePath(
+            "archive cleanup source and quarantine must be distinct siblings",
+        ));
+    }
     let path_absent = matches!(
         std::fs::symlink_metadata(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound

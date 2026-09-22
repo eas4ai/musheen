@@ -37,7 +37,7 @@ pub const fn decide_recovery(phase: JournalPhase, context: RecoveryContext) -> R
         JournalPhase::DestinationQuarantinePlanned
         | JournalPhase::DestinationQuarantined
         | JournalPhase::StagePublishPlanned
-        | JournalPhase::CleanupPlanned
+        | JournalPhase::PublishedDestinationCleanupPlanned
         | JournalPhase::PublishRollbackPlanned
         | JournalPhase::PublishedPayloadQuarantined
         | JournalPhase::DestinationRestorePlanned
@@ -54,7 +54,15 @@ pub const fn decide_recovery(phase: JournalPhase, context: RecoveryContext) -> R
                 RecoveryDecision::Ask
             }
         }
-        JournalPhase::CleanupQuarantined
+        JournalPhase::PrepublishStageCleanupPlanned
+        | JournalPhase::PrepublishStageCleanupQuarantined => {
+            if context.staging_owned {
+                RecoveryDecision::Rollback
+            } else {
+                RecoveryDecision::Ask
+            }
+        }
+        JournalPhase::PublishedDestinationCleanupQuarantined
         | JournalPhase::SourceRemoved
         | JournalPhase::StagingCleaned => {
             if context.continuation_verified && context.destination_verified {

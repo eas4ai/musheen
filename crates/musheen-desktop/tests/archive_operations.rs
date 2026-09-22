@@ -10,9 +10,9 @@ use musheen_desktop::{
     recover_archive_operations_with_cancellation,
 };
 use musheen_ops::{
-    ArchiveCheckpoint, ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan,
-    ArchivePathIdentity, CorruptSource, Durability, EventGeneration, JobId, Journal, JournalPhase,
-    JournalStorage, ProviderLimits, ProviderSnapshot, Scheduler,
+    ArchiveCheckpoint, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy,
+    ArchiveOperationPlan, ArchivePathIdentity, CorruptSource, Durability, EventGeneration, JobId,
+    Journal, JournalPhase, JournalStorage, ProviderLimits, ProviderSnapshot, Scheduler,
 };
 use std::io::{self, Cursor, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -343,14 +343,16 @@ fn approved_recovery_action(phase: JournalPhase) -> ArchiveRecoveryAction {
         | JournalPhase::DestinationQuarantinePlanned
         | JournalPhase::DestinationQuarantined
         | JournalPhase::StagePublishPlanned
-        | JournalPhase::CleanupPlanned
+        | JournalPhase::PrepublishStageCleanupPlanned
+        | JournalPhase::PublishedDestinationCleanupPlanned
         | JournalPhase::DestinationPublished
         | JournalPhase::PublishRollbackPlanned
         | JournalPhase::PublishedPayloadQuarantined
         | JournalPhase::DestinationRestorePlanned
         | JournalPhase::DestinationRestored
         | JournalPhase::StageRestorePlanned
-        | JournalPhase::CleanupQuarantined
+        | JournalPhase::PrepublishStageCleanupQuarantined
+        | JournalPhase::PublishedDestinationCleanupQuarantined
         | JournalPhase::RecoveryRequired
         | JournalPhase::StagingCleaned => ArchiveRecoveryAction::Resume,
         JournalPhase::Planned | JournalPhase::StagingCreated => ArchiveRecoveryAction::Rollback,
@@ -757,7 +759,8 @@ fn cleanup_swap_retains_foreign_stage_and_never_journals_staging_cleaned() {
                 | JournalPhase::PublishedPayloadQuarantined
                 | JournalPhase::DestinationRestorePlanned
                 | JournalPhase::DestinationRestored
-                | JournalPhase::CleanupPlanned
+                | JournalPhase::PrepublishStageCleanupPlanned
+                | JournalPhase::PublishedDestinationCleanupPlanned
         )
     ));
 }
@@ -858,7 +861,7 @@ fn failed_cleanup_is_recovery_needed_and_not_a_terminal_rollback() {
     ));
     assert_eq!(
         journal.records().last().map(|record| record.phase()),
-        Some(JournalPhase::CleanupPlanned)
+        Some(JournalPhase::PublishedDestinationCleanupPlanned)
     );
     assert!(live_staging(root.path()).exists());
 }
@@ -923,17 +926,14 @@ fn post_publish_rollback_survives_stage_recreation_and_reports_injected_failure(
             .archive_checkpoint()
             .expect("checkpoint");
         let staging = checkpoint.staging().as_unix_path().expect("local stage");
-        let cleanup = checkpoint
-            .cleanup()
-            .and_then(StorePath::as_unix_path)
-            .expect("cleanup path");
+        let cleanup = Path::new(&format!("{}.rollback", staging.display())).to_path_buf();
         let published_quarantine = checkpoint
             .publication_quarantine()
             .and_then(StorePath::as_unix_path)
             .expect("published quarantine");
         if inject_rollback_failure {
             assert_eq!(
-                std::fs::read(cleanup).expect("old destination is quarantined"),
+                std::fs::read(&cleanup).expect("old destination is quarantined"),
                 b"old destination"
             );
             assert_ne!(
@@ -1734,45 +1734,136 @@ fn recovery_identity_walk_uses_persisted_memory_limit_and_cancellation() {
 }
 
 #[test]
-fn recovery_resumes_cleanup_before_rename_after_rename_and_after_delete() {
+fn prepublish_cleanup_recovers_every_topology_without_touching_foreign_collisions() {
     for (crash_point, phase) in [
-        ("planned-before-rename", JournalPhase::CleanupPlanned),
-        ("planned-after-rename", JournalPhase::CleanupPlanned),
+        (
+            "planned-before-rename",
+            JournalPhase::PrepublishStageCleanupPlanned,
+        ),
+        (
+            "planned-after-rename",
+            JournalPhase::PrepublishStageCleanupPlanned,
+        ),
         (
             "quarantined-before-delete",
-            JournalPhase::CleanupQuarantined,
+            JournalPhase::PrepublishStageCleanupQuarantined,
         ),
-        ("quarantined-after-delete", JournalPhase::CleanupQuarantined),
+        (
+            "quarantined-after-delete",
+            JournalPhase::PrepublishStageCleanupQuarantined,
+        ),
+    ] {
+        for destination_exists in [false, true] {
+            for action in [
+                ArchiveRecoveryAction::Resume,
+                ArchiveRecoveryAction::Rollback,
+            ] {
+                let root = tempdir().expect("temporary root");
+                let source = root.path().join("source.txt");
+                let destination = root.path().join("published.zip");
+                let staging = test_staging(root.path(), 79);
+                let rollback = Path::new(&format!("{}.rollback", staging.display())).to_path_buf();
+                let published =
+                    Path::new(&format!("{}.published", staging.display())).to_path_buf();
+                let deletion = Path::new(&format!("{}.delete", staging.display())).to_path_buf();
+                std::fs::write(&source, b"source").expect("source");
+                std::fs::write(&staging, b"owned stage").expect("stage");
+                std::fs::write(&rollback, b"foreign rollback").expect("foreign rollback");
+                std::fs::write(&published, b"foreign published").expect("foreign published");
+                if destination_exists {
+                    std::fs::write(&destination, b"existing destination").expect("destination");
+                }
+                let staging_identity = identity(&staging);
+                let destination_before = destination_exists.then(|| identity(&destination));
+                match crash_point {
+                    "planned-before-rename" => {}
+                    "planned-after-rename" | "quarantined-before-delete" => {
+                        std::fs::rename(&staging, &deletion).expect("stage quarantine");
+                    }
+                    "quarantined-after-delete" => {
+                        std::fs::rename(&staging, &deletion).expect("stage quarantine");
+                        std::fs::remove_file(&deletion).expect("stage delete");
+                    }
+                    _ => unreachable!(),
+                }
+                let plan = ArchiveOperationPlan::create(
+                    vec![local(&source)],
+                    local(&destination),
+                    ArchiveCodec::Zip,
+                    ArchiveConflictPolicy::Replace,
+                    false,
+                )
+                .expect("recovery plan");
+                let checkpoint = ArchiveCheckpoint::new(
+                    plan,
+                    local(&staging),
+                    Some(staging_identity),
+                    destination_before,
+                    None,
+                )
+                .with_staging_nonce(TEST_STAGE_NONCE)
+                .with_cleanup_intent(
+                    ArchiveCleanupKind::PrepublishStage,
+                    local(&staging),
+                    local(&deletion),
+                    Some(staging_identity),
+                )
+                .with_publication_quarantine(local(&published));
+                let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
+                journal
+                    .append_archive(
+                        JobId::new(79).expect("job id"),
+                        EventGeneration::new(0),
+                        phase,
+                        Durability::CrashDurable,
+                        checkpoint,
+                    )
+                    .expect("cleanup intent persists");
+
+                let request = recover_archive_operations(&journal)
+                    .expect("recovery scans")
+                    .pop()
+                    .expect("recovery request");
+                apply_archive_recovery(&mut journal, &request, action).unwrap_or_else(|error| {
+                    panic!(
+                        "{crash_point} destination={destination_exists} {action:?} recovers: {error:?}"
+                    )
+                });
+                assert!(!staging.exists(), "{crash_point}: stage removed");
+                assert!(!deletion.exists(), "{crash_point}: quarantine removed");
+                assert_eq!(
+                    std::fs::read(&rollback).expect("rollback remains"),
+                    b"foreign rollback"
+                );
+                assert_eq!(
+                    std::fs::read(&published).expect("published remains"),
+                    b"foreign published"
+                );
+                assert_eq!(destination.exists(), destination_exists);
+                assert_eq!(
+                    journal.records().last().map(|record| record.phase()),
+                    Some(JournalPhase::RolledBack)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prepublish_cleanup_rejects_an_occupied_exact_quarantine_for_both_actions() {
+    for action in [
+        ArchiveRecoveryAction::Resume,
+        ArchiveRecoveryAction::Rollback,
     ] {
         let root = tempdir().expect("temporary root");
         let source = root.path().join("source.txt");
-        let destination = root.path().join("published.zip");
-        let staging = test_staging(root.path(), 79);
-        let cleanup = {
-            let mut name = staging.file_name().expect("stage name").to_os_string();
-            name.push(".rollback");
-            staging.with_file_name(name)
-        };
-        let deletion = {
-            let mut name = cleanup.file_name().expect("cleanup name").to_os_string();
-            name.push(".delete");
-            cleanup.with_file_name(name)
-        };
+        let destination = root.path().join("archive.zip");
+        let staging = test_staging(root.path(), 81);
+        let deletion = Path::new(&format!("{}.delete", staging.display())).to_path_buf();
         std::fs::write(&source, b"source").expect("source");
-        std::fs::write(&destination, b"published archive").expect("destination");
-        std::fs::write(&cleanup, b"old destination").expect("cleanup");
-        let cleanup_identity = identity(&cleanup);
-        match crash_point {
-            "planned-before-rename" => {}
-            "planned-after-rename" | "quarantined-before-delete" => {
-                std::fs::rename(&cleanup, &deletion).expect("cleanup quarantine");
-            }
-            "quarantined-after-delete" => {
-                std::fs::rename(&cleanup, &deletion).expect("cleanup quarantine");
-                std::fs::remove_file(&deletion).expect("cleanup delete");
-            }
-            _ => unreachable!(),
-        }
+        std::fs::write(&staging, b"owned stage").expect("stage");
+        std::fs::write(&deletion, b"foreign quarantine").expect("foreign quarantine");
+        let staging_identity = identity(&staging);
         let plan = ArchiveOperationPlan::create(
             vec![local(&source)],
             local(&destination),
@@ -1780,39 +1871,244 @@ fn recovery_resumes_cleanup_before_rename_after_rename_and_after_delete() {
             ArchiveConflictPolicy::Replace,
             false,
         )
-        .expect("recovery plan");
-        let checkpoint = ArchiveCheckpoint::new(
-            plan,
-            local(&staging),
-            None,
-            Some(cleanup_identity),
-            Some(identity(&destination)),
-        )
-        .with_staging_nonce(TEST_STAGE_NONCE)
-        .with_cleanup(local(&cleanup), Some(cleanup_identity))
-        .with_cleanup_deletion(local(&deletion));
+        .expect("archive plan");
+        let checkpoint =
+            ArchiveCheckpoint::new(plan, local(&staging), Some(staging_identity), None, None)
+                .with_staging_nonce(TEST_STAGE_NONCE)
+                .with_cleanup_intent(
+                    ArchiveCleanupKind::PrepublishStage,
+                    local(&staging),
+                    local(&deletion),
+                    Some(staging_identity),
+                );
         let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
         journal
             .append_archive(
-                JobId::new(79).expect("job id"),
+                JobId::new(81).expect("job id"),
                 EventGeneration::new(0),
-                phase,
+                JournalPhase::PrepublishStageCleanupPlanned,
                 Durability::CrashDurable,
                 checkpoint,
             )
-            .expect("cleanup intent persists");
+            .expect("checkpoint persists");
 
         let request = recover_archive_operations(&journal)
             .expect("recovery scans")
             .pop()
             .expect("recovery request");
-        apply_archive_recovery(&mut journal, &request, ArchiveRecoveryAction::Resume)
-            .unwrap_or_else(|error| panic!("{crash_point} recovers: {error:?}"));
-        assert!(!cleanup.exists(), "{crash_point}: cleanup removed");
-        assert!(!deletion.exists(), "{crash_point}: quarantine removed");
+        assert!(apply_archive_recovery(&mut journal, &request, action).is_err());
+        assert_eq!(
+            std::fs::read(&staging).expect("stage remains"),
+            b"owned stage"
+        );
+        assert_eq!(
+            std::fs::read(&deletion).expect("foreign quarantine remains"),
+            b"foreign quarantine"
+        );
         assert_eq!(
             journal.records().last().map(|record| record.phase()),
-            Some(JournalPhase::Completed)
+            Some(JournalPhase::PrepublishStageCleanupPlanned)
+        );
+    }
+}
+
+#[test]
+fn published_destination_cleanup_has_distinct_resume_and_rollback_semantics() {
+    for (crash_point, phase) in [
+        (
+            "planned-before-rename",
+            JournalPhase::PublishedDestinationCleanupPlanned,
+        ),
+        (
+            "planned-after-rename",
+            JournalPhase::PublishedDestinationCleanupPlanned,
+        ),
+        (
+            "quarantined-before-delete",
+            JournalPhase::PublishedDestinationCleanupQuarantined,
+        ),
+        (
+            "quarantined-after-delete",
+            JournalPhase::PublishedDestinationCleanupQuarantined,
+        ),
+    ] {
+        for action in [
+            ArchiveRecoveryAction::Resume,
+            ArchiveRecoveryAction::Rollback,
+        ] {
+            let root = tempdir().expect("temporary root");
+            let source = root.path().join("source.txt");
+            let destination = root.path().join("archive.zip");
+            let staging = test_staging(root.path(), 82);
+            let rollback = Path::new(&format!("{}.rollback", staging.display())).to_path_buf();
+            let deletion = Path::new(&format!("{}.delete", rollback.display())).to_path_buf();
+            let published = Path::new(&format!("{}.published", staging.display())).to_path_buf();
+            std::fs::write(&source, b"source").expect("source");
+            std::fs::write(&destination, b"new archive").expect("new destination");
+            std::fs::write(&rollback, b"old archive").expect("old destination");
+            let new_identity = identity(&destination);
+            let old_identity = identity(&rollback);
+            match crash_point {
+                "planned-before-rename" => {}
+                "planned-after-rename" | "quarantined-before-delete" => {
+                    std::fs::rename(&rollback, &deletion).expect("cleanup quarantine");
+                }
+                "quarantined-after-delete" => {
+                    std::fs::remove_file(&rollback).expect("cleanup delete");
+                }
+                _ => unreachable!(),
+            }
+            let plan = ArchiveOperationPlan::create(
+                vec![local(&source)],
+                local(&destination),
+                ArchiveCodec::Zip,
+                ArchiveConflictPolicy::Replace,
+                false,
+            )
+            .expect("archive plan");
+            let checkpoint = ArchiveCheckpoint::new(
+                plan,
+                local(&staging),
+                Some(new_identity),
+                Some(old_identity),
+                Some(new_identity),
+            )
+            .with_staging_nonce(TEST_STAGE_NONCE)
+            .with_cleanup_intent(
+                ArchiveCleanupKind::PublishedDestination,
+                local(&rollback),
+                local(&deletion),
+                Some(old_identity),
+            )
+            .with_publication_quarantine(local(&published));
+            let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
+            journal
+                .append_archive(
+                    JobId::new(82).expect("job id"),
+                    EventGeneration::new(0),
+                    phase,
+                    Durability::CrashDurable,
+                    checkpoint,
+                )
+                .expect("checkpoint persists");
+            let request = recover_archive_operations(&journal)
+                .expect("recovery scans")
+                .pop()
+                .expect("recovery request");
+
+            if crash_point == "quarantined-after-delete"
+                && action == ArchiveRecoveryAction::Rollback
+            {
+                assert!(apply_archive_recovery(&mut journal, &request, action).is_err());
+                assert_eq!(
+                    std::fs::read(&destination).expect("new destination remains"),
+                    b"new archive"
+                );
+                assert!(!published.exists(), "new payload was not moved");
+                continue;
+            }
+            apply_archive_recovery(&mut journal, &request, action)
+                .unwrap_or_else(|error| panic!("{crash_point} {action:?} recovers: {error:?}"));
+            let (contents, terminal) = match action {
+                ArchiveRecoveryAction::Resume => {
+                    (b"new archive".as_slice(), JournalPhase::Completed)
+                }
+                ArchiveRecoveryAction::Rollback => {
+                    (b"old archive".as_slice(), JournalPhase::RolledBack)
+                }
+            };
+            assert_eq!(std::fs::read(&destination).expect("destination"), contents);
+            assert_eq!(
+                journal.records().last().map(|record| record.phase()),
+                Some(terminal)
+            );
+        }
+    }
+}
+
+#[test]
+fn recovery_handles_published_payload_with_a_foreign_recreated_stage_for_both_actions() {
+    for action in [
+        ArchiveRecoveryAction::Resume,
+        ArchiveRecoveryAction::Rollback,
+    ] {
+        let root = tempdir().expect("temporary root");
+        let source = root.path().join("source.txt");
+        let destination = root.path().join("archive.zip");
+        let staging = test_staging(root.path(), 80);
+        let rollback = Path::new(&format!("{}.rollback", staging.display())).to_path_buf();
+        let rollback_deletion = Path::new(&format!("{}.delete", rollback.display())).to_path_buf();
+        let published = Path::new(&format!("{}.published", staging.display())).to_path_buf();
+        std::fs::write(&source, b"source").expect("source");
+        std::fs::write(&destination, b"old archive").expect("destination");
+        std::fs::write(&published, b"new archive").expect("published quarantine");
+        let old_identity = identity(&destination);
+        let new_identity = identity(&published);
+        std::fs::write(&staging, b"foreign stage").expect("foreign stage");
+        let plan = ArchiveOperationPlan::create(
+            vec![local(&source)],
+            local(&destination),
+            ArchiveCodec::Zip,
+            ArchiveConflictPolicy::Replace,
+            false,
+        )
+        .expect("archive plan");
+        let checkpoint = ArchiveCheckpoint::new(
+            plan,
+            local(&staging),
+            Some(new_identity),
+            Some(old_identity),
+            Some(old_identity),
+        )
+        .with_staging_nonce(TEST_STAGE_NONCE)
+        .with_cleanup_intent(
+            ArchiveCleanupKind::PublishedDestination,
+            local(&rollback),
+            local(&rollback_deletion),
+            Some(old_identity),
+        )
+        .with_publication_quarantine(local(&published));
+        let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
+        journal
+            .append_archive(
+                JobId::new(80).expect("job id"),
+                EventGeneration::new(0),
+                JournalPhase::DestinationRestored,
+                Durability::CrashDurable,
+                checkpoint,
+            )
+            .expect("checkpoint persists");
+
+        let request = recover_archive_operations(&journal)
+            .expect("recovery scans")
+            .pop()
+            .expect("recovery request");
+        apply_archive_recovery(&mut journal, &request, action)
+            .unwrap_or_else(|error| panic!("{action:?} recovers: {error:?}"));
+
+        assert_eq!(
+            std::fs::read(&staging).expect("foreign stage remains"),
+            b"foreign stage"
+        );
+        assert!(!published.exists(), "owned quarantine is consumed");
+        assert!(!rollback.exists(), "rollback source is consumed");
+        assert!(
+            !rollback_deletion.exists(),
+            "rollback quarantine is consumed"
+        );
+        let (expected_contents, expected_phase) = match action {
+            ArchiveRecoveryAction::Resume => (b"new archive".as_slice(), JournalPhase::Completed),
+            ArchiveRecoveryAction::Rollback => {
+                (b"old archive".as_slice(), JournalPhase::RolledBack)
+            }
+        };
+        assert_eq!(
+            std::fs::read(&destination).expect("destination"),
+            expected_contents
+        );
+        assert_eq!(
+            journal.records().last().map(|record| record.phase()),
+            Some(expected_phase)
         );
     }
 }
@@ -1931,8 +2227,12 @@ fn publication_state_machine_recovers_every_durable_crash_topology() {
                 None,
             )
             .with_staging_nonce(TEST_STAGE_NONCE)
-            .with_cleanup(local(&rollback), Some(old_identity))
-            .with_cleanup_deletion(local(&rollback_deletion))
+            .with_cleanup_intent(
+                ArchiveCleanupKind::PublishedDestination,
+                local(&rollback),
+                local(&rollback_deletion),
+                Some(old_identity),
+            )
             .with_stage_deletion(local(&stage_deletion))
             .with_publication_quarantine(local(&published));
             let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");

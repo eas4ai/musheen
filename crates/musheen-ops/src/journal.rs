@@ -28,19 +28,31 @@ pub enum JournalPhase {
     DestinationQuarantinePlanned,
     DestinationQuarantined,
     StagePublishPlanned,
-    CleanupPlanned,
+    PrepublishStageCleanupPlanned,
+    PublishedDestinationCleanupPlanned,
     DestinationPublished,
     PublishRollbackPlanned,
     PublishedPayloadQuarantined,
     DestinationRestorePlanned,
     DestinationRestored,
     StageRestorePlanned,
-    CleanupQuarantined,
+    PrepublishStageCleanupQuarantined,
+    PublishedDestinationCleanupQuarantined,
     SourceRemoved,
     StagingCleaned,
     RecoveryRequired,
     Completed,
     RolledBack,
+}
+
+/// Identifies which owned object a durable cleanup checkpoint may remove.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveCleanupKind {
+    /// An unpublished staging payload. Successful cleanup ends in `RolledBack`.
+    PrepublishStage,
+    /// A displaced destination after its replacement was published.
+    PublishedDestination,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -136,6 +148,8 @@ pub struct ArchiveCheckpoint {
     #[serde(default)]
     cleanup: Option<StorePath>,
     #[serde(default)]
+    cleanup_kind: Option<ArchiveCleanupKind>,
+    #[serde(default)]
     cleanup_identity: Option<ArchivePathIdentity>,
     #[serde(default)]
     cleanup_deletion: Option<StorePath>,
@@ -170,6 +184,7 @@ impl ArchiveCheckpoint {
             destination_after,
             staging_nonce: None,
             cleanup: None,
+            cleanup_kind: None,
             cleanup_identity: None,
             cleanup_deletion: None,
             stage_deletion: None,
@@ -186,19 +201,17 @@ impl ArchiveCheckpoint {
     }
 
     #[must_use]
-    pub fn with_cleanup(
+    pub fn with_cleanup_intent(
         mut self,
-        cleanup: StorePath,
-        cleanup_identity: Option<ArchivePathIdentity>,
+        kind: ArchiveCleanupKind,
+        source: StorePath,
+        quarantine: StorePath,
+        identity: Option<ArchivePathIdentity>,
     ) -> Self {
-        self.cleanup = Some(cleanup);
-        self.cleanup_identity = cleanup_identity;
-        self
-    }
-
-    #[must_use]
-    pub fn with_cleanup_deletion(mut self, cleanup_deletion: StorePath) -> Self {
-        self.cleanup_deletion = Some(cleanup_deletion);
+        self.cleanup_kind = Some(kind);
+        self.cleanup = Some(source);
+        self.cleanup_deletion = Some(quarantine);
+        self.cleanup_identity = identity;
         self
     }
 
@@ -259,6 +272,7 @@ impl ArchiveCheckpoint {
             destination_after,
             staging_nonce: None,
             cleanup: None,
+            cleanup_kind: None,
             cleanup_identity: None,
             cleanup_deletion: None,
             stage_deletion: None,
@@ -290,6 +304,10 @@ impl ArchiveCheckpoint {
     #[must_use]
     pub const fn cleanup(&self) -> Option<&StorePath> {
         self.cleanup.as_ref()
+    }
+    #[must_use]
+    pub const fn cleanup_kind(&self) -> Option<ArchiveCleanupKind> {
+        self.cleanup_kind
     }
     #[must_use]
     pub const fn cleanup_identity(&self) -> Option<ArchivePathIdentity> {
@@ -391,6 +409,8 @@ struct ArchiveCheckpointDocument {
     staging_nonce: Option<[u8; 16]>,
     #[serde(default)]
     cleanup: Option<StorePath>,
+    #[serde(default)]
+    cleanup_kind: Option<ArchiveCleanupKind>,
     #[serde(default)]
     cleanup_identity: Option<ArchivePathIdentity>,
     #[serde(default)]
@@ -723,6 +743,7 @@ fn encode_record(record: &JournalRecord, include_plan: bool) -> Result<Vec<u8>, 
                 destination_after: checkpoint.destination_after,
                 staging_nonce: checkpoint.staging_nonce,
                 cleanup: checkpoint.cleanup.clone(),
+                cleanup_kind: checkpoint.cleanup_kind,
                 cleanup_identity: checkpoint.cleanup_identity,
                 cleanup_deletion: checkpoint.cleanup_deletion.clone(),
                 stage_deletion: checkpoint.stage_deletion.clone(),
@@ -801,6 +822,7 @@ fn decode_record(
                 destination_after: checkpoint.destination_after,
                 staging_nonce: checkpoint.staging_nonce,
                 cleanup: checkpoint.cleanup,
+                cleanup_kind: checkpoint.cleanup_kind,
                 cleanup_identity: checkpoint.cleanup_identity,
                 cleanup_deletion: checkpoint.cleanup_deletion,
                 stage_deletion: checkpoint.stage_deletion,
