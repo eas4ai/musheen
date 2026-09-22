@@ -29,13 +29,22 @@ pub(super) fn display_value(spec: &SettingSpec, value: &str, catalog: &Catalog) 
             .message("settings-value-credential-stored")
             .expect("stored credential status is localized")
             .to_owned(),
+        SettingKind::ConnectionProfiles => {
+            let count = musheen_desktop::ConnectionProfiles::import(value)
+                .map(|profiles| profiles.profiles().len())
+                .unwrap_or_default();
+            format!("{count}")
+        }
     }
 }
 
 /// References are managed by the connection editor rather than exposed as
 /// editable settings text. This helper remains for non-secret input controls.
 pub(super) fn input_value(spec: &SettingSpec, value: &str, catalog: &Catalog) -> String {
-    if matches!(spec.kind, SettingKind::CredentialReference) {
+    if matches!(
+        spec.kind,
+        SettingKind::CredentialReference | SettingKind::ConnectionProfiles
+    ) {
         value.to_owned()
     } else {
         display_value(spec, value, catalog)

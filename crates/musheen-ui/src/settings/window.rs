@@ -12,8 +12,9 @@ use gpui_kit::{
     Window, WindowBounds, WindowHandle, WindowOptions, div, px, size,
 };
 use musheen_desktop::{
-    CatalogStore, SettingKind, SettingSpec, SettingsDocument, SettingsFeature, SettingsPage,
-    SettingsStore, settings_schema,
+    CatalogStore, ConnectionProfiles, CredentialReference, RemoteProtocol, SaveConfirmation,
+    SaveRequirement, SecurityPolicy, SettingKind, SettingSpec, SettingsDocument, SettingsFeature,
+    SettingsPage, SettingsStore, TestReport, settings_schema,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -119,6 +120,17 @@ pub struct SettingsWindow {
     pub(super) action_shell: bool,
     pub(super) action_provider_uris: bool,
     pub(super) action_confirmation: musheen_desktop::ActionConfirmation,
+    remote_inputs: BTreeMap<&'static str, Entity<InputState>>,
+    remote_protocol: RemoteProtocol,
+    remote_security: SecurityPolicy,
+    remote_tester: Arc<dyn super::remote::ConnectionTestService>,
+    remote_testing: bool,
+    remote_test_generation: u64,
+    remote_test_cancellation: Option<musheen_core::CancellationToken>,
+    remote_test_report: Option<TestReport>,
+    remote_save_requirement: Option<SaveRequirement>,
+    remote_validation_failed: bool,
+    remote_editor_open: bool,
     recent_history_clearer: Option<RecentHistoryClearer>,
 }
 
@@ -127,6 +139,24 @@ impl SettingsWindow {
         store: SettingsStore,
         backends: SettingsBackends,
         catalog: Catalog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_connection_tester(
+            store,
+            backends,
+            catalog,
+            Arc::new(super::remote::UnavailableConnectionTestService),
+            window,
+            cx,
+        )
+    }
+
+    pub fn new_with_connection_tester(
+        store: SettingsStore,
+        backends: SettingsBackends,
+        catalog: Catalog,
+        remote_tester: Arc<dyn super::remote::ConnectionTestService>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -162,6 +192,17 @@ impl SettingsWindow {
             action_shell: false,
             action_provider_uris: false,
             action_confirmation: musheen_desktop::ActionConfirmation::Always,
+            remote_inputs: super::remote::inputs(window, cx),
+            remote_protocol: RemoteProtocol::Sftp,
+            remote_security: super::remote::default_security(RemoteProtocol::Sftp),
+            remote_tester,
+            remote_testing: false,
+            remote_test_generation: 0,
+            remote_test_cancellation: None,
+            remote_test_report: None,
+            remote_save_requirement: None,
+            remote_validation_failed: false,
+            remote_editor_open: false,
             recent_history_clearer: None,
             theme_input: theme_input.clone(),
             theme_error: None,
@@ -194,6 +235,7 @@ impl SettingsWindow {
                     | SettingKind::Shortcuts
                     | SettingKind::Theme
                     | SettingKind::CustomActions
+                    | SettingKind::ConnectionProfiles
                     | SettingKind::CredentialReference
             ) {
                 this.choices_focus.insert(spec.key, cx.focus_handle());
@@ -243,6 +285,9 @@ impl SettingsWindow {
                 }
             }));
         this.subscriptions.push(cx.on_release(|this, cx| {
+            if let Some(cancellation) = this.remote_test_cancellation.take() {
+                cancellation.cancel();
+            }
             this.restore_committed_appearance(cx);
         }));
         this
@@ -304,6 +349,141 @@ impl SettingsWindow {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    fn remote_profile(&self, cx: &App) -> Result<musheen_desktop::ConnectionProfile, ()> {
+        let credential = self
+            .state
+            .draft()
+            .value("remote.credential")
+            .filter(|value| !value.is_empty())
+            .map(|value| CredentialReference::from_setting_value(&value))
+            .transpose()
+            .map_err(|_| ())?;
+        super::remote::build_profile(
+            &self.remote_inputs,
+            self.remote_protocol,
+            self.remote_security.clone(),
+            credential,
+            cx,
+        )
+        .map_err(|_| ())
+    }
+
+    fn test_remote_connection(&mut self, cx: &mut Context<Self>) {
+        if self.remote_testing {
+            return;
+        }
+        let Ok(profile) = self.remote_profile(cx) else {
+            self.remote_validation_failed = true;
+            self.remote_save_requirement = None;
+            cx.notify();
+            return;
+        };
+        if let Some(cancellation) = self.remote_test_cancellation.take() {
+            cancellation.cancel();
+        }
+        let cancellation = musheen_core::CancellationToken::new();
+        self.remote_test_cancellation = Some(cancellation.clone());
+        self.remote_testing = true;
+        self.remote_validation_failed = false;
+        self.remote_save_requirement = None;
+        self.remote_test_report = None;
+        self.remote_test_generation = self.remote_test_generation.wrapping_add(1);
+        let generation = self.remote_test_generation;
+        let tester = self.remote_tester.clone();
+        let work = cx.background_spawn(async move {
+            let result = tester.test(&profile, cancellation).await;
+            (profile, result)
+        });
+        cx.spawn(async move |this, cx| {
+            let (profile, result) = work.await;
+            cx.update(|cx| {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |this, cx| {
+                        if this.remote_test_generation != generation {
+                            return;
+                        }
+                        this.remote_testing = false;
+                        this.remote_test_cancellation = None;
+                        this.remote_test_report = Some(match result {
+                            Ok(()) => TestReport::passed(&profile),
+                            Err(error) => TestReport::failed(&profile, error),
+                        });
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn stage_remote_connection(&mut self, confirmed: bool, cx: &mut Context<Self>) {
+        let Ok(profile) = self.remote_profile(cx) else {
+            self.remote_validation_failed = true;
+            self.remote_save_requirement = None;
+            cx.notify();
+            return;
+        };
+        let Some(document) = self.state.draft().value("remote.connections") else {
+            self.remote_validation_failed = true;
+            cx.notify();
+            return;
+        };
+        let Ok(saved) = ConnectionProfiles::import(&document) else {
+            self.remote_validation_failed = true;
+            cx.notify();
+            return;
+        };
+        let previous = saved
+            .profiles()
+            .iter()
+            .find(|saved| saved.id() == profile.id());
+        let requirement = profile.save_requirement(
+            previous,
+            self.remote_test_report.as_ref(),
+            if confirmed {
+                SaveConfirmation::all()
+            } else {
+                SaveConfirmation::default()
+            },
+        );
+        if requirement != SaveRequirement::Ready {
+            self.remote_save_requirement = Some(requirement);
+            self.remote_validation_failed = false;
+            cx.notify();
+            return;
+        }
+
+        let mut profiles = saved.profiles().to_vec();
+        if let Some(index) = profiles.iter().position(|saved| saved.id() == profile.id()) {
+            profiles[index] = profile;
+        } else {
+            profiles.push(profile);
+        }
+        let encoded = ConnectionProfiles::new(profiles)
+            .export()
+            .expect("validated connection profiles serialize");
+        if self.state.edit("remote.connections", &encoded).is_ok() {
+            self.remote_save_requirement = None;
+            self.remote_validation_failed = false;
+        } else {
+            self.remote_validation_failed = true;
+        }
+        cx.notify();
+    }
+
+    fn select_remote_protocol(&mut self, protocol: RemoteProtocol, cx: &mut Context<Self>) {
+        if self.remote_protocol == protocol {
+            return;
+        }
+        self.remote_protocol = protocol;
+        self.remote_security = super::remote::default_security(protocol);
+        self.remote_test_report = None;
+        self.remote_save_requirement = None;
+        self.remote_validation_failed = false;
         cx.notify();
     }
 
@@ -403,6 +583,231 @@ impl SettingsWindow {
             .overflow_y_scroll()
     }
 
+    fn render_remote_editor(&self, cx: &Context<Self>) -> impl IntoElement {
+        if !self.remote_editor_open {
+            return div()
+                .id("remote.connections")
+                .test_support()
+                .role(Role::Group)
+                .aria_label(self.label("setting-remote-connections"))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(status_label(
+                    "settings-remote-profile-count",
+                    display_value(
+                        settings_schema()
+                            .iter()
+                            .find(|spec| spec.key == "remote.connections")
+                            .expect("connection schema key"),
+                        &self
+                            .state
+                            .draft()
+                            .value("remote.connections")
+                            .expect("connection schema value"),
+                        &self.catalog,
+                    ),
+                    Role::Status,
+                ))
+                .child(
+                    Button::new("settings-remote-add")
+                        .label(self.label("settings-remote-add"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.remote_editor_open = true;
+                            cx.notify();
+                        })),
+                );
+        }
+        let mut fields = div()
+            .id("settings-remote-profile-list")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(self.label("settings-remote-editor"))
+            .flex()
+            .flex_col()
+            .gap_2();
+        for (id, label) in [
+            (super::remote::PROFILE_ID, "settings-remote-id"),
+            (super::remote::PROFILE_NAME, "settings-remote-name"),
+            (super::remote::PROFILE_HOST, "settings-remote-host"),
+            (super::remote::PROFILE_PORT, "settings-remote-port"),
+            (super::remote::PROFILE_PATH, "settings-remote-path"),
+            (super::remote::PROFILE_USERNAME, "settings-remote-username"),
+        ] {
+            fields = fields
+                .child(observed_label(format!("label-{id}"), self.label(label)))
+                .child(
+                    Input::new(&self.remote_inputs[id])
+                        .id(id)
+                        .disabled(self.blocked() || self.remote_testing)
+                        .accessibility_id(id)
+                        .aria_label(self.label(label)),
+                );
+        }
+
+        let mut protocols = div()
+            .id("settings-remote-protocol-options")
+            .test_support()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .role(Role::Group)
+            .aria_label(self.label("settings-remote-protocol"));
+        for protocol in super::remote::PROTOCOLS {
+            let id = super::remote::protocol_id(protocol);
+            protocols = protocols.child(
+                native_button(
+                    format!("settings-remote-protocol-{id}"),
+                    self.label(&format!("settings-value-{id}")),
+                    cx,
+                )
+                .selected(self.remote_protocol == protocol)
+                .disabled(self.blocked() || self.remote_testing)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_remote_protocol(protocol, cx);
+                })),
+            );
+        }
+
+        let security = match &self.remote_security {
+            SecurityPolicy::PlaintextConfirmed => "settings-remote-security-plaintext",
+            SecurityPolicy::Tls(_) => "settings-remote-security-tls",
+            SecurityPolicy::Ssh(_) => "settings-remote-security-host-key",
+            SecurityPolicy::SystemManaged => "settings-remote-security-system",
+        };
+        let credential = self
+            .state
+            .draft()
+            .value("remote.credential")
+            .filter(|value| !value.is_empty())
+            .map_or(
+                "settings-value-none",
+                |_| "settings-value-credential-stored",
+            );
+        let requires_confirmation = self.remote_save_requirement.is_some_and(|requirement| {
+            !matches!(
+                requirement,
+                SaveRequirement::Ready | SaveRequirement::TestRequired
+            )
+        });
+        let mut editor = div()
+            .id("remote.connections")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(self.label("setting-remote-connections"))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                native_button(
+                    "settings-remote-close-editor",
+                    self.label("settings-remote-close-editor"),
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.remote_editor_open = false;
+                    this.remote_save_requirement = None;
+                    this.remote_validation_failed = false;
+                    cx.notify();
+                })),
+            );
+        if requires_confirmation {
+            editor = editor
+                .child(status_label(
+                    "settings-remote-confirm-warning",
+                    self.label("settings-remote-confirm-warning"),
+                    Role::Alert,
+                ))
+                .child(
+                    Button::new("settings-remote-confirm-save")
+                        .label(self.label("settings-remote-confirm-save"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.stage_remote_connection(true, cx);
+                        })),
+                );
+        }
+        editor = editor
+            .child(fields)
+            .child(observed_label(
+                "settings-remote-protocol-label",
+                self.label("settings-remote-protocol"),
+            ))
+            .child(protocols)
+            .child(status_label(
+                "settings-remote-security",
+                self.label(security),
+                Role::Status,
+            ))
+            .child(status_label(
+                "settings-remote-credential",
+                self.label(credential),
+                Role::Status,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        native_button(
+                            "settings-remote-test",
+                            self.label("settings-remote-test"),
+                            cx,
+                        )
+                        .disabled(self.blocked() || self.remote_testing)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.test_remote_connection(cx);
+                        })),
+                    )
+                    .child(
+                        Button::new("settings-remote-save")
+                            .label(self.label("settings-remote-save"))
+                            .primary()
+                            .disabled(self.blocked() || self.remote_testing)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stage_remote_connection(false, cx);
+                            })),
+                    ),
+            );
+
+        if self.remote_testing {
+            editor = editor.child(status_label(
+                "settings-remote-testing",
+                self.label("settings-remote-testing"),
+                Role::Status,
+            ));
+        } else if let Some(report) = &self.remote_test_report {
+            let (id, label, role) = if report.error().is_some() {
+                (
+                    "settings-remote-test-failed",
+                    "settings-remote-test-failed",
+                    Role::Alert,
+                )
+            } else {
+                (
+                    "settings-remote-test-passed",
+                    "settings-remote-test-passed",
+                    Role::Status,
+                )
+            };
+            editor = editor.child(status_label(id, self.label(label), role));
+        }
+        if self.remote_validation_failed
+            || self.remote_save_requirement == Some(SaveRequirement::TestRequired)
+        {
+            editor = editor.child(status_label(
+                "settings-remote-validation-error",
+                self.label(if self.remote_validation_failed {
+                    "settings-remote-invalid"
+                } else {
+                    "settings-remote-test-required"
+                }),
+                Role::Alert,
+            ));
+        }
+        editor
+    }
+
     fn render_controls(&self, cx: &Context<Self>) -> impl IntoElement {
         let mut panel = div()
             .flex_1()
@@ -443,6 +848,7 @@ impl SettingsWindow {
                     | SettingKind::Shortcuts
                     | SettingKind::Theme
                     | SettingKind::CustomActions
+                    | SettingKind::ConnectionProfiles
             ) {
                 let editor = match spec.kind {
                     SettingKind::Toolbar => self.render_toolbar_editor(cx).into_any_element(),
@@ -450,6 +856,9 @@ impl SettingsWindow {
                     SettingKind::Theme => self.render_theme_editor(cx).into_any_element(),
                     SettingKind::CustomActions => {
                         self.render_custom_actions_editor(cx).into_any_element()
+                    }
+                    SettingKind::ConnectionProfiles => {
+                        self.render_remote_editor(cx).into_any_element()
                     }
                     _ => unreachable!("editor kind"),
                 };
@@ -488,7 +897,8 @@ impl SettingsWindow {
                 | SettingKind::Toolbar
                 | SettingKind::Shortcuts
                 | SettingKind::Theme
-                | SettingKind::CustomActions => String::new(),
+                | SettingKind::CustomActions
+                | SettingKind::ConnectionProfiles => String::new(),
                 SettingKind::Integer { maximum, units } => format!(
                     "{}: {} {}",
                     self.label("settings-maximum"),
@@ -792,6 +1202,22 @@ pub(super) fn observed_label(
         .id(id.into())
         .test_support()
         .role(Role::Label)
+        .aria_label(label.clone())
+        .min_w_0()
+        .max_w_full()
+        .whitespace_normal()
+        .child(label)
+}
+
+fn status_label(
+    id: impl Into<SharedString>,
+    label: String,
+    role: Role,
+) -> impl IntoElement + Styled {
+    div()
+        .id(id.into())
+        .test_support()
+        .role(role)
         .aria_label(label.clone())
         .min_w_0()
         .max_w_full()

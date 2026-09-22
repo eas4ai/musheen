@@ -18,6 +18,7 @@ use musheen_desktop::{
     CatalogError, CatalogStore, SettingSpec, SettingsDocument, SettingsError, SettingsFeature,
     SettingsPage, SettingsStore, settings_schema,
 };
+pub use remote::ConnectionTestService;
 use std::collections::BTreeSet;
 pub(crate) use window::{
     RecentHistoryClearer, accept_native_theme_change, apply_appearance,

@@ -1,13 +1,34 @@
 use gpui_kit::test::TestWindowExt;
-use musheen_core::{ItemId, ProviderId, StorePath};
+use musheen_core::{BoxFuture, CancellationToken, ItemId, ProviderId, StorePath};
 use musheen_desktop::{
-    CatalogDocument, CatalogStore, ConnectionId, CredentialReference, FolderIdentity,
-    SettingsDocument, SettingsPage, SettingsStore, settings_schema,
+    CatalogDocument, CatalogStore, ConnectionId, ConnectionProfile, ConnectionProfiles,
+    CredentialReference, FolderIdentity, RemoteError, RemoteErrorCategory, SettingsDocument,
+    SettingsPage, SettingsStore, settings_schema,
 };
-use musheen_ui::settings::{SettingsBackends, SettingsState, clear_recent_locations};
+use musheen_ui::settings::{
+    ConnectionTestService, SettingsBackends, SettingsState, clear_recent_locations,
+};
 use musheen_ui::{AppearanceMode, Catalog, Locale, ThemeProfile};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+
+struct FailingConnectionTester;
+
+impl ConnectionTestService for FailingConnectionTester {
+    fn test<'a>(
+        &'a self,
+        profile: &'a ConnectionProfile,
+        _cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RemoteError>> {
+        Box::pin(async move {
+            Err(RemoteError::new(
+                profile.protocol(),
+                RemoteErrorCategory::Network,
+                Some(profile.host().clone()),
+            ))
+        })
+    }
+}
 
 #[test]
 fn general_settings_clear_only_recent_location_history() {
@@ -240,6 +261,100 @@ fn failed_save_keeps_draft_and_committed_values_for_retry() {
     assert_eq!(state.draft().value("files.hidden").unwrap(), "false");
 }
 
+#[gpui_kit::test]
+async fn remote_connection_editor_tests_before_save_and_confirms_failed_tests(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext, Role, px, size};
+    use std::sync::Arc;
+
+    let root = tempfile::tempdir().unwrap();
+    cx.update(gpui_kit::init);
+    let mut view = None;
+    let handle = cx.open_window(size(px(760.), px(900.)), |window, cx| {
+        let settings = cx.new(|cx| {
+            musheen_ui::settings::SettingsWindow::new_with_connection_tester(
+                SettingsStore::from_config_home(root.path()),
+                SettingsBackends::all(),
+                Catalog::load(Locale::EnUs).unwrap(),
+                Arc::new(FailingConnectionTester),
+                window,
+                cx,
+            )
+        });
+        view = Some(settings.clone());
+        Root::new(settings, window, cx)
+    });
+    let view = view.unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-page-integrations", cx);
+        window.render_frame(cx);
+        window.click("settings-search", cx);
+        window.input("remote.connections", cx);
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("result-remote.connections", cx);
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-add", cx);
+        window.render_frame(cx);
+        for (id, value) in [
+            ("remote-profile-id", "work-sftp"),
+            ("remote-profile-name", "Work files"),
+            ("remote-profile-host", "files.example.test"),
+            ("remote-profile-path", "/home/alice"),
+            ("remote-profile-username", "alice"),
+        ] {
+            window.click(id, cx);
+            window.input(value, cx);
+        }
+        assert_eq!(
+            window.find("settings-remote-test").role(),
+            Some(Role::Button)
+        );
+        assert_eq!(
+            window.find("settings-remote-save").role(),
+            Some(Role::Button)
+        );
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-remote-test-failed").role(),
+            Some(Role::Alert)
+        );
+        window.click("settings-remote-save", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-remote-confirm-save").role(),
+            Some(Role::Button)
+        );
+        window.click("settings-remote-confirm-save", cx);
+    })
+    .unwrap();
+
+    let encoded = cx.update(|cx| {
+        view.read(cx)
+            .state()
+            .draft()
+            .value("remote.connections")
+            .unwrap()
+    });
+    let profiles = ConnectionProfiles::import(&encoded).unwrap();
+    assert_eq!(profiles.profiles().len(), 1);
+    assert_eq!(profiles.profiles()[0].id().as_str(), "work-sftp");
+    assert_eq!(profiles.profiles()[0].credential(), None);
+}
+
 #[test]
 fn future_schema_refusal_preserves_both_files() {
     let root = tempfile::tempdir().unwrap();
@@ -431,7 +546,8 @@ async fn settings_gallery_checks_rendered_controls_labels_and_confirmation_at_do
                         SettingKind::Boolean | SettingKind::Choice(_) => Role::Button,
                         SettingKind::Toolbar
                         | SettingKind::Shortcuts
-                        | SettingKind::CustomActions => Role::Group,
+                        | SettingKind::CustomActions
+                        | SettingKind::ConnectionProfiles => Role::Group,
                         SettingKind::CredentialReference => Role::Status,
                         _ => Role::TextInput,
                     };
