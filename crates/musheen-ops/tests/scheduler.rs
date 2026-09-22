@@ -3,7 +3,8 @@ use musheen_core::{
 };
 use musheen_ops::{
     ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase, ArchiveOperationPlan, Clock, JobState,
-    OperationKind, OperationPlan, ProviderLimits, ProviderSnapshot, Scheduler, WorkClass,
+    OperationKind, OperationPlan, ProviderLimits, ProviderSnapshot, Scheduler, SchedulerError,
+    WorkClass,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -287,6 +288,40 @@ fn cancellation_tokens_are_per_job_and_scheduler_limits_are_snapshotted() {
     .unwrap();
     assert_eq!(scheduler.limits().operation_data_mutations(), 2);
     assert_eq!(lowered.operation_data_mutations(), 1);
+}
+
+#[test]
+fn commit_admission_atomically_rejects_late_controls_until_completion() {
+    let scheduler = Scheduler::with_clock(&ResourceLimits::default(), ManualClock::default());
+    let id = scheduler
+        .enqueue(plan(
+            90,
+            OperationKind::Copy,
+            provider("commit-controls", ProviderLimits::unbounded()),
+        ))
+        .unwrap();
+    let job = scheduler.start_ready().unwrap().pop().unwrap();
+
+    scheduler
+        .begin_commit(id)
+        .expect("running job admits commit");
+    assert!(matches!(
+        scheduler.cancel(id),
+        Err(SchedulerError::CommitInProgress(job_id)) if job_id == id
+    ));
+    assert!(matches!(
+        scheduler.pause(id),
+        Err(SchedulerError::CommitInProgress(job_id)) if job_id == id
+    ));
+    assert!(matches!(
+        scheduler.interrupt(id),
+        Err(SchedulerError::CommitInProgress(job_id)) if job_id == id
+    ));
+    assert!(!job.cancellation().is_cancelled());
+    assert_eq!(scheduler.state(id), Some(JobState::Running));
+
+    scheduler.complete(id).expect("commit completes atomically");
+    assert_eq!(scheduler.state(id), Some(JobState::Completed));
 }
 
 #[test]

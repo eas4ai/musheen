@@ -57,18 +57,8 @@ impl StagingPath {
     #[must_use]
     pub fn nonce(path: &StorePath) -> Option<[u8; 16]> {
         let name = path.as_unix_path()?.file_name()?.as_bytes();
-        let suffix = name.strip_prefix(STAGING_PREFIX.as_bytes())?;
-        let mut parts = suffix.split(|byte| *byte == b'-');
-        let job = parts.next()?;
-        let generation = parts.next()?;
-        let encoded = parts.next()?;
-        if parts.next().is_some()
-            || parse_decimal(job).is_none_or(|value| value == 0)
-            || parse_decimal(generation).is_none()
-            || encoded.len() != 32
-        {
-            return None;
-        }
+        let (_, _, encoded) = parse_staging_name(name)?;
+        let encoded = encoded?;
         let mut nonce = [0_u8; 16];
         for (index, pair) in encoded.chunks_exact(2).enumerate() {
             nonce[index] = hex_digit(pair[0])?
@@ -116,16 +106,26 @@ impl StagingPath {
         let Some(name) = path.as_unix_path().and_then(std::path::Path::file_name) else {
             return false;
         };
-        let Some(suffix) = name.as_bytes().strip_prefix(STAGING_PREFIX.as_bytes()) else {
-            return false;
-        };
-        let Some(separator) = suffix.iter().position(|byte| *byte == b'-') else {
-            return false;
-        };
-        let (job, generation_with_separator) = suffix.split_at(separator);
-        let generation = &generation_with_separator[1..];
-        parse_decimal(job).is_some_and(|value| value > 0) && parse_decimal(generation).is_some()
+        parse_staging_name(name.as_bytes()).is_some()
     }
+}
+
+fn parse_staging_name(name: &[u8]) -> Option<(u64, u64, Option<&[u8]>)> {
+    let suffix = name.strip_prefix(STAGING_PREFIX.as_bytes())?;
+    let mut parts = suffix.split(|byte| *byte == b'-');
+    let job = parse_decimal(parts.next()?)?;
+    let generation = parse_decimal(parts.next()?)?;
+    let nonce = parts.next();
+    if job == 0 || parts.next().is_some() || nonce.is_some_and(|value| value.len() != 32) {
+        return None;
+    }
+    if let Some(encoded) = nonce {
+        for pair in encoded.chunks_exact(2) {
+            hex_digit(pair[0])?;
+            hex_digit(pair[1])?;
+        }
+    }
+    Some((job, generation, nonce))
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {

@@ -231,6 +231,24 @@ fn staging_names_are_destination_siblings_and_cleanup_is_owner_scoped() {
         destination.as_unix_path().unwrap().parent()
     );
     assert!(staging.is_app_owned());
+    let nonce_staging = StagingPath::for_destination_with_nonce(
+        &destination,
+        JobId::new(42).unwrap(),
+        EventGeneration::new(3),
+        [0x5a; 16],
+    )
+    .expect("nonce-bearing staging path");
+    assert!(nonce_staging.is_app_owned());
+    assert_eq!(StagingPath::nonce(nonce_staging.path()), Some([0x5a; 16]));
+    for malformed in [
+        "/volume/folder/.musheen-stage-v1-42-3-short",
+        "/volume/folder/.musheen-stage-v1-42-3-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "/volume/folder/.musheen-stage-v1-42-3-5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a-extra",
+    ] {
+        assert!(!StagingPath::is_owned_path(&StorePath::from_unix_path(
+            malformed
+        )));
+    }
     assert!(!StagingPath::is_owned_path(&StorePath::from_unix_path(
         "/volume/folder/.musheen-stage-user-data"
     )));

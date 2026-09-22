@@ -467,6 +467,7 @@ pub enum ArchiveOperationError {
     Journal,
     Engine,
     RecoveryConsentRequired,
+    RecoveryRequired,
 }
 
 impl fmt::Display for ArchiveOperationError {
@@ -498,6 +499,9 @@ impl fmt::Display for ArchiveOperationError {
             Self::Engine => formatter.write_str("the operation engine rejected the archive event"),
             Self::RecoveryConsentRequired => {
                 formatter.write_str("archive recovery requires an explicit approved action")
+            }
+            Self::RecoveryRequired => {
+                formatter.write_str("archive staging requires explicit recovery")
             }
         }
     }

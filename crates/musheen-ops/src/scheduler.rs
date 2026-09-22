@@ -83,6 +83,7 @@ struct JobRecord {
     plan: OperationPlan,
     state: JobStateMachine,
     cancellation: CancellationToken,
+    committing: bool,
 }
 
 #[derive(Debug)]
@@ -148,6 +149,7 @@ impl<C: Clock> Scheduler<C> {
                 plan,
                 state,
                 cancellation,
+                committing: false,
             },
         );
         transition(&mut data, id, JobState::Queued)?;
@@ -197,6 +199,10 @@ impl<C: Clock> Scheduler<C> {
             return Err(SchedulerError::NotRunning(id));
         }
         transition(&mut data, id, JobState::Completed)?;
+        data.jobs
+            .get_mut(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .committing = false;
         data.running.remove(&id);
         Ok(())
     }
@@ -207,6 +213,10 @@ impl<C: Clock> Scheduler<C> {
             return Err(SchedulerError::NotRunning(id));
         }
         transition(&mut data, id, JobState::Failed)?;
+        data.jobs
+            .get_mut(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .committing = false;
         data.running.remove(&id);
         Ok(())
     }
@@ -215,6 +225,14 @@ impl<C: Clock> Scheduler<C> {
         let mut data = self.lock();
         if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
+        }
+        if data
+            .jobs
+            .get(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .committing
+        {
+            return Err(SchedulerError::CommitInProgress(id));
         }
         let cancellation = data
             .jobs
@@ -245,6 +263,14 @@ impl<C: Clock> Scheduler<C> {
 
     pub fn cancel(&self, id: JobId) -> Result<(), SchedulerError> {
         let mut data = self.lock();
+        if data
+            .jobs
+            .get(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .committing
+        {
+            return Err(SchedulerError::CommitInProgress(id));
+        }
         let state = data
             .jobs
             .get(&id)
@@ -291,6 +317,7 @@ impl<C: Clock> Scheduler<C> {
             .get_mut(&id)
             .ok_or(SchedulerError::UnknownJob(id))?;
         record.cancellation = CancellationToken::new();
+        record.committing = false;
         data.queued.push_back(id);
         Ok(generation)
     }
@@ -299,6 +326,14 @@ impl<C: Clock> Scheduler<C> {
         let mut data = self.lock();
         if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
+        }
+        if data
+            .jobs
+            .get(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .committing
+        {
+            return Err(SchedulerError::CommitInProgress(id));
         }
         let cancellation = data
             .jobs
@@ -325,6 +360,27 @@ impl<C: Clock> Scheduler<C> {
     #[must_use]
     pub fn events(&self) -> Vec<JobEvent> {
         self.lock().events.clone()
+    }
+
+    /// Atomically admits a running job into its non-cancellable publication section.
+    ///
+    /// Once admitted, pause, cancellation, and interruption are rejected until the executor
+    /// reports completion or failure. This keeps publication and the terminal scheduler state one
+    /// indivisible operation from the point of view of control callers.
+    pub fn begin_commit(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        if !data.running.contains(&id) {
+            return Err(SchedulerError::NotRunning(id));
+        }
+        let record = data
+            .jobs
+            .get_mut(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?;
+        if record.state.state() != JobState::Running || record.cancellation.is_cancelled() {
+            return Err(SchedulerError::CommitAdmissionDenied(id));
+        }
+        record.committing = true;
+        Ok(())
     }
 
     /// Publishes an archive phase through the same ordered event stream as state changes.
@@ -433,6 +489,8 @@ fn transition_at<C: Clock>(
 pub enum SchedulerError {
     UnknownJob(JobId),
     NotRunning(JobId),
+    CommitInProgress(JobId),
+    CommitAdmissionDenied(JobId),
     JobIdExhausted,
     State(StateError),
     InvalidPlan(PlanError),
@@ -443,6 +501,20 @@ impl fmt::Display for SchedulerError {
         match self {
             Self::UnknownJob(id) => write!(formatter, "unknown job {}", id.get()),
             Self::NotRunning(id) => write!(formatter, "job {} is not running", id.get()),
+            Self::CommitInProgress(id) => {
+                write!(
+                    formatter,
+                    "job {} is committing and cannot be controlled",
+                    id.get()
+                )
+            }
+            Self::CommitAdmissionDenied(id) => {
+                write!(
+                    formatter,
+                    "job {} cannot enter its commit section",
+                    id.get()
+                )
+            }
             Self::JobIdExhausted => formatter.write_str("job identifier space is exhausted"),
             Self::State(error) => error.fmt(formatter),
             Self::InvalidPlan(error) => error.fmt(formatter),
@@ -455,7 +527,11 @@ impl Error for SchedulerError {
         match self {
             Self::State(error) => Some(error),
             Self::InvalidPlan(error) => Some(error),
-            Self::UnknownJob(_) | Self::NotRunning(_) | Self::JobIdExhausted => None,
+            Self::UnknownJob(_)
+            | Self::NotRunning(_)
+            | Self::CommitInProgress(_)
+            | Self::CommitAdmissionDenied(_)
+            | Self::JobIdExhausted => None,
         }
     }
 }

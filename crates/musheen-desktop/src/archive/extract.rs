@@ -4,7 +4,8 @@ use super::budget::{
 };
 use super::create::{
     ArchiveOperationOutcome, append_archive_phase, file_identity, local_path, path_identity,
-    publish_staging, remove_owned, staging_path, sync_parent,
+    path_identity_with_controls, publish_staging, remove_owned, remove_owned_live, staging_path,
+    sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
@@ -20,7 +21,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -48,6 +49,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     job_id: JobId,
     generation: EventGeneration,
     report_phase: &mut dyn FnMut(ArchiveEventPhase) -> Result<(), ArchiveOperationError>,
+    begin_commit: &mut dyn FnMut() -> Result<(), ArchiveOperationError>,
     accounting: &ArchiveOperationAccounting,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
@@ -80,14 +82,38 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     }
     let source_file = open_archive_source(&source)?;
     let source_identity = file_identity(&source_file)?;
-    let source_bytes = source_file
-        .metadata()
-        .map_err(|error| map_io(&error))?
-        .len();
+    let source_metadata = source_file.metadata().map_err(|error| map_io(&error))?;
+    let source_bytes = source_metadata.len();
+    let snapshot_parent = destination
+        .parent()
+        .ok_or(ArchiveOperationError::UnsafePath(
+            "archive destination needs a parent",
+        ))?;
+    budget.charge_temporary(source_bytes)?;
+    let mut source_snapshot =
+        tempfile::tempfile_in(snapshot_parent).map_err(|error| map_io(&error))?;
+    copy_source_snapshot(
+        &source_file,
+        &mut source_snapshot,
+        source_bytes,
+        source_metadata.mode(),
+        source_identity.content_digest(),
+        cancellation,
+        &budget,
+    )?;
+    if path_identity_with_controls(&source, Some(&budget), Some(cancellation))?
+        != Some(source_identity)
+        || file_identity(&source_file)? != source_identity
+    {
+        return Err(ArchiveOperationError::Conflict);
+    }
+    source_snapshot
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| map_io(&error))?;
     let format = archive_format(plan.codec());
     let decode_limits = decode_limits(limits);
     let entries = collect_extract_entries(
-        &source_file,
+        &source_snapshot,
         source_bytes,
         format,
         &decode_limits,
@@ -102,7 +128,8 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             ))?,
     )?;
     let staging = staging_path(plan, job_id, generation)?;
-    let destination_before = path_identity(&destination)?;
+    let destination_before =
+        path_identity_with_controls(&destination, Some(&budget), Some(cancellation))?;
     append_archive_phase(
         journal,
         job_id,
@@ -115,12 +142,14 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         Some(&budget),
     )?;
     let mut published = false;
-    let result = (|| {
+    let mut stage_root = None;
+    let mut result = (|| {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&staging)
             .map_err(|error| map_io(&error))?;
         sync_parent(&staging)?;
+        stage_root = path_identity(&staging)?;
         report_phase(ArchiveEventPhase::Staging)?;
         append_archive_phase(
             journal,
@@ -167,7 +196,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                         error: None,
                     };
                     let copy_result = copy_entry(
-                        &source_file,
+                        &source_snapshot,
                         format,
                         entry.ordinal,
                         &mut writer,
@@ -212,23 +241,27 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         )?;
         report_phase(ArchiveEventPhase::Publishing)?;
         cancellation.wait_if_paused()?;
-        if path_identity(&source)? != Some(source_identity)
-            || file_identity(&source_file)? != source_identity
-        {
-            return Err(ArchiveOperationError::Conflict);
-        }
-        let staging_before_publish = path_identity(&staging)?;
+        let staging_before_publish =
+            path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
+                .ok_or(ArchiveOperationError::Conflict)?;
+        begin_commit()?;
         let outcome = publish_staging(
             &staging,
             &destination,
             plan.conflict_policy(),
+            staging_before_publish,
             destination_before,
+            Some(&budget),
+            Some(cancellation),
         )?;
         if outcome == ArchiveOperationOutcome::Skipped {
-            if path_identity(&staging)? != staging_before_publish {
+            if path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
+                != Some(staging_before_publish)
+            {
                 return Err(ArchiveOperationError::Conflict);
             }
-            remove_owned(&staging)?;
+            remove_owned(&staging, Some(staging_before_publish))
+                .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
             append_archive_phase(
                 journal,
                 job_id,
@@ -244,7 +277,8 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         }
         published = true;
         sync_parent(&destination)?;
-        let destination_after = path_identity(&destination)?;
+        let destination_after =
+            path_identity_with_controls(&destination, Some(&budget), Some(cancellation))?;
         append_archive_phase(
             journal,
             job_id,
@@ -257,10 +291,13 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             Some(&budget),
         )?;
         report_phase(ArchiveEventPhase::Cleaning)?;
-        if path_identity(&staging)? != destination_before {
-            return Err(ArchiveOperationError::Conflict);
+        if path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
+            != destination_before
+        {
+            return Err(ArchiveOperationError::RecoveryRequired);
         }
-        remove_owned(&staging)?;
+        remove_owned(&staging, destination_before)
+            .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
         append_archive_phase(
             journal,
             job_id,
@@ -287,20 +324,60 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     })();
 
     if result.is_err() && !published && staging.exists() {
-        let _ = remove_owned(&staging);
-        let _ = append_archive_phase(
-            journal,
-            job_id,
-            generation,
-            JournalPhase::RolledBack,
-            plan,
-            &staging,
-            destination_before,
-            None,
-            Some(&budget),
-        );
+        if remove_owned_live(&staging, stage_root).is_ok() {
+            let _ = append_archive_phase(
+                journal,
+                job_id,
+                generation,
+                JournalPhase::RolledBack,
+                plan,
+                &staging,
+                destination_before,
+                None,
+                Some(&budget),
+            );
+        } else {
+            result = Err(ArchiveOperationError::RecoveryRequired);
+        }
     }
     result
+}
+
+fn copy_source_snapshot(
+    source: &File,
+    snapshot: &mut File,
+    source_bytes: u64,
+    source_mode: u32,
+    expected_digest: [u8; 32],
+    cancellation: &CancellationToken,
+    budget: &ArchiveBudget,
+) -> Result<(), ArchiveOperationError> {
+    let _memory = budget.reserve_memory(8 * 1_024)?;
+    let mut reader = source.try_clone().map_err(|error| map_io(&error))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| map_io(&error))?;
+    let mut copied = 0_u64;
+    let mut digest = blake3::Hasher::new();
+    digest.update(&source_mode.to_le_bytes());
+    digest.update(&source_bytes.to_le_bytes());
+    let mut buffer = [0_u8; 8 * 1_024];
+    loop {
+        cancellation.wait_if_paused()?;
+        let count = reader.read(&mut buffer).map_err(|error| map_io(&error))?;
+        if count == 0 {
+            break;
+        }
+        snapshot
+            .write_all(&buffer[..count])
+            .map_err(|error| map_io(&error))?;
+        digest.update(&buffer[..count]);
+        copied = copied.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+    if copied != source_bytes || *digest.finalize().as_bytes() != expected_digest {
+        return Err(ArchiveOperationError::Conflict);
+    }
+    snapshot.sync_all().map_err(|error| map_io(&error))
 }
 
 #[allow(clippy::too_many_arguments)]

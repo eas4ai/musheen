@@ -174,7 +174,7 @@ fn apply_record<S: JournalStorage>(
                 checkpoint.destination_before(),
                 path_identity(&destination)?,
             )?;
-            remove_owned(&staging)?;
+            remove_owned(&staging, checkpoint.staging_identity())?;
             append_archive_phase(
                 journal,
                 record.job_id(),
@@ -266,10 +266,17 @@ fn resume_publish<S: JournalStorage>(
         staging,
         destination,
         checkpoint.plan().conflict_policy(),
+        checkpoint
+            .staging_identity()
+            .ok_or(ArchiveOperationError::UnsafePath(
+                "archive recovery has no staging identity",
+            ))?,
         checkpoint.destination_before(),
+        None,
+        None,
     )?;
     if matches!(outcome, super::create::ArchiveOperationOutcome::Skipped) {
-        remove_owned(staging)?;
+        remove_owned(staging, checkpoint.staging_identity())?;
         append_archive_phase(
             journal,
             record.job_id(),
@@ -339,7 +346,7 @@ fn finish_published<S: JournalStorage>(
     let current_staging = path_identity(staging)?;
     if current_staging.is_some() {
         verify_exact(expected_staging, current_staging)?;
-        remove_owned(staging)?;
+        remove_owned(staging, expected_staging)?;
     }
     append_archive_phase(
         journal,

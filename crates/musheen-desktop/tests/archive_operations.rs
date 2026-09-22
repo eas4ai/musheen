@@ -34,6 +34,64 @@ struct HookJournal {
     hook: Option<Box<dyn FnOnce()>>,
 }
 
+struct TwoHookJournal {
+    inner: MemoryJournal,
+    first: Option<Box<dyn FnOnce()>>,
+    second: Option<Box<dyn FnOnce()>>,
+}
+
+impl JournalStorage for TwoHookJournal {
+    fn read_snapshot(&mut self) -> io::Result<Vec<u8>> {
+        self.inner.read_snapshot()
+    }
+    fn read_journal(&mut self) -> io::Result<Vec<u8>> {
+        self.inner.read_journal()
+    }
+    fn append_journal(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.inner.append_journal(bytes)?;
+        match self.inner.append_count {
+            2 => {
+                if let Some(hook) = self.first.take() {
+                    hook();
+                }
+            }
+            4 => {
+                if let Some(hook) = self.second.take() {
+                    hook();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn sync_journal(&mut self) -> io::Result<()> {
+        self.inner.sync_journal()
+    }
+    fn write_snapshot_temporary(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_snapshot_temporary(bytes)
+    }
+    fn sync_snapshot_temporary(&mut self) -> io::Result<()> {
+        self.inner.sync_snapshot_temporary()
+    }
+    fn publish_snapshot(&mut self) -> io::Result<()> {
+        self.inner.publish_snapshot()
+    }
+    fn sync_parent(&mut self) -> io::Result<()> {
+        self.inner.sync_parent()
+    }
+    fn reset_journal(&mut self) -> io::Result<()> {
+        self.inner.reset_journal()
+    }
+    fn quarantine(
+        &mut self,
+        source: CorruptSource,
+        valid_prefix: &[u8],
+        corrupt_suffix: &[u8],
+    ) -> io::Result<()> {
+        self.inner.quarantine(source, valid_prefix, corrupt_suffix)
+    }
+}
+
 impl JournalStorage for HookJournal {
     fn read_snapshot(&mut self) -> io::Result<Vec<u8>> {
         self.inner.read_snapshot()
@@ -210,6 +268,17 @@ const TEST_STAGE_NONCE: [u8; 16] = [0x5a; 16];
 
 fn test_staging(root: &Path, job: u64) -> std::path::PathBuf {
     root.join(format!(".musheen-stage-v1-{job}-0-{}", "5a".repeat(16)))
+}
+
+fn live_staging(root: &Path) -> std::path::PathBuf {
+    std::fs::read_dir(root)
+        .expect("staging parent")
+        .map(|entry| entry.expect("staging entry").path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.as_bytes().starts_with(b".musheen-stage-v1-"))
+        })
+        .expect("live archive staging path")
 }
 
 fn run(
@@ -544,6 +613,265 @@ fn replace_aborts_when_destination_changes_at_the_publish_boundary() {
 }
 
 #[test]
+fn publication_rejects_a_symlink_swapped_over_the_owned_stage() {
+    for extract in [false, true] {
+        let root = tempdir().expect("temporary root");
+        let source = root
+            .path()
+            .join(if extract { "source.zip" } else { "source.txt" });
+        let destination = root
+            .path()
+            .join(if extract { "output" } else { "data.zip" });
+        if extract {
+            std::fs::write(
+                &source,
+                zip_bytes(zip::CompressionMethod::Stored, b"payload"),
+            )
+            .expect("ZIP source");
+        } else {
+            std::fs::write(&source, b"payload").expect("source");
+        }
+        let plan = if extract {
+            ArchiveOperationPlan::extract(
+                local(&source),
+                local(&destination),
+                ArchiveCodec::Zip,
+                ArchiveConflictPolicy::Fail,
+                false,
+            )
+        } else {
+            ArchiveOperationPlan::create(
+                vec![local(&source)],
+                local(&destination),
+                ArchiveCodec::Zip,
+                ArchiveConflictPolicy::Fail,
+                false,
+            )
+        }
+        .expect("archive plan");
+        let stage_parent = root.path().to_path_buf();
+        let moved = root.path().join("captured-owned-stage");
+        let storage = HookJournal {
+            inner: MemoryJournal::default(),
+            hook_at: 4,
+            hook: Some(Box::new(move || {
+                let staging = live_staging(&stage_parent);
+                std::fs::rename(&staging, &moved).expect("move owned stage aside");
+                symlink("/tmp", &staging).expect("replace stage with symlink");
+            })),
+        };
+        let mut journal = Journal::open(storage).expect("journal opens");
+        let scheduler = Scheduler::new(&ResourceLimits::default());
+        scheduler
+            .enqueue_archive(plan, provider())
+            .expect("archive queues");
+        let job = scheduler.start_ready().expect("starts").pop().expect("job");
+
+        assert!(matches!(
+            execute_scheduled_archive_operation(
+                &scheduler,
+                &job,
+                &ArchiveOperationLimits::default(),
+                &Passwords("unused"),
+                &mut journal,
+            ),
+            Err(ArchiveOperationError::RecoveryRequired)
+                | Err(ArchiveOperationError::UnsupportedFileType)
+        ));
+        assert!(!destination.exists());
+        assert!(
+            std::fs::symlink_metadata(live_staging(root.path()))
+                .expect("foreign symlink retained")
+                .file_type()
+                .is_symlink()
+        );
+    }
+}
+
+#[test]
+fn cleanup_swap_retains_foreign_stage_and_never_journals_staging_cleaned() {
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("source.txt");
+    let destination = root.path().join("data.zip");
+    std::fs::write(&source, b"replacement archive").expect("source");
+    std::fs::write(&destination, b"old destination").expect("destination");
+    let plan = ArchiveOperationPlan::create(
+        vec![local(&source)],
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Replace,
+        false,
+    )
+    .expect("replace plan");
+    let stage_parent = root.path().to_path_buf();
+    let displaced = root.path().join("displaced-destination");
+    let storage = HookJournal {
+        inner: MemoryJournal::default(),
+        hook_at: 5,
+        hook: Some(Box::new(move || {
+            let staging = live_staging(&stage_parent);
+            std::fs::rename(&staging, &displaced).expect("retain displaced destination");
+            std::fs::write(&staging, b"foreign replacement").expect("foreign stage");
+        })),
+    };
+    let mut journal = Journal::open(storage).expect("journal opens");
+    let scheduler = Scheduler::new(&ResourceLimits::default());
+    scheduler
+        .enqueue_archive(plan, provider())
+        .expect("archive queues");
+    let job = scheduler.start_ready().expect("starts").pop().expect("job");
+
+    assert!(matches!(
+        execute_scheduled_archive_operation(
+            &scheduler,
+            &job,
+            &ArchiveOperationLimits::default(),
+            &Passwords("unused"),
+            &mut journal,
+        ),
+        Err(ArchiveOperationError::RecoveryRequired)
+    ));
+    assert_eq!(
+        std::fs::read(live_staging(root.path())).expect("foreign stage remains"),
+        b"foreign replacement"
+    );
+    assert_eq!(
+        journal.records().last().map(|record| record.phase()),
+        Some(JournalPhase::DestinationPublished)
+    );
+}
+
+#[test]
+fn failed_cleanup_is_recovery_needed_and_not_a_terminal_rollback() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("source.txt");
+    let destination = root.path().join("data.zip");
+    std::fs::write(&source, b"replacement archive").expect("source");
+    std::fs::write(&destination, b"old destination").expect("destination");
+    let plan = ArchiveOperationPlan::create(
+        vec![local(&source)],
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Replace,
+        false,
+    )
+    .expect("replace plan");
+    let parent = root.path().to_path_buf();
+    let storage = HookJournal {
+        inner: MemoryJournal::default(),
+        hook_at: 5,
+        hook: Some(Box::new(move || {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))
+                .expect("make cleanup parent read-only");
+        })),
+    };
+    let mut journal = Journal::open(storage).expect("journal opens");
+    let scheduler = Scheduler::new(&ResourceLimits::default());
+    scheduler
+        .enqueue_archive(plan, provider())
+        .expect("archive queues");
+    let job = scheduler.start_ready().expect("starts").pop().expect("job");
+    let result = execute_scheduled_archive_operation(
+        &scheduler,
+        &job,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &mut journal,
+    );
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restore parent permissions");
+
+    assert!(matches!(
+        result,
+        Err(ArchiveOperationError::RecoveryRequired)
+    ));
+    assert_eq!(
+        journal.records().last().map(|record| record.phase()),
+        Some(JournalPhase::DestinationPublished)
+    );
+    assert!(live_staging(root.path()).exists());
+}
+
+#[test]
+fn destination_identity_walk_is_budgeted_and_honors_midwalk_pause_cancel() {
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("source.txt");
+    let destination = root.path().join("existing-tree");
+    std::fs::write(&source, b"payload").expect("source");
+    std::fs::create_dir(&destination).expect("destination tree");
+    for index in 0..2_000 {
+        std::fs::write(destination.join(format!("entry-{index:04}")), b"").expect("tree entry");
+    }
+    let plan = ArchiveOperationPlan::create(
+        vec![local(&source)],
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Replace,
+        false,
+    )
+    .expect("replace plan");
+    let low_accounting = ArchiveOperationAccounting::default();
+    let low_limits = ArchiveOperationLimits {
+        max_memory_bytes: 32 * 1_024,
+        ..ArchiveOperationLimits::default()
+    };
+    assert!(matches!(
+        run_accounted(&plan, &low_limits, &low_accounting),
+        Err(ArchiveOperationError::LimitExceeded {
+            resource: "memory bytes",
+            ..
+        })
+    ));
+    assert!(destination.is_dir());
+
+    let accounting = ArchiveOperationAccounting::default();
+    let worker_accounting = accounting.clone();
+    let worker_plan = plan.clone();
+    let worker_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_done_signal = std::sync::Arc::clone(&worker_done);
+    let (control_sender, control_receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let scheduler = Scheduler::new(&ResourceLimits::default());
+        let id = scheduler
+            .enqueue_archive(worker_plan, provider())
+            .expect("archive queues");
+        let job = scheduler.start_ready().expect("starts").pop().expect("job");
+        control_sender
+            .send((scheduler.clone(), id))
+            .expect("send controls");
+        let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
+        let result = execute_scheduled_archive_operation_with_accounting(
+            &scheduler,
+            &job,
+            &ArchiveOperationLimits::default(),
+            &Passwords("unused"),
+            &mut journal,
+            &worker_accounting,
+        );
+        worker_done_signal.store(true, std::sync::atomic::Ordering::Release);
+        result
+    });
+    let (scheduler, id) = control_receiver.recv().expect("receive controls");
+    while accounting.counters().memory_bytes < 100 * 1_024
+        && !worker_done.load(std::sync::atomic::Ordering::Acquire)
+    {
+        std::thread::yield_now();
+    }
+    assert!(!worker_done.load(std::sync::atomic::Ordering::Acquire));
+    scheduler.pause(id).expect("pause during identity walk");
+    assert_eq!(scheduler.state(id), Some(musheen_ops::JobState::Paused));
+    scheduler.cancel(id).expect("cancel paused identity walk");
+    assert!(matches!(
+        worker.join().expect("worker joins"),
+        Err(ArchiveOperationError::Cancelled)
+    ));
+    assert_eq!(scheduler.state(id), Some(musheen_ops::JobState::Cancelled));
+    assert!(destination.is_dir());
+}
+
+#[test]
 fn scheduler_pause_and_cancel_stop_archive_before_publication() {
     let root = tempdir().expect("temporary root");
     let source = root.path().join("source.txt");
@@ -604,7 +932,54 @@ fn scheduler_pause_and_cancel_stop_archive_before_publication() {
 }
 
 #[test]
-fn extraction_rejects_an_in_place_source_rewrite_before_publication() {
+fn cancellation_after_commit_admission_is_rejected_and_publication_completes() {
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("source.txt");
+    let destination = root.path().join("data.zip");
+    std::fs::write(&source, b"committed payload").expect("source");
+    let plan = ArchiveOperationPlan::create(
+        vec![local(&source)],
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("create plan");
+    let scheduler = Scheduler::new(&ResourceLimits::default());
+    let id = scheduler
+        .enqueue_archive(plan, provider())
+        .expect("archive queues");
+    let job = scheduler.start_ready().expect("starts").pop().expect("job");
+    let cancel_control = scheduler.clone();
+    let storage = HookJournal {
+        inner: MemoryJournal::default(),
+        hook_at: 5,
+        hook: Some(Box::new(move || {
+            assert!(matches!(
+                cancel_control.cancel(id),
+                Err(musheen_ops::SchedulerError::CommitInProgress(job_id)) if job_id == id
+            ));
+        })),
+    };
+    let mut journal = Journal::open(storage).expect("journal opens");
+
+    assert_eq!(
+        execute_scheduled_archive_operation(
+            &scheduler,
+            &job,
+            &ArchiveOperationLimits::default(),
+            &Passwords("unused"),
+            &mut journal,
+        )
+        .expect("commit completes"),
+        ArchiveOperationOutcome::Published
+    );
+    assert_eq!(scheduler.state(id), Some(musheen_ops::JobState::Completed));
+    assert!(destination.exists());
+}
+
+#[test]
+fn extraction_remains_bound_to_snapshot_after_source_rewrite() {
     let root = tempdir().expect("temporary root");
     let source = root.path().join("source.zip");
     let destination = root.path().join("output");
@@ -639,20 +1014,75 @@ fn extraction_rejects_an_in_place_source_rewrite_before_publication() {
         .expect("archive queues");
     let job = scheduler.start_ready().expect("starts").pop().expect("job");
 
-    assert!(matches!(
+    assert_eq!(
         execute_scheduled_archive_operation(
             &scheduler,
             &job,
             &ArchiveOperationLimits::default(),
             &Passwords("unused"),
             &mut journal,
-        ),
-        Err(ArchiveOperationError::Conflict)
-    ));
-    assert!(!destination.exists());
+        )
+        .expect("owned source snapshot remains valid"),
+        ArchiveOperationOutcome::Published
+    );
+    assert_eq!(
+        std::fs::read(destination.join("x")).expect("snapshot payload"),
+        b"payload"
+    );
     assert_eq!(
         journal.records().last().map(|record| record.phase()),
-        Some(JournalPhase::RolledBack)
+        Some(JournalPhase::Completed)
+    );
+}
+
+#[test]
+fn extraction_decodes_only_from_its_owned_source_snapshot() {
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("source.zip");
+    let destination = root.path().join("output");
+    let original = zip_bytes(zip::CompressionMethod::Stored, b"stable snapshot payload");
+    std::fs::write(&source, &original).expect("ZIP fixture");
+    let plan = ArchiveOperationPlan::extract(
+        local(&source),
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    let mutate = source.clone();
+    let restore = source.clone();
+    let storage = TwoHookJournal {
+        inner: MemoryJournal::default(),
+        first: Some(Box::new(move || {
+            std::fs::write(&mutate, vec![0x7f; original.len()]).expect("transient rewrite");
+        })),
+        second: Some(Box::new(move || {
+            std::fs::write(
+                &restore,
+                zip_bytes(zip::CompressionMethod::Stored, b"stable snapshot payload"),
+            )
+            .expect("restore source");
+        })),
+    };
+    let mut journal = Journal::open(storage).expect("journal opens");
+    let scheduler = Scheduler::new(&ResourceLimits::default());
+    scheduler
+        .enqueue_archive(plan, provider())
+        .expect("archive queues");
+    let job = scheduler.start_ready().expect("starts").pop().expect("job");
+
+    execute_scheduled_archive_operation(
+        &scheduler,
+        &job,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &mut journal,
+    )
+    .expect("owned snapshot is immune to source rewrites during decode");
+    assert_eq!(
+        std::fs::read(destination.join("x")).expect("extracted payload"),
+        b"stable snapshot payload"
     );
 }
 
