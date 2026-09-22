@@ -8,13 +8,29 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub(crate) type ArchiveScannerFactory =
+    Arc<dyn Fn() -> Result<Box<dyn ArchiveScanner>, ArchiveError> + Send + Sync>;
+
+struct ResettingScanner;
+
+impl ArchiveScanner for ResettingScanner {
+    fn next_entry(
+        &mut self,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
+        Err(ArchiveError::InvalidArchive)
+    }
+}
+
 pub(crate) struct LazyArchiveIndex {
     scanner: Box<dyn ArchiveScanner>,
+    scanner_factory: ArchiveScannerFactory,
     pub(crate) entries: BTreeMap<ArchivePath, IndexedEntry>,
     pub(crate) children: BTreeMap<ArchivePath, Vec<ArchivePath>>,
     pub(crate) finished: bool,
     failure: Option<ArchiveError>,
     source_bytes: u64,
+    accepted_entries: usize,
 }
 
 pub(crate) struct IndexedEntry {
@@ -27,14 +43,20 @@ pub(crate) struct IndexedEntry {
 }
 
 impl LazyArchiveIndex {
-    pub(crate) fn new(scanner: Box<dyn ArchiveScanner>, source_bytes: u64) -> Self {
+    pub(crate) fn new(
+        scanner: Box<dyn ArchiveScanner>,
+        scanner_factory: ArchiveScannerFactory,
+        source_bytes: u64,
+    ) -> Self {
         Self {
             scanner,
+            scanner_factory,
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
             finished: false,
             failure: None,
             source_bytes,
+            accepted_entries: 0,
         }
     }
 
@@ -108,6 +130,12 @@ impl LazyArchiveIndex {
         }
         let raw = match raw {
             Ok(raw) => raw,
+            Err(ArchiveError::Cancelled) => {
+                if let Err(error) = self.rebuild_scanner() {
+                    return self.fail(error);
+                }
+                return Err(ArchiveError::Cancelled);
+            }
             Err(error) => return self.fail(error),
         };
         let Some(raw) = raw else {
@@ -126,9 +154,30 @@ impl LazyArchiveIndex {
             return self.fail(elapsed_limit(counters.elapsed(), limits.max_elapsed));
         }
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.accepted_entries = self.accepted_entries.saturating_add(1);
+                Ok(())
+            }
             Err(error) => self.fail(error),
         }
+    }
+
+    fn rebuild_scanner(&mut self) -> Result<(), ArchiveError> {
+        // Release codec-retained metadata before constructing the replacement. Otherwise a retry
+        // can transiently require twice the configured budget for two copies of the same index.
+        drop(std::mem::replace(
+            &mut self.scanner,
+            Box::new(ResettingScanner),
+        ));
+        let mut scanner = (self.scanner_factory)()?;
+        let replay = CancellationToken::new();
+        for _ in 0..self.accepted_entries {
+            scanner
+                .next_entry(&replay)?
+                .ok_or(ArchiveError::InvalidArchive)?;
+        }
+        self.scanner = scanner;
+        Ok(())
     }
 
     fn fail<T>(&mut self, error: ArchiveError) -> Result<T, ArchiveError> {

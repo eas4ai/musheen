@@ -1,5 +1,5 @@
 use super::format::{ArchiveCopyContext, copy_entry, open_scanner};
-use super::index::{IndexedEntry, LazyArchiveIndex};
+use super::index::{ArchiveScannerFactory, IndexedEntry, LazyArchiveIndex};
 use super::{ArchiveFormat, ArchivePath};
 use musheen_core::{
     BoxFuture, CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityReason,
@@ -534,14 +534,23 @@ impl ArchiveStore {
         self.index
             .get_or_init(|| {
                 let started = Instant::now();
-                let scanner = open_scanner(
-                    &self.source,
-                    self.provider.clone(),
-                    self.format,
-                    &self.limits,
-                    &self.counters,
-                    self.passwords.as_ref(),
-                );
+                let source = self.source.try_clone().map_err(|_| ArchiveError::Io)?;
+                let provider = self.provider.clone();
+                let format = self.format;
+                let limits = self.limits.clone();
+                let counters = Arc::clone(&self.counters);
+                let passwords = Arc::clone(&self.passwords);
+                let scanner_factory: ArchiveScannerFactory = Arc::new(move || {
+                    open_scanner(
+                        &source,
+                        provider.clone(),
+                        format,
+                        &limits,
+                        &counters,
+                        passwords.as_ref(),
+                    )
+                });
+                let scanner = scanner_factory();
                 self.counters.add_elapsed(started.elapsed());
                 if self.counters.elapsed() > self.limits.max_elapsed {
                     return Err(elapsed_limit(
@@ -550,7 +559,13 @@ impl ArchiveStore {
                     ));
                 }
                 let source_bytes = self.source.metadata().map_err(|_| ArchiveError::Io)?.len();
-                scanner.map(|scanner| Mutex::new(LazyArchiveIndex::new(scanner, source_bytes)))
+                scanner.map(|scanner| {
+                    Mutex::new(LazyArchiveIndex::new(
+                        scanner,
+                        scanner_factory,
+                        source_bytes,
+                    ))
+                })
             })
             .as_ref()
             .map_err(|error| error.clone().into())

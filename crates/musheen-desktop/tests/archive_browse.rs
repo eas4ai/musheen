@@ -448,6 +448,34 @@ fn encrypted_zip_metadata_does_not_request_an_unneeded_secret() {
 }
 
 #[test]
+fn encrypted_nested_zip_uses_the_bounded_single_entry_reader() {
+    let inner = zip_fixture(&[("inside.txt", b"inside")]);
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        SimpleFileOptions::default().with_aes_encryption(zip::AesMode::Aes256, "correct horse");
+    writer
+        .start_file("inner.zip", options)
+        .expect("AES entry starts");
+    writer.write_all(&inner).expect("AES entry writes");
+    let outer = writer.finish().expect("AES archive closes").into_inner();
+    let passwords = Arc::new(RecordingPasswords::default());
+    let store = open_bytes(
+        &outer,
+        ArchiveFormat::Zip,
+        ArchiveLimits::default(),
+        passwords.clone(),
+    );
+    let item = read_root(&store, 1)
+        .expect("encrypted metadata reads without a secret")
+        .remove(0);
+    let child = store
+        .open_nested(item.path(), ArchiveFormat::Zip, CancellationToken::new())
+        .expect("encrypted nested ZIP opens through the bounded target reader");
+    assert_eq!(passwords.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(read_root(&child, 1).expect("nested content reads").len(), 1);
+}
+
+#[test]
 fn encrypted_seven_zip_header_uses_the_password_callback() {
     use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
     use sevenz_rust2::{ArchiveEntry, ArchiveWriter, Password};
@@ -796,6 +824,63 @@ fn nested_byte_limit_preserves_the_typed_limit_error() {
 }
 
 #[test]
+fn nested_deflated_zip_uses_the_budgeted_target_reader() {
+    let inner = zip_fixture(&[("leaf.txt", b"leaf")]);
+    let outer = compressed_zip_fixture("inner.zip", &inner);
+    let store = open_bytes(
+        &outer,
+        ArchiveFormat::Zip,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let item = read_root(&store, 1).expect("outer archive reads").remove(0);
+    let child = store
+        .open_nested(item.path(), ArchiveFormat::Zip, CancellationToken::new())
+        .expect("deflated nested ZIP opens without an archive-wide metadata index");
+    assert_eq!(read_root(&child, 1).expect("nested ZIP reads").len(), 1);
+}
+
+#[test]
+fn nested_zip_cp437_names_reserve_raw_and_decoded_metadata_before_allocation() {
+    let inner = zip_fixture(&[("inside.txt", b"inside")]);
+    let long_name = format!("{}.zip", "a".repeat(4_091));
+    let mut outer = zip_fixture(&[(&long_name, &inner)]);
+    let local = outer
+        .windows(4)
+        .position(|window| window == b"PK\x03\x04")
+        .expect("local header");
+    let central = outer
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .expect("central header");
+    outer[local + 30] = 0x82;
+    outer[central + 46] = 0x82;
+    let store = open_bytes(
+        &outer,
+        ArchiveFormat::Zip,
+        ArchiveLimits {
+            max_metadata_bytes: 28 * 1_024,
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let item = read_root(&store, 1)
+        .expect("the incrementally indexed outer entry fits")
+        .remove(0);
+    let error = store
+        .open_nested(item.path(), ArchiveFormat::Zip, CancellationToken::new())
+        .expect_err("raw plus decoded CP437 metadata must be reserved before allocation");
+    assert!(matches!(
+        error,
+        ArchiveError::LimitExceeded {
+            resource: "metadata bytes",
+            ..
+        }
+    ));
+    assert!(store.counters().peak_metadata_bytes <= 28 * 1_024);
+}
+
+#[test]
 fn nested_seven_zip_uses_budgeted_sequential_decode() {
     use sevenz_rust2::{ArchiveEntry, ArchiveWriter};
 
@@ -872,6 +957,12 @@ fn compressed_tar_skip_observes_mid_stream_cancellation() {
     .expect_err("compressed tar decoding must stop after cancellation");
     cancel.join().expect("cancel thread");
     assert_eq!(error, StoreError::Cancelled);
+    assert_eq!(
+        read_root(&store, 2)
+            .expect("fresh token retries from a rebuilt compressed-tar scanner")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -934,5 +1025,87 @@ fn libarchive_scanner_advances_linearly() {
     assert!(
         total.saturating_sub(midpoint) <= midpoint,
         "second half reread more bytes than the first: midpoint={midpoint}, total={total}"
+    );
+}
+
+#[cfg(feature = "archive-libarchive")]
+#[test]
+fn libarchive_worker_enforces_expansion_and_timeout_bounds() {
+    let bytes = zip_fixture(&[("entry.txt", b"contents")]);
+    let expansion_store = open_bytes(
+        &bytes,
+        ArchiveFormat::Iso,
+        ArchiveLimits {
+            max_expanded_bytes: 1,
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let expansion = read_root(&expansion_store, 1).expect_err("worker byte bound must trip");
+    assert!(
+        expansion
+            .to_string()
+            .contains("expanded bytes limit exceeded"),
+        "unexpected expansion error: {expansion}"
+    );
+
+    let timeout_store = open_bytes(
+        &bytes,
+        ArchiveFormat::Iso,
+        ArchiveLimits {
+            max_elapsed: Duration::from_nanos(1),
+            ..ArchiveLimits::default()
+        },
+        Arc::new(RecordingPasswords::default()),
+    );
+    let timeout = read_root(&timeout_store, 1).expect_err("worker deadline must trip");
+    assert!(timeout.to_string().contains("milliseconds limit exceeded"));
+}
+
+#[cfg(feature = "archive-libarchive")]
+#[test]
+fn libarchive_worker_cancellation_retries_and_drop_is_bounded() {
+    let entries = (0..2_048)
+        .map(|index| {
+            (
+                format!("entry-{index:04}-{}.txt", "x".repeat(128)),
+                vec![b'x'],
+            )
+        })
+        .collect::<Vec<_>>();
+    let borrowed = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    let bytes = zip_fixture(&borrowed);
+    let store = open_bytes(
+        &bytes,
+        ArchiveFormat::Iso,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let cancellation = CancellationToken::new();
+    let cancel_from_thread = cancellation.clone();
+    let cancel = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1));
+        cancel_from_thread.cancel();
+    });
+    let result = block_on(store.read_directory(
+        &store.root_path(),
+        PageRequest::new(2_049, None).expect("large page"),
+        cancellation,
+    ));
+    cancel.join().expect("cancel thread");
+    assert_eq!(
+        result.expect_err("worker scan must observe cancellation"),
+        StoreError::Cancelled
+    );
+    assert_eq!(read_root(&store, 1).expect("fresh token retries").len(), 1);
+
+    let started = Instant::now();
+    drop(store);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "worker teardown must kill and reap without an indefinite join"
     );
 }

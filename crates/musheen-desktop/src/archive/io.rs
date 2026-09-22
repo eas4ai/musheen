@@ -29,13 +29,9 @@ impl PositionedFile {
         })
     }
 
-    fn offset(base: u64, offset: i64) -> io::Result<u64> {
-        let position = if offset >= 0 {
-            base.checked_add(offset as u64)
-        } else {
-            base.checked_sub(offset.unsigned_abs())
-        };
-        position.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"))
+    #[cfg(feature = "archive-libarchive")]
+    pub(crate) fn into_inner(self) -> File {
+        self.file
     }
 }
 
@@ -51,11 +47,20 @@ impl Seek for PositionedFile {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.position = match position {
             SeekFrom::Start(position) => position,
-            SeekFrom::End(offset) => Self::offset(self.length, offset)?,
-            SeekFrom::Current(offset) => Self::offset(self.position, offset)?,
+            SeekFrom::End(offset) => checked_seek_offset(self.length, offset)?,
+            SeekFrom::Current(offset) => checked_seek_offset(self.position, offset)?,
         };
         Ok(self.position)
     }
+}
+
+pub(crate) fn checked_seek_offset(base: u64, offset: i64) -> io::Result<u64> {
+    let position = if offset >= 0 {
+        base.checked_add(offset as u64)
+    } else {
+        base.checked_sub(offset.unsigned_abs())
+    };
+    position.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek"))
 }
 
 pub(crate) struct TimedReader<R> {
