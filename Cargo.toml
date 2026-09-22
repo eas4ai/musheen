@@ -79,7 +79,7 @@ xattr = "1"
 xdg-mime = "0.4"
 zbus = "5"
 zeroize = "1"
-zip = { version = "6", default-features = false, features = ["aes-crypto", "deflate-flate2", "zstd"] }
+zip = { version = "=6.0.0", default-features = false, features = ["aes-crypto", "deflate-flate2", "zstd"] }
 zstd = "0.13"
 zstd-safe = { version = "7", features = ["experimental"] }
 

@@ -1150,50 +1150,160 @@ fn production_archive_ceiling_values_trip_without_large_allocations() {
     );
 }
 
-#[test]
-fn nested_codec_allocations_share_one_live_memory_ceiling() {
-    let root = tempdir().expect("temporary root");
-    let long_name = format!("{}x", "nested/".repeat(120));
-    let mut nested_bytes = b"leaf".to_vec();
-    for _ in 0..8 {
-        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        zip.start_file(&long_name, zip::write::SimpleFileOptions::default())
-            .expect("nested entry");
-        zip.write_all(&nested_bytes).expect("nested bytes");
-        nested_bytes = zip.finish().expect("nested zip finish").into_inner();
-    }
-    let source = root.path().join("shared-memory.zip");
-    std::fs::write(&source, nested_bytes).expect("nested fixture");
-    let output = root.path().join("shared-memory-output");
+fn zip_bytes(method: zip::CompressionMethod, payload: &[u8]) -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    zip.start_file(
+        "x",
+        zip::write::SimpleFileOptions::default().compression_method(method),
+    )
+    .expect("ZIP entry");
+    zip.write_all(payload).expect("ZIP payload");
+    zip.finish().expect("ZIP finish").into_inner()
+}
+
+fn extraction_peak(source: &Path, output: &Path) -> u64 {
     let plan = ArchiveOperationPlan::extract(
-        local(&source),
-        local(&output),
+        local(source),
+        local(output),
         ArchiveCodec::Zip,
         ArchiveConflictPolicy::Fail,
         false,
     )
     .expect("extract plan");
+    let accounting = ArchiveOperationAccounting::default();
+    run_accounted(&plan, &ArchiveOperationLimits::default(), &accounting).expect("ZIP extraction");
+    assert_eq!(accounting.counters().memory_bytes, 0);
+    accounting.counters().peak_memory_bytes
+}
+
+#[test]
+fn zip_deflate_extraction_charges_decoder_workspace_before_allocation() {
+    let root = tempdir().expect("temporary root");
+    let stored = root.path().join("s.zip");
+    let deflate = root.path().join("d.zip");
+    std::fs::write(&stored, zip_bytes(zip::CompressionMethod::Stored, b"leaf"))
+        .expect("stored fixture");
+    std::fs::write(
+        &deflate,
+        zip_bytes(zip::CompressionMethod::Deflated, b"leaf"),
+    )
+    .expect("deflate fixture");
+
+    let stored_peak = extraction_peak(&stored, &root.path().join("s-out-a"));
+    let deflate_peak = extraction_peak(&deflate, &root.path().join("d-out-a"));
+    assert!(
+        deflate_peak > stored_peak + 16 * 1_024,
+        "deflate decoder workspace was not charged: stored={stored_peak}, deflate={deflate_peak}"
+    );
+
+    let output = root.path().join("d-out-b");
+    let plan = ArchiveOperationPlan::extract(
+        local(&deflate),
+        local(&output),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("limited extract plan");
+    let accounting = ArchiveOperationAccounting::default();
     let limits = ArchiveOperationLimits {
-        max_memory_bytes: 20 * 1024,
-        max_nesting: 10,
+        max_memory_bytes: deflate_peak - 1,
         ..ArchiveOperationLimits::default()
     };
-    let result = run(
-        &plan,
-        &limits,
-        &Passwords("unused"),
-        &CancellationToken::new(),
-    );
+    assert!(matches!(
+        run_accounted(&plan, &limits, &accounting),
+        Err(ArchiveOperationError::LimitExceeded {
+            resource: "memory bytes",
+            ..
+        })
+    ));
+    assert_eq!(accounting.counters().memory_bytes, 0);
+    assert!(!output.exists());
+}
+
+#[test]
+fn zip_zstd_extraction_charges_decoder_workspace_before_allocation() {
+    let root = tempdir().expect("temporary root");
+    let stored = root.path().join("s.zip");
+    let zstd = root.path().join("z.zip");
+    std::fs::write(&stored, zip_bytes(zip::CompressionMethod::Stored, b"leaf"))
+        .expect("stored fixture");
+    std::fs::write(&zstd, zip_bytes(zip::CompressionMethod::Zstd, b"leaf")).expect("zstd fixture");
+
+    let stored_peak = extraction_peak(&stored, &root.path().join("s-out-a"));
+    let zstd_peak = extraction_peak(&zstd, &root.path().join("z-out-a"));
     assert!(
-        matches!(
-            result,
-            Err(ArchiveOperationError::LimitExceeded {
-                resource: "memory bytes",
-                ..
-            })
-        ),
-        "shared nested allocation did not trip memory: {result:?}"
+        zstd_peak > stored_peak + 64 * 1_024,
+        "zstd decoder workspace was not charged: stored={stored_peak}, zstd={zstd_peak}"
     );
+
+    let output = root.path().join("z-out-b");
+    let plan = ArchiveOperationPlan::extract(
+        local(&zstd),
+        local(&output),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("limited extract plan");
+    let accounting = ArchiveOperationAccounting::default();
+    let limits = ArchiveOperationLimits {
+        max_memory_bytes: zstd_peak - 1,
+        ..ArchiveOperationLimits::default()
+    };
+    assert!(matches!(
+        run_accounted(&plan, &limits, &accounting),
+        Err(ArchiveOperationError::LimitExceeded {
+            resource: "memory bytes",
+            ..
+        })
+    ));
+    assert_eq!(accounting.counters().memory_bytes, 0);
+    assert!(!output.exists());
+}
+
+#[test]
+fn nested_zip_extraction_combines_live_global_memory_charges() {
+    let root = tempdir().expect("temporary root");
+    let inner_bytes = zip_bytes(zip::CompressionMethod::Zstd, b"leaf");
+    let inner = root.path().join("inner.zip");
+    let outer = root.path().join("outer.zip");
+    std::fs::write(&inner, &inner_bytes).expect("inner fixture");
+    std::fs::write(
+        &outer,
+        zip_bytes(zip::CompressionMethod::Deflated, &inner_bytes),
+    )
+    .expect("outer fixture");
+
+    let inner_peak = extraction_peak(&inner, &root.path().join("inner-out"));
+    let nested_peak = extraction_peak(&outer, &root.path().join("outer-out"));
+    assert!(
+        nested_peak > inner_peak,
+        "nested ZIP charges did not overlap: inner={inner_peak}, nested={nested_peak}"
+    );
+
+    let output = root.path().join("outer-two");
+    let plan = ArchiveOperationPlan::extract(
+        local(&outer),
+        local(&output),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("limited nested plan");
+    let accounting = ArchiveOperationAccounting::default();
+    let limits = ArchiveOperationLimits {
+        max_memory_bytes: nested_peak - 1,
+        ..ArchiveOperationLimits::default()
+    };
+    assert!(matches!(
+        run_accounted(&plan, &limits, &accounting),
+        Err(ArchiveOperationError::LimitExceeded {
+            resource: "memory bytes",
+            ..
+        })
+    ));
+    assert_eq!(accounting.counters().memory_bytes, 0);
     assert!(!output.exists());
 }
 

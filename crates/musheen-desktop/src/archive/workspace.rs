@@ -10,6 +10,9 @@ use std::sync::Arc;
 // These bounds match the pinned miniz_oxide 0.9.1 allocator layout. CompressorOxide
 // owns the inline LZ code buffer; the remaining arrays are its four boxed allocations.
 const FLATE_STREAM_BUFFER_BYTES: usize = 32 * 1024;
+// `zip` 6.0.0 constructs `std::io::BufReader::new` around each compressed entry. The pinned Rust
+// toolchain uses the standard library's documented default capacity of 8 KiB.
+const ZIP_INPUT_BUFFER_BYTES: usize = 8 * 1024;
 const MINIZ_DICTIONARY_BYTES: usize = 32_768 + 258;
 const MINIZ_HASH_BYTES: usize = 2 * 32_768 * size_of::<u16>();
 const MINIZ_HUFFMAN_BYTES: usize = 3 * 288 * (2 * size_of::<u16>() + size_of::<u8>());
@@ -33,6 +36,20 @@ pub(crate) const fn gzip_encoder_workspace_bytes() -> usize {
 
 pub(crate) const fn gzip_decoder_workspace_bytes() -> usize {
     size_of::<InflateState>() + FLATE_STREAM_BUFFER_BYTES
+}
+
+pub(crate) const fn zip_deflate_decoder_workspace_bytes() -> usize {
+    size_of::<InflateState>() + ZIP_INPUT_BUFFER_BYTES
+}
+
+pub(crate) fn zip_zstd_decoder_workspace_bytes(frame_header: &[u8]) -> Result<usize, ArchiveError> {
+    musheen_zstd_budget::decompression_stream_bytes_from_frame(frame_header)
+        .and_then(|bytes| bytes.checked_add(ZIP_INPUT_BUFFER_BYTES))
+        .ok_or(ArchiveError::InvalidArchive)
+}
+
+pub(crate) const fn zip_stored_reader_workspace_bytes() -> usize {
+    ZIP_INPUT_BUFFER_BYTES
 }
 
 pub(crate) fn zstd_encoder_workspace_bytes() -> Result<usize, ArchiveOperationError> {

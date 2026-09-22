@@ -9,6 +9,16 @@ use super::io::{PositionedFile, TimedReader, checked_seek_offset};
 use super::store::{
     AllocationLease, ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState,
 };
+use super::workspace::{
+    reserve_decode_workspace, zip_deflate_decoder_workspace_bytes,
+    zip_stored_reader_workspace_bytes, zip_zstd_decoder_workspace_bytes,
+};
+
+const STORED_METHOD: u16 = 0;
+const DEFLATE_METHOD: u16 = 8;
+const ZSTD_METHOD: u16 = 93;
+const AES_METHOD: u16 = 99;
+const ZSTD_FRAME_HEADER_MAX_BYTES: usize = 18;
 
 pub(crate) fn open_scanner(
     source: PositionedFile,
@@ -42,17 +52,30 @@ pub(crate) fn copy_entry<R: Read + Seek, W: Write>(
     }
     let name_length = le_u16(&local[26..28]) as usize;
     let extra_length = le_u16(&local[28..30]) as usize;
-    let _local_metadata = counters.reserve(
-        name_length
-            .saturating_mul(5)
-            .saturating_add(extra_length)
-            .saturating_add(4 * 1_024),
+    // `ZipArchive` parses the synthetic single-entry central directory into owned name, extra,
+    // index, and finder buffers. Reserve their hard upper bound before the parser allocates them.
+    let _archive_workspace = counters.reserve(
+        target
+            .central_record
+            .len()
+            .saturating_sub(46)
+            .saturating_mul(6)
+            .saturating_add(8 * 1_024),
         limits.max_metadata_bytes,
     )?;
+    let data_offset = target
+        .local_header_offset
+        .checked_add(30)
+        .and_then(|offset| offset.checked_add(name_length as u64))
+        .and_then(|offset| offset.checked_add(extra_length as u64))
+        .ok_or(ArchiveError::InvalidArchive)?;
+    let decoder_workspace = decoder_workspace_bytes(&mut reader, &target, data_offset)?;
+    let _decoder_workspace = reserve_decode_workspace(counters, limits, decoder_workspace)?;
     let local_length = 30_u64
-        .saturating_add(name_length as u64)
-        .saturating_add(extra_length as u64)
-        .saturating_add(target.compressed_size);
+        .checked_add(name_length as u64)
+        .and_then(|length| length.checked_add(extra_length as u64))
+        .and_then(|length| length.checked_add(target.compressed_size))
+        .ok_or(ArchiveError::InvalidArchive)?;
     let virtual_reader = SingleEntryZip::new(
         reader,
         target.local_header_offset,
@@ -84,6 +107,7 @@ struct BudgetedZipEntry {
     local_header_offset: u64,
     compressed_size: u64,
     encrypted: bool,
+    compression_method: u16,
     central_record: Vec<u8>,
     _allocation: AllocationLease,
     _raw_name: Vec<u8>,
@@ -168,6 +192,7 @@ fn find_entry<R: Read + Seek>(
             decode_cp437(&raw_name)
         };
         let (compressed_size, _expanded_size) = entry_sizes(&header, &extra)?;
+        let compression_method = compression_method(&header, &extra)?;
         let local_header_offset = local_header_offset(&header, &extra)?
             .checked_add(archive_prefix)
             .ok_or(ArchiveError::InvalidArchive)?;
@@ -186,6 +211,7 @@ fn find_entry<R: Read + Seek>(
             local_header_offset,
             compressed_size,
             encrypted: flags & 1 != 0,
+            compression_method,
             central_record,
             _allocation: allocation,
             _raw_name: raw_name,
@@ -193,6 +219,63 @@ fn find_entry<R: Read + Seek>(
         });
     }
     Err(ArchiveError::NotArchiveEntry)
+}
+
+fn decoder_workspace_bytes<R: Read + Seek>(
+    reader: &mut R,
+    target: &BudgetedZipEntry,
+    data_offset: u64,
+) -> Result<usize, ArchiveError> {
+    match target.compression_method {
+        STORED_METHOD => Ok(zip_stored_reader_workspace_bytes()),
+        DEFLATE_METHOD => Ok(zip_deflate_decoder_workspace_bytes()),
+        ZSTD_METHOD if target.encrypted => Err(ArchiveError::UnsupportedNestedFormat),
+        ZSTD_METHOD => {
+            let prefix_length = usize::try_from(
+                target
+                    .compressed_size
+                    .min(ZSTD_FRAME_HEADER_MAX_BYTES as u64),
+            )
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+            if prefix_length == 0 {
+                return Err(ArchiveError::InvalidArchive);
+            }
+            let mut header = [0_u8; ZSTD_FRAME_HEADER_MAX_BYTES];
+            reader
+                .seek(SeekFrom::Start(data_offset))
+                .map_err(|_| ArchiveError::InvalidArchive)?;
+            reader
+                .read_exact(&mut header[..prefix_length])
+                .map_err(|_| ArchiveError::InvalidArchive)?;
+            zip_zstd_decoder_workspace_bytes(&header[..prefix_length])
+        }
+        _ => Ok(zip_stored_reader_workspace_bytes()),
+    }
+}
+
+fn compression_method(header: &[u8; 46], extra: &[u8]) -> Result<u16, ArchiveError> {
+    let method = le_u16(&header[10..12]);
+    if method != AES_METHOD {
+        return Ok(method);
+    }
+    let mut offset = 0_usize;
+    while offset.saturating_add(4) <= extra.len() {
+        let field_id = le_u16(&extra[offset..offset + 2]);
+        let length = le_u16(&extra[offset + 2..offset + 4]) as usize;
+        offset = offset.saturating_add(4);
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= extra.len())
+            .ok_or(ArchiveError::InvalidArchive)?;
+        if field_id == 0x9901 {
+            return extra
+                .get(offset + 5..offset + 7)
+                .map(le_u16)
+                .ok_or(ArchiveError::InvalidArchive);
+        }
+        offset = end;
+    }
+    Err(ArchiveError::InvalidArchive)
 }
 
 struct SingleEntryZip<R> {
