@@ -1,6 +1,7 @@
 use futures_lite::future::block_on;
 use musheen_core::{
-    CancellationToken, CapabilityKind, CapabilityState, ItemKind, PageRequest, Store, StoreError,
+    CancellationToken, CapabilityKind, CapabilityState, ItemKind, PageRequest, ProviderId, Store,
+    StoreError, TotalHint,
 };
 use musheen_desktop::{
     ArchiveError, ArchiveFormat, ArchiveLimits, ArchivePassword, ArchivePasswordProvider,
@@ -50,8 +51,20 @@ fn open_bytes(
     let path = directory.path().join("fixture.archive");
     std::fs::write(&path, bytes).expect("fixture writes");
     let file = File::open(path).expect("fixture opens");
-    ArchiveStore::from_file(file, "fixture.archive", format, passwords, limits, 0)
+    ArchiveStore::from_file(file, "fixture.archive", format, passwords, limits)
         .expect("archive store opens")
+}
+
+fn test_provider() -> ProviderId {
+    ProviderId::new("archive-test").expect("test provider ID")
+}
+
+fn decode_hex(hex: &str) -> Vec<u8> {
+    hex.trim()
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
 }
 
 fn read_root(
@@ -75,24 +88,32 @@ fn archive_paths_reject_platform_escapes_and_nul() {
         b"safe\0hidden",
     ] {
         assert!(
-            ArchivePath::new(unsafe_name).is_err(),
+            ArchivePath::new(test_provider(), unsafe_name).is_err(),
             "accepted {unsafe_name:?}"
         );
     }
 
     assert_eq!(
-        ArchivePath::new(b"a/./b//c").expect("safe path").as_bytes(),
+        ArchivePath::new(test_provider(), b"a/./b//c")
+            .expect("safe path")
+            .as_bytes(),
         b"a/b/c"
     );
+
+    let other_provider = ProviderId::new("other-archive").expect("other provider ID");
+    let first = ArchivePath::new(test_provider(), b"same.txt").expect("first path");
+    let second = ArchivePath::new(other_provider.clone(), b"same.txt").expect("second path");
+    assert_ne!(first, second);
+    assert_eq!(second.provider_id(), &other_provider);
 }
 
 #[test]
 fn archive_path_enforces_the_4096_byte_boundary() {
     let maximum = vec![b'a'; 4_096];
-    assert!(ArchivePath::new(&maximum).is_ok());
+    assert!(ArchivePath::new(test_provider(), &maximum).is_ok());
     let too_long = vec![b'a'; 4_097];
     assert!(matches!(
-        ArchivePath::new(&too_long),
+        ArchivePath::new(test_provider(), &too_long),
         Err(ArchiveError::LimitExceeded {
             resource: "path bytes",
             ..
@@ -122,6 +143,8 @@ fn zip_browse_is_lazy_paged_read_only_and_preserves_non_utf8_names() {
         block_on(store.read_directory(&store.root_path(), first_request, CancellationToken::new()))
             .expect("root page");
     assert_eq!(first.items().len(), 1);
+    assert_eq!(first.total_hint(), TotalHint::AtLeast(1));
+    let first_page_bytes = store.counters().metadata_bytes;
     let second = block_on(store.read_directory(
         &store.root_path(),
         first.next_request().expect("continuation"),
@@ -129,6 +152,7 @@ fn zip_browse_is_lazy_paged_read_only_and_preserves_non_utf8_names() {
     ))
     .expect("second root page");
     assert_eq!(second.items().len(), 1);
+    assert!(store.counters().metadata_bytes > first_page_bytes);
     assert!(first.items().iter().chain(second.items()).any(|item| {
         item.path()
             .provider_key()
@@ -175,6 +199,46 @@ fn duplicate_normalized_names_are_rejected() {
 }
 
 #[test]
+fn archive_store_rejects_foreign_paths_and_reports_cancellation() {
+    let bytes = zip_fixture(&[("one.txt", b"one")]);
+    let store = open_bytes(
+        &bytes,
+        ArchiveFormat::Zip,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let foreign = ArchivePath::new(
+        ProviderId::new("foreign-archive").expect("foreign provider ID"),
+        b"one.txt",
+    )
+    .expect("foreign path")
+    .to_store_path()
+    .expect("foreign store path");
+    let request = PageRequest::new(1, None).expect("page request");
+    let error = block_on(store.read_directory(&foreign, request.clone(), CancellationToken::new()))
+        .expect_err("foreign paths must not cross archive providers");
+    assert!(error.to_string().contains("another provider"));
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = block_on(store.read_directory(&store.root_path(), request, cancellation))
+        .expect_err("cancelled archive reads must stop");
+    assert_eq!(error, StoreError::Cancelled);
+
+    let item = read_root(&store, 1)
+        .expect("archive root reads")
+        .into_iter()
+        .next()
+        .expect("archive entry");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = store
+        .open_nested(item.path(), ArchiveFormat::Zip, cancellation)
+        .expect_err("cancelled nested opens must stop");
+    assert_eq!(error, ArchiveError::Cancelled);
+}
+
+#[test]
 fn tar_links_are_metadata_and_are_never_followed() {
     let directory = tempdir().expect("temporary fixture directory");
     let path = directory.path().join("links.tar");
@@ -216,7 +280,6 @@ fn tar_links_are_metadata_and_are_never_followed() {
         ArchiveFormat::Tar,
         Arc::new(RecordingPasswords::default()),
         ArchiveLimits::default(),
-        0,
     )
     .expect("archive store opens");
     let items = read_root(&store, 10).expect("tar root reads");
@@ -254,6 +317,11 @@ fn encrypted_seven_zip_header_uses_the_password_callback() {
     use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
     use sevenz_rust2::{ArchiveEntry, ArchiveWriter, Password};
 
+    assert_eq!(
+        format!("{:?}", Password::new("do not log me")),
+        "Password([REDACTED])"
+    );
+
     let mut bytes = Vec::new();
     {
         let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).expect("7z writer starts");
@@ -280,6 +348,19 @@ fn encrypted_seven_zip_header_uses_the_password_callback() {
     assert_eq!(items.len(), 1);
     assert_eq!(passwords.calls.load(Ordering::Relaxed), 1);
     assert!(!format!("{store:?}").contains("correct horse"));
+
+    let wrong_passwords =
+        Arc::new(|_: &PasswordRequest| Ok(Some(ArchivePassword::new(b"wrong guess".to_vec()))));
+    let store = open_bytes(
+        &bytes,
+        ArchiveFormat::SevenZip,
+        ArchiveLimits::default(),
+        wrong_passwords,
+    );
+    let error = read_root(&store, 10).expect_err("wrong passwords must fail closed");
+    let message = error.to_string();
+    assert!(!message.contains("wrong guess"));
+    assert!(!message.contains("encrypted-name.txt"));
 }
 
 #[test]
@@ -320,58 +401,110 @@ fn compressed_tar_variants_browse_without_extraction() {
 
 #[test]
 fn malformed_metadata_is_bounded_by_time_and_allocation_counters() {
-    let hex = include_str!("fixtures/archive/malformed-central-directory.hex").trim();
-    let bytes = hex
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect::<Vec<_>>();
-    let limits = ArchiveLimits {
-        max_metadata_bytes: 1_024,
-        max_elapsed: Duration::from_millis(250),
-        ..ArchiveLimits::default()
-    };
-    let store = open_bytes(
-        &bytes,
-        ArchiveFormat::Zip,
-        limits,
+    for (name, hex) in [
+        (
+            "later central signature",
+            include_str!("fixtures/archive/later-central-signature.hex"),
+        ),
+        (
+            "oversized central name",
+            include_str!("fixtures/archive/oversized-central-name.hex"),
+        ),
+        (
+            "duplicate normalized name",
+            include_str!("fixtures/archive/duplicate-normalized-name.hex"),
+        ),
+    ] {
+        let limits = ArchiveLimits {
+            max_metadata_bytes: 256 * 1_024,
+            max_elapsed: Duration::from_millis(250),
+            ..ArchiveLimits::default()
+        };
+        let store = open_bytes(
+            &decode_hex(hex),
+            ArchiveFormat::Zip,
+            limits,
+            Arc::new(RecordingPasswords::default()),
+        );
+        let started = Instant::now();
+        let error = read_root(&store, 10).expect_err(name);
+        assert!(started.elapsed() < Duration::from_secs(1), "{name}");
+        assert!(!error.to_string().contains("private-name"), "{name}");
+        let counters = store.counters();
+        assert!(counters.total_allocated_bytes > 0, "{name}");
+        assert!(counters.peak_metadata_bytes > 0, "{name}");
+        assert!(counters.metadata_bytes <= 256 * 1_024, "{name}");
+        assert!(counters.elapsed <= Duration::from_secs(1), "{name}");
+    }
+}
+
+#[test]
+fn metadata_allocation_limit_trips_after_index_work() {
+    let directory = tempdir().expect("temporary fixture directory");
+    let path = directory.path().join("allocation-limit.tar");
+    let file = File::create(&path).expect("tar fixture creates");
+    let mut builder = tar::Builder::new(file);
+    for name in ["first", "a/second/path/with/a/longer/name"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, b"x".as_slice())
+            .expect("tar entry writes");
+    }
+    builder.finish().expect("tar fixture closes");
+
+    let limit = 300;
+    let store = ArchiveStore::from_file(
+        File::open(path).expect("fixture opens"),
+        "allocation-limit.tar",
+        ArchiveFormat::Tar,
         Arc::new(RecordingPasswords::default()),
-    );
-    let started = Instant::now();
-    let error = read_root(&store, 10).expect_err("malformed central directory fails");
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(!error.to_string().contains("private-name"));
+        ArchiveLimits {
+            max_metadata_bytes: limit,
+            ..ArchiveLimits::default()
+        },
+    )
+    .expect("archive store opens");
+    let error = read_root(&store, 10).expect_err("metadata allocation limit must fail closed");
+    assert!(error.to_string().contains("metadata bytes limit exceeded"));
     let counters = store.counters();
-    assert!(counters.metadata_bytes <= 1_024);
-    assert!(counters.elapsed <= Duration::from_secs(1));
+    assert!(counters.total_allocated_bytes > 0);
+    assert!(counters.peak_metadata_bytes <= limit);
 }
 
 #[test]
 fn nested_archive_depth_is_limited_to_eight() {
-    let bytes = zip_fixture(&[("inner.zip", b"not opened while browsing")]);
-    let directory = tempdir().unwrap();
-    let path = directory.path().join("nested.zip");
-    std::fs::write(&path, bytes).unwrap();
-    for depth in 0..=8 {
-        ArchiveStore::from_file(
-            File::open(&path).unwrap(),
-            "nested.zip",
-            ArchiveFormat::Zip,
-            Arc::new(RecordingPasswords::default()),
-            ArchiveLimits::default(),
-            depth,
-        )
-        .expect("depth at or below eight is allowed");
+    let mut bytes = zip_fixture(&[("leaf.txt", b"leaf")]);
+    for _ in 0..9 {
+        bytes = zip_fixture(&[("inner.zip", bytes.as_slice())]);
     }
-    let error = ArchiveStore::from_file(
-        File::open(path).unwrap(),
-        "nested.zip",
+    let mut store = open_bytes(
+        &bytes,
         ArchiveFormat::Zip,
-        Arc::new(RecordingPasswords::default()),
         ArchiveLimits::default(),
-        9,
-    )
-    .expect_err("ninth nested archive is rejected");
+        Arc::new(RecordingPasswords::default()),
+    );
+    for expected_depth in 1..=8 {
+        let item = read_root(&store, 10)
+            .expect("nested directory reads")
+            .into_iter()
+            .next()
+            .expect("nested archive entry");
+        store = store
+            .open_nested(item.path(), ArchiveFormat::Zip, CancellationToken::new())
+            .expect("nested archive opens within the limit");
+        assert_eq!(store.nesting_depth(), expected_depth);
+    }
+    let item = read_root(&store, 10)
+        .expect("eighth nested directory reads")
+        .into_iter()
+        .next()
+        .expect("ninth nested archive entry");
+    let error = store
+        .open_nested(item.path(), ArchiveFormat::Zip, CancellationToken::new())
+        .expect_err("ninth nested archive is rejected");
     assert!(matches!(
         error,
         ArchiveError::LimitExceeded {

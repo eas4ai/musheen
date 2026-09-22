@@ -90,3 +90,4 @@ workspace = true
 gpui-component = { path = "vendor/gpui-component" }
 gpui-pre = { path = "vendor/gpui-pre" }
 native-theme-gpui = { path = "vendor/native-theme-gpui" }
+sevenz-rust2 = { path = "vendor/sevenz-rust2" }

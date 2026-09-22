@@ -1,17 +1,21 @@
-use super::format::{RawArchiveEntry, RawEntryKind, read_entries};
+use super::format::{
+    ArchiveCopyContext, ArchiveScanner, RawArchiveEntry, RawEntryKind, copy_entry, open_scanner,
+};
 use super::{ArchiveFormat, ArchivePath};
 use musheen_core::{
     BoxFuture, CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityReason,
     CapabilityState, Continuation, DirectoryWatch, DisplayPath, ItemId, ItemKind, MutationRequest,
     Page, PageRequest, ProviderId, Store, StoreError, StoreItem, StorePath, TotalHint,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use zeroize::Zeroizing;
+use tempfile::NamedTempFile;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArchiveError {
@@ -25,6 +29,9 @@ pub enum ArchiveError {
     InvalidArchive,
     InvalidPassword,
     PasswordRequired,
+    Cancelled,
+    NotArchiveEntry,
+    UnsupportedNestedFormat,
     Io,
 }
 
@@ -44,6 +51,11 @@ impl fmt::Display for ArchiveError {
             Self::InvalidArchive => formatter.write_str("archive metadata is invalid"),
             Self::InvalidPassword => formatter.write_str("the archive password is invalid"),
             Self::PasswordRequired => formatter.write_str("the archive requires a password"),
+            Self::Cancelled => formatter.write_str("the archive operation was cancelled"),
+            Self::NotArchiveEntry => formatter.write_str("the target is not an archive file entry"),
+            Self::UnsupportedNestedFormat => {
+                formatter.write_str("nested browsing is unavailable for this archive format")
+            }
             Self::Io => formatter.write_str("the archive could not be read"),
         }
     }
@@ -53,7 +65,10 @@ impl std::error::Error for ArchiveError {}
 
 impl From<ArchiveError> for StoreError {
     fn from(error: ArchiveError) -> Self {
-        Self::Backend(error.to_string().into_boxed_str())
+        match error {
+            ArchiveError::Cancelled => Self::Cancelled,
+            other => Self::Backend(other.to_string().into_boxed_str()),
+        }
     }
 }
 
@@ -64,6 +79,7 @@ pub struct ArchiveLimits {
     pub max_metadata_bytes: usize,
     pub max_elapsed: Duration,
     pub max_nested_archives: usize,
+    pub max_nested_archive_bytes: u64,
 }
 
 impl Default for ArchiveLimits {
@@ -74,20 +90,39 @@ impl Default for ArchiveLimits {
             max_metadata_bytes: 512 * 1_024 * 1_024,
             max_elapsed: Duration::from_secs(10),
             max_nested_archives: 8,
+            max_nested_archive_bytes: 512 * 1_024 * 1_024,
         }
     }
 }
 
-pub struct ArchivePassword(Zeroizing<Vec<u8>>);
+pub struct ArchivePassword {
+    bytes: Zeroizing<Vec<u8>>,
+    #[cfg(test)]
+    drop_marker: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
 
 impl ArchivePassword {
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(Zeroizing::new(bytes))
+        Self {
+            bytes: Zeroizing::new(bytes),
+            #[cfg(test)]
+            drop_marker: None,
+        }
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.0.as_slice()
+        self.bytes.as_slice()
+    }
+}
+
+impl Drop for ArchivePassword {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        #[cfg(test)]
+        if let Some(marker) = self.drop_marker.take() {
+            marker.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -124,55 +159,79 @@ where
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArchiveCounters {
     pub bytes_read: u64,
+    /// Current tracked heap bytes retained by codec and index structures.
     pub metadata_bytes: usize,
+    pub peak_metadata_bytes: usize,
+    pub total_allocated_bytes: u64,
     pub elapsed: Duration,
 }
 
 pub(crate) struct DecodeCounterState {
     bytes_read: AtomicU64,
     metadata_bytes: AtomicU64,
+    peak_metadata_bytes: AtomicU64,
+    total_allocated_bytes: AtomicU64,
     elapsed: Mutex<Duration>,
 }
 
 impl DecodeCounterState {
-    fn new() -> Self {
-        Self {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
             bytes_read: AtomicU64::new(0),
             metadata_bytes: AtomicU64::new(0),
+            peak_metadata_bytes: AtomicU64::new(0),
+            total_allocated_bytes: AtomicU64::new(0),
             elapsed: Mutex::new(Duration::ZERO),
-        }
+        })
     }
 
     pub(crate) fn add_read_bytes(&self, count: u64) {
         self.bytes_read.fetch_add(count, Ordering::Relaxed);
     }
 
-    pub(crate) fn reserve_metadata(
-        &self,
+    pub(crate) fn add_elapsed(&self, elapsed: Duration) {
+        let mut total = self
+            .elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *total = total.saturating_add(elapsed);
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        *self
+            .elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
         count: usize,
         maximum: usize,
-    ) -> Result<(), ArchiveError> {
+    ) -> Result<AllocationLease, ArchiveError> {
         let count = u64::try_from(count).unwrap_or(u64::MAX);
         let maximum_u64 = u64::try_from(maximum).unwrap_or(u64::MAX);
-        self.metadata_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        let previous = self
+            .metadata_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(count)
                     .filter(|next| *next <= maximum_u64)
             })
-            .map(|_| ())
             .map_err(|current| ArchiveError::LimitExceeded {
                 resource: "metadata bytes",
                 value: usize::try_from(current.saturating_add(count)).unwrap_or(usize::MAX),
                 maximum,
-            })
-    }
-
-    fn finish(&self, elapsed: Duration) {
-        *self
-            .elapsed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = elapsed;
+            })?;
+        let current = previous.saturating_add(count);
+        self.peak_metadata_bytes
+            .fetch_max(current, Ordering::Relaxed);
+        self.total_allocated_bytes
+            .fetch_add(count, Ordering::Relaxed);
+        Ok(AllocationLease {
+            counters: Some(Arc::clone(self)),
+            bytes: count,
+        })
     }
 
     fn snapshot(&self) -> ArchiveCounters {
@@ -180,23 +239,54 @@ impl DecodeCounterState {
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             metadata_bytes: usize::try_from(self.metadata_bytes.load(Ordering::Relaxed))
                 .unwrap_or(usize::MAX),
-            elapsed: *self
-                .elapsed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            peak_metadata_bytes: usize::try_from(self.peak_metadata_bytes.load(Ordering::Relaxed))
+                .unwrap_or(usize::MAX),
+            total_allocated_bytes: self.total_allocated_bytes.load(Ordering::Relaxed),
+            elapsed: self.elapsed(),
         }
     }
+}
+
+pub(crate) struct AllocationLease {
+    counters: Option<Arc<DecodeCounterState>>,
+    bytes: u64,
+}
+
+impl fmt::Debug for AllocationLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AllocationLease")
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+impl Drop for AllocationLease {
+    fn drop(&mut self) {
+        if let Some(counters) = self.counters.take() {
+            counters
+                .metadata_bytes
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ArchiveLineage {
+    root: [u8; 16],
+    depth: usize,
 }
 
 pub struct ArchiveStore {
     provider: ProviderId,
     source: File,
-    label: Box<str>,
+    _temporary_source: Option<NamedTempFile>,
     format: ArchiveFormat,
     passwords: Arc<dyn ArchivePasswordProvider>,
     limits: ArchiveLimits,
+    lineage: ArchiveLineage,
     counters: Arc<DecodeCounterState>,
-    index: OnceLock<Result<ArchiveIndex, ArchiveError>>,
+    index: OnceLock<Result<Mutex<LazyArchiveIndex>, ArchiveError>>,
 }
 
 impl fmt::Debug for ArchiveStore {
@@ -204,8 +294,8 @@ impl fmt::Debug for ArchiveStore {
         formatter
             .debug_struct("ArchiveStore")
             .field("provider", &self.provider)
-            .field("label", &self.label)
             .field("format", &self.format)
+            .field("nesting_depth", &self.lineage.depth)
             .field("limits", &self.limits)
             .field("counters", &self.counters())
             .finish_non_exhaustive()
@@ -219,66 +309,145 @@ impl ArchiveStore {
         format: ArchiveFormat,
         passwords: Arc<dyn ArchivePasswordProvider>,
         limits: ArchiveLimits,
-        nested_depth: usize,
     ) -> Result<Self, ArchiveError> {
-        if nested_depth > limits.max_nested_archives {
+        let label = label.into();
+        let metadata = validate_source(&source, &limits)?;
+        let mut root_hash = blake3::Hasher::new();
+        hash_source_identity(&mut root_hash, &label, &metadata);
+        let mut root = [0_u8; 16];
+        root.copy_from_slice(&root_hash.finalize().as_bytes()[..16]);
+        Self::with_lineage(
+            source,
+            None,
+            label,
+            format,
+            passwords,
+            limits,
+            ArchiveLineage { root, depth: 0 },
+        )
+    }
+
+    fn with_lineage(
+        source: File,
+        temporary_source: Option<NamedTempFile>,
+        label: Box<str>,
+        format: ArchiveFormat,
+        passwords: Arc<dyn ArchivePasswordProvider>,
+        limits: ArchiveLimits,
+        lineage: ArchiveLineage,
+    ) -> Result<Self, ArchiveError> {
+        let metadata = validate_source(&source, &limits)?;
+        if lineage.depth > limits.max_nested_archives {
             return Err(ArchiveError::LimitExceeded {
                 resource: "nested archives",
-                value: nested_depth,
+                value: lineage.depth,
                 maximum: limits.max_nested_archives,
             });
         }
-        if limits.max_entries == 0
-            || limits.max_path_bytes == 0
-            || limits.max_path_bytes > ArchivePath::MAX_BYTES
-            || limits.max_metadata_bytes == 0
-            || limits.max_elapsed.is_zero()
-        {
-            return Err(ArchiveError::LimitExceeded {
-                resource: "archive limits",
-                value: 0,
-                maximum: 1,
-            });
-        }
-        let label = label.into();
-        let metadata = source.metadata().map_err(|_| ArchiveError::Io)?;
-        if !metadata.is_file() {
-            return Err(ArchiveError::InvalidArchive);
-        }
         let mut identity = blake3::Hasher::new();
-        identity.update(label.as_bytes());
-        identity.update(&metadata.len().to_be_bytes());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            identity.update(&metadata.dev().to_be_bytes());
-            identity.update(&metadata.ino().to_be_bytes());
-            identity.update(&metadata.mtime().to_be_bytes());
-            identity.update(&metadata.mtime_nsec().to_be_bytes());
-        }
+        identity.update(&lineage.root);
+        identity.update(&lineage.depth.to_be_bytes());
+        hash_source_identity(&mut identity, &label, &metadata);
         let provider = ProviderId::new(format!("archive-{}", &identity.finalize().to_hex()[..24]))
             .expect("a hashed archive provider ID is valid");
         Ok(Self {
             provider,
             source,
-            label,
+            _temporary_source: temporary_source,
             format,
             passwords,
             limits,
-            counters: Arc::new(DecodeCounterState::new()),
+            lineage,
+            counters: DecodeCounterState::new(),
             index: OnceLock::new(),
         })
     }
 
     #[must_use]
+    pub fn nesting_depth(&self) -> usize {
+        self.lineage.depth
+    }
+
+    #[must_use]
     pub fn root_path(&self) -> StorePath {
-        StorePath::from_provider_key(self.provider.clone(), b".".to_vec().into_boxed_slice())
-            .expect("the archive root sentinel is valid")
+        ArchivePath::root(self.provider.clone())
+            .to_store_path()
+            .expect("the archive root path is valid")
     }
 
     #[must_use]
     pub fn counters(&self) -> ArchiveCounters {
         self.counters.snapshot()
+    }
+
+    pub fn open_nested(
+        &self,
+        path: &StorePath,
+        format: ArchiveFormat,
+        cancellation: CancellationToken,
+    ) -> Result<Self, ArchiveError> {
+        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        let path = self.archive_path(path).map_err(store_error_to_archive)?;
+        let entry = {
+            let index = self.index().map_err(store_error_to_archive)?;
+            let mut index = index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            index
+                .find_entry(&path, &cancellation, &self.limits, &self.counters)?
+                .ok_or(ArchiveError::NotArchiveEntry)?
+                .locator
+                .ok_or(ArchiveError::NotArchiveEntry)?
+        };
+        let child_depth = self.lineage.depth.saturating_add(1);
+        if child_depth > self.limits.max_nested_archives {
+            return Err(ArchiveError::LimitExceeded {
+                resource: "nested archives",
+                value: child_depth,
+                maximum: self.limits.max_nested_archives,
+            });
+        }
+        let mut temporary = NamedTempFile::new().map_err(|_| ArchiveError::Io)?;
+        let started = Instant::now();
+        let copy_result = copy_entry(
+            &self.source,
+            self.format,
+            entry,
+            &mut temporary,
+            ArchiveCopyContext {
+                passwords: self.passwords.as_ref(),
+                limits: &self.limits,
+                counters: &self.counters,
+                cancellation: &cancellation,
+            },
+        );
+        self.counters.add_elapsed(started.elapsed());
+        if self.counters.elapsed() > self.limits.max_elapsed {
+            return Err(elapsed_limit(
+                self.counters.elapsed(),
+                self.limits.max_elapsed,
+            ));
+        }
+        copy_result?;
+        temporary
+            .as_file_mut()
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| ArchiveError::Io)?;
+        let source = temporary.reopen().map_err(|_| ArchiveError::Io)?;
+        Self::with_lineage(
+            source,
+            Some(temporary),
+            String::from_utf8_lossy(path.file_name())
+                .into_owned()
+                .into_boxed_str(),
+            format,
+            Arc::clone(&self.passwords),
+            self.limits.clone(),
+            ArchiveLineage {
+                root: self.lineage.root,
+                depth: child_depth,
+            },
+        )
     }
 
     fn archive_path(&self, path: &StorePath) -> Result<ArchivePath, StoreError> {
@@ -293,51 +462,52 @@ impl ArchiveStore {
             ));
         }
         if key == b"." {
-            return Ok(ArchivePath::root());
+            return Ok(ArchivePath::root(self.provider.clone()));
         }
-        ArchivePath::with_limit(key, self.limits.max_path_bytes).map_err(Into::into)
+        ArchivePath::with_limit(self.provider.clone(), key, self.limits.max_path_bytes)
+            .map_err(Into::into)
     }
 
-    fn index(&self) -> Result<&ArchiveIndex, StoreError> {
+    fn index(&self) -> Result<&Mutex<LazyArchiveIndex>, StoreError> {
         self.index
             .get_or_init(|| {
                 let started = Instant::now();
-                let parsed = read_entries(
+                let scanner = open_scanner(
                     &self.source,
+                    self.provider.clone(),
                     self.format,
                     &self.limits,
                     &self.counters,
                     self.passwords.as_ref(),
                 );
-                let result = if started.elapsed() > self.limits.max_elapsed {
-                    Err(elapsed_limit(started.elapsed(), self.limits.max_elapsed))
-                } else {
-                    parsed.and_then(|raw| {
-                        ArchiveIndex::build(raw, &self.limits, &self.counters, started)
-                    })
-                };
-                self.counters.finish(started.elapsed());
-                result
+                self.counters.add_elapsed(started.elapsed());
+                if self.counters.elapsed() > self.limits.max_elapsed {
+                    return Err(elapsed_limit(
+                        self.counters.elapsed(),
+                        self.limits.max_elapsed,
+                    ));
+                }
+                scanner.map(|scanner| Mutex::new(LazyArchiveIndex::new(scanner)))
             })
             .as_ref()
             .map_err(|error| error.clone().into())
     }
 
-    fn store_item(&self, entry: &IndexedEntry) -> Result<StoreItem, StoreError> {
-        let path = StorePath::from_provider_key(
-            self.provider.clone(),
-            entry.path.as_bytes().to_vec().into_boxed_slice(),
-        )
-        .map_err(|error| StoreError::Backend(error.to_string().into()))?;
+    fn store_item(
+        &self,
+        path: &ArchivePath,
+        entry: &IndexedEntry,
+    ) -> Result<StoreItem, StoreError> {
+        let store_path = path.to_store_path().map_err(StoreError::from)?;
         let id = ItemId::new(
             self.provider.clone(),
-            entry.path.as_bytes().to_vec().into_boxed_slice(),
+            path.as_bytes().to_vec().into_boxed_slice(),
         )
         .map_err(|error| StoreError::Backend(error.to_string().into()))?;
         Ok(StoreItem::new(
             id,
-            path,
-            DisplayPath::new(String::from_utf8_lossy(entry.path.file_name()).into_owned()),
+            store_path,
+            DisplayPath::new(String::from_utf8_lossy(path.file_name()).into_owned()),
             entry.kind,
             entry.size,
         ))
@@ -369,10 +539,19 @@ impl Store for ArchiveStore {
         if path.is_root() {
             return Ok(None);
         }
-        self.index()?
-            .entries
-            .get(&path)
-            .map(|entry| self.store_item(entry))
+        let index = self.index()?;
+        let mut index = index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        index
+            .find_entry(
+                &path,
+                &CancellationToken::new(),
+                &self.limits,
+                &self.counters,
+            )
+            .map_err(StoreError::from)?
+            .map(|entry| self.store_item(&path, entry))
             .transpose()
     }
 
@@ -399,34 +578,33 @@ impl Store for ArchiveStore {
         Box::pin(async move {
             cancellation.check()?;
             let location = self.archive_path(location)?;
+            let start = decode_cursor(request.continuation(), &self.provider, &location)?;
+            let required = start.saturating_add(request.page_size());
             let index = self.index()?;
-            if !location.is_root() {
-                match index.entries.get(&location) {
-                    Some(entry) if entry.kind == ItemKind::Directory => {}
-                    Some(_) => {
-                        return Err(StoreError::Backend(
-                            "archive location is not a directory".into(),
-                        ));
-                    }
-                    None => {
-                        return Err(StoreError::Backend(
-                            "archive directory no longer exists".into(),
-                        ));
-                    }
-                }
-            }
+            let mut index = index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            index
+                .ensure_directory(&location, &cancellation, &self.limits, &self.counters)
+                .map_err(StoreError::from)?;
+            index
+                .ensure_children(
+                    &location,
+                    required,
+                    &cancellation,
+                    &self.limits,
+                    &self.counters,
+                )
+                .map_err(StoreError::from)?;
             let children = index
                 .children
                 .get(&location)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let start = decode_cursor(request.continuation(), &self.provider, &location)?;
             if start > children.len() {
                 return Err(StoreError::InvalidContinuation);
             }
-            let end = start
-                .saturating_add(request.page_size())
-                .min(children.len());
+            let end = required.min(children.len());
             let mut items = Vec::with_capacity(end - start);
             for path in &children[start..end] {
                 cancellation.check()?;
@@ -434,16 +612,16 @@ impl Store for ArchiveStore {
                     .entries
                     .get(path)
                     .expect("every child path has an indexed entry");
-                items.push(self.store_item(entry)?);
+                items.push(self.store_item(path, entry)?);
             }
-            let next =
-                (end < children.len()).then(|| encode_cursor(&self.provider, &location, end));
-            Page::try_new(
-                &request,
-                items,
-                next,
-                TotalHint::Exact(children.len() as u64),
-            )
+            let next = (!index.finished || end < children.len())
+                .then(|| encode_cursor(&self.provider, &location, end));
+            let total_hint = if index.finished {
+                TotalHint::Exact(children.len() as u64)
+            } else {
+                TotalHint::AtLeast(children.len() as u64)
+            };
+            Page::try_new(&request, items, next, total_hint)
         })
     }
 
@@ -477,108 +655,240 @@ impl Store for ArchiveStore {
     }
 }
 
-struct ArchiveIndex {
+struct LazyArchiveIndex {
+    scanner: Box<dyn ArchiveScanner>,
     entries: BTreeMap<ArchivePath, IndexedEntry>,
     children: BTreeMap<ArchivePath, Vec<ArchivePath>>,
+    finished: bool,
 }
 
-#[derive(Clone)]
 struct IndexedEntry {
-    path: ArchivePath,
     kind: ItemKind,
     size: Option<u64>,
+    locator: Option<u64>,
+    explicit: bool,
+    _allocation: AllocationLease,
 }
 
-impl ArchiveIndex {
-    fn build(
-        raw_entries: Vec<RawArchiveEntry>,
-        limits: &ArchiveLimits,
-        counters: &DecodeCounterState,
-        started: Instant,
-    ) -> Result<Self, ArchiveError> {
-        let mut entries = BTreeMap::<ArchivePath, IndexedEntry>::new();
-        let mut explicit = HashSet::new();
+impl LazyArchiveIndex {
+    fn new(scanner: Box<dyn ArchiveScanner>) -> Self {
+        Self {
+            scanner,
+            entries: BTreeMap::new(),
+            children: BTreeMap::new(),
+            finished: false,
+        }
+    }
 
-        for raw in raw_entries {
-            if started.elapsed() > limits.max_elapsed {
-                return Err(elapsed_limit(started.elapsed(), limits.max_elapsed));
+    fn ensure_directory(
+        &mut self,
+        location: &ArchivePath,
+        cancellation: &CancellationToken,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<(), ArchiveError> {
+        if location.is_root() {
+            return Ok(());
+        }
+        while !self.finished && !self.entries.contains_key(location) {
+            self.scan_one(cancellation, limits, counters)?;
+        }
+        match self.entries.get(location) {
+            Some(entry) if entry.kind == ItemKind::Directory => Ok(()),
+            Some(_) => Err(ArchiveError::NotArchiveEntry),
+            None => Err(ArchiveError::NotArchiveEntry),
+        }
+    }
+
+    fn ensure_children(
+        &mut self,
+        location: &ArchivePath,
+        required: usize,
+        cancellation: &CancellationToken,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<(), ArchiveError> {
+        while !self.finished && self.children.get(location).map_or(0, std::vec::Vec::len) < required
+        {
+            self.scan_one(cancellation, limits, counters)?;
+        }
+        Ok(())
+    }
+
+    fn find_entry(
+        &mut self,
+        path: &ArchivePath,
+        cancellation: &CancellationToken,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<Option<&IndexedEntry>, ArchiveError> {
+        while !self.finished && !self.entries.contains_key(path) {
+            self.scan_one(cancellation, limits, counters)?;
+        }
+        Ok(self.entries.get(path))
+    }
+
+    fn scan_one(
+        &mut self,
+        cancellation: &CancellationToken,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<(), ArchiveError> {
+        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        if counters.elapsed() > limits.max_elapsed {
+            return Err(elapsed_limit(counters.elapsed(), limits.max_elapsed));
+        }
+        let started = Instant::now();
+        let raw = self.scanner.next_entry(cancellation);
+        counters.add_elapsed(started.elapsed());
+        if counters.elapsed() > limits.max_elapsed {
+            return Err(elapsed_limit(counters.elapsed(), limits.max_elapsed));
+        }
+        let Some(raw) = raw? else {
+            self.finished = true;
+            return Ok(());
+        };
+        let started = Instant::now();
+        let result = self.ingest(raw, limits, counters);
+        counters.add_elapsed(started.elapsed());
+        if counters.elapsed() > limits.max_elapsed {
+            return Err(elapsed_limit(counters.elapsed(), limits.max_elapsed));
+        }
+        result
+    }
+
+    fn ingest(
+        &mut self,
+        raw: RawArchiveEntry,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<(), ArchiveError> {
+        let path = ArchivePath::from_normalized(raw.provider.clone(), raw.path.clone());
+        if path.is_root() {
+            return Err(ArchiveError::UnsafePath(
+                "an archive entry cannot resolve to the archive root",
+            ));
+        }
+        if self.entries.get(&path).is_some_and(|entry| entry.explicit) {
+            return Err(ArchiveError::DuplicatePath);
+        }
+        for ancestor in path.ancestors() {
+            if !self.entries.contains_key(&ancestor) {
+                self.insert_entry(
+                    ancestor,
+                    ItemKind::Directory,
+                    None,
+                    None,
+                    false,
+                    limits,
+                    counters,
+                )?;
             }
-            let path = ArchivePath::with_limit(&raw.path, limits.max_path_bytes)?;
-            if path.is_root() || !explicit.insert(path.clone()) {
+        }
+        let kind = match raw.kind {
+            RawEntryKind::Directory => ItemKind::Directory,
+            RawEntryKind::RegularFile => ItemKind::RegularFile,
+            RawEntryKind::SymbolicLink => ItemKind::SymbolicLink,
+            RawEntryKind::HardLink | RawEntryKind::Other => ItemKind::Other,
+        };
+        if let Some(existing) = self.entries.get_mut(&path) {
+            if existing.kind != ItemKind::Directory || kind != ItemKind::Directory {
                 return Err(ArchiveError::DuplicatePath);
             }
-            for ancestor in path.ancestors() {
-                if !entries.contains_key(&ancestor) {
-                    reserve_entry(&ancestor, entries.len(), limits, counters)?;
-                    entries.insert(
-                        ancestor.clone(),
-                        IndexedEntry {
-                            path: ancestor,
-                            kind: ItemKind::Directory,
-                            size: None,
-                        },
-                    );
-                }
-            }
-            let kind = match raw.kind {
-                RawEntryKind::Directory => ItemKind::Directory,
-                RawEntryKind::RegularFile => ItemKind::RegularFile,
-                RawEntryKind::SymbolicLink => ItemKind::SymbolicLink,
-                RawEntryKind::HardLink | RawEntryKind::Other => ItemKind::Other,
-            };
-            if let Some(existing) = entries.get_mut(&path) {
-                if existing.kind != ItemKind::Directory || kind != ItemKind::Directory {
-                    return Err(ArchiveError::DuplicatePath);
-                }
-                existing.size = raw.size;
-            } else {
-                reserve_entry(&path, entries.len(), limits, counters)?;
-                entries.insert(
-                    path.clone(),
-                    IndexedEntry {
-                        path,
-                        kind,
-                        size: raw.size,
-                    },
-                );
-            }
+            existing.explicit = true;
+            existing.size = raw.size;
+            existing.locator = Some(raw.ordinal);
+        } else {
+            self.insert_entry(
+                path,
+                kind,
+                raw.size,
+                Some(raw.ordinal),
+                true,
+                limits,
+                counters,
+            )?;
         }
+        Ok(())
+    }
 
-        let mut children = BTreeMap::<ArchivePath, Vec<ArchivePath>>::new();
-        for path in entries.keys() {
-            let parent = path.parent().expect("indexed entries are not roots");
-            children.entry(parent).or_default().push(path.clone());
+    #[allow(clippy::too_many_arguments)]
+    fn insert_entry(
+        &mut self,
+        path: ArchivePath,
+        kind: ItemKind,
+        size: Option<u64>,
+        locator: Option<u64>,
+        explicit: bool,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<(), ArchiveError> {
+        if self.entries.len() >= limits.max_entries {
+            return Err(ArchiveError::LimitExceeded {
+                resource: "archive entries",
+                value: self.entries.len() + 1,
+                maximum: limits.max_entries,
+            });
         }
-        for paths in children.values_mut() {
-            paths.sort_by(|left, right| left.file_name().cmp(right.file_name()));
-        }
-        Ok(Self { entries, children })
+        let allocation_bytes = path
+            .as_bytes()
+            .len()
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of::<ArchivePath>() * 2)
+            .saturating_add(std::mem::size_of::<IndexedEntry>())
+            .saturating_add(3 * std::mem::size_of::<usize>());
+        let allocation = counters.reserve(allocation_bytes, limits.max_metadata_bytes)?;
+        let parent = path.parent().expect("indexed entries are not roots");
+        self.children.entry(parent).or_default().push(path.clone());
+        self.entries.insert(
+            path,
+            IndexedEntry {
+                kind,
+                size,
+                locator,
+                explicit,
+                _allocation: allocation,
+            },
+        );
+        Ok(())
     }
 }
 
-fn reserve_entry(
-    path: &ArchivePath,
-    current_entries: usize,
+fn validate_source(
+    source: &File,
     limits: &ArchiveLimits,
-    counters: &DecodeCounterState,
-) -> Result<(), ArchiveError> {
-    if current_entries >= limits.max_entries {
+) -> Result<std::fs::Metadata, ArchiveError> {
+    if limits.max_entries == 0
+        || limits.max_path_bytes == 0
+        || limits.max_path_bytes > ArchivePath::MAX_BYTES
+        || limits.max_metadata_bytes == 0
+        || limits.max_elapsed.is_zero()
+        || limits.max_nested_archive_bytes == 0
+    {
         return Err(ArchiveError::LimitExceeded {
-            resource: "archive entries",
-            value: current_entries + 1,
-            maximum: limits.max_entries,
+            resource: "archive limits",
+            value: 0,
+            maximum: 1,
         });
     }
-    let bytes = path
-        .as_bytes()
-        .len()
-        .checked_add(std::mem::size_of::<IndexedEntry>())
-        .ok_or(ArchiveError::LimitExceeded {
-            resource: "metadata bytes",
-            value: usize::MAX,
-            maximum: limits.max_metadata_bytes,
-        })?;
-    counters.reserve_metadata(bytes, limits.max_metadata_bytes)
+    let metadata = source.metadata().map_err(|_| ArchiveError::Io)?;
+    if !metadata.is_file() {
+        return Err(ArchiveError::InvalidArchive);
+    }
+    Ok(metadata)
+}
+
+fn hash_source_identity(identity: &mut blake3::Hasher, label: &str, metadata: &std::fs::Metadata) {
+    identity.update(label.as_bytes());
+    identity.update(&metadata.len().to_be_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        identity.update(&metadata.dev().to_be_bytes());
+        identity.update(&metadata.ino().to_be_bytes());
+        identity.update(&metadata.mtime().to_be_bytes());
+        identity.update(&metadata.mtime_nsec().to_be_bytes());
+    }
 }
 
 fn elapsed_limit(elapsed: Duration, maximum: Duration) -> ArchiveError {
@@ -621,4 +931,29 @@ fn decode_cursor(
         .try_into()
         .map_err(|_| StoreError::InvalidContinuation)?;
     usize::try_from(u64::from_be_bytes(encoded)).map_err(|_| StoreError::InvalidContinuation)
+}
+
+fn store_error_to_archive(error: StoreError) -> ArchiveError {
+    match error {
+        StoreError::Cancelled => ArchiveError::Cancelled,
+        _ => ArchiveError::InvalidArchive,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn archive_password_is_redacted_and_runs_secret_teardown() {
+        let marker = Arc::new(AtomicBool::new(false));
+        let password = ArchivePassword {
+            bytes: Zeroizing::new(b"do not log me".to_vec()),
+            drop_marker: Some(Arc::clone(&marker)),
+        };
+        assert_eq!(format!("{password:?}"), "ArchivePassword([REDACTED])");
+        drop(password);
+        assert!(marker.load(Ordering::Acquire));
+    }
 }
