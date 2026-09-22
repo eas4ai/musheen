@@ -55,18 +55,18 @@ modify `crates/musheen-ops/src/{plan,event}.rs`; create
 **Files:** Create `crates/musheen-desktop/src/remote/{mod,connection,pool,error}.rs`;
 create `crates/musheen-desktop/tests/remote_pool.rs`; modify Settings connection UI.
 
-- [ ] Test validation and redaction for every protocol, Secret Service references,
+- [x] Test validation and redaction for every protocol, Secret Service references,
   host-key/TLS decisions, proxy fields, cancellation, reconnect, saturated pool,
   15-second connect timeout, 60-second idle timeout, four requests per
   connection, and eight connections per provider.
-- [ ] Run the pool test with a deterministic fake transport; expect failure.
-- [ ] Implement versioned `ConnectionProfile` values without inline secrets and
+- [x] Run the pool test with a deterministic fake transport; expect failure.
+- [x] Implement versioned `ConnectionProfile` values without inline secrets and
   a fair cancellation-aware pool. Errors retain protocol/category and safe host
   context without credentials.
-- [ ] Add connection-test and save flows; saving a failed test requires explicit
+- [x] Add connection-test and save flows; saving a failed test requires explicit
   confirmation and never weakens TLS/host-key policy silently.
-- [ ] Run timeout, saturation, and log-redaction fixtures.
-- [ ] Commit with `feat(remote): add secure connection profiles and pools`.
+- [x] Run timeout, saturation, and log-redaction fixtures.
+- [x] Commit with `feat(remote): add secure connection profiles and pools`.
 
 ### Task 4: Implement OpenDAL-backed providers
 
