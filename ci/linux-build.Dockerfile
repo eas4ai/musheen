@@ -6,7 +6,9 @@ ENV CARGO_BUILD_JOBS=1 \
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
+        dbus-daemon \
         libacl1-dev \
+        libarchive-dev \
         libfontconfig1-dev \
         libfreetype6-dev \
         libxcb1-dev \
@@ -15,6 +17,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add --toolchain 1.95.0 clippy rustfmt
+RUN useradd --create-home musheen-test
 
 WORKDIR /workspace
 COPY . .
@@ -27,7 +30,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \
-    cargo test --workspace --all-features --locked
+    chown -R musheen-test:musheen-test \
+        /usr/local/cargo/registry /usr/local/cargo/git /workspace/target \
+    && runuser --user musheen-test -- \
+        env CARGO_HOME=/usr/local/cargo cargo test --workspace --all-features --locked
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \

@@ -10,10 +10,8 @@ use musheen_ops::{
     JournalPhase, JournalStorage, OperationKind, ScheduledJob, Scheduler, StagingPath,
 };
 use nix::libc::O_NOFOLLOW;
-use sevenz_rust2::encoder_options::AesEncoderOptions;
-use sevenz_rust2::{
-    ArchiveEntry as SevenEntry, ArchiveWriter as SevenWriter, EncoderMethod, Password,
-};
+use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options, LzmaOptions};
+use sevenz_rust2::{ArchiveEntry as SevenEntry, ArchiveWriter as SevenWriter, Password};
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -22,6 +20,14 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use zip::write::SimpleFileOptions;
+
+use super::workspace::{
+    WorkspaceWriter, deflate_encoder_workspace_bytes, gzip_encoder_workspace_bytes,
+    zstd_encoder_workspace_bytes,
+};
+
+const ZIP_ENTRY_STATE_BYTES: u64 = 512;
+const SEVEN_HEADER_INITIAL_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveOperationOutcome {
@@ -530,7 +536,17 @@ fn write_zip(
             .saturating_add(u64::try_from(entry.archive_name.len()).unwrap_or(u64::MAX))
             .saturating_add(u64::from(matches!(entry.kind, CreateEntryKind::Directory)))
     });
-    let _codec_names = stage.reserve_memory(codec_name_bytes)?;
+    // ZipWriter retains one ZipFileData, two owned name copies, and one map slot per
+    // entry. The fixed bound exceeds the locked zip 6 structure plus its map bucket.
+    let entry_state = u64::try_from(entries.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(ZIP_ENTRY_STATE_BYTES);
+    let codec_workspace = u64::try_from(deflate_encoder_workspace_bytes()).unwrap_or(u64::MAX);
+    let _codec_memory = stage.reserve_memory(
+        codec_workspace
+            .saturating_add(entry_state)
+            .saturating_add(codec_name_bytes.saturating_mul(2)),
+    )?;
     let password = encrypted
         .then(|| requested_password(ArchiveCodec::Zip, passwords))
         .transpose()?;
@@ -588,15 +604,31 @@ fn write_tar(
     match encoder {
         TarEncoder::Plain => write_tar_stream(stage, entries, cancellation)?.sync_all(),
         TarEncoder::Gzip => {
+            let workspace = stage.reserve_memory(
+                u64::try_from(gzip_encoder_workspace_bytes()).unwrap_or(u64::MAX),
+            )?;
+            let stage = WorkspaceWriter::new(stage, workspace);
             let encoder = flate2::write::GzEncoder::new(stage, flate2::Compression::default());
             let encoder = write_tar_stream(encoder, entries, cancellation)?;
-            encoder.finish().map_err(|error| map_io(&error))?.sync_all()
+            encoder
+                .finish()
+                .map_err(|error| map_io(&error))?
+                .into_inner()
+                .sync_all()
         }
         TarEncoder::Zstd => {
+            let workspace = stage.reserve_memory(
+                u64::try_from(zstd_encoder_workspace_bytes()?).unwrap_or(u64::MAX),
+            )?;
+            let stage = WorkspaceWriter::new(stage, workspace);
             let encoder =
                 zstd::stream::write::Encoder::new(stage, 0).map_err(|error| map_io(&error))?;
             let encoder = write_tar_stream(encoder, entries, cancellation)?;
-            encoder.finish().map_err(|error| map_io(&error))?.sync_all()
+            encoder
+                .finish()
+                .map_err(|error| map_io(&error))?
+                .into_inner()
+                .sync_all()
         }
     }
 }
@@ -659,18 +691,40 @@ fn write_seven_zip(
     let codec_name_bytes = entries.iter().fold(0_u64, |total, entry| {
         total.saturating_add(u64::try_from(entry.archive_name.len()).unwrap_or(u64::MAX))
     });
-    let _codec_names = stage.reserve_memory(codec_name_bytes)?;
+    let content_options = Lzma2Options::default();
+    let header_options = LzmaOptions::default();
+    let entry_count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    let retained_entries = entry_count
+        .saturating_mul(u64::try_from(std::mem::size_of::<SevenEntry>()).unwrap_or(u64::MAX))
+        .saturating_add(codec_name_bytes);
+    // The writer creates two 64 KiB header vectors and an encoded vector sized to
+    // half the serialized header. Names are UTF-16 in that representation.
+    let serialized_header = SEVEN_HEADER_INITIAL_BYTES
+        .saturating_add(codec_name_bytes.saturating_mul(2))
+        .saturating_add(entry_count.saturating_mul(512));
+    let header_buffers = serialized_header.saturating_mul(3);
+    let active_workspace = content_options.memory_usage_bytes().max(
+        header_options
+            .memory_usage_bytes()
+            .saturating_add(header_buffers),
+    );
+    let _codec_memory = stage.reserve_memory(retained_entries.saturating_add(active_workspace))?;
     let password = encrypted
         .then(|| requested_password(ArchiveCodec::SevenZip, passwords))
         .transpose()?;
     let mut writer = SevenWriter::new(stage).map_err(map_seven_create_error)?;
+    writer
+        .reserve_entries_exact(entries.len())
+        .map_err(map_seven_create_error)?;
     if let Some(password) = password.as_ref() {
         let password = std::str::from_utf8(password.as_bytes())
             .map_err(|_| ArchiveOperationError::InvalidPassword)?;
         writer.set_content_methods(vec![
             AesEncoderOptions::new(Password::new(password)).into(),
-            EncoderMethod::LZMA2.into(),
+            content_options.clone().into(),
         ]);
+    } else {
+        writer.set_content_methods(vec![content_options.into()]);
     }
     for entry in entries {
         cancellation.check()?;

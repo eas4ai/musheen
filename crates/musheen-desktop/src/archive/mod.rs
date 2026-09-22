@@ -13,6 +13,7 @@ mod recovery;
 mod seven_codec;
 mod store;
 mod tar_codec;
+mod workspace;
 mod zip_codec;
 
 pub use budget::{

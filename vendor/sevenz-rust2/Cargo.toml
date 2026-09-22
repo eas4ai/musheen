@@ -155,7 +155,6 @@ version = "1"
 
 [dependencies.flate2]
 version = "1"
-features = ["zlib-rs"]
 optional = true
 
 [dependencies.getrandom]

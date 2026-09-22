@@ -21,6 +21,12 @@ impl Default for LzmaOptions {
 
 #[cfg(feature = "compress")]
 impl LzmaOptions {
+    /// Returns the encoder's documented worst-case working memory in bytes.
+    #[must_use]
+    pub fn memory_usage_bytes(&self) -> u64 {
+        lzma_memory_usage_bytes(&self.0)
+    }
+
     /// Creates LZMA options with the specified compression level.
     ///
     /// # Arguments
@@ -69,6 +75,12 @@ impl Default for Lzma2Options {
 
 #[cfg(feature = "compress")]
 impl Lzma2Options {
+    /// Returns the encoder's documented worst-case working memory in bytes.
+    #[must_use]
+    pub fn memory_usage_bytes(&self) -> u64 {
+        lzma_memory_usage_bytes(&self.options.lzma_options)
+    }
+
     /// Creates LZMA2 options with the specified compression level.
     /// Encoded using a single thread.
     ///
@@ -119,6 +131,29 @@ impl Lzma2Options {
             lzma_rust2::LzmaOptions::NICE_LEN_MAX,
         );
     }
+}
+
+#[cfg(feature = "compress")]
+fn lzma_memory_usage_bytes(options: &lzma_rust2::LzmaOptions) -> u64 {
+    // lzma-rust2 0.21's public estimate is documented as KiB, but its LZ input
+    // buffer term is returned in bytes. Split that configured term back out so
+    // only the match-finder/table portion is converted from KiB.
+    let dict_size = u64::from(options.dict_size);
+    let (extra_before, extra_after) = match options.mode {
+        lzma_rust2::EncodeMode::Fast => (1_u64, 272_u64),
+        lzma_rust2::EncodeMode::Normal => (4_096_u64, 4_096_u64),
+    };
+    let input_buffer = dict_size
+        .saturating_add(extra_before)
+        .saturating_add(extra_after)
+        .saturating_add(273)
+        .saturating_add((dict_size / 2 + 256 * 1_024).min(512 * 1_024 * 1_024));
+    let mixed_units = u64::from(options.get_memory_usage());
+    input_buffer.saturating_add(
+        mixed_units
+            .saturating_sub(input_buffer)
+            .saturating_mul(1_024),
+    )
 }
 
 #[cfg(feature = "bzip2")]

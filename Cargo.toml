@@ -14,6 +14,7 @@ members = [
     "crates/musheen-ops",
     "crates/musheen-test-support",
     "crates/musheen-ui",
+    "crates/musheen-zstd-budget",
     "vendor/sevenz-rust2",
 ]
 resolver = "3"
@@ -47,6 +48,8 @@ native-theme = { version = "0.5", features = ["watch"] }
 native-theme-gpui = { version = "0.5", default-features = false, features = ["svg-rasterize"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 md-5 = "0.10"
+miniz_oxide = "=0.9.1"
+musheen-zstd-budget = { path = "crates/musheen-zstd-budget" }
 nix = { version = "0.31", features = ["fs", "poll"] }
 notify = "8"
 notify-rust = "4"
@@ -76,8 +79,9 @@ xattr = "1"
 xdg-mime = "0.4"
 zbus = "5"
 zeroize = "1"
-zip = { version = "6", default-features = false, features = ["aes-crypto", "deflate", "zstd"] }
+zip = { version = "6", default-features = false, features = ["aes-crypto", "deflate-flate2", "zstd"] }
 zstd = "0.13"
+zstd-safe = { version = "7", features = ["experimental"] }
 
 [dependencies]
 musheen-desktop = { path = "crates/musheen-desktop" }

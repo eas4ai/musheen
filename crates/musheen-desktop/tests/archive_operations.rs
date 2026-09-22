@@ -1198,6 +1198,160 @@ fn nested_codec_allocations_share_one_live_memory_ceiling() {
 }
 
 #[test]
+fn nested_gzip_and_zstd_workspaces_share_the_operation_memory_ceiling() {
+    let root = tempdir().expect("temporary root");
+    let mut leaf_tar = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut leaf_tar);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o600);
+        header.set_cksum();
+        tar.append_data(&mut header, "leaf", &b"leaf"[..])
+            .expect("leaf tar entry");
+        tar.finish().expect("leaf tar finish");
+    }
+    let nested_zstd = zstd::stream::encode_all(&leaf_tar[..], 0).expect("zstd nested tar");
+    let zstd_source = root.path().join("standalone.tar.zst");
+    std::fs::write(&zstd_source, &nested_zstd).expect("standalone zstd fixture");
+    let mut outer_tar = Vec::new();
+    {
+        let mut tar = tar::Builder::new(&mut outer_tar);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(nested_zstd.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        tar.append_data(&mut header, "opaque.bin", &nested_zstd[..])
+            .expect("nested zstd entry");
+        tar.finish().expect("outer tar finish");
+    }
+    let source = root.path().join("nested.tar.gz");
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = encoder;
+    encoder.write_all(&outer_tar).expect("gzip outer tar");
+    std::fs::write(&source, encoder.finish().expect("gzip finish")).expect("gzip fixture");
+
+    let first_output = root.path().join("workspace-a");
+    let first_plan = ArchiveOperationPlan::extract(
+        local(&source),
+        local(&first_output),
+        ArchiveCodec::TarGzip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("first extract plan");
+    let accounting = ArchiveOperationAccounting::default();
+    run_accounted(&first_plan, &ArchiveOperationLimits::default(), &accounting)
+        .expect("nested gzip/zstd extraction");
+    let peak = accounting.counters().peak_memory_bytes;
+
+    let zstd_output = root.path().join("standalone-zstd");
+    let zstd_plan = ArchiveOperationPlan::extract(
+        local(&zstd_source),
+        local(&zstd_output),
+        ArchiveCodec::TarZstd,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("standalone zstd plan");
+    let zstd_accounting = ArchiveOperationAccounting::default();
+    run_accounted(
+        &zstd_plan,
+        &ArchiveOperationLimits::default(),
+        &zstd_accounting,
+    )
+    .expect("standalone zstd extraction");
+    let zstd_peak = zstd_accounting.counters().peak_memory_bytes;
+    assert!(
+        peak > zstd_peak + 32 * 1024,
+        "nested codec workspaces did not overlap: nested={peak}, zstd={zstd_peak}"
+    );
+    assert_eq!(accounting.counters().memory_bytes, 0);
+    assert_eq!(zstd_accounting.counters().memory_bytes, 0);
+
+    let second_output = root.path().join("workspace-b");
+    let second_plan = ArchiveOperationPlan::extract(
+        local(&source),
+        local(&second_output),
+        ArchiveCodec::TarGzip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("second extract plan");
+    let limits = ArchiveOperationLimits {
+        max_memory_bytes: peak - 1,
+        ..ArchiveOperationLimits::default()
+    };
+    let failed_accounting = ArchiveOperationAccounting::default();
+    assert!(matches!(
+        run_accounted(&second_plan, &limits, &failed_accounting),
+        Err(ArchiveOperationError::LimitExceeded {
+            resource: "memory bytes",
+            ..
+        })
+    ));
+    assert_eq!(failed_accounting.counters().memory_bytes, 0);
+    assert!(!second_output.exists());
+}
+
+#[test]
+fn archive_creation_charges_codec_workspaces() {
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("input");
+    std::fs::write(&source, b"small payload").expect("source");
+
+    for (label, codec) in [
+        ("zip", ArchiveCodec::Zip),
+        ("7z", ArchiveCodec::SevenZip),
+        ("tar-gzip", ArchiveCodec::TarGzip),
+        ("tar-zstd", ArchiveCodec::TarZstd),
+    ] {
+        let first_output = root.path().join(format!("{label}-a.bin"));
+        let first_plan = ArchiveOperationPlan::create(
+            vec![local(&source)],
+            local(&first_output),
+            codec,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .expect("first creation plan");
+        let accounting = ArchiveOperationAccounting::default();
+        run_accounted(&first_plan, &ArchiveOperationLimits::default(), &accounting)
+            .expect("archive creation");
+        let peak = accounting.counters().peak_memory_bytes;
+        assert!(
+            peak > 64 * 1024,
+            "{label} codec workspace was not charged: {peak}"
+        );
+        assert_eq!(accounting.counters().memory_bytes, 0);
+
+        let second_output = root.path().join(format!("{label}-b.bin"));
+        let second_plan = ArchiveOperationPlan::create(
+            vec![local(&source)],
+            local(&second_output),
+            codec,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .expect("second creation plan");
+        let limits = ArchiveOperationLimits {
+            max_memory_bytes: peak - 1,
+            ..ArchiveOperationLimits::default()
+        };
+        let failed_accounting = ArchiveOperationAccounting::default();
+        assert!(matches!(
+            run_accounted(&second_plan, &limits, &failed_accounting),
+            Err(ArchiveOperationError::LimitExceeded {
+                resource: "memory bytes",
+                ..
+            })
+        ));
+        assert_eq!(failed_accounting.counters().memory_bytes, 0);
+        assert!(!second_output.exists());
+    }
+}
+
+#[test]
 fn production_expansion_ratio_and_nesting_limits_reject_real_bombs() {
     let root = tempdir().expect("temporary root");
 

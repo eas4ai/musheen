@@ -125,6 +125,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         })
     }
 
+    /// Reserves the exact entry count before compression starts, allowing callers to
+    /// reject the corresponding memory charge before this vector allocates.
+    pub fn reserve_entries_exact(&mut self, additional: usize) -> Result<()> {
+        self.files
+            .try_reserve_exact(additional)
+            .map_err(|error| Error::other(error.to_string()))
+    }
+
     /// Returns a wrapper around `self` that will finish the stream on drop.
     pub fn auto_finish(self) -> AutoFinisher<Self> {
         AutoFinisher(Some(self))

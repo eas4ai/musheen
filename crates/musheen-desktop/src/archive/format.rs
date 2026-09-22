@@ -2,6 +2,10 @@ use super::io::{BoundedWriter, PositionedFile, TimedReader};
 use super::store::{
     AllocationLease, ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState,
 };
+use super::workspace::{
+    WorkspaceReader, configure_zstd_decoder, gzip_decoder_workspace_bytes,
+    reserve_decode_workspace, zstd_decoder_workspace_bytes,
+};
 use musheen_core::{CancellationToken, ProviderId};
 use std::fs::File;
 use std::io::Write;
@@ -67,26 +71,34 @@ pub(crate) fn open_scanner(
             limits.clone(),
             Arc::clone(counters),
         )),
-        ArchiveFormat::TarGzip => Ok(super::tar_codec::open_stream(
-            Box::new(flate2::read::GzDecoder::new(TimedReader::new(
+        ArchiveFormat::TarGzip => {
+            let workspace =
+                reserve_decode_workspace(counters, limits, gzip_decoder_workspace_bytes())?;
+            let decoder = flate2::read::GzDecoder::new(TimedReader::new(
                 source,
                 limits.max_elapsed,
                 Arc::clone(counters),
-            ))),
-            provider,
-            limits.clone(),
-            Arc::clone(counters),
-            source_bytes,
-        )),
+            ));
+            Ok(super::tar_codec::open_stream(
+                Box::new(WorkspaceReader::new(decoder, workspace)),
+                provider,
+                limits.clone(),
+                Arc::clone(counters),
+                source_bytes,
+            ))
+        }
         ArchiveFormat::TarZstd => {
-            let decoder = zstd::stream::read::Decoder::new(TimedReader::new(
+            let workspace =
+                reserve_decode_workspace(counters, limits, zstd_decoder_workspace_bytes()?)?;
+            let mut decoder = zstd::stream::read::Decoder::new(TimedReader::new(
                 source,
                 limits.max_elapsed,
                 Arc::clone(counters),
             ))
             .map_err(|_| ArchiveError::InvalidArchive)?;
+            configure_zstd_decoder(&mut decoder).map_err(|_| ArchiveError::InvalidArchive)?;
             Ok(super::tar_codec::open_stream(
-                Box::new(decoder),
+                Box::new(WorkspaceReader::new(decoder, workspace)),
                 provider,
                 limits.clone(),
                 Arc::clone(counters),
@@ -156,9 +168,14 @@ pub(crate) fn copy_entry<W: Write>(
         ),
         ArchiveFormat::Tar => super::tar_codec::copy_tar(reader, ordinal, &mut destination),
         ArchiveFormat::TarGzip => {
+            let workspace = reserve_decode_workspace(
+                context.counters,
+                context.limits,
+                gzip_decoder_workspace_bytes(),
+            )?;
             let decoder = flate2::read::GzDecoder::new(reader);
             super::tar_codec::copy_guarded_tar(
-                decoder,
+                WorkspaceReader::new(decoder, workspace),
                 ordinal,
                 &mut destination,
                 &context,
@@ -166,10 +183,16 @@ pub(crate) fn copy_entry<W: Write>(
             )
         }
         ArchiveFormat::TarZstd => {
-            let decoder = zstd::stream::read::Decoder::new(reader)
+            let workspace = reserve_decode_workspace(
+                context.counters,
+                context.limits,
+                zstd_decoder_workspace_bytes()?,
+            )?;
+            let mut decoder = zstd::stream::read::Decoder::new(reader)
                 .map_err(|_| ArchiveError::InvalidArchive)?;
+            configure_zstd_decoder(&mut decoder).map_err(|_| ArchiveError::InvalidArchive)?;
             super::tar_codec::copy_guarded_tar(
-                decoder,
+                WorkspaceReader::new(decoder, workspace),
                 ordinal,
                 &mut destination,
                 &context,
