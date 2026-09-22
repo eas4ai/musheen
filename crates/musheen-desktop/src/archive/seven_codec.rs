@@ -84,7 +84,9 @@ impl ArchiveScanner for SevenZipScanner {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
-        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        cancellation
+            .wait_if_paused()
+            .map_err(|_| ArchiveError::Cancelled)?;
         while let Some(entry) = self.archive.files.get(self.next_index) {
             let ordinal = self.next_index as u64;
             self.next_index = self.next_index.saturating_add(1);

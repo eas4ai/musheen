@@ -2,7 +2,7 @@ use super::ArchiveError;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveOperationLimits {
@@ -58,6 +58,8 @@ struct BudgetEvidence {
     peak_memory_bytes: AtomicU64,
     max_nesting: AtomicU64,
     max_path_bytes: AtomicU64,
+    stage_write_remaining: AtomicU64,
+    stage_write_errno: AtomicI32,
 }
 
 impl ArchiveOperationAccounting {
@@ -77,6 +79,31 @@ impl ArchiveOperationAccounting {
             max_nesting: self.evidence.max_nesting.load(Ordering::Acquire),
             max_path_bytes: self.evidence.max_path_bytes.load(Ordering::Acquire),
         }
+    }
+
+    /// Configures a deterministic storage-boundary failure for integration tests.
+    #[doc(hidden)]
+    pub fn inject_stage_write_error_after(&self, bytes: u64, raw_os_error: i32) {
+        self.evidence
+            .stage_write_remaining
+            .store(bytes, Ordering::Release);
+        self.evidence
+            .stage_write_errno
+            .store(raw_os_error, Ordering::Release);
+    }
+
+    fn check_stage_write(&self, bytes: u64) -> std::io::Result<()> {
+        let errno = self.evidence.stage_write_errno.load(Ordering::Acquire);
+        if errno == 0 {
+            return Ok(());
+        }
+        self.evidence
+            .stage_write_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(bytes)
+            })
+            .map(|_| ())
+            .map_err(|_| std::io::Error::from_raw_os_error(errno))
     }
 }
 
@@ -369,6 +396,10 @@ impl ArchiveBudget {
         Ok(())
     }
 
+    pub(crate) fn check_stage_write(&self, bytes: u64) -> std::io::Result<()> {
+        self.accounting.check_stage_write(bytes)
+    }
+
     #[must_use]
     pub fn counters(&self) -> ArchiveBudgetCounters {
         let mut counters = self.accounting.counters();
@@ -435,6 +466,7 @@ pub enum ArchiveOperationError {
     Io,
     Journal,
     Engine,
+    RecoveryConsentRequired,
 }
 
 impl fmt::Display for ArchiveOperationError {
@@ -464,6 +496,9 @@ impl fmt::Display for ArchiveOperationError {
             Self::Io => formatter.write_str("the archive operation failed"),
             Self::Journal => formatter.write_str("the archive journal could not be updated"),
             Self::Engine => formatter.write_str("the operation engine rejected the archive event"),
+            Self::RecoveryConsentRequired => {
+                formatter.write_str("archive recovery requires an explicit approved action")
+            }
         }
     }
 }

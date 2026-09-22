@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use zip::write::SimpleFileOptions;
@@ -36,7 +36,7 @@ pub enum ArchiveOperationOutcome {
 }
 
 pub fn execute_scheduled_archive_operation<C: Clock, S: JournalStorage>(
-    scheduler: &mut Scheduler<C>,
+    scheduler: &Scheduler<C>,
     job: &ScheduledJob,
     limits: &ArchiveOperationLimits,
     passwords: &dyn ArchivePasswordProvider,
@@ -54,7 +54,7 @@ pub fn execute_scheduled_archive_operation<C: Clock, S: JournalStorage>(
 }
 
 pub fn execute_scheduled_archive_operation_with_accounting<C: Clock, S: JournalStorage>(
-    scheduler: &mut Scheduler<C>,
+    scheduler: &Scheduler<C>,
     job: &ScheduledJob,
     limits: &ArchiveOperationLimits,
     passwords: &dyn ArchivePasswordProvider,
@@ -168,7 +168,7 @@ fn run_archive_creation<S: JournalStorage>(
     accounting: &ArchiveOperationAccounting,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
-    cancellation.check()?;
+    cancellation.wait_if_paused()?;
     let budget = Rc::new(RefCell::new(ArchiveBudget::with_accounting(
         limits.clone(),
         accounting.clone(),
@@ -201,6 +201,7 @@ fn run_archive_creation<S: JournalStorage>(
         &staging,
         destination_before,
         None,
+        Some(&budget.borrow()),
     )?;
     let mut published = false;
     let result = (|| {
@@ -221,6 +222,7 @@ fn run_archive_creation<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget.borrow()),
         )?;
         report_phase(ArchiveEventPhase::Encoding)?;
         write_archive(
@@ -242,6 +244,7 @@ fn run_archive_creation<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget.borrow()),
         )?;
         append_archive_phase(
             journal,
@@ -252,10 +255,21 @@ fn run_archive_creation<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget.borrow()),
         )?;
         report_phase(ArchiveEventPhase::Publishing)?;
-        let outcome = publish_staging(&staging, &destination, plan.conflict_policy())?;
+        cancellation.wait_if_paused()?;
+        let staging_before_publish = path_identity(&staging)?;
+        let outcome = publish_staging(
+            &staging,
+            &destination,
+            plan.conflict_policy(),
+            destination_before,
+        )?;
         if outcome == ArchiveOperationOutcome::Skipped {
+            if path_identity(&staging)? != staging_before_publish {
+                return Err(ArchiveOperationError::Conflict);
+            }
             remove_owned(&staging)?;
             append_archive_phase(
                 journal,
@@ -266,6 +280,7 @@ fn run_archive_creation<S: JournalStorage>(
                 &staging,
                 destination_before,
                 None,
+                Some(&budget.borrow()),
             )?;
             return Ok(outcome);
         }
@@ -281,8 +296,12 @@ fn run_archive_creation<S: JournalStorage>(
             &staging,
             destination_before,
             destination_after,
+            Some(&budget.borrow()),
         )?;
         report_phase(ArchiveEventPhase::Cleaning)?;
+        if path_identity(&staging)? != destination_before {
+            return Err(ArchiveOperationError::Conflict);
+        }
         remove_owned(&staging)?;
         append_archive_phase(
             journal,
@@ -293,6 +312,7 @@ fn run_archive_creation<S: JournalStorage>(
             &staging,
             destination_before,
             destination_after,
+            Some(&budget.borrow()),
         )?;
         append_archive_phase(
             journal,
@@ -303,6 +323,7 @@ fn run_archive_creation<S: JournalStorage>(
             &staging,
             destination_before,
             destination_after,
+            Some(&budget.borrow()),
         )?;
         Ok(ArchiveOperationOutcome::Published)
     })();
@@ -318,6 +339,7 @@ fn run_archive_creation<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget.borrow()),
         );
     }
     result
@@ -337,7 +359,7 @@ fn collect_create_entries(
             ArchiveOperationError::UnsafePath("archive sources need a file name"),
         )?;
         for walked in walkdir::WalkDir::new(&source).follow_links(false) {
-            cancellation.check()?;
+            cancellation.wait_if_paused()?;
             let walked = walked.map_err(|_| ArchiveOperationError::Io)?;
             let metadata =
                 std::fs::symlink_metadata(walked.path()).map_err(|error| map_io(&error))?;
@@ -495,6 +517,14 @@ impl BudgetedWriteSeek {
 
 impl Write for BudgetedWriteSeek {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Err(error) = self
+            .budget
+            .borrow()
+            .check_stage_write(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        {
+            *self.error.borrow_mut() = Some(map_io(&error));
+            return Err(error);
+        }
         let requested = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let end = self.position.saturating_add(requested);
         let growth = end.saturating_sub(self.high_water);
@@ -559,7 +589,7 @@ fn write_zip(
         .transpose()?;
     let mut writer = zip::ZipWriter::new(stage);
     for entry in entries {
-        cancellation.check()?;
+        cancellation.wait_if_paused()?;
         verify_entry(entry)?;
         let name = std::str::from_utf8(&entry.archive_name)
             .map_err(|_| ArchiveOperationError::UnsupportedName)?;
@@ -640,7 +670,7 @@ fn write_tar_stream<W: Write>(
 ) -> Result<W, ArchiveOperationError> {
     let mut builder = tar::Builder::new(writer);
     for entry in entries {
-        cancellation.check()?;
+        cancellation.wait_if_paused()?;
         verify_entry(entry)?;
         let name = Path::new(std::ffi::OsStr::from_bytes(&entry.archive_name));
         let mut header = tar::Header::new_gnu();
@@ -727,7 +757,7 @@ fn write_seven_zip(
         writer.set_content_methods(vec![content_options.into()]);
     }
     for entry in entries {
-        cancellation.check()?;
+        cancellation.wait_if_paused()?;
         verify_entry(entry)?;
         let name = std::str::from_utf8(&entry.archive_name)
             .map_err(|_| ArchiveOperationError::UnsupportedName)?;
@@ -831,7 +861,7 @@ impl<'a> CancellableReader<'a> {
 
 impl Read for CancellableReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.wait_if_paused().is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "archive operation cancelled",
@@ -851,14 +881,53 @@ pub(crate) fn append_archive_phase<S: JournalStorage>(
     staging: &Path,
     destination_before: Option<ArchivePathIdentity>,
     destination_after: Option<ArchivePathIdentity>,
+    budget: Option<&ArchiveBudget>,
 ) -> Result<(), ArchiveOperationError> {
-    let checkpoint = ArchiveCheckpoint::new(
-        plan.clone(),
-        musheen_core::StorePath::from_unix_path(staging.as_os_str()),
-        path_identity(staging)?,
-        destination_before,
-        destination_after,
-    );
+    let include_plan = !journal.records().iter().any(|record| {
+        record.job_id() == job_id
+            && record.generation() == generation
+            && record.archive_checkpoint().is_some()
+    });
+    let _checkpoint_memory = budget
+        .map(|budget| {
+            budget.reserve_memory(checkpoint_memory_upper_bound(
+                plan,
+                staging.as_os_str().len(),
+                include_plan,
+            ))
+        })
+        .transpose()?;
+    let shared_plan = journal
+        .records()
+        .iter()
+        .rev()
+        .find(|record| record.job_id() == job_id && record.generation() == generation)
+        .and_then(|record| record.archive_checkpoint())
+        .map(|checkpoint| (checkpoint.shared_plan(), checkpoint.plan_digest()));
+    let staging_store = musheen_core::StorePath::from_unix_path(staging.as_os_str());
+    let staging_identity = path_identity(staging)?;
+    let checkpoint = if let Some((shared_plan, plan_digest)) = shared_plan {
+        ArchiveCheckpoint::from_shared_plan(
+            shared_plan,
+            plan_digest,
+            staging_store.clone(),
+            staging_identity,
+            destination_before,
+            destination_after,
+        )
+    } else {
+        ArchiveCheckpoint::new(
+            plan.clone(),
+            staging_store.clone(),
+            staging_identity,
+            destination_before,
+            destination_after,
+        )
+    };
+    let nonce = StagingPath::nonce(&staging_store).ok_or(ArchiveOperationError::UnsafePath(
+        "archive staging path has no ownership nonce",
+    ))?;
+    let checkpoint = checkpoint.with_staging_nonce(nonce);
     journal
         .append_archive(
             job_id,
@@ -869,6 +938,38 @@ pub(crate) fn append_archive_phase<S: JournalStorage>(
         )
         .map(|_| ())
         .map_err(|_| ArchiveOperationError::Journal)
+}
+
+fn checkpoint_memory_upper_bound(
+    plan: &ArchiveOperationPlan,
+    staging_path_bytes: usize,
+    include_plan: bool,
+) -> u64 {
+    let path_bytes = plan
+        .sources()
+        .iter()
+        .chain(std::iter::once(plan.destination()))
+        .map(|path| {
+            path.as_unix_path()
+                .map_or(0_u64, |value| value.as_os_str().len() as u64)
+        })
+        .fold(0_u64, u64::saturating_add);
+    let paths = u64::try_from(plan.sources().len().saturating_add(1)).unwrap_or(u64::MAX);
+    // StorePath's byte-array JSON and the outer escaped envelope use at most eight bytes per input
+    // path byte. The fixed allowance covers all record fields, both identities, and checksums.
+    let record = u64::try_from(staging_path_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(8)
+        .saturating_add(8 * 1_024);
+    if include_plan {
+        // A JSON byte may expand to six bytes in the payload and six more when the payload is
+        // escaped into the checksum envelope. Include the owned plan and collection storage too.
+        record
+            .saturating_add(path_bytes.saturating_mul(37))
+            .saturating_add(paths.saturating_mul(512))
+    } else {
+        record
+    }
 }
 
 pub(crate) fn path_identity(
@@ -882,14 +983,117 @@ pub(crate) fn path_identity(
     if metadata.file_type().is_symlink() {
         return Err(ArchiveOperationError::UnsupportedFileType);
     }
-    Ok(Some(ArchivePathIdentity::new(
+    let digest = content_digest(path, &metadata)?;
+    Ok(Some(
+        ArchivePathIdentity::new(
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.is_dir(),
+        )
+        .with_content_digest(digest),
+    ))
+}
+
+pub(crate) fn file_identity(file: &File) -> Result<ArchivePathIdentity, ArchiveOperationError> {
+    let metadata = file.metadata().map_err(|error| map_io(&error))?;
+    if !metadata.is_file() {
+        return Err(ArchiveOperationError::UnsupportedFileType);
+    }
+    let mut reader = file.try_clone().map_err(|error| map_io(&error))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| map_io(&error))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&metadata.mode().to_le_bytes());
+    hasher.update(&metadata.len().to_le_bytes());
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| map_io(&error))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(ArchivePathIdentity::new(
         metadata.dev(),
         metadata.ino(),
         metadata.len(),
         metadata.mtime(),
         metadata.mtime_nsec(),
-        metadata.is_dir(),
-    )))
+        false,
+    )
+    .with_content_digest(*hasher.finalize().as_bytes()))
+}
+
+fn content_digest(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<[u8; 32], ArchiveOperationError> {
+    let mut hasher = blake3::Hasher::new();
+    hash_path_content(path, metadata, &mut hasher)?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn hash_path_content(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    hasher: &mut blake3::Hasher,
+) -> Result<(), ArchiveOperationError> {
+    hasher.update(&metadata.mode().to_le_bytes());
+    hasher.update(&metadata.len().to_le_bytes());
+    if metadata.is_file() {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| map_io(&error))?;
+        let opened = file.metadata().map_err(|error| map_io(&error))?;
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return Err(ArchiveOperationError::Conflict);
+        }
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| map_io(&error))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Err(ArchiveOperationError::UnsupportedFileType);
+    }
+    let mut children = std::fs::read_dir(path)
+        .map_err(|error| map_io(&error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| map_io(&error))?;
+    children.sort_by(|left, right| {
+        left.file_name()
+            .as_bytes()
+            .cmp(right.file_name().as_bytes())
+    });
+    for child in children {
+        let name = child.file_name();
+        hasher.update(&(name.as_bytes().len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        let child_metadata =
+            std::fs::symlink_metadata(child.path()).map_err(|error| map_io(&error))?;
+        let file_type = child_metadata.file_type();
+        if file_type.is_symlink()
+            || file_type.is_fifo()
+            || file_type.is_socket()
+            || file_type.is_block_device()
+            || file_type.is_char_device()
+        {
+            return Err(ArchiveOperationError::UnsupportedFileType);
+        }
+        hash_path_content(&child.path(), &child_metadata, hasher)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn staging_path(
@@ -897,7 +1101,11 @@ pub(crate) fn staging_path(
     job_id: JobId,
     generation: EventGeneration,
 ) -> Result<PathBuf, ArchiveOperationError> {
-    StagingPath::for_destination(plan.destination(), job_id, generation)
+    let mut nonce = [0_u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut nonce))
+        .map_err(|error| map_io(&error))?;
+    StagingPath::for_destination_with_nonce(plan.destination(), job_id, generation, nonce)
         .map_err(|_| ArchiveOperationError::UnsafePath("archive staging needs a local parent"))?
         .path()
         .as_unix_path()
@@ -933,28 +1141,36 @@ pub(crate) fn publish_staging(
     staging: &Path,
     destination: &Path,
     policy: ArchiveConflictPolicy,
+    expected_destination: Option<ArchivePathIdentity>,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
-    match renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE) {
-        Ok(()) => Ok(ArchiveOperationOutcome::Published),
-        Err(error) if error == rustix::io::Errno::EXIST => match policy {
-            ArchiveConflictPolicy::Fail => Err(ArchiveOperationError::Conflict),
-            ArchiveConflictPolicy::Skip => Ok(ArchiveOperationOutcome::Skipped),
-            ArchiveConflictPolicy::Replace => {
-                match renameat_with(CWD, staging, CWD, destination, RenameFlags::EXCHANGE) {
-                    Ok(()) => Ok(ArchiveOperationOutcome::Published),
-                    Err(error) if error == rustix::io::Errno::NOENT => {
-                        renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE)
-                            .map_err(|error| {
-                                map_io(&io::Error::from_raw_os_error(error.raw_os_error()))
-                            })?;
-                        Ok(ArchiveOperationOutcome::Published)
-                    }
-                    Err(error) => Err(map_io(&io::Error::from_raw_os_error(error.raw_os_error()))),
-                }
+    if path_identity(destination)? != expected_destination {
+        return Err(ArchiveOperationError::Conflict);
+    }
+    match (expected_destination, policy) {
+        (Some(_), ArchiveConflictPolicy::Fail) => Err(ArchiveOperationError::Conflict),
+        (Some(_), ArchiveConflictPolicy::Skip) => Ok(ArchiveOperationOutcome::Skipped),
+        (Some(expected), ArchiveConflictPolicy::Replace) => {
+            renameat_with(CWD, staging, CWD, destination, RenameFlags::EXCHANGE)
+                .map_err(|error| map_io(&io::Error::from_raw_os_error(error.raw_os_error())))?;
+            if path_identity(staging)? != Some(expected) {
+                renameat_with(CWD, staging, CWD, destination, RenameFlags::EXCHANGE)
+                    .map_err(|error| map_io(&io::Error::from_raw_os_error(error.raw_os_error())))?;
+                sync_parent(destination)?;
+                return Err(ArchiveOperationError::Conflict);
             }
+            Ok(ArchiveOperationOutcome::Published)
+        }
+        (None, _) => match renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(ArchiveOperationOutcome::Published),
+            Err(error) if error == rustix::io::Errno::EXIST => match policy {
+                ArchiveConflictPolicy::Skip => Ok(ArchiveOperationOutcome::Skipped),
+                ArchiveConflictPolicy::Fail | ArchiveConflictPolicy::Replace => {
+                    Err(ArchiveOperationError::Conflict)
+                }
+            },
+            Err(error) => Err(map_io(&io::Error::from_raw_os_error(error.raw_os_error()))),
         },
-        Err(error) => Err(map_io(&io::Error::from_raw_os_error(error.raw_os_error()))),
     }
 }
 

@@ -3,8 +3,8 @@ use super::budget::{
     ArchiveOperationLimits, map_io,
 };
 use super::create::{
-    ArchiveOperationOutcome, append_archive_phase, local_path, path_identity, publish_staging,
-    remove_owned, staging_path, sync_parent,
+    ArchiveOperationOutcome, append_archive_phase, file_identity, local_path, path_identity,
+    publish_staging, remove_owned, staging_path, sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
@@ -51,7 +51,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     accounting: &ArchiveOperationAccounting,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
-    cancellation.check()?;
+    cancellation.wait_if_paused()?;
     let mut budget = ArchiveBudget::with_accounting(limits.clone(), accounting.clone());
     let plan_path_bytes = plan
         .sources()
@@ -79,6 +79,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         }
     }
     let source_file = open_archive_source(&source)?;
+    let source_identity = file_identity(&source_file)?;
     let source_bytes = source_file
         .metadata()
         .map_err(|error| map_io(&error))?
@@ -111,6 +112,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         &staging,
         destination_before,
         None,
+        Some(&budget),
     )?;
     let mut published = false;
     let result = (|| {
@@ -129,11 +131,12 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget),
         )?;
         report_phase(ArchiveEventPhase::Decoding)?;
         let mut actual_budget = budget.next_phase();
         for entry in &entries {
-            cancellation.check()?;
+            cancellation.wait_if_paused()?;
             let _path_memory = actual_budget.reserve_memory(
                 u64::try_from(entry.path.len().saturating_add(256)).unwrap_or(u64::MAX),
             )?;
@@ -194,6 +197,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget),
         )?;
         append_archive_phase(
             journal,
@@ -204,10 +208,26 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget),
         )?;
         report_phase(ArchiveEventPhase::Publishing)?;
-        let outcome = publish_staging(&staging, &destination, plan.conflict_policy())?;
+        cancellation.wait_if_paused()?;
+        if path_identity(&source)? != Some(source_identity)
+            || file_identity(&source_file)? != source_identity
+        {
+            return Err(ArchiveOperationError::Conflict);
+        }
+        let staging_before_publish = path_identity(&staging)?;
+        let outcome = publish_staging(
+            &staging,
+            &destination,
+            plan.conflict_policy(),
+            destination_before,
+        )?;
         if outcome == ArchiveOperationOutcome::Skipped {
+            if path_identity(&staging)? != staging_before_publish {
+                return Err(ArchiveOperationError::Conflict);
+            }
             remove_owned(&staging)?;
             append_archive_phase(
                 journal,
@@ -218,6 +238,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                 &staging,
                 destination_before,
                 None,
+                Some(&budget),
             )?;
             return Ok(outcome);
         }
@@ -233,8 +254,12 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             &staging,
             destination_before,
             destination_after,
+            Some(&budget),
         )?;
         report_phase(ArchiveEventPhase::Cleaning)?;
+        if path_identity(&staging)? != destination_before {
+            return Err(ArchiveOperationError::Conflict);
+        }
         remove_owned(&staging)?;
         append_archive_phase(
             journal,
@@ -245,6 +270,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             &staging,
             destination_before,
             destination_after,
+            Some(&budget),
         )?;
         append_archive_phase(
             journal,
@@ -255,6 +281,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             &staging,
             destination_before,
             destination_after,
+            Some(&budget),
         )?;
         Ok(ArchiveOperationOutcome::Published)
     })();
@@ -270,6 +297,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             &staging,
             destination_before,
             None,
+            Some(&budget),
         );
     }
     result
@@ -624,6 +652,10 @@ struct BudgetWriter<'a> {
 impl Write for BudgetWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if let Err(error) = self.budget.check_stage_write(count) {
+            self.error = Some(map_io(&error));
+            return Err(error);
+        }
         if let Err(error) = self
             .budget
             .charge_expanded(count, self.source_bytes.max(1))

@@ -6,6 +6,7 @@ use musheen_ops::{
     decide_recovery,
 };
 use std::io;
+use std::sync::Arc;
 
 #[derive(Default)]
 struct PersistentMemoryStorage {
@@ -192,4 +193,80 @@ fn archive_checkpoint_survives_a_fresh_journal_instance() {
     assert_eq!(recovered.plan(), &plan);
     assert_eq!(recovered.staging_identity(), Some(identity));
     assert_eq!(recovered.destination_after(), Some(identity));
+}
+
+#[test]
+fn archive_checkpoint_reuses_one_plan_in_memory_and_on_disk_across_phases() {
+    let sources = (0..64)
+        .map(|index| {
+            path(&format!(
+                "/data/{index:03}-{}",
+                "long-source-name".repeat(12)
+            ))
+        })
+        .collect();
+    let plan = ArchiveOperationPlan::create(
+        sources,
+        path("/data/out.zip"),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Replace,
+        false,
+    )
+    .expect("archive plan");
+    let staging = path("/data/.musheen-stage-v1-10-0-5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a");
+    let job = JobId::new(10).expect("job id");
+    let generation = EventGeneration::new(0);
+    let mut journal = Journal::open(PersistentMemoryStorage::default()).expect("journal opens");
+    for phase in [
+        JournalPhase::Planned,
+        JournalPhase::StagingCreated,
+        JournalPhase::DataCopied,
+        JournalPhase::MetadataApplied,
+    ] {
+        journal
+            .append_archive(
+                job,
+                generation,
+                phase,
+                Durability::CrashDurable,
+                ArchiveCheckpoint::new(plan.clone(), staging.clone(), None, None, None)
+                    .with_staging_nonce([0x5a; 16]),
+            )
+            .expect("checkpoint persists");
+    }
+    let records = journal.records();
+    let first_plan = records[0]
+        .archive_checkpoint()
+        .expect("first checkpoint")
+        .shared_plan();
+    for record in &records[1..] {
+        assert!(Arc::ptr_eq(
+            &first_plan,
+            &record
+                .archive_checkpoint()
+                .expect("checkpoint")
+                .shared_plan()
+        ));
+    }
+    let full_plan_bytes = serde_json::to_vec(&plan).expect("plan serializes").len();
+    assert!(
+        journal.storage().journal.len() < full_plan_bytes * 2,
+        "the durable journal must store the plan once, not once per phase"
+    );
+
+    let reopened = Journal::open(journal.into_storage()).expect("journal reopens");
+    assert_eq!(reopened.records().len(), 4);
+    let reopened_plan = reopened.records()[0]
+        .archive_checkpoint()
+        .expect("checkpoint")
+        .shared_plan();
+    for record in &reopened.records()[1..] {
+        assert!(Arc::ptr_eq(
+            &reopened_plan,
+            &record
+                .archive_checkpoint()
+                .expect("checkpoint")
+                .shared_plan()
+        ));
+    }
 }

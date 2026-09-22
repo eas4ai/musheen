@@ -150,7 +150,9 @@ impl TarScanner {
     }
 
     fn check_runtime(&self, cancellation: &CancellationToken) -> Result<(), ArchiveError> {
-        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        cancellation
+            .wait_if_paused()
+            .map_err(|_| ArchiveError::Cancelled)?;
         if self.started.elapsed() > self.limits.max_elapsed {
             return Err(elapsed_limit(
                 self.started.elapsed(),
@@ -239,7 +241,9 @@ impl ArchiveScanner for TarScanner {
         if self.finished {
             return Ok(None);
         }
-        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        cancellation
+            .wait_if_paused()
+            .map_err(|_| ArchiveError::Cancelled)?;
         self.skip(self.pending_skip, cancellation)?;
         self.pending_skip = 0;
         loop {

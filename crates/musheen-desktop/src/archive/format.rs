@@ -212,7 +212,7 @@ pub(crate) fn copy_entry<W: Write>(
     if let Some(error) = destination.take_error() {
         return Err(error);
     }
-    if context.cancellation.check().is_err() {
+    if context.cancellation.wait_if_paused().is_err() {
         return Err(ArchiveError::Cancelled);
     }
     result

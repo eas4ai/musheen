@@ -51,6 +51,11 @@ impl CancellationToken {
     }
 
     pub fn pause(&self) {
+        let _guard = self
+            .0
+            .pause_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.is_cancelled() {
             self.0.paused.store(true, Ordering::Release);
         }

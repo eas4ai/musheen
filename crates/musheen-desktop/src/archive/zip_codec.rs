@@ -400,7 +400,9 @@ impl ArchiveScanner for ZipScanner {
         &mut self,
         cancellation: &CancellationToken,
     ) -> Result<Option<RawArchiveEntry>, ArchiveError> {
-        cancellation.check().map_err(|_| ArchiveError::Cancelled)?;
+        cancellation
+            .wait_if_paused()
+            .map_err(|_| ArchiveError::Cancelled)?;
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -451,12 +453,13 @@ impl ArchiveScanner for ZipScanner {
         let name = ArchivePath::normalize_bytes(&name, self.limits.max_path_bytes)?;
         let unix_mode = le_u32(&header[38..42]) >> 16;
         let file_type = unix_mode & 0o170_000;
-        let kind = if directory_name || file_type == 0o040_000 {
-            RawEntryKind::Directory
-        } else if file_type == 0o120_000 {
-            RawEntryKind::SymbolicLink
-        } else {
-            RawEntryKind::RegularFile
+        let kind = match file_type {
+            0 if directory_name => RawEntryKind::Directory,
+            0 => RawEntryKind::RegularFile,
+            0o040_000 => RawEntryKind::Directory,
+            0o100_000 => RawEntryKind::RegularFile,
+            0o120_000 => RawEntryKind::SymbolicLink,
+            _ => RawEntryKind::Other,
         };
         let (compressed_size, expanded_size) = entry_sizes(&header, &extra)?;
         let ordinal = self.ordinal;

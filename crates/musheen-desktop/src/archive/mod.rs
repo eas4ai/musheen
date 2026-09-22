@@ -29,7 +29,10 @@ pub use format::ArchiveFormat;
 #[doc(hidden)]
 pub use libarchive_codec::run_worker as run_libarchive_worker;
 pub use path::ArchivePath;
-pub use recovery::{ArchiveRecoveryOutcome, recover_archive_operations};
+pub use recovery::{
+    ArchiveRecoveryAction, ArchiveRecoveryOutcome, ArchiveRecoveryRequest, apply_archive_recovery,
+    recover_archive_operations,
+};
 pub use store::{
     ArchiveCounters, ArchiveError, ArchiveLimits, ArchivePassword, ArchivePasswordProvider,
     ArchiveStore, PasswordRequest,

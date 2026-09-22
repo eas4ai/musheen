@@ -103,7 +103,7 @@ impl<R> TimedReader<R> {
         if self
             .cancellation
             .as_ref()
-            .is_some_and(|cancellation| cancellation.check().is_err())
+            .is_some_and(|cancellation| cancellation.wait_if_paused().is_err())
         {
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -125,7 +125,7 @@ impl<R: Read> Read for TimedReader<R> {
         if self
             .cancellation
             .as_ref()
-            .is_some_and(|cancellation| cancellation.check().is_err())
+            .is_some_and(|cancellation| cancellation.wait_if_paused().is_err())
         {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -146,7 +146,7 @@ impl<R: Seek> Seek for TimedReader<R> {
         if self
             .cancellation
             .as_ref()
-            .is_some_and(|cancellation| cancellation.check().is_err())
+            .is_some_and(|cancellation| cancellation.wait_if_paused().is_err())
         {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -202,7 +202,7 @@ impl<R> DecodeReader<R> {
 
 impl<R: Read> Read for DecodeReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.cancellation.check().is_err() {
+        if self.cancellation.wait_if_paused().is_err() {
             return Err(self.stop(ArchiveError::Cancelled));
         }
         if self.started.elapsed() > self.maximum_elapsed {
@@ -271,7 +271,7 @@ impl<W> BoundedWriter<W> {
 
 impl<W: io::Write> io::Write for BoundedWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.cancellation.check().is_err() {
+        if self.cancellation.wait_if_paused().is_err() {
             self.failure = Some(ArchiveError::Cancelled);
             return Err(io::Error::other("archive operation cancelled"));
         }

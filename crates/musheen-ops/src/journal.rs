@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 
@@ -37,6 +38,8 @@ pub struct ArchivePathIdentity {
     modified_seconds: i64,
     modified_nanoseconds: i64,
     directory: bool,
+    #[serde(default)]
+    content_digest: [u8; 32],
 }
 
 impl ArchivePathIdentity {
@@ -56,7 +59,14 @@ impl ArchivePathIdentity {
             modified_seconds,
             modified_nanoseconds,
             directory,
+            content_digest: [0; 32],
         }
+    }
+
+    #[must_use]
+    pub const fn with_content_digest(mut self, content_digest: [u8; 32]) -> Self {
+        self.content_digest = content_digest;
+        self
     }
 
     #[must_use]
@@ -83,16 +93,25 @@ impl ArchivePathIdentity {
     pub const fn is_directory(self) -> bool {
         self.directory
     }
+
+    #[must_use]
+    pub const fn content_digest(self) -> [u8; 32] {
+        self.content_digest
+    }
 }
 
 /// Durable inputs and identities needed to recover one archive operation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArchiveCheckpoint {
-    plan: ArchiveOperationPlan,
+    plan: Arc<ArchiveOperationPlan>,
+    #[serde(default)]
+    plan_digest: [u8; 32],
     staging: StorePath,
     staging_identity: Option<ArchivePathIdentity>,
     destination_before: Option<ArchivePathIdentity>,
     destination_after: Option<ArchivePathIdentity>,
+    #[serde(default)]
+    staging_nonce: Option<[u8; 16]>,
 }
 
 impl ArchiveCheckpoint {
@@ -104,18 +123,59 @@ impl ArchiveCheckpoint {
         destination_before: Option<ArchivePathIdentity>,
         destination_after: Option<ArchivePathIdentity>,
     ) -> Self {
+        let plan_digest = serde_json::to_vec(&plan)
+            .map(|bytes| *blake3::hash(&bytes).as_bytes())
+            .unwrap_or([0; 32]);
         Self {
-            plan,
+            plan: Arc::new(plan),
+            plan_digest,
             staging,
             staging_identity,
             destination_before,
             destination_after,
+            staging_nonce: None,
         }
     }
 
     #[must_use]
-    pub const fn plan(&self) -> &ArchiveOperationPlan {
-        &self.plan
+    pub const fn with_staging_nonce(mut self, staging_nonce: [u8; 16]) -> Self {
+        self.staging_nonce = Some(staging_nonce);
+        self
+    }
+
+    #[must_use]
+    pub fn plan(&self) -> &ArchiveOperationPlan {
+        self.plan.as_ref()
+    }
+
+    #[must_use]
+    pub fn shared_plan(&self) -> Arc<ArchiveOperationPlan> {
+        Arc::clone(&self.plan)
+    }
+
+    #[must_use]
+    pub const fn plan_digest(&self) -> [u8; 32] {
+        self.plan_digest
+    }
+
+    #[must_use]
+    pub fn from_shared_plan(
+        plan: Arc<ArchiveOperationPlan>,
+        plan_digest: [u8; 32],
+        staging: StorePath,
+        staging_identity: Option<ArchivePathIdentity>,
+        destination_before: Option<ArchivePathIdentity>,
+        destination_after: Option<ArchivePathIdentity>,
+    ) -> Self {
+        Self {
+            plan,
+            plan_digest,
+            staging,
+            staging_identity,
+            destination_before,
+            destination_after,
+            staging_nonce: None,
+        }
     }
     #[must_use]
     pub const fn staging(&self) -> &StorePath {
@@ -132,6 +192,10 @@ impl ArchiveCheckpoint {
     #[must_use]
     pub const fn destination_after(&self) -> Option<ArchivePathIdentity> {
         self.destination_after
+    }
+    #[must_use]
+    pub const fn staging_nonce(&self) -> Option<[u8; 16]> {
+        self.staging_nonce
     }
 }
 
@@ -192,7 +256,21 @@ struct RecordDocument {
     phase: JournalPhase,
     durability: Durability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    archive: Option<ArchiveCheckpoint>,
+    archive: Option<ArchiveCheckpointDocument>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ArchiveCheckpointDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<ArchiveOperationPlan>,
+    #[serde(default)]
+    plan_digest: [u8; 32],
+    staging: StorePath,
+    staging_identity: Option<ArchivePathIdentity>,
+    destination_before: Option<ArchivePathIdentity>,
+    destination_after: Option<ArchivePathIdentity>,
+    #[serde(default)]
+    staging_nonce: Option<[u8; 16]>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -251,11 +329,13 @@ impl<S: JournalStorage> Journal<S> {
     pub fn open(mut storage: S) -> Result<Self, JournalError> {
         let snapshot = storage.read_snapshot().map_err(JournalError::Storage)?;
         let mut records = Vec::new();
+        let mut plans = std::collections::BTreeMap::new();
         let mut quarantined_records =
-            append_snapshot_prefix(&snapshot, &mut records, &mut storage)?;
+            append_snapshot_prefix(&snapshot, &mut records, &mut plans, &mut storage)?;
 
         let journal = storage.read_journal().map_err(JournalError::Storage)?;
-        quarantined_records += append_journal_prefix(&journal, &mut records, &mut storage)?;
+        quarantined_records +=
+            append_journal_prefix(&journal, &mut records, &mut plans, &mut storage)?;
 
         let next_sequence = match records.last() {
             Some(record) => record.sequence.checked_add(1),
@@ -290,8 +370,20 @@ impl<S: JournalStorage> Journal<S> {
         generation: EventGeneration,
         phase: JournalPhase,
         durability: Durability,
-        checkpoint: ArchiveCheckpoint,
+        mut checkpoint: ArchiveCheckpoint,
     ) -> Result<JournalRecord, JournalError> {
+        if let Some((shared, digest)) = self.records.iter().rev().find_map(|record| {
+            (record.job_id == job_id && record.generation == generation)
+                .then_some(record.archive.as_ref())
+                .flatten()
+                .map(|checkpoint| (checkpoint.shared_plan(), checkpoint.plan_digest))
+        }) {
+            if checkpoint.plan_digest != digest {
+                return Err(JournalError::ArchivePlanChanged);
+            }
+            checkpoint.plan = shared;
+            checkpoint.plan_digest = digest;
+        }
         self.append_record(job_id, generation, phase, durability, Some(checkpoint))
     }
 
@@ -313,7 +405,12 @@ impl<S: JournalStorage> Journal<S> {
             durability,
             archive,
         };
-        let encoded = encode_record(&record)?;
+        let include_plan = !self.records.iter().any(|existing| {
+            existing.job_id == job_id
+                && existing.generation == generation
+                && existing.archive.is_some()
+        });
+        let encoded = encode_record(&record, include_plan)?;
         self.storage
             .append_journal(&encoded)
             .map_err(JournalError::Storage)?;
@@ -326,8 +423,11 @@ impl<S: JournalStorage> Journal<S> {
 
     pub fn compact(&mut self) -> Result<(), JournalError> {
         let mut snapshot = Vec::new();
+        let mut encoded_plans = std::collections::BTreeSet::new();
         for record in &self.records {
-            snapshot.extend_from_slice(&encode_record(record)?);
+            let key = (record.job_id, record.generation);
+            let include_plan = record.archive.is_some() && encoded_plans.insert(key);
+            snapshot.extend_from_slice(&encode_record(record, include_plan)?);
         }
         self.storage
             .write_snapshot_temporary(&snapshot)
@@ -364,9 +464,10 @@ impl<S: JournalStorage> Journal<S> {
 fn append_snapshot_prefix<S: JournalStorage>(
     bytes: &[u8],
     records: &mut Vec<JournalRecord>,
+    plans: &mut std::collections::BTreeMap<[u8; 32], Arc<ArchiveOperationPlan>>,
     storage: &mut S,
 ) -> Result<usize, JournalError> {
-    let decoded = decode_lines(bytes);
+    let decoded = decode_lines(bytes, plans);
     let mut corrupt_at = decoded.corrupt_at;
     for line in decoded.lines {
         let expected = u64::try_from(records.len())
@@ -385,9 +486,10 @@ fn append_snapshot_prefix<S: JournalStorage>(
 fn append_journal_prefix<S: JournalStorage>(
     bytes: &[u8],
     records: &mut Vec<JournalRecord>,
+    plans: &mut std::collections::BTreeMap<[u8; 32], Arc<ArchiveOperationPlan>>,
     storage: &mut S,
 ) -> Result<usize, JournalError> {
-    let decoded = decode_lines(bytes);
+    let decoded = decode_lines(bytes, plans);
     let mut corrupt_at = decoded.corrupt_at;
     for line in decoded.lines {
         let sequence_index = line
@@ -446,7 +548,10 @@ struct DecodedLines {
     corrupt_at: Option<usize>,
 }
 
-fn decode_lines(bytes: &[u8]) -> DecodedLines {
+fn decode_lines(
+    bytes: &[u8],
+    plans: &mut std::collections::BTreeMap<[u8; 32], Arc<ArchiveOperationPlan>>,
+) -> DecodedLines {
     let mut lines = Vec::new();
     let mut offset = 0;
     for encoded in bytes.split_inclusive(|byte| *byte == b'\n') {
@@ -455,7 +560,7 @@ fn decode_lines(bytes: &[u8]) -> DecodedLines {
             offset += encoded.len();
             continue;
         }
-        match decode_record(line) {
+        match decode_record(line, plans) {
             Ok(record) => lines.push(DecodedLine { record, offset }),
             Err(_) => {
                 return DecodedLines {
@@ -472,7 +577,22 @@ fn decode_lines(bytes: &[u8]) -> DecodedLines {
     }
 }
 
-fn encode_record(record: &JournalRecord) -> Result<Vec<u8>, JournalError> {
+fn encode_record(record: &JournalRecord, include_plan: bool) -> Result<Vec<u8>, JournalError> {
+    let archive = record
+        .archive
+        .as_ref()
+        .map(|checkpoint| {
+            Ok(ArchiveCheckpointDocument {
+                plan: include_plan.then(|| checkpoint.plan().clone()),
+                plan_digest: checkpoint.plan_digest,
+                staging: checkpoint.staging.clone(),
+                staging_identity: checkpoint.staging_identity,
+                destination_before: checkpoint.destination_before,
+                destination_after: checkpoint.destination_after,
+                staging_nonce: checkpoint.staging_nonce,
+            })
+        })
+        .transpose()?;
     let document = RecordDocument {
         schema_version: record.schema_version,
         sequence: record.sequence,
@@ -480,7 +600,7 @@ fn encode_record(record: &JournalRecord) -> Result<Vec<u8>, JournalError> {
         generation: record.generation.get(),
         phase: record.phase,
         durability: record.durability.clone(),
-        archive: record.archive.clone(),
+        archive,
     };
     let payload = serde_json::to_string(&document).map_err(JournalError::Encode)?;
     let envelope = Envelope {
@@ -492,7 +612,10 @@ fn encode_record(record: &JournalRecord) -> Result<Vec<u8>, JournalError> {
     Ok(encoded)
 }
 
-fn decode_record(line: &[u8]) -> Result<JournalRecord, JournalError> {
+fn decode_record(
+    line: &[u8],
+    plans: &mut std::collections::BTreeMap<[u8; 32], Arc<ArchiveOperationPlan>>,
+) -> Result<JournalRecord, JournalError> {
     let envelope: Envelope = serde_json::from_slice(line).map_err(JournalError::Decode)?;
     let expected = blake3::hash(envelope.payload.as_bytes()).to_hex();
     if envelope.checksum.as_ref() != expected.as_str() {
@@ -504,6 +627,43 @@ fn decode_record(line: &[u8]) -> Result<JournalRecord, JournalError> {
         return Err(JournalError::UnsupportedSchema(document.schema_version));
     }
     let job_id = JobId::new(document.job_id).ok_or(JournalError::InvalidJobId)?;
+    let archive = document
+        .archive
+        .map(|checkpoint| {
+            let digest = if checkpoint.plan_digest == [0; 32] {
+                checkpoint
+                    .plan
+                    .as_ref()
+                    .map(|plan| {
+                        serde_json::to_vec(plan).map(|bytes| *blake3::hash(&bytes).as_bytes())
+                    })
+                    .transpose()
+                    .map_err(JournalError::Encode)?
+                    .ok_or(JournalError::MissingArchivePlan)?
+            } else {
+                checkpoint.plan_digest
+            };
+            let plan = if let Some(plan) = checkpoint.plan {
+                let plan = Arc::new(plan);
+                plans.insert(digest, Arc::clone(&plan));
+                plan
+            } else {
+                plans
+                    .get(&digest)
+                    .cloned()
+                    .ok_or(JournalError::MissingArchivePlan)?
+            };
+            Ok(ArchiveCheckpoint {
+                plan,
+                plan_digest: digest,
+                staging: checkpoint.staging,
+                staging_identity: checkpoint.staging_identity,
+                destination_before: checkpoint.destination_before,
+                destination_after: checkpoint.destination_after,
+                staging_nonce: checkpoint.staging_nonce,
+            })
+        })
+        .transpose()?;
     Ok(JournalRecord {
         schema_version: document.schema_version,
         sequence: document.sequence,
@@ -511,7 +671,7 @@ fn decode_record(line: &[u8]) -> Result<JournalRecord, JournalError> {
         generation: EventGeneration::new(document.generation),
         phase: document.phase,
         durability: document.durability,
-        archive: document.archive,
+        archive,
     })
 }
 
@@ -524,6 +684,8 @@ pub enum JournalError {
     UnsupportedSchema(u32),
     InvalidJobId,
     SequenceExhausted,
+    MissingArchivePlan,
+    ArchivePlanChanged,
 }
 
 impl fmt::Display for JournalError {
@@ -538,6 +700,12 @@ impl fmt::Display for JournalError {
             }
             Self::InvalidJobId => formatter.write_str("journal contains an invalid job ID"),
             Self::SequenceExhausted => formatter.write_str("journal sequence is exhausted"),
+            Self::MissingArchivePlan => {
+                formatter.write_str("journal archive checkpoint references a missing plan")
+            }
+            Self::ArchivePlanChanged => {
+                formatter.write_str("journal archive plan changed within one job generation")
+            }
         }
     }
 }
@@ -550,7 +718,9 @@ impl Error for JournalError {
             Self::ChecksumMismatch
             | Self::UnsupportedSchema(_)
             | Self::InvalidJobId
-            | Self::SequenceExhausted => return None,
+            | Self::SequenceExhausted
+            | Self::MissingArchivePlan
+            | Self::ArchivePlanChanged => return None,
         };
         Some(source)
     }

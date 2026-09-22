@@ -6,6 +6,7 @@ use musheen_core::{CancellationToken, ResourceLimits};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub trait Clock {
@@ -85,14 +86,28 @@ struct JobRecord {
 }
 
 #[derive(Debug)]
-pub struct Scheduler<C = SystemClock> {
-    limits: ResourceLimits,
+struct SchedulerData<C> {
     clock: C,
     next_job_id: u64,
     queued: VecDeque<JobId>,
     running: BTreeSet<JobId>,
     jobs: BTreeMap<JobId, JobRecord>,
     events: Vec<JobEvent>,
+}
+
+#[derive(Debug)]
+pub struct Scheduler<C = SystemClock> {
+    limits: ResourceLimits,
+    data: Arc<Mutex<SchedulerData<C>>>,
+}
+
+impl<C> Clone for Scheduler<C> {
+    fn clone(&self) -> Self {
+        Self {
+            limits: self.limits.clone(),
+            data: Arc::clone(&self.data),
+        }
+    }
 }
 
 impl Scheduler<SystemClock> {
@@ -107,24 +122,27 @@ impl<C: Clock> Scheduler<C> {
     pub fn with_clock(limits: &ResourceLimits, clock: C) -> Self {
         Self {
             limits: limits.snapshot(),
-            clock,
-            next_job_id: 1,
-            queued: VecDeque::new(),
-            running: BTreeSet::new(),
-            jobs: BTreeMap::new(),
-            events: Vec::new(),
+            data: Arc::new(Mutex::new(SchedulerData {
+                clock,
+                next_job_id: 1,
+                queued: VecDeque::new(),
+                running: BTreeSet::new(),
+                jobs: BTreeMap::new(),
+                events: Vec::new(),
+            })),
         }
     }
 
-    pub fn enqueue(&mut self, plan: OperationPlan) -> Result<JobId, SchedulerError> {
-        let id = JobId::new(self.next_job_id).ok_or(SchedulerError::JobIdExhausted)?;
-        self.next_job_id = self
+    pub fn enqueue(&self, plan: OperationPlan) -> Result<JobId, SchedulerError> {
+        let mut data = self.lock();
+        let id = JobId::new(data.next_job_id).ok_or(SchedulerError::JobIdExhausted)?;
+        data.next_job_id = data
             .next_job_id
             .checked_add(1)
             .ok_or(SchedulerError::JobIdExhausted)?;
         let cancellation = CancellationToken::new();
         let state = JobStateMachine::new(id);
-        self.jobs.insert(
+        data.jobs.insert(
             id,
             JobRecord {
                 plan,
@@ -132,35 +150,36 @@ impl<C: Clock> Scheduler<C> {
                 cancellation,
             },
         );
-        self.transition(id, JobState::Queued)?;
-        self.queued.push_back(id);
+        transition(&mut data, id, JobState::Queued)?;
+        data.queued.push_back(id);
         Ok(id)
     }
 
     pub fn enqueue_archive(
-        &mut self,
+        &self,
         plan: ArchiveOperationPlan,
         provider: ProviderSnapshot,
     ) -> Result<JobId, SchedulerError> {
         self.enqueue(plan.into_operation_plan(provider)?)
     }
 
-    pub fn start_ready(&mut self) -> Result<Vec<ScheduledJob>, SchedulerError> {
-        let queued = self.queued.len();
+    pub fn start_ready(&self) -> Result<Vec<ScheduledJob>, SchedulerError> {
+        let mut data = self.lock();
+        let queued = data.queued.len();
         let mut started = Vec::new();
         for _ in 0..queued {
-            let id = self
+            let id = data
                 .queued
                 .pop_front()
                 .expect("the recorded queue length remains exact");
-            if !self.can_start(id)? {
-                self.queued.push_back(id);
+            if !can_start(&data, &self.limits, id)? {
+                data.queued.push_back(id);
                 continue;
             }
-            let started_at = self.clock.now();
-            self.transition_at(id, JobState::Running, started_at)?;
-            self.running.insert(id);
-            let record = self.jobs.get(&id).ok_or(SchedulerError::UnknownJob(id))?;
+            let started_at = data.clock.now();
+            transition_at(&mut data, id, JobState::Running, started_at)?;
+            data.running.insert(id);
+            let record = data.jobs.get(&id).ok_or(SchedulerError::UnknownJob(id))?;
             started.push(ScheduledJob {
                 id,
                 plan: record.plan.clone(),
@@ -172,53 +191,67 @@ impl<C: Clock> Scheduler<C> {
         Ok(started)
     }
 
-    pub fn complete(&mut self, id: JobId) -> Result<(), SchedulerError> {
-        if !self.running.contains(&id) {
+    pub fn complete(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
         }
-        self.transition(id, JobState::Completed)?;
-        self.running.remove(&id);
+        transition(&mut data, id, JobState::Completed)?;
+        data.running.remove(&id);
         Ok(())
     }
 
-    pub fn fail(&mut self, id: JobId) -> Result<(), SchedulerError> {
-        if !self.running.contains(&id) {
+    pub fn fail(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
         }
-        self.transition(id, JobState::Failed)?;
-        self.running.remove(&id);
+        transition(&mut data, id, JobState::Failed)?;
+        data.running.remove(&id);
         Ok(())
     }
 
-    pub fn pause(&mut self, id: JobId) -> Result<(), SchedulerError> {
-        if !self.running.contains(&id) {
+    pub fn pause(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
         }
-        self.transition(id, JobState::Paused)?;
-        self.jobs
+        let cancellation = data
+            .jobs
             .get(&id)
             .ok_or(SchedulerError::UnknownJob(id))?
             .cancellation
-            .pause();
+            .clone();
+        transition(&mut data, id, JobState::Paused)?;
+        cancellation.pause();
         Ok(())
     }
 
-    pub fn resume(&mut self, id: JobId) -> Result<(), SchedulerError> {
-        if !self.running.contains(&id) {
+    pub fn resume(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
         }
-        self.transition(id, JobState::Running)?;
-        self.jobs
+        let cancellation = data
+            .jobs
             .get(&id)
             .ok_or(SchedulerError::UnknownJob(id))?
             .cancellation
-            .resume();
+            .clone();
+        transition(&mut data, id, JobState::Running)?;
+        cancellation.resume();
         Ok(())
     }
 
-    pub fn cancel(&mut self, id: JobId) -> Result<(), SchedulerError> {
-        let state = self.state(id).ok_or(SchedulerError::UnknownJob(id))?;
-        let cancellation = self
+    pub fn cancel(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        let state = data
+            .jobs
+            .get(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?
+            .state
+            .state();
+        let cancellation = data
             .jobs
             .get(&id)
             .ok_or(SchedulerError::UnknownJob(id))?
@@ -226,58 +259,62 @@ impl<C: Clock> Scheduler<C> {
             .clone();
         cancellation.cancel();
         if state == JobState::Queued {
-            self.queued.retain(|queued| *queued != id);
-            self.transition(id, JobState::Cancelled)?;
+            data.queued.retain(|queued| *queued != id);
+            transition(&mut data, id, JobState::Cancelled)?;
         } else {
-            self.transition(id, JobState::Cancelling)?;
+            transition(&mut data, id, JobState::Cancelling)?;
         }
         Ok(())
     }
 
-    pub fn finish_cancel(&mut self, id: JobId) -> Result<(), SchedulerError> {
-        if !self.running.contains(&id) {
+    pub fn finish_cancel(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
         }
-        self.transition(id, JobState::Cancelled)?;
-        self.running.remove(&id);
+        transition(&mut data, id, JobState::Cancelled)?;
+        data.running.remove(&id);
         Ok(())
     }
 
-    pub fn retry(&mut self, id: JobId) -> Result<EventGeneration, SchedulerError> {
-        let generation = self
+    pub fn retry(&self, id: JobId) -> Result<EventGeneration, SchedulerError> {
+        let mut data = self.lock();
+        let now = data.clock.now();
+        let generation = data
             .jobs
             .get_mut(&id)
             .ok_or(SchedulerError::UnknownJob(id))?
             .state
-            .retry(self.clock.now())?;
-        let record = self
+            .retry(now)?;
+        let record = data
             .jobs
             .get_mut(&id)
             .ok_or(SchedulerError::UnknownJob(id))?;
         record.cancellation = CancellationToken::new();
-        self.queued.push_back(id);
+        data.queued.push_back(id);
         Ok(generation)
     }
 
-    pub fn interrupt(&mut self, id: JobId) -> Result<(), SchedulerError> {
-        if !self.running.contains(&id) {
+    pub fn interrupt(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        if !data.running.contains(&id) {
             return Err(SchedulerError::NotRunning(id));
         }
-        let cancellation = self
+        let cancellation = data
             .jobs
             .get(&id)
             .ok_or(SchedulerError::UnknownJob(id))?
             .cancellation
             .clone();
         cancellation.cancel();
-        self.transition(id, JobState::Interrupted)?;
-        self.running.remove(&id);
+        transition(&mut data, id, JobState::Interrupted)?;
+        data.running.remove(&id);
         Ok(())
     }
 
     #[must_use]
     pub fn state(&self, id: JobId) -> Option<JobState> {
-        self.jobs.get(&id).map(|record| record.state.state())
+        self.lock().jobs.get(&id).map(|record| record.state.state())
     }
 
     #[must_use]
@@ -286,98 +323,110 @@ impl<C: Clock> Scheduler<C> {
     }
 
     #[must_use]
-    pub fn events(&self) -> &[JobEvent] {
-        &self.events
+    pub fn events(&self) -> Vec<JobEvent> {
+        self.lock().events.clone()
     }
 
     /// Publishes an archive phase through the same ordered event stream as state changes.
     pub fn emit_archive_phase(
-        &mut self,
+        &self,
         id: JobId,
         phase: ArchiveEventPhase,
     ) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        let occurred_at = data.clock.now();
         let event = {
-            let record = self
+            let record = data
                 .jobs
                 .get_mut(&id)
                 .ok_or(SchedulerError::UnknownJob(id))?;
-            let event =
-                JobEvent::archive_phase(id, record.state.generation(), self.clock.now(), phase);
+            let event = JobEvent::archive_phase(id, record.state.generation(), occurred_at, phase);
             record.state.apply(event.clone())?;
             event
         };
-        self.events.push(event);
+        data.events.push(event);
         Ok(())
     }
 
-    fn can_start(&self, id: JobId) -> Result<bool, SchedulerError> {
-        let candidate = self.jobs.get(&id).ok_or(SchedulerError::UnknownJob(id))?;
-        let class = candidate.plan.class();
-        let global_limit = self.global_limit(class);
-        let global_running = self
-            .running
-            .iter()
-            .filter(|running| {
-                self.jobs
-                    .get(running)
-                    .is_some_and(|record| record.plan.class() == class)
-            })
-            .count();
-        if global_running >= global_limit {
-            return Ok(false);
-        }
+    fn lock(&self) -> std::sync::MutexGuard<'_, SchedulerData<C>> {
+        self.data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
-        let provider = candidate.plan.provider().id();
-        let provider_running = self
-            .running
-            .iter()
-            .filter(|running| {
-                self.jobs.get(running).is_some_and(|record| {
-                    record.plan.class() == class && record.plan.provider().id() == provider
-                })
-            })
-            .count();
-        if provider_running >= candidate.plan.provider().limits().for_class(class) {
-            return Ok(false);
-        }
-
-        Ok(!self.running.iter().any(|running| {
-            self.jobs
+fn can_start<C: Clock>(
+    data: &SchedulerData<C>,
+    limits: &ResourceLimits,
+    id: JobId,
+) -> Result<bool, SchedulerError> {
+    let candidate = data.jobs.get(&id).ok_or(SchedulerError::UnknownJob(id))?;
+    let class = candidate.plan.class();
+    let global_limit = match class {
+        WorkClass::DataMutation => limits.operation_data_mutations(),
+        WorkClass::Metadata => limits.operation_metadata_jobs(),
+        WorkClass::HashOrPreview => limits.operation_hash_preview_jobs(),
+    };
+    let global_running = data
+        .running
+        .iter()
+        .filter(|running| {
+            data.jobs
                 .get(running)
-                .is_some_and(|record| candidate.plan.conflicts_with(&record.plan))
-        }))
+                .is_some_and(|record| record.plan.class() == class)
+        })
+        .count();
+    if global_running >= global_limit {
+        return Ok(false);
     }
 
-    const fn global_limit(&self, class: WorkClass) -> usize {
-        match class {
-            WorkClass::DataMutation => self.limits.operation_data_mutations(),
-            WorkClass::Metadata => self.limits.operation_metadata_jobs(),
-            WorkClass::HashOrPreview => self.limits.operation_hash_preview_jobs(),
-        }
+    let provider = candidate.plan.provider().id();
+    let provider_running = data
+        .running
+        .iter()
+        .filter(|running| {
+            data.jobs.get(running).is_some_and(|record| {
+                record.plan.class() == class && record.plan.provider().id() == provider
+            })
+        })
+        .count();
+    if provider_running >= candidate.plan.provider().limits().for_class(class) {
+        return Ok(false);
     }
 
-    fn transition(&mut self, id: JobId, state: JobState) -> Result<(), SchedulerError> {
-        self.transition_at(id, state, self.clock.now())
-    }
+    Ok(!data.running.iter().any(|running| {
+        data.jobs
+            .get(running)
+            .is_some_and(|record| candidate.plan.conflicts_with(&record.plan))
+    }))
+}
 
-    fn transition_at(
-        &mut self,
-        id: JobId,
-        state: JobState,
-        occurred_at: u64,
-    ) -> Result<(), SchedulerError> {
-        let event = {
-            let record = self
-                .jobs
-                .get_mut(&id)
-                .ok_or(SchedulerError::UnknownJob(id))?;
-            let event = JobEvent::transition(id, record.state.generation(), occurred_at, state);
-            record.state.apply(event.clone())?;
-            event
-        };
-        self.events.push(event);
-        Ok(())
-    }
+fn transition<C: Clock>(
+    data: &mut SchedulerData<C>,
+    id: JobId,
+    state: JobState,
+) -> Result<(), SchedulerError> {
+    let occurred_at = data.clock.now();
+    transition_at(data, id, state, occurred_at)
+}
+
+fn transition_at<C: Clock>(
+    data: &mut SchedulerData<C>,
+    id: JobId,
+    state: JobState,
+    occurred_at: u64,
+) -> Result<(), SchedulerError> {
+    let event = {
+        let record = data
+            .jobs
+            .get_mut(&id)
+            .ok_or(SchedulerError::UnknownJob(id))?;
+        let event = JobEvent::transition(id, record.state.generation(), occurred_at, state);
+        record.state.apply(event.clone())?;
+        event
+    };
+    data.events.push(event);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

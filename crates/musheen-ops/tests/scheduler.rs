@@ -21,7 +21,7 @@ impl ManualClock {
 fn archive_jobs_use_scheduler_plans_conflicts_and_events() {
     let limits = ResourceLimits::default();
     let clock = ManualClock::default();
-    let mut scheduler = Scheduler::with_clock(&limits, clock.clone());
+    let scheduler = Scheduler::with_clock(&limits, clock.clone());
     let local = provider("archive-local", ProviderLimits::unbounded());
     let archive = ArchiveOperationPlan::create(
         vec![
@@ -104,7 +104,7 @@ fn defaults_provider_limits_and_fifo_progress_are_enforced() {
 
     let clock = ManualClock::default();
     clock.set(100);
-    let mut scheduler = Scheduler::with_clock(&limits, clock.clone());
+    let scheduler = Scheduler::with_clock(&limits, clock.clone());
     let local = provider("local", ProviderLimits::unbounded());
     let data = (0..3)
         .map(|index| {
@@ -183,7 +183,7 @@ fn stricter_provider_limits_do_not_starve_other_providers() {
         ..ResourceLimitConfig::default()
     })
     .expect("fixture limits are valid");
-    let mut scheduler = Scheduler::with_clock(&limits, ManualClock::default());
+    let scheduler = Scheduler::with_clock(&limits, ManualClock::default());
     let slow = provider(
         "slow",
         ProviderLimits::new(1, 1, 1).expect("positive provider limits are valid"),
@@ -213,7 +213,7 @@ fn stricter_provider_limits_do_not_starve_other_providers() {
 #[test]
 fn overlapping_read_write_sets_are_serialized() {
     let limits = ResourceLimits::default();
-    let mut scheduler = Scheduler::with_clock(&limits, ManualClock::default());
+    let scheduler = Scheduler::with_clock(&limits, ManualClock::default());
     let local = provider("local", ProviderLimits::unbounded());
     let first = OperationPlan::new(
         OperationKind::Move,
@@ -253,7 +253,7 @@ fn overlapping_read_write_sets_are_serialized() {
 #[test]
 fn cancellation_tokens_are_per_job_and_scheduler_limits_are_snapshotted() {
     let source = ResourceLimits::default();
-    let mut scheduler = Scheduler::with_clock(&source, ManualClock::default());
+    let scheduler = Scheduler::with_clock(&source, ManualClock::default());
     let local = provider("local", ProviderLimits::unbounded());
     let first = scheduler
         .enqueue(plan(0, OperationKind::Copy, local.clone()))
@@ -293,7 +293,7 @@ fn cancellation_tokens_are_per_job_and_scheduler_limits_are_snapshotted() {
 fn pause_resume_cancel_retry_and_restart_states_are_explicit() {
     let limits = ResourceLimits::default();
     let clock = ManualClock::default();
-    let mut scheduler = Scheduler::with_clock(&limits, clock.clone());
+    let scheduler = Scheduler::with_clock(&limits, clock.clone());
     let local = provider("local-controls", ProviderLimits::unbounded());
     let paused = scheduler
         .enqueue(plan(100, OperationKind::Copy, local.clone()))

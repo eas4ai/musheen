@@ -27,6 +27,80 @@ impl StagingPath {
         })
     }
 
+    pub fn for_destination_with_nonce(
+        destination: &StorePath,
+        job_id: JobId,
+        generation: EventGeneration,
+        nonce: [u8; 16],
+    ) -> Result<Self, StagingError> {
+        let destination = destination
+            .as_unix_path()
+            .ok_or(StagingError::UnsupportedProvider)?;
+        let parent = destination.parent().ok_or(StagingError::MissingParent)?;
+        let nonce = nonce
+            .iter()
+            .fold(String::with_capacity(32), |mut output, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(output, "{byte:02x}");
+                output
+            });
+        let name = format!(
+            "{STAGING_PREFIX}{}-{}-{nonce}",
+            job_id.get(),
+            generation.get()
+        );
+        Ok(Self {
+            path: StorePath::from_unix_path(parent.join(name).into_os_string()),
+        })
+    }
+
+    #[must_use]
+    pub fn nonce(path: &StorePath) -> Option<[u8; 16]> {
+        let name = path.as_unix_path()?.file_name()?.as_bytes();
+        let suffix = name.strip_prefix(STAGING_PREFIX.as_bytes())?;
+        let mut parts = suffix.split(|byte| *byte == b'-');
+        let job = parts.next()?;
+        let generation = parts.next()?;
+        let encoded = parts.next()?;
+        if parts.next().is_some()
+            || parse_decimal(job).is_none_or(|value| value == 0)
+            || parse_decimal(generation).is_none()
+            || encoded.len() != 32
+        {
+            return None;
+        }
+        let mut nonce = [0_u8; 16];
+        for (index, pair) in encoded.chunks_exact(2).enumerate() {
+            nonce[index] = hex_digit(pair[0])?
+                .checked_mul(16)?
+                .checked_add(hex_digit(pair[1])?)?;
+        }
+        Some(nonce)
+    }
+
+    #[must_use]
+    pub fn is_for_destination(
+        path: &StorePath,
+        destination: &StorePath,
+        job_id: JobId,
+        generation: EventGeneration,
+        nonce: [u8; 16],
+    ) -> bool {
+        let Some(path_value) = path.as_unix_path() else {
+            return false;
+        };
+        let Some(destination_value) = destination.as_unix_path() else {
+            return false;
+        };
+        path_value.parent() == destination_value.parent()
+            && Self::nonce(path) == Some(nonce)
+            && path_value.file_name().is_some_and(|name| {
+                name.as_bytes().starts_with(
+                    format!("{STAGING_PREFIX}{}-{}-", job_id.get(), generation.get()).as_bytes(),
+                )
+            })
+    }
+
     #[must_use]
     pub const fn path(&self) -> &StorePath {
         &self.path
@@ -51,6 +125,14 @@ impl StagingPath {
         let (job, generation_with_separator) = suffix.split_at(separator);
         let generation = &generation_with_separator[1..];
         parse_decimal(job).is_some_and(|value| value > 0) && parse_decimal(generation).is_some()
+    }
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
