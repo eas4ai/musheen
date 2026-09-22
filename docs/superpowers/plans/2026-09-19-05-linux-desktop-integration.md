@@ -110,19 +110,19 @@ under `crates/musheen-desktop/src/bin/musheen-broker.rs`.
 create `crates/musheen-ui/src/terminal/{mod,drawer,renderer,input}.rs`;
 create tests in both crates.
 
-- [ ] Test cwd tracking per active pane, shell/profile selection, resize,
+- [x] Test cwd tracking per active pane, shell/profile selection, resize,
   Unicode wide cells, paste confirmation, OSC title, unsupported escape
   sequences, exit/restart, drawer focus, pane/tab switching, and completeness
   of the default keyboard map including F4.
-- [ ] Add million-line, long-line, and escape-heavy tests enforcing 10,000
+- [x] Add million-line, long-line, and escape-heavy tests enforcing 10,000
   lines and 64 MiB with oldest-complete-line truncation.
-- [ ] Implement PTY control with portable-pty, terminal state with
+- [x] Implement PTY control with portable-pty, terminal state with
   alacritty_terminal, and GPUI Kit rendering/input. The drawer is resizable,
   closable, keyboard reachable, and never blocks directory rendering.
-- [ ] Implement external terminal launch through configured desktop entries;
+- [x] Implement external terminal launch through configured desktop entries;
   refuse unrepresentable working directories with a named error.
-- [ ] Run terminal tests under normal exit, signal, and child-process load.
-- [ ] Commit with `feat(terminal): add external launch and embedded drawer`.
+- [x] Run terminal tests under normal exit, signal, and child-process load.
+- [x] Commit with `feat(terminal): add external launch and embedded drawer`.
 
 ### Task 7: Close the phase
 
