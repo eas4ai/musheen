@@ -126,11 +126,11 @@ create tests in both crates.
 
 ### Task 7: Close the phase
 
-- [ ] Run fake-service suites with every service absent, slow, disconnected,
+- [x] Run fake-service suites with every service absent, slow, disconnected,
   and restarted; the file manager must remain usable.
-- [ ] Run format, Clippy, workspace tests, locked release build, license audit,
+- [x] Run format, Clippy, workspace tests, locked release build, license audit,
   D-Bus introspection, accessibility, and visual baselines.
-- [ ] Review every process, URI, D-Bus, portal, credential, and privilege boundary
+- [x] Review every process, URI, D-Bus, portal, credential, and privilege boundary
   for injection and path-identity loss.
-- [ ] Perform the rule 13 self-review and commit with
+- [x] Perform the rule 13 self-review and commit with
   `test: close Linux desktop integration evidence`.
