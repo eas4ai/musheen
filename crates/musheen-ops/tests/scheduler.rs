@@ -2,8 +2,8 @@ use musheen_core::{
     CapabilityMatrix, CapabilityState, ProviderId, ResourceLimitConfig, ResourceLimits, StorePath,
 };
 use musheen_ops::{
-    Clock, JobState, OperationKind, OperationPlan, ProviderLimits, ProviderSnapshot, Scheduler,
-    WorkClass,
+    ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase, ArchiveOperationPlan, Clock, JobState,
+    OperationKind, OperationPlan, ProviderLimits, ProviderSnapshot, Scheduler, WorkClass,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +15,61 @@ impl ManualClock {
     fn set(&self, value: u64) {
         self.0.store(value, Ordering::Release);
     }
+}
+
+#[test]
+fn archive_jobs_use_scheduler_plans_conflicts_and_events() {
+    let limits = ResourceLimits::default();
+    let clock = ManualClock::default();
+    let mut scheduler = Scheduler::with_clock(&limits, clock.clone());
+    let local = provider("archive-local", ProviderLimits::unbounded());
+    let archive = ArchiveOperationPlan::create(
+        vec![
+            StorePath::from_unix_path("/data/one"),
+            StorePath::from_unix_path("/data/two"),
+        ],
+        StorePath::from_unix_path("/out/data.zip"),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .unwrap();
+    let archive_id = scheduler
+        .enqueue_archive(archive.clone(), local.clone())
+        .unwrap();
+    let conflicting = scheduler
+        .enqueue(
+            OperationPlan::new(
+                OperationKind::Move,
+                local,
+                Some(StorePath::from_unix_path("/data/two/child")),
+                StorePath::from_unix_path("/elsewhere/child"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let started = scheduler.start_ready().unwrap();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].id(), archive_id);
+    assert_eq!(started[0].archive_plan(), Some(&archive));
+    assert_eq!(scheduler.state(conflicting), Some(JobState::Queued));
+
+    clock.set(10);
+    scheduler
+        .emit_archive_phase(archive_id, ArchiveEventPhase::Preflight)
+        .unwrap();
+    scheduler
+        .emit_archive_phase(archive_id, ArchiveEventPhase::Encoding)
+        .unwrap();
+    assert_eq!(
+        scheduler
+            .events()
+            .iter()
+            .filter_map(|event| event.archive_phase_value())
+            .collect::<Vec<_>>(),
+        vec![ArchiveEventPhase::Preflight, ArchiveEventPhase::Encoding]
+    );
 }
 
 impl Clock for ManualClock {

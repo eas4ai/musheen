@@ -1,4 +1,5 @@
-use crate::{EventGeneration, JobId};
+use crate::{ArchiveOperationPlan, EventGeneration, JobId};
+use musheen_core::StorePath;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
@@ -27,6 +28,113 @@ pub enum Durability {
     BestEffort(Box<str>),
 }
 
+/// Stable filesystem identity recorded at an archive recovery boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchivePathIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    directory: bool,
+}
+
+impl ArchivePathIdentity {
+    #[must_use]
+    pub const fn new(
+        device: u64,
+        inode: u64,
+        size: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        directory: bool,
+    ) -> Self {
+        Self {
+            device,
+            inode,
+            size,
+            modified_seconds,
+            modified_nanoseconds,
+            directory,
+        }
+    }
+
+    #[must_use]
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+    #[must_use]
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+    #[must_use]
+    pub const fn modified_seconds(self) -> i64 {
+        self.modified_seconds
+    }
+    #[must_use]
+    pub const fn modified_nanoseconds(self) -> i64 {
+        self.modified_nanoseconds
+    }
+    #[must_use]
+    pub const fn is_directory(self) -> bool {
+        self.directory
+    }
+}
+
+/// Durable inputs and identities needed to recover one archive operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchiveCheckpoint {
+    plan: ArchiveOperationPlan,
+    staging: StorePath,
+    staging_identity: Option<ArchivePathIdentity>,
+    destination_before: Option<ArchivePathIdentity>,
+    destination_after: Option<ArchivePathIdentity>,
+}
+
+impl ArchiveCheckpoint {
+    #[must_use]
+    pub fn new(
+        plan: ArchiveOperationPlan,
+        staging: StorePath,
+        staging_identity: Option<ArchivePathIdentity>,
+        destination_before: Option<ArchivePathIdentity>,
+        destination_after: Option<ArchivePathIdentity>,
+    ) -> Self {
+        Self {
+            plan,
+            staging,
+            staging_identity,
+            destination_before,
+            destination_after,
+        }
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &ArchiveOperationPlan {
+        &self.plan
+    }
+    #[must_use]
+    pub const fn staging(&self) -> &StorePath {
+        &self.staging
+    }
+    #[must_use]
+    pub const fn staging_identity(&self) -> Option<ArchivePathIdentity> {
+        self.staging_identity
+    }
+    #[must_use]
+    pub const fn destination_before(&self) -> Option<ArchivePathIdentity> {
+        self.destination_before
+    }
+    #[must_use]
+    pub const fn destination_after(&self) -> Option<ArchivePathIdentity> {
+        self.destination_after
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalRecord {
     schema_version: u32,
@@ -35,6 +143,7 @@ pub struct JournalRecord {
     generation: EventGeneration,
     phase: JournalPhase,
     durability: Durability,
+    archive: Option<ArchiveCheckpoint>,
 }
 
 impl JournalRecord {
@@ -67,6 +176,11 @@ impl JournalRecord {
     pub const fn durability(&self) -> &Durability {
         &self.durability
     }
+
+    #[must_use]
+    pub const fn archive_checkpoint(&self) -> Option<&ArchiveCheckpoint> {
+        self.archive.as_ref()
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -77,6 +191,8 @@ struct RecordDocument {
     generation: u64,
     phase: JournalPhase,
     durability: Durability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive: Option<ArchiveCheckpoint>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -165,6 +281,28 @@ impl<S: JournalStorage> Journal<S> {
         phase: JournalPhase,
         durability: Durability,
     ) -> Result<JournalRecord, JournalError> {
+        self.append_record(job_id, generation, phase, durability, None)
+    }
+
+    pub fn append_archive(
+        &mut self,
+        job_id: JobId,
+        generation: EventGeneration,
+        phase: JournalPhase,
+        durability: Durability,
+        checkpoint: ArchiveCheckpoint,
+    ) -> Result<JournalRecord, JournalError> {
+        self.append_record(job_id, generation, phase, durability, Some(checkpoint))
+    }
+
+    fn append_record(
+        &mut self,
+        job_id: JobId,
+        generation: EventGeneration,
+        phase: JournalPhase,
+        durability: Durability,
+        archive: Option<ArchiveCheckpoint>,
+    ) -> Result<JournalRecord, JournalError> {
         let sequence = self.next_sequence.ok_or(JournalError::SequenceExhausted)?;
         let record = JournalRecord {
             schema_version: JOURNAL_SCHEMA_VERSION,
@@ -173,6 +311,7 @@ impl<S: JournalStorage> Journal<S> {
             generation,
             phase,
             durability,
+            archive,
         };
         let encoded = encode_record(&record)?;
         self.storage
@@ -341,6 +480,7 @@ fn encode_record(record: &JournalRecord) -> Result<Vec<u8>, JournalError> {
         generation: record.generation.get(),
         phase: record.phase,
         durability: record.durability.clone(),
+        archive: record.archive.clone(),
     };
     let payload = serde_json::to_string(&document).map_err(JournalError::Encode)?;
     let envelope = Envelope {
@@ -371,6 +511,7 @@ fn decode_record(line: &[u8]) -> Result<JournalRecord, JournalError> {
         generation: EventGeneration::new(document.generation),
         phase: document.phase,
         durability: document.durability,
+        archive: document.archive,
     })
 }
 

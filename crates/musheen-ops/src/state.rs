@@ -153,6 +153,14 @@ impl JobStateMachine {
             self.validate_progress(progress)?;
             self.progress = Some(progress);
         }
+        if event.archive_phase_value().is_some()
+            && !matches!(
+                self.state,
+                JobState::Running | JobState::Paused | JobState::Cancelling
+            )
+        {
+            return Err(StateError::ArchivePhaseUnavailable(self.state));
+        }
         self.last_event_at = event.occurred_at();
         Ok(())
     }
@@ -216,6 +224,7 @@ pub enum StateError {
     },
     RetryUnavailable(JobState),
     ProgressUnavailable(JobState),
+    ArchivePhaseUnavailable(JobState),
     GenerationExhausted,
     ClockMovedBackwards {
         previous: u64,
@@ -252,6 +261,12 @@ impl fmt::Display for StateError {
             Self::RetryUnavailable(state) => write!(formatter, "cannot retry a {state:?} job"),
             Self::ProgressUnavailable(state) => {
                 write!(formatter, "cannot report progress for a {state:?} job")
+            }
+            Self::ArchivePhaseUnavailable(state) => {
+                write!(
+                    formatter,
+                    "cannot report an archive phase for a {state:?} job"
+                )
             }
             Self::GenerationExhausted => formatter.write_str("job event generation is exhausted"),
             Self::ClockMovedBackwards { previous, actual } => write!(

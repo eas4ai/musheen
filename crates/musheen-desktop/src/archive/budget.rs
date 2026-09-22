@@ -57,19 +57,46 @@ impl ArchiveBudget {
         }
     }
 
+    /// Starts a new accounting phase while retaining the shared live-memory total.
+    #[must_use]
+    pub fn next_phase(&self) -> Self {
+        Self {
+            limits: self.limits.clone(),
+            entries: 0,
+            expanded_bytes: 0,
+            temporary_bytes: 0,
+            memory_bytes: Arc::clone(&self.memory_bytes),
+        }
+    }
+
     pub fn charge_entry(&mut self) -> Result<(), ArchiveOperationError> {
         self.entries = checked_charge("entries", self.entries, 1, self.limits.max_entries)?;
         Ok(())
     }
 
     pub fn check_path(&self, path: &[u8]) -> Result<(), ArchiveOperationError> {
-        let value = u64::try_from(path.len()).unwrap_or(u64::MAX);
+        self.check_path_len(path.len())
+    }
+
+    pub fn check_path_len(&self, length: usize) -> Result<(), ArchiveOperationError> {
+        let value = u64::try_from(length).unwrap_or(u64::MAX);
         let maximum = u64::try_from(self.limits.max_path_bytes).unwrap_or(u64::MAX);
         if value > maximum {
             return Err(ArchiveOperationError::LimitExceeded {
                 resource: "path bytes",
                 value,
                 maximum,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn check_temporary(&self, bytes: u64) -> Result<(), ArchiveOperationError> {
+        if bytes > self.limits.max_temporary_bytes {
+            return Err(ArchiveOperationError::LimitExceeded {
+                resource: "temporary bytes",
+                value: bytes,
+                maximum: self.limits.max_temporary_bytes,
             });
         }
         Ok(())
@@ -104,6 +131,47 @@ impl ArchiveBudget {
             });
         }
         self.expanded_bytes = next;
+        Ok(())
+    }
+
+    pub fn check_expanded(&self, bytes: u64) -> Result<(), ArchiveOperationError> {
+        if bytes > self.limits.max_expanded_bytes {
+            return Err(ArchiveOperationError::LimitExceeded {
+                resource: "expanded bytes",
+                value: bytes,
+                maximum: self.limits.max_expanded_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn charge_expanded_bytes(&mut self, bytes: u64) -> Result<(), ArchiveOperationError> {
+        let next =
+            self.expanded_bytes
+                .checked_add(bytes)
+                .ok_or(ArchiveOperationError::LimitExceeded {
+                    resource: "expanded bytes",
+                    value: u64::MAX,
+                    maximum: self.limits.max_expanded_bytes,
+                })?;
+        self.check_expanded(next)?;
+        self.expanded_bytes = next;
+        Ok(())
+    }
+
+    pub fn check_compression_ratio(
+        &self,
+        expanded_bytes: u64,
+        compressed_bytes: u64,
+    ) -> Result<(), ArchiveOperationError> {
+        let maximum = compressed_bytes.saturating_mul(self.limits.max_compression_ratio);
+        if expanded_bytes > maximum {
+            return Err(ArchiveOperationError::LimitExceeded {
+                resource: "compression ratio",
+                value: expanded_bytes,
+                maximum,
+            });
+        }
         Ok(())
     }
 
@@ -210,6 +278,7 @@ pub enum ArchiveOperationError {
     InvalidArchive,
     Io,
     Journal,
+    Engine,
 }
 
 impl fmt::Display for ArchiveOperationError {
@@ -238,11 +307,26 @@ impl fmt::Display for ArchiveOperationError {
             Self::InvalidArchive => formatter.write_str("the archive is invalid"),
             Self::Io => formatter.write_str("the archive operation failed"),
             Self::Journal => formatter.write_str("the archive journal could not be updated"),
+            Self::Engine => formatter.write_str("the operation engine rejected the archive event"),
         }
     }
 }
 
 impl Error for ArchiveOperationError {}
+
+impl ArchiveOperationError {
+    /// Maps an operating-system I/O failure at an archive filesystem boundary.
+    #[must_use]
+    pub fn from_io_error(error: &std::io::Error) -> Self {
+        if error.raw_os_error() == Some(28) {
+            Self::NoSpace
+        } else if error.kind() == std::io::ErrorKind::Interrupted {
+            Self::Cancelled
+        } else {
+            Self::Io
+        }
+    }
+}
 
 impl From<ArchiveError> for ArchiveOperationError {
     fn from(error: ArchiveError) -> Self {
@@ -252,7 +336,11 @@ impl From<ArchiveError> for ArchiveOperationError {
                 value,
                 maximum,
             } => Self::LimitExceeded {
-                resource,
+                resource: match resource {
+                    "nested archive bytes" => "temporary bytes",
+                    "nested archives" => "archive nesting",
+                    other => other,
+                },
                 value: u64::try_from(value).unwrap_or(u64::MAX),
                 maximum: u64::try_from(maximum).unwrap_or(u64::MAX),
             },
@@ -278,11 +366,5 @@ impl From<musheen_core::StoreError> for ArchiveOperationError {
 }
 
 pub(crate) fn map_io(error: &std::io::Error) -> ArchiveOperationError {
-    if error.raw_os_error() == Some(28) {
-        ArchiveOperationError::NoSpace
-    } else if error.kind() == std::io::ErrorKind::Interrupted {
-        ArchiveOperationError::Cancelled
-    } else {
-        ArchiveOperationError::Io
-    }
+    ArchiveOperationError::from_io_error(error)
 }

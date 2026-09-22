@@ -31,8 +31,8 @@ pub use delete::{
 pub use event::{ArchiveEventPhase, JobEvent, Progress, ProgressError, ProgressUnit};
 pub use job::{EventGeneration, JobId};
 pub use journal::{
-    CorruptSource, Durability, Journal, JournalError, JournalPhase, JournalRecord, JournalStorage,
-    StorageAction,
+    ArchiveCheckpoint, ArchivePathIdentity, CorruptSource, Durability, Journal, JournalError,
+    JournalPhase, JournalRecord, JournalStorage, StorageAction,
 };
 pub use link::{
     HardLinkRequest, LinkProvider, SymbolicLinkRequest, execute_hard_link, execute_symbolic_link,

@@ -4,21 +4,22 @@ use super::budget::{
 use super::{ArchivePassword, ArchivePasswordProvider, PasswordRequest};
 use musheen_core::CancellationToken;
 use musheen_ops::{
-    ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, Durability, EventGeneration, JobId,
-    Journal, JournalPhase, JournalStorage, OperationKind, StagingPath,
+    ArchiveCheckpoint, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
+    ArchiveOperationPlan, ArchivePathIdentity, Clock, Durability, EventGeneration, JobId, Journal,
+    JournalPhase, JournalStorage, OperationKind, ScheduledJob, Scheduler, StagingPath,
 };
 use nix::libc::O_NOFOLLOW;
 use sevenz_rust2::encoder_options::AesEncoderOptions;
 use sevenz_rust2::{
     ArchiveEntry as SevenEntry, ArchiveWriter as SevenWriter, EncoderMethod, Password,
 };
-use std::collections::HashSet;
-use std::ffi::OsString;
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use zip::write::SimpleFileOptions;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,7 +28,51 @@ pub enum ArchiveOperationOutcome {
     Skipped,
 }
 
-pub fn execute_archive_operation<S: JournalStorage>(
+pub fn execute_scheduled_archive_operation<C: Clock, S: JournalStorage>(
+    scheduler: &mut Scheduler<C>,
+    job: &ScheduledJob,
+    limits: &ArchiveOperationLimits,
+    passwords: &dyn ArchivePasswordProvider,
+    journal: &mut Journal<S>,
+) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
+    let plan = job
+        .archive_plan()
+        .ok_or(ArchiveOperationError::InvalidArchive)?
+        .clone();
+    let job_id = job.id();
+    let generation = job.generation();
+    let cancellation = job.cancellation().clone();
+    let mut report_phase = |phase| {
+        scheduler
+            .emit_archive_phase(job_id, phase)
+            .map_err(|_| ArchiveOperationError::Engine)
+    };
+    let result = execute_archive_operation(
+        &plan,
+        limits,
+        passwords,
+        &cancellation,
+        journal,
+        job_id,
+        generation,
+        &mut report_phase,
+    );
+    match &result {
+        Ok(_) => scheduler
+            .complete(job_id)
+            .map_err(|_| ArchiveOperationError::Engine)?,
+        Err(ArchiveOperationError::Cancelled) => scheduler
+            .finish_cancel(job_id)
+            .map_err(|_| ArchiveOperationError::Engine)?,
+        Err(_) => scheduler
+            .fail(job_id)
+            .map_err(|_| ArchiveOperationError::Engine)?,
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_archive_operation<S: JournalStorage>(
     plan: &ArchiveOperationPlan,
     limits: &ArchiveOperationLimits,
     passwords: &dyn ArchivePasswordProvider,
@@ -35,6 +80,7 @@ pub fn execute_archive_operation<S: JournalStorage>(
     journal: &mut Journal<S>,
     job_id: JobId,
     generation: EventGeneration,
+    report_phase: &mut dyn FnMut(ArchiveEventPhase) -> Result<(), ArchiveOperationError>,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     match plan.kind() {
         OperationKind::Compress => run_archive_creation(
@@ -45,6 +91,7 @@ pub fn execute_archive_operation<S: JournalStorage>(
             journal,
             job_id,
             generation,
+            report_phase,
         ),
         OperationKind::Extract => super::extract::execute_extract(
             plan,
@@ -54,6 +101,7 @@ pub fn execute_archive_operation<S: JournalStorage>(
             journal,
             job_id,
             generation,
+            report_phase,
         ),
         _ => Err(ArchiveOperationError::InvalidArchive),
     }
@@ -77,6 +125,7 @@ enum CreateEntryKind {
     File,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_archive_creation<S: JournalStorage>(
     plan: &ArchiveOperationPlan,
     limits: &ArchiveOperationLimits,
@@ -85,27 +134,60 @@ fn run_archive_creation<S: JournalStorage>(
     journal: &mut Journal<S>,
     job_id: JobId,
     generation: EventGeneration,
+    report_phase: &mut dyn FnMut(ArchiveEventPhase) -> Result<(), ArchiveOperationError>,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
+    report_phase(ArchiveEventPhase::Preflight)?;
     cancellation.check()?;
+    let budget = Rc::new(RefCell::new(ArchiveBudget::new(limits.clone())));
+    let plan_path_bytes = plan
+        .sources()
+        .iter()
+        .chain(std::iter::once(plan.destination()))
+        .map(|path| {
+            path.as_unix_path()
+                .map_or(0, |value| value.as_os_str().len())
+        })
+        .sum::<usize>();
+    let _plan_paths_memory = budget
+        .borrow()
+        .reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
     let destination = local_path(plan.destination())?;
     if let Some(outcome) = existing_destination_outcome(&destination, plan.conflict_policy())? {
         return Ok(outcome);
     }
-    let mut preflight_limits = limits.clone();
-    preflight_limits.max_memory_bytes /= 2;
-    let mut budget = ArchiveBudget::new(preflight_limits);
-    let entries = collect_create_entries(plan, &mut budget, cancellation)?;
-    append_phase(journal, job_id, generation, JournalPhase::Planned)?;
-
+    let entries = collect_create_entries(plan, &mut budget.borrow_mut(), cancellation)?;
     let staging = staging_path(plan, job_id, generation)?;
+    let destination_before = path_identity(&destination)?;
+    append_archive_phase(
+        journal,
+        job_id,
+        generation,
+        JournalPhase::Planned,
+        plan,
+        &staging,
+        destination_before,
+        None,
+    )?;
     let mut published = false;
     let result = (|| {
         let stage_file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&staging)
             .map_err(|error| map_io(&error))?;
-        append_phase(journal, job_id, generation, JournalPhase::StagingCreated)?;
+        report_phase(ArchiveEventPhase::Staging)?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::StagingCreated,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        )?;
+        report_phase(ArchiveEventPhase::Encoding)?;
         write_archive(
             stage_file,
             &entries,
@@ -113,33 +195,95 @@ fn run_archive_creation<S: JournalStorage>(
             plan.encrypted(),
             passwords,
             cancellation,
+            Rc::clone(&budget),
         )?;
         sync_file(&staging)?;
-        append_phase(journal, job_id, generation, JournalPhase::DataCopied)?;
-        append_phase(journal, job_id, generation, JournalPhase::MetadataApplied)?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::DataCopied,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        )?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::MetadataApplied,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        )?;
+        report_phase(ArchiveEventPhase::Publishing)?;
         let outcome = publish_staging(&staging, &destination, plan.conflict_policy())?;
         if outcome == ArchiveOperationOutcome::Skipped {
             remove_owned(&staging)?;
-            append_phase(journal, job_id, generation, JournalPhase::RolledBack)?;
+            append_archive_phase(
+                journal,
+                job_id,
+                generation,
+                JournalPhase::RolledBack,
+                plan,
+                &staging,
+                destination_before,
+                None,
+            )?;
             return Ok(outcome);
         }
         published = true;
         sync_parent(&destination)?;
-        append_phase(
+        let destination_after = path_identity(&destination)?;
+        append_archive_phase(
             journal,
             job_id,
             generation,
             JournalPhase::DestinationPublished,
+            plan,
+            &staging,
+            destination_before,
+            destination_after,
         )?;
+        report_phase(ArchiveEventPhase::Cleaning)?;
         remove_owned(&staging)?;
-        append_phase(journal, job_id, generation, JournalPhase::StagingCleaned)?;
-        append_phase(journal, job_id, generation, JournalPhase::Completed)?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::StagingCleaned,
+            plan,
+            &staging,
+            destination_before,
+            destination_after,
+        )?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::Completed,
+            plan,
+            &staging,
+            destination_before,
+            destination_after,
+        )?;
         Ok(ArchiveOperationOutcome::Published)
     })();
 
     if result.is_err() && !published && staging.exists() {
         let _ = remove_owned(&staging);
-        let _ = append_phase(journal, job_id, generation, JournalPhase::RolledBack);
+        let _ = append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::RolledBack,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        );
     }
     result
 }
@@ -150,8 +294,8 @@ fn collect_create_entries(
     cancellation: &CancellationToken,
 ) -> Result<Vec<CreateEntry>, ArchiveOperationError> {
     let mut entries = Vec::new();
-    let mut seen = HashSet::new();
     let mut total_bytes = 0_u64;
+    let mut projected_temporary = 0_u64;
     for source in plan.sources() {
         let source = local_path(source)?;
         let root_name = source.file_name().filter(|name| !name.is_empty()).ok_or(
@@ -173,17 +317,30 @@ fn collect_create_entries(
                 .path()
                 .strip_prefix(&source)
                 .map_err(|_| ArchiveOperationError::UnsafePath("source escaped its root"))?;
-            let mut archive_name = root_name.as_bytes().to_vec();
-            if !relative.as_os_str().is_empty() {
+            let relative_bytes = relative.as_os_str().as_bytes();
+            let archive_name_len = root_name
+                .as_bytes()
+                .len()
+                .saturating_add((!relative_bytes.is_empty()) as usize)
+                .saturating_add(relative_bytes.len());
+            budget.check_path_len(archive_name_len)?;
+            let allocation_bytes = archive_name_len
+                .saturating_add(walked.path().as_os_str().as_bytes().len())
+                .saturating_add(std::mem::size_of::<CreateEntry>())
+                .saturating_add(96);
+            let memory =
+                budget.reserve_memory(u64::try_from(allocation_bytes).unwrap_or(u64::MAX))?;
+            entries
+                .try_reserve(1)
+                .map_err(|_| ArchiveOperationError::Io)?;
+            let mut archive_name = Vec::with_capacity(archive_name_len);
+            archive_name.extend_from_slice(root_name.as_bytes());
+            if !relative_bytes.is_empty() {
                 archive_name.push(b'/');
-                archive_name.extend_from_slice(relative.as_os_str().as_bytes());
+                archive_name.extend_from_slice(relative_bytes);
             }
-            budget.check_path(&archive_name)?;
             let archive_name =
                 super::ArchivePath::normalize_bytes(&archive_name, super::ArchivePath::MAX_BYTES)?;
-            if !seen.insert(archive_name.clone()) {
-                return Err(ArchiveOperationError::InvalidArchive);
-            }
             budget.charge_entry()?;
             let size = if matches!(kind, CreateEntryKind::File) {
                 metadata.len()
@@ -202,10 +359,8 @@ fn collect_create_entries(
             let entry_temporary = size
                 .saturating_add(name_bytes.saturating_mul(2))
                 .saturating_add(4 * 1_024);
-            budget.charge_temporary(entry_temporary)?;
-            let memory = budget.reserve_memory(
-                u64::try_from(archive_name.len().saturating_add(128)).unwrap_or(u64::MAX),
-            )?;
+            projected_temporary = projected_temporary.saturating_add(entry_temporary);
+            budget.check_temporary(projected_temporary)?;
             entries.push(CreateEntry {
                 source: walked.path().to_path_buf(),
                 archive_name,
@@ -219,8 +374,15 @@ fn collect_create_entries(
             });
         }
     }
+    entries.sort_by(|left, right| left.archive_name.cmp(&right.archive_name));
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].archive_name == pair[1].archive_name)
+    {
+        return Err(ArchiveOperationError::InvalidArchive);
+    }
     budget.charge_expanded(total_bytes, total_bytes.max(1))?;
-    budget.charge_temporary(1_024 * 1_024)?;
+    budget.check_temporary(projected_temporary.saturating_add(1_024 * 1_024))?;
     Ok(entries)
 }
 
@@ -231,8 +393,12 @@ fn write_archive(
     encrypted: bool,
     passwords: &dyn ArchivePasswordProvider,
     cancellation: &CancellationToken,
+    budget: Rc<RefCell<ArchiveBudget>>,
 ) -> Result<(), ArchiveOperationError> {
-    match codec {
+    let _codec_memory = budget.borrow().reserve_memory(codec_memory_bytes(codec))?;
+    let state = Rc::new(RefCell::new(None));
+    let stage = BudgetedWriteSeek::new(stage, budget, Rc::clone(&state));
+    let result = match codec {
         ArchiveCodec::Zip => write_zip(stage, entries, encrypted, passwords, cancellation),
         ArchiveCodec::Tar => write_tar(stage, entries, TarEncoder::Plain, cancellation),
         ArchiveCodec::TarGzip => write_tar(stage, entries, TarEncoder::Gzip, cancellation),
@@ -240,6 +406,19 @@ fn write_archive(
         ArchiveCodec::SevenZip => {
             write_seven_zip(stage, entries, encrypted, passwords, cancellation)
         }
+    };
+    if let Some(error) = state.borrow_mut().take() {
+        return Err(error);
+    }
+    result
+}
+
+const fn codec_memory_bytes(codec: ArchiveCodec) -> u64 {
+    match codec {
+        ArchiveCodec::Zip | ArchiveCodec::Tar => 256 * 1_024,
+        ArchiveCodec::TarGzip => 2 * 1_024 * 1_024,
+        ArchiveCodec::TarZstd => 16 * 1_024 * 1_024,
+        ArchiveCodec::SevenZip => 32 * 1_024 * 1_024,
     }
 }
 
@@ -257,8 +436,67 @@ fn requested_password(
         .ok_or(ArchiveOperationError::PasswordRequired)
 }
 
+struct BudgetedWriteSeek {
+    inner: File,
+    budget: Rc<RefCell<ArchiveBudget>>,
+    error: Rc<RefCell<Option<ArchiveOperationError>>>,
+    position: u64,
+    high_water: u64,
+}
+
+impl BudgetedWriteSeek {
+    fn new(
+        inner: File,
+        budget: Rc<RefCell<ArchiveBudget>>,
+        error: Rc<RefCell<Option<ArchiveOperationError>>>,
+    ) -> Self {
+        Self {
+            inner,
+            budget,
+            error,
+            position: 0,
+            high_water: 0,
+        }
+    }
+
+    fn sync_all(self) -> Result<(), ArchiveOperationError> {
+        self.inner.sync_all().map_err(|error| map_io(&error))
+    }
+}
+
+impl Write for BudgetedWriteSeek {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let requested = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let end = self.position.saturating_add(requested);
+        let growth = end.saturating_sub(self.high_water);
+        if growth > 0
+            && let Err(error) = self.budget.borrow_mut().charge_temporary(growth)
+        {
+            *self.error.borrow_mut() = Some(error);
+            return Err(io::Error::other("archive temporary-space budget exceeded"));
+        }
+        let written = self.inner.write(bytes)?;
+        self.position = self
+            .position
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        self.high_water = self.high_water.max(end);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Seek for BudgetedWriteSeek {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.position = self.inner.seek(position)?;
+        Ok(self.position)
+    }
+}
+
 fn write_zip(
-    stage: File,
+    stage: BudgetedWriteSeek,
     entries: &[CreateEntry],
     encrypted: bool,
     passwords: &dyn ArchivePasswordProvider,
@@ -303,8 +541,7 @@ fn write_zip(
             }
         }
     }
-    let file = writer.finish().map_err(map_zip_error)?;
-    file.sync_all().map_err(|error| map_io(&error))
+    writer.finish().map_err(map_zip_error)?.sync_all()
 }
 
 enum TarEncoder {
@@ -314,33 +551,23 @@ enum TarEncoder {
 }
 
 fn write_tar(
-    stage: File,
+    stage: BudgetedWriteSeek,
     entries: &[CreateEntry],
     encoder: TarEncoder,
     cancellation: &CancellationToken,
 ) -> Result<(), ArchiveOperationError> {
     match encoder {
-        TarEncoder::Plain => write_tar_stream(stage, entries, cancellation)?
-            .sync_all()
-            .map_err(|error| map_io(&error)),
+        TarEncoder::Plain => write_tar_stream(stage, entries, cancellation)?.sync_all(),
         TarEncoder::Gzip => {
             let encoder = flate2::write::GzEncoder::new(stage, flate2::Compression::default());
             let encoder = write_tar_stream(encoder, entries, cancellation)?;
-            encoder
-                .finish()
-                .map_err(|error| map_io(&error))?
-                .sync_all()
-                .map_err(|error| map_io(&error))
+            encoder.finish().map_err(|error| map_io(&error))?.sync_all()
         }
         TarEncoder::Zstd => {
             let encoder =
                 zstd::stream::write::Encoder::new(stage, 0).map_err(|error| map_io(&error))?;
             let encoder = write_tar_stream(encoder, entries, cancellation)?;
-            encoder
-                .finish()
-                .map_err(|error| map_io(&error))?
-                .sync_all()
-                .map_err(|error| map_io(&error))
+            encoder.finish().map_err(|error| map_io(&error))?.sync_all()
         }
     }
 }
@@ -354,7 +581,7 @@ fn write_tar_stream<W: Write>(
     for entry in entries {
         cancellation.check()?;
         verify_entry(entry)?;
-        let name = PathBuf::from(OsString::from_vec(entry.archive_name.clone()));
+        let name = Path::new(std::ffi::OsStr::from_bytes(&entry.archive_name));
         let mut header = tar::Header::new_gnu();
         header.set_mode(if matches!(entry.kind, CreateEntryKind::Directory) {
             0o755
@@ -394,7 +621,7 @@ fn write_tar_stream<W: Write>(
 }
 
 fn write_seven_zip(
-    stage: File,
+    stage: BudgetedWriteSeek,
     entries: &[CreateEntry],
     encrypted: bool,
     passwords: &dyn ArchivePasswordProvider,
@@ -441,11 +668,7 @@ fn write_seven_zip(
             }
         }
     }
-    writer
-        .finish()
-        .map_err(|error| map_io(&error))?
-        .sync_all()
-        .map_err(|error| map_io(&error))
+    writer.finish().map_err(|error| map_io(&error))?.sync_all()
 }
 
 fn map_zip_error(error: zip::result::ZipError) -> ArchiveOperationError {
@@ -531,16 +754,55 @@ impl Read for CancellableReader<'_> {
     }
 }
 
-pub(crate) fn append_phase<S: JournalStorage>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_archive_phase<S: JournalStorage>(
     journal: &mut Journal<S>,
     job_id: JobId,
     generation: EventGeneration,
     phase: JournalPhase,
+    plan: &ArchiveOperationPlan,
+    staging: &Path,
+    destination_before: Option<ArchivePathIdentity>,
+    destination_after: Option<ArchivePathIdentity>,
 ) -> Result<(), ArchiveOperationError> {
+    let checkpoint = ArchiveCheckpoint::new(
+        plan.clone(),
+        musheen_core::StorePath::from_unix_path(staging.as_os_str()),
+        path_identity(staging)?,
+        destination_before,
+        destination_after,
+    );
     journal
-        .append(job_id, generation, phase, Durability::CrashDurable)
+        .append_archive(
+            job_id,
+            generation,
+            phase,
+            Durability::CrashDurable,
+            checkpoint,
+        )
         .map(|_| ())
         .map_err(|_| ArchiveOperationError::Journal)
+}
+
+pub(crate) fn path_identity(
+    path: &Path,
+) -> Result<Option<ArchivePathIdentity>, ArchiveOperationError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_io(&error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ArchiveOperationError::UnsupportedFileType);
+    }
+    Ok(Some(ArchivePathIdentity::new(
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.is_dir(),
+    )))
 }
 
 pub(crate) fn staging_path(

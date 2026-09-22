@@ -1,8 +1,60 @@
 use musheen_core::StorePath;
 use musheen_ops::{
-    ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase, ArchiveOperationPlan, EventGeneration,
-    JobEvent, JobId, JournalPhase, RecoveryContext, RecoveryDecision, decide_recovery,
+    ArchiveCheckpoint, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
+    ArchiveOperationPlan, ArchivePathIdentity, CorruptSource, Durability, EventGeneration,
+    JobEvent, JobId, Journal, JournalPhase, JournalStorage, RecoveryContext, RecoveryDecision,
+    decide_recovery,
 };
+use std::io;
+
+#[derive(Default)]
+struct PersistentMemoryStorage {
+    snapshot: Vec<u8>,
+    journal: Vec<u8>,
+    temporary: Vec<u8>,
+}
+
+impl JournalStorage for PersistentMemoryStorage {
+    fn read_snapshot(&mut self) -> io::Result<Vec<u8>> {
+        Ok(self.snapshot.clone())
+    }
+    fn read_journal(&mut self) -> io::Result<Vec<u8>> {
+        Ok(self.journal.clone())
+    }
+    fn append_journal(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.journal.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn sync_journal(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn write_snapshot_temporary(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.temporary = bytes.to_vec();
+        Ok(())
+    }
+    fn sync_snapshot_temporary(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn publish_snapshot(&mut self) -> io::Result<()> {
+        self.snapshot.clone_from(&self.temporary);
+        Ok(())
+    }
+    fn sync_parent(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn reset_journal(&mut self) -> io::Result<()> {
+        self.journal.clear();
+        Ok(())
+    }
+    fn quarantine(
+        &mut self,
+        _source: CorruptSource,
+        _valid_prefix: &[u8],
+        _corrupt_suffix: &[u8],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 fn path(value: &str) -> StorePath {
     StorePath::from_unix_path(value)
@@ -101,4 +153,43 @@ fn restart_recovery_never_auto_publishes_unfinished_archive_staging() {
         decide_recovery(JournalPhase::Completed, published),
         RecoveryDecision::NoAction
     );
+}
+
+#[test]
+fn archive_checkpoint_survives_a_fresh_journal_instance() {
+    let plan = ArchiveOperationPlan::extract(
+        path("/data/in.zip"),
+        path("/data/out"),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Replace,
+        false,
+    )
+    .expect("archive plan");
+    let identity = ArchivePathIdentity::new(1, 2, 3, 4, 5, true);
+    let checkpoint = ArchiveCheckpoint::new(
+        plan.clone(),
+        path("/data/.musheen-stage-v1-9-0"),
+        Some(identity),
+        None,
+        Some(identity),
+    );
+    let mut first = Journal::open(PersistentMemoryStorage::default()).expect("journal opens");
+    first
+        .append_archive(
+            JobId::new(9).expect("job id"),
+            EventGeneration::new(0),
+            JournalPhase::DestinationPublished,
+            Durability::CrashDurable,
+            checkpoint,
+        )
+        .expect("checkpoint persists");
+    let storage = first.into_storage();
+
+    let reopened = Journal::open(storage).expect("fresh journal instance reopens");
+    let recovered = reopened.records()[0]
+        .archive_checkpoint()
+        .expect("archive checkpoint survives");
+    assert_eq!(recovered.plan(), &plan);
+    assert_eq!(recovered.staging_identity(), Some(identity));
+    assert_eq!(recovered.destination_after(), Some(identity));
 }

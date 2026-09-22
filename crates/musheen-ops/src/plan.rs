@@ -2,6 +2,7 @@ use crate::JobState;
 use musheen_core::{
     CapabilityKind, CapabilityMatrix, CapabilityState, ItemId, ProviderId, StorePath,
 };
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 
@@ -12,7 +13,7 @@ pub enum WorkClass {
     HashOrPreview,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum OperationKind {
     Copy,
     Move,
@@ -33,7 +34,7 @@ pub enum OperationKind {
     Preview,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum ArchiveCodec {
     Zip,
     Tar,
@@ -49,7 +50,7 @@ impl ArchiveCodec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum ArchiveConflictPolicy {
     Fail,
     Skip,
@@ -57,7 +58,7 @@ pub enum ArchiveConflictPolicy {
 }
 
 /// A validated archive request submitted to the operation engine.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArchiveOperationPlan {
     kind: OperationKind,
     sources: Vec<StorePath>,
@@ -157,6 +158,14 @@ impl ArchiveOperationPlan {
     #[must_use]
     pub const fn encrypted(&self) -> bool {
         self.encrypted
+    }
+
+    /// Converts this archive request into a normal operation-engine plan.
+    pub fn into_operation_plan(
+        self,
+        provider: ProviderSnapshot,
+    ) -> Result<OperationPlan, PlanError> {
+        OperationPlan::from_archive(provider, self)
     }
 }
 
@@ -306,6 +315,7 @@ pub struct OperationPlan {
     source: Option<StorePath>,
     destination: StorePath,
     inverse: Option<Box<InverseTemplate>>,
+    archive: Option<Box<ArchiveOperationPlan>>,
 }
 
 impl OperationPlan {
@@ -327,7 +337,18 @@ impl OperationPlan {
             source,
             destination,
             inverse: None,
+            archive: None,
         })
+    }
+
+    pub fn from_archive(
+        provider: ProviderSnapshot,
+        archive: ArchiveOperationPlan,
+    ) -> Result<Self, PlanError> {
+        let source = archive.sources.first().cloned();
+        let mut plan = Self::new(archive.kind, provider, source, archive.destination.clone())?;
+        plan.archive = Some(Box::new(archive));
+        Ok(plan)
     }
 
     #[must_use]
@@ -359,6 +380,11 @@ impl OperationPlan {
     #[must_use]
     pub const fn destination(&self) -> &StorePath {
         &self.destination
+    }
+
+    #[must_use]
+    pub fn archive(&self) -> Option<&ArchiveOperationPlan> {
+        self.archive.as_deref()
     }
 
     #[must_use]
@@ -396,35 +422,34 @@ impl OperationPlan {
         let self_writes = self.write_set();
         let other_reads = other.read_set();
         let other_writes = other.write_set();
-        self_writes.iter().flatten().any(|write| {
+        self_writes.iter().any(|write| {
             other_reads
                 .iter()
                 .chain(other_writes.iter())
-                .flatten()
                 .any(|path| paths_overlap(write, path))
-        }) || other_writes.iter().flatten().any(|write| {
-            self_reads
-                .iter()
-                .flatten()
-                .any(|path| paths_overlap(write, path))
-        })
+        }) || other_writes
+            .iter()
+            .any(|write| self_reads.iter().any(|path| paths_overlap(write, path)))
     }
 
-    fn read_set(&self) -> [Option<&StorePath>; 1] {
-        [self.source.as_ref()]
-    }
-
-    fn write_set(&self) -> [Option<&StorePath>; 2] {
-        if self.class() == WorkClass::HashOrPreview {
-            return [None, None];
+    fn read_set(&self) -> Vec<&StorePath> {
+        if let Some(archive) = self.archive() {
+            return archive.sources.iter().collect();
         }
-        [
-            Some(&self.destination),
-            self.kind
-                .source_is_mutated()
-                .then_some(self.source.as_ref())
-                .flatten(),
-        ]
+        self.source.iter().collect()
+    }
+
+    fn write_set(&self) -> Vec<&StorePath> {
+        if self.class() == WorkClass::HashOrPreview {
+            return Vec::new();
+        }
+        let mut writes = vec![&self.destination];
+        if self.kind.source_is_mutated()
+            && let Some(source) = &self.source
+        {
+            writes.push(source);
+        }
+        writes
     }
 }
 

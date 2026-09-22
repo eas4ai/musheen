@@ -1,6 +1,6 @@
 use crate::{
-    EventGeneration, JobEvent, JobId, JobState, JobStateMachine, OperationPlan, StateError,
-    WorkClass,
+    ArchiveEventPhase, ArchiveOperationPlan, EventGeneration, JobEvent, JobId, JobState,
+    JobStateMachine, OperationPlan, PlanError, ProviderSnapshot, StateError, WorkClass,
 };
 use musheen_core::{CancellationToken, ResourceLimits};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -49,6 +49,11 @@ impl ScheduledJob {
     #[must_use]
     pub const fn plan(&self) -> &OperationPlan {
         &self.plan
+    }
+
+    #[must_use]
+    pub fn archive_plan(&self) -> Option<&ArchiveOperationPlan> {
+        self.plan.archive()
     }
 
     #[must_use]
@@ -130,6 +135,14 @@ impl<C: Clock> Scheduler<C> {
         self.transition(id, JobState::Queued)?;
         self.queued.push_back(id);
         Ok(id)
+    }
+
+    pub fn enqueue_archive(
+        &mut self,
+        plan: ArchiveOperationPlan,
+        provider: ProviderSnapshot,
+    ) -> Result<JobId, SchedulerError> {
+        self.enqueue(plan.into_operation_plan(provider)?)
     }
 
     pub fn start_ready(&mut self) -> Result<Vec<ScheduledJob>, SchedulerError> {
@@ -277,6 +290,26 @@ impl<C: Clock> Scheduler<C> {
         &self.events
     }
 
+    /// Publishes an archive phase through the same ordered event stream as state changes.
+    pub fn emit_archive_phase(
+        &mut self,
+        id: JobId,
+        phase: ArchiveEventPhase,
+    ) -> Result<(), SchedulerError> {
+        let event = {
+            let record = self
+                .jobs
+                .get_mut(&id)
+                .ok_or(SchedulerError::UnknownJob(id))?;
+            let event =
+                JobEvent::archive_phase(id, record.state.generation(), self.clock.now(), phase);
+            record.state.apply(event.clone())?;
+            event
+        };
+        self.events.push(event);
+        Ok(())
+    }
+
     fn can_start(&self, id: JobId) -> Result<bool, SchedulerError> {
         let candidate = self.jobs.get(&id).ok_or(SchedulerError::UnknownJob(id))?;
         let class = candidate.plan.class();
@@ -353,6 +386,7 @@ pub enum SchedulerError {
     NotRunning(JobId),
     JobIdExhausted,
     State(StateError),
+    InvalidPlan(PlanError),
 }
 
 impl fmt::Display for SchedulerError {
@@ -362,6 +396,7 @@ impl fmt::Display for SchedulerError {
             Self::NotRunning(id) => write!(formatter, "job {} is not running", id.get()),
             Self::JobIdExhausted => formatter.write_str("job identifier space is exhausted"),
             Self::State(error) => error.fmt(formatter),
+            Self::InvalidPlan(error) => error.fmt(formatter),
         }
     }
 }
@@ -370,6 +405,7 @@ impl Error for SchedulerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::State(error) => Some(error),
+            Self::InvalidPlan(error) => Some(error),
             Self::UnknownJob(_) | Self::NotRunning(_) | Self::JobIdExhausted => None,
         }
     }
@@ -378,5 +414,11 @@ impl Error for SchedulerError {
 impl From<StateError> for SchedulerError {
     fn from(error: StateError) -> Self {
         Self::State(error)
+    }
+}
+
+impl From<PlanError> for SchedulerError {
+    fn from(error: PlanError) -> Self {
+        Self::InvalidPlan(error)
     }
 }

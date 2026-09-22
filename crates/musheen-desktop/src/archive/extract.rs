@@ -2,22 +2,21 @@ use super::budget::{
     ArchiveBudget, ArchiveMemoryLease, ArchiveOperationError, ArchiveOperationLimits, map_io,
 };
 use super::create::{
-    ArchiveOperationOutcome, append_phase, local_path, publish_staging, remove_owned, staging_path,
-    sync_parent,
+    ArchiveOperationOutcome, append_archive_phase, local_path, path_identity, publish_staging,
+    remove_owned, staging_path, sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
 use super::{ArchiveFormat, ArchivePath};
 use musheen_core::{CancellationToken, ProviderId};
 use musheen_ops::{
-    ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, EventGeneration, JobId, Journal,
-    JournalPhase, JournalStorage,
+    ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase, ArchiveOperationPlan, EventGeneration,
+    JobId, Journal, JournalPhase, JournalStorage,
 };
 use nix::libc::O_NOFOLLOW;
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -37,6 +36,7 @@ enum ExtractEntryKind {
     File,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_extract<S: JournalStorage>(
     plan: &ArchiveOperationPlan,
     limits: &ArchiveOperationLimits,
@@ -45,8 +45,22 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     journal: &mut Journal<S>,
     job_id: JobId,
     generation: EventGeneration,
+    report_phase: &mut dyn FnMut(ArchiveEventPhase) -> Result<(), ArchiveOperationError>,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
+    report_phase(ArchiveEventPhase::Preflight)?;
     cancellation.check()?;
+    let mut budget = ArchiveBudget::new(limits.clone());
+    let plan_path_bytes = plan
+        .sources()
+        .iter()
+        .chain(std::iter::once(plan.destination()))
+        .map(|path| {
+            path.as_unix_path()
+                .map_or(0, |value| value.as_os_str().len())
+        })
+        .sum::<usize>();
+    let _plan_paths_memory =
+        budget.reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
     let source = local_path(
         plan.sources()
             .first()
@@ -66,10 +80,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         .map_err(|error| map_io(&error))?
         .len();
     let format = archive_format(plan.codec());
-    let mut preflight_limits = limits.clone();
-    preflight_limits.max_memory_bytes /= 2;
-    let decode_limits = decode_limits(&preflight_limits);
-    let mut budget = ArchiveBudget::new(preflight_limits);
+    let decode_limits = decode_limits(limits);
     let entries = collect_extract_entries(
         &source_file,
         source_bytes,
@@ -78,21 +89,51 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         passwords,
         cancellation,
         &mut budget,
+        destination
+            .parent()
+            .ok_or(ArchiveOperationError::UnsafePath(
+                "archive destination needs a parent",
+            ))?,
     )?;
-    append_phase(journal, job_id, generation, JournalPhase::Planned)?;
-
     let staging = staging_path(plan, job_id, generation)?;
+    let destination_before = path_identity(&destination)?;
+    append_archive_phase(
+        journal,
+        job_id,
+        generation,
+        JournalPhase::Planned,
+        plan,
+        &staging,
+        destination_before,
+        None,
+    )?;
     let mut published = false;
     let result = (|| {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&staging)
             .map_err(|error| map_io(&error))?;
-        append_phase(journal, job_id, generation, JournalPhase::StagingCreated)?;
+        report_phase(ArchiveEventPhase::Staging)?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::StagingCreated,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        )?;
+        report_phase(ArchiveEventPhase::Decoding)?;
         let counters = DecodeCounterState::new();
-        let mut actual_budget = ArchiveBudget::new(limits.clone());
+        let mut actual_budget = budget.next_phase();
+        let _codec_memory = actual_budget.reserve_memory(codec_memory_bytes(format))?;
         for entry in &entries {
             cancellation.check()?;
+            let _path_memory = actual_budget.reserve_memory(
+                u64::try_from(entry.path.len().saturating_add(256)).unwrap_or(u64::MAX),
+            )?;
+            actual_budget.charge_temporary(4 * 1_024)?;
             let output = output_path(&staging, &entry.path, limits.max_path_bytes)?;
             match entry.kind {
                 ExtractEntryKind::Directory => {
@@ -140,31 +181,92 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             }
         }
         sync_tree(&staging)?;
-        append_phase(journal, job_id, generation, JournalPhase::DataCopied)?;
-        append_phase(journal, job_id, generation, JournalPhase::MetadataApplied)?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::DataCopied,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        )?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::MetadataApplied,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        )?;
+        report_phase(ArchiveEventPhase::Publishing)?;
         let outcome = publish_staging(&staging, &destination, plan.conflict_policy())?;
         if outcome == ArchiveOperationOutcome::Skipped {
             remove_owned(&staging)?;
-            append_phase(journal, job_id, generation, JournalPhase::RolledBack)?;
+            append_archive_phase(
+                journal,
+                job_id,
+                generation,
+                JournalPhase::RolledBack,
+                plan,
+                &staging,
+                destination_before,
+                None,
+            )?;
             return Ok(outcome);
         }
         published = true;
         sync_parent(&destination)?;
-        append_phase(
+        let destination_after = path_identity(&destination)?;
+        append_archive_phase(
             journal,
             job_id,
             generation,
             JournalPhase::DestinationPublished,
+            plan,
+            &staging,
+            destination_before,
+            destination_after,
         )?;
+        report_phase(ArchiveEventPhase::Cleaning)?;
         remove_owned(&staging)?;
-        append_phase(journal, job_id, generation, JournalPhase::StagingCleaned)?;
-        append_phase(journal, job_id, generation, JournalPhase::Completed)?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::StagingCleaned,
+            plan,
+            &staging,
+            destination_before,
+            destination_after,
+        )?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::Completed,
+            plan,
+            &staging,
+            destination_before,
+            destination_after,
+        )?;
         Ok(ArchiveOperationOutcome::Published)
     })();
 
     if result.is_err() && !published && staging.exists() {
         let _ = remove_owned(&staging);
-        let _ = append_phase(journal, job_id, generation, JournalPhase::RolledBack);
+        let _ = append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::RolledBack,
+            plan,
+            &staging,
+            destination_before,
+            None,
+        );
     }
     result
 }
@@ -178,21 +280,31 @@ fn collect_extract_entries(
     passwords: &dyn ArchivePasswordProvider,
     cancellation: &CancellationToken,
     budget: &mut ArchiveBudget,
+    temporary_root: &Path,
 ) -> Result<Vec<ExtractEntry>, ArchiveOperationError> {
+    let _codec_memory = budget.reserve_memory(codec_memory_bytes(format))?;
     let counters = DecodeCounterState::new();
     let provider = ProviderId::new("archive-extract").map_err(|_| ArchiveOperationError::Io)?;
     let mut scanner = open_scanner(source, provider, format, limits, &counters, passwords)?;
     let mut entries = Vec::new();
-    let mut seen = HashSet::new();
     let mut total_expanded = 0_u64;
     let mut total_compressed = 0_u64;
     let mut all_file_sizes_known = true;
     while let Some(raw) = scanner.next_entry(cancellation)? {
         budget.charge_entry()?;
         budget.check_path(&raw.path)?;
-        if !seen.insert(raw.path.clone()) {
-            return Err(ArchiveOperationError::InvalidArchive);
-        }
+        let memory = budget.reserve_memory(
+            u64::try_from(
+                raw.path
+                    .len()
+                    .saturating_add(std::mem::size_of::<ExtractEntry>())
+                    .saturating_add(96),
+            )
+            .unwrap_or(u64::MAX),
+        )?;
+        entries
+            .try_reserve(1)
+            .map_err(|_| ArchiveOperationError::Io)?;
         let kind = match raw.kind {
             RawEntryKind::Directory => ExtractEntryKind::Directory,
             RawEntryKind::RegularFile => ExtractEntryKind::File,
@@ -209,6 +321,7 @@ fn collect_extract_entries(
                     value: u64::MAX,
                     maximum: limits.max_expanded_bytes,
                 })?;
+        budget.check_expanded(total_expanded)?;
         if matches!(kind, ExtractEntryKind::File) {
             if let Some(compressed_size) = raw.compressed_size {
                 total_compressed = total_compressed.checked_add(compressed_size).ok_or(
@@ -222,13 +335,20 @@ fn collect_extract_entries(
                 all_file_sizes_known = false;
             }
         }
-        budget.charge_temporary(size)?;
-        if looks_like_archive(&raw.path) {
-            budget.check_nesting(1)?;
+        if matches!(kind, ExtractEntryKind::File) {
+            inspect_nested_entry(
+                source,
+                format,
+                raw.ordinal,
+                raw.compressed_size,
+                limits,
+                passwords,
+                cancellation,
+                budget,
+                temporary_root,
+                1,
+            )?;
         }
-        let memory = budget.reserve_memory(
-            u64::try_from(raw.path.len().saturating_add(128)).unwrap_or(u64::MAX),
-        )?;
         entries.push(ExtractEntry {
             path: raw.path,
             kind,
@@ -236,6 +356,10 @@ fn collect_extract_entries(
             ordinal: raw.ordinal,
             _memory: memory,
         });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    if entries.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        return Err(ArchiveOperationError::InvalidArchive);
     }
     let compressed_budget = if all_file_sizes_known {
         total_compressed.max(1)
@@ -246,13 +370,180 @@ fn collect_extract_entries(
     Ok(entries)
 }
 
-fn looks_like_archive(path: &[u8]) -> bool {
-    let lower = path.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
-    [b".zip".as_slice(), b".7z", b".tar", b".tgz", b".tzst"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-        || lower.ends_with(b".tar.gz")
-        || lower.ends_with(b".tar.zst")
+const fn codec_memory_bytes(format: ArchiveFormat) -> u64 {
+    match format {
+        ArchiveFormat::Zip | ArchiveFormat::Tar => 256 * 1_024,
+        ArchiveFormat::TarGzip => 2 * 1_024 * 1_024,
+        ArchiveFormat::TarZstd => 16 * 1_024 * 1_024,
+        ArchiveFormat::SevenZip => 32 * 1_024 * 1_024,
+        #[cfg(feature = "archive-libarchive")]
+        ArchiveFormat::Rar | ArchiveFormat::Iso => 32 * 1_024 * 1_024,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_nested_entry(
+    source: &File,
+    format: ArchiveFormat,
+    ordinal: u64,
+    compressed_size: Option<u64>,
+    limits: &ArchiveLimits,
+    passwords: &dyn ArchivePasswordProvider,
+    cancellation: &CancellationToken,
+    budget: &mut ArchiveBudget,
+    temporary_root: &Path,
+    depth: usize,
+) -> Result<(), ArchiveOperationError> {
+    let temporary =
+        tempfile::NamedTempFile::new_in(temporary_root).map_err(|error| map_io(&error))?;
+    let error = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut writer = NestedBudgetWriter {
+        inner: temporary.reopen().map_err(|error| map_io(&error))?,
+        budget,
+        error: std::rc::Rc::clone(&error),
+    };
+    let counters = DecodeCounterState::new();
+    let copy_result = copy_entry(
+        source,
+        format,
+        ordinal,
+        &mut writer,
+        ArchiveCopyContext {
+            passwords,
+            limits,
+            counters: &counters,
+            cancellation,
+            compressed_size,
+        },
+    );
+    if let Some(error) = error.borrow_mut().take() {
+        return Err(error);
+    }
+    copy_result.map_err(ArchiveOperationError::from)?;
+    writer.inner.flush().map_err(|error| map_io(&error))?;
+    let NestedBudgetWriter { mut inner, .. } = writer;
+    inner
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| map_io(&error))?;
+    let Some(nested_format) = detect_archive_format(&mut inner)? else {
+        return Ok(());
+    };
+    budget.check_nesting(depth)?;
+    scan_nested_archive(
+        &inner,
+        nested_format,
+        limits,
+        passwords,
+        cancellation,
+        budget,
+        temporary_root,
+        depth,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_nested_archive(
+    source: &File,
+    format: ArchiveFormat,
+    limits: &ArchiveLimits,
+    passwords: &dyn ArchivePasswordProvider,
+    cancellation: &CancellationToken,
+    budget: &mut ArchiveBudget,
+    temporary_root: &Path,
+    depth: usize,
+) -> Result<(), ArchiveOperationError> {
+    let counters = DecodeCounterState::new();
+    let provider = ProviderId::new("archive-nested").map_err(|_| ArchiveOperationError::Io)?;
+    let mut scanner = open_scanner(source, provider, format, limits, &counters, passwords)?;
+    let source_bytes = source
+        .metadata()
+        .map_err(|error| map_io(&error))?
+        .len()
+        .max(1);
+    let mut expanded = 0_u64;
+    let mut compressed = 0_u64;
+    while let Some(raw) = scanner.next_entry(cancellation)? {
+        let _entry_memory = budget.reserve_memory(
+            u64::try_from(raw.path.len().saturating_add(256)).unwrap_or(u64::MAX),
+        )?;
+        budget.charge_entry()?;
+        budget.check_path(&raw.path)?;
+        match raw.kind {
+            RawEntryKind::Directory => {}
+            RawEntryKind::RegularFile => {
+                let size = raw.size.unwrap_or(0);
+                expanded = expanded.saturating_add(size);
+                compressed = compressed.saturating_add(raw.compressed_size.unwrap_or(0));
+                inspect_nested_entry(
+                    source,
+                    format,
+                    raw.ordinal,
+                    raw.compressed_size,
+                    limits,
+                    passwords,
+                    cancellation,
+                    budget,
+                    temporary_root,
+                    depth.saturating_add(1),
+                )?;
+            }
+            RawEntryKind::SymbolicLink | RawEntryKind::HardLink | RawEntryKind::Other => {
+                return Err(ArchiveOperationError::UnsupportedFileType);
+            }
+        }
+    }
+    budget.check_compression_ratio(expanded, compressed.max(source_bytes))?;
+    budget.charge_expanded_bytes(expanded)
+}
+
+fn detect_archive_format(file: &mut File) -> Result<Option<ArchiveFormat>, ArchiveOperationError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| map_io(&error))?;
+    let mut prefix = [0_u8; 512];
+    let count = file.read(&mut prefix).map_err(|error| map_io(&error))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| map_io(&error))?;
+    let bytes = &prefix[..count];
+    let format = if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
+        Some(ArchiveFormat::Zip)
+    } else if bytes.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        Some(ArchiveFormat::SevenZip)
+    } else if bytes.starts_with(&[0x1f, 0x8b]) {
+        Some(ArchiveFormat::TarGzip)
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some(ArchiveFormat::TarZstd)
+    } else if bytes.get(257..262) == Some(b"ustar") {
+        Some(ArchiveFormat::Tar)
+    } else {
+        None
+    };
+    Ok(format)
+}
+
+struct NestedBudgetWriter<'a> {
+    inner: File,
+    budget: &'a mut ArchiveBudget,
+    error: std::rc::Rc<std::cell::RefCell<Option<ArchiveOperationError>>>,
+}
+
+impl Write for NestedBudgetWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if let Err(error) = self.budget.charge_temporary(count) {
+            *self.error.borrow_mut() = Some(error);
+            return Err(io::Error::other(
+                "nested archive temporary-space budget exceeded",
+            ));
+        }
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn output_path(
