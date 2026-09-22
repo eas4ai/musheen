@@ -3,9 +3,10 @@ use super::budget::{
     ArchiveOperationLimits, map_io,
 };
 use super::create::{
-    ArchiveCleanupIntent, ArchiveOperationOutcome, append_archive_phase, cleanup_path,
-    cleanup_phase, deletion_path, file_identity, local_path, path_identity_with_controls,
-    publish_staging, remove_owned_journaled, staging_path, sync_parent,
+    ArchiveCleanupIntent, ArchiveOperationOutcome, ArchivePublicationPaths, append_archive_phase,
+    cleanup_path, cleanup_phase, deletion_path, file_identity, local_path,
+    path_identity_with_controls, publication_phase, publication_quarantine_path, publish_staging,
+    remove_owned_journaled, staging_path, sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
@@ -250,12 +251,21 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         begin_commit()?;
         transaction_started = true;
         let outcome = {
-            let mut publication_checkpoint = |phase, destination_after| {
+            let rollback_quarantine = deletion_path(&rollback)?;
+            let payload_quarantine = publication_quarantine_path(&staging)?;
+            let publication = ArchivePublicationPaths::new(
+                &staging,
+                &rollback,
+                &rollback_quarantine,
+                &payload_quarantine,
+                destination_before,
+            );
+            let mut publication_checkpoint = |phase, destination_after, paths| {
                 append_archive_phase(
                     journal,
                     job_id,
                     generation,
-                    phase,
+                    publication_phase(phase, paths),
                     plan,
                     &staging,
                     destination_before,
@@ -264,9 +274,8 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                 )
             };
             publish_staging(
-                &staging,
+                publication,
                 &destination,
-                &rollback,
                 plan.conflict_policy(),
                 staging_before_publish,
                 destination_before,

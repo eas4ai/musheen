@@ -1,8 +1,10 @@
-use super::budget::{ArchiveBudget, ArchiveOperationError, ArchiveOperationLimits};
+use super::budget::{
+    ArchiveBudget, ArchiveOperationAccounting, ArchiveOperationError, ArchiveOperationLimits,
+};
 use super::create::{
-    ArchiveCleanupIntent, append_archive_phase, cleanup_path, cleanup_phase, deletion_path,
-    local_path, path_identity_with_controls, publication_quarantine_path, publish_staging,
-    remove_owned_journaled, sync_parent,
+    ArchiveCleanupIntent, ArchivePublicationPaths, append_archive_phase, cleanup_path,
+    cleanup_phase, deletion_path, local_path, path_identity_with_controls, publication_phase,
+    publication_quarantine_path, publish_staging, remove_owned_journaled, sync_parent,
 };
 use musheen_core::CancellationToken;
 use musheen_ops::{
@@ -92,6 +94,24 @@ pub fn apply_archive_recovery_with_cancellation<S: JournalStorage>(
     action: ArchiveRecoveryAction,
     cancellation: &CancellationToken,
 ) -> Result<ArchiveRecoveryOutcome, ArchiveOperationError> {
+    apply_archive_recovery_with_accounting(
+        journal,
+        request,
+        action,
+        cancellation,
+        &ArchiveOperationAccounting::default(),
+    )
+}
+
+/// Applies an approved recovery action with explicit fault-accounting controls.
+#[doc(hidden)]
+pub fn apply_archive_recovery_with_accounting<S: JournalStorage>(
+    journal: &mut Journal<S>,
+    request: &ArchiveRecoveryRequest,
+    action: ArchiveRecoveryAction,
+    cancellation: &CancellationToken,
+    accounting: &ArchiveOperationAccounting,
+) -> Result<ArchiveRecoveryOutcome, ArchiveOperationError> {
     let record = latest_archive_records(journal)
         .into_iter()
         .find(|record| {
@@ -100,7 +120,7 @@ pub fn apply_archive_recovery_with_cancellation<S: JournalStorage>(
                 && record.phase() == request.phase
         })
         .ok_or(ArchiveOperationError::RecoveryConsentRequired)?;
-    apply_record(journal, &record, action, cancellation)
+    apply_record(journal, &record, action, cancellation, accounting)
 }
 
 fn latest_archive_records<S: JournalStorage>(journal: &Journal<S>) -> Vec<JournalRecord> {
@@ -121,7 +141,11 @@ fn recovery_request(
         .archive_checkpoint()
         .ok_or(ArchiveOperationError::InvalidArchive)?;
     let plan = checkpoint.plan();
-    let budget = recovery_budget(checkpoint, cancellation);
+    let budget = recovery_budget(
+        checkpoint,
+        cancellation,
+        &ArchiveOperationAccounting::default(),
+    );
     let staging = local_path(checkpoint.staging())?;
     let destination = local_path(plan.destination())?;
     let owned_path = checkpoint.staging_nonce().is_some_and(|nonce| {
@@ -175,12 +199,13 @@ fn apply_record<S: JournalStorage>(
     record: &JournalRecord,
     action: ArchiveRecoveryAction,
     cancellation: &CancellationToken,
+    accounting: &ArchiveOperationAccounting,
 ) -> Result<ArchiveRecoveryOutcome, ArchiveOperationError> {
     let checkpoint = record
         .archive_checkpoint()
         .ok_or(ArchiveOperationError::InvalidArchive)?;
     let plan = checkpoint.plan();
-    let budget = recovery_budget(checkpoint, cancellation);
+    let budget = recovery_budget(checkpoint, cancellation, accounting);
     let staging = local_path(checkpoint.staging())?;
     verify_staging_path(record, checkpoint.staging(), plan.destination())?;
     let destination = local_path(plan.destination())?;
@@ -340,6 +365,29 @@ fn resume_publish<S: JournalStorage>(
             deletion_path(&cleanup)?
         };
     let current_cleanup = path_identity_with_controls(&cleanup, Some(budget), Some(cancellation))?;
+    let current_cleanup_quarantine =
+        path_identity_with_controls(&cleanup_quarantine, Some(budget), Some(cancellation))?;
+    let expected_cleanup = checkpoint.destination_before();
+    if current_cleanup.is_some() && current_cleanup != expected_cleanup
+        || current_cleanup_quarantine.is_some() && current_cleanup_quarantine != expected_cleanup
+        || current_cleanup.is_some() && current_cleanup_quarantine.is_some()
+    {
+        return Err(ArchiveOperationError::UnsafePath(
+            "archive cleanup topology changed",
+        ));
+    }
+    let cleanup_owner = if current_cleanup == expected_cleanup && current_cleanup.is_some() {
+        Some(cleanup.as_path())
+    } else if current_cleanup_quarantine == expected_cleanup && current_cleanup_quarantine.is_some()
+    {
+        Some(cleanup_quarantine.as_path())
+    } else {
+        None
+    };
+    let cleanup_matches = expected_cleanup.map_or(
+        current_cleanup.is_none() && current_cleanup_quarantine.is_none(),
+        |_| cleanup_owner.is_some(),
+    );
     let publication_quarantine = checkpoint
         .publication_quarantine()
         .map(local_path)
@@ -349,9 +397,8 @@ fn resume_publish<S: JournalStorage>(
         path_identity_with_controls(&publication_quarantine, Some(budget), Some(cancellation))?;
     let current_destination =
         path_identity_with_controls(destination, Some(budget), Some(cancellation))?;
-    let publish_already_happened = current_destination == checkpoint.staging_identity()
-        && (current_cleanup == checkpoint.destination_before()
-            || (checkpoint.destination_before().is_none() && current_cleanup.is_none()));
+    let publish_already_happened =
+        current_destination == checkpoint.staging_identity() && cleanup_matches;
     if publish_already_happened {
         sync_parent(destination)?;
         append_archive_phase(
@@ -371,7 +418,7 @@ fn resume_publish<S: JournalStorage>(
             staging,
             &cleanup,
             &cleanup_quarantine,
-            current_cleanup,
+            expected_cleanup,
             current_destination,
             budget,
             cancellation,
@@ -380,7 +427,7 @@ fn resume_publish<S: JournalStorage>(
     }
     if current_publication_quarantine == checkpoint.staging_identity()
         && current_destination.is_none()
-        && current_cleanup == checkpoint.destination_before()
+        && cleanup_matches
         && checkpoint.destination_before().is_some()
     {
         append_archive_phase(
@@ -394,7 +441,12 @@ fn resume_publish<S: JournalStorage>(
             None,
             Some(budget),
         )?;
-        rename_sibling(&cleanup, destination)?;
+        rename_sibling(
+            cleanup_owner.ok_or(ArchiveOperationError::UnsafePath(
+                "old destination is unavailable for recovery",
+            ))?,
+            destination,
+        )?;
         append_archive_phase(
             journal,
             record.job_id(),
@@ -411,7 +463,7 @@ fn resume_publish<S: JournalStorage>(
     if checkpoint.destination_before().is_some()
         && current_staging == checkpoint.staging_identity()
         && current_destination.is_none()
-        && current_cleanup == checkpoint.destination_before()
+        && cleanup_matches
     {
         append_archive_phase(
             journal,
@@ -425,7 +477,12 @@ fn resume_publish<S: JournalStorage>(
             Some(budget),
         )?;
         if checkpoint.destination_before().is_some() {
-            rename_sibling(&cleanup, destination)?;
+            rename_sibling(
+                cleanup_owner.ok_or(ArchiveOperationError::UnsafePath(
+                    "old destination is unavailable for recovery",
+                ))?,
+                destination,
+            )?;
         }
         append_archive_phase(
             journal,
@@ -442,6 +499,7 @@ fn resume_publish<S: JournalStorage>(
     }
     verify_exact(checkpoint.destination_before(), current_destination)?;
     verify_exact(None, current_cleanup)?;
+    verify_exact(None, current_cleanup_quarantine)?;
     let (publish_source, publish_source_identity) =
         if current_staging == checkpoint.staging_identity() {
             (staging, current_staging)
@@ -456,12 +514,19 @@ fn resume_publish<S: JournalStorage>(
             ));
         };
     let outcome = {
-        let mut publication_checkpoint = |phase, destination_after| {
+        let publication = ArchivePublicationPaths::new(
+            publish_source,
+            &cleanup,
+            &cleanup_quarantine,
+            &publication_quarantine,
+            checkpoint.destination_before(),
+        );
+        let mut publication_checkpoint = |phase, destination_after, paths| {
             append_archive_phase(
                 journal,
                 record.job_id(),
                 record.generation(),
-                phase,
+                publication_phase(phase, paths),
                 checkpoint.plan(),
                 staging,
                 checkpoint.destination_before(),
@@ -470,9 +535,8 @@ fn resume_publish<S: JournalStorage>(
             )
         };
         publish_staging(
-            publish_source,
+            publication,
             destination,
-            &cleanup,
             checkpoint.plan().conflict_policy(),
             checkpoint
                 .staging_identity()
@@ -996,13 +1060,15 @@ fn finish_published<S: JournalStorage>(
 fn recovery_budget(
     checkpoint: &musheen_ops::ArchiveCheckpoint,
     cancellation: &CancellationToken,
+    accounting: &ArchiveOperationAccounting,
 ) -> ArchiveBudget {
     let limits = ArchiveOperationLimits {
         max_memory_bytes: checkpoint.identity_memory_limit(),
         max_identity_millis: checkpoint.identity_timeout_millis(),
         ..ArchiveOperationLimits::default()
     };
-    ArchiveBudget::new(limits).with_identity_cancellation(cancellation.clone())
+    ArchiveBudget::with_accounting(limits, accounting.clone())
+        .with_identity_cancellation(cancellation.clone())
 }
 
 fn verify_exact(

@@ -290,12 +290,21 @@ fn run_archive_creation<S: JournalStorage>(
         begin_commit()?;
         transaction_started = true;
         let outcome = {
-            let mut publication_checkpoint = |phase, destination_after| {
+            let rollback_quarantine = deletion_path(&rollback)?;
+            let payload_quarantine = publication_quarantine_path(&staging)?;
+            let publication = ArchivePublicationPaths::new(
+                &staging,
+                &rollback,
+                &rollback_quarantine,
+                &payload_quarantine,
+                destination_before,
+            );
+            let mut publication_checkpoint = |phase, destination_after, paths| {
                 append_archive_phase(
                     journal,
                     job_id,
                     generation,
-                    phase,
+                    publication_phase(phase, paths),
                     plan,
                     &staging,
                     destination_before,
@@ -304,9 +313,8 @@ fn run_archive_creation<S: JournalStorage>(
                 )
             };
             publish_staging(
-                &staging,
+                publication,
                 &destination,
-                &rollback,
                 plan.conflict_policy(),
                 staging_before_publish,
                 destination_before,
@@ -1112,6 +1120,7 @@ impl<'a> ArchiveCleanupIntent<'a> {
 pub(crate) struct ArchiveJournalPhase<'a> {
     phase: JournalPhase,
     cleanup: Option<ArchiveCleanupIntent<'a>>,
+    publication: Option<ArchivePublicationPaths<'a>>,
 }
 
 impl From<JournalPhase> for ArchiveJournalPhase<'_> {
@@ -1119,6 +1128,7 @@ impl From<JournalPhase> for ArchiveJournalPhase<'_> {
         Self {
             phase,
             cleanup: None,
+            publication: None,
         }
     }
 }
@@ -1130,6 +1140,45 @@ pub(crate) const fn cleanup_phase(
     ArchiveJournalPhase {
         phase,
         cleanup: Some(cleanup),
+        publication: None,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ArchivePublicationPaths<'a> {
+    source: &'a Path,
+    rollback: &'a Path,
+    rollback_quarantine: &'a Path,
+    payload_quarantine: &'a Path,
+    rollback_identity: Option<ArchivePathIdentity>,
+}
+
+impl<'a> ArchivePublicationPaths<'a> {
+    pub(crate) const fn new(
+        source: &'a Path,
+        rollback: &'a Path,
+        rollback_quarantine: &'a Path,
+        payload_quarantine: &'a Path,
+        rollback_identity: Option<ArchivePathIdentity>,
+    ) -> Self {
+        Self {
+            source,
+            rollback,
+            rollback_quarantine,
+            payload_quarantine,
+            rollback_identity,
+        }
+    }
+}
+
+pub(crate) const fn publication_phase<'a>(
+    phase: JournalPhase,
+    publication: ArchivePublicationPaths<'a>,
+) -> ArchiveJournalPhase<'a> {
+    ArchiveJournalPhase {
+        phase,
+        cleanup: None,
+        publication: Some(publication),
     }
 }
 
@@ -1147,6 +1196,7 @@ pub(crate) fn append_archive_phase<'a, S: JournalStorage>(
 ) -> Result<(), ArchiveOperationError> {
     let phase = phase.into();
     let cleanup_intent = phase.cleanup;
+    let publication_intent = phase.publication;
     let phase = phase.phase;
     let include_plan = !journal.records().iter().any(|record| {
         record.job_id() == job_id
@@ -1244,7 +1294,23 @@ pub(crate) fn append_archive_phase<'a, S: JournalStorage>(
         "archive staging path has no ownership nonce",
     ))?;
     let stage_deletion = deletion_path(staging)?;
-    let publication_quarantine = publication_quarantine_path(staging)?;
+    let publication_quarantine = publication_intent.map_or_else(
+        || {
+            prior_checkpoint.map_or_else(
+                || publication_quarantine_path(staging),
+                |checkpoint| {
+                    checkpoint
+                        .publication_quarantine()
+                        .map(local_path)
+                        .transpose()
+                        .and_then(|path| {
+                            path.map_or_else(|| publication_quarantine_path(staging), Ok)
+                        })
+                },
+            )
+        },
+        |intent| Ok(intent.payload_quarantine.to_path_buf()),
+    )?;
     let required_cleanup_kind = match phase {
         JournalPhase::PrepublishStageCleanupPlanned
         | JournalPhase::PrepublishStageCleanupQuarantined => {
@@ -1259,6 +1325,20 @@ pub(crate) fn append_archive_phase<'a, S: JournalStorage>(
     if required_cleanup_kind != cleanup_intent.map(|intent| intent.kind) {
         return Err(ArchiveOperationError::InvalidArchive);
     }
+    let publication_phase = matches!(
+        phase,
+        JournalPhase::DestinationQuarantinePlanned
+            | JournalPhase::DestinationQuarantined
+            | JournalPhase::StagePublishPlanned
+            | JournalPhase::DestinationPublished
+            | JournalPhase::PublishRollbackPlanned
+            | JournalPhase::PublishedPayloadQuarantined
+            | JournalPhase::DestinationRestorePlanned
+            | JournalPhase::DestinationRestored
+    );
+    if publication_intent.is_some() && !publication_phase {
+        return Err(ArchiveOperationError::InvalidArchive);
+    }
     if let Some(intent) = cleanup_intent
         && (intent.source == intent.quarantine
             || intent.source.parent().is_none()
@@ -1267,6 +1347,22 @@ pub(crate) fn append_archive_phase<'a, S: JournalStorage>(
         return Err(ArchiveOperationError::UnsafePath(
             "archive cleanup source and quarantine must be distinct siblings",
         ));
+    }
+    if let Some(intent) = publication_intent {
+        let parent = staging.parent();
+        if parent.is_none()
+            || intent.source.parent() != parent
+            || intent.rollback.parent() != parent
+            || intent.rollback_quarantine.parent() != parent
+            || intent.payload_quarantine.parent() != parent
+            || intent.rollback == intent.rollback_quarantine
+            || intent.rollback == intent.payload_quarantine
+            || intent.rollback_quarantine == intent.payload_quarantine
+        {
+            return Err(ArchiveOperationError::UnsafePath(
+                "archive publication paths must be distinct siblings",
+            ));
+        }
     }
     let checkpoint = checkpoint
         .with_staging_nonce(nonce)
@@ -1287,6 +1383,13 @@ pub(crate) fn append_archive_phase<'a, S: JournalStorage>(
             musheen_core::StorePath::from_unix_path(intent.source.as_os_str()),
             musheen_core::StorePath::from_unix_path(intent.quarantine.as_os_str()),
             intent.identity,
+        )
+    } else if let Some(intent) = publication_intent {
+        checkpoint.with_cleanup_intent(
+            ArchiveCleanupKind::PublishedDestination,
+            musheen_core::StorePath::from_unix_path(intent.rollback.as_os_str()),
+            musheen_core::StorePath::from_unix_path(intent.rollback_quarantine.as_os_str()),
+            intent.rollback_identity,
         )
     } else if let Some(prior) = prior_checkpoint
         && let (Some(kind), Some(source), Some(quarantine)) = (
@@ -1679,10 +1782,9 @@ fn existing_destination_outcome(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn publish_staging(
-    staging: &Path,
+pub(crate) fn publish_staging<'a>(
+    paths: ArchivePublicationPaths<'a>,
     destination: &Path,
-    rollback: &Path,
     policy: ArchiveConflictPolicy,
     expected_staging: ArchivePathIdentity,
     expected_destination: Option<ArchivePathIdentity>,
@@ -1691,13 +1793,21 @@ pub(crate) fn publish_staging(
     checkpoint: &mut dyn FnMut(
         JournalPhase,
         Option<ArchivePathIdentity>,
+        ArchivePublicationPaths<'a>,
     ) -> Result<(), ArchiveOperationError>,
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     use rustix::fs::{Mode, OFlags, RenameFlags, open, openat, renameat_with};
+    let staging = paths.source;
+    let rollback = paths.rollback;
+    let published_quarantine = paths.payload_quarantine;
     let parent_path = staging.parent().ok_or(ArchiveOperationError::UnsafePath(
         "archive staging needs a parent",
     ))?;
-    if destination.parent() != Some(parent_path) || rollback.parent() != Some(parent_path) {
+    if destination.parent() != Some(parent_path)
+        || rollback.parent() != Some(parent_path)
+        || paths.rollback_quarantine.parent() != Some(parent_path)
+        || published_quarantine.parent() != Some(parent_path)
+    {
         return Err(ArchiveOperationError::UnsafePath(
             "archive staging and destination must be siblings",
         ));
@@ -1717,7 +1827,6 @@ pub(crate) fn publish_staging(
         .ok_or(ArchiveOperationError::UnsafePath(
             "archive rollback location needs a file name",
         ))?;
-    let published_quarantine = publication_quarantine_path(staging)?;
     let published_quarantine_name =
         published_quarantine
             .file_name()
@@ -1752,14 +1861,16 @@ pub(crate) fn publish_staging(
     if path_identity_with_controls(rollback, budget, cancellation)?.is_some() {
         return Err(ArchiveOperationError::RecoveryRequired);
     }
-    if path_identity_with_controls(&published_quarantine, budget, cancellation)?.is_some() {
+    if published_quarantine != staging
+        && path_identity_with_controls(published_quarantine, budget, cancellation)?.is_some()
+    {
         return Err(ArchiveOperationError::RecoveryRequired);
     }
     let outcome = match (expected_destination, policy) {
         (Some(_), ArchiveConflictPolicy::Fail) => Err(ArchiveOperationError::Conflict),
         (Some(_), ArchiveConflictPolicy::Skip) => Ok(ArchiveOperationOutcome::Skipped),
         (Some(expected), ArchiveConflictPolicy::Replace) => {
-            checkpoint(JournalPhase::DestinationQuarantinePlanned, None)?;
+            checkpoint(JournalPhase::DestinationQuarantinePlanned, None, paths)?;
             renameat_with(
                 &parent,
                 destination_name,
@@ -1769,11 +1880,11 @@ pub(crate) fn publish_staging(
             )
             .map_err(map_errno)?;
             rustix::fs::fsync(&parent).map_err(map_errno)?;
-            checkpoint(JournalPhase::DestinationQuarantined, None)?;
+            checkpoint(JournalPhase::DestinationQuarantined, None, paths)?;
             if path_identity_with_controls(rollback, budget, cancellation)? != Some(expected) {
                 return Err(ArchiveOperationError::RecoveryRequired);
             }
-            checkpoint(JournalPhase::StagePublishPlanned, None)?;
+            checkpoint(JournalPhase::StagePublishPlanned, None, paths)?;
             renameat_with(
                 &parent,
                 staging_name,
@@ -1786,7 +1897,7 @@ pub(crate) fn publish_staging(
             Ok(ArchiveOperationOutcome::Published)
         }
         (None, _) => {
-            checkpoint(JournalPhase::StagePublishPlanned, None)?;
+            checkpoint(JournalPhase::StagePublishPlanned, None, paths)?;
             match renameat_with(
                 &parent,
                 staging_name,
@@ -1825,7 +1936,11 @@ pub(crate) fn publish_staging(
             rustix::fs::fsync(&parent).map_err(map_errno)?;
             return Err(ArchiveOperationError::RecoveryRequired);
         }
-        checkpoint(JournalPhase::PublishRollbackPlanned, Some(expected_staging))?;
+        checkpoint(
+            JournalPhase::PublishRollbackPlanned,
+            Some(expected_staging),
+            paths,
+        )?;
         renameat_with(
             &parent,
             destination_name,
@@ -1835,8 +1950,8 @@ pub(crate) fn publish_staging(
         )
         .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
         rustix::fs::fsync(&parent).map_err(map_errno)?;
-        checkpoint(JournalPhase::PublishedPayloadQuarantined, None)?;
-        checkpoint(JournalPhase::DestinationRestorePlanned, None)?;
+        checkpoint(JournalPhase::PublishedPayloadQuarantined, None, paths)?;
+        checkpoint(JournalPhase::DestinationRestorePlanned, None, paths)?;
         if expected_destination.is_some() {
             renameat_with(
                 &parent,
@@ -1849,16 +1964,24 @@ pub(crate) fn publish_staging(
         }
         rustix::fs::fsync(&parent).map_err(map_errno)?;
         if path_identity_with_controls(destination, budget, cancellation)? != expected_destination
-            || path_identity_with_controls(&published_quarantine, budget, cancellation)?
+            || path_identity_with_controls(published_quarantine, budget, cancellation)?
                 != Some(expected_staging)
         {
             return Err(ArchiveOperationError::RecoveryRequired);
         }
-        checkpoint(JournalPhase::DestinationRestored, expected_destination)?;
+        checkpoint(
+            JournalPhase::DestinationRestored,
+            expected_destination,
+            paths,
+        )?;
         return Err(ArchiveOperationError::RecoveryRequired);
     }
     if outcome == ArchiveOperationOutcome::Published {
-        checkpoint(JournalPhase::DestinationPublished, Some(expected_staging))?;
+        checkpoint(
+            JournalPhase::DestinationPublished,
+            Some(expected_staging),
+            paths,
+        )?;
     }
     Ok(outcome)
 }

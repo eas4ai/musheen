@@ -5,9 +5,9 @@ use musheen_desktop::{
     ArchiveBudget, ArchiveError, ArchiveOperationAccounting, ArchiveOperationError,
     ArchiveOperationLimits, ArchiveOperationOutcome, ArchivePassword, ArchivePasswordProvider,
     ArchiveRecoveryAction, FileJournalStorage, PasswordRequest, apply_archive_recovery,
-    apply_archive_recovery_with_cancellation, execute_scheduled_archive_operation,
-    execute_scheduled_archive_operation_with_accounting, recover_archive_operations,
-    recover_archive_operations_with_cancellation,
+    apply_archive_recovery_with_accounting, apply_archive_recovery_with_cancellation,
+    execute_scheduled_archive_operation, execute_scheduled_archive_operation_with_accounting,
+    recover_archive_operations, recover_archive_operations_with_cancellation,
 };
 use musheen_ops::{
     ArchiveCheckpoint, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy,
@@ -2027,6 +2027,134 @@ fn published_destination_cleanup_has_distinct_resume_and_rollback_semantics() {
 }
 
 #[test]
+fn cleanup_rollback_subphases_recover_old_destination_from_exact_quarantine() {
+    #[derive(Clone, Copy, Debug)]
+    enum Topology {
+        NewPublished,
+        PayloadQuarantined,
+        OldRestored,
+    }
+
+    let cases = [
+        (JournalPhase::PublishRollbackPlanned, Topology::NewPublished),
+        (
+            JournalPhase::PublishRollbackPlanned,
+            Topology::PayloadQuarantined,
+        ),
+        (
+            JournalPhase::PublishedPayloadQuarantined,
+            Topology::PayloadQuarantined,
+        ),
+        (
+            JournalPhase::DestinationRestorePlanned,
+            Topology::PayloadQuarantined,
+        ),
+        (
+            JournalPhase::DestinationRestorePlanned,
+            Topology::OldRestored,
+        ),
+        (JournalPhase::DestinationRestored, Topology::OldRestored),
+    ];
+
+    for (case_index, (phase, topology)) in cases.into_iter().enumerate() {
+        for action in [
+            ArchiveRecoveryAction::Resume,
+            ArchiveRecoveryAction::Rollback,
+        ] {
+            let root = tempdir().expect("temporary root");
+            let source = root.path().join("source.txt");
+            let destination = root.path().join("archive.zip");
+            let staging = test_staging(root.path(), 820 + case_index as u64);
+            let rollback = Path::new(&format!("{}.rollback", staging.display())).to_path_buf();
+            let deletion = Path::new(&format!("{}.delete", rollback.display())).to_path_buf();
+            let published = Path::new(&format!("{}.published", staging.display())).to_path_buf();
+            std::fs::write(&source, b"source").expect("source");
+            std::fs::write(&staging, b"foreign stage").expect("foreign stage");
+            std::fs::write(&deletion, b"old archive").expect("old cleanup quarantine");
+            std::fs::write(&destination, b"new archive").expect("new destination");
+            let old_identity = identity(&deletion);
+            let new_identity = identity(&destination);
+            match topology {
+                Topology::NewPublished => {}
+                Topology::PayloadQuarantined => {
+                    std::fs::rename(&destination, &published).expect("payload quarantine");
+                }
+                Topology::OldRestored => {
+                    std::fs::rename(&destination, &published).expect("payload quarantine");
+                    std::fs::rename(&deletion, &destination).expect("restore old destination");
+                }
+            }
+            let plan = ArchiveOperationPlan::create(
+                vec![local(&source)],
+                local(&destination),
+                ArchiveCodec::Zip,
+                ArchiveConflictPolicy::Replace,
+                false,
+            )
+            .expect("archive plan");
+            let checkpoint = ArchiveCheckpoint::new(
+                plan,
+                local(&staging),
+                Some(new_identity),
+                Some(old_identity),
+                None,
+            )
+            .with_staging_nonce(TEST_STAGE_NONCE)
+            .with_cleanup_intent(
+                ArchiveCleanupKind::PublishedDestination,
+                local(&rollback),
+                local(&deletion),
+                Some(old_identity),
+            )
+            .with_publication_quarantine(local(&published));
+            let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
+            journal
+                .append_archive(
+                    JobId::new(820 + case_index as u64).expect("job id"),
+                    EventGeneration::new(0),
+                    phase,
+                    Durability::CrashDurable,
+                    checkpoint,
+                )
+                .expect("checkpoint persists");
+            let request = recover_archive_operations(&journal)
+                .expect("recovery scans")
+                .pop()
+                .expect("recovery request");
+
+            apply_archive_recovery(&mut journal, &request, action).unwrap_or_else(|error| {
+                panic!("{phase:?} {topology:?} {action:?} recovers: {error:?}")
+            });
+
+            let (expected, terminal) = match action {
+                ArchiveRecoveryAction::Resume => {
+                    (b"new archive".as_slice(), JournalPhase::Completed)
+                }
+                ArchiveRecoveryAction::Rollback => {
+                    (b"old archive".as_slice(), JournalPhase::RolledBack)
+                }
+            };
+            assert_eq!(
+                std::fs::read(&destination).expect("destination exists"),
+                expected,
+                "{phase:?} {topology:?} {action:?}"
+            );
+            assert_eq!(
+                std::fs::read(&staging).expect("foreign stage remains"),
+                b"foreign stage"
+            );
+            assert!(!rollback.exists(), "rollback source is absent");
+            assert!(!deletion.exists(), "rollback quarantine is consumed");
+            assert!(!published.exists(), "payload quarantine is consumed");
+            assert_eq!(
+                journal.records().last().map(|record| record.phase()),
+                Some(terminal)
+            );
+        }
+    }
+}
+
+#[test]
 fn recovery_handles_published_payload_with_a_foreign_recreated_stage_for_both_actions() {
     for action in [
         ArchiveRecoveryAction::Resume,
@@ -2110,6 +2238,223 @@ fn recovery_handles_published_payload_with_a_foreign_recreated_stage_for_both_ac
             journal.records().last().map(|record| record.phase()),
             Some(expected_phase)
         );
+    }
+}
+
+#[test]
+fn foreign_stage_recovery_uses_the_persisted_payload_quarantine_for_validation_rollback() {
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("source.txt");
+    let destination = root.path().join("archive.zip");
+    let staging = test_staging(root.path(), 880);
+    let rollback = Path::new(&format!("{}.rollback", staging.display())).to_path_buf();
+    let rollback_deletion = Path::new(&format!("{}.delete", rollback.display())).to_path_buf();
+    let published = Path::new(&format!("{}.published", staging.display())).to_path_buf();
+    let derived_nested = Path::new(&format!("{}.published", published.display())).to_path_buf();
+    std::fs::write(&source, b"source").expect("source");
+    std::fs::write(&destination, b"old archive").expect("old destination");
+    std::fs::write(&published, b"new archive").expect("owned payload quarantine");
+    let old_identity = identity(&destination);
+    let new_identity = identity(&published);
+    std::fs::write(&staging, b"foreign stage").expect("foreign stage");
+    let plan = ArchiveOperationPlan::create(
+        vec![local(&source)],
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Replace,
+        false,
+    )
+    .expect("archive plan");
+    let checkpoint = ArchiveCheckpoint::new(
+        plan,
+        local(&staging),
+        Some(new_identity),
+        Some(old_identity),
+        Some(old_identity),
+    )
+    .with_staging_nonce(TEST_STAGE_NONCE)
+    .with_cleanup_intent(
+        ArchiveCleanupKind::PublishedDestination,
+        local(&rollback),
+        local(&rollback_deletion),
+        Some(old_identity),
+    )
+    .with_publication_quarantine(local(&published));
+    let mut journal = Journal::open(MemoryJournal::default()).expect("journal opens");
+    journal
+        .append_archive(
+            JobId::new(880).expect("job id"),
+            EventGeneration::new(0),
+            JournalPhase::DestinationRestored,
+            Durability::CrashDurable,
+            checkpoint,
+        )
+        .expect("checkpoint persists");
+    let request = recover_archive_operations(&journal)
+        .expect("recovery scans")
+        .pop()
+        .expect("recovery request");
+    let accounting = ArchiveOperationAccounting::default();
+    accounting.inject_post_publish_validation_failure();
+
+    assert!(matches!(
+        apply_archive_recovery_with_accounting(
+            &mut journal,
+            &request,
+            ArchiveRecoveryAction::Resume,
+            &CancellationToken::new(),
+            &accounting,
+        ),
+        Err(ArchiveOperationError::RecoveryRequired)
+    ));
+    assert!(!derived_nested.exists(), "no unjournaled nested quarantine");
+    assert_eq!(
+        std::fs::read(&staging).expect("foreign stage remains"),
+        b"foreign stage"
+    );
+    assert_eq!(
+        std::fs::read(&destination).expect("old destination restored"),
+        b"old archive"
+    );
+    assert_eq!(
+        std::fs::read(&published).expect("owned payload remains recoverable"),
+        b"new archive"
+    );
+
+    let request = recover_archive_operations(&journal)
+        .expect("recovery rescans")
+        .pop()
+        .expect("recovery request");
+    assert_eq!(
+        apply_archive_recovery(&mut journal, &request, ArchiveRecoveryAction::Resume)
+            .expect("owned payload resumes from the exact quarantine"),
+        musheen_desktop::ArchiveRecoveryOutcome::Completed
+    );
+    assert_eq!(
+        std::fs::read(&destination).expect("new destination published"),
+        b"new archive"
+    );
+    assert_eq!(
+        std::fs::read(&staging).expect("foreign stage remains"),
+        b"foreign stage"
+    );
+    assert!(!published.exists(), "owned quarantine is consumed");
+    assert!(!derived_nested.exists(), "derived quarantine never appears");
+}
+
+#[test]
+fn foreign_stage_publication_recovers_every_validation_rollback_checkpoint() {
+    for fail_append_at in 2..=8 {
+        for action in [
+            ArchiveRecoveryAction::Resume,
+            ArchiveRecoveryAction::Rollback,
+        ] {
+            let root = tempdir().expect("temporary root");
+            let source = root.path().join("source.txt");
+            let destination = root.path().join("archive.zip");
+            let staging = test_staging(root.path(), 900 + fail_append_at as u64);
+            let rollback = Path::new(&format!("{}.rollback", staging.display())).to_path_buf();
+            let rollback_deletion =
+                Path::new(&format!("{}.delete", rollback.display())).to_path_buf();
+            let published = Path::new(&format!("{}.published", staging.display())).to_path_buf();
+            let derived_nested =
+                Path::new(&format!("{}.published", published.display())).to_path_buf();
+            std::fs::write(&source, b"source").expect("source");
+            std::fs::write(&destination, b"old archive").expect("old destination");
+            std::fs::write(&published, b"new archive").expect("owned payload quarantine");
+            let old_identity = identity(&destination);
+            let new_identity = identity(&published);
+            std::fs::write(&staging, b"foreign stage").expect("foreign stage");
+            let plan = ArchiveOperationPlan::create(
+                vec![local(&source)],
+                local(&destination),
+                ArchiveCodec::Zip,
+                ArchiveConflictPolicy::Replace,
+                false,
+            )
+            .expect("archive plan");
+            let checkpoint = ArchiveCheckpoint::new(
+                plan,
+                local(&staging),
+                Some(new_identity),
+                Some(old_identity),
+                Some(old_identity),
+            )
+            .with_staging_nonce(TEST_STAGE_NONCE)
+            .with_cleanup_intent(
+                ArchiveCleanupKind::PublishedDestination,
+                local(&rollback),
+                local(&rollback_deletion),
+                Some(old_identity),
+            )
+            .with_publication_quarantine(local(&published));
+            let storage = MemoryJournal {
+                fail_append_at: Some(fail_append_at),
+                ..MemoryJournal::default()
+            };
+            let mut journal = Journal::open(storage).expect("journal opens");
+            journal
+                .append_archive(
+                    JobId::new(900 + fail_append_at as u64).expect("job id"),
+                    EventGeneration::new(0),
+                    JournalPhase::DestinationRestored,
+                    Durability::CrashDurable,
+                    checkpoint,
+                )
+                .expect("checkpoint persists");
+            let request = recover_archive_operations(&journal)
+                .expect("recovery scans")
+                .pop()
+                .expect("recovery request");
+            let accounting = ArchiveOperationAccounting::default();
+            accounting.inject_post_publish_validation_failure();
+            assert!(
+                apply_archive_recovery_with_accounting(
+                    &mut journal,
+                    &request,
+                    ArchiveRecoveryAction::Resume,
+                    &CancellationToken::new(),
+                    &accounting,
+                )
+                .is_err()
+            );
+
+            let mut storage = journal.into_storage();
+            storage.fail_append_at = None;
+            let mut reopened = Journal::open(storage).expect("journal reopens");
+            let request = recover_archive_operations(&reopened)
+                .unwrap_or_else(|error| panic!("append {fail_append_at} scans: {error:?}"))
+                .pop()
+                .expect("recovery request");
+            apply_archive_recovery(&mut reopened, &request, action).unwrap_or_else(|error| {
+                panic!("append {fail_append_at} {action:?} recovers: {error:?}")
+            });
+
+            let expected = match action {
+                ArchiveRecoveryAction::Resume => b"new archive".as_slice(),
+                ArchiveRecoveryAction::Rollback => b"old archive".as_slice(),
+            };
+            assert_eq!(
+                std::fs::read(&destination).expect("destination exists"),
+                expected,
+                "append {fail_append_at} {action:?}"
+            );
+            assert_eq!(
+                std::fs::read(&staging).expect("foreign stage remains"),
+                b"foreign stage"
+            );
+            assert!(!rollback.exists(), "rollback is consumed");
+            assert!(
+                !rollback_deletion.exists(),
+                "rollback quarantine is consumed"
+            );
+            assert!(!published.exists(), "payload quarantine is consumed");
+            assert!(!derived_nested.exists(), "derived quarantine never appears");
+            assert!(matches!(
+                reopened.records().last().map(|record| record.phase()),
+                Some(JournalPhase::Completed | JournalPhase::RolledBack)
+            ));
+        }
     }
 }
 
