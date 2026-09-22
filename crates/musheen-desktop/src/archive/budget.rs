@@ -1,8 +1,9 @@
 use super::ArchiveError;
+use musheen_core::CancellationToken;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveOperationLimits {
@@ -60,6 +61,10 @@ struct BudgetEvidence {
     max_path_bytes: AtomicU64,
     stage_write_remaining: AtomicU64,
     stage_write_errno: AtomicI32,
+    force_post_publish_failure: AtomicBool,
+    recreate_stage_during_rollback: AtomicBool,
+    rollback_errno: AtomicI32,
+    cleanup_errno: AtomicI32,
 }
 
 impl ArchiveOperationAccounting {
@@ -105,6 +110,38 @@ impl ArchiveOperationAccounting {
             .map(|_| ())
             .map_err(|_| std::io::Error::from_raw_os_error(errno))
     }
+
+    /// Forces the post-rename verifier down its rollback path for race testing.
+    #[doc(hidden)]
+    pub fn inject_post_publish_validation_failure(&self) {
+        self.evidence
+            .force_post_publish_failure
+            .store(true, Ordering::Release);
+    }
+
+    /// Recreates the former stage name immediately before rollback for race testing.
+    #[doc(hidden)]
+    pub fn inject_stage_recreation_during_rollback(&self) {
+        self.evidence
+            .recreate_stage_during_rollback
+            .store(true, Ordering::Release);
+    }
+
+    /// Forces rollback admission to fail with an OS error for recovery testing.
+    #[doc(hidden)]
+    pub fn inject_rollback_error(&self, raw_os_error: i32) {
+        self.evidence
+            .rollback_errno
+            .store(raw_os_error, Ordering::Release);
+    }
+
+    /// Forces an owned cleanup deletion to fail for recovery testing.
+    #[doc(hidden)]
+    pub fn inject_cleanup_error(&self, raw_os_error: i32) {
+        self.evidence
+            .cleanup_errno
+            .store(raw_os_error, Ordering::Release);
+    }
 }
 
 pub struct ArchiveBudget {
@@ -114,6 +151,8 @@ pub struct ArchiveBudget {
     temporary_bytes: u64,
     memory: SharedMemoryBudget,
     accounting: ArchiveOperationAccounting,
+    identity_cancellation: Option<CancellationToken>,
+    identity_deadline: std::time::Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +228,8 @@ impl ArchiveBudget {
             temporary_bytes: 0,
             memory: SharedMemoryBudget::new(maximum_memory, Arc::clone(&accounting.evidence)),
             accounting,
+            identity_cancellation: None,
+            identity_deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
         }
     }
 
@@ -202,6 +243,73 @@ impl ArchiveBudget {
             temporary_bytes: 0,
             memory: self.memory.clone(),
             accounting: self.accounting.clone(),
+            identity_cancellation: self.identity_cancellation.clone(),
+            identity_deadline: self.identity_deadline,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn with_identity_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.identity_cancellation = Some(cancellation);
+        self
+    }
+
+    pub(crate) fn identity_checkpoint(&self) -> Result<(), ArchiveOperationError> {
+        if let Some(cancellation) = &self.identity_cancellation {
+            cancellation.wait_if_paused()?;
+        }
+        if std::time::Instant::now() > self.identity_deadline {
+            return Err(ArchiveOperationError::LimitExceeded {
+                resource: "identity deadline milliseconds",
+                value: 30_001,
+                maximum: 30_000,
+            });
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn max_memory_bytes(&self) -> u64 {
+        self.limits.max_memory_bytes
+    }
+
+    pub(crate) fn force_post_publish_failure(&self) -> bool {
+        self.accounting
+            .evidence
+            .force_post_publish_failure
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn recreate_stage_during_rollback(&self) -> bool {
+        self.accounting
+            .evidence
+            .recreate_stage_during_rollback
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn check_rollback(&self) -> Result<(), ArchiveOperationError> {
+        let errno = self
+            .accounting
+            .evidence
+            .rollback_errno
+            .load(Ordering::Acquire);
+        if errno == 0 {
+            Ok(())
+        } else {
+            Err(map_io(&std::io::Error::from_raw_os_error(errno)))
+        }
+    }
+
+    pub(crate) fn check_cleanup(&self) -> Result<(), ArchiveOperationError> {
+        let errno = self
+            .accounting
+            .evidence
+            .cleanup_errno
+            .load(Ordering::Acquire);
+        if errno == 0 {
+            Ok(())
+        } else {
+            Err(map_io(&std::io::Error::from_raw_os_error(errno)))
         }
     }
 

@@ -3,9 +3,9 @@ use super::budget::{
     ArchiveOperationLimits, map_io,
 };
 use super::create::{
-    ArchiveOperationOutcome, append_archive_phase, file_identity, local_path, path_identity,
-    path_identity_with_controls, publish_staging, remove_owned, remove_owned_live, staging_path,
-    sync_parent,
+    ArchiveOperationOutcome, append_archive_phase, cleanup_path, file_identity, local_path,
+    path_identity_with_controls, publish_staging, remove_owned_live, remove_owned_with_controls,
+    staging_path, sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
@@ -54,7 +54,8 @@ pub(crate) fn execute_extract<S: JournalStorage>(
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
     cancellation.wait_if_paused()?;
-    let mut budget = ArchiveBudget::with_accounting(limits.clone(), accounting.clone());
+    let mut budget = ArchiveBudget::with_accounting(limits.clone(), accounting.clone())
+        .with_identity_cancellation(cancellation.clone());
     let plan_path_bytes = plan
         .sources()
         .iter()
@@ -128,6 +129,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             ))?,
     )?;
     let staging = staging_path(plan, job_id, generation)?;
+    let rollback = cleanup_path(&staging)?;
     let destination_before =
         path_identity_with_controls(&destination, Some(&budget), Some(cancellation))?;
     append_archive_phase(
@@ -149,7 +151,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             .create(&staging)
             .map_err(|error| map_io(&error))?;
         sync_parent(&staging)?;
-        stage_root = path_identity(&staging)?;
+        stage_root = path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?;
         report_phase(ArchiveEventPhase::Staging)?;
         append_archive_phase(
             journal,
@@ -244,10 +246,22 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         let staging_before_publish =
             path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
                 .ok_or(ArchiveOperationError::Conflict)?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::CleanupPlanned,
+            plan,
+            &staging,
+            destination_before,
+            None,
+            Some(&budget),
+        )?;
         begin_commit()?;
         let outcome = publish_staging(
             &staging,
             &destination,
+            &rollback,
             plan.conflict_policy(),
             staging_before_publish,
             destination_before,
@@ -260,8 +274,13 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             {
                 return Err(ArchiveOperationError::Conflict);
             }
-            remove_owned(&staging, Some(staging_before_publish))
-                .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
+            remove_owned_with_controls(
+                &staging,
+                Some(staging_before_publish),
+                &budget,
+                cancellation,
+            )
+            .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
             append_archive_phase(
                 journal,
                 job_id,
@@ -290,13 +309,24 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             destination_after,
             Some(&budget),
         )?;
+        append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::CleanupQuarantined,
+            plan,
+            &staging,
+            destination_before,
+            destination_after,
+            Some(&budget),
+        )?;
         report_phase(ArchiveEventPhase::Cleaning)?;
-        if path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
+        if path_identity_with_controls(&rollback, Some(&budget), Some(cancellation))?
             != destination_before
         {
             return Err(ArchiveOperationError::RecoveryRequired);
         }
-        remove_owned(&staging, destination_before)
+        remove_owned_with_controls(&rollback, destination_before, &budget, cancellation)
             .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
         append_archive_phase(
             journal,
@@ -323,9 +353,28 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         Ok(ArchiveOperationOutcome::Published)
     })();
 
-    if result.is_err() && !published && staging.exists() {
+    if matches!(result, Err(ArchiveOperationError::RecoveryRequired)) {
+        let recovery_destination =
+            path_identity_with_controls(&destination, Some(&budget), Some(cancellation))
+                .unwrap_or(None);
+        if append_archive_phase(
+            journal,
+            job_id,
+            generation,
+            JournalPhase::RecoveryRequired,
+            plan,
+            &staging,
+            destination_before,
+            recovery_destination,
+            Some(&budget),
+        )
+        .is_err()
+        {
+            result = Err(ArchiveOperationError::Journal);
+        }
+    } else if result.is_err() && !published && staging.exists() {
         if remove_owned_live(&staging, stage_root).is_ok() {
-            let _ = append_archive_phase(
+            if append_archive_phase(
                 journal,
                 job_id,
                 generation,
@@ -335,7 +384,11 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                 destination_before,
                 None,
                 Some(&budget),
-            );
+            )
+            .is_err()
+            {
+                result = Err(ArchiveOperationError::RecoveryRequired);
+            }
         } else {
             result = Err(ArchiveOperationError::RecoveryRequired);
         }

@@ -34,6 +34,7 @@ pub const fn decide_recovery(phase: JournalPhase, context: RecoveryContext) -> R
                 RecoveryDecision::Ask
             }
         }
+        JournalPhase::CleanupPlanned | JournalPhase::RecoveryRequired => RecoveryDecision::Ask,
         JournalPhase::DestinationPublished => {
             if context.continuation_verified
                 && context.destination_verified
@@ -44,7 +45,9 @@ pub const fn decide_recovery(phase: JournalPhase, context: RecoveryContext) -> R
                 RecoveryDecision::Ask
             }
         }
-        JournalPhase::SourceRemoved | JournalPhase::StagingCleaned => {
+        JournalPhase::CleanupQuarantined
+        | JournalPhase::SourceRemoved
+        | JournalPhase::StagingCleaned => {
             if context.continuation_verified && context.destination_verified {
                 RecoveryDecision::Resume
             } else {

@@ -7,6 +7,11 @@ use std::io;
 use std::sync::Arc;
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_IDENTITY_MEMORY_LIMIT: u64 = 512 * 1_024 * 1_024;
+
+const fn default_identity_memory_limit() -> u64 {
+    DEFAULT_IDENTITY_MEMORY_LIMIT
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,9 +20,12 @@ pub enum JournalPhase {
     StagingCreated,
     DataCopied,
     MetadataApplied,
+    CleanupPlanned,
     DestinationPublished,
+    CleanupQuarantined,
     SourceRemoved,
     StagingCleaned,
+    RecoveryRequired,
     Completed,
     RolledBack,
 }
@@ -112,6 +120,14 @@ pub struct ArchiveCheckpoint {
     destination_after: Option<ArchivePathIdentity>,
     #[serde(default)]
     staging_nonce: Option<[u8; 16]>,
+    #[serde(default)]
+    cleanup: Option<StorePath>,
+    #[serde(default)]
+    cleanup_identity: Option<ArchivePathIdentity>,
+    #[serde(default)]
+    cleanup_deletion: Option<StorePath>,
+    #[serde(default = "default_identity_memory_limit")]
+    identity_memory_limit: u64,
 }
 
 impl ArchiveCheckpoint {
@@ -134,12 +150,39 @@ impl ArchiveCheckpoint {
             destination_before,
             destination_after,
             staging_nonce: None,
+            cleanup: None,
+            cleanup_identity: None,
+            cleanup_deletion: None,
+            identity_memory_limit: DEFAULT_IDENTITY_MEMORY_LIMIT,
         }
     }
 
     #[must_use]
     pub const fn with_staging_nonce(mut self, staging_nonce: [u8; 16]) -> Self {
         self.staging_nonce = Some(staging_nonce);
+        self
+    }
+
+    #[must_use]
+    pub fn with_cleanup(
+        mut self,
+        cleanup: StorePath,
+        cleanup_identity: Option<ArchivePathIdentity>,
+    ) -> Self {
+        self.cleanup = Some(cleanup);
+        self.cleanup_identity = cleanup_identity;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cleanup_deletion(mut self, cleanup_deletion: StorePath) -> Self {
+        self.cleanup_deletion = Some(cleanup_deletion);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_identity_memory_limit(mut self, limit: u64) -> Self {
+        self.identity_memory_limit = limit;
         self
     }
 
@@ -175,6 +218,10 @@ impl ArchiveCheckpoint {
             destination_before,
             destination_after,
             staging_nonce: None,
+            cleanup: None,
+            cleanup_identity: None,
+            cleanup_deletion: None,
+            identity_memory_limit: DEFAULT_IDENTITY_MEMORY_LIMIT,
         }
     }
     #[must_use]
@@ -196,6 +243,22 @@ impl ArchiveCheckpoint {
     #[must_use]
     pub const fn staging_nonce(&self) -> Option<[u8; 16]> {
         self.staging_nonce
+    }
+    #[must_use]
+    pub const fn cleanup(&self) -> Option<&StorePath> {
+        self.cleanup.as_ref()
+    }
+    #[must_use]
+    pub const fn cleanup_identity(&self) -> Option<ArchivePathIdentity> {
+        self.cleanup_identity
+    }
+    #[must_use]
+    pub const fn cleanup_deletion(&self) -> Option<&StorePath> {
+        self.cleanup_deletion.as_ref()
+    }
+    #[must_use]
+    pub const fn identity_memory_limit(&self) -> u64 {
+        self.identity_memory_limit
     }
 }
 
@@ -271,6 +334,14 @@ struct ArchiveCheckpointDocument {
     destination_after: Option<ArchivePathIdentity>,
     #[serde(default)]
     staging_nonce: Option<[u8; 16]>,
+    #[serde(default)]
+    cleanup: Option<StorePath>,
+    #[serde(default)]
+    cleanup_identity: Option<ArchivePathIdentity>,
+    #[serde(default)]
+    cleanup_deletion: Option<StorePath>,
+    #[serde(default = "default_identity_memory_limit")]
+    identity_memory_limit: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -590,6 +661,10 @@ fn encode_record(record: &JournalRecord, include_plan: bool) -> Result<Vec<u8>, 
                 destination_before: checkpoint.destination_before,
                 destination_after: checkpoint.destination_after,
                 staging_nonce: checkpoint.staging_nonce,
+                cleanup: checkpoint.cleanup.clone(),
+                cleanup_identity: checkpoint.cleanup_identity,
+                cleanup_deletion: checkpoint.cleanup_deletion.clone(),
+                identity_memory_limit: checkpoint.identity_memory_limit,
             })
         })
         .transpose()?;
@@ -661,6 +736,10 @@ fn decode_record(
                 destination_before: checkpoint.destination_before,
                 destination_after: checkpoint.destination_after,
                 staging_nonce: checkpoint.staging_nonce,
+                cleanup: checkpoint.cleanup,
+                cleanup_identity: checkpoint.cleanup_identity,
+                cleanup_deletion: checkpoint.cleanup_deletion,
+                identity_memory_limit: checkpoint.identity_memory_limit,
             })
         })
         .transpose()?;

@@ -31,7 +31,8 @@ pub use libarchive_codec::run_worker as run_libarchive_worker;
 pub use path::ArchivePath;
 pub use recovery::{
     ArchiveRecoveryAction, ArchiveRecoveryOutcome, ArchiveRecoveryRequest, apply_archive_recovery,
-    recover_archive_operations,
+    apply_archive_recovery_with_cancellation, recover_archive_operations,
+    recover_archive_operations_with_cancellation,
 };
 pub use store::{
     ArchiveCounters, ArchiveError, ArchiveLimits, ArchivePassword, ArchivePasswordProvider,
