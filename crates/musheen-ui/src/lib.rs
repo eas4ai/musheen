@@ -3,6 +3,7 @@
 mod app;
 pub mod dialogs;
 mod directory;
+mod elevated_browser;
 mod i18n;
 mod icons;
 mod info_pane;
@@ -24,6 +25,10 @@ pub use app::{installed_static_command_actions, installed_static_shortcut_bindin
 pub use dialogs::*;
 pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
+};
+pub use elevated_browser::{
+    ElevatedBrowser, ElevatedChrome, PrivilegeBackend, RootedFilesystemStore,
+    SystemPrivilegeBackend,
 };
 pub use i18n::{Catalog, CatalogError, Locale};
 pub use icons::{

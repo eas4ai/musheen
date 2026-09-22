@@ -26,6 +26,7 @@ musheen-ops = { path = "../musheen-ops" }
 nix.workspace = true
 notify-rust.workspace = true
 open.workspace = true
+portable-pty.workspace = true
 png.workspace = true
 posix-acl.workspace = true
 proc-mounts.workspace = true

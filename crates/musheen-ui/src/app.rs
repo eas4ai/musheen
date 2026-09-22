@@ -14,6 +14,7 @@ use crate::dialogs::{
 use crate::directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
 };
+use crate::elevated_browser::{PrivilegeBackend, RootedFilesystemStore, SystemPrivilegeBackend};
 use crate::i18n::{Catalog, Locale};
 use crate::icons::{ApplicationIdentity, ContentIdentity, freedesktop_icon_name};
 use crate::info_pane::{
@@ -69,11 +70,12 @@ use musheen_core::{
     WatchEvent,
 };
 use musheen_desktop::{
-    ApplicationIconProvider, CatalogDocument, CatalogStore, ConflictDecisionStore,
-    DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths, FolderIdentity,
-    FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
-    MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation, OperationUsage,
-    OperationUse, PreviewDocument, ProcessRunner, SessionStore, SystemProcessRunner,
+    ApplicationIconProvider, BrokerError, BrokerOutput, BrokerRequest, CatalogDocument,
+    CatalogStore, ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher, DesktopPaths,
+    FolderIdentity, FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError,
+    MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation,
+    OperationUsage, OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner,
+    RootCapabilityDescriptor, SecretBuffer, SessionStore, SystemClock, SystemProcessRunner,
     TagMoveOutcome, TerminalCommand, ThumbnailCache, ThumbnailLimits, ThumbnailLookup,
     ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution,
     VolumeAction, VolumeError, VolumeId, VolumeRuntime,
@@ -412,7 +414,8 @@ struct ContextDialogStrings {
     cancel: String,
     review_operation: String,
     continue_action: String,
-    authorization_unavailable: String,
+    authorization_provider: String,
+    sudo_password: String,
     command: String,
     targets: String,
     move_review: String,
@@ -972,7 +975,8 @@ impl ContextDialogStrings {
             cancel: message("dialog.cancel"),
             review_operation: message("dialog.review-operation"),
             continue_action: message("dialog.continue"),
-            authorization_unavailable: message("dialog.authorization-unavailable"),
+            authorization_provider: message("dialog.authorization-provider"),
+            sudo_password: message("dialog.sudo-password"),
             command: message("dialog.command"),
             targets: message("dialog.targets"),
             move_review: message("dialog.move-review"),
@@ -1109,9 +1113,17 @@ struct ContextReviewDialog {
     move_operation: bool,
     targets: Vec<String>,
     cancellation_warning: Option<String>,
+    privilege_provider: Option<String>,
+    sudo_password: Option<Entity<InputState>>,
+    submitted_secret: Option<SecretBuffer>,
     strings: ContextDialogStrings,
     focus: FocusHandle,
     pending_focus: bool,
+}
+
+struct ContextReviewAuthorization {
+    cancellation_warning: Option<String>,
+    privilege_provider: Option<String>,
 }
 
 impl EventEmitter<ContextReviewEvent> for ContextReviewDialog {}
@@ -1121,15 +1133,28 @@ impl ContextReviewDialog {
         command: String,
         move_operation: bool,
         targets: Vec<String>,
-        cancellation_warning: Option<String>,
+        authorization: ContextReviewAuthorization,
         strings: ContextDialogStrings,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let sudo_password =
+            (authorization.privilege_provider.as_deref() == Some("sudo")).then(|| {
+                let placeholder = strings.sudo_password.clone();
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder(placeholder)
+                        .masked(true)
+                })
+            });
         Self {
             command,
             move_operation,
             targets,
-            cancellation_warning,
+            cancellation_warning: authorization.cancellation_warning,
+            privilege_provider: authorization.privilege_provider,
+            sudo_password,
+            submitted_secret: None,
             strings,
             focus: cx.focus_handle(),
             pending_focus: true,
@@ -1160,7 +1185,10 @@ impl Render for ContextReviewDialog {
             .flex_col()
             .gap_3()
             .p_4()
-            .on_action(cx.listener(|_, _: &Escape, window, cx| {
+            .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                if let Some(password) = this.sudo_password.clone() {
+                    password.update(cx, |password, cx| password.set_value("", window, cx));
+                }
                 cx.emit(ContextReviewEvent::Cancelled);
                 window.defer(cx, |window, _| window.remove_window());
             }))
@@ -1207,7 +1235,24 @@ impl Render for ContextReviewDialog {
                         .child(warning),
                 )
             })
-            .child(self.strings.authorization_unavailable.clone())
+            .when_some(self.privilege_provider.clone(), |dialog, provider| {
+                let message = format!("{}: {provider}", self.strings.authorization_provider);
+                dialog.child(
+                    div()
+                        .id("context-review-privilege-provider")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(message.clone())
+                        .child(message),
+                )
+            })
+            .when_some(self.sudo_password.clone(), |dialog, password| {
+                dialog.child(
+                    Input::new(&password)
+                        .id("context-review-sudo-password")
+                        .content_type(InputContentType::Password),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1215,7 +1260,12 @@ impl Render for ContextReviewDialog {
                     .child(
                         Button::new("context-review-cancel")
                             .label(self.strings.cancel.clone())
-                            .on_click(cx.listener(|_, _, window, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(password) = this.sudo_password.clone() {
+                                    password.update(cx, |password, cx| {
+                                        password.set_value("", window, cx);
+                                    });
+                                }
                                 cx.emit(ContextReviewEvent::Cancelled);
                                 window.defer(cx, |window, _| window.remove_window());
                             })),
@@ -1224,7 +1274,18 @@ impl Render for ContextReviewDialog {
                         Button::new("context-review-confirm")
                             .label(self.strings.continue_action.clone())
                             .primary()
-                            .on_click(cx.listener(|_, _, window, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submitted_secret =
+                                    this.sudo_password.as_ref().map(|password| {
+                                        SecretBuffer::new(
+                                            password.read(cx).value().as_bytes().to_vec(),
+                                        )
+                                    });
+                                if let Some(password) = this.sudo_password.clone() {
+                                    password.update(cx, |password, cx| {
+                                        password.set_value("", window, cx);
+                                    });
+                                }
                                 cx.emit(ContextReviewEvent::Confirmed);
                                 window.defer(cx, |window, _| window.remove_window());
                             })),
@@ -2528,6 +2589,10 @@ struct MusheenApp {
     pending_application_commands: Vec<PendingApplicationCommand>,
     application_icons: Arc<dyn ApplicationIconProvider>,
     application_runner: Arc<dyn ProcessRunner>,
+    privilege_backend: Arc<dyn PrivilegeBackend>,
+    privilege_cancellation: CancellationToken,
+    pending_privilege_authentication: Option<SecretBuffer>,
+    elevated_store: Option<Arc<RootedFilesystemStore<SystemClock>>>,
     terminal_command: Option<TerminalCommand>,
     status_center_open: bool,
     trash_states: HashMap<TabId, TrashState>,
@@ -2561,6 +2626,7 @@ impl Drop for MusheenApp {
         for info_pane in self.info_panes.values_mut() {
             info_pane.cancel_active();
         }
+        self.privilege_cancellation.cancel();
     }
 }
 
@@ -2721,6 +2787,13 @@ impl MusheenApp {
                 }
             });
         let catalog_projection_revision = catalog_binding.revision();
+        let privilege_provider = if settings.as_ref().is_some_and(|settings| {
+            settings.value("integrations.privilege").as_deref() == Some("sudo")
+        }) {
+            PrivilegeProvider::Sudo
+        } else {
+            PrivilegeProvider::Polkit
+        };
         let mut this = Self {
             custom_actions: custom_actions::from_settings(settings.as_ref()),
             custom_action_warning: None,
@@ -2782,6 +2855,10 @@ impl MusheenApp {
             pending_application_commands: Vec::new(),
             application_icons: Arc::new(FreedesktopIconProvider),
             application_runner: Arc::new(SystemProcessRunner),
+            privilege_backend: Arc::new(SystemPrivilegeBackend::new(privilege_provider)),
+            privilege_cancellation: CancellationToken::new(),
+            pending_privilege_authentication: None,
+            elevated_store: None,
             terminal_command: TerminalCommand::new("x-terminal-emulator", ["-e"]).ok(),
             status_center_open: false,
             trash_states: HashMap::new(),
@@ -2945,6 +3022,11 @@ impl MusheenApp {
     }
 
     fn start_load_for_tab(&mut self, tab_id: TabId, location: StorePath, cx: &mut Context<Self>) {
+        if let Err(error) = self.validate_elevated_location(&location) {
+            self.operation_error = Some(localized_privilege_error(&self.catalog, &error));
+            cx.notify();
+            return;
+        }
         let trash = is_trash_location(&location);
         if !self.directories.contains_key(&tab_id) {
             let mut directory = DirectoryModel::new(self.limits.snapshot());
@@ -3317,6 +3399,11 @@ impl MusheenApp {
 
     fn navigate(&mut self, location: StorePath, remember: bool, cx: &mut Context<Self>) {
         if self.browser_input_blocked() {
+            return;
+        }
+        if let Err(error) = self.validate_elevated_location(&location) {
+            self.operation_error = Some(localized_privilege_error(&self.catalog, &error));
+            cx.notify();
             return;
         }
         let tab_id = self.navigation.focused_tab().id();
@@ -5399,6 +5486,11 @@ impl MusheenApp {
         let approved_volume_users = cancellation_review
             .map(|(_, operations)| operations)
             .unwrap_or_default();
+        let privilege_provider = matches!(
+            pending.command_id(),
+            "directory.open_as_administrator" | "file.run_as_administrator"
+        )
+        .then(|| self.privilege_backend.provider().as_str().to_owned());
         let strings = ContextDialogStrings::from_catalog(&self.catalog);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(580.), px(360.)), cx)),
@@ -5417,8 +5509,12 @@ impl MusheenApp {
                         command,
                         move_operation,
                         targets,
-                        cancellation_warning,
+                        ContextReviewAuthorization {
+                            cancellation_warning,
+                            privilege_provider,
+                        },
                         strings,
+                        window,
                         cx,
                     )
                 });
@@ -5428,9 +5524,17 @@ impl MusheenApp {
             .expect("Musheen could not open a context review dialog");
         self.track_context_dialog_window(dialog_window.window_id(), pending.origin_tab(), cx);
         let dialog = dialog.expect("the context review dialog constructs its view");
+        let secret_dialog = dialog.clone();
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
             ContextReviewEvent::Confirmed => {
-                this.confirm_context_review(invocation.clone(), approved_volume_users.clone(), cx);
+                let authentication =
+                    secret_dialog.update(cx, |dialog, _| dialog.submitted_secret.take());
+                this.confirm_context_review(
+                    invocation.clone(),
+                    approved_volume_users.clone(),
+                    authentication,
+                    cx,
+                );
             }
             ContextReviewEvent::Cancelled => {
                 cx.notify();
@@ -5475,6 +5579,7 @@ impl MusheenApp {
         &mut self,
         invocation: MenuInvocation,
         approved_volume_users: Vec<OperationUse>,
+        privilege_authentication: Option<SecretBuffer>,
         cx: &mut Context<Self>,
     ) {
         let surface = self.shell.context_menus().clone();
@@ -5511,6 +5616,7 @@ impl MusheenApp {
                     // A normal destructive-action confirmation is not consent
                     // to cancel an operation that started after the dialog
                     // opened. Only a dialog that named active users grants it.
+                    self.pending_privilege_authentication = privilege_authentication;
                     self.dispatch_typed_context_command(
                         action,
                         parameters,
@@ -5619,6 +5725,10 @@ impl MusheenApp {
                 self.dispatch_volume_action(*action, targets, confirmed, cx);
             }
             (
+                action @ (CommandAction::OpenAsAdministrator | CommandAction::RunAsAdministrator),
+                CommandParameters::Targets(targets),
+            ) => self.dispatch_privilege_action(*action, targets, origin_tab, confirmed, cx),
+            (
                 action @ (CommandAction::Open
                 | CommandAction::OpenWith
                 | CommandAction::SetDefaultApplication
@@ -5707,6 +5817,202 @@ impl MusheenApp {
                 cx.notify();
             }
         }
+    }
+
+    fn dispatch_privilege_action(
+        &mut self,
+        action: CommandAction,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !confirmed || targets.len() != 1 {
+            self.operation_error = Some(
+                self.catalog
+                    .message("privilege-confirmation-required")
+                    .expect("the privilege confirmation refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+            self.operation_error = Some(error);
+            cx.notify();
+            return;
+        }
+        let Some(path) = targets[0].path().as_unix_path().map(Path::to_path_buf) else {
+            self.operation_error = Some(
+                self.catalog
+                    .message("privilege-local-only")
+                    .expect("the local-only privilege refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let request = match action {
+            CommandAction::OpenAsAdministrator => BrokerRequest::open_directory(&path),
+            CommandAction::RunAsAdministrator => {
+                BrokerRequest::run_executable(&path, std::iter::empty::<String>())
+            }
+            _ => unreachable!("only privilege commands reach this helper"),
+        };
+        let Ok(request) = request else {
+            self.operation_error = Some(
+                self.catalog
+                    .message("privilege-invalid-request")
+                    .expect("the invalid privilege request is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let backend = Arc::clone(&self.privilege_backend);
+        let cancellation = self.privilege_cancellation.clone();
+        let authentication = self.pending_privilege_authentication.take();
+        cx.spawn(async move |this, cx| {
+            let worker_request = request.clone();
+            let result = cx
+                .background_spawn(async move {
+                    backend
+                        .perform(&worker_request, cancellation, authentication)
+                        .await
+                })
+                .await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(BrokerOutput::DirectoryGranted(descriptor))
+                    if matches!(action, CommandAction::OpenAsAdministrator) =>
+                {
+                    state.open_elevated_window(descriptor, cx);
+                }
+                Ok(BrokerOutput::Exited(code))
+                    if matches!(action, CommandAction::RunAsAdministrator) =>
+                {
+                    if code != 0 {
+                        state.operation_error = Some(
+                            state
+                                .catalog
+                                .message("privilege-command-failed")
+                                .expect("the privilege command failure is localized")
+                                .into(),
+                        );
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    state.operation_error = Some(
+                        state
+                            .catalog
+                            .message("privilege-response-invalid")
+                            .expect("the invalid privilege response is localized")
+                            .into(),
+                    );
+                    cx.notify();
+                }
+                Err(error) => {
+                    state.operation_error = Some(localized_privilege_error(&state.catalog, &error));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_elevated_window(
+        &mut self,
+        descriptor: RootCapabilityDescriptor,
+        cx: &mut Context<Self>,
+    ) {
+        let root = descriptor.root().to_path_buf();
+        let elevated_store = Arc::new(RootedFilesystemStore::<SystemClock>::remote(
+            descriptor,
+            Arc::clone(&self.privilege_backend),
+        ));
+        let providers = match ProviderRuntime::with_primary_store(elevated_store.clone()) {
+            Ok(providers) => providers,
+            Err(_) => {
+                self.operation_error = Some(
+                    self.catalog
+                        .message("privilege-window-failed")
+                        .expect("the elevated-window failure is localized")
+                        .into(),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let provider = Arc::clone(&self.privilege_backend);
+        let watch_directories = self.watch_directories;
+        let location = StorePath::from_unix_path(root.into_os_string());
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(1024.), px(720.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from(
+                    self.catalog
+                        .message("elevated-browser-title")
+                        .expect("the elevated browser title is localized")
+                        .to_owned(),
+                )),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(720.), px(480.))),
+            ..WindowOptions::default()
+        };
+        if cx
+            .open_window(options, move |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut app = MusheenApp::new_with_navigation(
+                        WindowSession::new(location),
+                        None,
+                        Some(providers),
+                        ResourceLimits::default(),
+                        watch_directories,
+                        cx,
+                    );
+                    app.elevated_store = Some(elevated_store);
+                    app.privilege_backend = provider;
+                    app
+                });
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .is_err()
+        {
+            self.operation_error = Some(
+                self.catalog
+                    .message("privilege-window-failed")
+                    .expect("the elevated-window failure is localized")
+                    .into(),
+            );
+            cx.notify();
+        }
+    }
+
+    fn validate_elevated_location(&self, location: &StorePath) -> Result<(), BrokerError> {
+        let Some(store) = &self.elevated_store else {
+            return Ok(());
+        };
+        let path = location.as_unix_path().ok_or(BrokerError::ScopeEscape)?;
+        let relative = path
+            .strip_prefix(store.root())
+            .map_err(|_| BrokerError::ScopeEscape)?;
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return Err(BrokerError::ScopeEscape);
+        }
+        store
+            .rooted_store()
+            .map_or(Ok(()), |local| local.resolve(relative).map(|_| ()))
     }
 
     fn dispatch_local_target_command(
@@ -6420,15 +6726,14 @@ impl MusheenApp {
                 | CommandAction::Eject
                 | CommandAction::Unlock
                 | CommandAction::PowerOff
+                | CommandAction::OpenAsAdministrator
+                | CommandAction::RunAsAdministrator
         ) {
             return CapabilityState::Supported;
         }
         let reason = match action {
             CommandAction::Extract | CommandAction::ExtractHere => {
                 "Archive extraction is unavailable because no archive operation provider is installed"
-            }
-            CommandAction::OpenAsAdministrator | CommandAction::RunAsAdministrator => {
-                "Privilege elevation is unavailable because no authorization broker is installed"
             }
             _ => "This command is not available in the current desktop backend",
         };
@@ -8812,7 +9117,7 @@ impl MusheenApp {
         let Some(invocation) = self.pending_empty_trash.take() else {
             return;
         };
-        self.confirm_context_review(invocation, Vec::new(), cx);
+        self.confirm_context_review(invocation, Vec::new(), None, cx);
     }
 
     fn empty_trash(
@@ -10422,6 +10727,29 @@ impl Render for MusheenApp {
             }))
             .child(self.render_tab_strip(cx))
             .child(self.render_toolbar(window, cx))
+            .when(self.elevated_store.is_some(), |shell| {
+                let warning = self
+                    .catalog
+                    .message("elevated-browser-warning")
+                    .expect("the elevated warning is localized")
+                    .to_owned();
+                shell.child(
+                    div()
+                        .id("elevated-browser-warning")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(warning.clone())
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .bg(colors.warning)
+                        .text_color(colors.warning_foreground)
+                        .child(Icon::new(IconName::Shield))
+                        .child(warning),
+                )
+            })
             .child(self.render_custom_toolbar(cx))
             .children(self.custom_action_warning_row())
             .when_some(operation_error, |shell, message| {
@@ -10651,6 +10979,29 @@ fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
         VolumeError::CancellationFailed(reason) => with_detail("volume-error-cancellation", reason),
         VolumeError::Protocol(reason) => with_detail("volume-error-protocol", reason),
     }
+}
+
+fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str> {
+    let key = match error {
+        BrokerError::AuthorizationCancelled => "privilege-error-cancelled",
+        BrokerError::AuthorizationDenied => "privilege-error-denied",
+        BrokerError::AuthorizationExpired => "privilege-error-expired",
+        BrokerError::AuthorizationUnavailable => "privilege-error-unavailable",
+        BrokerError::TargetReplaced => "privilege-error-target-replaced",
+        BrokerError::ScopeEscape => "privilege-error-scope-escape",
+        BrokerError::SymlinkRefused => "privilege-error-symlink",
+        BrokerError::NotExecutable => "privilege-error-not-executable",
+        BrokerError::InvalidRequest => "privilege-invalid-request",
+        BrokerError::BrokerCrashed => "privilege-error-broker-crashed",
+        BrokerError::Busy => "privilege-error-busy",
+        BrokerError::ExecutionTimedOut => "privilege-error-timeout",
+        BrokerError::AuditFailed => "privilege-error-audit",
+        BrokerError::Io => "privilege-error-io",
+    };
+    catalog
+        .message(key)
+        .expect("the privilege error is localized")
+        .into()
 }
 
 const fn local_volume_error_key(error: &VolumeError) -> Option<&'static str> {
@@ -10931,7 +11282,9 @@ mod tests {
         CapabilityMatrix, CapabilityReason, CapabilityState, MutationRequest, PageRequest,
         ProviderId, SearchCapabilities, SearchResult, SearchScopeError,
     };
-    use musheen_desktop::{PreparedLaunch, ProcessRunner, TagBackend, XattrTagBackend};
+    use musheen_desktop::{
+        BrokerOperation, PreparedLaunch, ProcessRunner, TagBackend, XattrTagBackend,
+    };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
 
@@ -11430,8 +11783,16 @@ mod tests {
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let loader = Arc::clone(&loader);
             let view = cx.new(|cx| {
-                let mut state =
-                    MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx);
+                let mut state = MusheenApp::new_with_navigation(
+                    WindowSession::new(StorePath::from_unix_path(
+                        temporary.path().as_os_str().to_owned(),
+                    )),
+                    None,
+                    None,
+                    ResourceLimits::default(),
+                    false,
+                    cx,
+                );
                 state.desktop_paths = Some(DesktopPaths::new(
                     temporary.path().join("config"),
                     temporary.path().join("data"),
@@ -13389,16 +13750,19 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_context_actions_name_the_missing_production_capability() {
+    fn context_actions_report_current_production_capabilities() {
         assert!(
             MusheenApp::backend_action_state(CommandAction::Extract)
                 .reason()
                 .is_some_and(|reason| reason.contains("archive operation provider"))
         );
-        assert!(
-            MusheenApp::backend_action_state(CommandAction::OpenAsAdministrator)
-                .reason()
-                .is_some_and(|reason| reason.contains("authorization broker"))
+        assert_eq!(
+            MusheenApp::backend_action_state(CommandAction::OpenAsAdministrator),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            MusheenApp::backend_action_state(CommandAction::RunAsAdministrator),
+            CapabilityState::Supported
         );
         assert_eq!(
             MusheenApp::backend_action_state(CommandAction::OpenWith),
@@ -13408,6 +13772,152 @@ mod tests {
             MusheenApp::backend_action_state(CommandAction::ChooseApplication),
             CapabilityState::Supported
         );
+    }
+
+    #[gpui_kit::test]
+    async fn administrator_action_requires_review_and_opens_a_visibly_elevated_surface(
+        cx: &mut TestAppContext,
+    ) {
+        #[derive(Clone, Default)]
+        struct RecordingPrivilegeBackend(Arc<Mutex<Vec<BrokerRequest>>>);
+
+        impl PrivilegeBackend for RecordingPrivilegeBackend {
+            fn provider(&self) -> PrivilegeProvider {
+                PrivilegeProvider::Polkit
+            }
+
+            fn perform<'a>(
+                &'a self,
+                request: &'a BrokerRequest,
+                _cancellation: CancellationToken,
+                _authentication: Option<SecretBuffer>,
+            ) -> musheen_core::BoxFuture<'a, Result<BrokerOutput, BrokerError>> {
+                self.0.lock().unwrap().push(request.clone());
+                match request.operation() {
+                    BrokerOperation::OpenDirectory { .. } => {
+                        let descriptor =
+                            RootCapabilityDescriptor::capture(request.target(), u64::MAX);
+                        Box::pin(async move { descriptor.map(BrokerOutput::DirectoryGranted) })
+                    }
+                    BrokerOperation::ReadDirectory { .. } => {
+                        Box::pin(async { Ok(BrokerOutput::DirectoryEntries(Vec::new())) })
+                    }
+                    BrokerOperation::RunExecutable { .. } => {
+                        Box::pin(async { Ok(BrokerOutput::Exited(0)) })
+                    }
+                }
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let effective_uid = || {
+            filesystem::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:\t"))
+                .and_then(|uids| uids.split_whitespace().nth(1))
+                .unwrap()
+                .to_owned()
+        };
+        let original_euid = effective_uid();
+        let temporary = tempfile::tempdir().unwrap();
+        let protected = temporary.path().join("protected");
+        filesystem::create_dir(&protected).unwrap();
+        let backend = RecordingPrivilegeBackend::default();
+        let calls = Arc::clone(&backend.0);
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut state =
+                    MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx);
+                state.privilege_backend = Arc::new(backend);
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                let item = state
+                    .focused_directory()
+                    .view()
+                    .items()
+                    .iter()
+                    .find(|item| item.path().as_unix_path() == Some(protected.as_path()))
+                    .unwrap();
+                let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+                state.dispatch_typed_context_command(
+                    CommandAction::OpenAsAdministrator,
+                    CommandParameters::targets(vec![target.clone()]),
+                    Some(tab),
+                    None,
+                    false,
+                    cx,
+                );
+                assert!(calls.lock().unwrap().is_empty());
+                assert_eq!(
+                    state.operation_error.as_deref(),
+                    state
+                        .catalog
+                        .message("privilege-confirmation-required")
+                        .ok()
+                );
+                state.operation_error = None;
+                state.dispatch_typed_context_command(
+                    CommandAction::OpenAsAdministrator,
+                    CommandParameters::targets(vec![target]),
+                    Some(tab),
+                    None,
+                    true,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            !calls.lock().unwrap().is_empty() && cx.windows().len() == 2
+        })
+        .await;
+
+        let recorded = calls.lock().unwrap();
+        let privileged_open = recorded
+            .iter()
+            .filter(|request| matches!(request.operation(), BrokerOperation::OpenDirectory { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(privileged_open.len(), 1);
+        assert_eq!(privileged_open[0].target(), protected);
+        assert!(matches!(
+            privileged_open[0].operation(),
+            BrokerOperation::OpenDirectory { .. }
+        ));
+        assert!(recorded.iter().any(|request| {
+            matches!(request.operation(), BrokerOperation::ReadDirectory { .. })
+        }));
+        drop(recorded);
+        assert_eq!(effective_uid(), original_euid);
+        let elevated = cx
+            .windows()
+            .into_iter()
+            .find(|candidate| *candidate != browser)
+            .unwrap();
+        cx.update_window(elevated, |_, window, cx| {
+            window.activate_accessibility_for_test();
+            window.render_frame(cx);
+            assert!(window.find("elevated-browser-warning").visible());
+            assert!(window.find("elevated-browser-warning").label().is_some());
+        })
+        .unwrap();
     }
 
     #[test]

@@ -47,6 +47,7 @@ nix = { version = "0.31", features = ["fs", "poll"] }
 notify = "8"
 notify-rust = "4"
 open = "5"
+portable-pty = "0.9"
 proc-mounts = "0.3"
 posix-acl = "1.2"
 png = "0.18"

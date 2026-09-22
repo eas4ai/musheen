@@ -89,6 +89,18 @@ impl ProviderRuntime {
             .expect("the built-in provider registrations are valid")
     }
 
+    pub(crate) fn with_primary_store(store: Arc<dyn Store>) -> Result<Self, ProviderRuntimeError> {
+        let primary = ProviderId::new("local").expect("the built-in provider ID is valid");
+        if store.provider_id() != &primary {
+            return Err(ProviderRuntimeError::MissingPrimaryProvider(primary));
+        }
+        let mut builder = ProviderRuntimeBuilder::shipping();
+        builder.adapters.remove(&primary);
+        builder
+            .register_adapter(Arc::new(StoreOnlyAdapter::new(store)))?
+            .build()
+    }
+
     pub(crate) fn store(&self) -> Arc<dyn Store> {
         self.store.clone()
     }

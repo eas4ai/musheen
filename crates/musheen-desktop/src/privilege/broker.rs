@@ -1,0 +1,1279 @@
+use base64::Engine as _;
+use rustix::fs::{Mode, OFlags, open, openat};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+use super::{
+    BrokerOperation, BrokerRequest, PrivilegeProvider, RequestSubject, RootCapabilityDescriptor,
+    RootGrant, RootedEntryKind, RootedStore,
+};
+use crate::SecretBuffer;
+use musheen_core::CancellationToken;
+
+pub const SUDO_BROKER_READY: &str = "MUSHEEN_BROKER_READY";
+pub const BROKER_REQUEST_FRAME: &str = "MUSHEEN_REQUEST ";
+pub const BROKER_RESPONSE_FRAME: &str = "MUSHEEN_RESPONSE ";
+const MAX_BROKER_OUTPUT: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorizationError {
+    Cancelled,
+    Denied,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationGrant {
+    subject: Box<str>,
+    expires_at_unix_millis: u64,
+}
+
+impl AuthorizationGrant {
+    #[must_use]
+    pub fn new(subject: impl Into<Box<str>>, expires_at_unix_millis: u64) -> Self {
+        Self {
+            subject: subject.into(),
+            expires_at_unix_millis,
+        }
+    }
+
+    #[must_use]
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    #[must_use]
+    pub const fn expires_at_unix_millis(&self) -> u64 {
+        self.expires_at_unix_millis
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizationRequest {
+    request_id: Box<str>,
+    action_id: &'static str,
+    target: PathBuf,
+    provider: PrivilegeProvider,
+    subject: RequestSubject,
+    binding_digest: blake3::Hash,
+}
+
+impl AuthorizationRequest {
+    #[must_use]
+    pub fn from_broker_request(request: &BrokerRequest, provider: PrivilegeProvider) -> Self {
+        Self {
+            request_id: request.id().into(),
+            action_id: request.operation().action_id(),
+            target: request.target().to_path_buf(),
+            provider,
+            subject: request.subject(),
+            binding_digest: request.binding_digest(),
+        }
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    #[must_use]
+    pub const fn action_id(&self) -> &'static str {
+        self.action_id
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> PrivilegeProvider {
+        self.provider
+    }
+
+    #[must_use]
+    pub const fn subject(&self) -> RequestSubject {
+        self.subject
+    }
+
+    #[must_use]
+    pub const fn binding_digest(&self) -> blake3::Hash {
+        self.binding_digest
+    }
+}
+
+pub trait Authorizer: Send + Sync + 'static {
+    fn authorize(
+        &self,
+        request: &AuthorizationRequest,
+    ) -> Result<AuthorizationGrant, AuthorizationError>;
+
+    fn authorize_cancellable(
+        &self,
+        request: &AuthorizationRequest,
+        cancellation: &CancellationToken,
+        _timeout: Duration,
+    ) -> Result<AuthorizationGrant, AuthorizationError> {
+        if cancellation.is_cancelled() {
+            return Err(AuthorizationError::Cancelled);
+        }
+        let result = self.authorize(request);
+        if cancellation.is_cancelled() {
+            Err(AuthorizationError::Cancelled)
+        } else {
+            result
+        }
+    }
+}
+
+pub trait Clock: Clone + Send + Sync + 'static {
+    fn now_unix_millis(&self) -> u64;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix_millis(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+#[derive(Debug)]
+pub struct ValidatedRequest {
+    operation: BrokerOperation,
+    target: ValidatedTarget,
+    environment: BTreeMap<String, String>,
+}
+
+impl ValidatedRequest {
+    #[must_use]
+    pub const fn operation(&self) -> &BrokerOperation {
+        &self.operation
+    }
+
+    #[must_use]
+    pub const fn target_file(&self) -> &File {
+        &self.target.file
+    }
+
+    #[must_use]
+    pub const fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+}
+
+pub trait OperationRunner: Send + Sync + 'static {
+    fn execute(&self, request: ValidatedRequest) -> Result<BrokerOutput, BrokerError>;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrokerOutput {
+    DirectoryGranted(RootCapabilityDescriptor),
+    DirectoryEntries(Vec<BrokerDirectoryEntry>),
+    Exited(i32),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrokerDirectoryEntry {
+    name: Vec<u8>,
+    identity: [u8; 16],
+    kind: RootedEntryKind,
+    size: Option<u64>,
+    modified_unix_seconds: Option<i64>,
+}
+
+impl BrokerDirectoryEntry {
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &[u8; 16] {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> RootedEntryKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    #[must_use]
+    pub const fn modified_unix_seconds(&self) -> Option<i64> {
+        self.modified_unix_seconds
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrokerResponse {
+    ok: bool,
+    result: Option<BrokerOutput>,
+    error: Option<Box<str>>,
+}
+
+impl BrokerResponse {
+    #[must_use]
+    pub fn success(result: BrokerOutput) -> Self {
+        Self {
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failure(error: &BrokerError) -> Self {
+        Self {
+            ok: false,
+            result: None,
+            error: Some(error.code().into()),
+        }
+    }
+
+    fn into_result(self) -> Result<BrokerOutput, BrokerError> {
+        if self.ok {
+            self.result.ok_or(BrokerError::BrokerCrashed)
+        } else {
+            Err(self
+                .error
+                .as_deref()
+                .and_then(BrokerError::from_code)
+                .unwrap_or(BrokerError::BrokerCrashed))
+        }
+    }
+}
+
+pub fn encode_broker_request(request: &BrokerRequest) -> Result<String, BrokerError> {
+    let payload = serde_json::to_vec(request).map_err(|_| BrokerError::InvalidRequest)?;
+    Ok(format!(
+        "{BROKER_REQUEST_FRAME}{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(payload)
+    ))
+}
+
+pub fn decode_broker_request(frame: &str) -> Result<BrokerRequest, BrokerError> {
+    let payload = frame
+        .strip_prefix(BROKER_REQUEST_FRAME)
+        .ok_or(BrokerError::InvalidRequest)?;
+    let payload = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(payload)
+        .map_err(|_| BrokerError::InvalidRequest)?;
+    serde_json::from_slice(&payload).map_err(|_| BrokerError::InvalidRequest)
+}
+
+pub fn encode_broker_response(response: &BrokerResponse) -> Result<String, BrokerError> {
+    let payload = serde_json::to_vec(response).map_err(|_| BrokerError::BrokerCrashed)?;
+    Ok(format!(
+        "{BROKER_RESPONSE_FRAME}{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(payload)
+    ))
+}
+
+pub fn decode_broker_response(frame: &str) -> Result<BrokerOutput, BrokerError> {
+    let payload = frame
+        .strip_prefix(BROKER_RESPONSE_FRAME)
+        .ok_or(BrokerError::BrokerCrashed)?;
+    let payload = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(payload)
+        .map_err(|_| BrokerError::BrokerCrashed)?;
+    serde_json::from_slice::<BrokerResponse>(&payload)
+        .map_err(|_| BrokerError::BrokerCrashed)?
+        .into_result()
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuditOutcome {
+    Denied,
+    Expired,
+    Failed,
+    Started,
+    Succeeded,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuditPhase {
+    Attempt,
+    Authorization,
+    Dispatch,
+    Completion,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditRecord {
+    request_id: Box<str>,
+    operation: Box<str>,
+    #[serde(with = "super::request::path_bytes")]
+    target: PathBuf,
+    provider: PrivilegeProvider,
+    phase: AuditPhase,
+    outcome: AuditOutcome,
+    timestamp_unix_millis: u64,
+}
+
+impl AuditRecord {
+    #[must_use]
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> PrivilegeProvider {
+        self.provider
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> AuditOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> AuditPhase {
+        self.phase
+    }
+}
+
+pub trait AuditSink: Send + Sync + 'static {
+    fn record(&self, record: &AuditRecord) -> Result<(), BrokerError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopAudit;
+
+impl AuditSink for NoopAudit {
+    fn record(&self, _: &AuditRecord) -> Result<(), BrokerError> {
+        Ok(())
+    }
+}
+
+pub struct JsonAuditLog {
+    file: Mutex<File>,
+}
+
+impl JsonAuditLog {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, BrokerError> {
+        let path = path.as_ref();
+        let parent = path.parent().ok_or(BrokerError::AuditFailed)?;
+        std::fs::create_dir_all(parent).map_err(|_| BrokerError::AuditFailed)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| BrokerError::AuditFailed)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|_| BrokerError::AuditFailed)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| BrokerError::AuditFailed)?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+}
+
+impl AuditSink for JsonAuditLog {
+    fn record(&self, record: &AuditRecord) -> Result<(), BrokerError> {
+        let mut file = self.file.lock().map_err(|_| BrokerError::AuditFailed)?;
+        serde_json::to_writer(&mut *file, record).map_err(|_| BrokerError::AuditFailed)?;
+        file.write_all(b"\n")
+            .and_then(|()| file.sync_data())
+            .map_err(|_| BrokerError::AuditFailed)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrokerLaunch {
+    program: PathBuf,
+    arguments: Box<[std::ffi::OsString]>,
+    provider: PrivilegeProvider,
+}
+
+impl BrokerLaunch {
+    #[must_use]
+    pub fn new(broker: impl AsRef<Path>, provider: PrivilegeProvider) -> Self {
+        let broker = broker.as_ref().as_os_str().to_owned();
+        let provider_argument = format!("--provider={}", provider.as_str());
+        let (program, arguments) = match provider {
+            PrivilegeProvider::Polkit => (
+                PathBuf::from("pkexec"),
+                vec![
+                    "--disable-internal-agent".into(),
+                    broker,
+                    "--stdio".into(),
+                    provider_argument.into(),
+                ],
+            ),
+            PrivilegeProvider::Sudo => (
+                PathBuf::from("sudo"),
+                vec![
+                    "--".into(),
+                    broker,
+                    "--stdio".into(),
+                    provider_argument.into(),
+                ],
+            ),
+        };
+        Self {
+            program,
+            arguments: arguments.into_boxed_slice(),
+            provider,
+        }
+    }
+
+    /// Constructs the same narrowly typed sudo invocation with an explicit
+    /// sudo executable. This is useful for sandboxed/recording transports and
+    /// does not permit changing the broker argument schema.
+    #[must_use]
+    pub fn sudo_with_program(sudo: impl AsRef<Path>, broker: impl AsRef<Path>) -> Self {
+        Self {
+            program: sudo.as_ref().to_path_buf(),
+            arguments: vec![
+                "--".into(),
+                broker.as_ref().as_os_str().to_owned(),
+                "--stdio".into(),
+                "--provider=sudo".into(),
+            ]
+            .into_boxed_slice(),
+            provider: PrivilegeProvider::Sudo,
+        }
+    }
+
+    #[must_use]
+    pub fn polkit_with_program(pkexec: impl AsRef<Path>, broker: impl AsRef<Path>) -> Self {
+        Self {
+            program: pkexec.as_ref().to_path_buf(),
+            arguments: vec![
+                "--disable-internal-agent".into(),
+                broker.as_ref().as_os_str().to_owned(),
+                "--stdio".into(),
+                "--provider=polkit".into(),
+            ]
+            .into_boxed_slice(),
+            provider: PrivilegeProvider::Polkit,
+        }
+    }
+
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    #[must_use]
+    pub fn arguments(&self) -> &[std::ffi::OsString] {
+        &self.arguments
+    }
+
+    #[must_use]
+    pub const fn provider(&self) -> PrivilegeProvider {
+        self.provider
+    }
+}
+
+pub trait BrokerTransport: Send + Sync + 'static {
+    fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError>;
+
+    fn perform_cancellable(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<BrokerOutput, BrokerError> {
+        if cancellation.is_cancelled() {
+            return Err(BrokerError::AuthorizationCancelled);
+        }
+        self.perform(request)
+    }
+
+    fn perform_with_authentication(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+        authentication: Option<SecretBuffer>,
+    ) -> Result<BrokerOutput, BrokerError> {
+        drop(authentication);
+        self.perform_cancellable(request, cancellation)
+    }
+}
+
+#[derive(Clone)]
+pub struct ProcessBrokerTransport {
+    launch: BrokerLaunch,
+    timeout: Duration,
+    active: Arc<AtomicBool>,
+    authorizer: Arc<dyn Authorizer>,
+}
+
+impl fmt::Debug for ProcessBrokerTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessBrokerTransport")
+            .field("launch", &self.launch)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProcessBrokerTransport {
+    #[must_use]
+    pub fn new(launch: BrokerLaunch) -> Self {
+        Self {
+            launch,
+            timeout: Duration::from_secs(120),
+            active: Arc::new(AtomicBool::new(false)),
+            authorizer: Arc::new(super::polkit::PolkitAuthorizer::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+}
+
+impl BrokerTransport for ProcessBrokerTransport {
+    fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError> {
+        self.perform_cancellable(request, &CancellationToken::new())
+    }
+
+    fn perform_cancellable(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<BrokerOutput, BrokerError> {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let _admission = TransportAdmission::enter(&self.active)?;
+        if cancellation.is_cancelled() {
+            return Err(BrokerError::AuthorizationCancelled);
+        }
+        if self.launch.provider() != PrivilegeProvider::Polkit {
+            return Err(BrokerError::AuthorizationUnavailable);
+        }
+        let authorization =
+            AuthorizationRequest::from_broker_request(request, PrivilegeProvider::Polkit);
+        let deadline = Instant::now() + self.timeout;
+        match self
+            .authorizer
+            .authorize_cancellable(&authorization, cancellation, self.timeout)
+        {
+            Ok(grant) if grant.expires_at_unix_millis() > SystemClock.now_unix_millis() => {}
+            Ok(_) => return Err(BrokerError::AuthorizationExpired),
+            Err(AuthorizationError::Cancelled) => {
+                return Err(BrokerError::AuthorizationCancelled);
+            }
+            Err(AuthorizationError::Denied) => return Err(BrokerError::AuthorizationDenied),
+            Err(AuthorizationError::Unavailable) => {
+                return Err(BrokerError::AuthorizationUnavailable);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(BrokerError::ExecutionTimedOut);
+        }
+        let mut child = std::process::Command::new(self.launch.program())
+            .args(self.launch.arguments())
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|_| BrokerError::BrokerCrashed)?;
+        let encoded = encode_broker_request(request)?;
+        let mut stdin = child.stdin.take().ok_or(BrokerError::BrokerCrashed)?;
+        stdin
+            .write_all(encoded.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .map_err(|_| BrokerError::BrokerCrashed)?;
+        drop(stdin);
+        loop {
+            if cancellation.is_cancelled() {
+                kill_and_reap_process_group(&mut child);
+                return Err(BrokerError::AuthorizationCancelled);
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    kill_and_reap_process_group(&mut child);
+                    return Err(BrokerError::ExecutionTimedOut);
+                }
+                Err(_) => return Err(BrokerError::BrokerCrashed),
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|_| BrokerError::BrokerCrashed)?;
+        let frame = std::str::from_utf8(&output.stdout).map_err(|_| BrokerError::BrokerCrashed)?;
+        decode_broker_response(frame.trim())
+    }
+}
+
+fn kill_and_reap_process_group(child: &mut std::process::Child) {
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Runs the sudo provider with sudo and the broker attached to a dedicated
+/// pseudoterminal. The request is withheld until the elevated broker emits a
+/// readiness marker, so request JSON can never be consumed as authentication
+/// input. Musheen never captures or logs terminal output.
+#[derive(Clone, Debug)]
+pub struct SudoPtyBrokerTransport {
+    launch: BrokerLaunch,
+    timeout: Duration,
+    active: Arc<AtomicBool>,
+}
+
+impl SudoPtyBrokerTransport {
+    #[must_use]
+    pub fn new(launch: BrokerLaunch) -> Self {
+        Self {
+            launch,
+            timeout: Duration::from_secs(120),
+            active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+impl BrokerTransport for SudoPtyBrokerTransport {
+    fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError> {
+        self.perform_cancellable(request, &CancellationToken::new())
+    }
+
+    fn perform_cancellable(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<BrokerOutput, BrokerError> {
+        self.perform_with_authentication(request, cancellation, None)
+    }
+
+    fn perform_with_authentication(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+        mut authentication: Option<SecretBuffer>,
+    ) -> Result<BrokerOutput, BrokerError> {
+        let _admission = TransportAdmission::enter(&self.active)?;
+        if cancellation.is_cancelled() {
+            return Err(BrokerError::AuthorizationCancelled);
+        }
+        if authentication.as_ref().is_some_and(|secret| {
+            secret.expose_secret(|bytes| {
+                bytes.len() > 1024
+                    || bytes
+                        .iter()
+                        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+            })
+        }) {
+            return Err(BrokerError::InvalidRequest);
+        }
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .map_err(|_| BrokerError::AuthorizationUnavailable)?;
+        let mut command = portable_pty::CommandBuilder::new(self.launch.program());
+        command.args(self.launch.arguments());
+        command.env_clear();
+        command.env("LC_ALL", "C");
+        command.env("SUDO_PROMPT", "MUSHEEN_SUDO_PASSWORD:");
+        let mut child = pty
+            .slave
+            .spawn_command(command)
+            .map_err(|_| BrokerError::AuthorizationUnavailable)?;
+        drop(pty.slave);
+        let process_group = pty.master.process_group_leader();
+        let mut writer = pty
+            .master
+            .take_writer()
+            .map_err(|_| BrokerError::BrokerCrashed)?;
+        let mut reader = pty
+            .master
+            .try_clone_reader()
+            .map_err(|_| BrokerError::BrokerCrashed)?;
+        let (chunks, incoming) = mpsc::sync_channel::<Vec<u8>>(8);
+        let reader_thread = std::thread::Builder::new()
+            .name("musheen-sudo-pty".to_owned())
+            .spawn(move || {
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    match reader.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(length) if chunks.send(chunk[..length].to_vec()).is_err() => break,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .map_err(|_| BrokerError::BrokerCrashed)?;
+        let deadline = Instant::now() + self.timeout;
+        let encoded = encode_broker_request(request)?;
+        let mut buffer = Vec::new();
+        let mut request_sent = false;
+        let mut authentication_sent = false;
+        let mut denied = false;
+        let mut child_exit_deadline = None;
+        let result = 'transport: loop {
+            if cancellation.is_cancelled() {
+                break Err(BrokerError::AuthorizationCancelled);
+            }
+            if Instant::now() >= deadline {
+                break Err(BrokerError::ExecutionTimedOut);
+            }
+            match incoming.recv_timeout(Duration::from_millis(20)) {
+                Ok(chunk) => {
+                    buffer.extend_from_slice(&chunk);
+                    if buffer.len() > MAX_BROKER_OUTPUT {
+                        break Err(BrokerError::BrokerCrashed);
+                    }
+                    if buffer
+                        .windows(b"MUSHEEN_SUDO_PASSWORD:".len())
+                        .any(|window| window == b"MUSHEEN_SUDO_PASSWORD:")
+                    {
+                        if authentication_sent {
+                            break Err(BrokerError::AuthorizationDenied);
+                        }
+                        let Some(mut secret) = authentication.take() else {
+                            break Err(BrokerError::AuthorizationCancelled);
+                        };
+                        let write_result = secret.expose_secret(|bytes| {
+                            writer
+                                .write_all(bytes)
+                                .and_then(|()| writer.write_all(b"\n"))
+                                .and_then(|()| writer.flush())
+                        });
+                        secret.clear();
+                        if write_result.is_err() {
+                            break Err(BrokerError::BrokerCrashed);
+                        }
+                        authentication_sent = true;
+                        buffer.clear();
+                    }
+                    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                        let line = buffer.drain(..=newline).collect::<Vec<_>>();
+                        let line = String::from_utf8_lossy(&line);
+                        let line = line.trim_matches(['\r', '\n']);
+                        if line == SUDO_BROKER_READY {
+                            if writer
+                                .write_all(encoded.as_bytes())
+                                .and_then(|()| writer.write_all(b"\n"))
+                                .and_then(|()| writer.flush())
+                                .is_err()
+                            {
+                                break 'transport Err(BrokerError::BrokerCrashed);
+                            }
+                            request_sent = true;
+                        } else if line.contains("Sorry, try again.") {
+                            denied = true;
+                        } else if request_sent && line.starts_with(BROKER_RESPONSE_FRAME) {
+                            break 'transport decode_broker_response(line);
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break if denied {
+                        Err(BrokerError::AuthorizationDenied)
+                    } else {
+                        Err(BrokerError::BrokerCrashed)
+                    };
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let drain_deadline = child_exit_deadline
+                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
+                    if Instant::now() >= *drain_deadline {
+                        break if denied {
+                            Err(BrokerError::AuthorizationDenied)
+                        } else {
+                            Err(BrokerError::BrokerCrashed)
+                        };
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => break Err(BrokerError::BrokerCrashed),
+            }
+        };
+        if let Some(process_group) = process_group
+            && let Some(pid) = rustix::process::Pid::from_raw(process_group)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(writer);
+        drop(pty.master);
+        let _ = reader_thread.join();
+        result
+    }
+}
+
+struct TransportAdmission<'a>(&'a AtomicBool);
+
+impl<'a> TransportAdmission<'a> {
+    fn enter(active: &'a Arc<AtomicBool>) -> Result<Self, BrokerError> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self(active.as_ref()))
+            .map_err(|_| BrokerError::Busy)
+    }
+}
+
+impl Drop for TransportAdmission<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrokerError {
+    AuditFailed,
+    AuthorizationCancelled,
+    AuthorizationDenied,
+    AuthorizationExpired,
+    AuthorizationUnavailable,
+    BrokerCrashed,
+    Busy,
+    ExecutionTimedOut,
+    InvalidRequest,
+    Io,
+    NotExecutable,
+    ScopeEscape,
+    SymlinkRefused,
+    TargetReplaced,
+}
+
+impl fmt::Display for BrokerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AuditFailed => "privilege audit failed",
+            Self::AuthorizationCancelled => "authorization was cancelled",
+            Self::AuthorizationDenied => "authorization was denied",
+            Self::AuthorizationExpired => "authorization expired",
+            Self::AuthorizationUnavailable => "authorization is unavailable",
+            Self::BrokerCrashed => "the privilege broker stopped unexpectedly",
+            Self::Busy => "the privilege broker is busy",
+            Self::ExecutionTimedOut => "the privileged command timed out",
+            Self::InvalidRequest => "the privilege request is invalid",
+            Self::Io => "the privilege operation failed",
+            Self::NotExecutable => "the selected target is not executable",
+            Self::ScopeEscape => "the path leaves the authorized root",
+            Self::SymlinkRefused => "symbolic links require new authorization",
+            Self::TargetReplaced => "the target changed during authorization",
+        })
+    }
+}
+
+impl std::error::Error for BrokerError {}
+
+impl BrokerError {
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::AuditFailed => "audit-failed",
+            Self::AuthorizationCancelled => "authorization-cancelled",
+            Self::AuthorizationDenied => "authorization-denied",
+            Self::AuthorizationExpired => "authorization-expired",
+            Self::AuthorizationUnavailable => "authorization-unavailable",
+            Self::BrokerCrashed => "broker-crashed",
+            Self::Busy => "busy",
+            Self::ExecutionTimedOut => "execution-timed-out",
+            Self::InvalidRequest => "invalid-request",
+            Self::Io => "io-failed",
+            Self::NotExecutable => "not-executable",
+            Self::ScopeEscape => "scope-escape",
+            Self::SymlinkRefused => "symlink-refused",
+            Self::TargetReplaced => "target-replaced",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "audit-failed" => Self::AuditFailed,
+            "authorization-cancelled" => Self::AuthorizationCancelled,
+            "authorization-denied" => Self::AuthorizationDenied,
+            "authorization-expired" => Self::AuthorizationExpired,
+            "authorization-unavailable" => Self::AuthorizationUnavailable,
+            "broker-crashed" => Self::BrokerCrashed,
+            "busy" => Self::Busy,
+            "execution-timed-out" => Self::ExecutionTimedOut,
+            "invalid-request" => Self::InvalidRequest,
+            "io-failed" => Self::Io,
+            "not-executable" => Self::NotExecutable,
+            "scope-escape" => Self::ScopeEscape,
+            "symlink-refused" => Self::SymlinkRefused,
+            "target-replaced" => Self::TargetReplaced,
+            _ => return None,
+        })
+    }
+}
+
+pub struct Broker<A, R, S, C> {
+    authorizer: A,
+    runner: R,
+    audit: S,
+    clock: C,
+    provider: PrivilegeProvider,
+}
+
+impl<A, R, S, C> Broker<A, R, S, C>
+where
+    A: Authorizer,
+    R: OperationRunner,
+    S: AuditSink,
+    C: Clock,
+{
+    #[must_use]
+    pub fn new(authorizer: A, runner: R, audit: S, clock: C) -> Self {
+        Self {
+            authorizer,
+            runner,
+            audit,
+            clock,
+            provider: PrivilegeProvider::Polkit,
+        }
+    }
+
+    #[must_use]
+    pub fn with_provider(mut self, provider: PrivilegeProvider) -> Self {
+        self.provider = provider;
+        self
+    }
+
+    pub fn handle(&self, request: BrokerRequest) -> Result<BrokerOutput, BrokerError> {
+        self.handle_with_environment(request, std::env::vars().collect())
+    }
+
+    pub fn handle_with_environment(
+        &self,
+        request: BrokerRequest,
+        environment: BTreeMap<String, String>,
+    ) -> Result<BrokerOutput, BrokerError> {
+        self.record(&request, AuditPhase::Attempt, AuditOutcome::Started)?;
+        if let Err(error) = request.subject().validate_live() {
+            self.record(&request, AuditPhase::Completion, AuditOutcome::Failed)?;
+            return Err(error);
+        }
+        let before = match ValidatedTarget::open(request.operation()) {
+            Ok(target) => target,
+            Err(error) => {
+                self.record(&request, AuditPhase::Completion, AuditOutcome::Failed)?;
+                return Err(error);
+            }
+        };
+        let authorization = AuthorizationRequest::from_broker_request(&request, self.provider);
+        let grant = match self.authorizer.authorize(&authorization) {
+            Ok(grant) => grant,
+            Err(AuthorizationError::Cancelled) => {
+                self.record(&request, AuditPhase::Authorization, AuditOutcome::Denied)?;
+                return Err(BrokerError::AuthorizationCancelled);
+            }
+            Err(AuthorizationError::Denied) => {
+                self.record(&request, AuditPhase::Authorization, AuditOutcome::Denied)?;
+                return Err(BrokerError::AuthorizationDenied);
+            }
+            Err(AuthorizationError::Unavailable) => {
+                self.record(&request, AuditPhase::Authorization, AuditOutcome::Failed)?;
+                return Err(BrokerError::AuthorizationUnavailable);
+            }
+        };
+        if grant.expires_at_unix_millis() <= self.clock.now_unix_millis() {
+            self.record(&request, AuditPhase::Authorization, AuditOutcome::Expired)?;
+            return Err(BrokerError::AuthorizationExpired);
+        }
+        self.record(&request, AuditPhase::Authorization, AuditOutcome::Succeeded)?;
+        let after = match ValidatedTarget::open(request.operation()) {
+            Ok(target) => target,
+            Err(error) => {
+                self.record(&request, AuditPhase::Completion, AuditOutcome::Failed)?;
+                return Err(error);
+            }
+        };
+        if before.identity != after.identity {
+            self.record(&request, AuditPhase::Completion, AuditOutcome::Failed)?;
+            return Err(BrokerError::TargetReplaced);
+        }
+        let validated = ValidatedRequest {
+            operation: request.operation().clone(),
+            target: after,
+            environment: scrub_environment(environment),
+        };
+        self.record(&request, AuditPhase::Dispatch, AuditOutcome::Started)?;
+        let result = self.runner.execute(validated);
+        self.record(
+            &request,
+            AuditPhase::Completion,
+            if result.is_ok() {
+                AuditOutcome::Succeeded
+            } else {
+                AuditOutcome::Failed
+            },
+        )?;
+        result
+    }
+
+    fn record(
+        &self,
+        request: &BrokerRequest,
+        phase: AuditPhase,
+        outcome: AuditOutcome,
+    ) -> Result<(), BrokerError> {
+        let record = AuditRecord {
+            request_id: request.id().into(),
+            operation: request.operation().command_label().into(),
+            target: request.target().to_path_buf(),
+            provider: self.provider,
+            phase,
+            outcome,
+            timestamp_unix_millis: self.clock.now_unix_millis(),
+        };
+        self.audit.record(&record)
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedTarget {
+    file: File,
+    identity: FileIdentity,
+}
+
+impl ValidatedTarget {
+    fn open(operation: &BrokerOperation) -> Result<Self, BrokerError> {
+        let directory = matches!(
+            operation,
+            BrokerOperation::OpenDirectory { .. } | BrokerOperation::ReadDirectory { .. }
+        );
+        let file = open_absolute_no_symlinks(operation.target(), directory)?;
+        let metadata = file.metadata().map_err(|_| BrokerError::Io)?;
+        if matches!(operation, BrokerOperation::RunExecutable { .. })
+            && (!metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0)
+        {
+            return Err(BrokerError::NotExecutable);
+        }
+        Ok(Self {
+            identity: FileIdentity::from_metadata(&metadata),
+            file,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+}
+
+impl FileIdentity {
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+        }
+    }
+}
+
+pub(crate) fn open_absolute_no_symlinks(
+    path: &Path,
+    require_directory: bool,
+) -> Result<File, BrokerError> {
+    if !path.is_absolute() {
+        return Err(BrokerError::InvalidRequest);
+    }
+    let mut directory = File::from(
+        open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| BrokerError::Io)?,
+    );
+    let components = path.components().collect::<Vec<_>>();
+    let normal_count = components
+        .iter()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    if normal_count == 0 {
+        return if require_directory {
+            Ok(directory)
+        } else {
+            Err(BrokerError::InvalidRequest)
+        };
+    }
+    let mut seen = 0;
+    for component in components {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::ParentDir | Component::Prefix(_)) {
+                return Err(BrokerError::ScopeEscape);
+            }
+            continue;
+        };
+        seen += 1;
+        let final_component = seen == normal_count;
+        let mut flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        if !final_component || require_directory {
+            flags |= OFlags::DIRECTORY;
+        }
+        directory =
+            File::from(openat(&directory, name, flags, Mode::empty()).map_err(map_open_error)?);
+    }
+    Ok(directory)
+}
+
+fn map_open_error(error: rustix::io::Errno) -> BrokerError {
+    if error == rustix::io::Errno::LOOP {
+        BrokerError::SymlinkRefused
+    } else {
+        BrokerError::Io
+    }
+}
+
+fn scrub_environment(environment: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    environment
+        .into_iter()
+        .filter(|(key, value)| {
+            (key == "LANG" || key == "TERM" || key.starts_with("LC_"))
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._@+-".contains(&byte))
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SystemOperationRunner {
+    timeout: Duration,
+}
+
+impl Default for SystemOperationRunner {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl SystemOperationRunner {
+    #[must_use]
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl OperationRunner for SystemOperationRunner {
+    fn execute(&self, request: ValidatedRequest) -> Result<BrokerOutput, BrokerError> {
+        match request.operation {
+            BrokerOperation::OpenDirectory { target } => {
+                let expires = SystemClock.now_unix_millis().saturating_add(60_000);
+                let descriptor =
+                    RootCapabilityDescriptor::from_file(&target, &request.target.file, expires)?;
+                Ok(BrokerOutput::DirectoryGranted(descriptor))
+            }
+            BrokerOperation::ReadDirectory {
+                capability,
+                relative,
+            } => {
+                let grant = RootGrant::from_descriptor_file(
+                    capability,
+                    request.target.file,
+                    PrivilegeProvider::Polkit,
+                )?;
+                let store = RootedStore::new(grant, SystemClock);
+                let entries = store
+                    .read_directory(&relative)?
+                    .into_iter()
+                    .map(|entry| BrokerDirectoryEntry {
+                        name: entry.name().as_bytes().to_vec(),
+                        identity: *entry.identity(),
+                        kind: entry.kind(),
+                        size: entry.size(),
+                        modified_unix_seconds: entry.modified_unix_seconds(),
+                    })
+                    .collect();
+                Ok(BrokerOutput::DirectoryEntries(entries))
+            }
+            BrokerOperation::RunExecutable { arguments, .. } => {
+                use std::os::fd::AsRawFd as _;
+                use std::os::unix::process::CommandExt as _;
+                use std::process::Stdio;
+
+                let executable = format!("/proc/self/fd/{}", request.target.file.as_raw_fd());
+                let fd_flags =
+                    rustix::io::fcntl_getfd(&request.target.file).map_err(|_| BrokerError::Io)?;
+                rustix::io::fcntl_setfd(
+                    &request.target.file,
+                    fd_flags & !rustix::io::FdFlags::CLOEXEC,
+                )
+                .map_err(|_| BrokerError::Io)?;
+                let child = std::process::Command::new(executable)
+                    .args(arguments.iter())
+                    .env_clear()
+                    .envs(request.environment)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0)
+                    .spawn();
+                let _ = rustix::io::fcntl_setfd(&request.target.file, fd_flags);
+                let mut child = child.map_err(|_| BrokerError::BrokerCrashed)?;
+                let deadline = Instant::now() + self.timeout;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            return Ok(BrokerOutput::Exited(status.code().unwrap_or(128)));
+                        }
+                        Ok(None) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Ok(None) => {
+                            kill_and_reap_process_group(&mut child);
+                            return Err(BrokerError::ExecutionTimedOut);
+                        }
+                        Err(_) => return Err(BrokerError::BrokerCrashed),
+                    }
+                }
+            }
+        }
+    }
+}
