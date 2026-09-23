@@ -147,7 +147,7 @@ impl OperationStatusEntry {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct StatusCenterModel {
     custom_actions: Vec<CustomActionStatus>,
     entries: BTreeMap<JobId, OperationStatusEntry>,

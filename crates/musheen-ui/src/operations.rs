@@ -19,6 +19,118 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+#[derive(Debug)]
+enum StatusPersistenceCommand {
+    Snapshot {
+        revision: u64,
+        status: StatusCenterModel,
+    },
+    Flush(std::sync::mpsc::Sender<Result<(), Box<str>>>),
+}
+
+#[derive(Debug)]
+struct StatusPersistence {
+    sender: Option<std::sync::mpsc::Sender<StatusPersistenceCommand>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl StatusPersistence {
+    fn spawn(
+        store: StatusStore,
+        persistence_error: Arc<Mutex<Option<Box<str>>>>,
+        status_revision: Arc<AtomicU64>,
+    ) -> Result<Self, OperationHubError> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("musheen-status-persistence".into())
+            .spawn(move || {
+                let mut last_result = Ok(());
+                let mut persisted_revision = 0;
+                while let Ok(command) = receiver.recv() {
+                    let (mut revision, mut snapshot) = match command {
+                        StatusPersistenceCommand::Snapshot { revision, status } => {
+                            (revision, status)
+                        }
+                        StatusPersistenceCommand::Flush(acknowledgement) => {
+                            let _ = acknowledgement.send(last_result.clone());
+                            continue;
+                        }
+                    };
+                    let mut flushes = Vec::new();
+                    while let Ok(command) = receiver.try_recv() {
+                        match command {
+                            StatusPersistenceCommand::Snapshot {
+                                revision: newer_revision,
+                                status: newer,
+                            } if newer_revision > revision => {
+                                revision = newer_revision;
+                                snapshot = newer;
+                            }
+                            StatusPersistenceCommand::Snapshot { .. } => {}
+                            StatusPersistenceCommand::Flush(acknowledgement) => {
+                                flushes.push(acknowledgement);
+                            }
+                        }
+                    }
+                    if revision > persisted_revision {
+                        last_result = snapshot
+                            .to_json()
+                            .map_err(|error| error.to_string().into())
+                            .and_then(|document| {
+                                store
+                                    .save(&document)
+                                    .map_err(|error| error.to_string().into())
+                            });
+                        persisted_revision = revision;
+                        if let Ok(mut error) = persistence_error.lock() {
+                            *error = last_result.as_ref().err().cloned();
+                        }
+                        status_revision.fetch_add(1, Ordering::AcqRel);
+                    }
+                    for acknowledgement in flushes {
+                        let _ = acknowledgement.send(last_result.clone());
+                    }
+                }
+            })
+            .map_err(|error| OperationHubError::Storage(error.to_string().into()))?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn persist(&self, revision: u64, status: StatusCenterModel) -> Result<(), Box<str>> {
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Box::<str>::from("the status persistence worker stopped"))?
+            .send(StatusPersistenceCommand::Snapshot { revision, status })
+            .map_err(|_| Box::<str>::from("the status persistence worker stopped"))
+    }
+
+    fn flush(&self) -> Result<(), Box<str>> {
+        let (acknowledgement, result) = std::sync::mpsc::channel();
+        self.sender
+            .as_ref()
+            .ok_or_else(|| Box::<str>::from("the status persistence worker stopped"))?
+            .send(StatusPersistenceCommand::Flush(acknowledgement))
+            .map_err(|_| Box::<str>::from("the status persistence worker stopped"))?;
+        result
+            .recv()
+            .map_err(|_| Box::<str>::from("the status persistence worker stopped"))?
+    }
+}
+
+impl Drop for StatusPersistence {
+    fn drop(&mut self) {
+        let _ = self.flush();
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
 
 pub(crate) struct OperationMountReservation {
     queue: Arc<Mutex<LocalOperationQueue>>,
@@ -50,7 +162,7 @@ impl Drop for OperationMountReservation {
 pub struct OperationHub {
     queue: Arc<Mutex<LocalOperationQueue>>,
     status: Arc<Mutex<StatusCenterModel>>,
-    store: Option<StatusStore>,
+    persistence: Option<Arc<StatusPersistence>>,
     persistence_error: Arc<Mutex<Option<Box<str>>>>,
     status_revision: Arc<AtomicU64>,
     reservations: Arc<Mutex<BTreeMap<u64, Vec<std::path::PathBuf>>>>,
@@ -114,7 +226,7 @@ impl OperationHub {
         Self {
             queue: Arc::new(Mutex::new(queue)),
             status: Arc::new(Mutex::new(StatusCenterModel::default())),
-            store: None,
+            persistence: None,
             persistence_error: Arc::new(Mutex::new(None)),
             status_revision: Arc::new(AtomicU64::new(0)),
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
@@ -168,12 +280,20 @@ impl OperationHub {
             None => LocalOperationQueue::new(limits),
         };
         providers.configure_queue(&mut queue);
+        let status = Arc::new(Mutex::new(status));
+        let persistence_error = Arc::new(Mutex::new(recovery_error));
+        let status_revision = Arc::new(AtomicU64::new(0));
+        let persistence = Arc::new(StatusPersistence::spawn(
+            store,
+            Arc::clone(&persistence_error),
+            Arc::clone(&status_revision),
+        )?);
         Ok(Self {
             queue: Arc::new(Mutex::new(queue)),
-            status: Arc::new(Mutex::new(status)),
-            store: Some(store),
-            persistence_error: Arc::new(Mutex::new(recovery_error)),
-            status_revision: Arc::new(AtomicU64::new(0)),
+            status,
+            persistence: Some(persistence),
+            persistence_error,
+            status_revision,
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
         })
@@ -575,23 +695,34 @@ impl OperationHub {
     }
 
     fn persist_status(&self) {
-        self.status_revision.fetch_add(1, Ordering::AcqRel);
-        let Some(store) = self.store.as_ref() else {
+        let revision = self
+            .status_revision
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let Some(persistence) = self.persistence.as_ref() else {
             return;
         };
-        let result = self
-            .status
-            .lock()
-            .map_err(|_| "the status center lock is poisoned".into())
-            .and_then(|status| status.to_json().map_err(|error| error.to_string().into()))
-            .and_then(|document| {
-                store
-                    .save(&document)
-                    .map_err(|error| error.to_string().into())
-            });
-        if let Ok(mut persistence_error) = self.persistence_error.lock() {
-            *persistence_error = result.err();
+        let snapshot = match self.status.lock() {
+            Ok(status) => status.clone(),
+            Err(_) => {
+                if let Ok(mut error) = self.persistence_error.lock() {
+                    *error = Some("the status center lock is poisoned".into());
+                }
+                return;
+            }
+        };
+        if let Err(error) = persistence.persist(revision, snapshot)
+            && let Ok(mut persistence_error) = self.persistence_error.lock()
+        {
+            *persistence_error = Some(error);
         }
+    }
+
+    #[cfg(test)]
+    fn flush_status_persistence(&self) -> Result<(), Box<str>> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(()), |persistence| persistence.flush())
     }
 
     fn with_unreserved_queue<'a, T>(
@@ -1111,6 +1242,47 @@ mod tests {
             hub.status.lock().unwrap().entry(id).unwrap().location(),
             &StorePath::from_unix_path(destination_directory.join("file.txt"))
         );
+    }
+
+    #[test]
+    fn status_persistence_worker_flushes_the_latest_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = StatusStore::at(temporary.path().join("status/operations.json"));
+        let hub =
+            OperationHub::with_status_store(&ResourceLimits::default(), store.clone()).unwrap();
+        let parent = StorePath::from_unix_path(temporary.path());
+
+        let first = hub
+            .submit_create(CreateRequest::new(
+                parent.clone(),
+                "first.txt".into(),
+                musheen_ops::CreateKind::File,
+            ))
+            .unwrap();
+        let second = hub
+            .submit_create(CreateRequest::new(
+                parent,
+                "second.txt".into(),
+                musheen_ops::CreateKind::File,
+            ))
+            .unwrap();
+        hub.flush_status_persistence().unwrap();
+
+        let document = store.load().unwrap().unwrap();
+        let restored = StatusCenterModel::from_json(&document).unwrap();
+        assert!(restored.entry(first).is_some());
+        assert!(restored.entry(second).is_some());
+
+        filesystem::remove_dir_all(temporary.path().join("status")).unwrap();
+        filesystem::write(temporary.path().join("status"), b"blocked").unwrap();
+        hub.submit_create(CreateRequest::new(
+            StorePath::from_unix_path(temporary.path()),
+            "third.txt".into(),
+            musheen_ops::CreateKind::File,
+        ))
+        .unwrap();
+        assert!(hub.flush_status_persistence().is_err());
+        assert!(hub.persistence_error().is_some());
     }
 
     #[test]

@@ -3702,6 +3702,7 @@ impl MusheenApp {
                     let revision = state.operation_hub.status_revision();
                     if revision != state.operation_status_revision {
                         state.operation_status_revision = revision;
+                        state.sync_operation_persistence_error();
                         changed = true;
                     }
                     let revision = state.catalog_binding.revision();
@@ -3716,6 +3717,12 @@ impl MusheenApp {
             }
         })
         .detach();
+    }
+
+    fn sync_operation_persistence_error(&mut self) {
+        if let Some(error) = self.operation_hub.persistence_error() {
+            self.operation_error = Some(error);
+        }
     }
 
     fn install_volume_properties_cleanup(&mut self, cx: &mut Context<Self>) {
