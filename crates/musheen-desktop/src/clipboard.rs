@@ -171,9 +171,8 @@ impl ClipboardPayload {
             .ok_or(ClipboardError::MissingUris)?;
         let paths = parse_uri_list(uri_data)?;
         if let (Some(_), Some(gnome)) = (formats.get(URI_LIST), gnome) {
-            let gnome_paths = parse_uri_list(
-                gnome_uri_lines(gnome).ok_or(ClipboardError::Malformed)?,
-            )?;
+            let gnome_paths =
+                parse_uri_list(gnome_uri_lines(gnome).ok_or(ClipboardError::Malformed)?)?;
             if gnome_paths != paths {
                 return Err(ClipboardError::Malformed);
             }

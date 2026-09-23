@@ -9891,12 +9891,14 @@ impl MusheenApp {
         }
     }
 
-    fn render_omnibar(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_omnibar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let input = self
             .omnibar_input
             .as_ref()
             .expect("the omnibar is initialized before rendering");
         let mode = self.omnibar.mode();
+        let editing = input.read(cx).focus_handle(cx).is_focused(window);
+        let show_breadcrumbs = mode == OmnibarMode::Path && !editing;
         let suggestions = self
             .active_path_suggestions()
             .into_iter()
@@ -9914,25 +9916,31 @@ impl MusheenApp {
                     }))
             })
             .collect::<Vec<_>>();
-        let breadcrumbs = BreadcrumbTrail::from_path(self.navigation.focused_tab().location(), 4);
-        let hidden_crumbs = breadcrumbs
+        let breadcrumbs = BreadcrumbTrail::from_path(self.navigation.focused_tab().location(), 3);
+        let hidden_ancestors = breadcrumbs
             .hidden()
             .iter()
-            .enumerate()
-            .map(|(index, crumb)| {
-                let target = crumb.target().clone();
-                Button::new(SharedString::from(format!("breadcrumb-overflow-{index}")))
-                    .label("…")
-                    .accessibility_label(format!("Go to {}", crumb.label().as_str()))
-                    .tooltip(crumb.label().as_str().to_owned())
-                    .ghost()
-                    .small()
-                    .compact()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.navigate(target.clone(), true, cx);
-                    }))
-            })
+            .map(|crumb| (crumb.label().as_str().to_owned(), crumb.target().clone()))
             .collect::<Vec<_>>();
+        let hidden_crumbs = (!hidden_ancestors.is_empty()).then(|| {
+            let view = cx.entity();
+            Button::new("breadcrumb-overflow")
+                .label("…")
+                .accessibility_label("More ancestor folders")
+                .tooltip("More ancestor folders")
+                .ghost()
+                .small()
+                .compact()
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (label, target) in hidden_ancestors.iter().cloned() {
+                        let view = view.clone();
+                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.navigate(target.clone(), true, cx));
+                        }));
+                    }
+                    menu
+                })
+        });
         let last_crumb = breadcrumbs.visible().len().saturating_sub(1);
         let visible_crumbs = breadcrumbs
             .visible()
@@ -9970,7 +9978,7 @@ impl MusheenApp {
                 .expect("an omnibar command label is localized")
                 .to_owned();
             Button::new(binding.button_id())
-                .label(label.clone())
+                .icon(menu_icon(Some(command.icon_key())))
                 .accessibility_label(label.clone())
                 .tooltip(label)
                 .ghost()
@@ -9991,26 +9999,31 @@ impl MusheenApp {
             .flex()
             .items_center()
             .gap_1()
-            .child(
-                div()
-                    .id("breadcrumbs")
-                    .test_support()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_1()
-                    .flex_shrink_1()
-                    .overflow_hidden()
-                    .children(hidden_crumbs)
-                    .children(visible_crumbs),
-            )
+            .when(show_breadcrumbs, |omnibar| {
+                omnibar.child(
+                    div()
+                        .id("breadcrumbs")
+                        .test_support()
+                        .flex()
+                        .items_center()
+                        .justify_start()
+                        .gap_1()
+                        .flex_grow(1.0)
+                        .flex_shrink_1()
+                        .overflow_hidden()
+                        .children(hidden_crumbs)
+                        .children(visible_crumbs),
+                )
+            })
             .children(mode_buttons)
-            .child(
-                Input::new(input)
-                    .id("omnibar-input")
-                    .aria_label("Path, search, or command")
-                    .small(),
-            )
+            .when(!show_breadcrumbs, |omnibar| {
+                omnibar.child(
+                    Input::new(input)
+                        .id("omnibar-input")
+                        .aria_label("Path, search, or command")
+                        .small(),
+                )
+            })
             .children(suggestions)
             .into_any_element()
     }
@@ -10104,7 +10117,7 @@ impl MusheenApp {
         } else {
             colors.border
         };
-        let compact = window.viewport_size().width.as_f32() < 960.0;
+        let compact = window.viewport_size().width.as_f32() < 1440.0;
 
         div()
             .id("navigation-toolbar")
@@ -10120,7 +10133,7 @@ impl MusheenApp {
             .border_b_1()
             .border_color(boundary)
             .children(NAVIGATION_LEADING_IDS.map(|id| self.toolbar_button(id, cx)))
-            .child(self.render_omnibar(cx))
+            .child(self.render_omnibar(window, cx))
             .child(self.toolbar_button(SEARCH_COMMAND_ID, cx))
             .when(compact, |toolbar| {
                 toolbar.child(self.render_view_overflow(cx))
@@ -10506,8 +10519,6 @@ impl MusheenApp {
                                             Button::new(SharedString::from(format!(
                                                 "sidebar-{section_index}-{entry_index}"
                                             )))
-                                            .label(label.clone())
-                                            .icon(icon)
                                             .accessibility_label(accessibility_label)
                                             .ghost()
                                             .small()
@@ -10517,7 +10528,15 @@ impl MusheenApp {
                                             })
                                             .selected(selected)
                                             .w_full()
-                                            .justify_start()
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(Icon::new(icon).small())
+                                                    .child(label.clone()),
+                                            )
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(tag) = activation_tag.as_deref() {
                                                     this.apply_tag_filter(tag, cx);
@@ -10542,12 +10561,11 @@ impl MusheenApp {
                                     Button::new(SharedString::from(format!(
                                         "sidebar-section-{section_index}"
                                     )))
-                                    .label(section_label)
                                     .accessibility_label(section_description)
                                     .ghost()
                                     .small()
                                     .w_full()
-                                    .justify_start()
+                                    .child(div().w_full().text_left().child(section_label))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_sidebar_section(kind, cx);
                                     })),
@@ -17374,7 +17392,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../musheen-test-support/fixtures/shell-gallery");
         let mut app = None;
-        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+        let handle = cx.open_window(size(px(1_480.), px(760.)), |window, cx| {
             let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
             app = Some(view.clone());
             Root::new(view, window, cx)
