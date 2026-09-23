@@ -771,3 +771,91 @@ fn broker_rejects_a_forged_requesting_subject_before_authorization() {
     );
     assert!(runner.requests.lock().unwrap().is_empty());
 }
+
+#[test]
+fn broker_rebinds_a_decoded_subject_to_pkexec_provenance() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("protected");
+    fs::create_dir(&target).unwrap();
+    let request = BrokerRequest::open_directory(&target).unwrap();
+    let mut document = serde_json::to_value(&request).unwrap();
+    document["subject"]["pid"] = serde_json::Value::from(1_u64);
+    document["subject"]["uid"] = serde_json::Value::from(0_u64);
+    document["subject"]["start_time"] = serde_json::Value::from(1_u64);
+    let mut decoded: BrokerRequest = serde_json::from_value(document).unwrap();
+    let caller_pid = std::process::id();
+    let caller_uid = rustix::process::geteuid().as_raw();
+
+    decoded
+        .bind_to_invoker(
+            PrivilegeProvider::Polkit,
+            &BTreeMap::from([("PKEXEC_UID".to_owned(), caller_uid.to_string())]),
+            caller_pid,
+        )
+        .unwrap();
+
+    assert_eq!(decoded.subject().pid(), caller_pid);
+    assert_eq!(decoded.subject().uid(), caller_uid);
+    assert_ne!(decoded.subject().start_time(), 1);
+}
+
+#[test]
+fn decoded_subject_cannot_be_used_without_kernel_provenance_binding() {
+    let temporary = tempfile::tempdir().unwrap();
+    let target = temporary.path().join("protected");
+    fs::create_dir(&target).unwrap();
+    let encoded = serde_json::to_value(BrokerRequest::open_directory(&target).unwrap()).unwrap();
+    let decoded: BrokerRequest = serde_json::from_value(encoded).unwrap();
+    let runner = RecordingRunner::default();
+
+    assert_eq!(
+        broker(
+            FakeAuthorizer::granting(1_000),
+            runner.clone(),
+            RecordingAudit::default(),
+            FixedClock::new(100),
+        )
+        .handle(decoded),
+        Err(BrokerError::AuthorizationDenied)
+    );
+    assert!(runner.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn broker_rejects_missing_invalid_and_conflicting_elevation_provenance() {
+    let target = tempfile::tempdir().unwrap();
+    let caller_pid = std::process::id();
+    let caller_uid = rustix::process::geteuid().as_raw().to_string();
+
+    for environment in [
+        BTreeMap::new(),
+        BTreeMap::from([("PKEXEC_UID".to_owned(), "not-a-uid".to_owned())]),
+        BTreeMap::from([
+            ("PKEXEC_UID".to_owned(), caller_uid.clone()),
+            ("SUDO_UID".to_owned(), caller_uid.clone()),
+        ]),
+    ] {
+        let mut request = BrokerRequest::open_directory(target.path()).unwrap();
+        assert_eq!(
+            request.bind_to_invoker(PrivilegeProvider::Polkit, &environment, caller_pid),
+            Err(BrokerError::AuthorizationDenied)
+        );
+    }
+
+    let mut sudo_request = BrokerRequest::open_directory(target.path()).unwrap();
+    sudo_request
+        .bind_to_invoker(
+            PrivilegeProvider::Sudo,
+            &BTreeMap::from([("SUDO_UID".to_owned(), caller_uid.clone())]),
+            u32::MAX,
+        )
+        .unwrap();
+    assert_eq!(sudo_request.subject().pid(), 0);
+    assert_eq!(sudo_request.subject().uid().to_string(), caller_uid);
+
+    let mut missing_sudo = BrokerRequest::open_directory(target.path()).unwrap();
+    assert_eq!(
+        missing_sudo.bind_to_invoker(PrivilegeProvider::Sudo, &BTreeMap::new(), caller_pid),
+        Err(BrokerError::AuthorizationDenied)
+    );
+}

@@ -989,7 +989,7 @@ where
         environment: BTreeMap<String, String>,
     ) -> Result<BrokerOutput, BrokerError> {
         self.record(&request, AuditPhase::Attempt, AuditOutcome::Started)?;
-        if let Err(error) = request.subject().validate_live() {
+        if let Err(error) = request.validate_subject(self.provider) {
             self.record(&request, AuditPhase::Completion, AuditOutcome::Failed)?;
             return Err(error);
         }

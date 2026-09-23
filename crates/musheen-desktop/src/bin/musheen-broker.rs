@@ -66,13 +66,28 @@ fn main() {
     {
         return fail("invalid broker request", 2);
     }
-    let request = match std::str::from_utf8(&request)
+    let mut request = match std::str::from_utf8(&request)
         .map_err(|_| ())
         .and_then(|frame| decode_broker_request(frame.trim()).map_err(|_| ()))
     {
         Ok(request) => request,
         Err(_) => return fail("invalid broker request", 2),
     };
+    let environment = std::env::vars().collect();
+    let parent_pid =
+        match rustix::process::getppid().and_then(|pid| u32::try_from(pid.as_raw_pid()).ok()) {
+            Some(pid) => pid,
+            None => return fail("caller identity unavailable", 3),
+        };
+    if request
+        .bind_to_invoker(provider, &environment, parent_pid)
+        .is_err()
+    {
+        return fail("caller identity unavailable", 3);
+    }
+    if rustix::process::geteuid().as_raw() != 0 {
+        return fail("broker must run elevated", 3);
+    }
     let audit = match JsonAuditLog::open(AUDIT_PATH) {
         Ok(audit) => audit,
         Err(_) => return fail("broker audit unavailable", 3),

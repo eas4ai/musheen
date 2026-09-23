@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -87,6 +88,8 @@ pub struct BrokerRequest {
     id: Box<str>,
     subject: RequestSubject,
     operation: BrokerOperation,
+    #[serde(skip, default)]
+    subject_is_trusted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -132,6 +135,24 @@ impl RequestSubject {
         }
         Ok(())
     }
+
+    fn from_process(pid: u32, uid: u32) -> Result<Self, BrokerError> {
+        let subject = Self {
+            pid,
+            uid,
+            start_time: process_start_time(pid).ok_or(BrokerError::AuthorizationDenied)?,
+        };
+        subject.validate_live()?;
+        Ok(subject)
+    }
+
+    const fn from_authenticated_uid(uid: u32) -> Self {
+        Self {
+            pid: 0,
+            uid,
+            start_time: 0,
+        }
+    }
 }
 
 impl BrokerRequest {
@@ -144,6 +165,7 @@ impl BrokerRequest {
             operation: BrokerOperation::OpenDirectory {
                 target: target.to_path_buf(),
             },
+            subject_is_trusted: true,
         })
     }
 
@@ -168,6 +190,7 @@ impl BrokerRequest {
                 target: target.to_path_buf(),
                 arguments: arguments.into_boxed_slice(),
             },
+            subject_is_trusted: true,
         })
     }
 
@@ -195,7 +218,46 @@ impl BrokerRequest {
                 capability,
                 relative: relative.to_path_buf(),
             },
+            subject_is_trusted: true,
         })
+    }
+
+    /// Replaces the untrusted JSON subject with identity established by the
+    /// elevation mechanism. `parent_pid` must come from `getppid(2)`, never
+    /// from request data.
+    pub fn bind_to_invoker(
+        &mut self,
+        provider: PrivilegeProvider,
+        environment: &BTreeMap<String, String>,
+        parent_pid: u32,
+    ) -> Result<(), BrokerError> {
+        if environment.contains_key(match provider {
+            PrivilegeProvider::Polkit => "SUDO_UID",
+            PrivilegeProvider::Sudo => "PKEXEC_UID",
+        }) {
+            return Err(BrokerError::AuthorizationDenied);
+        }
+        self.subject = match provider {
+            PrivilegeProvider::Polkit => {
+                let uid = parse_invoking_uid(environment.get("PKEXEC_UID"))?;
+                RequestSubject::from_process(parent_pid, uid)?
+            }
+            PrivilegeProvider::Sudo => RequestSubject::from_authenticated_uid(parse_invoking_uid(
+                environment.get("SUDO_UID"),
+            )?),
+        };
+        self.subject_is_trusted = true;
+        Ok(())
+    }
+
+    pub(crate) fn validate_subject(&self, provider: PrivilegeProvider) -> Result<(), BrokerError> {
+        if !self.subject_is_trusted {
+            return Err(BrokerError::AuthorizationDenied);
+        }
+        if provider == PrivilegeProvider::Sudo && self.subject.pid == 0 {
+            return Ok(());
+        }
+        self.subject.validate_live()
     }
 
     #[must_use]
@@ -240,6 +302,16 @@ impl BrokerRequest {
             arguments: self.operation.arguments().to_vec().into_boxed_slice(),
         }
     }
+}
+
+fn parse_invoking_uid(value: Option<&String>) -> Result<u32, BrokerError> {
+    let value = value.ok_or(BrokerError::AuthorizationDenied)?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BrokerError::AuthorizationDenied);
+    }
+    value
+        .parse::<u32>()
+        .map_err(|_| BrokerError::AuthorizationDenied)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
