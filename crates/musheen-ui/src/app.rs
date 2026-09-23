@@ -9300,7 +9300,7 @@ impl MusheenApp {
                     &capabilities,
                 )
             }
-            LocalOperationOutcome::Archive => return,
+            LocalOperationOutcome::Trash(_) | LocalOperationOutcome::Archive => return,
         };
         match result {
             Ok(TagMoveOutcome::Preserved) => {}

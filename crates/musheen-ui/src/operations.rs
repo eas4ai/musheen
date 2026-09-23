@@ -1140,7 +1140,7 @@ where
                             Ok(LocalOperationOutcome::Transfer(
                                 TransferOutcome::MetadataReview { review, .. },
                             )) => queue.finish_metadata_review(id, review.clone())?,
-                            Ok(_) => queue.finish(id, Ok(()))?,
+                            Ok(outcome) => queue.finish_with_outcome(id, outcome.clone())?,
                             Err(error) => {
                                 queue.finish(id, Err(error.message().to_owned().into()))?;
                             }
@@ -1595,6 +1595,58 @@ mod tests {
             .unwrap();
         operation.execute().unwrap();
         hub.queue.lock().unwrap().finish(undo_job, Ok(())).unwrap();
+        assert_eq!(filesystem::read(original_path).unwrap(), b"contents");
+    }
+
+    #[test]
+    fn completed_trash_undo_is_tracked_as_a_restore() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_path = temporary.path().join("discarded.txt");
+        filesystem::write(&original_path, b"contents").unwrap();
+        let original = StorePath::from_unix_path(original_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = musheen_ops::MutationProvider::identity(&mut store, &original)
+            .unwrap()
+            .unwrap();
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let job = hub
+            .submit_trash(vec![DeleteTarget::new(original, identity.into_vec())])
+            .unwrap()[0];
+        let operation = hub
+            .queue
+            .lock()
+            .unwrap()
+            .start_ready()
+            .unwrap()
+            .pop()
+            .unwrap();
+        let outcome = operation.execute_detailed().unwrap();
+        hub.queue
+            .lock()
+            .unwrap()
+            .finish_with_outcome(job, outcome)
+            .unwrap();
+        assert!(hub.can_undo(job));
+
+        let undo_job = hub.submit_undo(job).unwrap();
+        assert_eq!(
+            hub.status.lock().unwrap().entry(undo_job).unwrap().kind(),
+            OperationKind::Restore
+        );
+        let operation = hub
+            .queue
+            .lock()
+            .unwrap()
+            .start_ready()
+            .unwrap()
+            .pop()
+            .unwrap();
+        let outcome = operation.execute_detailed().unwrap();
+        hub.queue
+            .lock()
+            .unwrap()
+            .finish_with_outcome(undo_job, outcome)
+            .unwrap();
         assert_eq!(filesystem::read(original_path).unwrap(), b"contents");
     }
 

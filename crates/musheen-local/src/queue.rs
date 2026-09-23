@@ -2,15 +2,18 @@ use crate::LocalStore;
 use crate::mutation::{
     ResolvedTransferFailure, ResolvedTransferOutcome, execute_resolved_transfer,
 };
-use musheen_core::{CommandTargetRef, DisplayPath, ItemId, ResourceLimits, Store, StorePath};
+use musheen_core::{
+    CommandTargetRef, DisplayPath, ItemId, ProviderId, ResourceLimits, Store, StorePath,
+};
 use musheen_ops::{
     ArchiveOperationPlan, ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest,
     CopySession, CreateRequest, DeleteTarget, EventGeneration, JobId, JobState, MetadataChange,
     MetadataPlan, MetadataScope, MoveMetadataReview, MutationError, MutationProvider,
     OperationFailure, OperationKind, OperationPlan, PermanentDeleteConfirmation,
     PermanentDeleteRequest, ProviderLimits, ProviderSnapshot, PublicationState, RenameRequest,
-    Scheduler, SchedulerError, SourceState, complete_move_after_metadata_review, execute_create,
-    execute_delete, execute_move, execute_permanent_delete, execute_rename,
+    Scheduler, SchedulerError, SourceState, TrashReceipt, complete_move_after_metadata_review,
+    execute_create, execute_delete, execute_move, execute_permanent_delete, execute_rename,
+    execute_restore,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -105,6 +108,10 @@ enum LocalOperation {
     Create(CreateRequest),
     Rename(RenameRequest),
     Trash(DeleteTarget),
+    Restore {
+        receipt: TrashReceipt,
+        expected_parent_identity: Box<[u8]>,
+    },
     PermanentDelete {
         request: PermanentDeleteRequest,
         confirmation: PermanentDeleteConfirmation,
@@ -214,9 +221,56 @@ impl MoveUndo {
 }
 
 #[derive(Clone, Debug)]
+struct TrashUndo {
+    receipt: TrashReceipt,
+    original_parent: StorePath,
+    expected_parent_identity: Box<[u8]>,
+}
+
+impl TrashUndo {
+    fn from_completed(receipt: TrashReceipt) -> Option<Self> {
+        let mut store = LocalStore::new();
+        let receipt = store
+            .list_trash()
+            .ok()?
+            .into_iter()
+            .find(|entry| entry.receipt().provider_reference() == receipt.provider_reference())?
+            .receipt()
+            .clone();
+        let original_parent = StorePath::from_unix_path(
+            clean_absolute_path(receipt.original_path())?
+                .parent()?
+                .as_os_str(),
+        );
+        let expected_parent_identity =
+            MutationProvider::identity(&mut store, &original_parent).ok()??;
+        Some(Self {
+            receipt,
+            original_parent,
+            expected_parent_identity,
+        })
+    }
+
+    fn is_available(&self) -> bool {
+        let mut store = LocalStore::new();
+        matches!(
+            MutationProvider::identity(&mut store, self.receipt.original_path()),
+            Ok(None)
+        ) && matches!(
+            MutationProvider::identity(&mut store, &self.original_parent),
+            Ok(Some(identity)) if identity == self.expected_parent_identity
+        ) && writable_directory(&self.original_parent).is_ok()
+            && store
+                .list_trash()
+                .is_ok_and(|entries| entries.iter().any(|entry| entry.receipt() == &self.receipt))
+    }
+}
+
+#[derive(Clone, Debug)]
 enum UndoCandidate {
     Rename(RenameUndo),
     Move(MoveUndo),
+    Trash(TrashUndo),
 }
 
 impl UndoCandidate {
@@ -224,6 +278,7 @@ impl UndoCandidate {
         match self {
             Self::Rename(undo) => undo.is_available(),
             Self::Move(undo) => undo.is_available(),
+            Self::Trash(undo) => undo.is_available(),
         }
     }
 
@@ -231,6 +286,10 @@ impl UndoCandidate {
         match self {
             Self::Rename(undo) => [undo.reverse.source().clone(), undo.original.clone()],
             Self::Move(undo) => [undo.moved.clone(), undo.original.clone()],
+            Self::Trash(undo) => [
+                undo.receipt.original_path().clone(),
+                undo.receipt.original_path().clone(),
+            ],
         }
     }
 
@@ -238,6 +297,7 @@ impl UndoCandidate {
         match self {
             Self::Rename(_) => OperationKind::Rename,
             Self::Move(_) => OperationKind::Move,
+            Self::Trash(_) => OperationKind::Restore,
         }
     }
 }
@@ -260,6 +320,7 @@ impl LocalOperation {
             },
             Self::Rename(_) => OperationKind::Rename,
             Self::Trash(_) => OperationKind::Trash,
+            Self::Restore { .. } => OperationKind::Restore,
             Self::PermanentDelete { .. } => OperationKind::PermanentDelete,
             Self::Archive { plan, .. } => plan.kind(),
         }
@@ -273,6 +334,7 @@ impl LocalOperation {
             Self::Create(request) => request.parent(),
             Self::Rename(request) => request.source(),
             Self::Trash(target) => target.path(),
+            Self::Restore { receipt, .. } => receipt.original_path(),
             Self::PermanentDelete { request, .. } => request.location(),
             Self::Archive { plan, .. } => plan.destination(),
         }
@@ -292,6 +354,7 @@ impl LocalOperation {
             Self::Create(request) => vec![request.parent().clone()],
             Self::Rename(request) => vec![request.source().clone()],
             Self::Trash(target) => vec![target.path().clone()],
+            Self::Restore { receipt, .. } => vec![receipt.original_path().clone()],
             Self::PermanentDelete { request, .. } => request
                 .targets()
                 .iter()
@@ -337,6 +400,7 @@ pub enum LocalOperationOutcome {
     Transfer(TransferOutcome),
     Metadata,
     Mutation,
+    Trash(TrashReceipt),
     Archive,
 }
 
@@ -659,13 +723,32 @@ impl ReadyLocalOperation {
                 .map_err(|error| LocalOperationFailure::failed(error.to_string())),
             LocalOperation::Trash(target) => execute_delete(&mut store, vec![target])
                 .and_then(|outcome| {
+                    if let Some(failure) = outcome.failures().first() {
+                        return Err(failure.error().clone());
+                    }
                     outcome
-                        .failures()
+                        .trashed()
                         .first()
-                        .map_or(Ok(()), |failure| Err(failure.error().clone()))
+                        .cloned()
+                        .ok_or(MutationError::Missing)
                 })
-                .map(|()| LocalOperationOutcome::Mutation)
+                .map(LocalOperationOutcome::Trash)
                 .map_err(|error| LocalOperationFailure::failed(error.to_string())),
+            LocalOperation::Restore {
+                receipt,
+                expected_parent_identity,
+            } => {
+                validate_undo_transfer(
+                    &mut store,
+                    receipt.original_path(),
+                    receipt.original_path(),
+                    None,
+                    Some(&expected_parent_identity),
+                )?;
+                execute_restore(&mut store, &receipt)
+                    .map(|()| LocalOperationOutcome::Mutation)
+                    .map_err(|error| LocalOperationFailure::failed(error.to_string()))
+            }
             LocalOperation::PermanentDelete {
                 request,
                 confirmation,
@@ -1017,10 +1100,7 @@ impl LocalOperationQueue {
                         _ => None,
                     });
                 if let Some(undo) = undo {
-                    self.undo_candidates.insert(id, undo);
-                    if self.undo_candidates.len() > 100 {
-                        self.undo_candidates.pop_first();
-                    }
+                    self.remember_undo(id, undo);
                 }
             }
             Err(error) => {
@@ -1029,6 +1109,36 @@ impl LocalOperationQueue {
             }
         }
         Ok(())
+    }
+
+    pub fn finish_with_outcome(
+        &mut self,
+        id: JobId,
+        outcome: LocalOperationOutcome,
+    ) -> Result<(), DropError> {
+        let receipt = match &outcome {
+            LocalOperationOutcome::Trash(receipt) => match self.operations.get(&id) {
+                Some(LocalOperation::Trash(target)) if target.path() == receipt.original_path() => {
+                    Some(receipt.clone())
+                }
+                _ => return Err(DropError::UndoUnavailable(id)),
+            },
+            _ => None,
+        };
+        self.finish(id, Ok(()))?;
+        if self.scheduler.state(id) == Some(JobState::Completed)
+            && let Some(undo) = receipt.and_then(TrashUndo::from_completed)
+        {
+            self.remember_undo(id, UndoCandidate::Trash(undo));
+        }
+        Ok(())
+    }
+
+    fn remember_undo(&mut self, id: JobId, undo: UndoCandidate) {
+        self.undo_candidates.insert(id, undo);
+        if self.undo_candidates.len() > 100 {
+            self.undo_candidates.pop_first();
+        }
     }
 
     pub fn finish_metadata_review(
@@ -1167,6 +1277,33 @@ impl LocalOperationQueue {
                     .into_iter()
                     .next()
                     .ok_or(DropError::UndoUnavailable(id))?
+            }
+            UndoCandidate::Trash(undo) => {
+                let original = undo.receipt.original_path().clone();
+                let source = StorePath::from_provider_key(
+                    ProviderId::new("local.trash")
+                        .map_err(|error| DropError::Plan(error.to_string().into()))?,
+                    undo.receipt.provider_reference().to_vec(),
+                )
+                .map_err(|error| DropError::Plan(error.to_string().into()))?;
+                let store = LocalStore::new();
+                let plan = OperationPlan::new(
+                    OperationKind::Restore,
+                    provider_snapshot(&store, &original),
+                    Some(source),
+                    original,
+                )
+                .map_err(|error| DropError::Plan(error.to_string().into()))?;
+                self.enqueue_planned(vec![(
+                    plan,
+                    LocalOperation::Restore {
+                        receipt: undo.receipt,
+                        expected_parent_identity: undo.expected_parent_identity,
+                    },
+                )])?
+                .into_iter()
+                .next()
+                .ok_or(DropError::UndoUnavailable(id))?
             }
         };
         self.undo_candidates.remove(&id);
@@ -1670,7 +1807,9 @@ mod tests {
             .expect("one operation is ready");
         let id = operation.id();
         let outcome = operation.execute_detailed().expect("operation succeeds");
-        queue.finish(id, Ok(())).expect("operation finishes");
+        queue
+            .finish_with_outcome(id, outcome.clone())
+            .expect("operation finishes");
         outcome
     }
 
@@ -2005,6 +2144,129 @@ mod tests {
         assert!(ready.execute_detailed().is_err());
         assert_eq!(fs::read(moved_path).unwrap(), b"original contents");
         assert!(!other_directory.join("item.txt").exists());
+    }
+
+    #[test]
+    fn completed_trash_can_be_undone_through_a_new_restore_job() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_path = temporary.path().join("discarded.txt");
+        fs::write(&original_path, b"recoverable contents").unwrap();
+        let original = StorePath::from_unix_path(original_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &original)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_trash(vec![DeleteTarget::new(original, identity.into_vec())])
+            .unwrap()[0];
+        let _ = finish_one(&mut queue);
+        assert!(!original_path.exists());
+        assert!(queue.can_undo(job));
+
+        let undo_job = queue.submit_undo(job).unwrap();
+        let _ = finish_one(&mut queue);
+        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(fs::read(&original_path).unwrap(), b"recoverable contents");
+    }
+
+    #[test]
+    fn trash_undo_requires_an_empty_original_and_a_live_receipt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_path = temporary.path().join("discarded.txt");
+        fs::write(&original_path, b"recoverable contents").unwrap();
+        let original = StorePath::from_unix_path(original_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &original)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_trash(vec![DeleteTarget::new(original, identity.into_vec())])
+            .unwrap()[0];
+        let LocalOperationOutcome::Trash(receipt) = finish_one(&mut queue) else {
+            panic!("trash produces a receipt");
+        };
+
+        fs::write(&original_path, b"new occupant").unwrap();
+        assert!(!queue.can_undo(job));
+        assert!(queue.submit_undo(job).is_err());
+        assert_eq!(fs::read(&original_path).unwrap(), b"new occupant");
+        fs::remove_file(&original_path).unwrap();
+        assert!(queue.can_undo(job));
+
+        store.purge_trash(&[receipt]).unwrap();
+        assert!(!queue.can_undo(job));
+        assert!(queue.submit_undo(job).is_err());
+        assert!(!original_path.exists());
+    }
+
+    #[test]
+    fn queued_trash_undo_refuses_a_new_occupant() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_path = temporary.path().join("discarded.txt");
+        fs::write(&original_path, b"recoverable contents").unwrap();
+        let original = StorePath::from_unix_path(original_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &original)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_trash(vec![DeleteTarget::new(original, identity.into_vec())])
+            .unwrap()[0];
+        let LocalOperationOutcome::Trash(receipt) = finish_one(&mut queue) else {
+            panic!("trash produces a receipt");
+        };
+
+        let undo_job = queue.submit_undo(job).unwrap();
+        fs::write(&original_path, b"new occupant").unwrap();
+        let operation = queue.start_ready().unwrap().pop().unwrap();
+        assert_eq!(operation.id(), undo_job);
+        assert!(operation.execute_detailed().is_err());
+        queue
+            .finish(undo_job, Err("restore conflict".into()))
+            .unwrap();
+        assert_eq!(queue.state(undo_job), Some(JobState::Failed));
+        assert_eq!(fs::read(&original_path).unwrap(), b"new occupant");
+
+        store.purge_trash(&[receipt]).unwrap();
+    }
+
+    #[test]
+    fn trash_undo_restores_a_file_trashed_through_a_symlinked_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let actual_directory = temporary.path().join("actual");
+        let linked_directory = temporary.path().join("linked");
+        fs::create_dir(&actual_directory).unwrap();
+        std::os::unix::fs::symlink(&actual_directory, &linked_directory).unwrap();
+        let actual_path = actual_directory.join("discarded.txt");
+        let linked_path = linked_directory.join("discarded.txt");
+        fs::write(&actual_path, b"recoverable contents").unwrap();
+
+        let linked = StorePath::from_unix_path(linked_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &linked)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_trash(vec![DeleteTarget::new(linked, identity.into_vec())])
+            .unwrap()[0];
+        let LocalOperationOutcome::Trash(receipt) = finish_one(&mut queue) else {
+            panic!("trash produces a receipt");
+        };
+        assert!(!actual_path.exists());
+        let available = queue.can_undo(job);
+        if !available {
+            store.purge_trash(&[receipt]).unwrap();
+        }
+        assert!(available);
+
+        let undo_job = queue.submit_undo(job).unwrap();
+        let _ = finish_one(&mut queue);
+        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(fs::read(&actual_path).unwrap(), b"recoverable contents");
     }
 
     #[test]
