@@ -29,7 +29,7 @@ struct DesktopArchiveRoute {
     limits: ArchiveOperationLimits,
 }
 
-struct NoArchivePasswords;
+pub(crate) struct NoArchivePasswords;
 
 impl ArchivePasswordProvider for NoArchivePasswords {
     fn request_password(

@@ -27,8 +27,8 @@ use crate::navigation::{
     OmnibarSubmission, PaneId, TabId, WindowSession, resolve_path_input,
 };
 use crate::operations::{
-    DropAction, FileDragPayload, LocalOperationOutcome, OperationHub, TransferOutcome,
-    spawn_ready_hub_operations,
+    DropAction, FileDragPayload, LocalOperationOutcome, NoArchivePasswords, OperationHub,
+    TransferOutcome, spawn_ready_hub_operations,
 };
 use crate::providers::{ApplicationTargetError, ProviderRuntime, network_root_path};
 use crate::search::{DirectoryFilter, SearchGeneration, SearchResultModel, SearchState};
@@ -74,16 +74,17 @@ use musheen_core::{
     WatchEvent,
 };
 use musheen_desktop::{
-    ApplicationIconProvider, BrokerError, BrokerOutput, BrokerRequest, CatalogDocument,
-    CatalogStore, ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher,
-    DesktopEntryTerminalLauncher, DesktopPaths, ElevatedRootReference, ExternalTerminalCommand,
-    FolderIdentity, FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError,
-    MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation,
-    OperationUsage, OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent,
-    SecretBuffer, SessionStore, SystemClock, SystemProcessRunner, TagMoveOutcome, TerminalCommand,
-    TerminalError, TerminalModel, TerminalProfile, TerminalSession, TerminalSize, ThumbnailCache,
-    ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService,
-    ThumbnailSize, UsageResolution, VolumeAction, VolumeError, VolumeId, VolumeRuntime,
+    ApplicationIconProvider, ArchiveFormat, ArchiveLimits, ArchiveStore, BrokerError, BrokerOutput,
+    BrokerRequest, CatalogDocument, CatalogStore, ConflictDecisionStore, DesktopEntryCatalog,
+    DesktopEntryLauncher, DesktopEntryTerminalLauncher, DesktopPaths, ElevatedRootReference,
+    ExternalTerminalCommand, FolderIdentity, FreedesktopIconProvider, LaunchError, LaunchTarget,
+    MimeAppsError, MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation,
+    OperationReservation, OperationUsage, OperationUse, PreviewDocument, PrivilegeProvider,
+    ProcessRunner, PtyEvent, SecretBuffer, SessionStore, SystemClock, SystemProcessRunner,
+    TagMoveOutcome, TerminalCommand, TerminalError, TerminalModel, TerminalProfile,
+    TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
+    ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError,
+    VolumeId, VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -97,6 +98,7 @@ use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::NativeTheme;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -6957,6 +6959,9 @@ impl MusheenApp {
                     self.open_name_operation(operation, initial, origin_tab, cx);
                 }
             }
+            (CommandAction::BrowseArchive, CommandParameters::Targets(targets)) => {
+                self.open_archive_window(targets, cx);
+            }
             (
                 archive_action @ (CommandAction::Compress
                 | CommandAction::Extract
@@ -7173,6 +7178,85 @@ impl MusheenApp {
                 self.operation_error = Some(error);
                 cx.notify();
             }
+        }
+    }
+
+    fn open_archive_window(&mut self, targets: &[CommandTargetRef], cx: &mut Context<Self>) {
+        let result = (|| {
+            let [target] = targets else {
+                return Err(Box::<str>::from("select exactly one archive to browse"));
+            };
+            let source = target
+                .path()
+                .as_unix_path()
+                .ok_or_else(|| Box::<str>::from("only local archives can be opened"))?;
+            let format = archive_format_for_path(source)
+                .ok_or_else(|| Box::<str>::from("the selected file is not a supported archive"))?;
+            let label = source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| Box::<str>::from("the selected archive has no file name"))?;
+            let file = File::open(source).map_err(|error| error.to_string().into_boxed_str())?;
+            let archive = Arc::new(
+                ArchiveStore::from_file(
+                    file,
+                    label.clone(),
+                    format,
+                    Arc::new(NoArchivePasswords),
+                    ArchiveLimits::default(),
+                )
+                .map_err(|error| error.to_string().into_boxed_str())?,
+            );
+            let root = archive.root_path();
+            let providers = self
+                .providers
+                .with_additional_store(archive)
+                .map_err(|error| error.to_string().into_boxed_str())?;
+            Ok((label, root, providers))
+        })();
+        let (label, root, providers) = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.operation_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let operation_hub = self.operation_hub.clone();
+        let operation_error = operation_hub.persistence_error();
+        let operation_status_revision = operation_hub.status_revision();
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(1024.), px(720.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from(format!("{label} — Musheen"))),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(720.), px(480.))),
+            ..WindowOptions::default()
+        };
+        if cx
+            .open_window(options, move |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut app = MusheenApp::new_with_navigation(
+                        WindowSession::new(root),
+                        None,
+                        Some(providers),
+                        ResourceLimits::default(),
+                        false,
+                        cx,
+                    );
+                    app.operation_hub = operation_hub;
+                    app.operation_error = operation_error;
+                    app.operation_status_revision = operation_status_revision;
+                    app
+                });
+                register_file_manager_window(&view, window, cx);
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .is_err()
+        {
+            self.operation_error = Some("Musheen could not open the archive window".into());
+            cx.notify();
         }
     }
 
@@ -8309,6 +8393,7 @@ impl MusheenApp {
                 | CommandAction::Rename
                 | CommandAction::NewDirectory
                 | CommandAction::NewEmptyFile
+                | CommandAction::BrowseArchive
                 | CommandAction::Compress
                 | CommandAction::Extract
                 | CommandAction::ExtractHere
@@ -13131,6 +13216,7 @@ fn is_contextual_command(action: CommandAction) -> bool {
             | CommandAction::CreateHardLink
             | CommandAction::Hide
             | CommandAction::Unhide
+            | CommandAction::BrowseArchive
             | CommandAction::Compress
             | CommandAction::Extract
             | CommandAction::ExtractHere
@@ -13323,6 +13409,16 @@ fn archive_codec_and_suffix(path: &Path) -> Option<(ArchiveCodec, usize)> {
                     && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
                 .then_some((codec, suffix.len()))
             })
+    })
+}
+
+fn archive_format_for_path(path: &Path) -> Option<ArchiveFormat> {
+    archive_codec_and_suffix(path).map(|(codec, _)| match codec {
+        ArchiveCodec::Zip => ArchiveFormat::Zip,
+        ArchiveCodec::Tar => ArchiveFormat::Tar,
+        ArchiveCodec::TarGzip => ArchiveFormat::TarGzip,
+        ArchiveCodec::TarZstd => ArchiveFormat::TarZstd,
+        ArchiveCodec::SevenZip => ArchiveFormat::SevenZip,
     })
 }
 
@@ -13575,6 +13671,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[gpui_kit::test]
+    async fn browse_archive_opens_a_read_only_provider_window(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(FileManagerWindows::default());
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let archive = temporary.path().join("empty.zip");
+        std::fs::write(
+            &archive,
+            [
+                0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::BrowseArchive,
+                CommandParameters::targets(vec![local_command_target(&archive)]),
+                None,
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.windows().len() == 2
+        })
+        .await;
+        let archive_window = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.wait_for(archive_window, Duration::from_secs(2), |window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find("directory-empty")
+                .is_some_and(|element| element.visible())
+        })
+        .await;
     }
 
     #[test]
@@ -16525,6 +16679,7 @@ mod tests {
     #[test]
     fn context_actions_report_current_production_capabilities() {
         for action in [
+            CommandAction::BrowseArchive,
             CommandAction::Compress,
             CommandAction::Extract,
             CommandAction::ExtractHere,

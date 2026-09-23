@@ -101,6 +101,17 @@ impl ProviderRuntime {
             .build()
     }
 
+    pub(crate) fn with_additional_store(
+        &self,
+        store: Arc<dyn Store>,
+    ) -> Result<Self, ProviderRuntimeError> {
+        ProviderRuntimeBuilder {
+            adapters: self.adapters.as_ref().clone(),
+        }
+        .register_adapter(Arc::new(StoreOnlyAdapter::new(store)))?
+        .build()
+    }
+
     pub(crate) fn store(&self) -> Arc<dyn Store> {
         self.store.clone()
     }
@@ -493,4 +504,50 @@ pub(crate) fn network_root_path() -> StorePath {
         NETWORK_ROOT_KEY.to_vec(),
     )
     .expect("the built-in network root key is valid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use musheen_desktop::{
+        ArchiveFormat, ArchiveLimits, ArchivePasswordProvider, ArchiveStore, PasswordRequest,
+    };
+    use std::fs::File;
+    use std::io::Write;
+
+    #[test]
+    fn additional_store_routes_archive_paths_without_replacing_local_storage() {
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source
+            .write_all(&[
+                0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])
+            .unwrap();
+        let passwords: Arc<dyn ArchivePasswordProvider> = Arc::new(|_: &PasswordRequest| Ok(None));
+        let archive = Arc::new(
+            ArchiveStore::from_file(
+                File::open(source.path()).unwrap(),
+                "empty.zip",
+                ArchiveFormat::Zip,
+                passwords,
+                ArchiveLimits::default(),
+            )
+            .unwrap(),
+        );
+        let root = archive.root_path();
+
+        let runtime = ProviderRuntime::for_current_user()
+            .with_additional_store(archive)
+            .unwrap();
+
+        assert_eq!(runtime.store().provider_id().as_str(), "local");
+        assert_eq!(runtime.store().resolve_item(&root).unwrap(), None);
+        assert!(matches!(
+            runtime
+                .store()
+                .capabilities(&root)
+                .get(CapabilityKind::Watching),
+            CapabilityState::Unsupported(_)
+        ));
+    }
 }
