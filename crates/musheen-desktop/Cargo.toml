@@ -10,6 +10,7 @@ publish.workspace = true
 default = []
 archive-libarchive = ["dep:compress-tools"]
 portal-backend = []
+smb-pavao = ["dep:pavao"]
 
 [dependencies]
 alacritty_terminal.workspace = true
@@ -30,6 +31,7 @@ image.workspace = true
 md-5.workspace = true
 miniz_oxide.workspace = true
 musheen-core = { path = "../musheen-core" }
+musheen-local = { path = "../musheen-local" }
 musheen-ops = { path = "../musheen-ops" }
 musheen-zstd-budget.workspace = true
 nix.workspace = true
@@ -38,6 +40,7 @@ open.workspace = true
 opendal.workspace = true
 opendal-http-transport-reqwest.workspace = true
 portable-pty.workspace = true
+pavao = { workspace = true, optional = true }
 png.workspace = true
 posix-acl.workspace = true
 proc-mounts.workspace = true

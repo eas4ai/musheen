@@ -61,6 +61,7 @@ open = "5"
 opendal = { version = "0.59.3", default-features = false, features = ["executors-tokio", "http-transport-reqwest", "layers-concurrent-limit", "layers-timeout", "services-ftp", "services-http", "services-memory", "services-sftp", "services-webdav"] }
 opendal-http-transport-reqwest = { version = "0.59.3", default-features = false, features = ["rustls"] }
 portable-pty = "0.9"
+pavao = { version = "0.3.1", default-features = false }
 proc-mounts = "0.3"
 posix-acl = "1.2"
 png = "0.18"
