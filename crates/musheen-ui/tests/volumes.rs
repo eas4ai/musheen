@@ -177,6 +177,106 @@ fn sidebar_hides_devices_marked_for_non_file_manager_use() {
 }
 
 #[test]
+fn sidebar_shows_internal_data_volume_mounted_in_user_storage() {
+    let mounts = Arc::new(Mounts::default());
+    let data_mount = PathBuf::from("/home/musheen-user/workspace2");
+    *mounts.records.lock().unwrap() = vec![MountRecord::new(
+        "/dev/nvme0n1p5",
+        data_mount.clone(),
+        "ext4",
+        false,
+    )];
+    let internal_data = DeviceDescriptor::new(
+        VolumeId::new("workspace2").unwrap(),
+        "/org/freedesktop/UDisks2/block_devices/nvme0n1p5",
+    )
+    .with_label("workspace2")
+    .with_device("/dev/nvme0n1p5")
+    .with_sidebar_visible(false);
+    let mut service = VolumeService::new(
+        Arc::new(Backend(Mutex::new(BackendSnapshot::new(
+            "owner",
+            [internal_data],
+        )))),
+        mounts,
+        Arc::new(NoOperationUsage),
+    );
+    service.refresh().unwrap();
+    let mut sidebar = SidebarModel::new(PinStore::default());
+
+    sidebar.sync_volumes(service.model());
+
+    let storage = sidebar
+        .sections()
+        .into_iter()
+        .find(|section| section.kind() == SidebarSectionKind::Mounts)
+        .expect("a mounted internal data volume remains visible");
+    assert_eq!(storage.items().len(), 1);
+    assert_eq!(
+        storage.items()[0].navigation_location().as_unix_path(),
+        Some(data_mount.as_path())
+    );
+}
+
+#[test]
+fn sidebar_mount_fallback_keeps_user_storage_and_hides_system_filesystems() {
+    let mounts = Arc::new(Mounts::default());
+    *mounts.records.lock().unwrap() = vec![
+        MountRecord::new("bpf", "/sys/fs/bpf", "bpf", false),
+        MountRecord::new("cgroup2", "/sys/fs/cgroup", "cgroup2", false),
+        MountRecord::new(
+            "overlay",
+            "/var/lib/docker/overlay2/example",
+            "overlay",
+            false,
+        ),
+        MountRecord::new(
+            "gvfsd-fuse",
+            "/run/user/1000/gvfs",
+            "fuse.gvfsd-fuse",
+            false,
+        ),
+        MountRecord::new("/dev/sdc1", "/mnt/archive", "ext4", false),
+        MountRecord::new(
+            "/dev/nvme0n1p5",
+            "/home/musheen-user/projects",
+            "ext4",
+            false,
+        ),
+    ];
+    let mut service = VolumeService::new(
+        Arc::new(Backend(Mutex::new(BackendSnapshot::new(
+            "owner",
+            Vec::<DeviceDescriptor>::new(),
+        )))),
+        mounts,
+        Arc::new(NoOperationUsage),
+    );
+    service.refresh().unwrap();
+    let mut sidebar = SidebarModel::new(PinStore::default());
+
+    sidebar.sync_volumes(service.model());
+
+    let storage = sidebar
+        .sections()
+        .into_iter()
+        .find(|section| section.kind() == SidebarSectionKind::Mounts)
+        .expect("user storage mounts remain visible without UDisks");
+    let paths = storage
+        .items()
+        .iter()
+        .filter_map(|entry| entry.navigation_location().as_unix_path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        [
+            Path::new("/home/musheen-user/projects"),
+            Path::new("/mnt/archive"),
+        ]
+    );
+}
+
+#[test]
 fn sidebar_hides_loop_mounts_when_udisks_is_unavailable() {
     let mounts = Arc::new(Mounts::default());
     *mounts.records.lock().unwrap() = vec![MountRecord::new(

@@ -369,9 +369,6 @@ impl Default for SidebarModel {
 }
 
 fn is_sidebar_volume(volume: &Volume) -> bool {
-    let descriptor_visible = volume
-        .descriptor()
-        .is_none_or(|descriptor| descriptor.is_sidebar_visible());
     let loop_device = volume
         .device()
         .file_name()
@@ -380,7 +377,48 @@ fn is_sidebar_volume(volume: &Volume) -> bool {
         .is_some_and(|suffix| {
             !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
         });
-    descriptor_visible && !loop_device
+    if loop_device || volume.filesystem_type().is_some_and(is_pseudo_filesystem) {
+        return false;
+    }
+
+    let mounted_in_user_storage = volume.mount_points().iter().any(|path| {
+        path.starts_with("/media")
+            || path.starts_with("/mnt")
+            || path.starts_with("/run/media")
+            || path
+                .strip_prefix("/home")
+                .is_ok_and(|relative| relative.components().count() >= 2)
+    });
+    volume
+        .descriptor()
+        .is_some_and(|descriptor| descriptor.is_sidebar_visible())
+        || mounted_in_user_storage
+}
+
+fn is_pseudo_filesystem(filesystem_type: &str) -> bool {
+    matches!(
+        filesystem_type,
+        "autofs"
+            | "binfmt_misc"
+            | "bpf"
+            | "cgroup"
+            | "cgroup2"
+            | "configfs"
+            | "debugfs"
+            | "devpts"
+            | "devtmpfs"
+            | "efivarfs"
+            | "fusectl"
+            | "hugetlbfs"
+            | "mqueue"
+            | "nsfs"
+            | "overlay"
+            | "proc"
+            | "pstore"
+            | "securityfs"
+            | "sysfs"
+            | "tracefs"
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
