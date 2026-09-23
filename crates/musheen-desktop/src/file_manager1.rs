@@ -8,6 +8,7 @@ use std::time::Duration;
 use std::os::unix::ffi::OsStringExt as _;
 
 pub const FILE_MANAGER_NAME: &str = "org.freedesktop.FileManager1";
+pub const MUSHEEN_FILE_MANAGER_NAME: &str = "org.musheen.FileManager1";
 pub const FILE_MANAGER_PATH: &str = "/org/freedesktop/FileManager1";
 const MAX_URIS: usize = 256;
 const MAX_URI_BYTES: usize = 16 * 1024;
@@ -286,19 +287,93 @@ pub async fn serve_file_manager1(
     address: Option<&str>,
     sink: Arc<dyn FileManagerRequestSink>,
 ) -> Result<zbus::Connection, FileManagerError> {
+    serve_file_manager1_named(address, FILE_MANAGER_NAME, sink).await
+}
+
+pub async fn serve_file_manager1_named(
+    address: Option<&str>,
+    name: &'static str,
+    sink: Arc<dyn FileManagerRequestSink>,
+) -> Result<zbus::Connection, FileManagerError> {
     let builder = match address {
         Some(address) => zbus::connection::Builder::address(address),
         None => zbus::connection::Builder::session(),
     }
     .map_err(|error| FileManagerError::Service(error.to_string().into()))?;
     builder
-        .name(FILE_MANAGER_NAME)
+        .name(name)
         .map_err(|error| FileManagerError::Service(error.to_string().into()))?
         .serve_at(FILE_MANAGER_PATH, FileManager1::new(sink))
         .map_err(|error| FileManagerError::Service(error.to_string().into()))?
         .build()
         .await
         .map_err(|error| FileManagerError::Service(error.to_string().into()))
+}
+
+pub async fn forward_show_folders_to_musheen(
+    address: Option<&str>,
+    locations: &[StorePath],
+    startup_id: &str,
+) -> Result<(), FileManagerError> {
+    if locations.is_empty() || locations.len() > MAX_URIS || startup_id.len() > MAX_URI_BYTES {
+        return Err(FileManagerError::InvalidRequest);
+    }
+    let uris = locations
+        .iter()
+        .map(file_uri)
+        .collect::<Result<Vec<_>, _>>()?;
+    let connection = match address {
+        Some(address) => zbus::connection::Builder::address(address),
+        None => zbus::connection::Builder::session(),
+    }
+    .map_err(|error| FileManagerError::Service(error.to_string().into()))?
+    .build()
+    .await
+    .map_err(|error| FileManagerError::Service(error.to_string().into()))?;
+    let proxy = zbus::Proxy::new(
+        &connection,
+        MUSHEEN_FILE_MANAGER_NAME,
+        FILE_MANAGER_PATH,
+        FILE_MANAGER_NAME,
+    )
+    .await
+    .map_err(|error| FileManagerError::Service(error.to_string().into()))?;
+    proxy
+        .call_method("ShowFolders", &(uris, startup_id))
+        .await
+        .map_err(|error| FileManagerError::Service(error.to_string().into()))?;
+    Ok(())
+}
+
+fn file_uri(location: &StorePath) -> Result<String, FileManagerError> {
+    let path = location
+        .as_unix_path()
+        .ok_or(FileManagerError::UnsupportedUri)?;
+    #[cfg(unix)]
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
+    #[cfg(not(unix))]
+    let bytes = path
+        .to_str()
+        .ok_or(FileManagerError::InvalidUri)?
+        .as_bytes();
+    let mut uri = String::with_capacity(bytes.len().saturating_mul(3).saturating_add(7));
+    uri.push_str("file://");
+    for byte in bytes {
+        match *byte {
+            b'/' | b'-' | b'.' | b'_' | b'~' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => {
+                uri.push(char::from(*byte));
+            }
+            byte => {
+                use std::fmt::Write as _;
+                write!(&mut uri, "%{byte:02X}").expect("writing to a String cannot fail");
+            }
+        }
+    }
+    if uri.len() > MAX_URI_BYTES {
+        Err(FileManagerError::InvalidUri)
+    } else {
+        Ok(uri)
+    }
 }
 
 pub(crate) fn parse_file_uri(uri: &str) -> Result<StorePath, FileManagerError> {

@@ -102,6 +102,8 @@ zstd = "0.13"
 zstd-safe = { version = "7", features = ["experimental"] }
 
 [dependencies]
+futures-lite.workspace = true
+musheen-core = { path = "crates/musheen-core" }
 musheen-desktop = { path = "crates/musheen-desktop" }
 musheen-local = { path = "crates/musheen-local" }
 musheen-ui = { path = "crates/musheen-ui" }

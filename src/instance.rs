@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) enum InstanceStatus {
     Primary(InstanceGuard),
@@ -8,13 +8,38 @@ pub(crate) enum InstanceStatus {
 }
 
 pub(crate) struct InstanceGuard {
-    _lock: File,
+    _locks: Vec<File>,
 }
 
 pub(crate) fn acquire_for_current_user() -> io::Result<InstanceStatus> {
     let status = musheen_desktop::StatusStore::for_current_user();
-    let path = status.path().with_file_name("instance.lock");
-    acquire_at(&path)
+    let legacy_path = status.path().with_file_name("instance.lock");
+    let runtime_directory = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let path = instance_lock_path(runtime_directory.as_deref(), status.path());
+    if path == legacy_path {
+        return acquire_at(&path);
+    }
+    match acquire_at(&path) {
+        Ok(InstanceStatus::Primary(mut runtime)) => match acquire_at(&legacy_path) {
+            Ok(InstanceStatus::Primary(mut legacy)) => {
+                runtime._locks.append(&mut legacy._locks);
+                Ok(InstanceStatus::Primary(runtime))
+            }
+            Ok(InstanceStatus::AlreadyRunning) => Ok(InstanceStatus::AlreadyRunning),
+            Err(_) => Ok(InstanceStatus::Primary(runtime)),
+        },
+        Ok(InstanceStatus::AlreadyRunning) => Ok(InstanceStatus::AlreadyRunning),
+        Err(_) => acquire_at(&legacy_path),
+    }
+}
+
+fn instance_lock_path(runtime_directory: Option<&Path>, status_path: &Path) -> PathBuf {
+    runtime_directory
+        .filter(|path| path.is_absolute())
+        .map_or_else(
+            || status_path.with_file_name("instance.lock"),
+            |path| path.join("musheen/instance.lock"),
+        )
 }
 
 pub(crate) fn acquire_at(path: &Path) -> io::Result<InstanceStatus> {
@@ -37,7 +62,9 @@ pub(crate) fn acquire_at(path: &Path) -> io::Result<InstanceStatus> {
         .map_err(io::Error::from)?,
     );
     match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(InstanceStatus::Primary(InstanceGuard { _lock: lock })),
+        Ok(()) => Ok(InstanceStatus::Primary(InstanceGuard {
+            _locks: vec![lock],
+        })),
         Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(InstanceStatus::AlreadyRunning),
         Err(error) => Err(io::Error::from(error)),
     }
@@ -63,5 +90,23 @@ mod tests {
             acquire_at(&path).unwrap(),
             InstanceStatus::Primary(_)
         ));
+    }
+
+    #[test]
+    fn runtime_directory_hosts_the_ephemeral_instance_lock() {
+        assert_eq!(
+            instance_lock_path(
+                Some(Path::new("/run/user/1000")),
+                Path::new("/home/user/.config/musheen/operations.json"),
+            ),
+            Path::new("/run/user/1000/musheen/instance.lock")
+        );
+        assert_eq!(
+            instance_lock_path(
+                Some(Path::new("relative-runtime")),
+                Path::new("/home/user/.config/musheen/operations.json"),
+            ),
+            Path::new("/home/user/.config/musheen/instance.lock")
+        );
     }
 }

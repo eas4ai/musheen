@@ -260,3 +260,38 @@ fn exports_all_standard_methods_introspection_and_recovers_after_restart() {
     });
     assert_eq!(sink.0.lock().unwrap().len(), 3);
 }
+
+#[test]
+fn musheen_owned_service_accepts_a_forwarded_second_launch() {
+    let bus = PrivateBus::start();
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("folder with spaces");
+    std::fs::create_dir(&folder).unwrap();
+    let sink = Arc::new(RecordingSink::default());
+
+    futures_lite::future::block_on(async {
+        let _service = musheen_desktop::serve_file_manager1_named(
+            Some(&bus.address),
+            musheen_desktop::MUSHEEN_FILE_MANAGER_NAME,
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        musheen_desktop::forward_show_folders_to_musheen(
+            Some(&bus.address),
+            &[musheen_core::StorePath::from_unix_path(folder.as_os_str())],
+            "second-launch",
+        )
+        .await
+        .unwrap();
+    });
+
+    let requests = sink.0.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].startup_id(), "second-launch");
+    assert_eq!(
+        requests[0].locations()[0].as_unix_path(),
+        Some(folder.as_path())
+    );
+}

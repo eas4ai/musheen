@@ -2062,25 +2062,12 @@ fn install_file_manager1(cx: &mut App) {
     }
     cx.set_global(FileManagerWindows::default());
     let (sender, receiver) = async_channel::bounded(32);
-    let retry_executor = cx.background_executor().clone();
-    cx.background_executor()
-        .spawn(async move {
-            let mut retry_delay = Duration::from_secs(1);
-            loop {
-                match musheen_desktop::serve_file_manager1(None, Arc::new(sender.clone())).await {
-                    Ok(connection) => {
-                        retry_delay = Duration::from_secs(1);
-                        connection.closed().await;
-                    }
-                    Err(error) => {
-                        eprintln!("Musheen could not export FileManager1: {error}");
-                    }
-                }
-                retry_executor.timer(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-            }
-        })
-        .detach();
+    spawn_file_manager1_service(
+        musheen_desktop::MUSHEEN_FILE_MANAGER_NAME,
+        sender.clone(),
+        cx,
+    );
+    spawn_file_manager1_service(musheen_desktop::FILE_MANAGER_NAME, sender, cx);
     cx.spawn(async move |cx| {
         while let Ok(envelope) = receiver.recv().await {
             cx.update(|cx| {
@@ -2089,6 +2076,38 @@ fn install_file_manager1(cx: &mut App) {
         }
     })
     .detach();
+}
+
+fn spawn_file_manager1_service(
+    name: &'static str,
+    sender: async_channel::Sender<musheen_desktop::FileManagerRequestEnvelope>,
+    cx: &mut App,
+) {
+    let retry_executor = cx.background_executor().clone();
+    cx.background_executor()
+        .spawn(async move {
+            let mut retry_delay = Duration::from_secs(1);
+            loop {
+                match musheen_desktop::serve_file_manager1_named(
+                    None,
+                    name,
+                    Arc::new(sender.clone()),
+                )
+                .await
+                {
+                    Ok(connection) => {
+                        retry_delay = Duration::from_secs(1);
+                        connection.closed().await;
+                    }
+                    Err(error) => {
+                        eprintln!("Musheen could not export {name}: {error}");
+                    }
+                }
+                retry_executor.timer(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+            }
+        })
+        .detach();
 }
 
 fn register_file_manager_window(view: &Entity<MusheenApp>, window: &mut Window, cx: &mut App) {
