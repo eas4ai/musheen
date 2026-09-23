@@ -515,6 +515,7 @@ struct PendingDrop {
     decisions: Vec<ConflictDecision>,
     policies: ConflictPolicies,
     automatic_scope: bool,
+    clear_cut_clipboard_on_success: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2893,7 +2894,6 @@ struct MusheenApp {
     transfer_preflights: usize,
     file_clipboard: Option<FileClipboard>,
     pending_cut_jobs: std::collections::HashSet<musheen_ops::JobId>,
-    pending_paste_cut: bool,
     pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
     pending_context_menu: Option<ContextMenu>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
@@ -3606,7 +3606,6 @@ impl MusheenApp {
             transfer_preflights: 0,
             file_clipboard: None,
             pending_cut_jobs: std::collections::HashSet::new(),
-            pending_paste_cut: false,
             pending_catalog_moves: HashMap::new(),
             pending_context_menu: None,
             keyboard_context_popup: None,
@@ -8143,10 +8142,12 @@ impl MusheenApp {
             action,
         );
         match payload {
-            Ok(payload) => {
-                self.pending_paste_cut = clipboard.action == ClipboardAction::Cut;
-                self.submit_reviewed_transfer(payload, destination, cx);
-            }
+            Ok(payload) => self.submit_reviewed_transfer_with_clipboard(
+                payload,
+                destination,
+                clipboard.action == ClipboardAction::Cut,
+                cx,
+            ),
             Err(error) => {
                 self.operation_error = Some(error.to_string().into());
                 cx.notify();
@@ -8227,6 +8228,16 @@ impl MusheenApp {
         target: StorePath,
         cx: &mut Context<Self>,
     ) {
+        self.submit_reviewed_transfer_with_clipboard(payload, target, false, cx);
+    }
+
+    fn submit_reviewed_transfer_with_clipboard(
+        &mut self,
+        payload: FileDragPayload,
+        target: StorePath,
+        clear_cut_clipboard_on_success: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.pending_drop.is_some() {
             return;
         }
@@ -8244,7 +8255,13 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| {
-                state.finish_transfer_preflight(payload, target, result, cx);
+                state.finish_transfer_preflight(
+                    payload,
+                    target,
+                    clear_cut_clipboard_on_success,
+                    result,
+                    cx,
+                );
             });
         })
         .detach();
@@ -8254,6 +8271,7 @@ impl MusheenApp {
         &mut self,
         payload: FileDragPayload,
         target: StorePath,
+        clear_cut_clipboard_on_success: bool,
         result: Result<Vec<ConflictRecord>, Box<str>>,
         cx: &mut Context<Self>,
     ) {
@@ -8261,7 +8279,6 @@ impl MusheenApp {
         let conflicts = match result {
             Ok(conflicts) => conflicts,
             Err(error) => {
-                self.pending_paste_cut = false;
                 self.operation_error = Some(error);
                 cx.notify();
                 return;
@@ -8269,7 +8286,6 @@ impl MusheenApp {
         };
         if !conflicts.is_empty() {
             if self.pending_drop.is_some() {
-                self.pending_paste_cut = false;
                 self.operation_error = Some("another file conflict is awaiting a decision".into());
                 cx.notify();
                 return;
@@ -8284,6 +8300,7 @@ impl MusheenApp {
                 decisions: Vec::new(),
                 policies: ConflictPolicies::default(),
                 automatic_scope: false,
+                clear_cut_clipboard_on_success,
             });
             self.advance_pending_drop(cx);
             return;
@@ -8293,7 +8310,7 @@ impl MusheenApp {
             .operation_hub
             .submit_drop(payload, target)
             .map_err(|error| Box::<str>::from(error.to_string()));
-        self.finish_drop_submission(submitted, catalog_moves, cx);
+        self.finish_drop_submission(submitted, catalog_moves, clear_cut_clipboard_on_success, cx);
     }
 
     fn catalog_moves_for_transfer(
@@ -8323,14 +8340,14 @@ impl MusheenApp {
         &mut self,
         submitted: Result<Vec<musheen_ops::JobId>, Box<str>>,
         catalog_moves: Vec<Option<PendingCatalogMove>>,
+        clear_cut_clipboard_on_success: bool,
         cx: &mut Context<Self>,
     ) {
         match submitted {
             Ok(ids) => {
-                if self.pending_paste_cut {
+                if clear_cut_clipboard_on_success {
                     self.pending_cut_jobs.extend(ids.iter().copied());
                 }
-                self.pending_paste_cut = false;
                 self.pending_catalog_moves.extend(
                     ids.into_iter()
                         .zip(catalog_moves)
@@ -8342,7 +8359,6 @@ impl MusheenApp {
                 self.pump_operation_queue(cx);
             }
             Err(error) => {
-                self.pending_paste_cut = false;
                 self.operation_error = Some(error);
                 cx.notify();
             }
@@ -8359,13 +8375,19 @@ impl MusheenApp {
                     .pending_drop
                     .take()
                     .expect("the completed drop remains pending");
+                let clear_cut_clipboard_on_success = pending.clear_cut_clipboard_on_success;
                 let catalog_moves =
                     self.catalog_moves_for_transfer(&pending.payload, &pending.target);
                 let submitted = self
                     .operation_hub
                     .submit_drop_resolved(pending.payload, pending.target, pending.decisions)
                     .map_err(|error| Box::<str>::from(error.to_string()));
-                self.finish_drop_submission(submitted, catalog_moves, cx);
+                self.finish_drop_submission(
+                    submitted,
+                    catalog_moves,
+                    clear_cut_clipboard_on_success,
+                    cx,
+                );
                 return;
             }
             let conflict = pending.conflicts[pending.next_conflict].clone();
@@ -9219,6 +9241,15 @@ impl MusheenApp {
                 _ => Vec::new(),
             };
             return self.context_menu_request(tab.id(), target, tab.location().clone(), selection);
+        }
+        // Paste Into from a directory context menu captures its target earlier.
+        if action == CommandAction::PasteInto {
+            return self.context_menu_request(
+                tab.id(),
+                MenuTarget::Background,
+                tab.location().clone(),
+                Vec::new(),
+            );
         }
         let selection = self
             .directories
@@ -12943,6 +12974,9 @@ fn column_label(column: ColumnKey) -> &'static str {
         ColumnKey::Modified => "Modified",
     }
 }
+
+#[cfg(test)]
+mod paste_tests;
 
 #[cfg(test)]
 mod tests {
@@ -16805,6 +16839,7 @@ mod tests {
                     .unwrap();
                     state.submit_file_drop(payload.clone(), StorePath::from_unix_path("/tmp"), cx);
                     state.submit_reviewed_transfer(payload, StorePath::from_unix_path("/tmp"), cx);
+                    paste_tests::assert_rejected_cut_paste_does_not_capture_pending_drop(state, cx);
                     if let Some(previous) = previous_window {
                         state.handle_drop_conflict_event(
                             previous,
@@ -19938,6 +19973,7 @@ mod tests {
                 .find(|item| item.path().as_unix_path() == Some(copy_source.as_path()))
                 .unwrap();
             let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+            state.select_item(tab, item.id().clone(), cx);
             state.dispatch_typed_context_command(
                 CommandAction::Copy,
                 CommandParameters::targets(vec![target]),
@@ -19946,6 +19982,7 @@ mod tests {
                 false,
                 cx,
             );
+            paste_tests::assert_active_paste_targets_current_folder(state, temporary.path());
             state.paste_file_clipboard(StorePath::from_unix_path(child.as_os_str()), cx);
         });
         cx.wait_for(browser, Duration::from_secs(2), |_, _| {
