@@ -138,7 +138,16 @@ impl OperationHub {
     ) -> Result<Self, OperationHubError> {
         let mut status = load_status(&store)?;
         let interrupted = status.mark_unfinished_interrupted();
-        let local_store = LocalStore::new();
+        let mut local_store = LocalStore::new();
+        for location in status
+            .history()
+            .into_iter()
+            .map(|entry| entry.location().clone())
+        {
+            if location.as_unix_path().is_some() {
+                local_store.recover_replacements_at(&location)?;
+            }
+        }
         let recovery_reconciled = status.reconcile_recovery_staging(
             |path| local_store.recovery_staging_available(path),
             |_| false,
@@ -149,7 +158,10 @@ impl OperationHub {
                 .save(&document)
                 .map_err(|error| OperationHubError::Storage(error.to_string().into()))?;
         }
-        let mut queue = LocalOperationQueue::new(limits);
+        let mut queue = match status.highest_job_id() {
+            Some(last_job_id) => LocalOperationQueue::starting_after(limits, last_job_id)?,
+            None => LocalOperationQueue::new(limits),
+        };
         providers.configure_queue(&mut queue);
         Ok(Self {
             queue: Arc::new(Mutex::new(queue)),

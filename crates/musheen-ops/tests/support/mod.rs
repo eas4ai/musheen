@@ -1,7 +1,7 @@
 use musheen_core::{CancellationToken, StorePath};
 use musheen_ops::{
     CopyCapabilities, CopyProvider, CopyRequest, EntryKind, EntrySnapshot, EventGeneration, JobId,
-    MetadataReport, ProviderError,
+    MetadataReport, ProviderError, SourceRemovalToken,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +19,7 @@ pub enum Action {
     Publish,
     Cleanup,
     AtomicMove,
+    PrepareSourceRemoval,
     RemoveSource,
 }
 
@@ -216,8 +217,18 @@ impl CopyProvider for RecordingProvider {
         &mut self,
         _source: &StorePath,
         _expected: &EntrySnapshot,
+        _prepared: &SourceRemovalToken,
     ) -> Result<(), ProviderError> {
         self.record(Action::RemoveSource)
+    }
+
+    fn prepare_source_removal(
+        &mut self,
+        _source: &StorePath,
+        expected: &EntrySnapshot,
+    ) -> Result<SourceRemovalToken, ProviderError> {
+        self.record(Action::PrepareSourceRemoval)?;
+        Ok(SourceRemovalToken::new(expected.identity().to_vec()))
     }
 }
 

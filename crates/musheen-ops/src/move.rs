@@ -1,5 +1,8 @@
 use crate::copy::provider_failure_kind;
-use crate::{CopyProvider, CopyRequest, CopySession, CopyStrategy, FailureKind, OperationFailure};
+use crate::{
+    CopyProvider, CopyRequest, CopySession, CopyStrategy, FailureKind, MetadataReport,
+    OperationFailure,
+};
 use musheen_core::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +15,7 @@ pub enum MoveStrategy {
 pub struct MoveOutcome {
     strategy: MoveStrategy,
     copy_strategy: Option<CopyStrategy>,
+    metadata: MetadataReport,
 }
 
 impl MoveOutcome {
@@ -23,6 +27,11 @@ impl MoveOutcome {
     #[must_use]
     pub const fn copy_strategy(&self) -> Option<CopyStrategy> {
         self.copy_strategy
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> &MetadataReport {
+        &self.metadata
     }
 }
 
@@ -44,6 +53,7 @@ pub fn execute_move<P: CopyProvider>(
                 return Ok(MoveOutcome {
                     strategy: MoveStrategy::AtomicRename,
                     copy_strategy: None,
+                    metadata: MetadataReport::default(),
                 });
             }
             Ok(false) => {}
@@ -66,13 +76,21 @@ pub fn execute_move<P: CopyProvider>(
             request.destination(),
         ));
     }
+    let prepared = provider
+        .prepare_source_removal(request.source(), copied.source_snapshot())
+        .map_err(|error| {
+            OperationFailure::after_publish(provider_failure_kind(error), request.destination())
+        })?;
     provider
-        .remove_source(request.source(), copied.source_snapshot())
+        .remove_source(request.source(), copied.source_snapshot(), &prepared)
         .map_err(|error| {
             let unknown = error == crate::ProviderError::SourceRemovalUnknown;
+            let partial = error == crate::ProviderError::SourcePartiallyRemoved;
             let kind = provider_failure_kind(error);
             if unknown {
                 OperationFailure::after_source_removal_unknown(kind, request.destination())
+            } else if partial {
+                OperationFailure::after_partial_source_removal(kind, request.destination())
             } else {
                 OperationFailure::after_publish(kind, request.destination())
             }
@@ -80,5 +98,6 @@ pub fn execute_move<P: CopyProvider>(
     Ok(MoveOutcome {
         strategy: MoveStrategy::VerifiedCopy,
         copy_strategy: Some(copied.strategy()),
+        metadata: copied.metadata().clone(),
     })
 }

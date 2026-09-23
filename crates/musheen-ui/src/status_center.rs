@@ -476,6 +476,11 @@ impl StatusCenterModel {
     }
 
     #[must_use]
+    pub fn highest_job_id(&self) -> Option<JobId> {
+        self.entries.keys().next_back().copied()
+    }
+
+    #[must_use]
     pub fn active_count(&self) -> usize {
         self.entries
             .values()

@@ -2,19 +2,21 @@ use crate::LocalStore;
 use musheen_core::{CancellationToken, StorePath};
 use musheen_ops::{
     CopyCapabilities, CopyProvider, EntryKind, EntrySnapshot, MetadataKind, MetadataReport,
-    ProviderError, SourceMetadata,
+    ProviderError, SourceMetadata, SourceRemovalToken, source_unchanged,
 };
 use nix::errno::Errno;
 use nix::unistd::{Whence, lseek};
 use posix_acl::{PosixACL, Qualifier};
+use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, CWD, Gid, RenameFlags, StatxFlags, Timespec, Timestamps, Uid, chown, renameat_with,
-    statx, utimensat,
+    AtFlags, CWD, Gid, Mode, OFlags, RenameFlags, StatxFlags, Timespec, Timestamps, Uid, chown,
+    fsync, open, openat, renameat_with, statx, unlinkat, utimensat,
 };
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -54,6 +56,7 @@ impl CopyProvider for LocalStore {
         _kind: EntryKind,
     ) -> Result<(), ProviderError> {
         self.operation_metadata_skips.clear();
+        self.operation_partial_metadata_skips.clear();
         self.operation_timestamps.clear();
         match fs::symlink_metadata(local_path(staging)?) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -144,6 +147,7 @@ impl CopyProvider for LocalStore {
             include_nested_mounts,
             cancellation,
             &mut self.operation_metadata_skips,
+            &mut self.operation_partial_metadata_skips,
             &mut self.operation_timestamps,
         )
     }
@@ -155,11 +159,12 @@ impl CopyProvider for LocalStore {
         staging: &StorePath,
     ) -> Result<MetadataReport, ProviderError> {
         let mut skipped = std::mem::take(&mut self.operation_metadata_skips);
+        let partial_skips = std::mem::take(&mut self.operation_partial_metadata_skips);
         let source = local_path(source)?;
         let staging = local_path(staging)?;
         skipped.extend(copy_metadata(source, staging, source_snapshot)?);
         record_timestamp(&mut self.operation_timestamps, staging, source_snapshot);
-        Ok(MetadataReport::with_skipped(skipped))
+        Ok(MetadataReport::with_skipped(skipped).with_partially_skipped(partial_skips))
     }
 
     fn verify(
@@ -234,7 +239,9 @@ impl CopyProvider for LocalStore {
                 }
                 Ok(true)
             }
-            Err(error) if error == rustix::io::Errno::XDEV => Ok(false),
+            Err(rustix::io::Errno::XDEV | rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {
+                Ok(false)
+            }
             Err(error) if error == rustix::io::Errno::EXIST => Err(destination_conflict()),
             Err(error) => Err(map_rustix(error)),
         }
@@ -244,14 +251,36 @@ impl CopyProvider for LocalStore {
         &mut self,
         source: &StorePath,
         expected: &EntrySnapshot,
+        prepared: &SourceRemovalToken,
     ) -> Result<(), ProviderError> {
         let source = local_path(source)?;
         let current = fs::symlink_metadata(source).map_err(map_io)?;
-        if snapshot(source, &current)? != *expected {
+        if !source_unchanged(expected, &snapshot(source, &current)?) {
             return Err(ProviderError::SourceChanged);
         }
-        remove_tree_without_crossing(source, expected.filesystem_id())?;
+        let removal = DescriptorRemoval::prepare(source, expected.filesystem_id())?;
+        if removal.token().as_bytes() != prepared.as_bytes() {
+            return Err(ProviderError::SourceChanged);
+        }
+        #[cfg(test)]
+        let fault_after = self.source_removal_fault_after;
+        #[cfg(not(test))]
+        let fault_after = None;
+        removal.execute(fault_after)?;
         sync_parent(source).map_err(|_| ProviderError::SourceRemovalUnknown)
+    }
+
+    fn prepare_source_removal(
+        &mut self,
+        source: &StorePath,
+        expected: &EntrySnapshot,
+    ) -> Result<SourceRemovalToken, ProviderError> {
+        let source = local_path(source)?;
+        let current = fs::symlink_metadata(source).map_err(map_io)?;
+        if !source_unchanged(expected, &snapshot(source, &current)?) {
+            return Err(ProviderError::SourceChanged);
+        }
+        DescriptorRemoval::prepare(source, expected.filesystem_id()).map(|plan| plan.token())
     }
 }
 
@@ -411,6 +440,7 @@ fn copy_directory_tree(
     include_nested_mounts: bool,
     cancellation: &CancellationToken,
     metadata_skips: &mut Vec<MetadataKind>,
+    partial_metadata_skips: &mut Vec<MetadataKind>,
     timestamps: &mut Vec<(PathBuf, SourceMetadata)>,
 ) -> Result<u64, ProviderError> {
     fs::create_dir(destination).map_err(map_io)?;
@@ -464,12 +494,20 @@ fn copy_directory_tree(
                 &target,
                 &entry_snapshot,
                 metadata_skips,
+                partial_metadata_skips,
                 timestamps,
             )?;
         }
     }
     for (source, target, snapshot) in directories.into_iter().rev() {
-        apply_tree_metadata(&source, &target, &snapshot, metadata_skips, timestamps)?;
+        apply_tree_metadata(
+            &source,
+            &target,
+            &snapshot,
+            metadata_skips,
+            partial_metadata_skips,
+            timestamps,
+        )?;
     }
     File::open(destination)
         .and_then(|directory| directory.sync_all())
@@ -516,9 +554,15 @@ fn apply_tree_metadata(
     target: &Path,
     snapshot: &EntrySnapshot,
     metadata_skips: &mut Vec<MetadataKind>,
+    partial_metadata_skips: &mut Vec<MetadataKind>,
     timestamps: &mut Vec<(PathBuf, SourceMetadata)>,
 ) -> Result<(), ProviderError> {
-    metadata_skips.extend(copy_metadata(source, target, snapshot)?);
+    let skipped = copy_metadata(source, target, snapshot)?;
+    if snapshot.kind() == EntryKind::SymbolicLink {
+        partial_metadata_skips.extend(skipped);
+    } else {
+        metadata_skips.extend(skipped);
+    }
     record_timestamp(timestamps, target, snapshot);
     Ok(())
 }
@@ -646,7 +690,10 @@ fn restore_timestamps(
     report: &MetadataReport,
     timestamps: &mut Vec<(PathBuf, SourceMetadata)>,
 ) -> Result<bool, ProviderError> {
-    if report.skipped().contains(&MetadataKind::Timestamps) {
+    if report
+        .verification_skipped()
+        .contains(&MetadataKind::Timestamps)
+    {
         timestamps.clear();
         return Ok(true);
     }
@@ -725,7 +772,7 @@ fn metadata_matches(
     let Some(expected) = source.metadata() else {
         return Ok(false);
     };
-    let skipped = report.skipped();
+    let skipped = report.verification_skipped();
     if !skipped.contains(&MetadataKind::Mode) && destination.mode() & 0o7777 != expected.mode {
         return Ok(false);
     }
@@ -798,11 +845,392 @@ fn destination_conflict() -> ProviderError {
 }
 
 fn rename_without_replacement(source: &Path, destination: &Path) -> Result<(), ProviderError> {
-    match renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE) {
+    rename_without_replacement_with(source, destination, |source, destination| {
+        renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE)
+    })
+}
+
+fn rename_without_replacement_with(
+    source: &Path,
+    destination: &Path,
+    rename: impl FnOnce(&Path, &Path) -> Result<(), rustix::io::Errno>,
+) -> Result<(), ProviderError> {
+    match rename(source, destination) {
         Ok(()) => Ok(()),
         Err(error) if error == rustix::io::Errno::EXIST => Err(destination_conflict()),
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {
+            publish_without_rename_noreplace(source, destination)
+        }
         Err(error) => Err(map_rustix(error)),
     }
+}
+
+fn publish_without_rename_noreplace(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), ProviderError> {
+    let metadata = fs::symlink_metadata(source).map_err(map_io)?;
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(source).map_err(map_io)?;
+        match symlink(&target, destination) {
+            Ok(()) => fs::remove_file(source).map_err(|_| ProviderError::PublishUnknown),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(destination_conflict())
+            }
+            Err(error) => Err(map_io(error)),
+        }
+    } else if metadata.is_file() {
+        match fs::hard_link(source, destination) {
+            Ok(()) => fs::remove_file(source).map_err(|_| ProviderError::PublishUnknown),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(destination_conflict())
+            }
+            Err(error) => Err(map_io(error)),
+        }
+    } else if metadata.is_dir() {
+        let source_mount = mount_identity(source, &metadata)?;
+        match fs::create_dir(destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(destination_conflict());
+            }
+            Err(error) => return Err(map_io(error)),
+        }
+        publish_directory_without_rename(source, destination, &metadata)
+            .map_err(|_| ProviderError::PublishUnknown)?;
+        remove_tree_without_crossing(source, source_mount)
+            .map_err(|_| ProviderError::PublishUnknown)
+    } else {
+        Err(ProviderError::Unsupported(
+            "safe publication fallback does not support this file type".into(),
+        ))
+    }
+}
+
+fn publish_directory_without_rename(
+    source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ProviderError> {
+    for entry in fs::read_dir(source).map_err(map_io)? {
+        let entry = entry.map_err(map_io)?;
+        let child_source = entry.path();
+        let child_destination = destination.join(entry.file_name());
+        let child_metadata = fs::symlink_metadata(&child_source).map_err(map_io)?;
+        if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
+            fs::create_dir(&child_destination).map_err(map_io)?;
+            publish_directory_without_rename(&child_source, &child_destination, &child_metadata)?;
+        } else if child_metadata.file_type().is_symlink() {
+            symlink(
+                fs::read_link(&child_source).map_err(map_io)?,
+                &child_destination,
+            )
+            .map_err(map_io)?;
+        } else {
+            fs::hard_link(&child_source, &child_destination).map_err(map_io)?;
+        }
+    }
+    chown(
+        destination,
+        Some(Uid::from_raw(metadata.uid())),
+        Some(Gid::from_raw(metadata.gid())),
+    )
+    .map_err(map_rustix)?;
+    copy_xattrs(source, destination).map_err(map_io)?;
+    copy_acls(source, destination, true).map_err(|kind| {
+        ProviderError::Other(format!("could not preserve directory ACL: {kind:?}").into())
+    })?;
+    fs::set_permissions(destination, metadata.permissions()).map_err(map_io)?;
+    set_timestamps(
+        destination,
+        SourceMetadata {
+            mode: metadata.mode(),
+            owner: metadata.uid(),
+            group: metadata.gid(),
+            accessed_seconds: metadata.atime(),
+            accessed_nanoseconds: metadata.atime_nsec(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        },
+    )
+    .map_err(map_rustix)
+}
+
+struct DescriptorRemoval {
+    parent: OwnedFd,
+    name: OsString,
+    root_identity: Box<[u8]>,
+    root_directory: Option<(OwnedFd, Vec<DescriptorRemovalNode>)>,
+}
+
+struct DescriptorRemovalNode {
+    name: OsString,
+    identity: Box<[u8]>,
+    directory: bool,
+    children: Vec<Self>,
+}
+
+impl DescriptorRemoval {
+    fn prepare(path: &Path, root_mount: u64) -> Result<Self, ProviderError> {
+        let parent_path = path.parent().ok_or_else(|| {
+            ProviderError::Unsupported("source has no containing directory".into())
+        })?;
+        let name = path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ProviderError::Unsupported("source has no file name".into()))?;
+        let parent = open(
+            parent_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_rustix)?;
+        let root = descriptor_stat(&parent, name)?;
+        if descriptor_mount_identity(&root) != root_mount {
+            return Err(ProviderError::NestedMount);
+        }
+        let root_identity = descriptor_identity(&root);
+        let root_directory = if descriptor_is_directory(&root) {
+            let directory = openat(
+                &parent,
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_rustix)?;
+            if descriptor_fd_identity(&directory)? != root_identity {
+                return Err(ProviderError::SourceChanged);
+            }
+            let children = plan_descriptor_removal(&directory, root_mount)?;
+            Some((directory, children))
+        } else {
+            None
+        };
+        Ok(Self {
+            parent,
+            name: name.to_os_string(),
+            root_identity,
+            root_directory,
+        })
+    }
+
+    fn token(&self) -> SourceRemovalToken {
+        let mut hasher = blake3::Hasher::new();
+        hash_removal_identity(&mut hasher, &self.name, &self.root_identity);
+        if let Some((_, children)) = &self.root_directory {
+            hash_removal_nodes(&mut hasher, children);
+        }
+        SourceRemovalToken::new(hasher.finalize().as_bytes().to_vec())
+    }
+
+    fn execute(self, fault_after: Option<usize>) -> Result<(), ProviderError> {
+        let mut removed = 0_usize;
+        let result = if let Some((directory, children)) = self.root_directory {
+            execute_descriptor_removal(&directory, &children, fault_after, &mut removed)
+                .and_then(|()| ensure_descriptor_directory_empty(&directory))
+                .and_then(|()| {
+                    revalidate_descriptor_entry(&self.parent, &self.name, &self.root_identity)
+                })
+                .and_then(|()| inject_removal_fault(fault_after, removed))
+                .and_then(|()| {
+                    unlinkat(&self.parent, &self.name, AtFlags::REMOVEDIR).map_err(map_rustix)
+                })
+        } else {
+            revalidate_descriptor_entry(&self.parent, &self.name, &self.root_identity)
+                .and_then(|()| inject_removal_fault(fault_after, removed))
+                .and_then(|()| {
+                    unlinkat(&self.parent, &self.name, AtFlags::empty()).map_err(map_rustix)
+                })
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(_) if removed > 0 => Err(ProviderError::SourcePartiallyRemoved),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn plan_descriptor_removal(
+    directory: &OwnedFd,
+    root_mount: u64,
+) -> Result<Vec<DescriptorRemovalNode>, ProviderError> {
+    let mut plan = Vec::new();
+    for result in fs::read_dir(descriptor_fd_path(directory)).map_err(map_io)? {
+        let entry = result.map_err(map_io)?;
+        let name = entry.file_name();
+        let stat = descriptor_stat(directory, &name)?;
+        if descriptor_mount_identity(&stat) != root_mount {
+            return Err(ProviderError::NestedMount);
+        }
+        let identity = descriptor_identity(&stat);
+        let directory_entry = descriptor_is_directory(&stat);
+        let children = if directory_entry {
+            let child = openat(
+                directory,
+                &name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_rustix)?;
+            if descriptor_fd_identity(&child)? != identity {
+                return Err(ProviderError::SourceChanged);
+            }
+            plan_descriptor_removal(&child, root_mount)?
+        } else {
+            Vec::new()
+        };
+        plan.push(DescriptorRemovalNode {
+            name,
+            identity,
+            directory: directory_entry,
+            children,
+        });
+    }
+    plan.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    Ok(plan)
+}
+
+fn execute_descriptor_removal(
+    directory: &OwnedFd,
+    plan: &[DescriptorRemovalNode],
+    fault_after: Option<usize>,
+    removed: &mut usize,
+) -> Result<(), ProviderError> {
+    let actual_names = fs::read_dir(descriptor_fd_path(directory))
+        .map_err(map_io)?
+        .map(|entry| entry.map(|entry| entry.file_name()).map_err(map_io))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    let planned_names = plan
+        .iter()
+        .map(|node| node.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual_names != planned_names {
+        return Err(ProviderError::SourceChanged);
+    }
+
+    for node in plan {
+        revalidate_descriptor_entry(directory, &node.name, &node.identity)?;
+        inject_removal_fault(fault_after, *removed)?;
+        if node.directory {
+            let child = openat(
+                directory,
+                &node.name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_rustix)?;
+            if descriptor_fd_identity(&child)? != node.identity {
+                return Err(ProviderError::SourceChanged);
+            }
+            execute_descriptor_removal(&child, &node.children, fault_after, removed)?;
+            ensure_descriptor_directory_empty(&child)?;
+            revalidate_descriptor_entry(directory, &node.name, &node.identity)?;
+            inject_removal_fault(fault_after, *removed)?;
+            unlinkat(directory, &node.name, AtFlags::REMOVEDIR).map_err(map_rustix)?;
+        } else {
+            unlinkat(directory, &node.name, AtFlags::empty()).map_err(map_rustix)?;
+        }
+        *removed = (*removed).saturating_add(1);
+    }
+    fsync(directory).map_err(map_rustix)
+}
+
+fn ensure_descriptor_directory_empty(directory: &OwnedFd) -> Result<(), ProviderError> {
+    if fs::read_dir(descriptor_fd_path(directory))
+        .map_err(map_io)?
+        .next()
+        .is_some()
+    {
+        Err(ProviderError::SourceChanged)
+    } else {
+        Ok(())
+    }
+}
+
+fn revalidate_descriptor_entry(
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected: &[u8],
+) -> Result<(), ProviderError> {
+    if descriptor_identity(&descriptor_stat(parent, name)?).as_ref() == expected {
+        Ok(())
+    } else {
+        Err(ProviderError::SourceChanged)
+    }
+}
+
+fn inject_removal_fault(fault_after: Option<usize>, removed: usize) -> Result<(), ProviderError> {
+    if fault_after == Some(removed) {
+        Err(ProviderError::PermissionDenied)
+    } else {
+        Ok(())
+    }
+}
+
+fn descriptor_stat(parent: &OwnedFd, name: &OsStr) -> Result<rustix::fs::Statx, ProviderError> {
+    statx(
+        parent,
+        name,
+        AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    )
+    .map_err(map_rustix)
+}
+
+fn descriptor_fd_identity(fd: &OwnedFd) -> Result<Box<[u8]>, ProviderError> {
+    statx(
+        fd,
+        "",
+        AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    )
+    .map(|stat| descriptor_identity(&stat))
+    .map_err(map_rustix)
+}
+
+fn descriptor_identity(stat: &rustix::fs::Statx) -> Box<[u8]> {
+    let mut identity = Vec::with_capacity(80);
+    identity.extend_from_slice(&stat.stx_dev_major.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_dev_minor.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_mnt_id.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_ino.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_mode.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_size.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_mtime.tv_sec.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_mtime.tv_nsec.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_ctime.tv_sec.to_ne_bytes());
+    identity.extend_from_slice(&stat.stx_ctime.tv_nsec.to_ne_bytes());
+    identity.into_boxed_slice()
+}
+
+fn descriptor_mount_identity(stat: &rustix::fs::Statx) -> u64 {
+    if stat.stx_mask & StatxFlags::MNT_ID.bits() != 0 {
+        stat.stx_mnt_id
+    } else {
+        (u64::from(stat.stx_dev_major) << 32) | u64::from(stat.stx_dev_minor)
+    }
+}
+
+const fn descriptor_is_directory(stat: &rustix::fs::Statx) -> bool {
+    stat.stx_mode & 0o170_000 == 0o040_000
+}
+
+fn descriptor_fd_path(fd: &OwnedFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+fn hash_removal_nodes(hasher: &mut blake3::Hasher, nodes: &[DescriptorRemovalNode]) {
+    for node in nodes {
+        hash_removal_identity(hasher, &node.name, &node.identity);
+        hasher.update(&[u8::from(node.directory)]);
+        hash_removal_nodes(hasher, &node.children);
+        hasher.update(&[0xff]);
+    }
+}
+
+fn hash_removal_identity(hasher: &mut blake3::Hasher, name: &OsStr, identity: &[u8]) {
+    hash_bytes(hasher, name.as_bytes());
+    hash_bytes(hasher, identity);
 }
 
 pub(crate) fn remove_path(path: &Path) -> Result<(), ProviderError> {
@@ -961,7 +1389,10 @@ fn hash_verified_metadata(
     metadata: &fs::Metadata,
     report: &MetadataReport,
 ) -> Result<(), ProviderError> {
-    let skipped = report.skipped();
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let skipped = report.verification_skipped();
     if !skipped.contains(&MetadataKind::Mode) {
         hasher.update(&(metadata.mode() & 0o7777).to_le_bytes());
     }
@@ -1021,4 +1452,145 @@ fn hash_acl(hasher: &mut blake3::Hasher, acl: &PosixACL) {
         hasher.update(&entry.perm.to_le_bytes());
     }
     hasher.update(&[0xff]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_path(path: &Path) -> StorePath {
+        StorePath::from_unix_path(path.as_os_str())
+    }
+
+    #[test]
+    fn rename_noreplace_einval_uses_atomic_creation_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stage");
+        let destination = root.path().join("published");
+        fs::write(&source, b"complete").unwrap();
+
+        rename_without_replacement_with(&source, &destination, |_, _| {
+            Err(rustix::io::Errno::INVAL)
+        })
+        .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn rename_noreplace_einval_publishes_a_complete_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stage");
+        let destination = root.path().join("published");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"complete").unwrap();
+        symlink("file", source.join("link")).unwrap();
+
+        rename_without_replacement_with(&source, &destination, |_, _| {
+            Err(rustix::io::Errno::INVAL)
+        })
+        .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("file")).unwrap(), b"complete");
+        assert_eq!(
+            fs::read_link(destination.join("link")).unwrap(),
+            Path::new("file")
+        );
+    }
+
+    #[test]
+    fn descriptor_removal_refuses_a_new_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("original"), b"kept").unwrap();
+        let path = store_path(&source);
+        let mut provider = LocalStore::new();
+        let expected = provider.inspect(&path, false).unwrap();
+        let token = provider.prepare_source_removal(&path, &expected).unwrap();
+        fs::write(source.join("concurrent"), b"new").unwrap();
+
+        assert_eq!(
+            provider.remove_source(&path, &expected, &token),
+            Err(ProviderError::SourceChanged)
+        );
+        assert_eq!(fs::read(source.join("concurrent")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn descriptor_removal_refuses_a_swapped_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("tree");
+        fs::create_dir(&source).unwrap();
+        let child = source.join("child");
+        fs::write(&child, b"old").unwrap();
+        let path = store_path(&source);
+        let mut provider = LocalStore::new();
+        let expected = provider.inspect(&path, false).unwrap();
+        let token = provider.prepare_source_removal(&path, &expected).unwrap();
+        fs::rename(&child, source.join("removed-child")).unwrap();
+        fs::write(&child, b"replacement").unwrap();
+
+        assert_eq!(
+            provider.remove_source(&path, &expected, &token),
+            Err(ProviderError::SourceChanged)
+        );
+        assert_eq!(fs::read(child).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn atime_change_does_not_invalidate_source_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::write(&source, b"read changes atime on relatime mounts").unwrap();
+        let old = Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        utimensat(
+            CWD,
+            &source,
+            &Timestamps {
+                last_access: old,
+                last_modification: old,
+            },
+            AtFlags::empty(),
+        )
+        .unwrap();
+        let path = store_path(&source);
+        let mut provider = LocalStore::new();
+        let expected = provider.inspect(&path, false).unwrap();
+        let mut bytes = Vec::new();
+        File::open(&source)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let token = provider.prepare_source_removal(&path, &expected).unwrap();
+
+        provider.remove_source(&path, &expected, &token).unwrap();
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn removal_reports_partial_progress_after_injected_fault() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a"), b"a").unwrap();
+        fs::write(source.join("b"), b"b").unwrap();
+        let path = store_path(&source);
+        let mut provider = LocalStore::new();
+        let expected = provider.inspect(&path, false).unwrap();
+        let token = provider.prepare_source_removal(&path, &expected).unwrap();
+        provider.source_removal_fault_after = Some(1);
+
+        assert_eq!(
+            provider.remove_source(&path, &expected, &token),
+            Err(ProviderError::SourcePartiallyRemoved)
+        );
+        assert!(source.exists());
+        assert_eq!(fs::read_dir(source).unwrap().count(), 1);
+    }
 }

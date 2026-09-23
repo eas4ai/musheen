@@ -33,7 +33,10 @@ pub struct LocalStore {
     provider: ProviderId,
     enumerations: EnumerationRegistry,
     operation_metadata_skips: Vec<MetadataKind>,
+    operation_partial_metadata_skips: Vec<MetadataKind>,
     operation_timestamps: Vec<(PathBuf, SourceMetadata)>,
+    #[cfg(test)]
+    source_removal_fault_after: Option<usize>,
 }
 
 impl LocalStore {
@@ -57,7 +60,10 @@ impl LocalStore {
             enumerations: EnumerationRegistry::new(provider.clone()),
             provider,
             operation_metadata_skips: Vec::new(),
+            operation_partial_metadata_skips: Vec::new(),
             operation_timestamps: Vec::new(),
+            #[cfg(test)]
+            source_removal_fault_after: None,
         }
     }
 

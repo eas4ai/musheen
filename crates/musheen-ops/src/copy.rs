@@ -146,6 +146,7 @@ pub struct CopyRequest {
     source: StorePath,
     destination: StorePath,
     options: CopyOptions,
+    staging_nonce: [u8; 16],
 }
 
 impl CopyRequest {
@@ -162,6 +163,7 @@ impl CopyRequest {
             source,
             destination,
             options: CopyOptions::default(),
+            staging_nonce: StagingPath::unique_nonce(),
         }
     }
 
@@ -195,6 +197,17 @@ impl CopyRequest {
     pub const fn options(&self) -> CopyOptions {
         self.options
     }
+
+    #[must_use]
+    pub const fn staging_nonce(&self) -> [u8; 16] {
+        self.staging_nonce
+    }
+
+    #[must_use]
+    pub const fn with_staging_nonce(mut self, nonce: [u8; 16]) -> Self {
+        self.staging_nonce = nonce;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +222,7 @@ pub enum ProviderError {
     Cancelled,
     PublishUnknown,
     SourceRemovalUnknown,
+    SourcePartiallyRemoved,
     AtomicMoveUnknown,
     Other(Box<str>),
 }
@@ -234,6 +248,9 @@ impl fmt::Display for ProviderError {
             }
             Self::SourceRemovalUnknown => {
                 formatter.write_str("source removal has an unknown outcome")
+            }
+            Self::SourcePartiallyRemoved => {
+                formatter.write_str("source removal stopped after removing part of the source")
             }
             Self::AtomicMoveUnknown => formatter.write_str("atomic move has an unknown outcome"),
             Self::Other(message) => formatter.write_str(message),
@@ -311,11 +328,32 @@ pub trait CopyProvider {
         source: &StorePath,
         destination: &StorePath,
     ) -> Result<bool, ProviderError>;
+    fn prepare_source_removal(
+        &mut self,
+        source: &StorePath,
+        expected: &EntrySnapshot,
+    ) -> Result<SourceRemovalToken, ProviderError>;
     fn remove_source(
         &mut self,
         source: &StorePath,
         expected: &EntrySnapshot,
+        prepared: &SourceRemovalToken,
     ) -> Result<(), ProviderError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRemovalToken(Box<[u8]>);
+
+impl SourceRemovalToken {
+    #[must_use]
+    pub fn new(value: impl Into<Box<[u8]>>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,6 +415,7 @@ pub enum PublicationState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceState {
     Retained,
+    PartiallyRemoved,
     Removed,
     Unknown,
 }
@@ -418,6 +457,16 @@ impl OperationFailure {
             destination: destination.clone(),
             publication_state: PublicationState::Published,
             source_state: SourceState::Unknown,
+        }
+    }
+
+    pub(crate) fn after_partial_source_removal(kind: FailureKind, destination: &StorePath) -> Self {
+        Self {
+            kind,
+            staging_retained: None,
+            destination: destination.clone(),
+            publication_state: PublicationState::Published,
+            source_state: SourceState::PartiallyRemoved,
         }
     }
 
@@ -505,16 +554,17 @@ impl CopySession {
             ));
         }
 
-        let staging =
-            StagingPath::for_destination(request.destination(), request.job_id, request.generation)
-                .map_err(|_| {
-                    OperationFailure::before_publish(
-                        FailureKind::StagingUnavailable,
-                        request.destination(),
-                    )
-                })?
-                .path()
-                .clone();
+        let staging = StagingPath::for_destination_with_nonce(
+            request.destination(),
+            request.job_id,
+            request.generation,
+            request.staging_nonce,
+        )
+        .map_err(|_| {
+            OperationFailure::before_publish(FailureKind::StagingUnavailable, request.destination())
+        })?
+        .path()
+        .clone();
         if let Err(error) = provider.create_staging(&staging, source.kind) {
             return Err(match error {
                 ProviderError::StagingExists => OperationFailure::before_publish(

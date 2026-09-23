@@ -12,6 +12,7 @@ pub enum MetadataKind {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetadataReport {
     skipped: Vec<MetadataKind>,
+    verification_skipped: Vec<MetadataKind>,
 }
 
 impl MetadataReport {
@@ -20,7 +21,18 @@ impl MetadataReport {
         let mut skipped = kinds.into_iter().collect::<Vec<_>>();
         skipped.sort_unstable();
         skipped.dedup();
-        Self { skipped }
+        Self {
+            verification_skipped: skipped.clone(),
+            skipped,
+        }
+    }
+
+    #[must_use]
+    pub fn with_partially_skipped(mut self, kinds: impl IntoIterator<Item = MetadataKind>) -> Self {
+        for kind in kinds {
+            insert_kind(&mut self.skipped, kind);
+        }
+        self
     }
 
     #[must_use]
@@ -28,15 +40,25 @@ impl MetadataReport {
         &self.skipped
     }
 
+    #[must_use]
+    pub fn verification_skipped(&self) -> &[MetadataKind] {
+        &self.verification_skipped
+    }
+
     pub(crate) fn note_skipped(&mut self, kind: MetadataKind) {
-        match self.skipped.binary_search(&kind) {
-            Ok(_) => {}
-            Err(index) => self.skipped.insert(index, kind),
-        }
+        insert_kind(&mut self.skipped, kind);
+        insert_kind(&mut self.verification_skipped, kind);
     }
 
     #[must_use]
     pub fn complete(&self) -> bool {
         self.skipped.is_empty()
+    }
+}
+
+fn insert_kind(kinds: &mut Vec<MetadataKind>, kind: MetadataKind) {
+    match kinds.binary_search(&kind) {
+        Ok(_) => {}
+        Err(index) => kinds.insert(index, kind),
     }
 }

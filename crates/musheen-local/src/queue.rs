@@ -459,6 +459,15 @@ impl LocalOperationQueue {
         }
     }
 
+    pub fn starting_after(limits: &ResourceLimits, last_job_id: JobId) -> Result<Self, DropError> {
+        Ok(Self {
+            scheduler: Scheduler::new_starting_after(limits, last_job_id)?,
+            operations: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            provider_routes: HashMap::new(),
+        })
+    }
+
     pub fn register_provider_transfer_route(&mut self, route: Arc<dyn ProviderTransferRoute>) {
         self.provider_routes.insert(
             (
@@ -755,6 +764,8 @@ impl LocalOperationQueue {
             return self.inspect_provider_drop(payload, target, &destination_provider);
         }
         let target_path = writable_directory(target)?;
+        let canonical_target = fs::canonicalize(target_path)
+            .map_err(|_| DropError::UnsupportedTarget(target.clone()))?;
         let mut store = LocalStore::new();
         let provider = provider_snapshot(&store, target);
         let mut sources = HashSet::with_capacity(payload.sources.len());
@@ -788,8 +799,13 @@ impl LocalOperationQueue {
                     "special files cannot be transferred".into(),
                 ));
             }
-            if kind.is_dir() && target_path.starts_with(source_path) {
-                return Err(DropError::RecursiveTarget(source.clone()));
+            if kind.is_dir() {
+                let canonical_source = fs::canonicalize(source_path).map_err(|error| {
+                    DropError::InvalidSource(source.clone(), error.to_string().into())
+                })?;
+                if canonical_target.starts_with(&canonical_source) {
+                    return Err(DropError::RecursiveTarget(source.clone()));
+                }
             }
             let name = source_path.file_name().ok_or_else(|| {
                 DropError::InvalidSource(source.clone(), "the source has no file name".into())
@@ -971,9 +987,8 @@ fn clean_absolute_path(path: &StorePath) -> Option<&Path> {
 fn writable_directory(target: &StorePath) -> Result<&Path, DropError> {
     let path =
         clean_absolute_path(target).ok_or_else(|| DropError::UnsupportedTarget(target.clone()))?;
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| DropError::UnsupportedTarget(target.clone()))?;
-    if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o222 == 0 {
+    let metadata = fs::metadata(path).map_err(|_| DropError::UnsupportedTarget(target.clone()))?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o222 == 0 {
         return Err(DropError::UnsupportedTarget(target.clone()));
     }
     let store = LocalStore::new();

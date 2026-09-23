@@ -15,6 +15,8 @@ use std::fs;
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 
 fn run_ready(queue: &mut LocalOperationQueue) {
     let ready = queue.start_ready().expect("ready operations start");
@@ -498,6 +500,26 @@ fn unsupported_targets_are_rejected_before_any_job_is_queued() {
             Err(DropError::UnsupportedTarget(_))
         ));
     }
+    assert_eq!(queue.job_count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_target_inside_source_is_rejected_as_recursive() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let inside = source.join("inside");
+    let target = temporary.path().join("target-link");
+    fs::create_dir_all(&inside).unwrap();
+    symlink(&inside, &target).unwrap();
+    let source_path = StorePath::from_unix_path(source.as_os_str());
+    let payload = FileDragPayload::new(vec![source_path.clone()], DropAction::Copy).unwrap();
+    let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+
+    assert!(matches!(
+        queue.submit_drop(payload, StorePath::from_unix_path(target.as_os_str())),
+        Err(DropError::RecursiveTarget(path)) if path == source_path
+    ));
     assert_eq!(queue.job_count(), 0);
 }
 

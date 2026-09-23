@@ -178,6 +178,26 @@ fn defaults_provider_limits_and_fifo_progress_are_enforced() {
 }
 
 #[test]
+fn restored_history_can_advance_the_first_new_job_id() {
+    let scheduler = Scheduler::with_clock_starting_after(
+        &ResourceLimits::default(),
+        ManualClock::default(),
+        musheen_ops::JobId::new(41).unwrap(),
+    )
+    .unwrap();
+    let id = scheduler
+        .enqueue(plan(
+            42,
+            OperationKind::Copy,
+            provider("restart", ProviderLimits::unbounded()),
+        ))
+        .unwrap();
+
+    assert_eq!(id.get(), 42);
+    assert_eq!(scheduler.start_ready().unwrap()[0].id(), id);
+}
+
+#[test]
 fn stricter_provider_limits_do_not_starve_other_providers() {
     let limits = ResourceLimits::try_from(ResourceLimitConfig {
         operation_data_mutations: 3,

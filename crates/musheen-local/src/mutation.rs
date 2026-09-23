@@ -26,6 +26,24 @@ use walkdir::WalkDir;
 
 static TRASH_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_RESTORE_NAME: AtomicU64 = AtomicU64::new(1);
+const REPLACE_BACKUP_PREFIX: &str = ".musheen-replace-backup-v1-";
+const REPLACE_JOURNAL_PREFIX: &str = ".musheen-replace-journal-v1-";
+
+#[derive(Debug)]
+struct ReplacementJournal {
+    version: u8,
+    job_id: u64,
+    generation: u64,
+    nonce: [u8; 16],
+    destination: Vec<u8>,
+    backup: Vec<u8>,
+    staging: Vec<u8>,
+}
+
+struct ReplacementTransaction {
+    backup: PathBuf,
+    journal: PathBuf,
+}
 
 #[derive(Debug)]
 pub(crate) enum ResolvedTransferFailure {
@@ -95,6 +113,30 @@ impl LocalTrashEntry {
 }
 
 impl LocalStore {
+    pub fn recover_replacements_at(&mut self, location: &StorePath) -> Result<(), MutationError> {
+        let location = location.as_unix_path().ok_or(MutationError::Unsupported)?;
+        let parent = location.parent().ok_or(MutationError::InvalidScope)?;
+        let entries = match fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(map_io_error(error)),
+        };
+        let mut journals = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(map_io_error)?.path();
+            if path.file_name().is_some_and(|name| {
+                name.as_bytes()
+                    .starts_with(REPLACE_JOURNAL_PREFIX.as_bytes())
+            }) {
+                journals.push(path);
+            }
+        }
+        for journal_path in journals {
+            recover_replacement_journal(&journal_path)?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn recovery_staging_available(&self, staging: &StorePath) -> bool {
         StagingPath::is_owned_path(staging)
@@ -676,6 +718,246 @@ fn keep_both_destination(destination: &StorePath) -> Result<StorePath, Box<str>>
     unreachable!("the keep-both sequence is unbounded")
 }
 
+impl ReplacementTransaction {
+    fn begin(request: &CopyRequest, destination: &Path) -> Result<Self, MutationError> {
+        let parent = destination.parent().ok_or(MutationError::InvalidScope)?;
+        let nonce = request.staging_nonce();
+        let nonce_hex = nonce
+            .iter()
+            .fold(String::with_capacity(32), |mut value, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(value, "{byte:02x}");
+                value
+            });
+        let suffix = format!(
+            "{}-{}-{nonce_hex}",
+            request.job_id().get(),
+            request.generation().get()
+        );
+        let backup = parent.join(format!("{REPLACE_BACKUP_PREFIX}{suffix}"));
+        let journal = parent.join(format!("{REPLACE_JOURNAL_PREFIX}{suffix}"));
+        let staging = StagingPath::for_destination_with_nonce(
+            request.destination(),
+            request.job_id(),
+            request.generation(),
+            nonce,
+        )
+        .map_err(|_| MutationError::InvalidScope)?
+        .path()
+        .as_unix_path()
+        .ok_or(MutationError::Unsupported)?
+        .to_path_buf();
+        let document = ReplacementJournal {
+            version: 1,
+            job_id: request.job_id().get(),
+            generation: request.generation().get(),
+            nonce,
+            destination: destination.as_os_str().as_bytes().to_vec(),
+            backup: backup.as_os_str().as_bytes().to_vec(),
+            staging: staging.as_os_str().as_bytes().to_vec(),
+        };
+        let bytes = encode_replacement_journal(&document);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&journal)
+            .map_err(map_io_error)?;
+        use std::io::Write as _;
+        file.write_all(&bytes).map_err(map_io_error)?;
+        file.sync_all().map_err(map_io_error)?;
+        sync_parent(&journal).map_err(map_io_error)?;
+        if let Err(error) = renameat_with(CWD, destination, CWD, &backup, RenameFlags::NOREPLACE) {
+            let _ = fs::remove_file(&journal);
+            return Err(map_errno(error));
+        }
+        sync_parent(destination).map_err(|error| {
+            MutationError::RecoveryRequired(
+                format!(
+                    "the previous destination remains at {} because its journal could not be made durable: {error}",
+                    backup.display()
+                )
+                .into(),
+            )
+        })?;
+        Ok(Self { backup, journal })
+    }
+
+    fn remove_journal(&self) -> Result<(), MutationError> {
+        match fs::remove_file(&self.journal) {
+            Ok(()) => sync_parent(&self.journal).map_err(map_io_error),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(map_io_error(error)),
+        }
+    }
+}
+
+fn recover_replacement_journal(journal_path: &Path) -> Result<(), MutationError> {
+    let bytes = fs::read(journal_path).map_err(map_io_error)?;
+    let journal = decode_replacement_journal(&bytes)?;
+    let destination = PathBuf::from(OsString::from_vec(journal.destination));
+    let backup = PathBuf::from(OsString::from_vec(journal.backup));
+    let staging = PathBuf::from(OsString::from_vec(journal.staging));
+    let parent = journal_path.parent().ok_or(MutationError::InvalidScope)?;
+    let nonce_hex = encode_hex(&journal.nonce);
+    let suffix = format!("{}-{}-{nonce_hex}", journal.job_id, journal.generation);
+    let expected_backup = parent.join(format!("{REPLACE_BACKUP_PREFIX}{suffix}"));
+    let expected_journal = parent.join(format!("{REPLACE_JOURNAL_PREFIX}{suffix}"));
+    let staging_owned = StagingPath::is_for_destination(
+        &StorePath::from_unix_path(staging.as_os_str()),
+        &StorePath::from_unix_path(destination.as_os_str()),
+        musheen_ops::JobId::new(journal.job_id).ok_or(MutationError::InvalidScope)?,
+        musheen_ops::EventGeneration::new(journal.generation),
+        journal.nonce,
+    );
+    if journal.version != 1
+        || destination.parent() != Some(parent)
+        || backup != expected_backup
+        || journal_path != expected_journal
+        || !staging_owned
+    {
+        return Err(MutationError::RecoveryRequired(
+            "replacement journal paths failed ownership validation".into(),
+        ));
+    }
+    if backup.exists() {
+        if destination.exists() {
+            let recovered = recovered_original_path(&destination)?;
+            renameat_with(CWD, &backup, CWD, &recovered, RenameFlags::NOREPLACE)
+                .map_err(map_errno)?;
+        } else {
+            renameat_with(CWD, &backup, CWD, &destination, RenameFlags::NOREPLACE)
+                .map_err(map_errno)?;
+        }
+        sync_parent(&destination).map_err(map_io_error)?;
+    }
+    if !destination.exists() {
+        return Err(MutationError::RecoveryRequired(
+            format!(
+                "replacement recovery preserved staging at {} because neither destination nor backup exists",
+                staging.display()
+            )
+            .into(),
+        ));
+    }
+    if staging.exists() {
+        remove_path(&staging).map_err(|error| MutationError::Provider(error.to_string().into()))?;
+        sync_parent(&staging).map_err(map_io_error)?;
+    }
+    fs::remove_file(journal_path).map_err(map_io_error)?;
+    sync_parent(journal_path).map_err(map_io_error)
+}
+
+fn encode_replacement_journal(journal: &ReplacementJournal) -> Vec<u8> {
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        journal.version,
+        journal.job_id,
+        journal.generation,
+        encode_hex(&journal.nonce),
+        encode_hex(&journal.destination),
+        encode_hex(&journal.backup),
+        encode_hex(&journal.staging),
+    )
+    .into_bytes()
+}
+
+fn decode_replacement_journal(bytes: &[u8]) -> Result<ReplacementJournal, MutationError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| MutationError::RecoveryRequired("replacement journal is not UTF-8".into()))?;
+    let mut lines = text.lines();
+    let version = u8::try_from(parse_journal_number(lines.next(), "version")?).map_err(|_| {
+        MutationError::RecoveryRequired("replacement journal version is out of range".into())
+    })?;
+    let job_id = parse_journal_number(lines.next(), "job id")?;
+    let generation = parse_journal_number(lines.next(), "generation")?;
+    let nonce = decode_hex(lines.next().unwrap_or_default())?;
+    let nonce: [u8; 16] = nonce.try_into().map_err(|_| {
+        MutationError::RecoveryRequired("replacement journal nonce has the wrong size".into())
+    })?;
+    let destination = decode_hex(lines.next().unwrap_or_default())?;
+    let backup = decode_hex(lines.next().unwrap_or_default())?;
+    let staging = decode_hex(lines.next().unwrap_or_default())?;
+    if lines.next().is_some() {
+        return Err(MutationError::RecoveryRequired(
+            "replacement journal has unexpected fields".into(),
+        ));
+    }
+    Ok(ReplacementJournal {
+        version,
+        job_id,
+        generation,
+        nonce,
+        destination,
+        backup,
+        staging,
+    })
+}
+
+fn parse_journal_number(value: Option<&str>, field: &str) -> Result<u64, MutationError> {
+    value
+        .ok_or_else(|| {
+            MutationError::RecoveryRequired(format!("replacement journal lacks {field}").into())
+        })?
+        .parse()
+        .map_err(|_| {
+            MutationError::RecoveryRequired(
+                format!("replacement journal has an invalid {field}").into(),
+            )
+        })
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
+        |mut value, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(value, "{byte:02x}");
+            value
+        },
+    )
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, MutationError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(MutationError::RecoveryRequired(
+            "replacement journal has invalid hex".into(),
+        ));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = decode_hex_digit(pair[0])?;
+            let low = decode_hex_digit(pair[1])?;
+            Ok(high * 16 + low)
+        })
+        .collect()
+}
+
+fn decode_hex_digit(value: u8) -> Result<u8, MutationError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err(MutationError::RecoveryRequired(
+            "replacement journal has invalid hex".into(),
+        )),
+    }
+}
+
+fn recovered_original_path(destination: &Path) -> Result<PathBuf, MutationError> {
+    let parent = destination.parent().ok_or(MutationError::InvalidScope)?;
+    let name = destination.file_name().ok_or(MutationError::InvalidScope)?;
+    for sequence in 1_u64.. {
+        let mut recovered = name.to_os_string();
+        recovered.push(format!(" (recovered original {sequence})"));
+        let recovered = parent.join(recovered);
+        if !recovered.try_exists().map_err(map_io_error)? {
+            return Ok(recovered);
+        }
+    }
+    unreachable!("the recovered-original sequence is unbounded")
+}
+
 fn execute_replacing_transfer(
     store: &mut LocalStore,
     request: &CopyRequest,
@@ -685,8 +967,9 @@ fn execute_replacing_transfer(
     let destination = request.destination().as_unix_path().ok_or_else(|| {
         ResolvedTransferFailure::Failed("the destination is not a local path".into())
     })?;
-    let backup = move_destination_aside(destination, RestoreDisposition::Replace)
-        .map_err(resolved_move_aside_failure)?;
+    let transaction =
+        ReplacementTransaction::begin(request, destination).map_err(resolved_move_aside_failure)?;
+    let backup = transaction.backup.clone();
     if let Err(error) = execute_transfer(store, request, operation, cancellation) {
         let original_error = error.to_string();
         if !replacement_destination_can_be_removed(&error) {
@@ -719,6 +1002,9 @@ fn execute_replacing_transfer(
                 .into(),
             )
         })?;
+        transaction
+            .remove_journal()
+            .map_err(resolved_move_aside_failure)?;
         return Err(error);
     }
     remove_path(&backup).map_err(|error| {
@@ -734,7 +1020,10 @@ fn execute_replacing_transfer(
         ResolvedTransferFailure::NeedsAttention(
             format!("the destination was published but could not be made durable: {error}").into(),
         )
-    })
+    })?;
+    transaction
+        .remove_journal()
+        .map_err(resolved_move_aside_failure)
 }
 
 fn replacement_destination_can_be_removed(error: &ResolvedTransferFailure) -> bool {
@@ -1517,6 +1806,15 @@ fn map_errno(error: rustix::io::Errno) -> MutationError {
 mod tests {
     use super::*;
 
+    fn request(source: &Path, destination: &Path) -> CopyRequest {
+        CopyRequest::new(
+            musheen_ops::JobId::new(91).unwrap(),
+            musheen_ops::EventGeneration::new(3),
+            StorePath::from_unix_path(source.as_os_str()),
+            StorePath::from_unix_path(destination.as_os_str()),
+        )
+    }
+
     #[test]
     fn moving_a_destination_aside_rolls_back_when_directory_sync_fails() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
@@ -1535,5 +1833,127 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(names, vec![OsString::from("destination.txt")]);
+    }
+
+    #[test]
+    fn replacement_journal_restores_a_hidden_original_after_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&destination, b"original").unwrap();
+        let request = request(&source, &destination);
+        let staging = StagingPath::for_destination_with_nonce(
+            request.destination(),
+            request.job_id(),
+            request.generation(),
+            request.staging_nonce(),
+        )
+        .unwrap();
+        let _crashed = ReplacementTransaction::begin(&request, &destination).unwrap();
+        fs::write(staging.path().as_unix_path().unwrap(), b"partial").unwrap();
+
+        LocalStore::new()
+            .recover_replacements_at(request.destination())
+            .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        assert!(!staging.path().as_unix_path().unwrap().exists());
+        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn restart_preserves_both_complete_versions_when_publish_finished() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&destination, b"original").unwrap();
+        let request = request(&source, &destination);
+        let _crashed = ReplacementTransaction::begin(&request, &destination).unwrap();
+        fs::write(&destination, b"new").unwrap();
+
+        LocalStore::new()
+            .recover_replacements_at(request.destination())
+            .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert_eq!(
+            fs::read(temporary.path().join("destination (recovered original 1)")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn recovery_never_deletes_staging_without_another_complete_copy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::write(&source, b"new").unwrap();
+        fs::write(&destination, b"original").unwrap();
+        let request = request(&source, &destination);
+        let staging = StagingPath::for_destination_with_nonce(
+            request.destination(),
+            request.job_id(),
+            request.generation(),
+            request.staging_nonce(),
+        )
+        .unwrap();
+        let crashed = ReplacementTransaction::begin(&request, &destination).unwrap();
+        fs::write(staging.path().as_unix_path().unwrap(), b"complete new copy").unwrap();
+        fs::remove_file(&crashed.backup).unwrap();
+
+        assert!(
+            LocalStore::new()
+                .recover_replacements_at(request.destination())
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(staging.path().as_unix_path().unwrap()).unwrap(),
+            b"complete new copy"
+        );
+        assert!(crashed.journal.exists());
+    }
+
+    #[test]
+    fn cross_device_replace_preserves_verified_destination_after_partial_removal() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let destination_root = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir_in("/dev/shm").unwrap();
+        if fs::metadata(destination_root.path()).unwrap().dev()
+            == fs::metadata(source_root.path()).unwrap().dev()
+        {
+            return;
+        }
+        let source = source_root.path().join("tree");
+        let destination = destination_root.path().join("tree");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("a"), b"a").unwrap();
+        fs::write(source.join("b"), b"b").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("old"), b"old").unwrap();
+        let request = request(&source, &destination);
+        let mut store = LocalStore::new();
+        store.source_removal_fault_after = Some(1);
+
+        let error = execute_replacing_transfer(
+            &mut store,
+            &request,
+            OperationKind::Move,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ResolvedTransferFailure::NeedsAttention(_)));
+        assert_eq!(fs::read(destination.join("a")).unwrap(), b"a");
+        assert_eq!(fs::read(destination.join("b")).unwrap(), b"b");
+        assert!(fs::read_dir(destination_root.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .as_bytes()
+                .starts_with(REPLACE_BACKUP_PREFIX.as_bytes())
+        }));
     }
 }

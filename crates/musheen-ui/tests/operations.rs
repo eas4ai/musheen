@@ -142,9 +142,11 @@ fn operation_hub_restores_interrupted_work_and_persisted_dismissals() {
     let temporary = tempfile::tempdir().expect("temporary directory is available");
     let source_one = temporary.path().join("one.txt");
     let source_two = temporary.path().join("two.txt");
+    let source_three = temporary.path().join("three.txt");
     let destination = temporary.path().join("destination");
     fs::write(&source_one, b"one").expect("first source writes");
     fs::write(&source_two, b"two").expect("second source writes");
+    fs::write(&source_three, b"three").expect("third source writes");
     fs::create_dir(&destination).expect("destination directory creates");
     let store = StatusStore::at(temporary.path().join("operations.json"));
     let limits = ResourceLimits::default();
@@ -194,6 +196,28 @@ fn operation_hub_restores_interrupted_work_and_persisted_dismissals() {
     assert!(status.entry(second).unwrap().dismissed());
     drop(status);
     assert!(!restored.can_retry(first));
+
+    let new_id = restored
+        .submit_drop(
+            FileDragPayload::new(
+                vec![StorePath::from_unix_path(source_three.into_os_string())],
+                DropAction::Copy,
+            )
+            .unwrap(),
+            StorePath::from_unix_path(destination.as_os_str()),
+        )
+        .unwrap()[0];
+    assert!(new_id > second);
+    assert_eq!(
+        restored
+            .status()
+            .lock()
+            .unwrap()
+            .entry(new_id)
+            .unwrap()
+            .status(),
+        OperationStatus::Pending
+    );
 }
 
 #[test]

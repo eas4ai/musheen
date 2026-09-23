@@ -97,6 +97,7 @@ fn local_directory_copy_finishes_children_before_restoring_read_only_mode() {
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("child.txt"), b"still reachable").unwrap();
     fs::hard_link(nested.join("child.txt"), nested.join("second.txt")).unwrap();
+    symlink("child.txt", nested.join("child-link")).unwrap();
     let preserved_time = Timespec {
         tv_sec: 1_600_000_000,
         tv_nsec: 123_456_789,
@@ -140,6 +141,18 @@ fn local_directory_copy_finishes_children_before_restoring_read_only_mode() {
     assert_eq!(copied_metadata.atime_nsec(), preserved_time.tv_nsec);
     assert_eq!(copied_metadata.mtime(), preserved_time.tv_sec);
     assert_eq!(copied_metadata.mtime_nsec(), preserved_time.tv_nsec);
+    assert!(
+        outcome
+            .metadata()
+            .skipped()
+            .contains(&musheen_ops::MetadataKind::Mode)
+    );
+    assert!(
+        !outcome
+            .metadata()
+            .verification_skipped()
+            .contains(&musheen_ops::MetadataKind::Mode)
+    );
 
     fs::set_permissions(&copied, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
@@ -188,7 +201,7 @@ fn local_copy_and_move_never_replace_an_existing_destination() {
 }
 
 #[test]
-fn local_copy_preserves_an_existing_recovery_staging_path() {
+fn local_copy_uses_a_fresh_nonce_and_preserves_existing_recovery_staging() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let destination = root.path().join("destination");
@@ -204,14 +217,12 @@ fn local_copy_preserves_an_existing_recovery_staging_path() {
     fs::write(staging_path, b"recovery bytes").unwrap();
     let mut provider = LocalStore::new();
 
-    assert!(
-        CopySession::default()
-            .execute(&mut provider, &request, &CancellationToken::new())
-            .is_err()
-    );
+    CopySession::default()
+        .execute(&mut provider, &request, &CancellationToken::new())
+        .unwrap();
 
     assert_eq!(fs::read(staging_path).unwrap(), b"recovery bytes");
-    assert!(!destination.exists());
+    assert_eq!(fs::read(destination).unwrap(), b"new bytes");
 }
 
 #[test]

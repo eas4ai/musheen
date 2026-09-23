@@ -62,5 +62,5 @@ pub use conflict::{
 pub use copy::{
     CopyCapabilities, CopyOptions, CopyOutcome, CopyProvider, CopyRequest, CopySession,
     CopyStrategy, EntryKind, EntrySnapshot, FailureKind, OperationFailure, ProviderError,
-    PublicationState, SourceMetadata, SourceState,
+    PublicationState, SourceMetadata, SourceRemovalToken, SourceState,
 };

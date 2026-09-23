@@ -3,8 +3,11 @@ use musheen_core::StorePath;
 use std::error::Error;
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const STAGING_PREFIX: &str = ".musheen-stage-v1-";
+static NEXT_STAGING_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagingPath {
@@ -12,6 +15,22 @@ pub struct StagingPath {
 }
 
 impl StagingPath {
+    #[must_use]
+    pub fn unique_nonce() -> [u8; 16] {
+        let sequence = NEXT_STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        let mut input = Vec::with_capacity(36);
+        input.extend_from_slice(&timestamp.to_ne_bytes());
+        input.extend_from_slice(&std::process::id().to_ne_bytes());
+        input.extend_from_slice(&sequence.to_ne_bytes());
+        let hash = blake3::hash(&input);
+        let mut nonce = [0_u8; 16];
+        nonce.copy_from_slice(&hash.as_bytes()[..16]);
+        nonce
+    }
+
     pub fn for_destination(
         destination: &StorePath,
         job_id: JobId,

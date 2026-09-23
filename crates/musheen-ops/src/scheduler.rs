@@ -116,16 +116,39 @@ impl Scheduler<SystemClock> {
     pub fn new(limits: &ResourceLimits) -> Self {
         Self::with_clock(limits, SystemClock::default())
     }
+
+    pub fn new_starting_after(
+        limits: &ResourceLimits,
+        last_job_id: JobId,
+    ) -> Result<Self, SchedulerError> {
+        Self::with_clock_starting_after(limits, SystemClock::default(), last_job_id)
+    }
 }
 
 impl<C: Clock> Scheduler<C> {
     #[must_use]
     pub fn with_clock(limits: &ResourceLimits, clock: C) -> Self {
+        Self::with_next_job_id(limits, clock, 1)
+    }
+
+    pub fn with_clock_starting_after(
+        limits: &ResourceLimits,
+        clock: C,
+        last_job_id: JobId,
+    ) -> Result<Self, SchedulerError> {
+        let next_job_id = last_job_id
+            .get()
+            .checked_add(1)
+            .ok_or(SchedulerError::JobIdExhausted)?;
+        Ok(Self::with_next_job_id(limits, clock, next_job_id))
+    }
+
+    fn with_next_job_id(limits: &ResourceLimits, clock: C, next_job_id: u64) -> Self {
         Self {
             limits: limits.snapshot(),
             data: Arc::new(Mutex::new(SchedulerData {
                 clock,
-                next_job_id: 1,
+                next_job_id,
                 queued: VecDeque::new(),
                 running: BTreeSet::new(),
                 jobs: BTreeMap::new(),

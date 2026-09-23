@@ -1,7 +1,10 @@
 mod support;
 
 use musheen_core::CancellationToken;
-use musheen_ops::{MoveStrategy, OperationFailure, ProviderError, SourceState, execute_move};
+use musheen_ops::{
+    MetadataKind, MetadataReport, MoveStrategy, OperationFailure, ProviderError, SourceState,
+    execute_move,
+};
 use support::{Action, RecordingProvider, destination, request};
 
 #[test]
@@ -97,6 +100,35 @@ fn ambiguous_move_outcomes_never_allow_destructive_rollback() {
 
     assert_eq!(failure.source_state(), SourceState::Unknown);
     assert!(!failure.destination_can_be_removed_for_rollback());
+}
+
+#[test]
+fn partial_source_removal_preserves_the_verified_destination() {
+    let mut provider = RecordingProvider::regular();
+    provider.fail_action = Some(Action::RemoveSource);
+    provider.fail_with = ProviderError::SourcePartiallyRemoved;
+
+    let failure = move_failure(&mut provider, "partial-removal");
+
+    assert_eq!(failure.source_state(), SourceState::PartiallyRemoved);
+    assert!(failure.destination_published());
+    assert!(!failure.destination_can_be_removed_for_rollback());
+}
+
+#[test]
+fn verified_move_reports_metadata_that_was_not_preserved() {
+    let mut provider = RecordingProvider::regular();
+    provider.metadata =
+        MetadataReport::with_skipped([MetadataKind::Ownership, MetadataKind::AccessControlList]);
+
+    let outcome = execute_move(
+        &mut provider,
+        &request("metadata-loss"),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.metadata(), &provider.metadata);
 }
 
 fn move_failure(provider: &mut RecordingProvider, name: &str) -> OperationFailure {
