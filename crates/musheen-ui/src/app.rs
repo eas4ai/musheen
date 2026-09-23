@@ -42,8 +42,8 @@ use crate::toolbar::{
     resolve_command_mode, static_shortcut_declarations,
 };
 use crate::views::{
-    AdaptiveLayout, ColumnKey, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
-    ViewPreferenceStore,
+    AdaptiveLayout, ColumnKey, ColumnTrail, GroupKey, Layout, SelectionMode, SortDirection,
+    SortKey, SortSpec, ViewPreferenceStore,
 };
 use crate::{
     ContextMenu, ContextMenuDestinationResolver, MenuEntry, MenuInvocation, MenuTarget,
@@ -60,9 +60,9 @@ use gpui_kit::{
     AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, Context, DismissEvent,
     Entity, EventEmitter, FocusHandle, Focusable, Global, ImageSource, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role,
-    SharedString, Subscription, TestSupportExt, TitlebarOptions, UniformListScrollHandle,
-    WeakEntity, Window, WindowBounds, WindowId, WindowOptions, canvas, div, fill, img, point, px,
-    size, uniform_list,
+    ScrollHandle, SharedString, Subscription, TestSupportExt, TitlebarOptions,
+    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowId, WindowOptions, canvas,
+    div, fill, img, point, px, size, uniform_list,
 };
 use musheen_core::{
     ActiveLayout, CancellationToken, CapabilityKind, CapabilityReason, CapabilityState,
@@ -282,8 +282,19 @@ struct ItemRenderSpec {
     modified_unix_seconds: Option<i64>,
     columns: Vec<(ColumnKey, u16)>,
     layout: Layout,
+    row_height: Pixels,
     selected: bool,
     focused: bool,
+}
+
+struct ColumnParentRenderSpec {
+    tab_id: TabId,
+    parent_index: usize,
+    index: usize,
+    parent_location: StorePath,
+    item: StoreItem,
+    selected: bool,
+    row_height: Pixels,
 }
 
 struct FileDragPreview {
@@ -2943,6 +2954,7 @@ impl OperationUsage for HubVolumeUsage {
 
 struct MusheenApp {
     directories: HashMap<TabId, DirectoryModel>,
+    column_trails: HashMap<TabId, ColumnTrail>,
     searches: HashMap<TabId, ActiveSearch>,
     filters: HashMap<TabId, ActiveFilter>,
     sidebars: HashMap<TabId, SidebarModel>,
@@ -3048,6 +3060,9 @@ struct MusheenApp {
     conflict_subscriptions: Vec<Subscription>,
     rubber_band: Option<RubberBandGesture>,
     directory_scrolls: HashMap<(TabId, usize), UniformListScrollHandle>,
+    column_scrolls: HashMap<(TabId, usize), UniformListScrollHandle>,
+    column_horizontal_scrolls: HashMap<(TabId, usize), ScrollHandle>,
+    column_reveal_counts: HashMap<(TabId, usize), usize>,
     startup_load_started: bool,
 }
 
@@ -3661,6 +3676,7 @@ impl MusheenApp {
             live_application_popups: Vec::new(),
             customization_keys: None,
             directories,
+            column_trails: HashMap::new(),
             searches: HashMap::new(),
             filters: HashMap::new(),
             sidebars,
@@ -3760,6 +3776,9 @@ impl MusheenApp {
             conflict_subscriptions: Vec::new(),
             rubber_band: None,
             directory_scrolls: HashMap::new(),
+            column_scrolls: HashMap::new(),
+            column_horizontal_scrolls: HashMap::new(),
+            column_reveal_counts: HashMap::new(),
             startup_load_started: false,
         };
         this.install_volume_properties_cleanup(cx);
@@ -4505,6 +4524,16 @@ impl MusheenApp {
     }
 
     fn navigate(&mut self, location: StorePath, remember: bool, cx: &mut Context<Self>) {
+        self.navigate_with_column_parent(location, remember, None, cx);
+    }
+
+    fn navigate_with_column_parent(
+        &mut self,
+        location: StorePath,
+        remember: bool,
+        parent_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         if self.browser_input_blocked() {
             return;
         }
@@ -4514,6 +4543,55 @@ impl MusheenApp {
             return;
         }
         let tab_id = self.navigation.focused_tab().id();
+        let column_navigation = if let Some(index) = parent_index {
+            if !self
+                .column_trails
+                .get_mut(&tab_id)
+                .is_some_and(|trail| trail.select_from_parent(index, &location))
+            {
+                return;
+            }
+            true
+        } else if let Some(directory) = self.directories.get(&tab_id) {
+            if directory.view().preferences().layout == Layout::Columns {
+                if let Some(current) = directory.location().cloned() {
+                    let complete = directory.view().is_complete();
+                    let descending =
+                        directory.view().visible_items().into_iter().any(|item| {
+                            item.kind() == ItemKind::Directory && item.path() == &location
+                        });
+                    let items = if descending {
+                        self.directories
+                            .get_mut(&tab_id)
+                            .expect("the column directory exists")
+                            .view_mut()
+                            .take_visible_items()
+                    } else {
+                        Vec::new()
+                    };
+                    self.column_trails
+                        .entry(tab_id)
+                        .or_default()
+                        .navigate(&current, &location, items, complete)
+                } else {
+                    false
+                }
+            } else {
+                self.column_trails.remove(&tab_id);
+                false
+            }
+        } else {
+            false
+        };
+        let preserve_columns = column_navigation
+            || (!remember
+                && self.directories.get(&tab_id).is_some_and(|directory| {
+                    directory.view().preferences().layout == Layout::Columns
+                }));
+        if preserve_columns {
+            self.column_reveal_counts
+                .retain(|(tab, _), _| *tab != tab_id);
+        }
         self.cancel_search(tab_id);
         self.info_panes.entry(tab_id).or_default().clear();
         self.filters.remove(&tab_id);
@@ -4523,11 +4601,14 @@ impl MusheenApp {
         }
         self.sync_terminal_location(&location, cx);
         self.remember_folder_location(&location);
-        let preferences = self.preferences_with_catalog(
+        let mut preferences = self.preferences_with_catalog(
             &location,
             self.navigation.preferences_for(&location).clone(),
             &self.catalog_binding.snapshot(),
         );
+        if preserve_columns {
+            preferences.layout = Layout::Columns;
+        }
         *self.focused_directory_mut().view_mut().preferences_mut() = preferences.clone();
         self.navigation
             .focused_tab_mut()
@@ -5165,6 +5246,10 @@ impl MusheenApp {
     }
 
     fn set_layout(&mut self, layout: Layout) -> bool {
+        if layout != Layout::Columns {
+            self.column_trails
+                .remove(&self.navigation.focused_tab().id());
+        }
         self.focused_directory_mut()
             .view_mut()
             .preferences_mut()
@@ -6081,14 +6166,32 @@ impl MusheenApp {
         location: &StorePath,
         selection: &[CommandTargetRef],
     ) -> CommandContext {
-        let item_count = self
-            .directories
-            .get(&tab_id)
-            .map_or(0, |directory| directory.view().items().len());
+        let column_parent = self.column_trails.get(&tab_id).and_then(|trail| {
+            trail
+                .parents()
+                .iter()
+                .find(|pane| pane.location() == location)
+        });
+        let item_count = column_parent.map_or_else(
+            || {
+                self.directories
+                    .get(&tab_id)
+                    .map_or(0, |directory| directory.view().items().len())
+            },
+            |pane| pane.items().len(),
+        );
         let selected_item = selection.first().and_then(|target| {
             self.directories
                 .get(&tab_id)
                 .and_then(|directory| directory.view().item(target.id()))
+                .filter(|item| item.path() == target.path())
+                .or_else(|| {
+                    column_parent.and_then(|pane| {
+                        pane.items()
+                            .iter()
+                            .find(|item| item.id() == target.id() && item.path() == target.path())
+                    })
+                })
         });
         let executable_state = selected_item.and_then(|item| {
             (item.kind() == ItemKind::RegularFile)
@@ -9389,6 +9492,19 @@ impl MusheenApp {
     }
 
     fn finish_navigation_change(&mut self, cx: &mut Context<Self>) {
+        let open_tabs = self
+            .navigation
+            .panes()
+            .iter()
+            .flat_map(|pane| pane.tabs().iter().map(|tab| tab.id()))
+            .collect::<std::collections::HashSet<_>>();
+        self.column_trails.retain(|tab, _| open_tabs.contains(tab));
+        self.column_scrolls
+            .retain(|(tab, _), _| open_tabs.contains(tab));
+        self.column_horizontal_scrolls
+            .retain(|(tab, _), _| open_tabs.contains(tab));
+        self.column_reveal_counts
+            .retain(|(tab, _), _| open_tabs.contains(tab));
         self.schedule_session_save(cx);
         self.load_focused_tab(cx);
     }
@@ -9425,6 +9541,14 @@ impl MusheenApp {
             if let Some(directory) = self.directories.remove(&old_id) {
                 self.directories.insert(new_id, directory);
             }
+            if let Some(trail) = self.column_trails.remove(&old_id) {
+                self.column_trails.insert(new_id, trail);
+            }
+            self.column_scrolls.retain(|(tab, _), _| *tab != old_id);
+            self.column_horizontal_scrolls
+                .retain(|(tab, _), _| *tab != old_id);
+            self.column_reveal_counts
+                .retain(|(tab, _), _| *tab != old_id);
             self.schedule_session_save(cx);
             self.load_focused_tab(cx);
         }
@@ -10698,12 +10822,18 @@ impl MusheenApp {
             .navigation
             .tab(spec.tab_id)
             .is_some_and(|tab| is_home_location(tab.location()));
+        let columns = self
+            .directories
+            .get(&spec.tab_id)
+            .is_some_and(|directory| directory.view().preferences().layout == Layout::Columns);
         let body = if home {
             self.render_home_surface(spec.tab_id, cx)
         } else if trash {
             self.render_trash_surface(spec.tab_id, cx)
         } else if self.searches.contains_key(&spec.tab_id) {
             self.render_search_results(spec.tab_id, spec.pane_index, cx)
+        } else if columns {
+            self.render_items(spec.tab_id, spec.pane_index, window, cx)
         } else {
             match state {
                 DirectoryState::Loading => self.render_loading(colors.skeleton),
@@ -11874,61 +12004,89 @@ impl MusheenApp {
         } else {
             base_columns
         };
-        let list = match layout {
-            Layout::Details | Layout::List | Layout::Columns => {
-                let item_ids = Arc::clone(&visible_item_ids);
-                uniform_list(
-                    SharedString::from(format!("directory-items-list-{pane_index}")),
-                    item_count,
-                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                        let items = range
-                            .filter_map(|index| {
-                                let id = item_ids.get(index)?;
-                                this.item_render_spec(tab_id, pane_index, index, id, layout)
-                            })
-                            .collect::<Vec<_>>();
-                        items
-                            .into_iter()
-                            .map(|item| div().h(list_row_height).child(this.render_item(item, cx)))
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(&scroll)
-                .w_full()
-                .flex_grow(1.0)
-                .min_h(px(0.))
-                .p_4()
-                .into_any_element()
+        let column_state = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| directory.state().clone())
+            .unwrap_or(DirectoryState::Loading);
+        let list = if layout == Layout::Columns && column_state != DirectoryState::Ready {
+            match column_state {
+                DirectoryState::Loading => self.render_loading(cx.theme().colors.skeleton),
+                DirectoryState::Empty => self.render_empty(cx.theme().colors.muted_foreground),
+                DirectoryState::Error(message) => self.render_error(message, cx),
+                DirectoryState::Ready => unreachable!(),
             }
-            Layout::Cards | Layout::Grid | Layout::Adaptive => {
-                let item_ids = Arc::clone(&visible_item_ids);
-                let columns = grid_columns;
-                uniform_list(
-                    SharedString::from(format!("directory-items-grid-{pane_index}")),
-                    grid_row_count(item_count, columns),
-                    cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
-                        rows.map(|row| {
-                            let items = grid_item_range(row, item_count, columns)
+        } else {
+            match layout {
+                Layout::Details | Layout::List | Layout::Columns => {
+                    let item_ids = Arc::clone(&visible_item_ids);
+                    uniform_list(
+                        SharedString::from(format!("directory-items-list-{pane_index}")),
+                        item_count,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            let items = range
                                 .filter_map(|index| {
                                     let id = item_ids.get(index)?;
-                                    this.item_render_spec(tab_id, pane_index, index, id, layout)
+                                    this.item_render_spec(
+                                        tab_id,
+                                        pane_index,
+                                        index,
+                                        id,
+                                        layout,
+                                        list_row_height,
+                                    )
                                 })
                                 .collect::<Vec<_>>();
-                            div()
-                                .h(px(116.))
-                                .flex()
-                                .gap_2()
-                                .children(items.into_iter().map(|item| this.render_item(item, cx)))
-                        })
-                        .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(&scroll)
-                .w_full()
-                .flex_grow(1.0)
-                .min_h(px(0.))
-                .p_4()
-                .into_any_element()
+                            items
+                                .into_iter()
+                                .map(|item| {
+                                    div().h(list_row_height).child(this.render_item(item, cx))
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&scroll)
+                    .w_full()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .p_4()
+                    .into_any_element()
+                }
+                Layout::Cards | Layout::Grid | Layout::Adaptive => {
+                    let item_ids = Arc::clone(&visible_item_ids);
+                    let columns = grid_columns;
+                    uniform_list(
+                        SharedString::from(format!("directory-items-grid-{pane_index}")),
+                        grid_row_count(item_count, columns),
+                        cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
+                            rows.map(|row| {
+                                let items = grid_item_range(row, item_count, columns)
+                                    .filter_map(|index| {
+                                        let id = item_ids.get(index)?;
+                                        this.item_render_spec(
+                                            tab_id,
+                                            pane_index,
+                                            index,
+                                            id,
+                                            layout,
+                                            list_row_height,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                div().h(px(116.)).flex().gap_2().children(
+                                    items.into_iter().map(|item| this.render_item(item, cx)),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&scroll)
+                    .w_full()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .p_4()
+                    .into_any_element()
+                }
             }
         };
 
@@ -11940,8 +12098,12 @@ impl MusheenApp {
         let view = cx.entity();
         let selection_color = cx.theme().colors.primary;
         let rubber_band_scroll = scroll;
-        let chrome_height = if has_filter_summary { 32.0 } else { 0.0 }
-            + if layout == Layout::Details { 32.0 } else { 0.0 };
+        let chrome_height = if layout == Layout::Columns {
+            36.0
+        } else {
+            (if has_filter_summary { 32.0 } else { 0.0 })
+                + (if layout == Layout::Details { 32.0 } else { 0.0 })
+        };
         let top_inset = 16.0 + chrome_height;
         let scrollbar_width = cx
             .try_global::<NativeTheme>()
@@ -12021,6 +12183,21 @@ impl MusheenApp {
         )
         .absolute()
         .inset_0();
+        let (content, selection_overlay) = if layout == Layout::Columns {
+            (
+                self.render_column_panes(
+                    tab_id,
+                    pane_index,
+                    list,
+                    rubber_band.into_any_element(),
+                    list_row_height,
+                    cx,
+                ),
+                None,
+            )
+        } else {
+            (list, Some(rubber_band.into_any_element()))
+        };
         div()
             .id(items_id)
             .test_support()
@@ -12048,11 +12225,276 @@ impl MusheenApp {
             .when(layout == Layout::Details, |items| {
                 items.child(self.render_details_header(tab_id, cx))
             })
-            .child(list)
-            .child(rubber_band)
+            .child(content)
+            .when_some(selection_overlay, |items, overlay| items.child(overlay))
             .on_scroll_wheel(cx.listener(move |this, _, _, cx| {
                 this.start_next_directory_page(tab_id, cx);
             }))
+            .into_any_element()
+    }
+
+    fn render_column_panes(
+        &mut self,
+        tab_id: TabId,
+        pane_index: usize,
+        current: AnyElement,
+        selection_overlay: AnyElement,
+        row_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let parents = self
+            .column_trails
+            .get(&tab_id)
+            .map(|trail| trail.parents().to_vec())
+            .unwrap_or_default();
+        let pane_key = (tab_id, pane_index);
+        let scroll = self
+            .column_horizontal_scrolls
+            .entry(pane_key)
+            .or_default()
+            .clone();
+        let column_count = parents.len() + 1;
+        if self.column_reveal_counts.get(&pane_key) != Some(&column_count) {
+            scroll.scroll_to_item(column_count - 1);
+            self.column_reveal_counts.insert(pane_key, column_count);
+        }
+        let border = cx.theme().colors.border;
+        let columns = parents
+            .into_iter()
+            .enumerate()
+            .map(|(parent_index, parent)| {
+                let location = parent.location().clone();
+                let header_location = location.clone();
+                let more_location = location.clone();
+                let items = Arc::clone(parent.items());
+                let item_count = items.len();
+                let active_child = parent.active_child().clone();
+                let scroll = self
+                    .column_scrolls
+                    .entry((tab_id, parent_index))
+                    .or_default()
+                    .clone();
+                let list = uniform_list(
+                    SharedString::from(format!("column-parent-list-{pane_index}-{parent_index}")),
+                    item_count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .filter_map(|index| {
+                                let item = items.get(index)?.clone();
+                                Some(div().h(row_height).child(this.render_column_parent_item(
+                                    ColumnParentRenderSpec {
+                                        tab_id,
+                                        parent_index,
+                                        index,
+                                        parent_location: location.clone(),
+                                        selected: item.path() == &active_child,
+                                        item,
+                                        row_height,
+                                    },
+                                    cx,
+                                )))
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&scroll)
+                .w_full()
+                .flex_grow(1.0)
+                .min_h(px(0.));
+                div()
+                    .id(SharedString::from(format!(
+                        "column-parent-{pane_index}-{parent_index}"
+                    )))
+                    .test_support()
+                    .role(Role::Group)
+                    .aria_label(DisplayPath::from_store_path(&header_location).as_str())
+                    .w(px(280.))
+                    .min_w(px(280.))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .border_r_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "column-parent-header-{pane_index}-{parent_index}"
+                            )))
+                            .test_support()
+                            .h(px(36.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .text_sm()
+                            .child(
+                                DisplayPath::from_store_path(&header_location)
+                                    .as_str()
+                                    .to_owned(),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.navigation.focused_tab().id() != tab_id {
+                                    this.activate_tab(tab_id, cx);
+                                }
+                                this.navigate(header_location.clone(), true, cx);
+                            })),
+                    )
+                    .child(list)
+                    .when(!parent.is_complete(), |column| {
+                        column.child(
+                            Button::new(SharedString::from(format!(
+                                "column-parent-more-{pane_index}-{parent_index}"
+                            )))
+                            .label("More items…")
+                            .small()
+                            .tooltip("Open this folder to load remaining items")
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.navigate(more_location.clone(), true, cx);
+                                },
+                            )),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id(SharedString::from(format!("column-browser-{pane_index}")))
+            .test_support()
+            .size_full()
+            .min_h(px(0.))
+            .flex()
+            .overflow_x_scroll()
+            .track_scroll(&scroll)
+            .children(columns)
+            .child(
+                div()
+                    .id(SharedString::from(format!("column-current-{pane_index}")))
+                    .test_support()
+                    .w(px(320.))
+                    .min_w(px(320.))
+                    .h_full()
+                    .flex_none()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "column-current-header-{pane_index}"
+                            )))
+                            .test_support()
+                            .h(px(36.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .text_sm()
+                            .child(
+                                self.directories
+                                    .get(&tab_id)
+                                    .and_then(DirectoryModel::location)
+                                    .map(|path| {
+                                        DisplayPath::from_store_path(path).as_str().to_owned()
+                                    })
+                                    .unwrap_or_default(),
+                            ),
+                    )
+                    .child(current)
+                    .child(selection_overlay),
+            )
+            .into_any_element()
+    }
+
+    fn render_column_parent_item(
+        &mut self,
+        spec: ColumnParentRenderSpec,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ColumnParentRenderSpec {
+            tab_id,
+            parent_index,
+            index,
+            parent_location,
+            item,
+            selected,
+            row_height,
+        } = spec;
+        let kind = item.kind();
+        let path = item.path().clone();
+        let name = item.display_name().as_str().to_owned();
+        let target = CommandTargetRef::new(item.id().clone(), path.clone()).ok();
+        let context_target = target.clone();
+        let context_location = parent_location.clone();
+        let colors = cx.theme().colors;
+        let icon = Icon::new(if kind == ItemKind::Directory {
+            IconName::Folder
+        } else {
+            IconName::File
+        })
+        .small();
+        div()
+            .id(SharedString::from(format!(
+                "column-parent-item-{tab_id:?}-{parent_index}-{index}"
+            )))
+            .test_support()
+            .role(Role::ListItem)
+            .aria_label(name.clone())
+            .aria_selected(selected)
+            .h(row_height)
+            .w_full()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(selected, |row| row.bg(colors.list_active))
+            .hover(|style| style.bg(colors.list_hover))
+            .child(icon)
+            .child(div().flex_grow(1.0).overflow_hidden().child(name))
+            .when(kind == ItemKind::Directory, |row| {
+                row.child(Icon::new(IconName::ArrowRight).small())
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if event.modifiers().modified() {
+                    return;
+                }
+                if kind == ItemKind::Directory {
+                    if this.navigation.focused_tab().id() != tab_id {
+                        this.activate_tab(tab_id, cx);
+                    }
+                    this.navigate_with_column_parent(path.clone(), true, Some(parent_index), cx);
+                } else if event.click_count() == 2
+                    && let Some(target) = &target
+                {
+                    this.dispatch_local_target_command(
+                        &CommandAction::Open,
+                        &CommandParameters::targets(vec![target.clone()]),
+                        Some(tab_id),
+                        cx,
+                    );
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    if !this.context_dialog_windows.is_empty() {
+                        return;
+                    }
+                    let Some(target) = &context_target else {
+                        return;
+                    };
+                    let selection = vec![target.clone()];
+                    this.preflight_custom_actions(&selection, context_location.clone(), cx);
+                    this.refresh_application_snapshot(&selection, cx);
+                    this.pending_context_menu = Some(this.compose_context_menu_at(
+                        tab_id,
+                        MenuTarget::Item,
+                        context_location.clone(),
+                        selection,
+                    ));
+                }),
+            )
             .into_any_element()
     }
 
@@ -12197,6 +12639,7 @@ impl MusheenApp {
         index: usize,
         id: &ItemId,
         layout: Layout,
+        row_height: Pixels,
     ) -> Option<ItemRenderSpec> {
         let view = self.directories.get(&tab_id)?.view();
         let item = view.item(id)?;
@@ -12212,6 +12655,7 @@ impl MusheenApp {
             modified_unix_seconds: item.modified_unix_seconds(),
             columns: view.preferences().columns.visible_columns_with_widths(),
             layout,
+            row_height,
             selected: view.selected_ids().contains(item.id()),
             focused: view
                 .focused_item_id()
@@ -12222,17 +12666,28 @@ impl MusheenApp {
     fn render_item(&mut self, spec: ItemRenderSpec, cx: &mut Context<Self>) -> AnyElement {
         let identity = content_identity_for_item(spec.kind, &spec.path);
         let icon_name = freedesktop_icon_name(&identity);
+        let compact_icon = matches!(
+            spec.layout,
+            Layout::List | Layout::Columns | Layout::Details
+        );
         let icon = self.content_icon(icon_name).map_or_else(
             || {
-                Icon::new(if spec.kind == ItemKind::Directory {
+                let icon = Icon::new(if spec.kind == ItemKind::Directory {
                     IconName::Folder
                 } else {
                     IconName::File
-                })
-                .large()
-                .into_any_element()
+                });
+                if compact_icon {
+                    icon.small().into_any_element()
+                } else {
+                    icon.large().into_any_element()
+                }
             },
-            |source| img(source).size(px(42.)).into_any_element(),
+            |source| {
+                img(source)
+                    .size(px(if compact_icon { 24. } else { 42. }))
+                    .into_any_element()
+            },
         );
         let colors = cx.theme().colors;
         let focused_unselected = spec.focused && !spec.selected;
@@ -12284,7 +12739,7 @@ impl MusheenApp {
                 .role(Role::ListItem)
                 .aria_label(spec.name.clone())
                 .aria_selected(spec.selected)
-                .h(px(34.))
+                .h(spec.row_height)
                 .w_full()
                 .flex()
                 .items_center()
@@ -12306,7 +12761,30 @@ impl MusheenApp {
                         .text_color(colors.muted_foreground)
                         .child(spec.size.map_or_else(String::new, format_size)),
                 ),
-            Layout::Details | Layout::Columns => {
+            Layout::Columns => div()
+                .id(item_id)
+                .test_support()
+                .role(Role::ListItem)
+                .aria_label(spec.name.clone())
+                .aria_selected(spec.selected)
+                .h(spec.row_height)
+                .w_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .when(spec.selected, |item| {
+                    item.bg(colors.list_active)
+                        .border_1()
+                        .border_color(colors.list_active_border)
+                })
+                .hover(|style| style.bg(colors.list_hover))
+                .child(div().w(px(28.)).flex().justify_center().child(icon))
+                .child(div().flex_grow(1.0).overflow_hidden().child(spec.name))
+                .when(spec.kind == ItemKind::Directory, |item| {
+                    item.child(Icon::new(IconName::ArrowRight).small())
+                }),
+            Layout::Details => {
                 let mut icon = Some(icon);
                 let cells =
                     spec.columns
@@ -12351,7 +12829,7 @@ impl MusheenApp {
                     .role(Role::ListItem)
                     .aria_label(spec.name)
                     .aria_selected(spec.selected)
-                    .h(px(34.))
+                    .h(spec.row_height)
                     .w_full()
                     .flex()
                     .items_center()
@@ -12386,7 +12864,9 @@ impl MusheenApp {
             };
             this.select_item_with_mode(tab_id, stable_id.clone(), mode, cx);
             this.focus_directory_item(tab_id, Some(focused_id.clone()), cx);
-            if event.click_count() == 2 && !modifiers.modified() {
+            if !modifiers.modified()
+                && (event.click_count() == 2 || (spec.layout == Layout::Columns && is_drop_target))
+            {
                 this.activate_directory_item(tab_id, stable_id.clone(), cx);
             }
         }))
@@ -14161,6 +14641,105 @@ mod tests {
 
     fn selected_item_count(app: &Entity<MusheenApp>, cx: &TestAppContext) -> usize {
         cx.read(|cx| app.read(cx).focused_directory().view().selected_ids().len())
+    }
+
+    #[gpui_kit::test]
+    async fn column_view_keeps_parent_levels_and_opens_siblings(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        let leaf = first.join("leaf");
+        filesystem::create_dir(&first).unwrap();
+        filesystem::create_dir(&second).unwrap();
+        filesystem::create_dir(&leaf).unwrap();
+        filesystem::write(leaf.join("item.txt"), b"item").unwrap();
+        filesystem::write(second.join("other.txt"), b"other").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::Columns, cx).await;
+        let tab_id = cx.read(|cx| app.read(cx).navigation.focused_tab().id());
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("column-current-0").visible());
+            window.click("directory-item-0-0", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().location() == Some(&StorePath::from_unix_path(&first))
+                && app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, _| {
+            let parent = &state.column_trails[&tab_id].parents()[0];
+            let folder = &parent.items()[0];
+            let target = CommandTargetRef::new(folder.id().clone(), folder.path().clone()).unwrap();
+            let context =
+                state.context_for_menu(tab_id, MenuTarget::Item, parent.location(), &[target]);
+            assert_eq!(context.target, CommandTarget::Directory);
+        });
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("column-parent-0-0").visible());
+            window.click("directory-item-0-0", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().location() == Some(&StorePath::from_unix_path(&leaf))
+                && app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, _| {
+            state
+                .column_horizontal_scrolls
+                .get(&(tab_id, 0))
+                .expect("column scroll handle exists")
+                .set_offset(point(px(0.), px(0.)));
+        });
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("column-parent-0-1").visible());
+            let sibling_id = format!("column-parent-item-{tab_id:?}-0-1");
+            window.click(SharedString::from(sibling_id), cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().location() == Some(&StorePath::from_unix_path(&second))
+                && app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("column-parent-0-0").visible());
+            assert!(window.try_find("column-parent-0-1").is_none());
+            assert_eq!(
+                app.read(cx).focused_directory().view().preferences().layout,
+                Layout::Columns
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn column_view_keeps_parent_visible_for_an_empty_child(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let empty = temporary.path().join("empty");
+        filesystem::create_dir(&empty).unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::Columns, cx).await;
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("directory-item-0-0", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().location() == Some(&StorePath::from_unix_path(&empty))
+                && app.read(cx).focused_directory().state() == &DirectoryState::Empty
+        })
+        .await;
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("column-parent-0-0").visible());
+            assert!(window.find("directory-empty").visible());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

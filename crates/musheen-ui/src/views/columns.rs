@@ -1,5 +1,112 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
+
+use musheen_core::{ItemKind, StoreItem, StorePath};
+
+/// Retain only the levels that can fit beside the active directory. Older
+/// levels remain reachable through Back and the breadcrumb trail.
+const MAX_PARENT_LEVELS: usize = 3;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ColumnPane {
+    location: StorePath,
+    items: Arc<[StoreItem]>,
+    active_child: StorePath,
+    complete: bool,
+}
+
+impl ColumnPane {
+    #[must_use]
+    pub(crate) fn location(&self) -> &StorePath {
+        &self.location
+    }
+
+    #[must_use]
+    pub(crate) fn items(&self) -> &Arc<[StoreItem]> {
+        &self.items
+    }
+
+    #[must_use]
+    pub(crate) fn active_child(&self) -> &StorePath {
+        &self.active_child
+    }
+
+    #[must_use]
+    pub(crate) const fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ColumnTrail {
+    parents: Vec<ColumnPane>,
+}
+
+impl ColumnTrail {
+    #[must_use]
+    pub(crate) fn parents(&self) -> &[ColumnPane] {
+        &self.parents
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.parents.clear();
+    }
+
+    /// Keep the current directory only when the destination is one of its
+    /// folders. Back navigation reuses the older levels without duplicating it.
+    pub(crate) fn navigate(
+        &mut self,
+        current: &StorePath,
+        next: &StorePath,
+        visible_items: impl IntoIterator<Item = StoreItem>,
+        complete: bool,
+    ) -> bool {
+        if current == next {
+            return true;
+        }
+        if let Some(index) = self.parents.iter().position(|pane| pane.location() == next) {
+            self.parents.truncate(index);
+            return true;
+        }
+        let items = visible_items.into_iter().collect::<Vec<_>>();
+        if !items
+            .iter()
+            .any(|item| item.kind() == ItemKind::Directory && item.path() == next)
+        {
+            self.clear();
+            return false;
+        }
+        self.parents.push(ColumnPane {
+            location: current.clone(),
+            items: items.into(),
+            active_child: next.clone(),
+            complete,
+        });
+        if self.parents.len() > MAX_PARENT_LEVELS {
+            self.parents.remove(0);
+        }
+        true
+    }
+
+    /// A click in an older column selects a sibling without treating the
+    /// previously active child as the source of the next navigation.
+    pub(crate) fn select_from_parent(&mut self, index: usize, next: &StorePath) -> bool {
+        let Some(pane) = self.parents.get(index) else {
+            return false;
+        };
+        if !pane
+            .items
+            .iter()
+            .any(|item| item.kind() == ItemKind::Directory && item.path() == next)
+        {
+            return false;
+        }
+        self.parents.truncate(index + 1);
+        self.parents[index].active_child = next.clone();
+        true
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum ColumnKey {
@@ -173,3 +280,110 @@ impl fmt::Display for ColumnLayoutError {
 impl std::error::Error for ColumnLayoutError {}
 
 pub struct ColumnsPresentation;
+
+#[cfg(test)]
+mod tests {
+    use super::ColumnTrail;
+    use crate::views::DirectoryViewModel;
+    use musheen_core::{DisplayPath, ItemId, ItemKind, ProviderId, StoreItem, StorePath};
+
+    fn directory(index: u64, path: &str) -> StoreItem {
+        let provider = ProviderId::new("local").unwrap();
+        let name = path.rsplit('/').next().unwrap();
+        StoreItem::new(
+            ItemId::new(provider, index.to_be_bytes()).unwrap(),
+            StorePath::from_unix_path(path),
+            DisplayPath::new(name),
+            ItemKind::Directory,
+            None,
+        )
+    }
+
+    #[test]
+    fn descending_and_backtracking_preserves_only_the_ancestor_chain() {
+        let root = StorePath::from_unix_path("/root");
+        let first = StorePath::from_unix_path("/root/first");
+        let leaf = StorePath::from_unix_path("/root/first/leaf");
+        let mut trail = ColumnTrail::default();
+
+        trail.navigate(&root, &first, [directory(1, "/root/first")], true);
+        trail.navigate(&first, &leaf, [directory(2, "/root/first/leaf")], true);
+        assert_eq!(trail.parents().len(), 2);
+        assert_eq!(trail.parents()[0].active_child(), &first);
+        assert_eq!(trail.parents()[1].active_child(), &leaf);
+
+        trail.navigate(&leaf, &root, [], true);
+        assert!(trail.parents().is_empty());
+    }
+
+    #[test]
+    fn sibling_selection_trims_younger_columns_and_rejects_unknown_targets() {
+        let root = StorePath::from_unix_path("/root");
+        let first = StorePath::from_unix_path("/root/first");
+        let second = StorePath::from_unix_path("/root/second");
+        let leaf = StorePath::from_unix_path("/root/first/leaf");
+        let mut trail = ColumnTrail::default();
+        trail.navigate(
+            &root,
+            &first,
+            [directory(1, "/root/first"), directory(2, "/root/second")],
+            false,
+        );
+        trail.navigate(&first, &leaf, [directory(3, "/root/first/leaf")], true);
+
+        assert!(!trail.select_from_parent(0, &StorePath::from_unix_path("/unknown")));
+        assert!(trail.select_from_parent(0, &second));
+        assert_eq!(trail.parents().len(), 1);
+        assert_eq!(trail.parents()[0].active_child(), &second);
+        assert!(!trail.parents()[0].is_complete());
+    }
+
+    #[test]
+    fn unrelated_navigation_clears_cached_levels_and_depth_is_bounded() {
+        let mut trail = ColumnTrail::default();
+        let mut current_path = "/root".to_owned();
+        for index in 0..8 {
+            let next_path = format!("{current_path}/{index}");
+            let next = StorePath::from_unix_path(&next_path);
+            trail.navigate(
+                &StorePath::from_unix_path(&current_path),
+                &next,
+                [directory(index + 1, &next_path)],
+                true,
+            );
+            current_path = next_path;
+        }
+        assert_eq!(trail.parents().len(), 3);
+        trail.navigate(
+            &StorePath::from_unix_path(&current_path),
+            &StorePath::from_unix_path("/elsewhere"),
+            [],
+            true,
+        );
+        assert!(trail.parents().is_empty());
+    }
+
+    #[test]
+    fn moving_visible_items_preserves_sort_order_without_retaining_hidden_rows() {
+        let mut view = DirectoryViewModel::new(10);
+        let hidden = StoreItem::new(
+            ItemId::new(ProviderId::new("local").unwrap(), 9_u64.to_be_bytes()).unwrap(),
+            StorePath::from_unix_path("/root/.hidden"),
+            DisplayPath::new(".hidden"),
+            ItemKind::RegularFile,
+            None,
+        );
+        view.extend([
+            directory(2, "/root/zeta"),
+            hidden,
+            directory(1, "/root/alpha"),
+        ]);
+        let names = view
+            .take_visible_items()
+            .into_iter()
+            .map(|item| item.display_name().as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "zeta"]);
+        assert!(view.items().is_empty());
+    }
+}

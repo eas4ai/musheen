@@ -109,9 +109,13 @@ Mechanism: drag-and-drop tests over writable, read-only, and non-file targets.
 [BROWSE-013]
 Status: Draft
 The content area offers details, list, cards, grid, columns, and adaptive
-layouts over the same directory model.
-Falsifier: changing layout changes the represented directory contents.
-Mechanism: model-equivalence test that renders one fixture in every layout.
+layouts over the same directory model. Columns shows folder levels side by
+side: selecting a folder opens the next column, selecting a sibling replaces
+its descendants, and the active column uses the same item actions as other
+layouts. Older levels remain reachable through breadcrumbs and Back.
+Falsifier: changing layout changes directory contents, or column navigation
+loses the parent path or keeps a stale descendant after sibling selection.
+Mechanism: model-equivalence and nested/sibling column-navigation tests.
 
 [BROWSE-014]
 Status: Draft

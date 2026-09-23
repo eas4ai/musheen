@@ -8,6 +8,7 @@ mod selection;
 mod sort;
 
 pub use adaptive::AdaptiveLayout;
+pub(crate) use columns::ColumnTrail;
 pub use columns::{ColumnKey, ColumnLayout, ColumnLayoutError, ColumnsPresentation};
 pub use details::DetailsPresentation;
 pub use grid::GridPresentation;
@@ -303,6 +304,24 @@ impl DirectoryViewModel {
             .iter()
             .map(|index| &self.items[*index])
             .collect()
+    }
+
+    /// Move the ordered visible items into a column pane before this view is
+    /// reset for child navigation. Large directories must not clone every path
+    /// and metadata record on the UI thread.
+    pub(crate) fn take_visible_items(&mut self) -> Vec<StoreItem> {
+        self.ensure_visible_order();
+        let order = self.visible_order.get_mut().take().unwrap_or_default();
+        let mut items = std::mem::take(&mut self.items)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let visible = order
+            .into_iter()
+            .filter_map(|index| items.get_mut(index).and_then(Option::take))
+            .collect();
+        self.reset_items();
+        visible
     }
 
     fn ensure_visible_order(&self) {
