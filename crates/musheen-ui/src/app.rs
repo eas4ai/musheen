@@ -14162,7 +14162,10 @@ fn format_size(bytes: u64) -> String {
     const KIB: u64 = 1_024;
     const MIB: u64 = KIB * 1_024;
     const GIB: u64 = MIB * 1_024;
-    if bytes >= GIB {
+    const TIB: u64 = GIB * 1_024;
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
         format!("{:.1} GiB", bytes as f64 / GIB as f64)
     } else if bytes >= MIB {
         format!("{:.1} MiB", bytes as f64 / MIB as f64)
@@ -14304,6 +14307,13 @@ mod tests {
     };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[test]
+    fn large_sizes_use_tib_instead_of_four_digit_gib_values() {
+        let tib = 1_024_u64.pow(4);
+        assert_eq!(format_size(tib), "1.0 TiB");
+        assert_eq!(format_size(tib + tib / 2), "1.5 TiB");
+    }
 
     fn local_command_target(path: &Path) -> CommandTargetRef {
         let path = StorePath::from_unix_path(path);

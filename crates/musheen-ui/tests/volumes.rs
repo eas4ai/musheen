@@ -75,6 +75,42 @@ fn build_service(mounts: Arc<Mounts>) -> VolumeService {
     )
 }
 
+struct NamedMount<'a> {
+    id: &'a str,
+    label: &'a str,
+    device: &'a str,
+    mount: &'a str,
+}
+
+fn sidebar_with_named_mounts(devices: &[NamedMount<'_>]) -> SidebarModel {
+    let mounts = Arc::new(Mounts::default());
+    *mounts.records.lock().unwrap() = devices
+        .iter()
+        .map(|item| MountRecord::new(item.device, item.mount, "ext4", false))
+        .collect();
+    let descriptors = devices.iter().map(|item| {
+        DeviceDescriptor::new(
+            VolumeId::new(item.id).unwrap(),
+            format!("/org/freedesktop/UDisks2/block_devices/{}", item.id),
+        )
+        .with_label(item.label)
+        .with_device(item.device)
+        .with_mount_points([PathBuf::from(item.mount)])
+    });
+    let mut service = VolumeService::new(
+        Arc::new(Backend(Mutex::new(BackendSnapshot::new(
+            "owner",
+            descriptors,
+        )))),
+        mounts,
+        Arc::new(NoOperationUsage),
+    );
+    service.refresh().unwrap();
+    let mut sidebar = SidebarModel::new(PinStore::default());
+    sidebar.sync_volumes(service.model());
+    sidebar
+}
+
 #[test]
 fn sidebar_projection_uses_live_mount_location_capacity_and_read_only_state() {
     let mounts = Arc::new(Mounts::default());
@@ -216,6 +252,90 @@ fn sidebar_shows_internal_data_volume_mounted_in_user_storage() {
         storage.items()[0].navigation_location().as_unix_path(),
         Some(data_mount.as_path())
     );
+}
+
+#[test]
+fn sidebar_distinguishes_volumes_with_the_same_device_label() {
+    let sidebar = sidebar_with_named_mounts(&[
+        NamedMount {
+            id: "projects",
+            label: "data",
+            device: "/dev/nvme4n1p2",
+            mount: "/home/shawn/projects",
+        },
+        NamedMount {
+            id: "workspace2",
+            label: "data",
+            device: "/dev/nvme3n1p1",
+            mount: "/home/shawn/workspace2",
+        },
+        NamedMount {
+            id: "data",
+            label: "data",
+            device: "/dev/nvme2n1p1",
+            mount: "/run/media/shawn/data",
+        },
+        NamedMount {
+            id: "photos",
+            label: "projects",
+            device: "/dev/sdb1",
+            mount: "/media/photos",
+        },
+    ]);
+    let storage = sidebar
+        .sections()
+        .into_iter()
+        .find(|section| section.kind() == SidebarSectionKind::Mounts)
+        .unwrap();
+    let labels_by_mount = storage
+        .items()
+        .iter()
+        .map(|entry| {
+            (
+                entry.navigation_location().as_unix_path().unwrap(),
+                entry.label(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        labels_by_mount[Path::new("/home/shawn/projects")],
+        "/home/shawn/projects"
+    );
+    assert_eq!(
+        labels_by_mount[Path::new("/home/shawn/workspace2")],
+        "workspace2"
+    );
+    assert_eq!(labels_by_mount[Path::new("/run/media/shawn/data")], "data");
+    assert_eq!(labels_by_mount[Path::new("/media/photos")], "projects");
+}
+
+#[test]
+fn sidebar_uses_full_mount_paths_when_duplicate_labels_share_a_folder_name() {
+    let sidebar = sidebar_with_named_mounts(&[
+        NamedMount {
+            id: "first",
+            label: "data",
+            device: "/dev/sdb1",
+            mount: "/media/alice/data",
+        },
+        NamedMount {
+            id: "second",
+            label: "data",
+            device: "/dev/sdc1",
+            mount: "/media/bob/data",
+        },
+    ]);
+    let storage = sidebar
+        .sections()
+        .into_iter()
+        .find(|section| section.kind() == SidebarSectionKind::Mounts)
+        .unwrap();
+    let labels = storage
+        .items()
+        .iter()
+        .map(|entry| entry.label())
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["/media/alice/data", "/media/bob/data"]);
 }
 
 #[test]

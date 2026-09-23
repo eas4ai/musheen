@@ -3,6 +3,7 @@ use musheen_desktop::{
     Capacity, PinCatalog, PinState, Volume, VolumeCapabilities, VolumeId, VolumeModel,
 };
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -311,13 +312,49 @@ impl SidebarModel {
     }
 
     pub fn sync_volumes(&mut self, volumes: &VolumeModel) {
+        let visible = volumes
+            .volumes()
+            .into_iter()
+            .filter(|volume| is_sidebar_volume(volume))
+            .collect::<Vec<_>>();
+        let mut label_counts = BTreeMap::<&str, usize>::new();
+        for volume in &visible {
+            *label_counts.entry(volume.label()).or_default() += 1;
+        }
+        let mut short_name_counts = BTreeMap::<String, usize>::new();
+        for volume in &visible {
+            if label_counts[volume.label()] == 1 {
+                *short_name_counts
+                    .entry(volume.label().to_owned())
+                    .or_default() += 1;
+            } else if let Some(name) = volume_label_path(volume).file_name() {
+                *short_name_counts
+                    .entry(name.to_string_lossy().into_owned())
+                    .or_default() += 1;
+            }
+        }
         self.set_section_items(
             SidebarSectionKind::Mounts,
-            volumes
-                .volumes()
-                .into_iter()
-                .filter(|volume| is_sidebar_volume(volume))
-                .map(SidebarEntry::volume),
+            visible.into_iter().map(|volume| {
+                let mut entry = SidebarEntry::volume(volume);
+                if label_counts[volume.label()] > 1 {
+                    let path = volume_label_path(volume);
+                    let short_name = path
+                        .file_name()
+                        .filter(|name| !name.is_empty())
+                        .map_or_else(
+                            || volume.id().as_str().to_owned(),
+                            |name| name.to_string_lossy().into_owned(),
+                        );
+                    entry.label = if short_name_counts.get(&short_name).copied().unwrap_or(0) > 1 {
+                        path.to_string_lossy().into_owned()
+                    } else {
+                        short_name
+                    }
+                    .into();
+                }
+                entry
+            }),
         );
     }
 
@@ -366,6 +403,13 @@ impl Default for SidebarModel {
     fn default() -> Self {
         Self::new(PinStore::default())
     }
+}
+
+fn volume_label_path(volume: &Volume) -> &Path {
+    volume
+        .mount_points()
+        .first()
+        .map_or_else(|| volume.device(), |path| path.as_path())
 }
 
 fn is_sidebar_volume(volume: &Volume) -> bool {
