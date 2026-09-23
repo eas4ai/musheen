@@ -2,10 +2,10 @@ use super::{ConnectionProfile, RemoteError, RemoteErrorCategory};
 use musheen_core::{BoxFuture, CancellationToken};
 use std::collections::VecDeque;
 use std::fmt;
-use std::future::{Future, pending, poll_fn};
+use std::future::{Future, poll_fn};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -186,7 +186,7 @@ impl<C: RemoteConnector, R: PoolRuntime> ProviderPool<C, R> {
         connector: C,
         runtime: R,
         limits: PoolLimits,
-        maintenance: Result<&MaintenanceService, ()>,
+        maintenance: Result<Arc<MaintenanceService>, ()>,
     ) -> Result<Self, RemoteError> {
         let maintenance = maintenance.map_err(|()| {
             RemoteError::new(
@@ -711,20 +711,25 @@ impl MaintenanceThreadSpawner for SystemMaintenanceThreadSpawner {
 struct MaintenanceService {
     executor: Arc<async_executor::Executor<'static>>,
     active_tasks: Arc<AtomicUsize>,
-    _worker: std::thread::JoinHandle<()>,
+    shutdown: async_channel::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MaintenanceService {
     fn start(spawner: &impl MaintenanceThreadSpawner) -> io::Result<Self> {
         let executor = Arc::new(async_executor::Executor::new());
         let worker_executor = executor.clone();
+        let (shutdown, stopped) = async_channel::bounded(1);
         let worker = spawner.spawn(Box::new(move || {
-            futures_lite::future::block_on(worker_executor.run(pending::<()>()))
+            futures_lite::future::block_on(worker_executor.run(async move {
+                let _ = stopped.recv().await;
+            }))
         }))?;
         Ok(Self {
             executor,
             active_tasks: Arc::new(AtomicUsize::new(0)),
-            _worker: worker,
+            shutdown,
+            worker: Some(worker),
         })
     }
 
@@ -740,6 +745,17 @@ impl MaintenanceService {
     }
 }
 
+impl Drop for MaintenanceService {
+    fn drop(&mut self) {
+        let _ = self.shutdown.try_send(());
+        if let Some(worker) = self.worker.take()
+            && worker.thread().id() != std::thread::current().id()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
 struct ActiveMaintenanceTask(Arc<AtomicUsize>);
 
 impl Drop for ActiveMaintenanceTask {
@@ -748,14 +764,50 @@ impl Drop for ActiveMaintenanceTask {
     }
 }
 
-static MAINTENANCE_SERVICE: OnceLock<Result<MaintenanceService, io::ErrorKind>> = OnceLock::new();
+struct RetryableShared<T> {
+    value: Mutex<Option<Arc<T>>>,
+}
 
-fn shared_maintenance_service() -> Result<&'static MaintenanceService, ()> {
+impl<T> RetryableShared<T> {
+    const fn new() -> Self {
+        Self {
+            value: Mutex::new(None),
+        }
+    }
+
+    fn get_or_try_init<E>(&self, initialize: impl FnOnce() -> Result<T, E>) -> Result<Arc<T>, E> {
+        let mut value = lock(&self.value);
+        if let Some(value) = value.as_ref() {
+            return Ok(value.clone());
+        }
+        let initialized = Arc::new(initialize()?);
+        *value = Some(initialized.clone());
+        Ok(initialized)
+    }
+}
+
+struct MaintenanceServiceRegistry {
+    service: RetryableShared<MaintenanceService>,
+}
+
+impl MaintenanceServiceRegistry {
+    const fn new() -> Self {
+        Self {
+            service: RetryableShared::new(),
+        }
+    }
+
+    fn get(&self, spawner: &impl MaintenanceThreadSpawner) -> io::Result<Arc<MaintenanceService>> {
+        self.service
+            .get_or_try_init(|| MaintenanceService::start(spawner))
+    }
+}
+
+static MAINTENANCE_SERVICE: MaintenanceServiceRegistry = MaintenanceServiceRegistry::new();
+
+fn shared_maintenance_service() -> Result<Arc<MaintenanceService>, ()> {
     MAINTENANCE_SERVICE
-        .get_or_init(|| {
-            MaintenanceService::start(&SystemMaintenanceThreadSpawner).map_err(|error| error.kind())
-        })
-        .as_ref()
+        .get(&SystemMaintenanceThreadSpawner)
         .map_err(|_| ())
 }
 
@@ -774,7 +826,7 @@ mod tests {
         }
 
         fn sleep(&self, _: Duration) -> BoxFuture<'_, ()> {
-            Box::pin(pending())
+            Box::pin(std::future::pending())
         }
     }
 
@@ -788,7 +840,7 @@ mod tests {
             _: &'a ConnectionProfile,
             _: CancellationToken,
         ) -> BoxFuture<'a, Result<Self::Connection, RemoteErrorCategory>> {
-            Box::pin(pending())
+            Box::pin(std::future::pending())
         }
     }
 
@@ -800,6 +852,31 @@ mod tests {
             _: Box<dyn FnOnce() + Send + 'static>,
         ) -> io::Result<std::thread::JoinHandle<()>> {
             Err(io::Error::from(io::ErrorKind::ResourceBusy))
+        }
+    }
+
+    struct FailOnceSpawner {
+        attempts: AtomicUsize,
+    }
+
+    impl FailOnceSpawner {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MaintenanceThreadSpawner for FailOnceSpawner {
+        fn spawn(
+            &self,
+            run: Box<dyn FnOnce() + Send + 'static>,
+        ) -> io::Result<std::thread::JoinHandle<()>> {
+            if self.attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                Err(io::Error::from(io::ErrorKind::ResourceBusy))
+            } else {
+                std::thread::Builder::new().spawn(run)
+            }
         }
     }
 
@@ -841,6 +918,57 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.category(), RemoteErrorCategory::Unavailable);
+    }
+
+    #[test]
+    fn shared_maintenance_initialization_retries_after_a_transient_failure() {
+        let registry = MaintenanceServiceRegistry::new();
+        let spawner = FailOnceSpawner::new();
+
+        let first_error = match registry.get(&spawner) {
+            Ok(_) => panic!("first maintenance worker spawn must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(first_error.kind(), io::ErrorKind::ResourceBusy);
+
+        let recovered = registry.get(&spawner).unwrap();
+        let reused = registry.get(&spawner).unwrap();
+        assert!(Arc::ptr_eq(&recovered, &reused));
+        assert_eq!(spawner.attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn concurrent_maintenance_retries_create_exactly_one_shared_worker() {
+        let registry = Arc::new(MaintenanceServiceRegistry::new());
+        let spawner = Arc::new(FailOnceSpawner::new());
+        let first_error = match registry.get(spawner.as_ref()) {
+            Ok(_) => panic!("first maintenance worker spawn must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(first_error.kind(), io::ErrorKind::ResourceBusy);
+
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let mut retries = Vec::new();
+        for _ in 0..16 {
+            let registry = registry.clone();
+            let spawner = spawner.clone();
+            let barrier = barrier.clone();
+            retries.push(std::thread::spawn(move || {
+                barrier.wait();
+                registry.get(spawner.as_ref()).unwrap()
+            }));
+        }
+
+        let services = retries
+            .into_iter()
+            .map(|retry| retry.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(spawner.attempts.load(Ordering::Acquire), 2);
+        assert!(
+            services
+                .iter()
+                .all(|service| Arc::ptr_eq(service, &services[0]))
+        );
     }
 
     #[test]
