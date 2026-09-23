@@ -3,9 +3,9 @@ use musheen_desktop::SecretBuffer;
 use musheen_desktop::privilege::{
     AuditOutcome, AuditPhase, AuditRecord, AuditSink, AuthorizationError, AuthorizationGrant,
     AuthorizationRequest, Authorizer, Broker, BrokerError, BrokerLaunch, BrokerOperation,
-    BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, Clock, JsonAuditLog,
-    OperationRunner, PrivilegeProvider, ProcessBrokerTransport, RootCapabilityDescriptor,
-    RootGrant, RootedStore, SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest,
+    BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, Clock, ElevatedRootReference,
+    JsonAuditLog, OperationRunner, PrivilegeProvider, ProcessBrokerTransport, RootGrant,
+    RootedStore, SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest,
     encode_broker_response,
 };
 use std::collections::BTreeMap;
@@ -89,6 +89,8 @@ struct RecordingRunner {
 struct RecordedExecution {
     operation: BrokerOperation,
     environment: BTreeMap<String, String>,
+    provider: PrivilegeProvider,
+    authorization_expires_at: u64,
 }
 
 impl OperationRunner for RecordingRunner {
@@ -99,11 +101,13 @@ impl OperationRunner for RecordingRunner {
         self.requests.lock().unwrap().push(RecordedExecution {
             operation: request.operation().clone(),
             environment: request.environment().clone(),
+            provider: request.provider(),
+            authorization_expires_at: request.authorization().expires_at_unix_millis(),
         });
         Ok(match request.operation() {
-            BrokerOperation::OpenDirectory { target } => BrokerOutput::DirectoryGranted(
-                RootCapabilityDescriptor::capture(target, u64::MAX).unwrap(),
-            ),
+            BrokerOperation::OpenDirectory { target } => {
+                BrokerOutput::RootReferenced(ElevatedRootReference::capture(target).unwrap())
+            }
             BrokerOperation::RunExecutable { .. } => BrokerOutput::Exited(0),
             BrokerOperation::ReadDirectory { .. } => BrokerOutput::DirectoryEntries(Vec::new()),
         })
@@ -347,6 +351,40 @@ fn expired_root_grant_cannot_browse() {
 }
 
 #[test]
+fn elevated_root_reference_carries_identity_but_no_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let reference = ElevatedRootReference::capture(root.path()).unwrap();
+    let document = serde_json::to_value(reference).unwrap();
+
+    assert!(document.get("root").is_some());
+    assert!(document.get("device").is_some());
+    assert!(document.get("inode").is_some());
+    assert!(document.get("expires_at_unix_millis").is_none());
+    assert!(document.get("grant_id").is_none());
+}
+
+#[test]
+fn each_root_reference_read_carries_its_fresh_selected_provider_grant() {
+    let root = tempfile::tempdir().unwrap();
+    let reference = ElevatedRootReference::capture(root.path()).unwrap();
+    let runner = RecordingRunner::default();
+
+    broker(
+        FakeAuthorizer::granting(777),
+        runner.clone(),
+        RecordingAudit::default(),
+        FixedClock::new(100),
+    )
+    .with_provider(PrivilegeProvider::Sudo)
+    .handle(BrokerRequest::read_directory(reference, ".").unwrap())
+    .unwrap();
+
+    let requests = runner.requests.lock().unwrap();
+    assert_eq!(requests[0].provider, PrivilegeProvider::Sudo);
+    assert_eq!(requests[0].authorization_expires_at, 777);
+}
+
+#[test]
 fn request_paths_remain_lossless() {
     use std::os::unix::ffi::OsStringExt as _;
     let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec()));
@@ -472,9 +510,7 @@ fn sudo_transport_uses_a_readiness_gated_pty_and_returns_typed_results() {
     let temporary = tempfile::tempdir().unwrap();
     let target = temporary.path().join("protected");
     fs::create_dir(&target).unwrap();
-    let expected = BrokerOutput::DirectoryGranted(
-        RootCapabilityDescriptor::capture(&target, u64::MAX).unwrap(),
-    );
+    let expected = BrokerOutput::RootReferenced(ElevatedRootReference::capture(&target).unwrap());
     let response = encode_broker_response(&BrokerResponse::success(expected.clone())).unwrap();
     let recorder = executable_script(
         temporary.path(),
@@ -528,9 +564,7 @@ fn sudo_password_prompt_is_bounded_masked_and_cancellable() {
     let temporary = tempfile::tempdir().unwrap();
     let target = temporary.path().join("protected");
     fs::create_dir(&target).unwrap();
-    let expected = BrokerOutput::DirectoryGranted(
-        RootCapabilityDescriptor::capture(&target, u64::MAX).unwrap(),
-    );
+    let expected = BrokerOutput::RootReferenced(ElevatedRootReference::capture(&target).unwrap());
     let response = encode_broker_response(&BrokerResponse::success(expected.clone())).unwrap();
     let recorder = executable_script(
         temporary.path(),
@@ -605,13 +639,13 @@ fn production_runner_executes_root_owned_target_with_exact_arguments() {
 }
 
 #[test]
-fn production_broker_reads_directory_through_the_bound_capability_and_rejects_replacement() {
+fn production_broker_reads_directory_through_the_root_reference_and_rejects_replacement() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("protected");
     let moved = temporary.path().join("original");
     fs::create_dir(&root).unwrap();
     fs::write(root.join("visible.txt"), b"visible").unwrap();
-    let descriptor = RootCapabilityDescriptor::capture(&root, u64::MAX).unwrap();
+    let descriptor = ElevatedRootReference::capture(&root).unwrap();
     let service = Broker::new(
         FakeAuthorizer::granting(u64::MAX),
         SystemOperationRunner::with_timeout(Duration::from_secs(1)),

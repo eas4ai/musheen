@@ -17,6 +17,6 @@ pub use request::{
     BrokerOperation, BrokerRequest, ConfirmationSummary, PrivilegeProvider, RequestSubject,
 };
 pub use rooted_store::{
-    RootCapabilityDescriptor, RootGrant, RootedDirectoryEntry, RootedEntry, RootedEntryKind,
+    ElevatedRootReference, RootGrant, RootedDirectoryEntry, RootedEntry, RootedEntryKind,
     RootedStore,
 };

@@ -5,49 +5,31 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::broker::{FileIdentity, open_absolute_no_symlinks};
 use super::{BrokerError, Clock, PrivilegeProvider};
 
-static NEXT_GRANT_ID: AtomicU64 = AtomicU64::new(1);
-
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct RootCapabilityDescriptor {
+#[serde(deny_unknown_fields)]
+pub struct ElevatedRootReference {
     #[serde(with = "super::request::path_bytes")]
     root: PathBuf,
     device: u64,
     inode: u64,
-    expires_at_unix_millis: u64,
-    grant_id: Box<str>,
 }
 
-impl RootCapabilityDescriptor {
-    pub fn capture(
-        root: impl AsRef<Path>,
-        expires_at_unix_millis: u64,
-    ) -> Result<Self, BrokerError> {
+impl ElevatedRootReference {
+    pub fn capture(root: impl AsRef<Path>) -> Result<Self, BrokerError> {
         let file = open_absolute_no_symlinks(root.as_ref(), true)?;
-        Self::from_file(root.as_ref(), &file, expires_at_unix_millis)
+        Self::from_file(root.as_ref(), &file)
     }
 
-    pub(crate) fn from_file(
-        root: &Path,
-        file: &File,
-        expires_at_unix_millis: u64,
-    ) -> Result<Self, BrokerError> {
+    pub(crate) fn from_file(root: &Path, file: &File) -> Result<Self, BrokerError> {
         let metadata = file.metadata().map_err(|_| BrokerError::Io)?;
         Ok(Self {
             root: root.to_path_buf(),
             device: metadata.dev(),
             inode: metadata.ino(),
-            expires_at_unix_millis,
-            grant_id: format!(
-                "{}-{}",
-                std::process::id(),
-                NEXT_GRANT_ID.fetch_add(1, Ordering::Relaxed)
-            )
-            .into_boxed_str(),
         })
     }
 
@@ -57,13 +39,11 @@ impl RootCapabilityDescriptor {
     }
 
     #[must_use]
-    pub fn grant_id(&self) -> &str {
-        &self.grant_id
-    }
-
-    #[must_use]
-    pub const fn expires_at_unix_millis(&self) -> u64 {
-        self.expires_at_unix_millis
+    pub fn identity(&self) -> [u8; 16] {
+        let mut identity = [0_u8; 16];
+        identity[..8].copy_from_slice(&self.device.to_le_bytes());
+        identity[8..].copy_from_slice(&self.inode.to_le_bytes());
+        identity
     }
 }
 
@@ -97,21 +77,23 @@ impl RootGrant {
         })
     }
 
-    pub(crate) fn from_descriptor_file(
-        descriptor: RootCapabilityDescriptor,
+    pub(crate) fn from_reference_file(
+        reference: ElevatedRootReference,
         file: File,
+        grant_id: impl Into<Box<str>>,
+        expires_at_unix_millis: u64,
         provider: PrivilegeProvider,
     ) -> Result<Self, BrokerError> {
         let metadata = file.metadata().map_err(|_| BrokerError::Io)?;
-        if metadata.dev() != descriptor.device || metadata.ino() != descriptor.inode {
+        if metadata.dev() != reference.device || metadata.ino() != reference.inode {
             return Err(BrokerError::TargetReplaced);
         }
         Ok(Self {
-            root: descriptor.root,
+            root: reference.root,
             file,
             identity: FileIdentity::from_metadata(&metadata),
-            grant_id: descriptor.grant_id,
-            expires_at_unix_millis: descriptor.expires_at_unix_millis,
+            grant_id: grant_id.into(),
+            expires_at_unix_millis,
             provider,
         })
     }

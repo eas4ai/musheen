@@ -6,8 +6,8 @@ use musheen_core::{
 };
 use musheen_desktop::{
     BrokerDirectoryEntry, BrokerError, BrokerLaunch, BrokerOutput, BrokerRequest, BrokerTransport,
-    Clock, INSTALLED_BROKER_PATH, PrivilegeProvider, ProcessBrokerTransport,
-    RootCapabilityDescriptor, RootedEntryKind, RootedStore, SecretBuffer, SudoPtyBrokerTransport,
+    Clock, ElevatedRootReference, INSTALLED_BROKER_PATH, PrivilegeProvider, ProcessBrokerTransport,
+    RootedEntryKind, RootedStore, SecretBuffer, SudoPtyBrokerTransport,
 };
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -70,9 +70,9 @@ impl<C: Clock> ElevatedBrowser<C> {
 pub struct RootedFilesystemStore<C> {
     provider: ProviderId,
     root: PathBuf,
-    grant_id: Box<str>,
+    root_identity: Box<[u8]>,
     store: Option<Arc<RootedStore<C>>>,
-    capability: Option<RootCapabilityDescriptor>,
+    root_reference: Option<ElevatedRootReference>,
     backend: Option<Arc<dyn PrivilegeBackend>>,
 }
 
@@ -80,28 +80,28 @@ impl<C: Clock> RootedFilesystemStore<C> {
     #[must_use]
     pub fn new(store: RootedStore<C>) -> Self {
         let root = store.grant().root().to_path_buf();
-        let grant_id = store.grant().grant_id().into();
+        let root_identity = store.grant().grant_id().as_bytes().into();
         Self {
             provider: ProviderId::new("local").expect("the built-in provider ID is valid"),
             root,
-            grant_id,
+            root_identity,
             store: Some(Arc::new(store)),
-            capability: None,
+            root_reference: None,
             backend: None,
         }
     }
 
     #[must_use]
     pub fn remote(
-        capability: RootCapabilityDescriptor,
+        root_reference: ElevatedRootReference,
         backend: Arc<dyn PrivilegeBackend>,
     ) -> Self {
         Self {
             provider: ProviderId::new("local").expect("the built-in provider ID is valid"),
-            root: capability.root().to_path_buf(),
-            grant_id: capability.grant_id().into(),
+            root: root_reference.root().to_path_buf(),
+            root_identity: root_reference.identity().to_vec().into_boxed_slice(),
             store: None,
-            capability: Some(capability),
+            root_reference: Some(root_reference),
             backend: Some(backend),
         }
     }
@@ -159,7 +159,7 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
             store.resolve(&relative).map_err(Self::map_error)?;
         }
         let key = if relative.as_os_str().is_empty() {
-            self.grant_id.as_bytes().to_vec()
+            self.root_identity.to_vec()
         } else {
             relative.as_os_str().as_bytes().to_vec()
         };
@@ -201,16 +201,16 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
                     })
                     .collect::<Vec<_>>()
             } else {
-                let capability = self
-                    .capability
+                let root_reference = self
+                    .root_reference
                     .clone()
-                    .ok_or_else(|| StoreError::Backend("missing elevated capability".into()))?;
+                    .ok_or_else(|| StoreError::Backend("missing elevated root reference".into()))?;
                 let backend = self
                     .backend
                     .as_ref()
                     .ok_or_else(|| StoreError::Backend("missing elevated broker".into()))?;
                 backend
-                    .read_directory(capability, relative.clone(), cancellation.clone())
+                    .read_directory(root_reference, relative.clone(), cancellation.clone())
                     .await
                     .map_err(Self::map_error)?
                     .into_iter()
@@ -342,12 +342,12 @@ pub trait PrivilegeBackend: Send + Sync + 'static {
 
     fn read_directory<'a>(
         &'a self,
-        capability: RootCapabilityDescriptor,
+        root: ElevatedRootReference,
         relative: PathBuf,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<BrokerDirectoryEntry>, BrokerError>> {
         Box::pin(async move {
-            let request = BrokerRequest::read_directory(capability, relative)?;
+            let request = BrokerRequest::read_directory(root, relative)?;
             match self.perform(&request, cancellation, None).await? {
                 BrokerOutput::DirectoryEntries(entries) => Ok(entries),
                 _ => Err(BrokerError::BrokerCrashed),

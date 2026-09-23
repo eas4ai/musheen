@@ -72,15 +72,14 @@ use musheen_core::{
 use musheen_desktop::{
     ApplicationIconProvider, BrokerError, BrokerOutput, BrokerRequest, CatalogDocument,
     CatalogStore, ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher,
-    DesktopEntryTerminalLauncher, DesktopPaths, ExternalTerminalCommand, FolderIdentity,
-    FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
-    MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation, OperationUsage,
-    OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent,
-    RootCapabilityDescriptor, SecretBuffer, SessionStore, SystemClock, SystemProcessRunner,
-    TagMoveOutcome, TerminalCommand, TerminalError, TerminalModel, TerminalProfile,
-    TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
-    ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError,
-    VolumeId, VolumeRuntime,
+    DesktopEntryTerminalLauncher, DesktopPaths, ElevatedRootReference, ExternalTerminalCommand,
+    FolderIdentity, FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError,
+    MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation,
+    OperationUsage, OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent,
+    SecretBuffer, SessionStore, SystemClock, SystemProcessRunner, TagMoveOutcome, TerminalCommand,
+    TerminalError, TerminalModel, TerminalProfile, TerminalSession, TerminalSize, ThumbnailCache,
+    ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService,
+    ThumbnailSize, UsageResolution, VolumeAction, VolumeError, VolumeId, VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -6903,10 +6902,10 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| match result {
-                Ok(BrokerOutput::DirectoryGranted(descriptor))
+                Ok(BrokerOutput::RootReferenced(root_reference))
                     if matches!(action, CommandAction::OpenAsAdministrator) =>
                 {
-                    state.open_elevated_window(descriptor, cx);
+                    state.open_elevated_window(root_reference, cx);
                 }
                 Ok(BrokerOutput::Exited(code))
                     if matches!(action, CommandAction::RunAsAdministrator) =>
@@ -6943,12 +6942,12 @@ impl MusheenApp {
 
     fn open_elevated_window(
         &mut self,
-        descriptor: RootCapabilityDescriptor,
+        root_reference: ElevatedRootReference,
         cx: &mut Context<Self>,
     ) {
-        let root = descriptor.root().to_path_buf();
+        let root = root_reference.root().to_path_buf();
         let elevated_store = Arc::new(RootedFilesystemStore::<SystemClock>::remote(
-            descriptor,
+            root_reference,
             Arc::clone(&self.privilege_backend),
         ));
         let providers = match ProviderRuntime::with_primary_store(elevated_store.clone()) {
@@ -15424,9 +15423,8 @@ mod tests {
                 self.0.lock().unwrap().push(request.clone());
                 match request.operation() {
                     BrokerOperation::OpenDirectory { .. } => {
-                        let descriptor =
-                            RootCapabilityDescriptor::capture(request.target(), u64::MAX);
-                        Box::pin(async move { descriptor.map(BrokerOutput::DirectoryGranted) })
+                        let root_reference = ElevatedRootReference::capture(request.target());
+                        Box::pin(async move { root_reference.map(BrokerOutput::RootReferenced) })
                     }
                     BrokerOperation::ReadDirectory { .. } => {
                         Box::pin(async { Ok(BrokerOutput::DirectoryEntries(Vec::new())) })

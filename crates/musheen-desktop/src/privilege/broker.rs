@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use super::{
-    BrokerOperation, BrokerRequest, PrivilegeProvider, RequestSubject, RootCapabilityDescriptor,
+    BrokerOperation, BrokerRequest, ElevatedRootReference, PrivilegeProvider, RequestSubject,
     RootGrant, RootedEntryKind, RootedStore,
 };
 use crate::SecretBuffer;
@@ -156,9 +156,12 @@ impl Clock for SystemClock {
 
 #[derive(Debug)]
 pub struct ValidatedRequest {
+    request_id: Box<str>,
     operation: BrokerOperation,
     target: ValidatedTarget,
     environment: BTreeMap<String, String>,
+    authorization: AuthorizationGrant,
+    provider: PrivilegeProvider,
 }
 
 impl ValidatedRequest {
@@ -176,6 +179,16 @@ impl ValidatedRequest {
     pub const fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
     }
+
+    #[must_use]
+    pub const fn provider(&self) -> PrivilegeProvider {
+        self.provider
+    }
+
+    #[must_use]
+    pub const fn authorization(&self) -> &AuthorizationGrant {
+        &self.authorization
+    }
 }
 
 pub trait OperationRunner: Send + Sync + 'static {
@@ -185,7 +198,7 @@ pub trait OperationRunner: Send + Sync + 'static {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BrokerOutput {
-    DirectoryGranted(RootCapabilityDescriptor),
+    RootReferenced(ElevatedRootReference),
     DirectoryEntries(Vec<BrokerDirectoryEntry>),
     Exited(i32),
 }
@@ -1043,9 +1056,12 @@ where
             return Err(BrokerError::TargetReplaced);
         }
         let validated = ValidatedRequest {
+            request_id: request.id().into(),
             operation: request.operation().clone(),
             target: after,
             environment: scrub_environment(environment),
+            authorization: grant,
+            provider: self.provider,
         };
         self.record(&request, AuditPhase::Dispatch, AuditOutcome::Started)?;
         let result = self.runner.execute(validated);
@@ -1246,19 +1262,16 @@ impl OperationRunner for SystemOperationRunner {
     fn execute(&self, request: ValidatedRequest) -> Result<BrokerOutput, BrokerError> {
         match request.operation {
             BrokerOperation::OpenDirectory { target } => {
-                let expires = SystemClock.now_unix_millis().saturating_add(60_000);
-                let descriptor =
-                    RootCapabilityDescriptor::from_file(&target, &request.target.file, expires)?;
-                Ok(BrokerOutput::DirectoryGranted(descriptor))
+                let reference = ElevatedRootReference::from_file(&target, &request.target.file)?;
+                Ok(BrokerOutput::RootReferenced(reference))
             }
-            BrokerOperation::ReadDirectory {
-                capability,
-                relative,
-            } => {
-                let grant = RootGrant::from_descriptor_file(
-                    capability,
+            BrokerOperation::ReadDirectory { root, relative } => {
+                let grant = RootGrant::from_reference_file(
+                    root,
                     request.target.file,
-                    PrivilegeProvider::Polkit,
+                    request.request_id,
+                    request.authorization.expires_at_unix_millis(),
+                    request.provider,
                 )?;
                 let store = RootedStore::new(grant, SystemClock);
                 let entries = store

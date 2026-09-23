@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{BrokerError, RootCapabilityDescriptor};
+use super::{BrokerError, ElevatedRootReference};
 
 const MAX_ARGUMENTS: usize = 256;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -39,7 +39,7 @@ pub enum BrokerOperation {
         arguments: Box<[String]>,
     },
     ReadDirectory {
-        capability: RootCapabilityDescriptor,
+        root: ElevatedRootReference,
         #[serde(with = "path_bytes")]
         relative: PathBuf,
     },
@@ -50,7 +50,7 @@ impl BrokerOperation {
     pub fn target(&self) -> &Path {
         match self {
             Self::OpenDirectory { target } | Self::RunExecutable { target, .. } => target,
-            Self::ReadDirectory { capability, .. } => capability.root(),
+            Self::ReadDirectory { root, .. } => root.root(),
         }
     }
 
@@ -195,7 +195,7 @@ impl BrokerRequest {
     }
 
     pub fn read_directory(
-        capability: RootCapabilityDescriptor,
+        root: ElevatedRootReference,
         relative: impl AsRef<Path>,
     ) -> Result<Self, BrokerError> {
         let relative = relative.as_ref();
@@ -215,7 +215,7 @@ impl BrokerRequest {
             id: next_request_id(),
             subject: RequestSubject::current()?,
             operation: BrokerOperation::ReadDirectory {
-                capability,
+                root,
                 relative: relative.to_path_buf(),
             },
             subject_is_trusted: true,
