@@ -1759,6 +1759,14 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    struct AcceptDecisions;
+
+    impl musheen_ops::ConflictDecisionJournal for AcceptDecisions {
+        fn persist_decision(&mut self, _: &ConflictDecision) -> Result<(), MutationError> {
+            Ok(())
+        }
+    }
+
     #[derive(Debug, Default)]
     struct RecordingArchiveRoute {
         execution: Mutex<Option<(JobId, EventGeneration, ArchiveOperationPlan)>>,
@@ -2046,6 +2054,49 @@ mod tests {
         assert_eq!(queue.state(undo_job), Some(JobState::Completed));
         assert_eq!(fs::read(&original_path).unwrap(), b"original contents");
         assert!(!moved_path.exists());
+    }
+
+    #[test]
+    fn completed_replacing_move_never_offers_undo() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_directory = temporary.path().join("source");
+        let target_directory = temporary.path().join("target");
+        fs::create_dir(&source_directory).unwrap();
+        fs::create_dir(&target_directory).unwrap();
+        let source_path = source_directory.join("item.txt");
+        let target_path = target_directory.join("item.txt");
+        fs::write(&source_path, b"new contents").unwrap();
+        fs::write(&target_path, b"old contents").unwrap();
+        let payload = FileDragPayload::new(
+            vec![StorePath::from_unix_path(source_path.as_os_str())],
+            DropAction::Move,
+        )
+        .unwrap();
+        let target = StorePath::from_unix_path(target_directory.as_os_str());
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let conflict = queue.conflicts_for_drop(&payload, &target).unwrap();
+        assert_eq!(conflict.len(), 1);
+        let decision = musheen_ops::ConflictPolicies::default()
+            .decide(
+                &conflict[0],
+                musheen_ops::ConflictChoice::Replace,
+                musheen_ops::ApplyScope::ThisConflict,
+                &mut AcceptDecisions,
+            )
+            .unwrap();
+        let job = queue
+            .submit_drop_resolved(payload, target, vec![decision])
+            .unwrap()[0];
+        finish_one(&mut queue);
+
+        assert_eq!(fs::read(&target_path).unwrap(), b"new contents");
+        assert!(!source_path.exists());
+        assert!(!queue.has_undo_candidate(job));
+        assert!(!queue.can_undo(job));
+        assert!(matches!(
+            queue.submit_undo(job),
+            Err(DropError::UndoUnavailable(id)) if id == job
+        ));
     }
 
     #[test]

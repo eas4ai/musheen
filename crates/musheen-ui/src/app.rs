@@ -21393,6 +21393,19 @@ mod tests {
                 "{:?}",
                 state.operation_error
             );
+            let completed_moves = state
+                .operation_status_entries()
+                .into_iter()
+                .filter(|entry| {
+                    entry.kind() == OperationKind::Move
+                        && entry.status() == OperationStatus::Completed
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(completed_moves.len(), 3);
+            for entry in completed_moves {
+                assert!(!state.operation_hub.has_undo_candidate(entry.id()));
+                assert!(!state.operation_hub.can_undo(entry.id()));
+            }
         });
     }
 
