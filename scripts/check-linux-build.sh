@@ -5,12 +5,6 @@ repository_root=$(git rev-parse --show-toplevel)
 revision=$(git -C "$repository_root" rev-parse --verify HEAD)
 runtime_dir=${XDG_RUNTIME_DIR:-/tmp}
 lock_file="$runtime_dir/musheen-linux-build.lock"
-docker_config=$(mktemp -d)
-
-cleanup() {
-    rm -r "$docker_config"
-}
-trap cleanup EXIT
 
 exec 9>"$lock_file"
 if ! flock -n 9; then
@@ -19,7 +13,7 @@ if ! flock -n 9; then
 fi
 
 git -C "$repository_root" archive --format=tar "$revision" \
-    | DOCKER_CONFIG="$docker_config" docker build \
+    | docker build \
         --pull=false \
         --label "org.opencontainers.image.revision=$revision" \
         --file ci/linux-build.Dockerfile \

@@ -23,7 +23,11 @@ fn linux_build_uses_the_dockerfile_from_its_archived_context() {
     let repository = scratch.join("repository");
     let arguments = scratch.join("docker-arguments");
     let context = scratch.join("docker-context.tar");
+    let supplied_docker_config = scratch.join("docker-config");
+    let docker_config_record = scratch.join("docker-config-record");
     fs::create_dir_all(&fake_bin).expect("fake executable directory should be created");
+    fs::create_dir_all(&supplied_docker_config)
+        .expect("supplied Docker configuration directory should be created");
     fs::create_dir_all(repository.join("scripts"))
         .expect("fixture scripts directory should be created");
     fs::create_dir_all(repository.join("ci")).expect("fixture CI directory should be created");
@@ -42,7 +46,7 @@ fn linux_build_uses_the_dockerfile_from_its_archived_context() {
     let docker = fake_bin.join("docker");
     fs::write(
         &docker,
-        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\0' \"$@\" > \"$MUSHEEN_DOCKER_ARGS\"\ncat > \"$MUSHEEN_DOCKER_CONTEXT\"\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\0' \"$@\" > \"$MUSHEEN_DOCKER_ARGS\"\nprintf '%s' \"${DOCKER_CONFIG:-}\" > \"$MUSHEEN_DOCKER_CONFIG_RECORD\"\ncat > \"$MUSHEEN_DOCKER_CONTEXT\"\n",
     )
     .expect("fake Docker executable should be written");
     let mut permissions = fs::metadata(&docker)
@@ -97,7 +101,9 @@ fn linux_build_uses_the_dockerfile_from_its_archived_context() {
     let output = Command::new(repository.join("scripts/check-linux-build.sh"))
         .current_dir(&repository)
         .env("PATH", path)
+        .env("DOCKER_CONFIG", &supplied_docker_config)
         .env("MUSHEEN_DOCKER_ARGS", &arguments)
+        .env("MUSHEEN_DOCKER_CONFIG_RECORD", &docker_config_record)
         .env("MUSHEEN_DOCKER_CONTEXT", &context)
         .output()
         .expect("Linux build script should start");
@@ -105,6 +111,11 @@ fn linux_build_uses_the_dockerfile_from_its_archived_context() {
         output.status.success(),
         "Linux build script failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&docker_config_record).expect("Docker config path should be recorded"),
+        supplied_docker_config.to_string_lossy(),
+        "Linux build must preserve the caller's Docker credentials"
     );
 
     let raw_arguments = fs::read(&arguments).expect("Docker arguments should be recorded");
