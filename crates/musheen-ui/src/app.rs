@@ -16240,7 +16240,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn every_static_shortcut_reaches_its_live_handler_in_browser_and_input_contexts(
+    async fn default_shortcuts_reach_live_handlers_in_browser_and_input_contexts(
         cx: &mut TestAppContext,
     ) {
         cx.update(|cx| {
@@ -16291,6 +16291,9 @@ mod tests {
             ("view.adaptive", "ctrl-6", true, true),
             ("view.sidebar", "ctrl-b", true, true),
             ("item.properties", "alt-enter", true, false),
+            ("create.directory", "ctrl-shift-n", false, true),
+            ("file.move_to_trash", "delete", false, false),
+            ("file.delete_permanently", "shift-delete", false, false),
         ];
         cx.update_window(browser, |_, window, cx| {
             window.render_frame(cx);
