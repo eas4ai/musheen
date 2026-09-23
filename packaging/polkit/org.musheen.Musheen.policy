@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Musheen</vendor>
+  <vendor_url>https://github.com/musheen/musheen</vendor_url>
+  <icon_name>org.musheen.Musheen</icon_name>
+
+  <action id="org.musheen.open-directory-as-administrator">
+    <description>Open a directory as administrator</description>
+    <message>Authentication is required to run $(command_line)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/musheen-broker</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.open-directory-as-administrator</annotate>
+  </action>
+
+  <action id="org.musheen.run-executable-as-administrator">
+    <description>Run an executable as administrator</description>
+    <message>Authentication is required to run $(command_line)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/musheen-broker</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.run-executable-as-administrator</annotate>
+  </action>
+
+  <action id="org.musheen.browse-directory-as-administrator">
+    <description>Browse a directory as administrator</description>
+    <message>Authentication is required to run $(command_line)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/musheen-broker</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.browse-directory-as-administrator</annotate>
+  </action>
+</policyconfig>

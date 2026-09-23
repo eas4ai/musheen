@@ -1,5 +1,4 @@
 mod broker;
-mod polkit;
 mod request;
 mod rooted_store;
 
@@ -12,9 +11,10 @@ pub use broker::{
     ValidatedRequest, decode_broker_request, decode_broker_response, encode_broker_request,
     encode_broker_response,
 };
-pub use polkit::{PolkitAuthorizer, PolkitConnectionFactory, SystemBusPolkitConnection};
 pub use request::{
-    BrokerOperation, BrokerRequest, ConfirmationSummary, PrivilegeProvider, RequestSubject,
+    ADMIN_ACTION_IDS, BROWSE_DIRECTORY_ACTION_ID, BrokerOperation, BrokerRequest,
+    ConfirmationSummary, OPEN_DIRECTORY_ACTION_ID, PrivilegeProvider, RUN_EXECUTABLE_ACTION_ID,
+    RequestSubject,
 };
 pub use rooted_store::{
     ElevatedRootReference, RootGrant, RootedDirectoryEntry, RootedEntry, RootedEntryKind,

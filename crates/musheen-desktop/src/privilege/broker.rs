@@ -497,7 +497,10 @@ impl BrokerLaunch {
     #[must_use]
     pub fn arguments_for(&self, request: &BrokerRequest) -> Vec<std::ffi::OsString> {
         let mut arguments = self.arguments.to_vec();
-        arguments.push(format!("--action-id={}", request.operation().action_id()).into());
+        arguments.insert(
+            2,
+            format!("--action-id={}", request.operation().action_id()).into(),
+        );
         arguments.push(format!("--request-digest={}", request.operation_digest().to_hex()).into());
         arguments.push("--target".into());
         arguments.push(request.target().as_os_str().to_owned());
@@ -540,7 +543,6 @@ pub struct ProcessBrokerTransport {
     launch: BrokerLaunch,
     timeout: Duration,
     active: Arc<AtomicBool>,
-    authorizer: Arc<dyn Authorizer>,
 }
 
 impl fmt::Debug for ProcessBrokerTransport {
@@ -560,19 +562,12 @@ impl ProcessBrokerTransport {
             launch,
             timeout: Duration::from_secs(120),
             active: Arc::new(AtomicBool::new(false)),
-            authorizer: Arc::new(super::polkit::PolkitAuthorizer::default()),
         }
     }
 
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-
-    #[must_use]
-    pub fn with_authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
-        self.authorizer = authorizer;
         self
     }
 }
@@ -597,23 +592,7 @@ impl BrokerTransport for ProcessBrokerTransport {
         if self.launch.provider() != PrivilegeProvider::Polkit {
             return Err(BrokerError::AuthorizationUnavailable);
         }
-        let authorization =
-            AuthorizationRequest::from_broker_request(request, PrivilegeProvider::Polkit);
         let deadline = Instant::now() + self.timeout;
-        match self
-            .authorizer
-            .authorize_cancellable(&authorization, cancellation, self.timeout)
-        {
-            Ok(grant) if grant.expires_at_unix_millis() > SystemClock.now_unix_millis() => {}
-            Ok(_) => return Err(BrokerError::AuthorizationExpired),
-            Err(AuthorizationError::Cancelled) => {
-                return Err(BrokerError::AuthorizationCancelled);
-            }
-            Err(AuthorizationError::Denied) => return Err(BrokerError::AuthorizationDenied),
-            Err(AuthorizationError::Unavailable) => {
-                return Err(BrokerError::AuthorizationUnavailable);
-            }
-        }
         if Instant::now() >= deadline {
             return Err(BrokerError::ExecutionTimedOut);
         }

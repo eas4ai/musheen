@@ -441,9 +441,9 @@ fn broker_launches_are_fixed_argument_vectors_and_never_relaunch_the_gui() {
         [
             "--disable-internal-agent",
             "/usr/libexec/musheen-broker",
+            "--action-id=org.musheen.run-executable-as-administrator",
             "--stdio",
             "--provider=polkit",
-            "--action-id=org.musheen.run-executable-as-administrator",
             &format!("--request-digest={}", request.operation_digest().to_hex()),
             "--target",
             "/usr/bin/true"
@@ -456,9 +456,9 @@ fn broker_launches_are_fixed_argument_vectors_and_never_relaunch_the_gui() {
         [
             "--",
             "/usr/libexec/musheen-broker",
+            "--action-id=org.musheen.run-executable-as-administrator",
             "--stdio",
             "--provider=sudo",
-            "--action-id=org.musheen.run-executable-as-administrator",
             &format!("--request-digest={}", request.operation_digest().to_hex()),
             "--target",
             "/usr/bin/true"
@@ -766,7 +766,7 @@ fn transport_admission_and_owner_cancellation_are_bounded() {
 }
 
 #[test]
-fn production_polkit_transport_authorizes_exact_request_before_helper_dispatch() {
+fn production_polkit_transport_dispatches_only_the_bound_pkexec_request() {
     let temporary = tempfile::tempdir().unwrap();
     let captured = temporary.path().join("request.frame");
     let response =
@@ -782,20 +782,13 @@ fn production_polkit_transport_authorizes_exact_request_before_helper_dispatch()
     );
     let executable = executable_script(temporary.path(), "tool", "exit 0");
     let request = BrokerRequest::run_executable(&executable, ["--exact", "semi;colon"]).unwrap();
-    let authorizer = FakeAuthorizer::granting(u64::MAX);
-    let observed = Arc::clone(&authorizer.observed);
     let transport = ProcessBrokerTransport::new(BrokerLaunch::polkit_with_program(
         helper,
         "/fixed/musheen-broker",
     ))
-    .with_authorizer(Arc::new(authorizer))
     .with_timeout(Duration::from_secs(1));
 
     assert_eq!(transport.perform(&request), Ok(BrokerOutput::Exited(0)));
-    let calls = observed.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].target(), executable);
-    assert_eq!(calls[0].binding_digest(), request.binding_digest());
     assert!(
         fs::read_to_string(captured)
             .unwrap()

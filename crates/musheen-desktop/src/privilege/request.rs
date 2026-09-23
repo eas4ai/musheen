@@ -9,6 +9,15 @@ const MAX_ARGUMENTS: usize = 256;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+pub const OPEN_DIRECTORY_ACTION_ID: &str = "org.musheen.open-directory-as-administrator";
+pub const RUN_EXECUTABLE_ACTION_ID: &str = "org.musheen.run-executable-as-administrator";
+pub const BROWSE_DIRECTORY_ACTION_ID: &str = "org.musheen.browse-directory-as-administrator";
+pub const ADMIN_ACTION_IDS: [&str; 3] = [
+    OPEN_DIRECTORY_ACTION_ID,
+    RUN_EXECUTABLE_ACTION_ID,
+    BROWSE_DIRECTORY_ACTION_ID,
+];
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrivilegeProvider {
@@ -57,9 +66,9 @@ impl BrokerOperation {
     #[must_use]
     pub const fn action_id(&self) -> &'static str {
         match self {
-            Self::OpenDirectory { .. } => "org.musheen.open-directory-as-administrator",
-            Self::RunExecutable { .. } => "org.musheen.run-executable-as-administrator",
-            Self::ReadDirectory { .. } => "org.musheen.browse-directory-as-administrator",
+            Self::OpenDirectory { .. } => OPEN_DIRECTORY_ACTION_ID,
+            Self::RunExecutable { .. } => RUN_EXECUTABLE_ACTION_ID,
+            Self::ReadDirectory { .. } => BROWSE_DIRECTORY_ACTION_ID,
         }
     }
 

@@ -1,8 +1,8 @@
 use musheen_desktop::Clock as _;
 use musheen_desktop::privilege::{
     AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker,
-    BrokerResponse, JsonAuditLog, PolkitAuthorizer, PrivilegeProvider, SUDO_BROKER_READY,
-    SystemClock, SystemOperationRunner, decode_broker_request, encode_broker_response,
+    BrokerResponse, JsonAuditLog, PrivilegeProvider, SUDO_BROKER_READY, SystemClock,
+    SystemOperationRunner, decode_broker_request, encode_broker_response,
 };
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const AUDIT_PATH: &str = "/var/log/musheen/privilege.jsonl";
 
 enum ElevatedBrokerAuthorizer {
-    Polkit(PolkitAuthorizer),
+    Pkexec,
     Sudo,
 }
 
@@ -23,22 +23,21 @@ impl Authorizer for ElevatedBrokerAuthorizer {
         if rustix::process::geteuid().as_raw() != 0 {
             return Err(AuthorizationError::Denied);
         }
-        match self {
-            Self::Polkit(authorizer) => authorizer.authorize(request),
-            Self::Sudo => {
-                let invoking_uid = std::env::var("SUDO_UID")
-                    .ok()
-                    .and_then(|uid| uid.parse::<u32>().ok())
-                    .ok_or(AuthorizationError::Denied)?;
-                if invoking_uid != request.subject().uid() {
-                    return Err(AuthorizationError::Denied);
-                }
-                Ok(AuthorizationGrant::new(
-                    format!("uid:{invoking_uid}"),
-                    SystemClock.now_unix_millis().saturating_add(60_000),
-                ))
-            }
+        let variable = match self {
+            Self::Pkexec => "PKEXEC_UID",
+            Self::Sudo => "SUDO_UID",
+        };
+        let invoking_uid = std::env::var(variable)
+            .ok()
+            .and_then(|uid| uid.parse::<u32>().ok())
+            .ok_or(AuthorizationError::Denied)?;
+        if invoking_uid != request.subject().uid() {
+            return Err(AuthorizationError::Denied);
         }
+        Ok(AuthorizationGrant::new(
+            format!("uid:{invoking_uid}"),
+            SystemClock.now_unix_millis().saturating_add(60_000),
+        ))
     }
 }
 
@@ -98,9 +97,7 @@ fn main() {
         Err(_) => return fail("broker audit unavailable", 3),
     };
     let authorizer = match provider {
-        PrivilegeProvider::Polkit => ElevatedBrokerAuthorizer::Polkit(
-            PolkitAuthorizer::default().with_user_interaction(false),
-        ),
+        PrivilegeProvider::Polkit => ElevatedBrokerAuthorizer::Pkexec,
         PrivilegeProvider::Sudo => ElevatedBrokerAuthorizer::Sudo,
     };
     let broker = Broker::new(
@@ -136,6 +133,11 @@ impl InvocationBinding {
 
 fn parse_invocation() -> Option<InvocationBinding> {
     let mut arguments = std::env::args_os().skip(1);
+    let action_id = arguments
+        .next()?
+        .to_str()?
+        .strip_prefix("--action-id=")?
+        .to_owned();
     if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--stdio")) {
         return None;
     }
@@ -144,11 +146,6 @@ fn parse_invocation() -> Option<InvocationBinding> {
         "--provider=sudo" => PrivilegeProvider::Sudo,
         _ => return None,
     };
-    let action_id = arguments
-        .next()?
-        .to_str()?
-        .strip_prefix("--action-id=")?
-        .to_owned();
     let request_digest = arguments
         .next()?
         .to_str()?
