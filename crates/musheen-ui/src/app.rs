@@ -5,12 +5,14 @@ use catalog::{CatalogBinding, DirectoryObservation, TagTarget};
 
 use crate::date_time::format_modified;
 use crate::dialogs::{
-    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, OpenWithDialog, OpenWithDialogEvent,
-    OpenWithIntent as DialogOpenWithIntent, OpenWithModel, PropertiesFailureWindow, PropertiesPage,
-    PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow, ProviderPropertiesWindowData,
-    TagDelta, TagWriter, VolumePropertiesModel, VolumePropertiesWindow, conflict_window_options,
-    install_open_with_key_bindings, install_properties_key_bindings, open_with_window_options,
-    properties_window_options,
+    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, MetadataReviewChoice,
+    MetadataReviewDialog, MetadataReviewDialogEvent, MetadataReviewDialogModel, OpenWithDialog,
+    OpenWithDialogEvent, OpenWithIntent as DialogOpenWithIntent, OpenWithModel,
+    PropertiesFailureWindow, PropertiesPage, PropertiesWindow, PropertiesWindowData,
+    ProviderPropertiesWindow, ProviderPropertiesWindowData, TagDelta, TagWriter,
+    VolumePropertiesModel, VolumePropertiesWindow, conflict_window_options,
+    install_open_with_key_bindings, install_properties_key_bindings,
+    metadata_review_window_options, open_with_window_options, properties_window_options,
 };
 use crate::directory::{ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState};
 use crate::elevated_browser::{PrivilegeBackend, RootedFilesystemStore, SystemPrivilegeBackend};
@@ -2948,6 +2950,7 @@ struct MusheenApp {
     #[cfg(test)]
     command_dispatch_probe: Option<CommandDispatchProbe>,
     pending_restores: HashMap<WindowId, PendingRestore>,
+    pending_metadata_reviews: HashMap<WindowId, JobId>,
     pending_drop: Option<PendingDrop>,
     transfer_preflights: usize,
     file_clipboard: Option<FileClipboard>,
@@ -3661,6 +3664,7 @@ impl MusheenApp {
             #[cfg(test)]
             command_dispatch_probe: None,
             pending_restores: HashMap::new(),
+            pending_metadata_reviews: HashMap::new(),
             pending_drop: None,
             transfer_preflights: 0,
             file_clipboard: None,
@@ -6516,6 +6520,9 @@ impl MusheenApp {
         };
         let dialog = self.context_dialog_windows.remove(index);
         self.pending_restores.remove(&closed);
+        if let Some(id) = self.pending_metadata_reviews.remove(&closed) {
+            self.resolve_metadata_review_choice(id, MetadataReviewChoice::KeepSource, cx);
+        }
         if self
             .pending_drop
             .as_ref()
@@ -8760,45 +8767,144 @@ impl MusheenApp {
         let result = spawn_ready_hub_operations(
             self.operation_hub.clone(),
             cx,
-            |state: &mut Self, id, outcome, error, cx| {
-                if state.pending_cut_jobs.remove(&id) {
-                    let moved = matches!(
-                        &outcome,
-                        Some(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
-                            _
-                        )))
-                    ) && error.is_none();
-                    if !moved {
-                        // Preserve the cut clipboard after any failed or
-                        // skipped move so the user can retry safely.
-                        state.pending_cut_jobs.clear();
-                    } else if state.pending_cut_jobs.is_empty() {
-                        state.file_clipboard = None;
-                    }
-                }
-                if let Some(error) = error {
-                    state.operation_error = Some(error);
-                }
-                if let Some(outcome) = outcome {
-                    state.finish_catalog_move(id, outcome);
-                    // A background completion refreshes the current tab; it
-                    // must not steal focus restored when a review closes.
-                    let pending_content_focus = state.pending_content_focus;
-                    let tab_id = state.navigation.focused_tab().id();
-                    let location = state.navigation.focused_tab().location().clone();
-                    state.start_operation_directory_refresh(tab_id, location, cx);
-                    state.pending_content_focus = pending_content_focus;
-                } else {
-                    state.pending_catalog_moves.remove(&id);
-                }
-                state.pump_operation_queue(cx);
-                cx.notify();
-            },
+            Self::handle_finished_operation,
         );
         if let Err(error) = result {
             self.operation_error = Some(error.to_string().into());
             cx.notify();
         }
+    }
+
+    fn handle_finished_operation(
+        &mut self,
+        id: JobId,
+        outcome: Option<LocalOperationOutcome>,
+        error: Option<Box<str>>,
+        cx: &mut Context<Self>,
+    ) {
+        let awaiting_metadata_review = matches!(
+            &outcome,
+            Some(LocalOperationOutcome::Transfer(
+                TransferOutcome::MetadataReview { .. }
+            ))
+        );
+        if !awaiting_metadata_review && self.pending_cut_jobs.remove(&id) {
+            let moved = matches!(
+                &outcome,
+                Some(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
+                    _
+                )))
+            ) && error.is_none();
+            if !moved {
+                // Preserve the cut clipboard after any failed or skipped move
+                // so the user can retry safely.
+                self.pending_cut_jobs.clear();
+            } else if self.pending_cut_jobs.is_empty() {
+                self.file_clipboard = None;
+            }
+        }
+        if let Some(error) = error {
+            self.operation_error = Some(error);
+        }
+        if let Some(outcome) = outcome {
+            match outcome {
+                LocalOperationOutcome::Transfer(TransferOutcome::MetadataReview {
+                    review, ..
+                }) => self.open_metadata_review(id, *review, cx),
+                outcome => self.finish_catalog_move(id, outcome),
+            }
+            // A background completion refreshes the current tab; it must not
+            // steal focus restored when a review closes.
+            let pending_content_focus = self.pending_content_focus;
+            let tab_id = self.navigation.focused_tab().id();
+            let location = self.navigation.focused_tab().location().clone();
+            self.start_operation_directory_refresh(tab_id, location, cx);
+            self.pending_content_focus = pending_content_focus;
+        } else {
+            self.pending_catalog_moves.remove(&id);
+        }
+        self.pump_operation_queue(cx);
+        cx.notify();
+    }
+
+    fn open_metadata_review(
+        &mut self,
+        id: JobId,
+        review: musheen_ops::MoveMetadataReview,
+        cx: &mut Context<Self>,
+    ) {
+        let model = MetadataReviewDialogModel::new(
+            review.source().clone(),
+            review.destination().clone(),
+            review.metadata().clone(),
+            &self.catalog,
+        );
+        let title = model.title().to_owned();
+        let mut dialog = None;
+        let options = metadata_review_window_options(title, cx);
+        let window = match cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| MetadataReviewDialog::new(model, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        }) {
+            Ok(window) => window,
+            Err(error) => {
+                self.resolve_metadata_review_choice(id, MetadataReviewChoice::KeepSource, cx);
+                if self.operation_error.is_none() {
+                    let explanation = self
+                        .catalog
+                        .message("metadata-review-open-failed")
+                        .expect("the metadata review failure message exists");
+                    self.operation_error = Some(format!("{explanation}: {error}").into());
+                }
+                return;
+            }
+        };
+        let window_id = window.window_id();
+        let dialog = dialog.expect("the metadata review dialog constructs its view");
+        self.pending_metadata_reviews.insert(window_id, id);
+        self.track_context_dialog_window(window_id, None, cx);
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| {
+            this.pending_metadata_reviews.remove(&window_id);
+            this.resolve_metadata_review(id, *event, cx);
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    fn resolve_metadata_review(
+        &mut self,
+        id: JobId,
+        event: MetadataReviewDialogEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let MetadataReviewDialogEvent::Resolved(choice) = event;
+        self.resolve_metadata_review_choice(id, choice, cx);
+    }
+
+    fn resolve_metadata_review_choice(
+        &mut self,
+        id: JobId,
+        choice: MetadataReviewChoice,
+        cx: &mut Context<Self>,
+    ) {
+        let result = match choice {
+            MetadataReviewChoice::RemoveSource => {
+                self.operation_hub.confirm_metadata_loss(id).map(|()| true)
+            }
+            MetadataReviewChoice::KeepSource => self
+                .operation_hub
+                .keep_source_after_metadata_review(id)
+                .map(|()| false),
+        };
+        match result {
+            Ok(true) => self.pump_operation_queue(cx),
+            Ok(false) => {
+                self.pending_cut_jobs.remove(&id);
+                self.pending_catalog_moves.remove(&id);
+            }
+            Err(error) => self.operation_error = Some(error.to_string().into()),
+        }
+        cx.notify();
     }
 
     fn finish_catalog_move(&mut self, id: musheen_ops::JobId, outcome: LocalOperationOutcome) {
@@ -8816,6 +8922,7 @@ impl MusheenApp {
                     &capabilities,
                 )
             }
+            LocalOperationOutcome::Transfer(TransferOutcome::MetadataReview { .. }) => return,
             LocalOperationOutcome::Metadata => {
                 self.operation_error = Some(
                     format!(

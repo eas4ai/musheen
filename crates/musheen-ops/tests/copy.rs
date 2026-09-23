@@ -175,6 +175,27 @@ fn strategy_fallbacks_report_unpreserved_layout_and_link_relationships() {
 }
 
 #[test]
+fn directory_allocation_does_not_report_sparse_file_layout_loss() {
+    let mut provider = RecordingProvider::regular();
+    provider.initial = EntrySnapshot::new(b"directory".to_vec(), EntryKind::Directory, 80, 0, 1);
+
+    let outcome = CopySession::default()
+        .execute(
+            &mut provider,
+            &request("directory"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+    assert!(
+        !outcome
+            .metadata()
+            .skipped()
+            .contains(&MetadataKind::SparseLayout)
+    );
+}
+
+#[test]
 fn failures_and_cancellation_remove_unpublished_staging() {
     for (action, error) in [
         (Action::Stream, ProviderError::OutOfSpace),

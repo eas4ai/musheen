@@ -42,7 +42,10 @@ pub use metadata::{
     MetadataPlan, MetadataProvider, MetadataScope, ResolvedMetadataChange,
 };
 pub use metadata_copy::{MetadataKind, MetadataReport};
-pub use r#move::{MoveOutcome, MoveStrategy, execute_move};
+pub use r#move::{
+    MoveMetadataReview, MoveOutcome, MoveStrategy, complete_move_after_metadata_review,
+    execute_move,
+};
 pub use mutation::{MutationError, MutationProvider};
 pub use plan::{
     ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, InverseTemplate, OperationKind,

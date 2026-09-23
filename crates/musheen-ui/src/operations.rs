@@ -603,6 +603,35 @@ impl OperationHub {
         Ok(())
     }
 
+    #[must_use]
+    pub fn can_confirm_metadata_loss(&self, id: JobId) -> bool {
+        self.job_is_unreserved(id)
+            && self
+                .queue
+                .lock()
+                .is_ok_and(|queue| queue.can_confirm_metadata_loss(id))
+    }
+
+    pub fn confirm_metadata_loss(&self, id: JobId) -> Result<(), OperationHubError> {
+        let generation = self.with_unreserved_job(id, |queue| queue.confirm_metadata_loss(id))?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .mark_metadata_review_pending(id, generation)?;
+        self.persist_status();
+        Ok(())
+    }
+
+    pub fn keep_source_after_metadata_review(&self, id: JobId) -> Result<(), OperationHubError> {
+        self.with_unreserved_job(id, |queue| queue.keep_source_after_metadata_review(id))?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .acknowledge_metadata_review_keep_source(id)?;
+        self.persist_status();
+        Ok(())
+    }
+
     pub fn cancel(&self, id: JobId) -> Result<(), OperationHubError> {
         let state = {
             let mut queue = self
@@ -954,18 +983,22 @@ where
             let result = work.await;
             let outcome = result.as_ref().ok().cloned();
             let failure = result.as_ref().err().cloned();
-            let queue_result = result
-                .as_ref()
-                .map(|_| ())
-                .map_err(|error| Box::<str>::from(error.message().to_owned()));
-            let finish = hub
-                .queue
-                .lock()
-                .map_err(|_| OperationHubError::QueueLock)
-                .and_then(|mut queue| {
-                    queue.finish(id, queue_result)?;
-                    Ok(queue.state(id))
-                });
+            let finish =
+                hub.queue
+                    .lock()
+                    .map_err(|_| OperationHubError::QueueLock)
+                    .and_then(|mut queue| {
+                        match result.as_ref() {
+                            Ok(LocalOperationOutcome::Transfer(
+                                TransferOutcome::MetadataReview { review, .. },
+                            )) => queue.finish_metadata_review(id, review.clone())?,
+                            Ok(_) => queue.finish(id, Ok(()))?,
+                            Err(error) => {
+                                queue.finish(id, Err(error.message().to_owned().into()))?;
+                            }
+                        }
+                        Ok(queue.state(id))
+                    });
             let status_result = hub
                 .status
                 .lock()
@@ -976,6 +1009,7 @@ where
                         id,
                         finish.as_ref().ok().copied().flatten(),
                         affected_path,
+                        outcome.as_ref(),
                         failure.as_ref(),
                     )
                     .map_err(Into::into)
@@ -1004,8 +1038,21 @@ fn record_finished_operation(
     id: JobId,
     state: Option<JobState>,
     affected_path: StorePath,
+    outcome: Option<&LocalOperationOutcome>,
     failure: Option<&LocalOperationFailure>,
 ) -> Result<(), StatusCenterError> {
+    if let Some(LocalOperationOutcome::Transfer(TransferOutcome::MetadataReview {
+        review, ..
+    })) = outcome
+    {
+        status.record_failure(
+            id,
+            review.source().clone(),
+            metadata_review_message(review.metadata()),
+            [RecoveryAction::ViewLocation],
+        )?;
+        return status.mark_needs_attention(id);
+    }
     match state {
         Some(JobState::Cancelled) => status.mark_cancelled(id),
         Some(JobState::Completed) => {
@@ -1015,6 +1062,27 @@ fn record_finished_operation(
         Some(JobState::Failed) => record_failed_operation(status, id, affected_path, failure),
         _ => Ok(()),
     }
+}
+
+fn metadata_review_message(report: &musheen_ops::MetadataReport) -> Box<str> {
+    let skipped = report
+        .skipped()
+        .iter()
+        .map(|kind| match kind {
+            musheen_ops::MetadataKind::Timestamps => "timestamps",
+            musheen_ops::MetadataKind::Mode => "permissions",
+            musheen_ops::MetadataKind::Ownership => "ownership",
+            musheen_ops::MetadataKind::ExtendedAttributes => "extended attributes",
+            musheen_ops::MetadataKind::AccessControlList => "access control lists",
+            musheen_ops::MetadataKind::SparseLayout => "sparse layout",
+            musheen_ops::MetadataKind::HardLinkRelationship => "hard-link relationships",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "the destination was copied, but the source was kept because these metadata could not be preserved: {skipped}"
+    )
+    .into()
 }
 
 fn record_failed_operation(
@@ -1185,6 +1253,7 @@ mod tests {
             id,
             Some(JobState::Failed),
             affected_path,
+            None,
             None,
         )
         .unwrap();

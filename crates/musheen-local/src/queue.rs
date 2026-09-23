@@ -6,10 +6,11 @@ use musheen_core::{CommandTargetRef, DisplayPath, ItemId, ResourceLimits, Store,
 use musheen_ops::{
     ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest, CopySession, CreateRequest,
     DeleteTarget, EventGeneration, JobId, JobState, MetadataChange, MetadataPlan, MetadataScope,
-    MutationError, MutationProvider, OperationFailure, OperationKind, OperationPlan,
-    PermanentDeleteConfirmation, PermanentDeleteRequest, ProviderLimits, ProviderSnapshot,
-    PublicationState, RenameRequest, Scheduler, SchedulerError, SourceState, execute_create,
-    execute_delete, execute_move, execute_permanent_delete, execute_rename,
+    MoveMetadataReview, MutationError, MutationProvider, OperationFailure, OperationKind,
+    OperationPlan, PermanentDeleteConfirmation, PermanentDeleteRequest, ProviderLimits,
+    ProviderSnapshot, PublicationState, RenameRequest, Scheduler, SchedulerError, SourceState,
+    complete_move_after_metadata_review, execute_create, execute_delete, execute_move,
+    execute_permanent_delete, execute_rename,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -97,6 +98,7 @@ enum LocalOperation {
         expected_identity: Option<ItemId>,
         provider_route: Option<Arc<dyn ProviderTransferRoute>>,
     },
+    FinalizeMove(Box<MoveMetadataReview>),
     Metadata(MetadataPlan),
     Create(CreateRequest),
     Rename(RenameRequest),
@@ -111,6 +113,7 @@ impl LocalOperation {
     const fn kind(&self) -> OperationKind {
         match self {
             Self::Transfer { action, .. } => action.operation_kind(),
+            Self::FinalizeMove(_) => OperationKind::Move,
             Self::Metadata(plan) => {
                 if plan.requires_permissions() {
                     OperationKind::SetPermissions
@@ -131,6 +134,7 @@ impl LocalOperation {
     fn affected_path(&self) -> &StorePath {
         match self {
             Self::Transfer { source, .. } => source,
+            Self::FinalizeMove(review) => review.source(),
             Self::Metadata(plan) => plan.root(),
             Self::Create(request) => request.parent(),
             Self::Rename(request) => request.source(),
@@ -146,6 +150,9 @@ impl LocalOperation {
                 destination,
                 ..
             } => vec![source.clone(), destination.clone()],
+            Self::FinalizeMove(review) => {
+                vec![review.source().clone(), review.destination().clone()]
+            }
             Self::Metadata(plan) => vec![plan.root().clone()],
             Self::Create(request) => vec![request.parent().clone()],
             Self::Rename(request) => vec![request.source().clone()],
@@ -178,6 +185,10 @@ pub struct ReadyLocalOperation {
 pub enum TransferOutcome {
     Skipped,
     Completed(CommandTargetRef),
+    MetadataReview {
+        target: CommandTargetRef,
+        review: Box<MoveMetadataReview>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -421,9 +432,10 @@ impl ReadyLocalOperation {
                         ResolvedTransferOutcome::Skipped => {
                             Ok(LocalOperationOutcome::Transfer(TransferOutcome::Skipped))
                         }
-                        ResolvedTransferOutcome::Completed(path) => {
-                            transfer_completed(&store, path)
-                        }
+                        ResolvedTransferOutcome::Completed {
+                            path,
+                            metadata_review,
+                        } => transfer_completed(&store, path, metadata_review),
                     };
                 }
                 match action {
@@ -431,13 +443,24 @@ impl ReadyLocalOperation {
                         CopySession::default()
                             .execute(&mut store, &request, &self.cancellation)
                             .map_err(LocalOperationFailure::from_transfer)?;
+                        transfer_completed(&store, request.destination().clone(), None)
                     }
                     DropAction::Move => {
-                        execute_move(&mut store, &request, &self.cancellation)
+                        let outcome = execute_move(&mut store, &request, &self.cancellation)
                             .map_err(LocalOperationFailure::from_transfer)?;
+                        transfer_completed(
+                            &store,
+                            request.destination().clone(),
+                            outcome.into_metadata_review().map(Box::new),
+                        )
                     }
-                };
-                transfer_completed(&store, request.destination().clone())
+                }
+            }
+            LocalOperation::FinalizeMove(review) => {
+                let destination = review.destination().clone();
+                complete_move_after_metadata_review(&mut store, *review, &self.cancellation)
+                    .map_err(LocalOperationFailure::from_transfer)?;
+                transfer_completed(&store, destination, None)
             }
             LocalOperation::Metadata(plan) => plan
                 .execute_controlled(&mut store, &self.cancellation)
@@ -477,6 +500,7 @@ impl ReadyLocalOperation {
 fn transfer_completed(
     store: &LocalStore,
     path: StorePath,
+    metadata_review: Option<Box<MoveMetadataReview>>,
 ) -> Result<LocalOperationOutcome, LocalOperationFailure> {
     let item = store
         .resolve_item(&path)
@@ -488,8 +512,9 @@ fn transfer_completed(
         })?;
     let target = CommandTargetRef::new(item.id().clone(), path)
         .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
-    Ok(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
-        target,
+    Ok(LocalOperationOutcome::Transfer(metadata_review.map_or(
+        TransferOutcome::Completed(target.clone()),
+        |review| TransferOutcome::MetadataReview { target, review },
     )))
 }
 
@@ -728,6 +753,48 @@ impl LocalOperationQueue {
                 self.failures.insert(id, error);
             }
         }
+        Ok(())
+    }
+
+    pub fn finish_metadata_review(
+        &mut self,
+        id: JobId,
+        review: Box<MoveMetadataReview>,
+    ) -> Result<(), DropError> {
+        self.scheduler.fail(id)?;
+        self.operations
+            .insert(id, LocalOperation::FinalizeMove(review));
+        self.failures
+            .insert(id, "metadata loss requires confirmation".into());
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn can_confirm_metadata_loss(&self, id: JobId) -> bool {
+        self.scheduler.state(id) == Some(JobState::Failed)
+            && matches!(
+                self.operations.get(&id),
+                Some(LocalOperation::FinalizeMove(_))
+            )
+    }
+
+    pub fn confirm_metadata_loss(&mut self, id: JobId) -> Result<EventGeneration, DropError> {
+        if !self.can_confirm_metadata_loss(id) {
+            return Err(DropError::MissingOperation(id));
+        }
+        let generation = self.scheduler.retry(id)?;
+        self.failures.remove(&id);
+        Ok(generation)
+    }
+
+    pub fn keep_source_after_metadata_review(&mut self, id: JobId) -> Result<(), DropError> {
+        if !self.can_confirm_metadata_loss(id) {
+            return Err(DropError::MissingOperation(id));
+        }
+        self.scheduler.retry(id)?;
+        self.scheduler.cancel(id)?;
+        self.operations.remove(&id);
+        self.failures.remove(&id);
         Ok(())
     }
 
@@ -1210,6 +1277,25 @@ impl From<SchedulerError> for DropError {
 mod tests {
     use super::*;
 
+    fn metadata_review(
+        source: StorePath,
+        destination: StorePath,
+    ) -> musheen_ops::MoveMetadataReview {
+        musheen_ops::MoveMetadataReview::new(
+            source,
+            destination,
+            musheen_ops::EntrySnapshot::new(
+                b"source".to_vec(),
+                musheen_ops::EntryKind::RegularFile,
+                8,
+                8,
+                1,
+            ),
+            musheen_ops::CopyStrategy::Streamed,
+            musheen_ops::MetadataReport::with_skipped([musheen_ops::MetadataKind::Ownership]),
+        )
+    }
+
     fn finish_one(queue: &mut LocalOperationQueue) -> LocalOperationOutcome {
         let operation = queue
             .start_ready()
@@ -1238,6 +1324,71 @@ mod tests {
             failure.message(),
             "the published destination needs inspection"
         );
+    }
+
+    #[test]
+    fn metadata_review_stays_failed_until_the_user_confirms_source_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        let destination_directory = temporary.path().join("destination");
+        fs::write(&source_path, b"contents").unwrap();
+        fs::create_dir(&destination_directory).unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let target = StorePath::from_unix_path(destination_directory.as_os_str());
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let id = queue
+            .submit_drop(
+                FileDragPayload::new(vec![source.clone()], DropAction::Move).unwrap(),
+                target,
+            )
+            .unwrap()[0];
+        let destination = queue.operation_paths(id).unwrap()[1].clone();
+        let _running = queue.start_ready().unwrap();
+
+        queue
+            .finish_metadata_review(
+                id,
+                Box::new(metadata_review(source.clone(), destination.clone())),
+            )
+            .unwrap();
+
+        assert_eq!(queue.state(id), Some(JobState::Failed));
+        assert!(queue.can_confirm_metadata_loss(id));
+        assert_eq!(queue.operation_paths(id), Some(vec![source, destination]));
+
+        queue.confirm_metadata_loss(id).unwrap();
+
+        assert_eq!(queue.state(id), Some(JobState::Queued));
+        assert_eq!(queue.start_ready().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn keeping_the_source_cancels_the_pending_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        let destination_directory = temporary.path().join("destination");
+        fs::write(&source_path, b"contents").unwrap();
+        fs::create_dir(&destination_directory).unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let target = StorePath::from_unix_path(destination_directory.as_os_str());
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let id = queue
+            .submit_drop(
+                FileDragPayload::new(vec![source.clone()], DropAction::Move).unwrap(),
+                target,
+            )
+            .unwrap()[0];
+        let destination = queue.operation_paths(id).unwrap()[1].clone();
+        let _running = queue.start_ready().unwrap();
+        queue
+            .finish_metadata_review(id, Box::new(metadata_review(source, destination)))
+            .unwrap();
+
+        queue.keep_source_after_metadata_review(id).unwrap();
+
+        assert_eq!(queue.state(id), Some(JobState::Cancelled));
+        assert!(!queue.can_confirm_metadata_loss(id));
+        assert!(queue.start_ready().unwrap().is_empty());
     }
 
     #[test]

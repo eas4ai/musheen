@@ -3,7 +3,7 @@ mod support;
 use musheen_core::CancellationToken;
 use musheen_ops::{
     MetadataKind, MetadataReport, MoveStrategy, OperationFailure, ProviderError, SourceState,
-    execute_move,
+    complete_move_after_metadata_review, execute_move,
 };
 use support::{Action, RecordingProvider, destination, request};
 
@@ -116,7 +116,7 @@ fn partial_source_removal_preserves_the_verified_destination() {
 }
 
 #[test]
-fn verified_move_reports_metadata_that_was_not_preserved() {
+fn metadata_loss_requires_review_before_source_removal() {
     let mut provider = RecordingProvider::regular();
     provider.metadata =
         MetadataReport::with_skipped([MetadataKind::Ownership, MetadataKind::AccessControlList]);
@@ -129,6 +129,63 @@ fn verified_move_reports_metadata_that_was_not_preserved() {
     .unwrap();
 
     assert_eq!(outcome.metadata(), &provider.metadata);
+    assert_eq!(
+        outcome
+            .metadata_review()
+            .expect("incomplete metadata requires a decision")
+            .metadata(),
+        &provider.metadata
+    );
+    assert!(!provider.actions.contains(&Action::PrepareSourceRemoval));
+    assert!(!provider.actions.contains(&Action::RemoveSource));
+}
+
+#[test]
+fn confirmed_metadata_loss_removes_the_unchanged_source() {
+    let mut provider = RecordingProvider::regular();
+    provider.metadata = MetadataReport::with_skipped([MetadataKind::Ownership]);
+    let outcome = execute_move(
+        &mut provider,
+        &request("metadata-confirmed"),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    let review = outcome
+        .into_metadata_review()
+        .expect("incomplete metadata requires a decision");
+
+    let completed =
+        complete_move_after_metadata_review(&mut provider, review, &CancellationToken::new())
+            .unwrap();
+
+    assert!(completed.metadata_review().is_none());
+    assert_eq!(completed.metadata(), &provider.metadata);
+    assert!(provider.actions.contains(&Action::PrepareSourceRemoval));
+    assert!(provider.actions.contains(&Action::RemoveSource));
+}
+
+#[test]
+fn confirmed_metadata_loss_reverifies_the_published_destination_before_removal() {
+    let mut provider = RecordingProvider::regular();
+    provider.metadata = MetadataReport::with_skipped([MetadataKind::Ownership]);
+    let review = execute_move(
+        &mut provider,
+        &request("metadata-destination-changed"),
+        &CancellationToken::new(),
+    )
+    .unwrap()
+    .into_metadata_review()
+    .expect("incomplete metadata requires a decision");
+    provider.verify_ok = false;
+    provider.actions.clear();
+
+    let failure =
+        complete_move_after_metadata_review(&mut provider, review, &CancellationToken::new())
+            .unwrap_err();
+
+    assert!(failure.destination_published());
+    assert!(failure.source_retained());
+    assert_eq!(provider.actions, [Action::Verify]);
 }
 
 fn move_failure(provider: &mut RecordingProvider, name: &str) -> OperationFailure {

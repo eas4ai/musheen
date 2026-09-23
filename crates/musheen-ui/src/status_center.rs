@@ -408,6 +408,35 @@ impl StatusCenterModel {
         Ok(())
     }
 
+    pub fn mark_metadata_review_pending(
+        &mut self,
+        id: JobId,
+        generation: EventGeneration,
+    ) -> Result<(), StatusCenterError> {
+        let entry = self.entry_mut(id)?;
+        if entry.status != OperationStatus::NeedsAttention {
+            return Err(StatusCenterError::InvalidState(id));
+        }
+        entry.generation = generation;
+        entry.status = OperationStatus::Pending;
+        entry.completed_items = 0;
+        entry.failures.clear();
+        entry.dismissed = false;
+        Ok(())
+    }
+
+    pub fn acknowledge_metadata_review_keep_source(
+        &mut self,
+        id: JobId,
+    ) -> Result<(), StatusCenterError> {
+        let entry = self.entry_mut(id)?;
+        if entry.status != OperationStatus::NeedsAttention {
+            return Err(StatusCenterError::InvalidState(id));
+        }
+        entry.status = OperationStatus::Cancelled;
+        Ok(())
+    }
+
     pub fn mark_staging_discarded(
         &mut self,
         id: JobId,

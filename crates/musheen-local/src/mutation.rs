@@ -4,8 +4,9 @@ use musheen_core::{CancellationToken, CapabilityKind, CapabilityState, StorePath
 use musheen_ops::{
     AclChange, AclEntry, AclQualifier, ConflictChoice, ConflictDecision, CopyRequest, CopySession,
     CreateKind, DeleteProvider, DeleteTarget, LinkProvider, MetadataEntry, MetadataEntryKind,
-    MetadataProvider, MetadataScope, MutationError, MutationProvider, OperationFailure,
-    OperationKind, ResolvedMetadataChange, StagingPath, TrashReceipt, execute_move,
+    MetadataProvider, MetadataScope, MoveMetadataReview, MutationError, MutationProvider,
+    OperationFailure, OperationKind, ResolvedMetadataChange, StagingPath, TrashReceipt,
+    execute_move,
 };
 use posix_acl::{ACL_EXECUTE, ACL_READ, ACL_WRITE, PosixACL, Qualifier};
 use rustix::fd::OwnedFd;
@@ -61,7 +62,10 @@ pub(crate) enum ResolvedTransferFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ResolvedTransferOutcome {
     Skipped,
-    Completed(StorePath),
+    Completed {
+        path: StorePath,
+        metadata_review: Option<Box<MoveMetadataReview>>,
+    },
 }
 
 impl From<OperationFailure> for ResolvedTransferFailure {
@@ -636,22 +640,28 @@ pub(crate) fn execute_resolved_transfer(
                 destination,
             )
             .with_options(request.options());
-            execute_transfer(store, &alternate, decision.operation(), cancellation)?;
-            Ok(ResolvedTransferOutcome::Completed(
-                alternate.destination().clone(),
-            ))
+            let metadata_review =
+                execute_transfer(store, &alternate, decision.operation(), cancellation)?;
+            Ok(ResolvedTransferOutcome::Completed {
+                path: alternate.destination().clone(),
+                metadata_review,
+            })
         }
         ConflictChoice::Replace | ConflictChoice::ReplaceTree => {
-            execute_replacing_transfer(store, request, decision.operation(), cancellation)?;
-            Ok(ResolvedTransferOutcome::Completed(
-                request.destination().clone(),
-            ))
+            let metadata_review =
+                execute_replacing_transfer(store, request, decision.operation(), cancellation)?;
+            Ok(ResolvedTransferOutcome::Completed {
+                path: request.destination().clone(),
+                metadata_review,
+            })
         }
         ConflictChoice::MergeDirectory => {
-            execute_merging_transfer(store, request, decision.operation(), cancellation)?;
-            Ok(ResolvedTransferOutcome::Completed(
-                request.destination().clone(),
-            ))
+            let metadata_review =
+                execute_merging_transfer(store, request, decision.operation(), cancellation)?;
+            Ok(ResolvedTransferOutcome::Completed {
+                path: request.destination().clone(),
+                metadata_review,
+            })
         }
     }
 }
@@ -687,14 +697,14 @@ fn execute_transfer(
     request: &CopyRequest,
     operation: OperationKind,
     cancellation: &CancellationToken,
-) -> Result<(), ResolvedTransferFailure> {
+) -> Result<Option<Box<MoveMetadataReview>>, ResolvedTransferFailure> {
     match operation {
         OperationKind::Copy => CopySession::default()
             .execute(store, request, cancellation)
-            .map(|_| ())
+            .map(|_| None)
             .map_err(ResolvedTransferFailure::Transfer),
         OperationKind::Move => execute_move(store, request, cancellation)
-            .map(|_| ())
+            .map(|outcome| outcome.into_metadata_review().map(Box::new))
             .map_err(ResolvedTransferFailure::Transfer),
         _ => Err(ResolvedTransferFailure::Failed(
             "the conflict does not describe a transfer".into(),
@@ -1108,50 +1118,53 @@ fn execute_replacing_transfer(
     request: &CopyRequest,
     operation: OperationKind,
     cancellation: &CancellationToken,
-) -> Result<(), ResolvedTransferFailure> {
+) -> Result<Option<Box<MoveMetadataReview>>, ResolvedTransferFailure> {
     let destination = request.destination().as_unix_path().ok_or_else(|| {
         ResolvedTransferFailure::Failed("the destination is not a local path".into())
     })?;
     let transaction =
         ReplacementTransaction::begin(request, destination).map_err(resolved_move_aside_failure)?;
     let backup = transaction.backup.clone();
-    if let Err(error) = execute_transfer(store, request, operation, cancellation) {
-        let original_error = error.to_string();
-        if !replacement_destination_can_be_removed(&error) {
-            return Err(ResolvedTransferFailure::NeedsAttention(
-                format!(
-                    "{original_error}; the source state is uncertain, so Musheen preserved the \
-                     possible new destination at {} and the previous destination at {}",
-                    destination.display(),
-                    backup.display()
-                )
-                .into(),
-            ));
-        }
-        if destination.try_exists().unwrap_or(true) {
-            remove_path(destination).map_err(|rollback| {
-                ResolvedTransferFailure::NeedsAttention(
+    let metadata_review = match execute_transfer(store, request, operation, cancellation) {
+        Ok(metadata_review) => metadata_review,
+        Err(error) => {
+            let original_error = error.to_string();
+            if !replacement_destination_can_be_removed(&error) {
+                return Err(ResolvedTransferFailure::NeedsAttention(
                     format!(
-                        "{original_error}; rollback could not remove the new destination: \
-                         {rollback}"
+                        "{original_error}; the source state is uncertain, so Musheen preserved the \
+                     possible new destination at {} and the previous destination at {}",
+                        destination.display(),
+                        backup.display()
                     )
                     .into(),
-                )
-            })?;
-        }
-        restore_moved_destination(&backup, destination).map_err(|rollback| {
-            ResolvedTransferFailure::NeedsAttention(
+                ));
+            }
+            if destination.try_exists().unwrap_or(true) {
+                remove_path(destination).map_err(|rollback| {
+                    ResolvedTransferFailure::NeedsAttention(
+                        format!(
+                            "{original_error}; rollback could not remove the new destination: \
+                         {rollback}"
+                        )
+                        .into(),
+                    )
+                })?;
+            }
+            restore_moved_destination(&backup, destination).map_err(|rollback| {
+                ResolvedTransferFailure::NeedsAttention(
                 format!(
                     "{original_error}; rollback could not restore the old destination: {rollback}"
                 )
                 .into(),
             )
-        })?;
-        transaction
-            .remove_journal()
-            .map_err(resolved_move_aside_failure)?;
-        return Err(error);
-    }
+            })?;
+            transaction
+                .remove_journal()
+                .map_err(resolved_move_aside_failure)?;
+            return Err(error);
+        }
+    };
     transaction.mark_published().map_err(|error| {
         ResolvedTransferFailure::NeedsAttention(
             format!(
@@ -1177,7 +1190,8 @@ fn execute_replacing_transfer(
     })?;
     transaction
         .remove_journal()
-        .map_err(resolved_move_aside_failure)
+        .map_err(resolved_move_aside_failure)?;
+    Ok(metadata_review)
 }
 
 fn replacement_destination_can_be_removed(error: &ResolvedTransferFailure) -> bool {
@@ -1193,7 +1207,7 @@ fn execute_merging_transfer(
     request: &CopyRequest,
     operation: OperationKind,
     cancellation: &CancellationToken,
-) -> Result<(), ResolvedTransferFailure> {
+) -> Result<Option<Box<MoveMetadataReview>>, ResolvedTransferFailure> {
     let source = request
         .source()
         .as_unix_path()
@@ -1206,21 +1220,24 @@ fn execute_merging_transfer(
     let transaction =
         ReplacementTransaction::begin(request, destination).map_err(resolved_move_aside_failure)?;
     let backup = transaction.backup.clone();
-    if let Err(error) = execute_transfer(store, request, operation, cancellation) {
-        let original_error = error.to_string();
-        restore_moved_destination(&backup, destination).map_err(|rollback| {
-            ResolvedTransferFailure::NeedsAttention(
+    let metadata_review = match execute_transfer(store, request, operation, cancellation) {
+        Ok(metadata_review) => metadata_review,
+        Err(error) => {
+            let original_error = error.to_string();
+            restore_moved_destination(&backup, destination).map_err(|rollback| {
+                ResolvedTransferFailure::NeedsAttention(
                 format!(
                     "{original_error}; rollback could not restore the old destination: {rollback}"
                 )
                 .into(),
             )
-        })?;
-        transaction
-            .remove_journal()
-            .map_err(resolved_move_aside_failure)?;
-        return Err(error);
-    }
+            })?;
+            transaction
+                .remove_journal()
+                .map_err(resolved_move_aside_failure)?;
+            return Err(error);
+        }
+    };
 
     transaction.mark_merging().map_err(|error| {
         ResolvedTransferFailure::NeedsAttention(
@@ -1258,7 +1275,8 @@ fn execute_merging_transfer(
     })?;
     transaction
         .remove_journal()
-        .map_err(resolved_move_aside_failure)
+        .map_err(resolved_move_aside_failure)?;
+    Ok(metadata_review)
 }
 
 impl MutationProvider for LocalStore {

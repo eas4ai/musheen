@@ -606,7 +606,8 @@ impl CopySession {
                     &staging,
                 )
             })?;
-        if source.allocated_bytes < source.size
+        if source.kind == EntryKind::RegularFile
+            && source.allocated_bytes < source.size
             && !matches!(strategy, CopyStrategy::Reflink | CopyStrategy::Sparse)
         {
             metadata.note_skipped(MetadataKind::SparseLayout);

@@ -2,11 +2,12 @@ use musheen_core::{ResourceLimits, StorePath};
 use musheen_desktop::StatusStore;
 use musheen_ops::{
     ApplyScope, ConflictChoice, ConflictItemKind, ConflictRecord, EventGeneration, JobId,
-    OperationKind, TrashReceipt,
+    MetadataKind, MetadataReport, OperationKind, TrashReceipt,
 };
 use musheen_ui::{
     ConfirmationDefault, ConflictDialogModel, DestructiveConfirmation, DropAction, FileDragPayload,
-    OperationHub, OperationStatus, RecoveryAction, StatusCenterModel, TrashItem, TrashSurfaceModel,
+    MetadataReviewChoice, MetadataReviewDialogModel, OperationHub, OperationStatus, RecoveryAction,
+    StatusCenterModel, TrashItem, TrashSurfaceModel,
 };
 use std::fs;
 
@@ -54,6 +55,93 @@ fn partial_success_keeps_actionable_failures_and_dismissal_survives_restart() {
     assert!(restored.visible_entries().is_empty());
     assert!(restored.entry(id).unwrap().dismissed());
     assert_eq!(restored.retry_targets(id).unwrap(), vec![failed_item]);
+}
+
+#[test]
+fn confirmed_metadata_review_returns_the_move_to_pending_without_old_failures() {
+    let id = JobId::new(42).unwrap();
+    let location = StorePath::from_unix_path("/home/user/Documents/file.txt");
+    let mut center = StatusCenterModel::default();
+    center
+        .register(
+            id,
+            EventGeneration::new(0),
+            OperationKind::Move,
+            location.clone(),
+            Some(1),
+        )
+        .unwrap();
+    center.mark_running(id).unwrap();
+    center
+        .record_failure(
+            id,
+            location,
+            "ownership metadata could not be preserved; source was kept",
+            [RecoveryAction::ViewLocation],
+        )
+        .unwrap();
+    center.mark_needs_attention(id).unwrap();
+
+    center
+        .mark_metadata_review_pending(id, EventGeneration::new(1))
+        .unwrap();
+
+    let entry = center.entry(id).unwrap();
+    assert_eq!(entry.status(), OperationStatus::Pending);
+    assert_eq!(entry.generation(), EventGeneration::new(1));
+    assert!(entry.failures().is_empty());
+}
+
+#[test]
+fn keeping_the_source_acknowledges_the_metadata_review() {
+    let id = JobId::new(43).unwrap();
+    let location = StorePath::from_unix_path("/home/user/Documents/file.txt");
+    let mut center = StatusCenterModel::default();
+    center
+        .register(
+            id,
+            EventGeneration::new(0),
+            OperationKind::Move,
+            location.clone(),
+            Some(1),
+        )
+        .unwrap();
+    center.mark_running(id).unwrap();
+    center
+        .record_failure(
+            id,
+            location,
+            "ownership metadata could not be preserved; source was kept",
+            [RecoveryAction::ViewLocation],
+        )
+        .unwrap();
+    center.mark_needs_attention(id).unwrap();
+
+    center.acknowledge_metadata_review_keep_source(id).unwrap();
+
+    let entry = center.entry(id).unwrap();
+    assert_eq!(entry.status(), OperationStatus::Cancelled);
+    assert_eq!(entry.failures().len(), 1);
+}
+
+#[test]
+fn metadata_review_defaults_to_keeping_the_source_and_names_every_loss() {
+    let mut model = MetadataReviewDialogModel::new(
+        StorePath::from_unix_path("/home/user/source.txt"),
+        StorePath::from_unix_path("/mnt/target/source.txt"),
+        MetadataReport::with_skipped([MetadataKind::Ownership, MetadataKind::AccessControlList]),
+        &musheen_ui::Catalog::load(musheen_ui::Locale::EnUs).unwrap(),
+    );
+
+    assert_eq!(model.choice(), MetadataReviewChoice::KeepSource);
+    let warning = model.warning();
+    assert!(warning.contains("ownership"));
+    assert!(warning.contains("access control lists"));
+    assert!(warning.contains("/home/user/source.txt"));
+    assert!(warning.contains("/mnt/target/source.txt"));
+
+    model.select(MetadataReviewChoice::RemoveSource);
+    assert_eq!(model.choice(), MetadataReviewChoice::RemoveSource);
 }
 
 #[test]
