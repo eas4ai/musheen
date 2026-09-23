@@ -6,8 +6,9 @@ use musheen_desktop::{
     ArchiveOperationLimits, ArchiveOperationOutcome, ArchivePassword, ArchivePasswordProvider,
     ArchiveRecoveryAction, FileJournalStorage, PasswordRequest, apply_archive_recovery,
     apply_archive_recovery_with_accounting, apply_archive_recovery_with_cancellation,
-    execute_scheduled_archive_operation, execute_scheduled_archive_operation_with_accounting,
-    recover_archive_operations, recover_archive_operations_with_cancellation,
+    execute_archive_plan, execute_scheduled_archive_operation,
+    execute_scheduled_archive_operation_with_accounting, recover_archive_operations,
+    recover_archive_operations_with_cancellation,
 };
 use musheen_ops::{
     ArchiveCheckpoint, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy,
@@ -462,6 +463,37 @@ fn scheduled_executor_emits_archive_phases_through_the_job_event_stream() {
         ]
     );
     assert_eq!(scheduler.state(id), Some(musheen_ops::JobState::Completed));
+}
+
+#[test]
+fn direct_archive_executor_publishes_for_an_external_scheduler() {
+    let root = tempdir().expect("temporary root");
+    let source = root.path().join("source.txt");
+    let destination = root.path().join("direct.zip");
+    std::fs::write(&source, b"payload").expect("source");
+    let plan = ArchiveOperationPlan::create(
+        vec![local(&source)],
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("archive plan");
+    let mut journal = Journal::open(MemoryJournal::default()).expect("journal");
+
+    let outcome = execute_archive_plan(
+        &plan,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &CancellationToken::new(),
+        &mut journal,
+        JobId::new(71).unwrap(),
+        EventGeneration::new(3),
+    )
+    .expect("archive completes");
+
+    assert_eq!(outcome, ArchiveOperationOutcome::Published);
+    assert!(destination.is_file());
 }
 
 #[test]

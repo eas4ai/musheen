@@ -55,6 +55,35 @@ pub fn execute_scheduled_archive_operation<C: Clock, S: JournalStorage>(
     )
 }
 
+pub fn execute_archive_plan<S: JournalStorage>(
+    plan: &ArchiveOperationPlan,
+    limits: &ArchiveOperationLimits,
+    passwords: &dyn ArchivePasswordProvider,
+    cancellation: &CancellationToken,
+    journal: &mut Journal<S>,
+    job_id: JobId,
+    generation: EventGeneration,
+) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
+    let mut report_phase = |_| Ok(());
+    let mut begin_commit = || {
+        cancellation
+            .wait_if_paused()
+            .map_err(|_| ArchiveOperationError::Cancelled)
+    };
+    execute_archive_operation(
+        plan,
+        limits,
+        passwords,
+        cancellation,
+        journal,
+        job_id,
+        generation,
+        &mut report_phase,
+        &mut begin_commit,
+        &ArchiveOperationAccounting::default(),
+    )
+}
+
 pub fn execute_scheduled_archive_operation_with_accounting<C: Clock, S: JournalStorage>(
     scheduler: &Scheduler<C>,
     job: &ScheduledJob,

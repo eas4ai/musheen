@@ -87,15 +87,17 @@ use musheen_desktop::{
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
-    ApplyScope, ConflictChoice, ConflictDecision, ConflictItemKind, ConflictPolicies,
-    ConflictRecord, CreateRequest, DeleteTarget, EventGeneration, JobId, MutationError,
-    MutationProvider, OperationKind, PermanentDeleteRequest, RenameRequest,
+    ApplyScope, ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, ConflictChoice,
+    ConflictDecision, ConflictItemKind, ConflictPolicies, ConflictRecord, CreateRequest,
+    DeleteTarget, EventGeneration, JobId, MutationError, MutationProvider, OperationKind,
+    PermanentDeleteRequest, RenameRequest,
 };
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::NativeTheme;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -6956,6 +6958,12 @@ impl MusheenApp {
                 }
             }
             (
+                archive_action @ (CommandAction::Compress
+                | CommandAction::Extract
+                | CommandAction::ExtractHere),
+                CommandParameters::Targets(targets),
+            ) => self.submit_archive_command(*archive_action, targets, cx),
+            (
                 delete_action @ (CommandAction::MoveToTrash | CommandAction::DeletePermanently),
                 CommandParameters::Targets(targets),
             ) => {
@@ -7140,6 +7148,29 @@ impl MusheenApp {
                         .expect("backend refusal is localized")
                         .into(),
                 );
+                cx.notify();
+            }
+        }
+    }
+
+    fn submit_archive_command(
+        &mut self,
+        action: CommandAction,
+        targets: &[CommandTargetRef],
+        cx: &mut Context<Self>,
+    ) {
+        let plan = build_archive_plan(action, targets);
+        match plan.and_then(|plan| {
+            self.operation_hub
+                .submit_archive(plan)
+                .map_err(|error| error.to_string().into())
+        }) {
+            Ok(_) => {
+                self.operation_error = self.operation_hub.persistence_error();
+                self.pump_operation_queue(cx);
+            }
+            Err(error) => {
+                self.operation_error = Some(error);
                 cx.notify();
             }
         }
@@ -8278,17 +8309,15 @@ impl MusheenApp {
                 | CommandAction::Rename
                 | CommandAction::NewDirectory
                 | CommandAction::NewEmptyFile
+                | CommandAction::Compress
+                | CommandAction::Extract
+                | CommandAction::ExtractHere
         ) {
             return CapabilityState::Supported;
         }
-        let reason = match action {
-            CommandAction::Extract | CommandAction::ExtractHere => {
-                "Archive extraction is unavailable because no archive operation provider is installed"
-            }
-            _ => "This command is not available in the current desktop backend",
-        };
         CapabilityState::Unsupported(
-            CapabilityReason::new(reason).expect("the desktop-backend reason is valid"),
+            CapabilityReason::new("This command is not available in the current desktop backend")
+                .expect("the desktop-backend reason is valid"),
         )
     }
 
@@ -8975,6 +9004,7 @@ impl MusheenApp {
                     &capabilities,
                 )
             }
+            LocalOperationOutcome::Archive => return,
         };
         match result {
             Ok(TagMoveOutcome::Preserved) => {}
@@ -13178,16 +13208,121 @@ fn is_hidden_path(path: &StorePath) -> bool {
 }
 
 fn is_archive_path(path: &StorePath) -> bool {
-    path.as_unix_path().is_some_and(|path| {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        [
-            ".zip", ".tar", ".tgz", ".tar.gz", ".tbz", ".tar.bz2", ".txz", ".tar.xz",
-        ]
+    path.as_unix_path()
+        .and_then(archive_codec_and_suffix)
+        .is_some()
+}
+
+fn build_archive_plan(
+    action: CommandAction,
+    targets: &[CommandTargetRef],
+) -> Result<ArchiveOperationPlan, Box<str>> {
+    match action {
+        CommandAction::Compress => build_compress_plan(targets),
+        CommandAction::Extract | CommandAction::ExtractHere => build_extract_plan(action, targets),
+        _ => Err("the command is not an archive operation".into()),
+    }
+}
+
+fn build_compress_plan(targets: &[CommandTargetRef]) -> Result<ArchiveOperationPlan, Box<str>> {
+    if targets.is_empty() {
+        return Err("select at least one file or folder to compress".into());
+    }
+    let sources = targets
         .iter()
-        .any(|extension| name.ends_with(extension))
+        .map(|target| {
+            target
+                .path()
+                .as_unix_path()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| Box::<str>::from("only local files can be compressed"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let parent = sources[0]
+        .parent()
+        .ok_or_else(|| Box::<str>::from("the selected item has no parent folder"))?;
+    if sources.iter().any(|source| source.parent() != Some(parent)) {
+        return Err("compressed items must come from the same folder".into());
+    }
+    let archive_name = if sources.len() == 1 {
+        let mut name = sources[0]
+            .file_name()
+            .ok_or_else(|| Box::<str>::from("the selected item has no file name"))?
+            .to_os_string();
+        name.push(".zip");
+        name
+    } else {
+        OsString::from("Archive.zip")
+    };
+    let destination = StorePath::from_unix_path(parent.join(archive_name));
+    ArchiveOperationPlan::create(
+        targets.iter().map(|target| target.path().clone()).collect(),
+        destination,
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .map_err(|error| error.to_string().into())
+}
+
+fn build_extract_plan(
+    action: CommandAction,
+    targets: &[CommandTargetRef],
+) -> Result<ArchiveOperationPlan, Box<str>> {
+    let [target] = targets else {
+        return Err("select exactly one archive to extract".into());
+    };
+    let source = target
+        .path()
+        .as_unix_path()
+        .ok_or_else(|| Box::<str>::from("only local archives can be extracted"))?;
+    let parent = source
+        .parent()
+        .ok_or_else(|| Box::<str>::from("the selected archive has no parent folder"))?;
+    let (codec, suffix_length) = archive_codec_and_suffix(source)
+        .ok_or_else(|| Box::<str>::from("the selected file is not a supported archive"))?;
+    let destination = if action == CommandAction::ExtractHere {
+        parent.to_path_buf()
+    } else {
+        let name = source
+            .file_name()
+            .ok_or_else(|| Box::<str>::from("the selected archive has no file name"))?;
+        let stem_length = name.as_bytes().len().saturating_sub(suffix_length);
+        if stem_length == 0 {
+            return Err("the selected archive has no usable output folder name".into());
+        }
+        parent.join(OsString::from_vec(name.as_bytes()[..stem_length].to_vec()))
+    };
+    ArchiveOperationPlan::extract(
+        target.path().clone(),
+        StorePath::from_unix_path(destination),
+        codec,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .map_err(|error| error.to_string().into())
+}
+
+fn archive_codec_and_suffix(path: &Path) -> Option<(ArchiveCodec, usize)> {
+    let name = path.file_name()?.as_bytes();
+    [
+        (b".tar.zst".as_slice(), ArchiveCodec::TarZstd),
+        (b".tar.gz".as_slice(), ArchiveCodec::TarGzip),
+        (b".tzst".as_slice(), ArchiveCodec::TarZstd),
+        (b".tgz".as_slice(), ArchiveCodec::TarGzip),
+        (b".7z".as_slice(), ArchiveCodec::SevenZip),
+        (b".tar".as_slice(), ArchiveCodec::Tar),
+        (b".zip".as_slice(), ArchiveCodec::Zip),
+    ]
+    .into_iter()
+    .find_map(|(suffix, codec)| {
+        name.ends_with(suffix)
+            .then_some((codec, suffix.len()))
+            .or_else(|| {
+                (name.len() >= suffix.len()
+                    && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix))
+                .then_some((codec, suffix.len()))
+            })
     })
 }
 
@@ -13368,6 +13503,79 @@ mod tests {
     };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    fn local_command_target(path: &Path) -> CommandTargetRef {
+        let path = StorePath::from_unix_path(path);
+        let item = LocalStore::new()
+            .resolve_item(&path)
+            .unwrap()
+            .expect("the test target exists");
+        CommandTargetRef::new(item.id().clone(), path).unwrap()
+    }
+
+    #[test]
+    fn compress_plan_uses_a_sibling_zip_without_overwrite_policy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("report.txt");
+        std::fs::write(&source, b"contents").unwrap();
+
+        let plan = build_archive_plan(CommandAction::Compress, &[local_command_target(&source)])
+            .expect("compression plan is valid");
+
+        assert_eq!(plan.kind(), OperationKind::Compress);
+        assert_eq!(plan.codec(), ArchiveCodec::Zip);
+        assert_eq!(plan.conflict_policy(), ArchiveConflictPolicy::Fail);
+        assert_eq!(
+            plan.destination().as_unix_path(),
+            Some(temporary.path().join("report.txt.zip").as_path())
+        );
+    }
+
+    #[test]
+    fn extract_plan_recognizes_compound_suffix_and_chooses_folder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("backup.TAR.GZ");
+        std::fs::write(&source, b"fixture").unwrap();
+        let target = local_command_target(&source);
+
+        let plan = build_archive_plan(CommandAction::Extract, std::slice::from_ref(&target))
+            .expect("extraction plan is valid");
+        let here = build_archive_plan(CommandAction::ExtractHere, &[target])
+            .expect("extract-here plan is valid");
+
+        assert_eq!(plan.codec(), ArchiveCodec::TarGzip);
+        assert_eq!(
+            plan.destination().as_unix_path(),
+            Some(temporary.path().join("backup").as_path())
+        );
+        assert_eq!(here.destination().as_unix_path(), Some(temporary.path()));
+    }
+
+    #[test]
+    fn extract_plan_rejects_ambiguous_or_unsupported_selection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first.zip");
+        let second = temporary.path().join("second.zip");
+        let unsupported = temporary.path().join("notes.txt");
+        for path in [&first, &second, &unsupported] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+
+        assert!(
+            build_archive_plan(
+                CommandAction::Extract,
+                &[local_command_target(&first), local_command_target(&second)]
+            )
+            .is_err()
+        );
+        assert!(
+            build_archive_plan(
+                CommandAction::Extract,
+                &[local_command_target(&unsupported)]
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn keeping_source_clears_cut_visual_state() {
@@ -16316,11 +16524,16 @@ mod tests {
 
     #[test]
     fn context_actions_report_current_production_capabilities() {
-        assert!(
-            MusheenApp::backend_action_state(CommandAction::Extract)
-                .reason()
-                .is_some_and(|reason| reason.contains("archive operation provider"))
-        );
+        for action in [
+            CommandAction::Compress,
+            CommandAction::Extract,
+            CommandAction::ExtractHere,
+        ] {
+            assert_eq!(
+                MusheenApp::backend_action_state(action),
+                CapabilityState::Supported
+            );
+        }
         assert_eq!(
             MusheenApp::backend_action_state(CommandAction::OpenAsAdministrator),
             CapabilityState::Supported

@@ -21,7 +21,7 @@ pub use budget::{
     ArchiveOperationError, ArchiveOperationLimits,
 };
 pub use create::{
-    ArchiveOperationOutcome, execute_scheduled_archive_operation,
+    ArchiveOperationOutcome, execute_archive_plan, execute_scheduled_archive_operation,
     execute_scheduled_archive_operation_with_accounting,
 };
 pub use format::ArchiveFormat;

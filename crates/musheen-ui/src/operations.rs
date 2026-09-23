@@ -1,18 +1,21 @@
 pub use musheen_local::{
-    DropAction, DropError, FileDragPayload, LocalFailureDisposition, LocalOperationFailure,
-    LocalOperationOutcome, LocalOperationQueue, LocalStore, ProviderTransferRoute,
-    ReadyLocalOperation, TransferOutcome,
+    ArchiveOperationExecution, ArchiveOperationRoute, DropAction, DropError, FileDragPayload,
+    LocalFailureDisposition, LocalOperationFailure, LocalOperationOutcome, LocalOperationQueue,
+    LocalStore, ProviderTransferRoute, ReadyLocalOperation, TransferOutcome,
 };
 
 use crate::providers::ProviderRuntime;
 use crate::{RecoveryAction, StatusCenterError, StatusCenterModel};
 use gpui_kit::{AppContext, Context};
 use musheen_core::{ResourceLimits, StorePath};
-use musheen_desktop::StatusStore;
+use musheen_desktop::{
+    ArchiveError, ArchiveOperationLimits, ArchivePassword, ArchivePasswordProvider,
+    FileJournalStorage, PasswordRequest, StatusStore, execute_archive_plan,
+};
 use musheen_ops::{
-    ConflictDecision, ConflictRecord, CreateRequest, DeleteTarget, JobId, JobState, MetadataChange,
-    MetadataScope, OperationKind, PermanentDeleteConfirmation, PermanentDeleteRequest,
-    RenameRequest,
+    ArchiveOperationPlan, ConflictDecision, ConflictRecord, CreateRequest, DeleteTarget, JobId,
+    JobState, Journal, MetadataChange, MetadataScope, OperationKind, PermanentDeleteConfirmation,
+    PermanentDeleteRequest, RenameRequest,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -20,6 +23,59 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+struct DesktopArchiveRoute {
+    journal: Mutex<Journal<FileJournalStorage>>,
+    limits: ArchiveOperationLimits,
+}
+
+struct NoArchivePasswords;
+
+impl ArchivePasswordProvider for NoArchivePasswords {
+    fn request_password(
+        &self,
+        _request: &PasswordRequest,
+    ) -> Result<Option<ArchivePassword>, ArchiveError> {
+        Ok(None)
+    }
+}
+
+impl fmt::Debug for DesktopArchiveRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DesktopArchiveRoute")
+    }
+}
+
+impl DesktopArchiveRoute {
+    fn for_current_user() -> Result<Self, Box<str>> {
+        let storage = FileJournalStorage::for_current_user().map_err(|error| error.to_string())?;
+        let journal = Journal::open(storage).map_err(|error| error.to_string())?;
+        Ok(Self {
+            journal: Mutex::new(journal),
+            limits: ArchiveOperationLimits::default(),
+        })
+    }
+}
+
+impl ArchiveOperationRoute for DesktopArchiveRoute {
+    fn execute_archive(&self, execution: ArchiveOperationExecution<'_>) -> Result<(), Box<str>> {
+        let mut journal = self
+            .journal
+            .lock()
+            .map_err(|_| Box::<str>::from("archive journal lock is unavailable"))?;
+        execute_archive_plan(
+            execution.plan(),
+            &self.limits,
+            &NoArchivePasswords,
+            execution.cancellation(),
+            &mut journal,
+            execution.id(),
+            execution.generation(),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string().into())
+    }
+}
 
 #[derive(Debug)]
 enum StatusPersistenceCommand {
@@ -164,6 +220,7 @@ pub struct OperationHub {
     status: Arc<Mutex<StatusCenterModel>>,
     persistence: Option<Arc<StatusPersistence>>,
     persistence_error: Arc<Mutex<Option<Box<str>>>>,
+    archive_route_error: Arc<Mutex<Option<Box<str>>>>,
     status_revision: Arc<AtomicU64>,
     reservations: Arc<Mutex<BTreeMap<u64, Vec<std::path::PathBuf>>>>,
     next_reservation: Arc<AtomicU64>,
@@ -228,6 +285,7 @@ impl OperationHub {
             status: Arc::new(Mutex::new(StatusCenterModel::default())),
             persistence: None,
             persistence_error: Arc::new(Mutex::new(None)),
+            archive_route_error: Arc::new(Mutex::new(None)),
             status_revision: Arc::new(AtomicU64::new(0)),
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
@@ -282,6 +340,7 @@ impl OperationHub {
             status,
             persistence: Some(persistence),
             persistence_error,
+            archive_route_error: Arc::new(Mutex::new(None)),
             status_revision,
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
@@ -297,7 +356,7 @@ impl OperationHub {
         limits: &ResourceLimits,
         providers: &ProviderRuntime,
     ) -> Self {
-        match Self::with_status_store_and_provider_runtime(
+        let hub = match Self::with_status_store_and_provider_runtime(
             limits,
             StatusStore::for_current_user(),
             providers,
@@ -310,7 +369,20 @@ impl OperationHub {
                 }
                 hub
             }
+        };
+        match DesktopArchiveRoute::for_current_user() {
+            Ok(route) => {
+                if let Ok(mut queue) = hub.queue.lock() {
+                    queue.register_archive_route(Arc::new(route));
+                }
+            }
+            Err(error) => {
+                if let Ok(mut archive_route_error) = hub.archive_route_error.lock() {
+                    *archive_route_error = Some(error);
+                }
+            }
         }
+        hub
     }
 
     #[must_use]
@@ -478,6 +550,38 @@ impl OperationHub {
             musheen_ops::CreateKind::Directory => OperationKind::CreateDirectory,
         };
         let id = self.with_unreserved_queue([&location], |queue| queue.submit_create(request))?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                kind,
+                location,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(id)
+    }
+
+    pub fn submit_archive(&self, plan: ArchiveOperationPlan) -> Result<JobId, OperationHubError> {
+        if let Some(error) = self
+            .archive_route_error
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?
+            .clone()
+        {
+            return Err(OperationHubError::Storage(error));
+        }
+        let kind = plan.kind();
+        let location = plan.destination().clone();
+        let paths = plan
+            .sources()
+            .iter()
+            .cloned()
+            .chain(std::iter::once(plan.destination().clone()))
+            .collect::<Vec<_>>();
+        let id = self.with_unreserved_queue(paths.iter(), |queue| queue.submit_archive(plan))?;
         self.status
             .lock()
             .map_err(|_| OperationHubError::StatusLock)?

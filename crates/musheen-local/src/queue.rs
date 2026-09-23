@@ -4,13 +4,13 @@ use crate::mutation::{
 };
 use musheen_core::{CommandTargetRef, DisplayPath, ItemId, ResourceLimits, Store, StorePath};
 use musheen_ops::{
-    ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest, CopySession, CreateRequest,
-    DeleteTarget, EventGeneration, JobId, JobState, MetadataChange, MetadataPlan, MetadataScope,
-    MoveMetadataReview, MutationError, MutationProvider, OperationFailure, OperationKind,
-    OperationPlan, PermanentDeleteConfirmation, PermanentDeleteRequest, ProviderLimits,
-    ProviderSnapshot, PublicationState, RenameRequest, Scheduler, SchedulerError, SourceState,
-    complete_move_after_metadata_review, execute_create, execute_delete, execute_move,
-    execute_permanent_delete, execute_rename,
+    ArchiveOperationPlan, ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest,
+    CopySession, CreateRequest, DeleteTarget, EventGeneration, JobId, JobState, MetadataChange,
+    MetadataPlan, MetadataScope, MoveMetadataReview, MutationError, MutationProvider,
+    OperationFailure, OperationKind, OperationPlan, PermanentDeleteConfirmation,
+    PermanentDeleteRequest, ProviderLimits, ProviderSnapshot, PublicationState, RenameRequest,
+    Scheduler, SchedulerError, SourceState, complete_move_after_metadata_review, execute_create,
+    execute_delete, execute_move, execute_permanent_delete, execute_rename,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -107,6 +107,10 @@ enum LocalOperation {
         request: PermanentDeleteRequest,
         confirmation: PermanentDeleteConfirmation,
     },
+    Archive {
+        plan: ArchiveOperationPlan,
+        route: Arc<dyn ArchiveOperationRoute>,
+    },
 }
 
 impl LocalOperation {
@@ -128,6 +132,7 @@ impl LocalOperation {
             Self::Rename(_) => OperationKind::Rename,
             Self::Trash(_) => OperationKind::Trash,
             Self::PermanentDelete { .. } => OperationKind::PermanentDelete,
+            Self::Archive { plan, .. } => plan.kind(),
         }
     }
 
@@ -140,6 +145,7 @@ impl LocalOperation {
             Self::Rename(request) => request.source(),
             Self::Trash(target) => target.path(),
             Self::PermanentDelete { request, .. } => request.location(),
+            Self::Archive { plan, .. } => plan.destination(),
         }
     }
 
@@ -161,6 +167,12 @@ impl LocalOperation {
                 .targets()
                 .iter()
                 .map(|target| target.path().clone())
+                .collect(),
+            Self::Archive { plan, .. } => plan
+                .sources()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(plan.destination().clone()))
                 .collect(),
         }
     }
@@ -196,6 +208,41 @@ pub enum LocalOperationOutcome {
     Transfer(TransferOutcome),
     Metadata,
     Mutation,
+    Archive,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ArchiveOperationExecution<'a> {
+    id: JobId,
+    generation: EventGeneration,
+    plan: &'a ArchiveOperationPlan,
+    cancellation: &'a musheen_core::CancellationToken,
+}
+
+impl<'a> ArchiveOperationExecution<'a> {
+    #[must_use]
+    pub const fn id(self) -> JobId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> EventGeneration {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn plan(self) -> &'a ArchiveOperationPlan {
+        self.plan
+    }
+
+    #[must_use]
+    pub const fn cancellation(self) -> &'a musheen_core::CancellationToken {
+        self.cancellation
+    }
+}
+
+pub trait ArchiveOperationRoute: fmt::Debug + Send + Sync {
+    fn execute_archive(&self, execution: ArchiveOperationExecution<'_>) -> Result<(), Box<str>>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -493,6 +540,15 @@ impl ReadyLocalOperation {
                 })
                 .map(|()| LocalOperationOutcome::Mutation)
                 .map_err(|error| LocalOperationFailure::failed(error.to_string())),
+            LocalOperation::Archive { plan, route } => route
+                .execute_archive(ArchiveOperationExecution {
+                    id: self.id,
+                    generation: self.generation,
+                    plan: &plan,
+                    cancellation: &self.cancellation,
+                })
+                .map(|()| LocalOperationOutcome::Archive)
+                .map_err(LocalOperationFailure::failed),
         }
     }
 }
@@ -527,6 +583,7 @@ pub struct LocalOperationQueue {
         (musheen_core::ProviderId, musheen_core::ProviderId),
         Arc<dyn ProviderTransferRoute>,
     >,
+    archive_route: Option<Arc<dyn ArchiveOperationRoute>>,
 }
 
 impl LocalOperationQueue {
@@ -537,6 +594,7 @@ impl LocalOperationQueue {
             operations: BTreeMap::new(),
             failures: BTreeMap::new(),
             provider_routes: HashMap::new(),
+            archive_route: None,
         }
     }
 
@@ -546,6 +604,7 @@ impl LocalOperationQueue {
             operations: BTreeMap::new(),
             failures: BTreeMap::new(),
             provider_routes: HashMap::new(),
+            archive_route: None,
         })
     }
 
@@ -557,6 +616,10 @@ impl LocalOperationQueue {
             ),
             route,
         );
+    }
+
+    pub fn register_archive_route(&mut self, route: Arc<dyn ArchiveOperationRoute>) {
+        self.archive_route = Some(route);
     }
 
     #[must_use]
@@ -712,6 +775,23 @@ impl LocalOperationQueue {
                 request,
                 confirmation,
             },
+        )])
+        .map(|mut ids| ids.remove(0))
+    }
+
+    pub fn submit_archive(&mut self, plan: ArchiveOperationPlan) -> Result<JobId, DropError> {
+        let route = self
+            .archive_route
+            .clone()
+            .ok_or_else(|| DropError::Plan("archive operation provider is unavailable".into()))?;
+        let store = LocalStore::new();
+        let operation_plan = plan
+            .clone()
+            .into_operation_plan(provider_snapshot(&store, plan.destination()))
+            .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(
+            operation_plan,
+            LocalOperation::Archive { plan, route },
         )])
         .map(|mut ids| ids.remove(0))
     }
@@ -1276,6 +1356,26 @@ impl From<SchedulerError> for DropError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct RecordingArchiveRoute {
+        execution: Mutex<Option<(JobId, EventGeneration, ArchiveOperationPlan)>>,
+    }
+
+    impl ArchiveOperationRoute for RecordingArchiveRoute {
+        fn execute_archive(
+            &self,
+            execution: ArchiveOperationExecution<'_>,
+        ) -> Result<(), Box<str>> {
+            *self.execution.lock().unwrap() = Some((
+                execution.id(),
+                execution.generation(),
+                execution.plan().clone(),
+            ));
+            Ok(())
+        }
+    }
 
     fn metadata_review(
         source: StorePath,
@@ -1475,5 +1575,34 @@ mod tests {
             Err(DropError::Mutation(MutationError::InvalidName))
         );
         assert!(queue.start_ready().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_plan_runs_through_the_registered_queue_route() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = StorePath::from_unix_path(temporary.path().join("source.txt"));
+        let destination = StorePath::from_unix_path(temporary.path().join("source.txt.zip"));
+        fs::write(source.as_unix_path().unwrap(), b"archive me").unwrap();
+        let plan = ArchiveOperationPlan::create(
+            vec![source],
+            destination.clone(),
+            musheen_ops::ArchiveCodec::Zip,
+            musheen_ops::ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .unwrap();
+        let route = Arc::new(RecordingArchiveRoute::default());
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        queue.register_archive_route(route.clone());
+
+        let id = queue.submit_archive(plan.clone()).unwrap();
+
+        assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Archive);
+        assert_eq!(queue.state(id), Some(JobState::Completed));
+        assert_eq!(
+            *route.execution.lock().unwrap(),
+            Some((id, EventGeneration::new(0), plan))
+        );
+        assert!(!destination.as_unix_path().unwrap().exists());
     }
 }

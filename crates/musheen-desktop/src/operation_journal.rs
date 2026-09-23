@@ -188,6 +188,14 @@ pub struct FileJournalStorage {
 }
 
 impl FileJournalStorage {
+    pub fn for_current_user() -> io::Result<Self> {
+        Self::from_config_home(freedesktop::xdg_config_home())
+    }
+
+    pub fn from_config_home(config_home: impl AsRef<Path>) -> io::Result<Self> {
+        Self::at(config_home.as_ref().join("musheen/archive-operations"))
+    }
+
     pub fn at(directory: impl Into<PathBuf>) -> io::Result<Self> {
         let directory = directory.into();
         create_private_directory(&directory)?;
