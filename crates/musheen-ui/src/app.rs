@@ -93,6 +93,7 @@ use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::NativeTheme;
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1461,7 +1462,39 @@ enum NameOperation {
         parent: StorePath,
         kind: musheen_ops::CreateKind,
     },
-    Rename(CommandTargetRef),
+    Rename {
+        target: CommandTargetRef,
+        original_name: OsString,
+    },
+}
+
+impl NameOperation {
+    fn rename(target: CommandTargetRef) -> Self {
+        let original_name = target
+            .path()
+            .as_unix_path()
+            .and_then(Path::file_name)
+            .map_or_else(OsString::new, OsStr::to_os_string);
+        Self::Rename {
+            target,
+            original_name,
+        }
+    }
+
+    fn initial_name(&self) -> String {
+        match self {
+            Self::Rename { original_name, .. } => original_name.to_string_lossy().into_owned(),
+            Self::Create { .. } => String::new(),
+        }
+    }
+}
+
+fn submitted_rename_name(original_name: &OsStr, submitted: &str) -> OsString {
+    if submitted == original_name.to_string_lossy() {
+        original_name.to_os_string()
+    } else {
+        submitted.into()
+    }
 }
 
 #[derive(Clone)]
@@ -6689,18 +6722,9 @@ impl MusheenApp {
             }
             (CommandAction::Rename, CommandParameters::Targets(targets)) => {
                 if let Some(target) = targets.first().filter(|_| targets.len() == 1) {
-                    let initial = target
-                        .path()
-                        .as_unix_path()
-                        .and_then(Path::file_name)
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.open_name_operation(
-                        NameOperation::Rename(target.clone()),
-                        initial,
-                        origin_tab,
-                        cx,
-                    );
+                    let operation = NameOperation::rename(target.clone());
+                    let initial = operation.initial_name();
+                    self.open_name_operation(operation, initial, origin_tab, cx);
                 }
             }
             (
@@ -7332,7 +7356,7 @@ impl MusheenApp {
                 kind: musheen_ops::CreateKind::File,
                 ..
             } => "New Empty File",
-            NameOperation::Rename(_) => "Rename",
+            NameOperation::Rename { .. } => "Rename",
         };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(440.), px(220.)), cx)),
@@ -7374,14 +7398,17 @@ impl MusheenApp {
                 NameOperation::Create { parent, kind } => hub
                     .submit_create(CreateRequest::new(parent, name.into(), kind))
                     .map_err(|error| Box::<str>::from(error.to_string())),
-                NameOperation::Rename(target) => {
+                NameOperation::Rename {
+                    target,
+                    original_name,
+                } => {
                     let mut store = LocalStore::new();
                     let identity = MutationProvider::identity(&mut store, target.path())
                         .map_err(|error| Box::<str>::from(error.to_string()))?
                         .ok_or_else(|| Box::<str>::from("the selected item no longer exists"))?;
                     hub.submit_rename(RenameRequest::new(
                         target.path().clone(),
-                        name.into(),
+                        submitted_rename_name(&original_name, &name),
                         identity.into_vec(),
                     ))
                     .map_err(|error| Box::<str>::from(error.to_string()))
@@ -13009,6 +13036,21 @@ mod tests {
         assert_eq!(
             content_identity_for_item(ItemKind::RegularFile, &unknown),
             ContentIdentity::GenericFile
+        );
+    }
+
+    #[test]
+    fn unchanged_lossy_rename_input_preserves_the_original_non_utf8_name() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let original = std::ffi::OsString::from_vec(b"name-\xff".to_vec());
+        assert_eq!(
+            submitted_rename_name(&original, "name-�").as_bytes(),
+            original.as_bytes()
+        );
+        assert_eq!(
+            submitted_rename_name(&original, "renamed").as_bytes(),
+            b"renamed"
         );
     }
 
@@ -19872,7 +19914,7 @@ mod tests {
                 .find(|item| item.path().as_unix_path() == Some(created.as_path()))
                 .unwrap();
             let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
-            state.submit_name_operation(NameOperation::Rename(target), "renamed".to_owned(), cx);
+            state.submit_name_operation(NameOperation::rename(target), "renamed".to_owned(), cx);
         });
         let renamed = temporary.path().join("renamed");
         cx.wait_for(browser, Duration::from_secs(2), |_, _| renamed.is_dir())
