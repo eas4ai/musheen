@@ -408,6 +408,7 @@ fn is_pseudo_filesystem(filesystem_type: &str) -> bool {
             | "devpts"
             | "devtmpfs"
             | "efivarfs"
+            | "fuse"
             | "fusectl"
             | "hugetlbfs"
             | "mqueue"
@@ -419,6 +420,17 @@ fn is_pseudo_filesystem(filesystem_type: &str) -> bool {
             | "sysfs"
             | "tracefs"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_fuse_clipboard_mounts_are_not_sidebar_volumes() {
+        assert!(is_pseudo_filesystem("fuse"));
+        assert!(!is_pseudo_filesystem("fuse.sshfs"));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

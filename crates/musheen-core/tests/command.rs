@@ -96,6 +96,8 @@ mod command {
             ("selection.clear", "Escape"),
             ("item.properties", "Alt+Enter"),
             ("app.settings", "Ctrl+,"),
+            ("file.move_to_trash", "Delete"),
+            ("create.directory", "Ctrl+Shift+N"),
         ] {
             let entry = registry.get(id).expect("the command is registered");
             assert!(

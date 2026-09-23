@@ -95,7 +95,7 @@ use musheen_ops::{
 };
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
-use native_theme_gpui::NativeTheme;
+use native_theme_gpui::{NativeTheme, geometry};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -309,6 +309,7 @@ struct RubberBandSurface {
     top_inset: f32,
     first_item_index: usize,
     first_item_offset: f32,
+    list_row_height: f32,
 }
 
 fn normalized_pointer_bounds(start: Point<Pixels>, end: Point<Pixels>) -> Bounds<Pixels> {
@@ -342,6 +343,7 @@ fn rubber_band_indices(selection: Bounds<Pixels>, surface: RubberBandSurface) ->
         top_inset,
         first_item_index,
         first_item_offset,
+        list_row_height,
     } = surface;
     if item_count == 0 {
         return Vec::new();
@@ -355,7 +357,7 @@ fn rubber_band_indices(selection: Bounds<Pixels>, surface: RubberBandSurface) ->
     let row_height;
     match layout {
         Layout::Details | Layout::List | Layout::Columns => {
-            row_height = 36.0;
+            row_height = list_row_height.max(1.0);
             first_row = ((selection_top - content_top) / row_height)
                 .floor()
                 .max(0.0) as usize;
@@ -373,7 +375,10 @@ fn rubber_band_indices(selection: Bounds<Pixels>, surface: RubberBandSurface) ->
                             px(content_left),
                             px(content_top + visible_index as f32 * row_height),
                         ),
-                        size(px((bounds.size.width.as_f32() - 32.0).max(0.0)), px(34.0)),
+                        size(
+                            px((bounds.size.width.as_f32() - 32.0).max(0.0)),
+                            px((row_height - 2.0).max(1.0)),
+                        ),
                     );
                     selection.intersects(&item).then_some(index)
                 })
@@ -9695,6 +9700,11 @@ impl MusheenApp {
                 | CommandAction::ViewAdaptive
         )
         .then_some(state.is_checked());
+        let native_radius = cx
+            .try_global::<NativeTheme>()
+            .and_then(|theme| theme.resolved(cx))
+            .map(|theme| px(theme.button.border.corner_radius.max(0.0)))
+            .unwrap_or(cx.theme().radius);
         let id = id.to_owned();
         Button::new(control_id)
             .icon(menu_icon(Some(command.icon_key())))
@@ -9703,6 +9713,7 @@ impl MusheenApp {
             .ghost()
             .small()
             .compact()
+            .rounded(native_radius)
             .disabled(!state.is_enabled())
             .selected(toggled.unwrap_or(false))
             .when_some(toggled, |button, toggled| button.toggled(toggled))
@@ -10433,6 +10444,7 @@ impl MusheenApp {
                                     .ghost()
                                     .small()
                                     .w_full()
+                                    .justify_start()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_sidebar_section(kind, cx);
                                     })),
@@ -11728,67 +11740,76 @@ impl MusheenApp {
         });
         let has_filter_summary = filter_label.is_some();
         let base_columns = grid_column_count(window.viewport_size().width.as_f32());
+        let list_row_height = cx
+            .try_global::<NativeTheme>()
+            .and_then(|theme| theme.native(cx))
+            .map(|native| {
+                let list = &native.resolved.list;
+                geometry::control_height(list.row_height, &list.item_font, &list.border, native)
+            })
+            .unwrap_or(px(36.));
         let grid_columns = if layout == Layout::Cards {
             base_columns.div_ceil(2)
         } else {
             base_columns
         };
-        let list =
-            match layout {
-                Layout::Details | Layout::List | Layout::Columns => {
-                    let item_ids = Arc::clone(&visible_item_ids);
-                    uniform_list(
-                        SharedString::from(format!("directory-items-list-{pane_index}")),
-                        item_count,
-                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                            let items = range
+        let list = match layout {
+            Layout::Details | Layout::List | Layout::Columns => {
+                let item_ids = Arc::clone(&visible_item_ids);
+                uniform_list(
+                    SharedString::from(format!("directory-items-list-{pane_index}")),
+                    item_count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        let items = range
+                            .filter_map(|index| {
+                                let id = item_ids.get(index)?;
+                                this.item_render_spec(tab_id, pane_index, index, id, layout)
+                            })
+                            .collect::<Vec<_>>();
+                        items
+                            .into_iter()
+                            .map(|item| div().h(list_row_height).child(this.render_item(item, cx)))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&scroll)
+                .w_full()
+                .flex_grow(1.0)
+                .min_h(px(0.))
+                .p_4()
+                .into_any_element()
+            }
+            Layout::Cards | Layout::Grid | Layout::Adaptive => {
+                let item_ids = Arc::clone(&visible_item_ids);
+                let columns = grid_columns;
+                uniform_list(
+                    SharedString::from(format!("directory-items-grid-{pane_index}")),
+                    grid_row_count(item_count, columns),
+                    cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
+                        rows.map(|row| {
+                            let items = grid_item_range(row, item_count, columns)
                                 .filter_map(|index| {
                                     let id = item_ids.get(index)?;
                                     this.item_render_spec(tab_id, pane_index, index, id, layout)
                                 })
                                 .collect::<Vec<_>>();
-                            items
-                                .into_iter()
-                                .map(|item| div().h(px(36.)).child(this.render_item(item, cx)))
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .track_scroll(&scroll)
-                    .w_full()
-                    .flex_grow(1.0)
-                    .min_h(px(0.))
-                    .p_4()
-                    .into_any_element()
-                }
-                Layout::Cards | Layout::Grid | Layout::Adaptive => {
-                    let item_ids = Arc::clone(&visible_item_ids);
-                    let columns = grid_columns;
-                    uniform_list(
-                        SharedString::from(format!("directory-items-grid-{pane_index}")),
-                        grid_row_count(item_count, columns),
-                        cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
-                            rows.map(|row| {
-                                let items = grid_item_range(row, item_count, columns)
-                                    .filter_map(|index| {
-                                        let id = item_ids.get(index)?;
-                                        this.item_render_spec(tab_id, pane_index, index, id, layout)
-                                    })
-                                    .collect::<Vec<_>>();
-                                div().h(px(116.)).flex().gap_2().children(
-                                    items.into_iter().map(|item| this.render_item(item, cx)),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                        }),
-                    )
-                    .track_scroll(&scroll)
-                    .w_full()
-                    .flex_grow(1.0)
-                    .min_h(px(0.))
-                    .p_4()
-                    .into_any_element()
-                }
-            };
+                            div()
+                                .h(px(116.))
+                                .flex()
+                                .gap_2()
+                                .children(items.into_iter().map(|item| this.render_item(item, cx)))
+                        })
+                        .collect::<Vec<_>>()
+                    }),
+                )
+                .track_scroll(&scroll)
+                .w_full()
+                .flex_grow(1.0)
+                .min_h(px(0.))
+                .p_4()
+                .into_any_element()
+            }
+        };
 
         let items_id = if pane_index == 0 {
             SharedString::from("directory-items")
@@ -11856,6 +11877,7 @@ impl MusheenApp {
                     top_inset,
                     first_item_index,
                     first_item_offset: first_item_offset.as_f32(),
+                    list_row_height: list_row_height.as_f32(),
                 };
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                     if phase.capture() && event.dragging() {
@@ -13835,6 +13857,7 @@ mod tests {
                     top_inset: 16.0,
                     first_item_index: 0,
                     first_item_offset: 0.0,
+                    list_row_height: 36.0,
                 },
             ),
             vec![1, 2]
@@ -13855,6 +13878,33 @@ mod tests {
                     top_inset: 16.0,
                     first_item_index: 0,
                     first_item_offset: 0.0,
+                    list_row_height: 36.0,
+                },
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn rubber_band_geometry_uses_native_list_row_height() {
+        let bounds = Bounds::new(point(px(100.), px(50.)), size(px(800.), px(600.)));
+        let selection = Bounds::from_corners(
+            point(px(110.), px(50. + 16. + 48.)),
+            point(px(400.), px(50. + 16. + 48. * 2. - 1.)),
+        );
+
+        assert_eq!(
+            rubber_band_indices(
+                selection,
+                RubberBandSurface {
+                    bounds,
+                    layout: Layout::List,
+                    item_count: 20,
+                    columns: 1,
+                    top_inset: 16.0,
+                    first_item_index: 0,
+                    first_item_offset: 0.0,
+                    list_row_height: 48.0,
                 },
             ),
             vec![1]
@@ -13880,6 +13930,7 @@ mod tests {
                     top_inset: 16.0,
                     first_item_index: 10,
                     first_item_offset: 0.0,
+                    list_row_height: 36.0,
                 },
             ),
             vec![11, 12]
@@ -13905,6 +13956,7 @@ mod tests {
                     top_inset: 16.0,
                     first_item_index: 10,
                     first_item_offset: -18.0,
+                    list_row_height: 36.0,
                 },
             ),
             vec![11]
