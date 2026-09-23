@@ -409,6 +409,8 @@ fn is_pseudo_filesystem(filesystem_type: &str) -> bool {
             | "devtmpfs"
             | "efivarfs"
             | "fuse"
+            | "fuse.gvfsd-fuse"
+            | "fuse.portal"
             | "fusectl"
             | "hugetlbfs"
             | "mqueue"
@@ -427,8 +429,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plain_fuse_clipboard_mounts_are_not_sidebar_volumes() {
+    fn internal_fuse_mounts_are_hidden_without_hiding_sshfs() {
         assert!(is_pseudo_filesystem("fuse"));
+        assert!(is_pseudo_filesystem("fuse.gvfsd-fuse"));
+        assert!(is_pseudo_filesystem("fuse.portal"));
         assert!(!is_pseudo_filesystem("fuse.sshfs"));
     }
 }
