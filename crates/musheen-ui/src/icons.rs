@@ -1,7 +1,7 @@
 pub struct ApplicationIdentity;
 
 impl ApplicationIdentity {
-    pub const ID: &'static str = "io.musheen.Musheen";
+    pub const ID: &'static str = "org.musheen.Musheen";
     pub const ICON_NAME: &'static str = "musheen";
     pub const ICON_SVG: &'static [u8] = include_bytes!("../../../assets/icons/musheen.svg");
 }

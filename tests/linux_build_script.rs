@@ -164,6 +164,10 @@ fn linux_build_bounds_rust_compiler_resources() {
         "clean Docker builds must compile one crate job at a time"
     );
     assert!(
+        dockerfile.contains("CARGO_INCREMENTAL=0"),
+        "clean Docker builds must disable incremental compilation"
+    );
+    assert!(
         dockerfile.contains("RUST_MIN_STACK=16777216"),
         "clean Docker builds must give rustc enough worker stack"
     );
@@ -178,12 +182,16 @@ fn linux_build_bounds_rust_compiler_resources() {
 }
 
 #[test]
-fn linux_build_installs_gpui_native_link_dependencies() {
+fn linux_build_installs_native_and_package_validation_dependencies() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dockerfile = fs::read_to_string(root.join("ci/linux-build.Dockerfile"))
         .expect("Linux build Dockerfile should be readable");
 
     for package in [
+        "appstream",
+        "desktop-file-utils",
+        "file",
+        "jq",
         "libacl1-dev",
         "libfontconfig1-dev",
         "libfreetype6-dev",
@@ -191,11 +199,13 @@ fn linux_build_installs_gpui_native_link_dependencies() {
         "libxcb1-dev",
         "libxkbcommon-dev",
         "libxkbcommon-x11-dev",
+        "librsvg2-bin",
         "pkg-config",
+        "python3",
     ] {
         assert!(
             dockerfile.contains(package),
-            "clean Docker builds must install GPUI link dependency {package}"
+            "clean Docker builds must install native or package validation dependency {package}"
         );
     }
 }

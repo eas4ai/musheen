@@ -69,7 +69,7 @@ fn pseudo_locale_covers_and_expands_every_english_message() {
 
 #[test]
 fn application_and_content_icons_keep_distinct_identity_sources() {
-    assert_eq!(ApplicationIdentity::ID, "io.musheen.Musheen");
+    assert_eq!(ApplicationIdentity::ID, "org.musheen.Musheen");
     assert_eq!(ApplicationIdentity::ICON_NAME, "musheen");
     assert!(ApplicationIdentity::ICON_SVG.starts_with(b"<svg"));
 

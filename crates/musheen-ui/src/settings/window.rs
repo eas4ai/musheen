@@ -1,7 +1,7 @@
 use super::presentation::{choices, display_number, display_value, input_value, stored_number};
 use super::{SettingsBackends, SettingsState};
 use crate::theme::preview::AppearanceSnapshot;
-use crate::{Catalog, Locale};
+use crate::{ApplicationIdentity, Catalog, Locale};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Disableable, Root, WindowExt};
@@ -69,7 +69,7 @@ fn open_settings_at(
             ..Default::default()
         }),
         window_min_size: Some(size(px(720.), px(480.))),
-        app_id: Some("io.github.musheen.Settings".into()),
+        app_id: Some(ApplicationIdentity::ID.into()),
         ..Default::default()
     };
     match cx.open_window(options, move |window, cx| {

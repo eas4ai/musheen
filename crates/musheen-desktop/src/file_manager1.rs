@@ -8,7 +8,7 @@ use std::time::Duration;
 use std::os::unix::ffi::OsStringExt as _;
 
 pub const FILE_MANAGER_NAME: &str = "org.freedesktop.FileManager1";
-pub const MUSHEEN_FILE_MANAGER_NAME: &str = "org.musheen.FileManager1";
+pub const MUSHEEN_FILE_MANAGER_NAME: &str = "org.musheen.Musheen";
 pub const FILE_MANAGER_PATH: &str = "/org/freedesktop/FileManager1";
 const MAX_URIS: usize = 256;
 const MAX_URI_BYTES: usize = 16 * 1024;

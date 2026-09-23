@@ -3,7 +3,6 @@
   "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>Musheen</vendor>
-  <vendor_url>https://github.com/musheen/musheen</vendor_url>
   <icon_name>org.musheen.Musheen</icon_name>
 
   <action id="org.musheen.open-directory-as-administrator">

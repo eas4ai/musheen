@@ -340,7 +340,7 @@ pub(crate) fn properties_window_options(title: impl Into<SharedString>, cx: &App
             title: Some(title.into()),
             ..TitlebarOptions::default()
         }),
-        app_id: Some(format!("{}.Properties", ApplicationIdentity::ID)),
+        app_id: Some(ApplicationIdentity::ID.into()),
         window_min_size: Some(size(px(560.), px(420.))),
         ..WindowOptions::default()
     }
