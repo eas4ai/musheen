@@ -10,6 +10,15 @@ if [ "$DESTDIR" = / ]; then
     echo "DESTDIR must not be the filesystem root" >&2
     exit 1
 fi
+if [ -L "$DESTDIR" ]; then
+    echo "DESTDIR must not be a symlink" >&2
+    exit 1
+fi
+DESTDIR=$(realpath -m -- "$DESTDIR")
+if [ "$DESTDIR" = / ]; then
+    echo "DESTDIR resolves to the filesystem root" >&2
+    exit 1
+fi
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd)

@@ -114,5 +114,6 @@ fn native_installer_rejects_a_symlinked_destination_before_writing() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
     assert!(!destination.join("usr/bin/musheen").exists());
 }
