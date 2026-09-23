@@ -1,7 +1,7 @@
 use crate::copy::provider_failure_kind;
 use crate::{
     CopyProvider, CopyRequest, CopySession, CopyStrategy, EntrySnapshot, FailureKind,
-    MetadataReport, OperationFailure,
+    MetadataReport, OperationFailure, SourceRemovalToken,
 };
 use musheen_core::{CancellationToken, StorePath};
 
@@ -24,6 +24,7 @@ pub struct MoveMetadataReview {
     source: StorePath,
     destination: StorePath,
     source_snapshot: EntrySnapshot,
+    source_removal: SourceRemovalToken,
     copy_strategy: CopyStrategy,
     metadata: MetadataReport,
 }
@@ -34,6 +35,7 @@ impl MoveMetadataReview {
         source: StorePath,
         destination: StorePath,
         source_snapshot: EntrySnapshot,
+        source_removal: SourceRemovalToken,
         copy_strategy: CopyStrategy,
         metadata: MetadataReport,
     ) -> Self {
@@ -41,6 +43,7 @@ impl MoveMetadataReview {
             source,
             destination,
             source_snapshot,
+            source_removal,
             copy_strategy,
             metadata,
         }
@@ -124,7 +127,8 @@ pub fn execute_move<P: CopyProvider>(
         }
     }
 
-    let copied = CopySession::default().execute(provider, request, cancellation)?;
+    let (copied, source_removal) =
+        CopySession::default().execute_for_move(provider, request, cancellation)?;
     if cancellation.is_cancelled() {
         return Err(OperationFailure::after_publish(
             FailureKind::Cancelled,
@@ -142,6 +146,7 @@ pub fn execute_move<P: CopyProvider>(
                 request.source().clone(),
                 request.destination().clone(),
                 copied.source_snapshot().clone(),
+                source_removal,
                 copy_strategy,
                 metadata,
             )),
@@ -152,6 +157,7 @@ pub fn execute_move<P: CopyProvider>(
         request.source(),
         request.destination(),
         copied.source_snapshot(),
+        &source_removal,
     )?;
     Ok(MoveOutcome {
         strategy: MoveStrategy::VerifiedCopy,
@@ -199,6 +205,7 @@ pub fn complete_move_after_metadata_review<P: CopyProvider>(
         review.source(),
         review.destination(),
         &review.source_snapshot,
+        &review.source_removal,
     )?;
     Ok(MoveOutcome {
         strategy: MoveStrategy::VerifiedCopy,
@@ -213,14 +220,10 @@ fn remove_verified_source<P: CopyProvider>(
     source: &StorePath,
     destination: &StorePath,
     source_snapshot: &EntrySnapshot,
+    source_removal: &SourceRemovalToken,
 ) -> Result<(), OperationFailure> {
-    let prepared = provider
-        .prepare_source_removal(source, source_snapshot)
-        .map_err(|error| {
-            OperationFailure::after_publish(provider_failure_kind(error), destination)
-        })?;
     provider
-        .remove_source(source, source_snapshot, &prepared)
+        .remove_source(source, source_snapshot, source_removal)
         .map_err(|error| {
             let unknown = error == crate::ProviderError::SourceRemovalUnknown;
             let partial = error == crate::ProviderError::SourcePartiallyRemoved;

@@ -536,6 +536,14 @@ pub struct CopySession {
     copied_identities: BTreeMap<Box<[u8]>, StorePath>,
 }
 
+struct StagedCopy {
+    strategy: CopyStrategy,
+    bytes_copied: u64,
+    metadata: MetadataReport,
+    source: EntrySnapshot,
+    staging: StorePath,
+}
+
 impl CopySession {
     pub fn execute<P: CopyProvider>(
         &mut self,
@@ -543,6 +551,49 @@ impl CopySession {
         request: &CopyRequest,
         cancellation: &CancellationToken,
     ) -> Result<CopyOutcome, OperationFailure> {
+        let staged = self.stage_copy(provider, request, cancellation)?;
+        let verified = self.verify_staged(provider, request, staged)?;
+        self.publish_verified(provider, request, cancellation, verified)
+    }
+
+    pub(crate) fn execute_for_move<P: CopyProvider>(
+        &mut self,
+        provider: &mut P,
+        request: &CopyRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(CopyOutcome, SourceRemovalToken), OperationFailure> {
+        let staged = self.stage_copy(provider, request, cancellation)?;
+        check_cancellation(cancellation, request.destination()).map_err(|failure| {
+            cleanup_failure(
+                provider,
+                failure.kind,
+                request.destination(),
+                &staged.staging,
+            )
+        })?;
+        // Fingerprint first so verification catches mutations that raced preparation;
+        // removal rechecks the fingerprint to catch every mutation after verification.
+        let prepared = provider
+            .prepare_source_removal(request.source(), &staged.source)
+            .map_err(|error| {
+                cleanup_failure(
+                    provider,
+                    provider_failure_kind(error),
+                    request.destination(),
+                    &staged.staging,
+                )
+            })?;
+        let verified = self.verify_staged(provider, request, staged)?;
+        let copied = self.publish_verified(provider, request, cancellation, verified)?;
+        Ok((copied, prepared))
+    }
+
+    fn stage_copy<P: CopyProvider>(
+        &self,
+        provider: &mut P,
+        request: &CopyRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<StagedCopy, OperationFailure> {
         check_cancellation(cancellation, request.destination())?;
         let source = provider
             .inspect(request.source(), request.options.follows_links())
@@ -633,14 +684,34 @@ impl CopySession {
                 &staging,
             ));
         }
+        Ok(StagedCopy {
+            strategy,
+            bytes_copied,
+            metadata,
+            source,
+            staging,
+        })
+    }
+
+    fn verify_staged<P: CopyProvider>(
+        &self,
+        provider: &mut P,
+        request: &CopyRequest,
+        staged: StagedCopy,
+    ) -> Result<StagedCopy, OperationFailure> {
         let verified = provider
-            .verify(request.source(), &source, &staging, &metadata)
+            .verify(
+                request.source(),
+                &staged.source,
+                &staged.staging,
+                &staged.metadata,
+            )
             .map_err(|error| {
                 cleanup_failure(
                     provider,
                     provider_failure_kind(error),
                     request.destination(),
-                    &staging,
+                    &staged.staging,
                 )
             })?;
         if !verified {
@@ -648,28 +719,46 @@ impl CopySession {
                 provider,
                 FailureKind::VerificationFailed,
                 request.destination(),
-                &staging,
+                &staged.staging,
             ));
         }
+        Ok(staged)
+    }
+
+    fn publish_verified<P: CopyProvider>(
+        &mut self,
+        provider: &mut P,
+        request: &CopyRequest,
+        cancellation: &CancellationToken,
+        verified: StagedCopy,
+    ) -> Result<CopyOutcome, OperationFailure> {
         check_cancellation(cancellation, request.destination()).map_err(|failure| {
-            cleanup_failure(provider, failure.kind, request.destination(), &staging)
+            cleanup_failure(
+                provider,
+                failure.kind,
+                request.destination(),
+                &verified.staging,
+            )
         })?;
-        if let Err(error) = provider.publish(&staging, request.destination(), cancellation) {
+        if let Err(error) = provider.publish(&verified.staging, request.destination(), cancellation)
+        {
             return Err(publish_failure(
                 provider,
                 error,
                 request.destination(),
-                &staging,
+                &verified.staging,
             ));
         }
 
-        self.copied_identities
-            .insert(source.identity.clone(), request.destination().clone());
+        self.copied_identities.insert(
+            verified.source.identity.clone(),
+            request.destination().clone(),
+        );
         Ok(CopyOutcome {
-            strategy,
-            bytes_copied,
-            metadata,
-            source_snapshot: source,
+            strategy: verified.strategy,
+            bytes_copied: verified.bytes_copied,
+            metadata: verified.metadata,
+            source_snapshot: verified.source,
         })
     }
 

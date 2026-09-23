@@ -21,7 +21,7 @@ fn same_filesystem_move_prefers_atomic_rename() {
 }
 
 #[test]
-fn cross_filesystem_move_verifies_and_publishes_before_source_removal() {
+fn cross_filesystem_move_prepares_removal_before_publication() {
     let mut provider = RecordingProvider::regular();
 
     let outcome = execute_move(
@@ -32,6 +32,16 @@ fn cross_filesystem_move_verifies_and_publishes_before_source_removal() {
     .unwrap();
 
     assert_eq!(outcome.strategy(), MoveStrategy::VerifiedCopy);
+    let prepare = provider
+        .actions
+        .iter()
+        .position(|action| action == &Action::PrepareSourceRemoval)
+        .unwrap();
+    let verify = provider
+        .actions
+        .iter()
+        .position(|action| action == &Action::Verify)
+        .unwrap();
     let publish = provider
         .actions
         .iter()
@@ -42,6 +52,8 @@ fn cross_filesystem_move_verifies_and_publishes_before_source_removal() {
         .iter()
         .position(|action| action == &Action::RemoveSource)
         .unwrap();
+    assert!(prepare < verify);
+    assert!(verify < publish);
     assert!(publish < remove);
 }
 
@@ -60,6 +72,24 @@ fn failed_verification_or_cancellation_never_removes_the_source() {
     assert!(failure.source_retained());
     assert!(failure.destination_can_be_removed_for_rollback());
     assert!(!cancelled.actions.contains(&Action::RemoveSource));
+}
+
+#[test]
+fn source_removal_preparation_failure_never_publishes() {
+    let mut provider = RecordingProvider::regular();
+    provider.fail_action = Some(Action::PrepareSourceRemoval);
+
+    let failure = execute_move(
+        &mut provider,
+        &request("unremovable-source"),
+        &CancellationToken::new(),
+    )
+    .unwrap_err();
+
+    assert!(failure.source_retained());
+    assert!(!failure.destination_published());
+    assert!(provider.actions.contains(&Action::Cleanup));
+    assert!(!provider.actions.contains(&Action::Publish));
 }
 
 #[test]
@@ -136,7 +166,23 @@ fn metadata_loss_requires_review_before_source_removal() {
             .metadata(),
         &provider.metadata
     );
-    assert!(!provider.actions.contains(&Action::PrepareSourceRemoval));
+    let prepare = provider
+        .actions
+        .iter()
+        .position(|action| action == &Action::PrepareSourceRemoval)
+        .unwrap();
+    let verify = provider
+        .actions
+        .iter()
+        .position(|action| action == &Action::Verify)
+        .unwrap();
+    let publish = provider
+        .actions
+        .iter()
+        .position(|action| action == &Action::Publish)
+        .unwrap();
+    assert!(prepare < verify);
+    assert!(verify < publish);
     assert!(!provider.actions.contains(&Action::RemoveSource));
 }
 
@@ -153,6 +199,7 @@ fn confirmed_metadata_loss_removes_the_unchanged_source() {
     let review = outcome
         .into_metadata_review()
         .expect("incomplete metadata requires a decision");
+    provider.actions.clear();
 
     let completed =
         complete_move_after_metadata_review(&mut provider, review, &CancellationToken::new())
@@ -160,8 +207,7 @@ fn confirmed_metadata_loss_removes_the_unchanged_source() {
 
     assert!(completed.metadata_review().is_none());
     assert_eq!(completed.metadata(), &provider.metadata);
-    assert!(provider.actions.contains(&Action::PrepareSourceRemoval));
-    assert!(provider.actions.contains(&Action::RemoveSource));
+    assert_eq!(provider.actions, [Action::Verify, Action::RemoveSource]);
 }
 
 #[test]

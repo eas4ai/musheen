@@ -1291,6 +1291,7 @@ mod tests {
                 8,
                 1,
             ),
+            musheen_ops::SourceRemovalToken::new(b"source".to_vec()),
             musheen_ops::CopyStrategy::Streamed,
             musheen_ops::MetadataReport::with_skipped([musheen_ops::MetadataKind::Ownership]),
         )
