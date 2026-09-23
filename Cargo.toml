@@ -18,7 +18,12 @@ members = [
     "vendor/sevenz-rust2",
 ]
 resolver = "3"
-exclude = ["vendor/gpui-component", "vendor/gpui-pre", "vendor/native-theme-gpui"]
+exclude = [
+    "vendor/gpui-component",
+    "vendor/gpui-pre",
+    "vendor/gpui-pre-linux",
+    "vendor/native-theme-gpui",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -106,5 +111,6 @@ workspace = true
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
 native-theme-gpui = { path = "vendor/native-theme-gpui" }
 sevenz-rust2 = { path = "vendor/sevenz-rust2" }
