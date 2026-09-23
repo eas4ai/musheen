@@ -97,7 +97,7 @@ use musheen_ops::{
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::{NativeTheme, geometry};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -1906,10 +1906,7 @@ pub fn run(initial_path: PathBuf) {
                 ApplicationSession::new(vec![WindowSession::new(fallback)])
                     .expect("a single fallback window is a valid application session")
             });
-            let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
-                store,
-                application.windows().to_vec(),
-            )));
+            let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(store, application)));
             let operation_hub =
                 OperationHub::for_current_user_with_provider_runtime(&limits, &providers);
             install_desktop_notifications(&settings, operation_hub.clone(), cx);
@@ -2654,19 +2651,24 @@ fn restore_application_session(
 struct SessionCoordinator {
     store: SessionStore,
     windows: Vec<(u64, WindowSession)>,
+    unknown_fields: BTreeMap<String, serde_json::Value>,
     next_window_id: u64,
     revision: u64,
 }
 
 impl SessionCoordinator {
-    fn new(store: SessionStore, windows: Vec<WindowSession>) -> Self {
-        let windows = windows
-            .into_iter()
+    fn new(store: SessionStore, application: ApplicationSession) -> Self {
+        let unknown_fields = application.unknown_fields().clone();
+        let windows = application
+            .windows()
+            .iter()
+            .cloned()
             .enumerate()
             .map(|(index, window)| (index as u64 + 1, window))
             .collect::<Vec<_>>();
         Self {
             store,
+            unknown_fields,
             next_window_id: windows.len() as u64 + 1,
             windows,
             revision: 0,
@@ -2694,13 +2696,14 @@ impl SessionCoordinator {
     fn prepare_save(
         &mut self,
         window_id: u64,
-        window: WindowSession,
+        mut window: WindowSession,
     ) -> Result<(u64, Vec<u8>), NavigationError> {
         let Some((_, saved)) = self.windows.iter_mut().find(|(id, _)| *id == window_id) else {
             return Err(NavigationError::InvalidDocument(
                 "window is not registered in the application session".into(),
             ));
         };
+        window.preserve_unknown_fields_from(saved);
         *saved = window;
         let document = ApplicationSession::new(
             self.windows
@@ -2708,6 +2711,7 @@ impl SessionCoordinator {
                 .map(|(_, window)| window.clone())
                 .collect(),
         )?
+        .with_unknown_fields(self.unknown_fields.clone())
         .to_json()?;
         self.revision = self.revision.wrapping_add(1);
         Ok((self.revision, document))
@@ -3517,10 +3521,7 @@ impl MusheenApp {
                 ApplicationSession::new(vec![WindowSession::new(initial.clone())])
                     .expect("a single fallback window is a valid application session")
             });
-            let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
-                store,
-                application.windows().to_vec(),
-            )));
+            let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(store, application)));
             let (window_id, navigation) = coordinator
                 .lock()
                 .expect("session coordinator lock is not poisoned")
@@ -17749,6 +17750,40 @@ mod tests {
         assert_eq!(restored.windows()[0].focused_tab().location(), &expected);
     }
 
+    #[test]
+    fn coordinated_session_save_keeps_compatible_unknown_root_fields() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = SessionStore::at(temporary.path().join("session.json"));
+        let application = ApplicationSession::new(vec![WindowSession::new(
+            StorePath::from_unix_path("/before"),
+        )])
+        .unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&application.to_json().unwrap()).unwrap();
+        saved["future_root"] = serde_json::json!({ "enabled": true });
+        saved["windows"][0]["future_window"] = serde_json::json!({ "width": 920 });
+        store.save(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        let restored =
+            restore_application_session(&store, StorePath::from_unix_path("/fallback"), |_| true)
+                .unwrap();
+        let mut coordinator = SessionCoordinator::new(store, restored);
+        let window_id = coordinator.entries()[0].0;
+        let (_, document) = coordinator
+            .prepare_save(
+                window_id,
+                WindowSession::new(StorePath::from_unix_path("/after")),
+            )
+            .unwrap();
+        let rewritten: serde_json::Value = serde_json::from_slice(&document).unwrap();
+
+        assert_eq!(rewritten["future_root"], saved["future_root"]);
+        assert_eq!(
+            rewritten["windows"][0]["future_window"],
+            saved["windows"][0]["future_window"]
+        );
+        assert_eq!(rewritten["windows"].as_array().unwrap().len(), 1);
+    }
+
     #[gpui_kit::test]
     async fn newer_session_schema_save_failure_is_visible_without_replacing_the_file(
         cx: &mut TestAppContext,
@@ -17830,10 +17865,11 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
             SessionStore::at(temporary.path().join("session.json")),
-            vec![
+            ApplicationSession::new(vec![
                 WindowSession::new(StorePath::from_unix_path("/first")),
                 WindowSession::new(StorePath::from_unix_path("/second")),
-            ],
+            ])
+            .unwrap(),
         )));
         let first_id = coordinator
             .lock()
@@ -17875,7 +17911,10 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
             SessionStore::at(temporary.path().join("session.json")),
-            vec![WindowSession::new(StorePath::from_unix_path("/first"))],
+            ApplicationSession::new(vec![WindowSession::new(StorePath::from_unix_path(
+                "/first",
+            ))])
+            .unwrap(),
         )));
         let window_id = coordinator
             .lock()
@@ -17916,7 +17955,10 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
             SessionStore::at(temporary.path().join("session.json")),
-            vec![WindowSession::new(StorePath::from_unix_path("/first"))],
+            ApplicationSession::new(vec![WindowSession::new(StorePath::from_unix_path(
+                "/first",
+            ))])
+            .unwrap(),
         )));
         let window_id = coordinator
             .lock()
@@ -17966,7 +18008,10 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
         let mut coordinator = SessionCoordinator::new(
             SessionStore::at(temporary.path().join("session.json")),
-            vec![WindowSession::new(StorePath::from_unix_path("/first"))],
+            ApplicationSession::new(vec![WindowSession::new(StorePath::from_unix_path(
+                "/first",
+            ))])
+            .unwrap(),
         );
 
         for index in 1..MAX_WINDOWS {
@@ -19986,7 +20031,7 @@ mod tests {
         let navigation = WindowSession::new(StorePath::from_unix_path(temporary.path()));
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
             SessionStore::at(temporary.path().join("session.json")),
-            vec![navigation.clone()],
+            ApplicationSession::new(vec![navigation.clone()]).unwrap(),
         )));
         let window_id = coordinator.lock().unwrap().entries()[0].0;
         let binding = SessionBinding {
@@ -20535,7 +20580,7 @@ mod tests {
         let navigation = WindowSession::new(StorePath::from_unix_path(temporary.path()));
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
             SessionStore::at(temporary.path().join("session.json")),
-            vec![navigation.clone()],
+            ApplicationSession::new(vec![navigation.clone()]).unwrap(),
         )));
         let window_id = coordinator.lock().unwrap().entries()[0].0;
         let binding = SessionBinding {
@@ -20891,7 +20936,8 @@ mod tests {
         let second_navigation = WindowSession::new(initial);
         let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
             SessionStore::at(temporary.path().join("session.json")),
-            vec![first_navigation.clone(), second_navigation.clone()],
+            ApplicationSession::new(vec![first_navigation.clone(), second_navigation.clone()])
+                .unwrap(),
         )));
         let window_ids = coordinator
             .lock()

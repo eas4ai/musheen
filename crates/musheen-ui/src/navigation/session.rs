@@ -3,6 +3,7 @@ use crate::views::{ViewPreferenceStore, ViewPreferences};
 use musheen_core::StorePath;
 use musheen_desktop::SESSION_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 const MAX_PANES: usize = 2;
@@ -32,23 +33,30 @@ pub struct WindowSession {
     next_pane_id: u64,
     #[serde(default)]
     view_preferences: ViewPreferenceStore,
+    #[serde(default, flatten)]
+    unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct SessionDocument {
     schema_version: u32,
     window: WindowSession,
+    #[serde(flatten)]
+    unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationSession {
     windows: Vec<WindowSession>,
+    unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct ApplicationSessionDocument {
     schema_version: u32,
     windows: Vec<WindowSession>,
+    #[serde(flatten)]
+    unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
 impl ApplicationSession {
@@ -61,7 +69,10 @@ impl ApplicationSession {
         for window in &windows {
             window.validate()?;
         }
-        Ok(Self { windows })
+        Ok(Self {
+            windows,
+            unknown_fields: BTreeMap::new(),
+        })
     }
 
     #[must_use]
@@ -69,10 +80,23 @@ impl ApplicationSession {
         &self.windows
     }
 
+    pub(crate) fn unknown_fields(&self) -> &BTreeMap<String, serde_json::Value> {
+        &self.unknown_fields
+    }
+
+    pub(crate) fn with_unknown_fields(
+        mut self,
+        unknown_fields: BTreeMap<String, serde_json::Value>,
+    ) -> Self {
+        self.unknown_fields = unknown_fields;
+        self
+    }
+
     pub fn to_json(&self) -> Result<Vec<u8>, NavigationError> {
         serde_json::to_vec_pretty(&ApplicationSessionDocument {
             schema_version: SESSION_SCHEMA_VERSION,
             windows: self.windows.clone(),
+            unknown_fields: self.unknown_fields.clone(),
         })
         .map_err(NavigationError::Serialize)
     }
@@ -90,6 +114,7 @@ impl ApplicationSession {
             ));
         }
         let mut session = Self::new(document.windows)?;
+        session.unknown_fields = document.unknown_fields;
         for window in &mut session.windows {
             for pane in &mut window.panes {
                 pane.recover_missing(&exists, &fallback);
@@ -109,8 +134,11 @@ impl ApplicationSession {
             return Self::restore_json(bytes, &exists, fallback);
         }
         if shape.get("window").is_some() {
-            let window = WindowSession::restore_json(bytes, &exists, fallback)?;
-            return Self::new(vec![window]);
+            let document: SessionDocument =
+                serde_json::from_slice(bytes).map_err(NavigationError::Serialize)?;
+            let unknown_fields = document.unknown_fields.clone();
+            let window = WindowSession::restore_document(document, &exists, &fallback)?;
+            return Ok(Self::new(vec![window])?.with_unknown_fields(unknown_fields));
         }
         Err(NavigationError::InvalidDocument(
             "session document has no window collection".into(),
@@ -119,6 +147,14 @@ impl ApplicationSession {
 }
 
 impl WindowSession {
+    pub(crate) fn preserve_unknown_fields_from(&mut self, previous: &Self) {
+        for (key, value) in &previous.unknown_fields {
+            self.unknown_fields
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
     #[must_use]
     pub fn new(initial: StorePath) -> Self {
         Self {
@@ -126,6 +162,7 @@ impl WindowSession {
             focused_pane: 0,
             next_pane_id: 2,
             view_preferences: ViewPreferenceStore::default(),
+            unknown_fields: BTreeMap::new(),
         }
     }
 
@@ -258,6 +295,7 @@ impl WindowSession {
             focused_pane: 0,
             next_pane_id: 2,
             view_preferences: self.view_preferences.clone(),
+            unknown_fields: BTreeMap::new(),
         })
     }
 
@@ -287,6 +325,7 @@ impl WindowSession {
         serde_json::to_vec_pretty(&SessionDocument {
             schema_version: SESSION_SCHEMA_VERSION,
             window: self.clone(),
+            unknown_fields: BTreeMap::new(),
         })
         .map_err(NavigationError::Serialize)
     }
@@ -298,6 +337,14 @@ impl WindowSession {
     ) -> Result<Self, NavigationError> {
         let document: SessionDocument =
             serde_json::from_slice(bytes).map_err(NavigationError::Serialize)?;
+        Self::restore_document(document, &exists, &fallback)
+    }
+
+    fn restore_document(
+        document: SessionDocument,
+        exists: &impl Fn(&StorePath) -> bool,
+        fallback: &StorePath,
+    ) -> Result<Self, NavigationError> {
         if document.schema_version != SESSION_SCHEMA_VERSION {
             return Err(NavigationError::InvalidDocument(
                 "unsupported session schema".into(),
@@ -306,7 +353,7 @@ impl WindowSession {
         let mut window = document.window;
         window.validate()?;
         for pane in &mut window.panes {
-            pane.recover_missing(&exists, &fallback);
+            pane.recover_missing(exists, fallback);
         }
         Ok(window)
     }

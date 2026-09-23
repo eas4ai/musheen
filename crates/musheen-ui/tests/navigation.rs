@@ -292,6 +292,49 @@ fn application_session_restores_multiple_windows_in_order() {
 }
 
 #[test]
+fn application_session_roundtrip_preserves_compatible_unknown_root_fields() {
+    let session = ApplicationSession::new(vec![WindowSession::new(path("/kept"))]).unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&session.to_json().unwrap()).unwrap();
+    document["future_root"] = serde_json::json!({ "enabled": true });
+
+    let restored = ApplicationSession::restore_json(
+        &serde_json::to_vec(&document).unwrap(),
+        |_| true,
+        path("/fallback"),
+    )
+    .unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&restored.to_json().unwrap()).unwrap();
+
+    assert_eq!(saved["future_root"], document["future_root"]);
+    assert_eq!(
+        restored.windows()[0].focused_tab().location(),
+        &path("/kept")
+    );
+}
+
+#[test]
+fn window_session_roundtrip_preserves_compatible_unknown_window_fields() {
+    let window = WindowSession::new(path("/kept"));
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&window.to_json().unwrap()).unwrap();
+    document["window"]["future_window"] = serde_json::json!({ "width": 920 });
+
+    let restored = WindowSession::restore_json(
+        &serde_json::to_vec(&document).unwrap(),
+        |_| true,
+        path("/fallback"),
+    )
+    .unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&restored.to_json().unwrap()).unwrap();
+
+    assert_eq!(
+        saved["window"]["future_window"],
+        document["window"]["future_window"]
+    );
+}
+
+#[test]
 fn application_session_migrates_a_legacy_single_window_document() {
     let legacy = WindowSession::new(path("/legacy"))
         .to_json()
@@ -306,6 +349,25 @@ fn application_session_migrates_a_legacy_single_window_document() {
         restored.windows()[0].focused_tab().location(),
         &path("/legacy")
     );
+}
+
+#[test]
+fn legacy_single_window_migration_preserves_compatible_unknown_root_fields() {
+    let window = WindowSession::new(path("/legacy"));
+    let mut legacy: serde_json::Value = serde_json::from_slice(&window.to_json().unwrap()).unwrap();
+    legacy["future_root"] = serde_json::json!({ "enabled": true });
+
+    let restored = ApplicationSession::restore_compatible_json(
+        &serde_json::to_vec(&legacy).unwrap(),
+        |_| true,
+        path("/fallback"),
+    )
+    .unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&restored.to_json().unwrap()).unwrap();
+
+    assert_eq!(saved["future_root"], legacy["future_root"]);
+    assert!(saved.get("window").is_none());
+    assert_eq!(saved["windows"].as_array().unwrap().len(), 1);
 }
 
 #[test]
