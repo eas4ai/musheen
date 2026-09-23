@@ -495,6 +495,11 @@ impl DirectoryViewModel {
     }
 
     #[must_use]
+    pub fn has_retention_capacity(&self) -> bool {
+        self.unpinned_model_count() < self.retention_limit
+    }
+
+    #[must_use]
     pub fn rendered_range(&self, first_visible: usize, viewport_items: usize) -> Range<usize> {
         let length = self.visible_items().len();
         let start = first_visible.min(length);

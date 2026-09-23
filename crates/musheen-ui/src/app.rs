@@ -4126,6 +4126,7 @@ impl MusheenApp {
                     return;
                 }
                 let complete = directory.view().is_complete();
+                let should_prefetch = !complete && directory.view().has_retention_capacity();
                 let items = if complete {
                     directory.items().to_vec()
                 } else {
@@ -4163,6 +4164,9 @@ impl MusheenApp {
                     }
                 })
                 .detach();
+                if should_prefetch {
+                    self.start_next_directory_page(tab_id, cx);
+                }
             }
             Err(error) => {
                 let (request_error, operation_error) =
@@ -13549,6 +13553,32 @@ mod tests {
                 state.catalog_binding.path_hint(item.id()),
                 Some(destination)
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn directory_load_completes_paging_for_global_sorting(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        for index in (0..700).rev() {
+            filesystem::write(
+                temporary.path().join(format!("item-{index:04}.txt")),
+                b"item",
+            )
+            .unwrap();
+        }
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.wait_for(browser, Duration::from_secs(3), |_, cx| {
+            app.read(cx).focused_directory().view().is_complete()
+        })
+        .await;
+
+        cx.read(|cx| {
+            let state = app.read(cx);
+            let items = state.focused_directory().view().visible_items();
+            assert_eq!(items.len(), 700);
+            assert_eq!(items[0].display_name().as_str(), "item-0000.txt");
+            assert_eq!(items[699].display_name().as_str(), "item-0699.txt");
         });
     }
 
