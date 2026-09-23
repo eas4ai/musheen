@@ -313,6 +313,20 @@ fn normalized_pointer_bounds(start: Point<Pixels>, end: Point<Pixels>) -> Bounds
     Bounds::from_corners(point(px(left), px(top)), point(px(right), px(bottom)))
 }
 
+fn is_rubber_band_start(
+    position: Point<Pixels>,
+    surface: Bounds<Pixels>,
+    chrome_height: f32,
+    scrollbar_width: f32,
+) -> bool {
+    let left = surface.left().as_f32();
+    let right = (surface.right().as_f32() - scrollbar_width.max(0.0)).max(left);
+    let top = (surface.top().as_f32() + chrome_height.max(0.0)).min(surface.bottom().as_f32());
+    let x = position.x.as_f32();
+    let y = position.y.as_f32();
+    x >= left && x < right && y >= top && y <= surface.bottom().as_f32()
+}
+
 fn rubber_band_indices(selection: Bounds<Pixels>, surface: RubberBandSurface) -> Vec<usize> {
     let RubberBandSurface {
         bounds,
@@ -5238,15 +5252,31 @@ impl MusheenApp {
     }
 
     fn finish_rubber_band(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
-        if self
+        let clear_selection = self
+            .rubber_band
+            .as_ref()
+            .filter(|gesture| gesture.tab_id == tab_id)
+            .is_some_and(|gesture| !gesture.moved && gesture.mode == SelectionMode::Replace);
+        if !self
             .rubber_band
             .as_ref()
             .is_some_and(|gesture| gesture.tab_id == tab_id)
         {
-            self.rubber_band = None;
-            self.schedule_session_save(cx);
-            cx.notify();
+            return;
         }
+        self.rubber_band = None;
+        if clear_selection {
+            if let Some(directory) = self.directories.get_mut(&tab_id) {
+                directory.view_mut().clear_selection();
+                directory.view_mut().focus_item(None);
+            }
+            if let Some(tab) = self.navigation.tab_mut(tab_id) {
+                tab.set_selection(Vec::new());
+            }
+            self.refresh_info_pane(tab_id, cx);
+        }
+        self.schedule_session_save(cx);
+        cx.notify();
     }
 
     fn focus_directory_item(&mut self, tab_id: TabId, id: Option<ItemId>, cx: &mut Context<Self>) {
@@ -11383,9 +11413,14 @@ impl MusheenApp {
         let view = cx.entity();
         let selection_color = cx.theme().colors.primary;
         let rubber_band_scroll = scroll;
-        let top_inset = 16.0
-            + if has_filter_summary { 32.0 } else { 0.0 }
+        let chrome_height = if has_filter_summary { 32.0 } else { 0.0 }
             + if layout == Layout::Details { 32.0 } else { 0.0 };
+        let top_inset = 16.0 + chrome_height;
+        let scrollbar_width = cx
+            .try_global::<NativeTheme>()
+            .and_then(|theme| theme.resolved(cx))
+            .map(native_theme_gpui::scrollbar_width)
+            .unwrap_or(12.0);
         let rubber_band = canvas(
             |_, _, _| (),
             move |surface, _, window, cx| {
@@ -11404,7 +11439,12 @@ impl MusheenApp {
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
                     if phase.capture()
                         && event.button == MouseButton::Left
-                        && surface.contains(&event.position)
+                        && is_rubber_band_start(
+                            event.position,
+                            surface,
+                            chrome_height,
+                            scrollbar_width,
+                        )
                     {
                         down_view.update(cx, |this, _| {
                             this.begin_rubber_band(tab_id, event.position, event.modifiers);
@@ -13217,6 +13257,131 @@ mod tests {
             ),
             vec![11]
         );
+    }
+
+    async fn open_selected_directory(
+        path: &Path,
+        layout: Layout,
+        cx: &mut TestAppContext,
+    ) -> (Entity<MusheenApp>, AnyWindowHandle) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let root = path.to_path_buf();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(root, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let tab_id = state.navigation.focused_tab().id();
+            state
+                .focused_directory_mut()
+                .view_mut()
+                .preferences_mut()
+                .layout = layout;
+            let item = state.focused_directory().view().items()[0].id().clone();
+            state.select_item(tab_id, item, cx);
+        });
+        (app, browser)
+    }
+
+    fn selected_item_count(app: &Entity<MusheenApp>, cx: &TestAppContext) -> usize {
+        cx.read(|cx| app.read(cx).focused_directory().view().selected_ids().len())
+    }
+
+    #[gpui_kit::test]
+    async fn clicking_empty_directory_space_clears_the_selection(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("selected.txt"), b"selected").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let empty_position = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                let item = window.find("directory-item-0-0").bounds();
+                point(item.left() + px(20.), item.bottom() + px(24.))
+            })
+            .unwrap();
+
+        let mut visual = VisualTestContext::from_window(browser, cx);
+        visual.simulate_mouse_down(empty_position, MouseButton::Left, Modifiers::none());
+        visual.simulate_mouse_up(empty_position, MouseButton::Left, Modifiers::none());
+        visual.run_until_parked();
+
+        assert_eq!(selected_item_count(&app, cx), 0);
+    }
+
+    #[gpui_kit::test]
+    async fn dragging_the_details_header_preserves_the_selection(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("selected.txt"), b"selected").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::Details, cx).await;
+        let header_position = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                window.find("details-Name").bounds().center()
+            })
+            .unwrap();
+
+        let mut visual = VisualTestContext::from_window(browser, cx);
+        visual.simulate_mouse_down(header_position, MouseButton::Left, Modifiers::none());
+        visual.simulate_mouse_move(
+            point(header_position.x + px(24.), header_position.y),
+            Some(MouseButton::Left),
+            Modifiers::none(),
+        );
+        visual.simulate_mouse_up(
+            point(header_position.x + px(24.), header_position.y),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        visual.run_until_parked();
+
+        assert_eq!(selected_item_count(&app, cx), 1);
+    }
+
+    #[gpui_kit::test]
+    async fn dragging_the_directory_scrollbar_preserves_the_selection(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        for index in 0..100 {
+            filesystem::write(
+                temporary.path().join(format!("item-{index:03}.txt")),
+                b"item",
+            )
+            .unwrap();
+        }
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let scrollbar_position = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                let surface = window.find("directory-items").bounds();
+                point(surface.right() - px(2.), surface.center().y)
+            })
+            .unwrap();
+
+        let mut visual = VisualTestContext::from_window(browser, cx);
+        visual.simulate_mouse_down(scrollbar_position, MouseButton::Left, Modifiers::none());
+        visual.simulate_mouse_move(
+            point(scrollbar_position.x, scrollbar_position.y + px(60.)),
+            Some(MouseButton::Left),
+            Modifiers::none(),
+        );
+        visual.simulate_mouse_up(
+            point(scrollbar_position.x, scrollbar_position.y + px(60.)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        visual.run_until_parked();
+
+        assert_eq!(selected_item_count(&app, cx), 1);
     }
 
     #[gpui_kit::test]
