@@ -10663,6 +10663,7 @@ impl MusheenApp {
                                             .ghost()
                                             .small()
                                             .disabled(!available)
+                                            .tooltip(label.clone())
                                             .when_some(localized_unavailable, |button, reason| {
                                                 button.tooltip(reason)
                                             })
@@ -10671,11 +10672,22 @@ impl MusheenApp {
                                             .child(
                                                 div()
                                                     .w_full()
+                                                    .min_w_0()
                                                     .flex()
                                                     .items_center()
                                                     .gap_2()
                                                     .child(Icon::new(icon).small())
-                                                    .child(label.clone()),
+                                                    .child(
+                                                        div()
+                                                            .id(format!(
+                                                                "sidebar-label-{section_index}-{entry_index}"
+                                                            ))
+                                                            .test_support()
+                                                            .min_w_0()
+                                                            .flex_1()
+                                                            .truncate()
+                                                            .child(label.clone()),
+                                                    ),
                                             )
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(tag) = activation_tag.as_deref() {
@@ -18168,6 +18180,54 @@ mod tests {
             assert!(window.find("directory-content").focused().unwrap_or(false));
         })
         .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    fn long_sidebar_entry_stays_inside_sidebar_and_keeps_full_accessible_name(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let label = "An exceptionally long storage volume name with available capacity";
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut state = MusheenApp::new_with_session_store(fixture.clone(), None, cx);
+                let tab = state.navigation.focused_tab().id();
+                state.sidebars.get_mut(&tab).unwrap().set_section_items(
+                    SidebarSectionKind::Pinned,
+                    [SidebarEntry::new(
+                        label,
+                        StorePath::from_unix_path(fixture.as_os_str()),
+                    )],
+                );
+                state
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("the application view is constructed");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let state = app.read(cx);
+            let tab = state.navigation.focused_tab().id();
+            let section_index = state.sidebars[&tab]
+                .sections()
+                .iter()
+                .position(|section| section.kind() == SidebarSectionKind::Pinned)
+                .unwrap();
+            let sidebar = window.find("sidebar");
+            let entry = window.find(format!("sidebar-{section_index}-0"));
+            let text = window.find(format!("sidebar-label-{section_index}-0"));
+            assert_eq!(entry.label(), Some(label));
+            assert!(
+                text.bounds().origin.x + text.bounds().size.width
+                    <= sidebar.bounds().origin.x + sidebar.bounds().size.width,
+                "long sidebar text must stay inside the navigation rail: {text:?} vs {sidebar:?}"
+            );
+        })
+        .expect("the application window remains open");
     }
 
     #[gpui_kit::test]
