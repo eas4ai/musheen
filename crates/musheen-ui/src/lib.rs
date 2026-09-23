@@ -1,6 +1,7 @@
 //! Native-themed GPUI application shell.
 
 mod app;
+mod date_time;
 pub mod dialogs;
 mod directory;
 mod elevated_browser;

@@ -3,6 +3,7 @@ mod custom_actions;
 
 use catalog::{CatalogBinding, DirectoryObservation, TagTarget};
 
+use crate::date_time::format_modified;
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, OpenWithDialog, OpenWithDialogEvent,
     OpenWithIntent as DialogOpenWithIntent, OpenWithModel, PropertiesFailureWindow, PropertiesPage,
@@ -12813,45 +12814,6 @@ fn default_sidebar_model(pins: PinStore) -> SidebarModel {
     model
 }
 
-fn format_modified(unix_seconds: i64, locale: Locale) -> String {
-    let days = unix_seconds.div_euclid(86_400);
-    let seconds = unix_seconds.rem_euclid(86_400);
-    let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_parameter = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_parameter + 2) / 5 + 1;
-    let month = month_parameter + if month_parameter < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    let hour = seconds / 3_600;
-    let minute = seconds % 3_600 / 60;
-    let value = match locale {
-        Locale::EnUs => format!("{month:02}/{day:02}/{year:04}, {hour:02}:{minute:02} UTC"),
-        Locale::EnXa => format!("⟦{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC⟧"),
-        Locale::Ar => format!("{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}"),
-    };
-    if locale == Locale::Ar {
-        value
-            .chars()
-            .map(|character| match character {
-                '0'..='9' => char::from_u32('٠' as u32 + character as u32 - '0' as u32)
-                    .expect("Arabic decimal digit"),
-                _ => character,
-            })
-            .collect()
-    } else {
-        value
-    }
-}
-
 fn format_size(bytes: u64) -> String {
     const KIB: u64 = 1_024;
     const MIB: u64 = KIB * 1_024;
@@ -13034,13 +12996,6 @@ mod tests {
             secret.expose_secret(|bytes| assert_eq!(bytes, b"unlock fixture"));
         })
         .unwrap();
-    }
-
-    #[test]
-    fn modified_dates_are_human_readable_and_locale_specific() {
-        assert_eq!(format_modified(0, Locale::EnUs), "01/01/1970, 00:00 UTC");
-        assert_eq!(format_modified(0, Locale::EnXa), "⟦1970-01-01 00:00 UTC⟧");
-        assert_eq!(format_modified(0, Locale::Ar), "١٩٧٠/٠١/٠١ ٠٠:٠٠");
     }
 
     #[test]

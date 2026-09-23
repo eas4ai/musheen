@@ -56,6 +56,7 @@ gpui-kit = "0.6.4"
 native-theme = { version = "0.5", features = ["watch"] }
 native-theme-gpui = { version = "0.5", default-features = false, features = ["svg-rasterize"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+jiff = "0.2.35"
 md-5 = "0.10"
 miniz_oxide = "=0.9.1"
 musheen-zstd-budget = { path = "crates/musheen-zstd-budget" }

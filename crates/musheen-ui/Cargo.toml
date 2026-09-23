@@ -14,6 +14,7 @@ portal-backend = ["musheen-desktop/portal-backend"]
 async-channel.workspace = true
 futures-lite.workspace = true
 gpui-kit.workspace = true
+jiff.workspace = true
 musheen-core = { path = "../musheen-core" }
 musheen-desktop = { path = "../musheen-desktop" }
 musheen-local = { path = "../musheen-local" }
