@@ -159,11 +159,16 @@ impl CopyProvider for LocalStore {
         staging: &StorePath,
     ) -> Result<MetadataReport, ProviderError> {
         let mut skipped = std::mem::take(&mut self.operation_metadata_skips);
-        let partial_skips = std::mem::take(&mut self.operation_partial_metadata_skips);
+        let mut partial_skips = std::mem::take(&mut self.operation_partial_metadata_skips);
         let source = local_path(source)?;
         let staging = local_path(staging)?;
-        skipped.extend(copy_metadata(source, staging, source_snapshot)?);
+        let root_skips = copy_metadata(source, staging, source_snapshot)?;
         record_timestamp(&mut self.operation_timestamps, staging, source_snapshot);
+        if source_snapshot.kind() == EntryKind::SymbolicLink {
+            partial_skips.extend(root_skips);
+        } else {
+            skipped.extend(root_skips);
+        }
         Ok(MetadataReport::with_skipped(skipped).with_partially_skipped(partial_skips))
     }
 

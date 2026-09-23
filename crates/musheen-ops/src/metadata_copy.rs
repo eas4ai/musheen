@@ -12,6 +12,7 @@ pub enum MetadataKind {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetadataReport {
     skipped: Vec<MetadataKind>,
+    partially_skipped: Vec<MetadataKind>,
     verification_skipped: Vec<MetadataKind>,
 }
 
@@ -24,13 +25,14 @@ impl MetadataReport {
         Self {
             verification_skipped: skipped.clone(),
             skipped,
+            partially_skipped: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_partially_skipped(mut self, kinds: impl IntoIterator<Item = MetadataKind>) -> Self {
         for kind in kinds {
-            insert_kind(&mut self.skipped, kind);
+            insert_kind(&mut self.partially_skipped, kind);
         }
         self
     }
@@ -38,6 +40,11 @@ impl MetadataReport {
     #[must_use]
     pub fn skipped(&self) -> &[MetadataKind] {
         &self.skipped
+    }
+
+    #[must_use]
+    pub fn partially_skipped(&self) -> &[MetadataKind] {
+        &self.partially_skipped
     }
 
     #[must_use]

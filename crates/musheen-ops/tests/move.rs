@@ -187,6 +187,28 @@ fn metadata_loss_requires_review_before_source_removal() {
 }
 
 #[test]
+fn inapplicable_symlink_metadata_does_not_require_review() {
+    let mut provider = RecordingProvider::regular();
+    provider.metadata = MetadataReport::default().with_partially_skipped([
+        MetadataKind::Timestamps,
+        MetadataKind::Mode,
+        MetadataKind::Ownership,
+        MetadataKind::ExtendedAttributes,
+        MetadataKind::AccessControlList,
+    ]);
+
+    let outcome = execute_move(
+        &mut provider,
+        &request("symlink-metadata"),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    assert!(outcome.metadata_review().is_none());
+    assert!(provider.actions.contains(&Action::RemoveSource));
+}
+
+#[test]
 fn confirmed_metadata_loss_removes_the_unchanged_source() {
     let mut provider = RecordingProvider::regular();
     provider.metadata = MetadataReport::with_skipped([MetadataKind::Ownership]);

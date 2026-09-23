@@ -52,7 +52,7 @@ fn local_copy_preserves_bytes_mode_and_symbolic_links() {
     let link_source = root.path().join("source-link");
     let link_destination = root.path().join("destination-link");
     symlink("source.bin", &link_source).unwrap();
-    CopySession::default()
+    let link_outcome = CopySession::default()
         .execute(
             &mut provider,
             &request(&link_source, &link_destination),
@@ -62,6 +62,14 @@ fn local_copy_preserves_bytes_mode_and_symbolic_links() {
     assert_eq!(
         fs::read_link(link_destination).unwrap(),
         source.file_name().unwrap()
+    );
+    assert!(link_outcome.metadata().complete());
+    assert!(link_outcome.metadata().skipped().is_empty());
+    assert!(
+        link_outcome
+            .metadata()
+            .partially_skipped()
+            .contains(&musheen_ops::MetadataKind::Ownership)
     );
 }
 
@@ -141,10 +149,17 @@ fn local_directory_copy_finishes_children_before_restoring_read_only_mode() {
     assert_eq!(copied_metadata.atime_nsec(), preserved_time.tv_nsec);
     assert_eq!(copied_metadata.mtime(), preserved_time.tv_sec);
     assert_eq!(copied_metadata.mtime_nsec(), preserved_time.tv_nsec);
+    assert!(outcome.metadata().complete());
+    assert!(
+        !outcome
+            .metadata()
+            .skipped()
+            .contains(&musheen_ops::MetadataKind::Mode)
+    );
     assert!(
         outcome
             .metadata()
-            .skipped()
+            .partially_skipped()
             .contains(&musheen_ops::MetadataKind::Mode)
     );
     assert!(
