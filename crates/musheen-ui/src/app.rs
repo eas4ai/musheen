@@ -57,8 +57,9 @@ use gpui_kit::{
     AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, Context, DismissEvent,
     Entity, EventEmitter, FocusHandle, Focusable, Global, ImageSource, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role,
-    SharedString, Subscription, TestSupportExt, TitlebarOptions, WeakEntity, Window, WindowBounds,
-    WindowId, WindowOptions, canvas, div, fill, img, point, px, size, uniform_list,
+    SharedString, Subscription, TestSupportExt, TitlebarOptions, UniformListScrollHandle,
+    WeakEntity, Window, WindowBounds, WindowId, WindowOptions, canvas, div, fill, img, point, px,
+    size, uniform_list,
 };
 use musheen_core::{
     ActiveLayout, CancellationToken, CapabilityKind, CapabilityReason, CapabilityState,
@@ -298,6 +299,8 @@ struct RubberBandSurface {
     item_count: usize,
     columns: usize,
     top_inset: f32,
+    first_item_index: usize,
+    first_item_offset: f32,
 }
 
 fn normalized_pointer_bounds(start: Point<Pixels>, end: Point<Pixels>) -> Bounds<Pixels> {
@@ -308,19 +311,21 @@ fn normalized_pointer_bounds(start: Point<Pixels>, end: Point<Pixels>) -> Bounds
     Bounds::from_corners(point(px(left), px(top)), point(px(right), px(bottom)))
 }
 
-fn rubber_band_indices(
-    selection: Bounds<Pixels>,
-    surface: Bounds<Pixels>,
-    layout: Layout,
-    item_count: usize,
-    columns: usize,
-    top_inset: f32,
-) -> Vec<usize> {
+fn rubber_band_indices(selection: Bounds<Pixels>, surface: RubberBandSurface) -> Vec<usize> {
+    let RubberBandSurface {
+        bounds,
+        layout,
+        item_count,
+        columns,
+        top_inset,
+        first_item_index,
+        first_item_offset,
+    } = surface;
     if item_count == 0 {
         return Vec::new();
     }
-    let content_left = surface.left().as_f32() + 16.0;
-    let content_top = surface.top().as_f32() + top_inset;
+    let content_left = bounds.left().as_f32() + 16.0;
+    let content_top = bounds.top().as_f32() + top_inset + first_item_offset;
     let selection_top = selection.top().as_f32();
     let selection_bottom = selection.bottom().as_f32();
     let first_row;
@@ -335,16 +340,20 @@ fn rubber_band_indices(
             last_row = ((selection_bottom - content_top) / row_height)
                 .floor()
                 .max(0.0) as usize;
-            return (first_row..=last_row.min(item_count.saturating_sub(1)))
-                .filter(|index| {
+            return (first_row..=last_row)
+                .filter_map(|visible_index| {
+                    let index = first_item_index.saturating_add(visible_index);
+                    if index >= item_count {
+                        return None;
+                    }
                     let item = Bounds::new(
                         point(
                             px(content_left),
-                            px(content_top + *index as f32 * row_height),
+                            px(content_top + visible_index as f32 * row_height),
                         ),
-                        size(px((surface.size.width.as_f32() - 32.0).max(0.0)), px(34.0)),
+                        size(px((bounds.size.width.as_f32() - 32.0).max(0.0)), px(34.0)),
                     );
-                    selection.intersects(&item)
+                    selection.intersects(&item).then_some(index)
                 })
                 .collect();
         }
@@ -365,18 +374,19 @@ fn rubber_band_indices(
         128.0
     };
     let gap = 8.0;
-    (first_row..=last_row.min(item_count.saturating_sub(1) / columns))
-        .flat_map(|row| {
+    (first_row..=last_row)
+        .flat_map(|visible_row| {
             (0..columns).filter_map(move |column| {
-                let index = row * columns + column;
-                (index < item_count).then_some((index, column))
+                let visible_index = visible_row * columns + column;
+                let index = first_item_index.saturating_add(visible_index);
+                (index < item_count).then_some((index, visible_row, column))
             })
         })
-        .filter_map(|(index, column)| {
+        .filter_map(|(index, visible_row, column)| {
             let item = Bounds::new(
                 point(
                     px(content_left + column as f32 * (item_width + gap)),
-                    px(content_top + (index / columns) as f32 * row_height),
+                    px(content_top + visible_row as f32 * row_height),
                 ),
                 size(px(item_width), px(108.0)),
             );
@@ -2890,6 +2900,7 @@ struct MusheenApp {
     context_dialog_close_subscription: Option<Subscription>,
     conflict_subscriptions: Vec<Subscription>,
     rubber_band: Option<RubberBandGesture>,
+    directory_scrolls: HashMap<(TabId, usize), UniformListScrollHandle>,
 }
 
 impl Drop for MusheenApp {
@@ -3598,6 +3609,7 @@ impl MusheenApp {
             context_dialog_close_subscription: None,
             conflict_subscriptions: Vec::new(),
             rubber_band: None,
+            directory_scrolls: HashMap::new(),
         };
         this.install_volume_properties_cleanup(cx);
         this.sync_catalog_projection();
@@ -5005,14 +5017,22 @@ impl MusheenApp {
         if !self.context_dialog_windows.is_empty() {
             return;
         }
+        let rendered_order = (mode == SelectionMode::Add).then(|| {
+            self.filtered_items(tab_id)
+                .into_iter()
+                .map(|item| item.id().clone())
+                .collect::<Vec<_>>()
+        });
         let selected = {
             let Some(directory) = self.directories.get_mut(&tab_id) else {
                 return;
             };
             if mode == SelectionMode::Add {
-                directory
-                    .view_mut()
-                    .select_to_item(&id, SelectionMode::Replace);
+                directory.view_mut().select_to_item_in_order(
+                    &id,
+                    rendered_order.as_deref().unwrap_or_default(),
+                    SelectionMode::Replace,
+                );
             } else {
                 directory.view_mut().select_item(id, mode);
             }
@@ -5089,16 +5109,18 @@ impl MusheenApp {
         }
         gesture.moved = true;
         let selection = normalized_pointer_bounds(gesture.start, gesture.current);
-        let indices = rubber_band_indices(
-            selection,
-            surface.bounds,
-            surface.layout,
-            surface.item_count,
-            surface.columns,
-            surface.top_inset,
-        );
+        let indices = rubber_band_indices(selection, surface);
         let base_selection = gesture.base_selection.clone();
         let mode = gesture.mode;
+        let rendered_order = self
+            .filtered_items(tab_id)
+            .into_iter()
+            .map(|item| item.id().clone())
+            .collect::<Vec<_>>();
+        let ids = indices
+            .iter()
+            .filter_map(|index| rendered_order.get(*index).cloned())
+            .collect::<Vec<_>>();
         let selected = {
             let Some(directory) = self.directories.get_mut(&tab_id) else {
                 return;
@@ -5108,9 +5130,7 @@ impl MusheenApp {
             } else {
                 directory.view_mut().set_selected_ids(base_selection);
             }
-            directory
-                .view_mut()
-                .rubber_band_select_indices(&indices, mode);
+            directory.view_mut().rubber_band_select_ids(&ids, mode);
             directory.view().selected_ids().to_vec()
         };
         if let Some(tab) = self.navigation.tab_mut(tab_id) {
@@ -5182,10 +5202,14 @@ impl MusheenApp {
             cx.notify();
             return;
         }
+        let items = self
+            .filtered_items(tab_id)
+            .into_iter()
+            .map(|item| item.id().clone())
+            .collect::<Vec<_>>();
         let Some(directory) = self.directories.get_mut(&tab_id) else {
             return;
         };
-        let items = directory.view().visible_items();
         if items.is_empty() {
             directory.view_mut().focus_item(None);
             return;
@@ -5193,17 +5217,16 @@ impl MusheenApp {
         let current = directory
             .view()
             .focused_item_id()
-            .and_then(|id| items.iter().position(|item| item.id() == id));
+            .and_then(|id| items.iter().position(|item| item == id));
         let index = current
             .map(|index| (index as isize + delta).clamp(0, items.len() as isize - 1) as usize)
             .unwrap_or_else(|| if delta < 0 { items.len() - 1 } else { 0 });
-        let next = items[index].id().clone();
-        drop(items);
+        let next = items[index].clone();
         directory.view_mut().focus_item(Some(next.clone()));
         if extend {
             directory
                 .view_mut()
-                .select_to_item(&next, SelectionMode::Replace);
+                .select_to_item_in_order(&next, &items, SelectionMode::Replace);
         } else {
             directory
                 .view_mut()
@@ -11154,6 +11177,11 @@ impl MusheenApp {
                 .collect::<Vec<_>>(),
         );
         let item_count = visible_item_ids.len();
+        let scroll = self
+            .directory_scrolls
+            .entry((tab_id, pane_index))
+            .or_default()
+            .clone();
         let filter_label = self.filters.get(&tab_id).map(|filter| {
             filter.error.as_deref().map_or_else(
                 || format!("Filtered view — {item_count} matches"),
@@ -11187,6 +11215,7 @@ impl MusheenApp {
                                 .collect::<Vec<_>>()
                         }),
                     )
+                    .track_scroll(&scroll)
                     .w_full()
                     .flex_grow(1.0)
                     .min_h(px(0.))
@@ -11214,6 +11243,7 @@ impl MusheenApp {
                             .collect::<Vec<_>>()
                         }),
                     )
+                    .track_scroll(&scroll)
                     .w_full()
                     .flex_grow(1.0)
                     .min_h(px(0.))
@@ -11229,6 +11259,7 @@ impl MusheenApp {
         };
         let view = cx.entity();
         let selection_color = cx.theme().colors.primary;
+        let rubber_band_scroll = scroll;
         let top_inset = 16.0
             + if has_filter_summary { 32.0 } else { 0.0 }
             + if layout == Layout::Details { 32.0 } else { 0.0 };
@@ -11258,12 +11289,25 @@ impl MusheenApp {
                     }
                 });
                 let move_view = view.clone();
+                let (first_visible_row, first_item_offset) = rubber_band_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .logical_scroll_top();
+                let first_item_index = match layout {
+                    Layout::Cards | Layout::Grid | Layout::Adaptive => {
+                        first_visible_row.saturating_mul(grid_columns)
+                    }
+                    Layout::Details | Layout::List | Layout::Columns => first_visible_row,
+                };
                 let rubber_band_surface = RubberBandSurface {
                     bounds: surface,
                     layout,
                     item_count,
                     columns: grid_columns,
                     top_inset,
+                    first_item_index,
+                    first_item_offset: first_item_offset.as_f32(),
                 };
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                     if phase.capture() && event.dragging() {
@@ -12967,13 +13011,24 @@ mod tests {
 
     #[test]
     fn rubber_band_geometry_selects_only_intersected_rows_and_grid_cells() {
-        let surface = Bounds::new(point(px(100.), px(50.)), size(px(800.), px(600.)));
+        let bounds = Bounds::new(point(px(100.), px(50.)), size(px(800.), px(600.)));
         let list_selection = Bounds::from_corners(
             point(px(110.), px(50. + 16. + 36.)),
             point(px(400.), px(50. + 16. + 36. * 3. - 1.)),
         );
         assert_eq!(
-            rubber_band_indices(list_selection, surface, Layout::List, 20, 1, 16.0),
+            rubber_band_indices(
+                list_selection,
+                RubberBandSurface {
+                    bounds,
+                    layout: Layout::List,
+                    item_count: 20,
+                    columns: 1,
+                    top_inset: 16.0,
+                    first_item_index: 0,
+                    first_item_offset: 0.0,
+                },
+            ),
             vec![1, 2]
         );
 
@@ -12982,8 +13037,69 @@ mod tests {
             point(px(100. + 16. + 128. * 2. + 8. - 1.), px(50. + 16. + 108.)),
         );
         assert_eq!(
-            rubber_band_indices(grid_selection, surface, Layout::Grid, 12, 4, 16.0),
+            rubber_band_indices(
+                grid_selection,
+                RubberBandSurface {
+                    bounds,
+                    layout: Layout::Grid,
+                    item_count: 12,
+                    columns: 4,
+                    top_inset: 16.0,
+                    first_item_index: 0,
+                    first_item_offset: 0.0,
+                },
+            ),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn rubber_band_geometry_accounts_for_scrolled_items() {
+        let bounds = Bounds::new(point(px(100.), px(50.)), size(px(800.), px(600.)));
+        let selection = Bounds::from_corners(
+            point(px(110.), px(50. + 16. + 36.)),
+            point(px(400.), px(50. + 16. + 36. * 3. - 1.)),
+        );
+
+        assert_eq!(
+            rubber_band_indices(
+                selection,
+                RubberBandSurface {
+                    bounds,
+                    layout: Layout::List,
+                    item_count: 40,
+                    columns: 1,
+                    top_inset: 16.0,
+                    first_item_index: 10,
+                    first_item_offset: 0.0,
+                },
+            ),
+            vec![11, 12]
+        );
+    }
+
+    #[test]
+    fn rubber_band_geometry_accounts_for_a_partially_scrolled_row() {
+        let bounds = Bounds::new(point(px(100.), px(50.)), size(px(800.), px(600.)));
+        let selection = Bounds::from_corners(
+            point(px(110.), px(50. + 16. + 18.)),
+            point(px(400.), px(50. + 16. + 34.)),
+        );
+
+        assert_eq!(
+            rubber_band_indices(
+                selection,
+                RubberBandSurface {
+                    bounds,
+                    layout: Layout::List,
+                    item_count: 40,
+                    columns: 1,
+                    top_inset: 16.0,
+                    first_item_index: 10,
+                    first_item_offset: -18.0,
+                },
+            ),
+            vec![11]
         );
     }
 

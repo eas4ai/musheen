@@ -384,6 +384,15 @@ impl DirectoryViewModel {
 
     pub fn rubber_band_select_indices(&mut self, indices: &[usize], mode: SelectionMode) {
         let ids = self.visible_item_ids_at(indices);
+        self.rubber_band_select_ids(&ids, mode);
+    }
+
+    pub fn rubber_band_select_ids(&mut self, ids: &[ItemId], mode: SelectionMode) {
+        let ids = ids
+            .iter()
+            .filter(|id| self.item(id).is_some())
+            .cloned()
+            .collect();
         self.selection.apply(ids, mode);
         self.trim_unpinned();
     }
@@ -396,18 +405,27 @@ impl DirectoryViewModel {
     }
 
     pub fn select_to_item(&mut self, id: &ItemId, mode: SelectionMode) {
-        let visible = self.visible_items();
-        let Some(end) = visible.iter().position(|item| item.id() == id) else {
+        let order = self
+            .visible_items()
+            .into_iter()
+            .map(|item| item.id().clone())
+            .collect::<Vec<_>>();
+        self.select_to_item_in_order(id, &order, mode);
+    }
+
+    pub fn select_to_item_in_order(&mut self, id: &ItemId, order: &[ItemId], mode: SelectionMode) {
+        let Some(end) = order.iter().position(|candidate| candidate == id) else {
             return;
         };
         let original_anchor = self.selection.anchor().cloned();
         let start = original_anchor
             .as_ref()
-            .and_then(|anchor| visible.iter().position(|item| item.id() == anchor))
+            .and_then(|anchor| order.iter().position(|candidate| candidate == anchor))
             .unwrap_or(end);
-        let ids = visible[start.min(end)..=start.max(end)]
+        let ids = order[start.min(end)..=start.max(end)]
             .iter()
-            .map(|item| item.id().clone())
+            .filter(|candidate| self.item(candidate).is_some())
+            .cloned()
             .collect();
         self.selection.apply(ids, mode);
         if let Some(anchor) = original_anchor {

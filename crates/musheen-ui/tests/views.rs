@@ -200,6 +200,32 @@ fn ctrl_toggle_and_shift_ranges_keep_the_original_anchor() {
 }
 
 #[test]
+fn range_and_rubber_band_selection_follow_the_rendered_order() {
+    let mut model = DirectoryViewModel::new(16);
+    model.extend((0..5).map(|index| {
+        item(
+            index + 1,
+            &format!("item-{index}"),
+            ItemKind::RegularFile,
+            Some(index),
+        )
+    }));
+    let all = model
+        .visible_items()
+        .iter()
+        .map(|item| item.id().clone())
+        .collect::<Vec<_>>();
+    let rendered = vec![all[0].clone(), all[2].clone(), all[4].clone()];
+
+    model.select_item(rendered[0].clone(), SelectionMode::Replace);
+    model.select_to_item_in_order(&rendered[2], &rendered, SelectionMode::Replace);
+    assert_eq!(model.selected_ids(), rendered.as_slice());
+
+    model.rubber_band_select_ids(&rendered[1..], SelectionMode::Replace);
+    assert_eq!(model.selected_ids(), &rendered[1..]);
+}
+
+#[test]
 fn cached_visible_order_invalidates_for_items_and_preferences() {
     let mut model = DirectoryViewModel::new(16);
     model.extend([
