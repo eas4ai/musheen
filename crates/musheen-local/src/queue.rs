@@ -113,6 +113,45 @@ enum LocalOperation {
     },
 }
 
+#[derive(Clone, Debug)]
+struct RenameUndo {
+    reverse: RenameRequest,
+    original: StorePath,
+}
+
+impl RenameUndo {
+    fn from_completed(request: &RenameRequest) -> Option<Self> {
+        let original = request.source().clone();
+        let destination = request.destination().ok()?;
+        if destination == original {
+            return None;
+        }
+        let original_name = clean_absolute_path(&original)?.file_name()?.to_os_string();
+        Some(Self {
+            reverse: RenameRequest::new(
+                destination,
+                original_name,
+                request.expected_identity().to_vec(),
+            ),
+            original,
+        })
+    }
+
+    fn is_available(&self) -> bool {
+        let mut store = LocalStore::new();
+        matches!(
+            MutationProvider::identity(&mut store, self.reverse.source()),
+            Ok(Some(identity)) if identity.as_ref() == self.reverse.expected_identity()
+        ) && matches!(
+            MutationProvider::identity(&mut store, &self.original),
+            Ok(None)
+        ) && matches!(
+            MutationProvider::allows_rename(&mut store, self.reverse.source()),
+            Ok(true)
+        )
+    }
+}
+
 impl LocalOperation {
     const fn kind(&self) -> OperationKind {
         match self {
@@ -579,6 +618,7 @@ pub struct LocalOperationQueue {
     scheduler: Scheduler,
     operations: BTreeMap<JobId, LocalOperation>,
     failures: BTreeMap<JobId, Box<str>>,
+    rename_undos: BTreeMap<JobId, RenameUndo>,
     provider_routes: HashMap<
         (musheen_core::ProviderId, musheen_core::ProviderId),
         Arc<dyn ProviderTransferRoute>,
@@ -593,6 +633,7 @@ impl LocalOperationQueue {
             scheduler: Scheduler::new(limits),
             operations: BTreeMap::new(),
             failures: BTreeMap::new(),
+            rename_undos: BTreeMap::new(),
             provider_routes: HashMap::new(),
             archive_route: None,
         }
@@ -603,6 +644,7 @@ impl LocalOperationQueue {
             scheduler: Scheduler::new_starting_after(limits, last_job_id)?,
             operations: BTreeMap::new(),
             failures: BTreeMap::new(),
+            rename_undos: BTreeMap::new(),
             provider_routes: HashMap::new(),
             archive_route: None,
         })
@@ -826,7 +868,14 @@ impl LocalOperationQueue {
         match result {
             Ok(()) => {
                 self.scheduler.complete(id)?;
-                self.operations.remove(&id);
+                if let Some(LocalOperation::Rename(request)) = self.operations.remove(&id)
+                    && let Some(undo) = RenameUndo::from_completed(&request)
+                {
+                    self.rename_undos.insert(id, undo);
+                    if self.rename_undos.len() > 100 {
+                        self.rename_undos.pop_first();
+                    }
+                }
             }
             Err(error) => {
                 self.scheduler.fail(id)?;
@@ -913,6 +962,36 @@ impl LocalOperationQueue {
                 self.scheduler.state(id),
                 Some(JobState::Failed | JobState::Interrupted)
             )
+    }
+
+    #[must_use]
+    pub fn has_undo_candidate(&self, id: JobId) -> bool {
+        self.scheduler.state(id) == Some(JobState::Completed) && self.rename_undos.contains_key(&id)
+    }
+
+    #[must_use]
+    pub fn can_undo(&self, id: JobId) -> bool {
+        self.has_undo_candidate(id)
+            && self
+                .rename_undos
+                .get(&id)
+                .is_some_and(RenameUndo::is_available)
+    }
+
+    #[must_use]
+    pub fn undo_paths(&self, id: JobId) -> Option<[StorePath; 2]> {
+        let undo = self.rename_undos.get(&id)?;
+        Some([undo.reverse.source().clone(), undo.original.clone()])
+    }
+
+    pub fn submit_undo(&mut self, id: JobId) -> Result<JobId, DropError> {
+        if !self.can_undo(id) {
+            return Err(DropError::UndoUnavailable(id));
+        }
+        let reverse = self.rename_undos[&id].reverse.clone();
+        let undo_job = self.submit_rename(reverse)?;
+        self.rename_undos.remove(&id);
+        Ok(undo_job)
     }
 
     #[must_use]
@@ -1297,6 +1376,7 @@ pub enum DropError {
     RecursiveTarget(StorePath),
     NoChange(StorePath),
     MissingOperation(JobId),
+    UndoUnavailable(JobId),
     Plan(Box<str>),
     Mutation(MutationError),
     Scheduler(SchedulerError),
@@ -1324,6 +1404,9 @@ impl fmt::Display for DropError {
             }
             Self::NoChange(_) => formatter.write_str("the source is already in that directory"),
             Self::MissingOperation(id) => write!(formatter, "job {} has no operation", id.get()),
+            Self::UndoUnavailable(id) => {
+                write!(formatter, "job {} cannot be safely undone", id.get())
+            }
             Self::Plan(message) => formatter.write_str(message),
             Self::Mutation(error) => error.fmt(formatter),
             Self::Scheduler(error) => error.fmt(formatter),
@@ -1543,6 +1626,69 @@ mod tests {
             .expect("delete is queued");
         assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
         assert!(!renamed_path.exists());
+    }
+
+    #[test]
+    fn completed_rename_can_be_undone_only_while_its_target_is_unchanged() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_path = temporary.path().join("original");
+        let renamed_path = temporary.path().join("renamed");
+        fs::write(&original_path, b"original contents").unwrap();
+        let original = StorePath::from_unix_path(original_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &original)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_rename(RenameRequest::new(
+                original.clone(),
+                "renamed".into(),
+                identity.into_vec(),
+            ))
+            .unwrap();
+        assert!(!queue.can_undo(job));
+        assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
+        assert!(queue.can_undo(job));
+        assert!(queue.has_undo_candidate(job));
+
+        let undo_job = queue.submit_undo(job).unwrap();
+        assert!(!queue.can_undo(job));
+        assert!(!queue.has_undo_candidate(job));
+        assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
+        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(fs::read(&original_path).unwrap(), b"original contents");
+        assert!(!renamed_path.exists());
+    }
+
+    #[test]
+    fn rename_undo_disappears_after_replacement_or_source_reoccupation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_path = temporary.path().join("original");
+        let renamed_path = temporary.path().join("renamed");
+        fs::write(&original_path, b"original contents").unwrap();
+        let original = StorePath::from_unix_path(original_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &original)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_rename(RenameRequest::new(
+                original,
+                "renamed".into(),
+                identity.into_vec(),
+            ))
+            .unwrap();
+        finish_one(&mut queue);
+        fs::write(&original_path, b"new occupant").unwrap();
+        assert!(!queue.can_undo(job));
+        fs::remove_file(&original_path).unwrap();
+        fs::remove_file(&renamed_path).unwrap();
+        fs::write(&renamed_path, b"replacement").unwrap();
+        assert!(!queue.can_undo(job));
+        assert!(queue.submit_undo(job).is_err());
+        assert_eq!(fs::read(&renamed_path).unwrap(), b"replacement");
     }
 
     #[test]

@@ -613,6 +613,57 @@ impl OperationHub {
         Ok(id)
     }
 
+    #[must_use]
+    pub fn has_undo_candidate(&self, id: JobId) -> bool {
+        let Ok(reserved) = self.reservations.lock() else {
+            return false;
+        };
+        let Ok(queue) = self.queue.lock() else {
+            return false;
+        };
+        queue.has_undo_candidate(id)
+            && queue.undo_paths(id).is_some_and(|paths| {
+                !operation_paths_are_reserved(reserved.values().flatten(), &paths)
+            })
+    }
+
+    #[must_use]
+    pub fn can_undo(&self, id: JobId) -> bool {
+        let Ok(reserved) = self.reservations.lock() else {
+            return false;
+        };
+        let Ok(queue) = self.queue.lock() else {
+            return false;
+        };
+        queue.can_undo(id)
+            && queue.undo_paths(id).is_some_and(|paths| {
+                !operation_paths_are_reserved(reserved.values().flatten(), &paths)
+            })
+    }
+
+    pub fn submit_undo(&self, id: JobId) -> Result<JobId, OperationHubError> {
+        let paths = self
+            .queue
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?
+            .undo_paths(id)
+            .ok_or(DropError::UndoUnavailable(id))?;
+        let location = paths[0].clone();
+        let undo_id = self.with_unreserved_queue(paths.iter(), |queue| queue.submit_undo(id))?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                undo_id,
+                musheen_ops::EventGeneration::new(0),
+                OperationKind::Rename,
+                location,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(undo_id)
+    }
+
     pub fn submit_trash(
         &self,
         targets: Vec<DeleteTarget>,
@@ -1440,6 +1491,57 @@ mod tests {
             hub.status.lock().unwrap().entry(id).unwrap().location(),
             &StorePath::from_unix_path(destination_directory.join("file.txt"))
         );
+    }
+
+    #[test]
+    fn completed_rename_undo_creates_a_new_tracked_job() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("before.txt");
+        filesystem::write(&source_path, b"contents").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = musheen_ops::MutationProvider::identity(&mut store, &source)
+            .unwrap()
+            .unwrap();
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let job = hub
+            .submit_rename(RenameRequest::new(
+                source,
+                "after.txt".into(),
+                identity.into_vec(),
+            ))
+            .unwrap();
+        let operation = hub
+            .queue
+            .lock()
+            .unwrap()
+            .start_ready()
+            .unwrap()
+            .pop()
+            .unwrap();
+        operation.execute().unwrap();
+        hub.queue.lock().unwrap().finish(job, Ok(())).unwrap();
+        assert!(hub.can_undo(job));
+        assert!(hub.has_undo_candidate(job));
+
+        let undo_job = hub.submit_undo(job).unwrap();
+        assert!(!hub.can_undo(job));
+        assert!(!hub.has_undo_candidate(job));
+        assert_eq!(
+            hub.status.lock().unwrap().entry(undo_job).unwrap().kind(),
+            OperationKind::Rename
+        );
+        let operation = hub
+            .queue
+            .lock()
+            .unwrap()
+            .start_ready()
+            .unwrap()
+            .pop()
+            .unwrap();
+        operation.execute().unwrap();
+        hub.queue.lock().unwrap().finish(undo_job, Ok(())).unwrap();
+        assert_eq!(filesystem::read(source_path).unwrap(), b"contents");
     }
 
     #[test]
