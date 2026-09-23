@@ -33,7 +33,7 @@ pub(super) fn display_value(spec: &SettingSpec, value: &str, catalog: &Catalog) 
             let count = musheen_desktop::ConnectionProfiles::import(value)
                 .map(|profiles| profiles.profiles().len())
                 .unwrap_or_default();
-            format!("{count}")
+            display_number(&count.to_string(), catalog.locale())
         }
     }
 }
@@ -105,5 +105,6 @@ mod tests {
             }
         }
         assert_eq!(display_number("4096", Locale::Ar), "٤٠٩٦");
+        assert_eq!(display_number("12", Locale::EnXa), "⟦12⟧");
     }
 }

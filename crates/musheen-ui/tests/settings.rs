@@ -3,8 +3,8 @@ use musheen_core::{BoxFuture, CancellationToken, ItemId, ProviderId, StorePath};
 use musheen_desktop::{
     CatalogDocument, CatalogStore, ConnectionId, ConnectionProbe, ConnectionProfile,
     ConnectionProfiles, CredentialReference, FolderIdentity, ProfileConnectionTester, ProxyKind,
-    RemoteError, RemoteErrorCategory, RemoteHost, SecurityPolicy, SettingsDocument, SettingsPage,
-    SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
+    RemoteError, RemoteErrorCategory, RemoteProtocol, SecurityPolicy, SettingsDocument,
+    SettingsPage, SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
 };
 use musheen_ui::settings::{
     ConnectionTestService, SettingsBackends, SettingsState, clear_recent_locations,
@@ -40,14 +40,27 @@ struct RecordingConnectionProbe {
 impl ConnectionProbe for RecordingConnectionProbe {
     fn connect<'a>(
         &'a self,
-        host: &'a RemoteHost,
-        port: u16,
+        profile: &'a musheen_desktop::ConnectionProfile,
         _cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), RemoteErrorCategory>> {
+        let port = profile.port().unwrap_or_else(|| match profile.protocol() {
+            RemoteProtocol::Ftp => 21,
+            RemoteProtocol::Ftps => 990,
+            RemoteProtocol::Sftp => 22,
+            RemoteProtocol::WebDav | RemoteProtocol::Http => {
+                if matches!(profile.security(), SecurityPolicy::PlaintextConfirmed) {
+                    80
+                } else {
+                    443
+                }
+            }
+            RemoteProtocol::Smb => 445,
+            RemoteProtocol::Nfs => 2049,
+        });
         self.calls
             .lock()
             .unwrap()
-            .push((host.as_str().to_owned(), port));
+            .push((profile.host().as_str().to_owned(), port));
         Box::pin(async { Ok(()) })
     }
 }
@@ -414,7 +427,8 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
             ("remote-profile-id", "secure-webdav"),
             ("remote-profile-name", "Secure WebDAV"),
             ("remote-profile-host", "dav.example.test"),
-            ("remote-profile-path", "/files"),
+            ("remote-profile-path", "files "),
+            ("remote-profile-username", "dav-user "),
         ] {
             window.click(id, cx);
             window.input(value, cx);
@@ -432,7 +446,7 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
         for (id, value) in [
             ("remote-proxy-host", "proxy.example.test"),
             ("remote-proxy-port", "1080"),
-            ("remote-proxy-username", "proxy-user"),
+            ("remote-proxy-username", "proxy-user "),
             ("remote-proxy-credential", "secret-service:proxy-secret"),
         ] {
             window.click(id, cx);
@@ -465,7 +479,9 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
     );
     let proxy = profile.proxy().unwrap();
     assert_eq!(proxy.kind(), ProxyKind::Socks5);
-    assert_eq!(proxy.username(), Some("proxy-user"));
+    assert_eq!(profile.path(), "/files ");
+    assert_eq!(profile.username(), Some("dav-user "));
+    assert_eq!(proxy.username(), Some("proxy-user "));
     assert_eq!(
         proxy.credential().unwrap().to_setting_value().as_deref(),
         Some("secret-service:proxy-secret")
@@ -475,7 +491,55 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
         &[("dav.example.test".to_owned(), 443)]
     );
 
-    let original = profiles.profiles()[0].clone();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("remote-profile-username", cx);
+        window.input("changed-user ", cx);
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+    })
+    .unwrap();
+    let unchanged = cx.update(|cx| {
+        ConnectionProfiles::import(
+            &view
+                .read(cx)
+                .state()
+                .draft()
+                .value("remote.connections")
+                .unwrap(),
+        )
+        .unwrap()
+        .profiles()[0]
+            .username()
+            .unwrap()
+            .to_owned()
+    });
+    assert_eq!(unchanged, "dav-user ");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-test", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("settings-remote-save", cx);
+    })
+    .unwrap();
+
+    let original = cx.update(|cx| {
+        ConnectionProfiles::import(
+            &view
+                .read(cx)
+                .state()
+                .draft()
+                .value("remote.connections")
+                .unwrap(),
+        )
+        .unwrap()
+        .profiles()[0]
+            .clone()
+    });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click("settings-remote-close-editor", cx);

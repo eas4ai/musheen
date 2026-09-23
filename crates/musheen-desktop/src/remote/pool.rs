@@ -3,7 +3,7 @@ use musheen_core::{BoxFuture, CancellationToken};
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::poll_fn;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -172,15 +172,31 @@ impl<C: RemoteConnector, R: PoolRuntime> ProviderPool<C, R> {
         runtime: R,
         limits: PoolLimits,
     ) -> Self {
-        Self {
-            inner: Arc::new(PoolInner {
-                profile,
-                connector,
-                runtime,
-                limits,
-                state: Mutex::new(PoolState::default()),
-            }),
-        }
+        let (maintenance_wake, maintenance_events) = async_channel::bounded(1);
+        let maintenance_stop = CancellationToken::new();
+        let inner = Arc::new(PoolInner {
+            profile,
+            connector,
+            runtime,
+            limits,
+            state: Mutex::new(PoolState::default()),
+            maintenance_wake,
+            maintenance_stop: maintenance_stop.clone(),
+            maintenance_thread: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&inner);
+        let handle = std::thread::Builder::new()
+            .name("musheen-remote-pool".to_owned())
+            .spawn(move || {
+                futures_lite::future::block_on(maintain_idle_connections(
+                    weak,
+                    maintenance_events,
+                    maintenance_stop,
+                ));
+            })
+            .expect("remote pool maintenance thread must start");
+        *lock(&inner.maintenance_thread) = Some(handle);
+        Self { inner }
     }
 
     pub async fn acquire(
@@ -250,6 +266,9 @@ struct PoolInner<C: RemoteConnector, R: PoolRuntime> {
     runtime: R,
     limits: PoolLimits,
     state: Mutex<PoolState<C::Connection>>,
+    maintenance_wake: async_channel::Sender<()>,
+    maintenance_stop: CancellationToken,
+    maintenance_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
@@ -281,6 +300,7 @@ impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
             .find(|slot| !slot.discard && slot.active < self.limits.requests_per_connection)
         {
             slot.active += 1;
+            self.wake_maintenance();
             let claim = Claim::Lease {
                 slot_id: slot.id,
                 connection: slot.connection.clone(),
@@ -376,6 +396,27 @@ impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
             Some(self.profile.host().clone()),
         )
     }
+
+    fn wake_maintenance(&self) {
+        let _ = self.maintenance_wake.try_send(());
+    }
+}
+
+impl<C: RemoteConnector, R: PoolRuntime> Drop for PoolInner<C, R> {
+    fn drop(&mut self) {
+        self.maintenance_stop.cancel();
+        let _ = self.maintenance_wake.try_send(());
+        let handle = self
+            .maintenance_thread
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle
+            && handle.thread().id() != std::thread::current().id()
+        {
+            let _ = handle.join();
+        }
+    }
 }
 
 trait LeaseRelease: Send + Sync {
@@ -395,6 +436,8 @@ impl<C: RemoteConnector, R: PoolRuntime> LeaseRelease for PoolInner<C, R> {
             .slots
             .retain(|slot| !(slot.discard && slot.active == 0));
         wake_front(&mut state);
+        drop(state);
+        self.wake_maintenance();
     }
 }
 
@@ -552,6 +595,86 @@ async fn cancelled(cancellation: CancellationToken) {
         }
     })
     .await;
+}
+
+async fn maintain_idle_connections<C: RemoteConnector, R: PoolRuntime>(
+    weak: Weak<PoolInner<C, R>>,
+    events: async_channel::Receiver<()>,
+    stop: CancellationToken,
+) {
+    enum Event {
+        Changed,
+        Expired,
+        Stopped,
+    }
+
+    loop {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let next_expiry = {
+            let state = lock(&inner.state);
+            state
+                .slots
+                .iter()
+                .filter(|slot| slot.active == 0 && !slot.discard)
+                .map(|slot| slot.last_used.saturating_add(inner.limits.idle_timeout))
+                .min()
+        };
+        let runtime = inner.runtime.clone();
+        drop(inner);
+
+        let event = if let Some(deadline) = next_expiry {
+            let delay = deadline.saturating_sub(runtime.now());
+            futures_lite::future::race(
+                async {
+                    cancelled(stop.clone()).await;
+                    Event::Stopped
+                },
+                futures_lite::future::race(
+                    async {
+                        let _ = events.recv().await;
+                        Event::Changed
+                    },
+                    async {
+                        runtime.sleep(delay).await;
+                        Event::Expired
+                    },
+                ),
+            )
+            .await
+        } else {
+            futures_lite::future::race(
+                async {
+                    cancelled(stop.clone()).await;
+                    Event::Stopped
+                },
+                async {
+                    let _ = events.recv().await;
+                    Event::Changed
+                },
+            )
+            .await
+        };
+
+        match event {
+            Event::Changed => {}
+            Event::Stopped => return,
+            Event::Expired => {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let now = inner.runtime.now();
+                let mut state = lock(&inner.state);
+                state.slots.retain(|slot| {
+                    slot.active != 0
+                        || (!slot.discard
+                            && now.saturating_sub(slot.last_used) < inner.limits.idle_timeout)
+                });
+                wake_front(&mut state);
+            }
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

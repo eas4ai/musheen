@@ -243,6 +243,8 @@ impl ConnectionProfile {
                 .as_ref()
                 .and_then(ProxySettings::credential)
                 .is_none_or(|reference| reference.persistence() == SecretPersistence::Persistent);
+        let proxy_is_supported =
+            proxy.is_none() || !matches!(protocol, RemoteProtocol::Smb | RemoteProtocol::Nfs);
         let valid = valid_text(&name, 128)
             && path.starts_with('/')
             && valid_text(&path, 4096)
@@ -251,7 +253,8 @@ impl ConnectionProfile {
                 value.len() <= 256 && !value.bytes().any(|b| b.is_ascii_control())
             })
             && security.is_compatible(protocol)
-            && credentials_are_persistent;
+            && credentials_are_persistent
+            && proxy_is_supported;
         if !valid {
             return Err(RemoteError::new(
                 protocol,
@@ -570,6 +573,11 @@ impl TestReport {
     #[must_use]
     pub fn error(&self) -> Option<&RemoteError> {
         self.error.as_ref()
+    }
+
+    #[must_use]
+    pub fn matches(&self, profile: &ConnectionProfile) -> bool {
+        self.fingerprint == profile.fingerprint()
     }
 }
 

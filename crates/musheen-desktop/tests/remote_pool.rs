@@ -2,16 +2,18 @@ use futures_lite::future::block_on;
 use futures_lite::future::poll_once;
 use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::remote::{
-    CONNECT_TIMEOUT, ConnectionProbe, ConnectionProfile, ConnectionProfiles, HostKeyPolicy,
-    PoolLimits, PoolRuntime, ProfileConnectionTest, ProfileConnectionTester, ProviderPool,
-    ProxyKind, ProxySettings, RemoteConnector, RemoteError, RemoteErrorCategory, RemoteHost,
-    RemoteProtocol, SaveConfirmation, SaveRequirement, SecurityPolicy, TLS_PIN_BYTES, TestReport,
-    TlsPolicy,
+    CONNECT_TIMEOUT, ConnectionProbe, ConnectionProfile, ConnectionProfiles, CredentialResolver,
+    HostKeyPolicy, PoolLimits, PoolRuntime, ProfileConnectionTest, ProfileConnectionTester,
+    ProtocolConnectionProbe, ProviderPool, ProxyKind, ProxySettings, RemoteConnector, RemoteError,
+    RemoteErrorCategory, RemoteHost, RemoteProtocol, SaveConfirmation, SaveRequirement,
+    SecurityPolicy, TLS_PIN_BYTES, TestReport, TlsPolicy,
 };
-use musheen_desktop::{ConnectionId, CredentialReference};
+use musheen_desktop::{ConnectionId, CredentialReference, SecretBuffer};
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::pending;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::Waker;
@@ -82,6 +84,33 @@ fn every_protocol_validates_and_profiles_never_serialize_inline_secrets() {
     assert!(
         ConnectionProfiles::import(r#"{"version":1,"profiles":[],"password":"hunter2"}"#,).is_err()
     );
+}
+
+#[test]
+fn profile_round_trip_preserves_path_and_username_whitespace() {
+    let profile = ConnectionProfile::new(
+        ConnectionId::new("significant-whitespace").unwrap(),
+        "Whitespace",
+        RemoteProtocol::Sftp,
+        RemoteHost::new(RemoteProtocol::Sftp, "files.example.test").unwrap(),
+        None,
+        "/directory with trailing space ",
+        Some("alice "),
+        None,
+        SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+        None,
+    )
+    .unwrap();
+    let encoded = ConnectionProfiles::new(vec![profile.clone()])
+        .export()
+        .unwrap();
+    let decoded = ConnectionProfiles::import(&encoded).unwrap();
+    assert_eq!(decoded.profiles(), [profile]);
+    assert_eq!(
+        decoded.profiles()[0].path(),
+        "/directory with trailing space "
+    );
+    assert_eq!(decoded.profiles()[0].username(), Some("alice "));
 }
 
 #[test]
@@ -207,6 +236,42 @@ fn host_tls_host_key_proxy_and_secret_references_are_strictly_validated() {
     assert_eq!(
         CredentialReference::from_setting_value(&value).unwrap(),
         credential("remote-1")
+    );
+}
+
+#[test]
+fn system_managed_protocols_reject_hidden_proxy_state() {
+    for protocol in [RemoteProtocol::Smb, RemoteProtocol::Nfs] {
+        let proxy = ProxySettings::new(
+            protocol,
+            ProxyKind::Socks5,
+            RemoteHost::new(protocol, "proxy.example.test").unwrap(),
+            1080,
+            None::<&str>,
+            None,
+        )
+        .unwrap();
+        let error = ConnectionProfile::new(
+            ConnectionId::new("system-managed").unwrap(),
+            "System managed",
+            protocol,
+            RemoteHost::new(protocol, "files.example.test").unwrap(),
+            None,
+            "/share",
+            None::<&str>,
+            None,
+            SecurityPolicy::SystemManaged,
+            Some(proxy),
+        )
+        .unwrap_err();
+        assert_eq!(error.protocol(), protocol);
+        assert_eq!(error.category(), RemoteErrorCategory::InvalidProfile);
+    }
+
+    let encoded = r#"{"version":1,"profiles":[{"id":"bad","name":"Bad","protocol":"smb","host":"files.example.test","port":null,"path":"/share","username":null,"credential":null,"security":{"kind":"system-managed"},"proxy":{"kind":"socks5","host":"proxy.example.test","port":1080,"username":null,"credential":null}}]}"#;
+    assert_eq!(
+        ConnectionProfiles::import(encoded).unwrap_err().category(),
+        RemoteErrorCategory::InvalidProfile
     );
 }
 
@@ -403,21 +468,17 @@ fn invalid_hosts_retain_the_selected_protocol() {
 
 #[derive(Clone, Default)]
 struct RecordingProbe {
-    calls: Arc<Mutex<Vec<(String, u16)>>>,
+    calls: Arc<Mutex<Vec<ConnectionProfile>>>,
     hang: bool,
 }
 
 impl ConnectionProbe for RecordingProbe {
     fn connect<'a>(
         &'a self,
-        host: &'a RemoteHost,
-        port: u16,
+        profile: &'a ConnectionProfile,
         _cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), RemoteErrorCategory>> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((host.as_str().to_owned(), port));
+        self.calls.lock().unwrap().push(profile.clone());
         Box::pin(async move { if self.hang { pending().await } else { Ok(()) } })
     }
 }
@@ -432,8 +493,8 @@ fn production_profile_tester_uses_protocol_ports_and_cancellation() {
     );
     block_on(tester.test(&sftp, CancellationToken::new())).unwrap();
     assert_eq!(
-        &*probe.calls.lock().unwrap(),
-        &[("files.example.test".to_owned(), 22)]
+        probe.calls.lock().unwrap().as_slice(),
+        std::slice::from_ref(&sftp)
     );
 
     let tester = ProfileConnectionTester::new(RecordingProbe {
@@ -448,6 +509,185 @@ fn production_profile_tester_uses_protocol_ports_and_cancellation() {
             .category(),
         RemoteErrorCategory::Cancelled
     );
+}
+
+#[derive(Clone, Copy)]
+struct StaticCredentialResolver;
+
+impl CredentialResolver for StaticCredentialResolver {
+    fn resolve<'a>(
+        &'a self,
+        _reference: &'a CredentialReference,
+        _cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<SecretBuffer, RemoteErrorCategory>> {
+        Box::pin(async { Ok(SecretBuffer::new(b"correct horse".to_vec())) })
+    }
+}
+
+fn read_headers(stream: &mut std::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut byte = [0];
+    while !bytes.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn protocol_tester_uses_authenticated_proxy_and_checks_configured_http_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let connect = read_headers(&mut stream);
+        assert!(connect.starts_with("CONNECT must-not-resolve.invalid:80 HTTP/1.1\r\n"));
+        assert!(connect.contains("Proxy-Authorization: Basic "));
+        stream.write_all(b"HTTP/1.1 200 Connected\r\n\r\n").unwrap();
+        let request = read_headers(&mut stream);
+        assert!(request.starts_with("HEAD /folder%20 HTTP/1.1\r\n"));
+        assert!(request.contains("Authorization: Basic "));
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+    });
+    let protocol = RemoteProtocol::Http;
+    let proxy = ProxySettings::new(
+        protocol,
+        ProxyKind::HttpConnect,
+        RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+        proxy_port,
+        Some("proxy user"),
+        Some(credential("proxy")),
+    )
+    .unwrap();
+    let profile = ConnectionProfile::new(
+        ConnectionId::new("proxy-http").unwrap(),
+        "Proxy HTTP",
+        protocol,
+        RemoteHost::new(protocol, "must-not-resolve.invalid").unwrap(),
+        None,
+        "/folder ",
+        Some("alice"),
+        Some(credential("target")),
+        SecurityPolicy::PlaintextConfirmed,
+        Some(proxy),
+    )
+    .unwrap();
+    let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::new(Arc::new(
+        StaticCredentialResolver,
+    )));
+    block_on(tester.test(&profile, CancellationToken::new())).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn protocol_tester_rejects_proxy_auth_and_unsupported_protocol_false_success() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _request = read_headers(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+            .unwrap();
+    });
+    let protocol = RemoteProtocol::Http;
+    let proxy = ProxySettings::new(
+        protocol,
+        ProxyKind::HttpConnect,
+        RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+        proxy_port,
+        Some("proxy"),
+        Some(credential("proxy")),
+    )
+    .unwrap();
+    let http = ConnectionProfile::new(
+        ConnectionId::new("bad-proxy").unwrap(),
+        "Bad proxy",
+        protocol,
+        RemoteHost::new(protocol, "must-not-resolve.invalid").unwrap(),
+        None,
+        "/",
+        None::<&str>,
+        None,
+        SecurityPolicy::PlaintextConfirmed,
+        Some(proxy),
+    )
+    .unwrap();
+    let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::new(Arc::new(
+        StaticCredentialResolver,
+    )));
+    assert_eq!(
+        block_on(tester.test(&http, CancellationToken::new()))
+            .unwrap_err()
+            .category(),
+        RemoteErrorCategory::Authentication
+    );
+    server.join().unwrap();
+
+    let sftp = profile(
+        RemoteProtocol::Sftp,
+        SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+    );
+    assert_eq!(
+        block_on(tester.test(&sftp, CancellationToken::new()))
+            .unwrap_err()
+            .category(),
+        RemoteErrorCategory::Unavailable
+    );
+}
+
+#[test]
+fn protocol_tester_sends_target_name_through_socks_without_direct_dns() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut greeting = [0; 3];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).unwrap();
+        let mut head = [0; 5];
+        stream.read_exact(&mut head).unwrap();
+        assert_eq!(&head[..4], &[5, 1, 0, 3]);
+        let mut host = vec![0; usize::from(head[4])];
+        stream.read_exact(&mut host).unwrap();
+        assert_eq!(host, b"must-not-resolve.invalid");
+        let mut port = [0; 2];
+        stream.read_exact(&mut port).unwrap();
+        assert_eq!(u16::from_be_bytes(port), 80);
+        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        let request = read_headers(&mut stream);
+        assert!(request.starts_with("HEAD / HTTP/1.1\r\n"));
+        stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+    });
+    let protocol = RemoteProtocol::Http;
+    let proxy = ProxySettings::new(
+        protocol,
+        ProxyKind::Socks5,
+        RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+        proxy_port,
+        None::<&str>,
+        None,
+    )
+    .unwrap();
+    let http = ConnectionProfile::new(
+        ConnectionId::new("socks-http").unwrap(),
+        "SOCKS HTTP",
+        protocol,
+        RemoteHost::new(protocol, "must-not-resolve.invalid").unwrap(),
+        None,
+        "/",
+        None::<&str>,
+        None,
+        SecurityPolicy::PlaintextConfirmed,
+        Some(proxy),
+    )
+    .unwrap();
+    let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::new(Arc::new(
+        StaticCredentialResolver,
+    )));
+    block_on(tester.test(&http, CancellationToken::new())).unwrap();
+    server.join().unwrap();
 }
 
 #[derive(Clone, Default)]
@@ -485,6 +725,17 @@ impl ManualRuntime {
     fn wait_for_sleeper(&self) {
         let mut sleepers = self.inner.sleepers.lock().unwrap();
         while sleepers.is_empty() {
+            sleepers = self.inner.changed.wait(sleepers).unwrap();
+        }
+    }
+
+    fn wait_for_sleeper_at(&self, deadline: Duration) {
+        let deadline = u64::try_from(deadline.as_millis()).unwrap();
+        let mut sleepers = self.inner.sleepers.lock().unwrap();
+        while !sleepers
+            .iter()
+            .any(|(registered, _)| *registered == deadline)
+        {
             sleepers = self.inner.changed.wait(sleepers).unwrap();
         }
     }
@@ -554,6 +805,31 @@ impl FakeConnector {
 
 #[derive(Debug)]
 struct FakeConnection(usize);
+
+#[derive(Clone)]
+struct DropRecordingConnector {
+    drops: Arc<AtomicUsize>,
+}
+
+struct DropRecordingConnection(Arc<AtomicUsize>);
+
+impl Drop for DropRecordingConnection {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl RemoteConnector for DropRecordingConnector {
+    type Connection = DropRecordingConnection;
+
+    fn connect<'a>(
+        &'a self,
+        _profile: &'a ConnectionProfile,
+        _cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<Self::Connection, RemoteErrorCategory>> {
+        Box::pin(async move { Ok(DropRecordingConnection(self.drops.clone())) })
+    }
+}
 
 impl RemoteConnector for FakeConnector {
     type Connection = FakeConnection;
@@ -741,6 +1017,55 @@ fn connect_timeout_and_idle_expiry_use_the_injected_runtime() {
     let lease = block_on(pool.acquire(CancellationToken::new())).unwrap();
     assert_eq!(lease.connection().0, 3);
     assert_eq!(connector.connects(), 3);
+}
+
+#[test]
+fn idle_connection_closes_at_deadline_without_another_acquire() {
+    let runtime = ManualRuntime::default();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let pool = ProviderPool::with_runtime(
+        profile(
+            RemoteProtocol::Sftp,
+            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+        ),
+        DropRecordingConnector {
+            drops: drops.clone(),
+        },
+        runtime.clone(),
+        PoolLimits::default(),
+    );
+    let lease = block_on(pool.acquire(CancellationToken::new())).unwrap();
+    drop(lease);
+    runtime.wait_for_sleeper_at(Duration::from_secs(60));
+    runtime.advance(Duration::from_secs(59));
+    assert_eq!(drops.load(Ordering::Acquire), 0);
+    runtime.advance(Duration::from_secs(1));
+    while drops.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
+    assert_eq!(pool.stats().connections(), 0);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    drop(pool);
+}
+
+#[test]
+fn dropping_pool_closes_idle_connection_and_joins_maintenance() {
+    let runtime = ManualRuntime::default();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let pool = ProviderPool::with_runtime(
+        profile(
+            RemoteProtocol::Sftp,
+            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+        ),
+        DropRecordingConnector {
+            drops: drops.clone(),
+        },
+        runtime,
+        PoolLimits::default(),
+    );
+    drop(block_on(pool.acquire(CancellationToken::new())).unwrap());
+    drop(pool);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
 }
 
 impl fmt::Debug for ManualRuntime {
