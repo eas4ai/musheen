@@ -97,7 +97,7 @@ use musheen_ops::{
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::{NativeTheme, geometry};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -156,6 +156,7 @@ const GRID_ITEM_WIDTH: f32 = 128.0;
 const GRID_GAP: f32 = 8.0;
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(250);
 const OPERATION_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
+const UNDO_AVAILABILITY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const XATTR_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const DIRECTORY_BROWSER_RETENTION: usize = 100_000;
 
@@ -2483,6 +2484,7 @@ fn activate_notification_action(action: musheen_desktop::NotificationAction, cx:
             .is_ok_and(|status| status.entry(action.job_id()).is_some())
         {
             state.status_center_open = true;
+            state.refresh_undo_availability();
             cx.notify();
         }
     });
@@ -3034,6 +3036,8 @@ struct MusheenApp {
     pending_terminal_close: bool,
     pending_terminal_focus: bool,
     status_center_open: bool,
+    undo_available: HashSet<JobId>,
+    undo_availability_checked_at: Option<Instant>,
     trash_states: HashMap<TabId, TrashState>,
     trash_focus: HashMap<TabId, CommandTargetRef>,
     pending_empty_trash: Option<MenuInvocation>,
@@ -3753,6 +3757,8 @@ impl MusheenApp {
             pending_terminal_close: false,
             pending_terminal_focus: false,
             status_center_open: false,
+            undo_available: HashSet::new(),
+            undo_availability_checked_at: None,
             trash_states: HashMap::new(),
             trash_focus: HashMap::new(),
             pending_empty_trash: None,
@@ -3819,12 +3825,24 @@ impl MusheenApp {
                     if revision != state.operation_status_revision {
                         state.operation_status_revision = revision;
                         state.sync_operation_persistence_error();
+                        if state.status_center_open {
+                            state.refresh_undo_availability();
+                        }
                         changed = true;
                     }
                     let revision = state.catalog_binding.revision();
                     if revision != state.catalog_projection_revision {
                         state.sync_catalog_projection();
                         changed = true;
+                    }
+                    if state.status_center_open
+                        && state.undo_availability_checked_at.is_none_or(|checked| {
+                            checked.elapsed() >= UNDO_AVAILABILITY_REFRESH_INTERVAL
+                        })
+                    {
+                        let previous = std::mem::take(&mut state.undo_available);
+                        state.refresh_undo_availability();
+                        changed |= state.undo_available != previous;
                     }
                     if changed {
                         cx.notify();
@@ -13017,6 +13035,20 @@ impl MusheenApp {
             .unwrap_or_default()
     }
 
+    fn refresh_undo_availability(&mut self) {
+        self.undo_available = self
+            .operation_status_entries()
+            .into_iter()
+            .filter(|entry| {
+                entry.status() == OperationStatus::Completed
+                    && self.operation_hub.has_undo_candidate(entry.id())
+                    && self.operation_hub.can_undo(entry.id())
+            })
+            .map(|entry| entry.id())
+            .collect();
+        self.undo_availability_checked_at = Some(Instant::now());
+    }
+
     fn record_operation_control_error(
         &mut self,
         result: Result<(), crate::OperationHubError>,
@@ -13063,6 +13095,7 @@ impl MusheenApp {
         if self.record_operation_control_error(result, cx) {
             self.pump_operation_queue(cx);
         }
+        self.refresh_undo_availability();
     }
 
     fn resume_recovery_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
@@ -13079,6 +13112,8 @@ impl MusheenApp {
 
     fn view_operation_location(&mut self, location: StorePath, cx: &mut Context<Self>) {
         self.status_center_open = false;
+        self.undo_available.clear();
+        self.undo_availability_checked_at = None;
         self.navigate(operation_browser_location(&location), true, cx);
     }
 
@@ -13100,7 +13135,7 @@ impl MusheenApp {
             let id_value = id.get();
             let status = entry.status();
             let can_retry = self.operation_hub.can_retry(id);
-            let has_undo_candidate = self.operation_hub.has_undo_candidate(id);
+            let has_undo_candidate = self.undo_available.contains(&id);
             let can_resume_recovery = self.operation_hub.can_resume_recovery(id);
             let can_discard_recovery = self.operation_hub.can_discard_recovery(id);
             let has_failures = !entry.failures().is_empty();
@@ -13610,6 +13645,12 @@ impl Render for MusheenApp {
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.status_center_open = !this.status_center_open;
+                                if this.status_center_open {
+                                    this.refresh_undo_availability();
+                                } else {
+                                    this.undo_available.clear();
+                                    this.undo_availability_checked_at = None;
+                                }
                                 cx.notify();
                             })),
                     ),
@@ -19181,6 +19222,153 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn replaced_rename_target_is_not_offered_undo_in_operation_history(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("before.txt");
+        let renamed_path = temporary.path().join("after.txt");
+        filesystem::write(&source_path, b"contents").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = musheen_ops::MutationProvider::identity(&mut store, &source)
+            .unwrap()
+            .unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let job = cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let job = state
+                    .operation_hub
+                    .submit_rename(RenameRequest::new(
+                        source,
+                        "after.txt".into(),
+                        identity.into_vec(),
+                    ))
+                    .unwrap();
+                state.pump_operation_queue(cx);
+                job
+            })
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .operation_hub
+                .status()
+                .lock()
+                .unwrap()
+                .entry(job)
+                .is_some_and(|entry| entry.status() == OperationStatus::Completed)
+        })
+        .await;
+        filesystem::remove_file(&renamed_path).unwrap();
+        filesystem::write(&renamed_path, b"replacement").unwrap();
+        assert!(!cx.update(|cx| app.read(cx).operation_hub.can_undo(job)));
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("operation-status-summary", cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find(format!("operation-undo-{}", job.get()))
+                    .is_none()
+            );
+        })
+        .unwrap();
+        assert_eq!(filesystem::read(renamed_path).unwrap(), b"replacement");
+    }
+
+    #[gpui_kit::test]
+    async fn undo_offer_disappears_when_target_changes_while_history_is_open(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("before.txt");
+        let renamed_path = temporary.path().join("after.txt");
+        filesystem::write(&source_path, b"contents").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = musheen_ops::MutationProvider::identity(&mut store, &source)
+            .unwrap()
+            .unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let job = cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let job = state
+                    .operation_hub
+                    .submit_rename(RenameRequest::new(
+                        source,
+                        "after.txt".into(),
+                        identity.into_vec(),
+                    ))
+                    .unwrap();
+                state.pump_operation_queue(cx);
+                job
+            })
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .operation_hub
+                .status()
+                .lock()
+                .unwrap()
+                .entry(job)
+                .is_some_and(|entry| entry.status() == OperationStatus::Completed)
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("operation-status-summary", cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find(format!("operation-undo-{}", job.get()))
+                    .is_some()
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            app.update(cx, |state, _| {
+                state.operation_status_revision = state.operation_hub.status_revision();
+            });
+        });
+
+        filesystem::remove_file(&renamed_path).unwrap();
+        filesystem::write(&renamed_path, b"replacement").unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(3), |window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find(format!("operation-undo-{}", job.get()))
+                .is_none()
+        })
+        .await;
+        assert_eq!(filesystem::read(renamed_path).unwrap(), b"replacement");
     }
 
     #[gpui_kit::test]
