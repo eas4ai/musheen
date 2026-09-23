@@ -1,12 +1,100 @@
+use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext};
 use musheen_core::StorePath;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::Mutex;
 
 pub const URI_LIST: &str = "text/uri-list";
 pub const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";
 pub const KDE_CUT_SELECTION: &str = "application/x-kde-cutselection";
+
+/// Owns the platform selection for as long as the application is running.
+/// Reading from another X11 selection owner can wait for its reply, so callers
+/// must dispatch reads off the UI thread.
+#[derive(Default)]
+pub struct SystemFileClipboard {
+    context: Mutex<Option<ClipboardContext>>,
+}
+
+impl SystemFileClipboard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn publish(&self, payload: &ClipboardPayload) -> Result<(), SystemClipboardError> {
+        let mut context = self
+            .context
+            .lock()
+            .map_err(|_| SystemClipboardError::Poisoned)?;
+        if context.is_none() {
+            *context = Some(ClipboardContext::new().map_err(SystemClipboardError::Platform)?);
+        }
+        let context = context.as_ref().expect("clipboard context was initialized");
+        let contents = payload
+            .formats()
+            .iter()
+            .map(|(mime, bytes)| ClipboardContent::Other(mime.to_string(), bytes.clone()))
+            .collect();
+        context
+            .set(contents)
+            .map_err(SystemClipboardError::Platform)
+    }
+
+    pub fn read(&self) -> Result<Option<ClipboardPayload>, SystemClipboardError> {
+        let mut context = self
+            .context
+            .lock()
+            .map_err(|_| SystemClipboardError::Poisoned)?;
+        if context.is_none() {
+            *context = Some(ClipboardContext::new().map_err(SystemClipboardError::Platform)?);
+        }
+        let context = context.as_ref().expect("clipboard context was initialized");
+        let offered = context
+            .available_formats()
+            .map_err(SystemClipboardError::Platform)?;
+        if !offered
+            .iter()
+            .any(|mime| mime == URI_LIST || mime == GNOME_COPIED_FILES)
+        {
+            return Ok(None);
+        }
+        let mut formats = BTreeMap::new();
+        for mime in [URI_LIST, GNOME_COPIED_FILES, KDE_CUT_SELECTION] {
+            if offered.iter().any(|offered| offered == mime) {
+                formats.insert(
+                    Box::<str>::from(mime),
+                    context
+                        .get_buffer(mime)
+                        .map_err(SystemClipboardError::Platform)?,
+                );
+            }
+        }
+        ClipboardPayload::parse(&formats)
+            .map(Some)
+            .map_err(SystemClipboardError::Payload)
+    }
+}
+
+#[derive(Debug)]
+pub enum SystemClipboardError {
+    Platform(Box<dyn Error + Send + Sync>),
+    Payload(ClipboardError),
+    Poisoned,
+}
+
+impl fmt::Display for SystemClipboardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Platform(error) => write!(formatter, "desktop clipboard: {error}"),
+            Self::Payload(error) => write!(formatter, "desktop clipboard: {error}"),
+            Self::Poisoned => formatter.write_str("desktop clipboard is unavailable"),
+        }
+    }
+}
+
+impl Error for SystemClipboardError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClipboardOperation {
@@ -82,6 +170,14 @@ impl ClipboardPayload {
             .or_else(|| gnome.and_then(gnome_uri_lines))
             .ok_or(ClipboardError::MissingUris)?;
         let paths = parse_uri_list(uri_data)?;
+        if let (Some(_), Some(gnome)) = (formats.get(URI_LIST), gnome) {
+            let gnome_paths = parse_uri_list(
+                gnome_uri_lines(gnome).ok_or(ClipboardError::Malformed)?,
+            )?;
+            if gnome_paths != paths {
+                return Err(ClipboardError::Malformed);
+            }
+        }
         Self::new(operation, paths)
     }
 

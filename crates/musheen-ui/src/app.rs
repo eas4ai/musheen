@@ -75,16 +75,17 @@ use musheen_core::{
 };
 use musheen_desktop::{
     ApplicationIconProvider, ArchiveFormat, ArchiveLimits, ArchiveStore, BrokerError, BrokerOutput,
-    BrokerRequest, CatalogDocument, CatalogStore, ConflictDecisionStore, DesktopEntryCatalog,
-    DesktopEntryLauncher, DesktopEntryTerminalLauncher, DesktopPaths, ElevatedRootReference,
-    ExternalTerminalCommand, FolderIdentity, FreedesktopIconProvider, LaunchError, LaunchTarget,
-    MimeAppsError, MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation,
-    OperationReservation, OperationUsage, OperationUse, PreviewDocument, PrivilegeProvider,
-    ProcessRunner, PtyEvent, SecretBuffer, SessionStore, SystemClock, SystemProcessRunner,
-    TagMoveOutcome, TerminalCommand, TerminalError, TerminalModel, TerminalProfile,
-    TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
-    ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError,
-    VolumeId, VolumeRuntime,
+    BrokerRequest, CatalogDocument, CatalogStore, ClipboardOperation, ClipboardPayload,
+    ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher, DesktopEntryTerminalLauncher,
+    DesktopPaths, ElevatedRootReference, ExternalTerminalCommand, FolderIdentity,
+    FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
+    MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation, OperationUsage,
+    OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent, SecretBuffer,
+    SessionStore, SystemClock, SystemFileClipboard, SystemProcessRunner, TagMoveOutcome,
+    TerminalCommand, TerminalError, TerminalModel, TerminalProfile, TerminalSession, TerminalSize,
+    ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest,
+    ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError, VolumeId,
+    VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -102,7 +103,7 @@ use std::fs::File;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 gpui_kit::assets::icon_assets!(
@@ -564,6 +565,46 @@ enum ClipboardAction {
 struct FileClipboard {
     targets: Vec<CommandTargetRef>,
     action: ClipboardAction,
+}
+
+fn shared_system_file_clipboard() -> Arc<SystemFileClipboard> {
+    static CLIPBOARD: OnceLock<Arc<SystemFileClipboard>> = OnceLock::new();
+    Arc::clone(CLIPBOARD.get_or_init(|| Arc::new(SystemFileClipboard::new())))
+}
+
+fn resolve_system_file_clipboard(
+    payload: &ClipboardPayload,
+    internal: Option<&FileClipboard>,
+    store: &dyn Store,
+) -> Result<FileClipboard, Box<str>> {
+    let action = match payload.operation() {
+        ClipboardOperation::Copy => ClipboardAction::Copy,
+        ClipboardOperation::Cut => ClipboardAction::Cut,
+    };
+    if let Some(internal) = internal
+        && internal.action == action
+        && internal.targets.len() == payload.paths().len()
+        && internal
+            .targets
+            .iter()
+            .zip(payload.paths())
+            .all(|(target, path)| target.path() == path)
+    {
+        return Ok(internal.clone());
+    }
+    let targets = payload
+        .paths()
+        .iter()
+        .map(|path| {
+            let item = store
+                .resolve_item(path)
+                .map_err(|error| Box::<str>::from(error.to_string()))?
+                .ok_or_else(|| Box::<str>::from("a clipboard file no longer exists"))?;
+            CommandTargetRef::new(item.id().clone(), path.clone())
+                .map_err(|error| Box::<str>::from(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(FileClipboard { targets, action })
 }
 
 fn clear_cancelled_cut_state(
@@ -2993,6 +3034,7 @@ struct MusheenApp {
     pending_drop: Option<PendingDrop>,
     transfer_preflights: usize,
     file_clipboard: Option<FileClipboard>,
+    system_file_clipboard: Option<Arc<SystemFileClipboard>>,
     pending_cut_jobs: std::collections::HashSet<musheen_ops::JobId>,
     pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
     pending_directory_restores: HashMap<TabId, PendingDirectoryRestore>,
@@ -3707,6 +3749,7 @@ impl MusheenApp {
             pending_drop: None,
             transfer_preflights: 0,
             file_clipboard: None,
+            system_file_clipboard: watch_directories.then(shared_system_file_clipboard),
             pending_cut_jobs: std::collections::HashSet::new(),
             pending_catalog_moves: HashMap::new(),
             pending_directory_restores: HashMap::new(),
@@ -6216,7 +6259,8 @@ impl MusheenApp {
                     .is_some_and(SessionBinding::can_append_window),
             can_split_pane: self.navigation.can_split(),
             can_focus_next_pane: self.navigation.panes().len() > 1,
-            clipboard_has_contents: self.file_clipboard.is_some(),
+            clipboard_has_contents: self.file_clipboard.is_some()
+                || self.system_file_clipboard.is_some(),
             target: item_target,
             item_count,
             selection_count: selection.len(),
@@ -6925,15 +6969,33 @@ impl MusheenApp {
                 clipboard_action @ (CommandAction::Copy | CommandAction::Cut),
                 CommandParameters::Targets(targets),
             ) => {
-                self.file_clipboard = Some(FileClipboard {
+                let file_clipboard = FileClipboard {
                     targets: targets.clone(),
                     action: if *clipboard_action == CommandAction::Cut {
                         ClipboardAction::Cut
                     } else {
                         ClipboardAction::Copy
                     },
+                };
+                self.operation_error = self.system_file_clipboard.as_ref().and_then(|system| {
+                    let operation = match file_clipboard.action {
+                        ClipboardAction::Copy => ClipboardOperation::Copy,
+                        ClipboardAction::Cut => ClipboardOperation::Cut,
+                    };
+                    ClipboardPayload::new(
+                        operation,
+                        file_clipboard
+                            .targets
+                            .iter()
+                            .map(|target| target.path().clone())
+                            .collect(),
+                    )
+                    .map_err(|error| error.to_string())
+                    .and_then(|payload| system.publish(&payload).map_err(|error| error.to_string()))
+                    .err()
+                    .map(Into::into)
                 });
-                self.operation_error = None;
+                self.file_clipboard = Some(file_clipboard);
                 cx.notify();
             }
             (CommandAction::PasteInto, CommandParameters::Location(destination)) => {
@@ -8509,9 +8571,50 @@ impl MusheenApp {
     }
 
     fn paste_file_clipboard(&mut self, destination: StorePath, cx: &mut Context<Self>) {
-        let Some(clipboard) = self.file_clipboard.clone() else {
+        let Some(system) = self.system_file_clipboard.clone() else {
+            if let Some(clipboard) = self.file_clipboard.clone() {
+                self.paste_resolved_file_clipboard(clipboard, destination, cx);
+            }
             return;
         };
+        let internal = self.file_clipboard.clone();
+        let store = Arc::clone(&self.store);
+        let work = cx.background_spawn(async move {
+            let payload = system
+                .read()
+                .map_err(|error| Box::<str>::from(error.to_string()))?
+                .ok_or_else(|| Box::<str>::from("the desktop clipboard has no files to paste"))?;
+            resolve_system_file_clipboard(&payload, internal.as_ref(), store.as_ref())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(clipboard) => {
+                    if state.file_clipboard.as_ref().is_some_and(|internal| {
+                        internal.action != clipboard.action || internal.targets != clipboard.targets
+                    }) {
+                        state.file_clipboard = None;
+                    }
+                    state.paste_resolved_file_clipboard(clipboard, destination, cx);
+                }
+                Err(error) => {
+                    state.operation_error = Some(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn paste_resolved_file_clipboard(
+        &mut self,
+        clipboard: FileClipboard,
+        destination: StorePath,
+        cx: &mut Context<Self>,
+    ) {
         let action = match clipboard.action {
             ClipboardAction::Copy => DropAction::Copy,
             ClipboardAction::Cut => DropAction::Move,
@@ -13693,6 +13796,46 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn external_file_clipboard_resolves_current_identity_and_cut_intent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("external.txt");
+        std::fs::write(&source, b"external").unwrap();
+        let path = StorePath::from_unix_path(&source);
+        let payload = ClipboardPayload::new(ClipboardOperation::Cut, vec![path.clone()]).unwrap();
+
+        let resolved = resolve_system_file_clipboard(&payload, None, &LocalStore::new()).unwrap();
+
+        assert_eq!(resolved.action, ClipboardAction::Cut);
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].path(), &path);
+        assert_eq!(
+            resolved.targets[0].id(),
+            LocalStore::new().resolve_item(&path).unwrap().unwrap().id()
+        );
+    }
+
+    #[test]
+    fn own_file_clipboard_keeps_captured_identity_after_path_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("replaced.txt");
+        std::fs::write(&source, b"original").unwrap();
+        let target = local_command_target(&source);
+        let payload =
+            ClipboardPayload::new(ClipboardOperation::Copy, vec![target.path().clone()]).unwrap();
+        let internal = FileClipboard {
+            targets: vec![target],
+            action: ClipboardAction::Copy,
+        };
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+
+        let resolved =
+            resolve_system_file_clipboard(&payload, Some(&internal), &LocalStore::new()).unwrap();
+
+        assert_eq!(resolved.targets, internal.targets);
     }
 
     #[gpui_kit::test]
