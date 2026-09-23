@@ -207,15 +207,9 @@ fn rooted_store_rejects_parent_absolute_and_symlink_escape() {
 
 #[test]
 fn run_request_preserves_hostile_arguments_without_shell_and_scrubs_environment() {
-    let root = tempfile::tempdir().unwrap();
-    let executable = root.path().join("runner;touch-pwned");
-    fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
-    let mut permissions = fs::metadata(&executable).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-    fs::set_permissions(&executable, permissions).unwrap();
     let runner = RecordingRunner::default();
     let request = BrokerRequest::run_executable(
-        &executable,
+        system_executable("true"),
         ["one;touch injected", "$(touch injected-2)", "line\nvalue"],
     )
     .unwrap();
@@ -401,33 +395,60 @@ fn json_audit_log_is_private_append_only_and_contains_one_record_per_attempt() {
 #[test]
 fn broker_launches_are_fixed_argument_vectors_and_never_relaunch_the_gui() {
     let broker = Path::new("/usr/libexec/musheen-broker");
+    let request = BrokerRequest::run_executable("/usr/bin/true", ["--safe"]).unwrap();
     let polkit = BrokerLaunch::new(broker, PrivilegeProvider::Polkit);
-    assert_eq!(polkit.program(), Path::new("pkexec"));
+    assert_eq!(polkit.program(), Path::new("/usr/bin/pkexec"));
     assert_eq!(
-        polkit.arguments(),
+        polkit.arguments_for(&request),
         [
             "--disable-internal-agent",
             "/usr/libexec/musheen-broker",
             "--stdio",
-            "--provider=polkit"
+            "--provider=polkit",
+            "--action-id=org.musheen.run-executable-as-administrator",
+            &format!("--request-digest={}", request.operation_digest().to_hex()),
+            "--target",
+            "/usr/bin/true"
         ]
     );
     let sudo = BrokerLaunch::new(broker, PrivilegeProvider::Sudo);
-    assert_eq!(sudo.program(), Path::new("sudo"));
+    assert_eq!(sudo.program(), Path::new("/usr/bin/sudo"));
     assert_eq!(
-        sudo.arguments(),
+        sudo.arguments_for(&request),
         [
             "--",
             "/usr/libexec/musheen-broker",
             "--stdio",
-            "--provider=sudo"
+            "--provider=sudo",
+            "--action-id=org.musheen.run-executable-as-administrator",
+            &format!("--request-digest={}", request.operation_digest().to_hex()),
+            "--target",
+            "/usr/bin/true"
         ]
     );
     assert!(
         polkit
-            .arguments()
+            .arguments_for(&request)
             .iter()
             .all(|argument| !argument.to_string_lossy().contains("musheen-ui"))
+    );
+}
+
+#[test]
+fn broker_refuses_an_invoking_user_owned_executable() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = executable_script(root.path(), "user-tool", "exit 0");
+    let request = BrokerRequest::run_executable(&executable, std::iter::empty::<&str>()).unwrap();
+
+    assert_eq!(
+        broker(
+            FakeAuthorizer::granting(1_000),
+            RecordingRunner::default(),
+            RecordingAudit::default(),
+            FixedClock::new(100),
+        )
+        .handle(request),
+        Err(BrokerError::UnsafeExecutable)
     );
 }
 
@@ -440,6 +461,10 @@ fn executable_script(directory: &Path, name: &str, body: &str) -> PathBuf {
     permissions.set_mode(0o700);
     fs::set_permissions(&path, permissions).unwrap();
     path
+}
+
+fn system_executable(name: &str) -> PathBuf {
+    fs::canonicalize(Path::new("/usr/bin").join(name)).unwrap()
 }
 
 #[test]
@@ -555,19 +580,16 @@ fn sudo_password_prompt_is_bounded_masked_and_cancellable() {
 }
 
 #[test]
-fn production_runner_executes_scripts_by_validated_descriptor_with_exact_arguments() {
+fn production_runner_executes_root_owned_target_with_exact_arguments() {
     let temporary = tempfile::tempdir().unwrap();
-    let output = temporary.path().join("arguments.txt");
-    let script = executable_script(
-        temporary.path(),
-        "validated-script",
-        "printf '%s' \"$2\" > \"$1\"",
-    );
+    let output = temporary.path().join("$(touch never); exact");
     let request = BrokerRequest::run_executable(
-        &script,
+        system_executable("bash"),
         [
+            "-c".to_owned(),
+            "printf '' > \"$1\"".to_owned(),
+            "musheen-test".to_owned(),
             output.to_string_lossy().to_string(),
-            "$(touch never); exact".to_owned(),
         ],
     )
     .unwrap();
@@ -579,7 +601,7 @@ fn production_runner_executes_scripts_by_validated_descriptor_with_exact_argumen
     );
 
     assert_eq!(service.handle(request), Ok(BrokerOutput::Exited(0)));
-    assert_eq!(fs::read_to_string(output).unwrap(), "$(touch never); exact");
+    assert!(output.exists());
 }
 
 #[test]
@@ -644,8 +666,6 @@ fn production_validation_rejects_non_regular_targets_without_blocking() {
 
 #[test]
 fn production_runner_kills_reaps_and_audits_timed_out_commands() {
-    let temporary = tempfile::tempdir().unwrap();
-    let script = executable_script(temporary.path(), "slow-script", "sleep 10");
     let audit = RecordingAudit::default();
     let service = Broker::new(
         FakeAuthorizer::granting(1_000),
@@ -655,8 +675,9 @@ fn production_runner_kills_reaps_and_audits_timed_out_commands() {
     );
 
     assert_eq!(
-        service
-            .handle(BrokerRequest::run_executable(script, std::iter::empty::<String>()).unwrap()),
+        service.handle(
+            BrokerRequest::run_executable(system_executable("bash"), ["-c", "sleep 10"]).unwrap()
+        ),
         Err(BrokerError::ExecutionTimedOut)
     );
     let records = audit.0.lock().unwrap();

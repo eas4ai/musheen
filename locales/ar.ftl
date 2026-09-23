@@ -46,6 +46,7 @@ privilege-error-target-replaced = تغير الهدف أثناء التفويض
 privilege-error-scope-escape = هذا الموقع خارج الجذر المصرح به
 privilege-error-symlink = يتطلب هذا الرابط الرمزي تفويضًا جديدًا
 privilege-error-not-executable = الهدف المحدد غير قابل للتنفيذ
+privilege-error-unsafe-executable = يتطلب التنفيذ كمسؤول هدفًا مملوكًا للجذر ولا يمكن للمستخدمين الآخرين تعديله
 privilege-error-broker-crashed = توقف وسيط المسؤول بشكل غير متوقع
 privilege-error-busy = هناك طلب مسؤول آخر قيد التنفيذ
 privilege-error-timeout = انتهت مهلة إجراء المسؤول

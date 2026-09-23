@@ -260,6 +260,7 @@ privilege-error-target-replaced = ⟦The target changed during authorization··
 privilege-error-scope-escape = ⟦This location is outside the authorized root······⟧
 privilege-error-symlink = ⟦This symbolic link requires new authorization······⟧
 privilege-error-not-executable = ⟦The selected target is not executable······⟧
+privilege-error-unsafe-executable = ⟦Administrator execution requires a root-owned target that other users cannot modify··········⟧
 privilege-error-broker-crashed = ⟦The administrator broker stopped unexpectedly······⟧
 privilege-error-busy = ⟦Aanootheer aadmiinistraatoor reeqeest iis aalreeady iin proogreess······⟧
 privilege-error-timeout = ⟦Thee aadmiinistraatoor aactioon tiimeed oout······⟧

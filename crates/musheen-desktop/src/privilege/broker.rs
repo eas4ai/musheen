@@ -22,6 +22,7 @@ use musheen_core::CancellationToken;
 pub const SUDO_BROKER_READY: &str = "MUSHEEN_BROKER_READY";
 pub const BROKER_REQUEST_FRAME: &str = "MUSHEEN_REQUEST ";
 pub const BROKER_RESPONSE_FRAME: &str = "MUSHEEN_RESPONSE ";
+pub const INSTALLED_BROKER_PATH: &str = "/usr/libexec/musheen-broker";
 const MAX_BROKER_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,7 +418,7 @@ impl BrokerLaunch {
         let provider_argument = format!("--provider={}", provider.as_str());
         let (program, arguments) = match provider {
             PrivilegeProvider::Polkit => (
-                PathBuf::from("pkexec"),
+                PathBuf::from("/usr/bin/pkexec"),
                 vec![
                     "--disable-internal-agent".into(),
                     broker,
@@ -426,7 +427,7 @@ impl BrokerLaunch {
                 ],
             ),
             PrivilegeProvider::Sudo => (
-                PathBuf::from("sudo"),
+                PathBuf::from("/usr/bin/sudo"),
                 vec![
                     "--".into(),
                     broker,
@@ -481,8 +482,13 @@ impl BrokerLaunch {
     }
 
     #[must_use]
-    pub fn arguments(&self) -> &[std::ffi::OsString] {
-        &self.arguments
+    pub fn arguments_for(&self, request: &BrokerRequest) -> Vec<std::ffi::OsString> {
+        let mut arguments = self.arguments.to_vec();
+        arguments.push(format!("--action-id={}", request.operation().action_id()).into());
+        arguments.push(format!("--request-digest={}", request.operation_digest().to_hex()).into());
+        arguments.push("--target".into());
+        arguments.push(request.target().as_os_str().to_owned());
+        arguments
     }
 
     #[must_use]
@@ -599,7 +605,7 @@ impl BrokerTransport for ProcessBrokerTransport {
             return Err(BrokerError::ExecutionTimedOut);
         }
         let mut child = std::process::Command::new(self.launch.program())
-            .args(self.launch.arguments())
+            .args(self.launch.arguments_for(request))
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -712,7 +718,7 @@ impl BrokerTransport for SudoPtyBrokerTransport {
             .openpty(portable_pty::PtySize::default())
             .map_err(|_| BrokerError::AuthorizationUnavailable)?;
         let mut command = portable_pty::CommandBuilder::new(self.launch.program());
-        command.args(self.launch.arguments());
+        command.args(self.launch.arguments_for(request));
         command.env_clear();
         command.env("LC_ALL", "C");
         command.env("SUDO_PROMPT", "MUSHEEN_SUDO_PASSWORD:");
@@ -880,6 +886,7 @@ pub enum BrokerError {
     ScopeEscape,
     SymlinkRefused,
     TargetReplaced,
+    UnsafeExecutable,
 }
 
 impl fmt::Display for BrokerError {
@@ -899,6 +906,7 @@ impl fmt::Display for BrokerError {
             Self::ScopeEscape => "the path leaves the authorized root",
             Self::SymlinkRefused => "symbolic links require new authorization",
             Self::TargetReplaced => "the target changed during authorization",
+            Self::UnsafeExecutable => "the executable can be modified by the invoking user",
         })
     }
 }
@@ -923,6 +931,7 @@ impl BrokerError {
             Self::ScopeEscape => "scope-escape",
             Self::SymlinkRefused => "symlink-refused",
             Self::TargetReplaced => "target-replaced",
+            Self::UnsafeExecutable => "unsafe-executable",
         }
     }
 
@@ -942,6 +951,7 @@ impl BrokerError {
             "scope-escape" => Self::ScopeEscape,
             "symlink-refused" => Self::SymlinkRefused,
             "target-replaced" => Self::TargetReplaced,
+            "unsafe-executable" => Self::UnsafeExecutable,
             _ => return None,
         })
     }
@@ -1089,10 +1099,41 @@ impl ValidatedTarget {
         {
             return Err(BrokerError::NotExecutable);
         }
+        if matches!(operation, BrokerOperation::RunExecutable { .. })
+            && (!executable_mode_is_trusted(metadata.uid(), metadata.permissions().mode())
+                || executable_has_access_acl(&file)?)
+        {
+            return Err(BrokerError::UnsafeExecutable);
+        }
         Ok(Self {
             identity: FileIdentity::from_metadata(&metadata),
             file,
         })
+    }
+}
+
+const fn executable_mode_is_trusted(owner: u32, mode: u32) -> bool {
+    owner == 0 && mode & 0o022 == 0
+}
+
+fn executable_has_access_acl(file: &File) -> Result<bool, BrokerError> {
+    use xattr::FileExt as _;
+
+    file.get_xattr("system.posix_acl_access")
+        .map(|attribute| attribute.is_some())
+        .map_err(|_| BrokerError::Io)
+}
+
+#[cfg(test)]
+mod executable_policy_tests {
+    use super::executable_mode_is_trusted;
+
+    #[test]
+    fn executable_must_be_root_owned_and_not_group_or_world_writable() {
+        assert!(executable_mode_is_trusted(0, 0o755));
+        assert!(!executable_mode_is_trusted(1_000, 0o555));
+        assert!(!executable_mode_is_trusted(0, 0o775));
+        assert!(!executable_mode_is_trusted(0, 0o757));
     }
 }
 

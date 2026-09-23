@@ -12493,6 +12493,7 @@ fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str>
         BrokerError::ScopeEscape => "privilege-error-scope-escape",
         BrokerError::SymlinkRefused => "privilege-error-symlink",
         BrokerError::NotExecutable => "privilege-error-not-executable",
+        BrokerError::UnsafeExecutable => "privilege-error-unsafe-executable",
         BrokerError::InvalidRequest => "privilege-invalid-request",
         BrokerError::BrokerCrashed => "privilege-error-broker-crashed",
         BrokerError::Busy => "privilege-error-busy",

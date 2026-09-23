@@ -6,8 +6,8 @@ use musheen_core::{
 };
 use musheen_desktop::{
     BrokerDirectoryEntry, BrokerError, BrokerLaunch, BrokerOutput, BrokerRequest, BrokerTransport,
-    Clock, PrivilegeProvider, ProcessBrokerTransport, RootCapabilityDescriptor, RootedEntryKind,
-    RootedStore, SecretBuffer, SudoPtyBrokerTransport,
+    Clock, INSTALLED_BROKER_PATH, PrivilegeProvider, ProcessBrokerTransport,
+    RootCapabilityDescriptor, RootedEntryKind, RootedStore, SecretBuffer, SudoPtyBrokerTransport,
 };
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -364,11 +364,7 @@ pub struct SystemPrivilegeBackend {
 impl SystemPrivilegeBackend {
     #[must_use]
     pub fn new(provider: PrivilegeProvider) -> Self {
-        let broker = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.join("musheen-broker")))
-            .unwrap_or_else(|| std::path::PathBuf::from("musheen-broker"));
-        let launch = BrokerLaunch::new(broker, provider);
+        let launch = BrokerLaunch::new(INSTALLED_BROKER_PATH, provider);
         let transport: Arc<dyn BrokerTransport> = match provider {
             PrivilegeProvider::Polkit => Arc::new(ProcessBrokerTransport::new(launch)),
             PrivilegeProvider::Sudo => Arc::new(SudoPtyBrokerTransport::new(launch)),

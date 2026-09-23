@@ -277,13 +277,20 @@ impl BrokerRequest {
 
     #[must_use]
     pub fn binding_digest(&self) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.operation_digest().as_bytes());
+        hasher.update(&self.subject.pid.to_le_bytes());
+        hasher.update(&self.subject.uid.to_le_bytes());
+        hasher.update(&self.subject.start_time.to_le_bytes());
+        hasher.finalize()
+    }
+
+    #[must_use]
+    pub fn operation_digest(&self) -> blake3::Hash {
         let operation = serde_json::to_vec(&self.operation)
             .expect("the closed broker operation schema always serializes");
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.id.as_bytes());
-        hasher.update(&self.subject.pid.to_le_bytes());
-        hasher.update(&self.subject.uid.to_le_bytes());
-        hasher.update(&self.subject.start_time.to_le_bytes());
         hasher.update(&operation);
         hasher.finalize()
     }
