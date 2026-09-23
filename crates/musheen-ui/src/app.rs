@@ -418,6 +418,15 @@ struct PendingCatalogMove {
     target_path: StorePath,
 }
 
+#[derive(Clone, Debug)]
+struct PendingDirectoryRestore {
+    generation: u64,
+    loaded_items: usize,
+    selected: Vec<ItemId>,
+    focused: Option<ItemId>,
+    scroll_offsets: Vec<(usize, Point<Pixels>)>,
+}
+
 #[derive(Default)]
 struct AppMenuDispatcher {
     dispatched: Option<(CommandAction, CommandParameters)>,
@@ -2944,6 +2953,7 @@ struct MusheenApp {
     file_clipboard: Option<FileClipboard>,
     pending_cut_jobs: std::collections::HashSet<musheen_ops::JobId>,
     pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
+    pending_directory_restores: HashMap<TabId, PendingDirectoryRestore>,
     pending_context_menu: Option<ContextMenu>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
     /// Dialog windows are tracked by their GPUI identity. The close observer
@@ -3656,6 +3666,7 @@ impl MusheenApp {
             file_clipboard: None,
             pending_cut_jobs: std::collections::HashSet::new(),
             pending_catalog_moves: HashMap::new(),
+            pending_directory_restores: HashMap::new(),
             pending_context_menu: None,
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
@@ -3834,6 +3845,7 @@ impl MusheenApp {
     }
 
     fn start_load_for_tab(&mut self, tab_id: TabId, location: StorePath, cx: &mut Context<Self>) {
+        self.pending_directory_restores.remove(&tab_id);
         if let Err(error) = self.validate_elevated_location(&location) {
             self.operation_error = Some(localized_privilege_error(&self.catalog, &error));
             cx.notify();
@@ -3883,6 +3895,45 @@ impl MusheenApp {
         self.start_next_directory_page(tab_id, cx);
         if self.watch_directories {
             self.start_watch(tab_id, load, cx);
+        }
+    }
+
+    fn start_operation_directory_refresh(
+        &mut self,
+        tab_id: TabId,
+        location: StorePath,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(directory) = self.directories.get(&tab_id) else {
+            self.start_load_for_tab(tab_id, location, cx);
+            return;
+        };
+        let previous_generation = directory.generation();
+        let loaded_items = directory.items().len();
+        let selected = directory.view().selected_ids().to_vec();
+        let focused = directory.view().focused_item_id().cloned();
+        let scroll_offsets = self
+            .directory_scrolls
+            .iter()
+            .filter(|((candidate, _), _)| candidate == &tab_id)
+            .map(|((_, pane_index), scroll)| (*pane_index, scroll.0.borrow().base_handle.offset()))
+            .collect();
+        self.start_load_for_tab(tab_id, location, cx);
+        if let Some(directory) = self
+            .directories
+            .get(&tab_id)
+            .filter(|directory| directory.generation() != previous_generation)
+        {
+            self.pending_directory_restores.insert(
+                tab_id,
+                PendingDirectoryRestore {
+                    generation: directory.generation(),
+                    loaded_items,
+                    selected,
+                    focused,
+                    scroll_offsets,
+                },
+            );
         }
     }
 
@@ -4065,6 +4116,7 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         let Some(directory) = self.directories.get_mut(&tab_id) else {
+            self.pending_directory_restores.remove(&tab_id);
             return;
         };
         match result {
@@ -4081,6 +4133,7 @@ impl MusheenApp {
                 };
                 self.remember_folder_location(load.location());
                 self.apply_pending_file_manager_selection(tab_id, cx);
+                self.advance_directory_restore(tab_id, cx);
 
                 // Catalog persistence can involve xattrs and fsync. Keep it
                 // outside GPUI's render thread even for very large folders.
@@ -4118,6 +4171,13 @@ impl MusheenApp {
                     self.operation_error = Some(operation_error);
                 }
                 self.fail_pending_file_manager_selection(tab_id, load, request_error);
+                if self
+                    .pending_directory_restores
+                    .get(&tab_id)
+                    .is_some_and(|restore| restore.generation == load.generation())
+                {
+                    self.pending_directory_restores.remove(&tab_id);
+                }
             }
         }
     }
@@ -4136,6 +4196,46 @@ impl MusheenApp {
         {
             pending.completion.complete_one(Err(error));
         }
+    }
+
+    fn advance_directory_restore(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let Some(restore) = self.pending_directory_restores.get(&tab_id) else {
+            return;
+        };
+        let Some(directory) = self.directories.get(&tab_id) else {
+            self.pending_directory_restores.remove(&tab_id);
+            return;
+        };
+        if directory.generation() != restore.generation {
+            self.pending_directory_restores.remove(&tab_id);
+            return;
+        }
+        if directory.items().len() < restore.loaded_items && !directory.view().is_complete() {
+            self.start_next_directory_page(tab_id, cx);
+            return;
+        }
+        let restore = self
+            .pending_directory_restores
+            .remove(&tab_id)
+            .expect("the directory restore exists");
+        let selected = {
+            let directory = self
+                .directories
+                .get_mut(&tab_id)
+                .expect("the restored directory exists");
+            directory.view_mut().set_selected_ids(restore.selected);
+            directory.view_mut().focus_item(restore.focused);
+            directory.view().selected_ids().to_vec()
+        };
+        if let Some(tab) = self.navigation.tab_mut(tab_id) {
+            tab.set_selection(selected);
+        }
+        for (pane_index, offset) in restore.scroll_offsets {
+            if let Some(scroll) = self.directory_scrolls.get(&(tab_id, pane_index)) {
+                scroll.0.borrow().base_handle.set_offset(offset);
+            }
+        }
+        self.refresh_info_pane(tab_id, cx);
     }
 
     fn apply_pending_file_manager_selection(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
@@ -8682,7 +8782,7 @@ impl MusheenApp {
                     let pending_content_focus = state.pending_content_focus;
                     let tab_id = state.navigation.focused_tab().id();
                     let location = state.navigation.focused_tab().location().clone();
-                    state.start_load_for_tab(tab_id, location, cx);
+                    state.start_operation_directory_refresh(tab_id, location, cx);
                     state.pending_content_focus = pending_content_focus;
                 } else {
                     state.pending_catalog_moves.remove(&id);
@@ -13448,6 +13548,85 @@ mod tests {
             assert_eq!(
                 state.catalog_binding.path_hint(item.id()),
                 Some(destination)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn operation_refresh_preserves_loaded_pages_selection_and_scroll(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        for index in 0..700 {
+            filesystem::write(
+                temporary.path().join(format!("item-{index:04}.txt")),
+                b"item",
+            )
+            .unwrap();
+        }
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        app.update(cx, |state, cx| {
+            let tab_id = state.navigation.focused_tab().id();
+            state.start_next_directory_page(tab_id, cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().view().is_complete()
+        })
+        .await;
+        let saved_offset = point(px(0.), px(-360.));
+        let (selected, loaded_count) = app.update(cx, |state, cx| {
+            let tab_id = state.navigation.focused_tab().id();
+            let selected = state.focused_directory().items()[600].id().clone();
+            state.select_item(tab_id, selected.clone(), cx);
+            state
+                .focused_directory_mut()
+                .view_mut()
+                .focus_item(Some(selected.clone()));
+            state
+                .directory_scrolls
+                .entry((tab_id, 0))
+                .or_default()
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(saved_offset);
+            (selected, state.focused_directory().items().len())
+        });
+        filesystem::write(temporary.path().join("new-item.txt"), b"new").unwrap();
+
+        app.update(cx, |state, cx| {
+            let tab_id = state.navigation.focused_tab().id();
+            state.start_operation_directory_refresh(
+                tab_id,
+                StorePath::from_unix_path(temporary.path()),
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |_, cx| {
+            let state = app.read(cx);
+            state.focused_directory().view().is_complete()
+                && state.focused_directory().items().len() >= loaded_count
+        })
+        .await;
+
+        cx.read(|cx| {
+            let state = app.read(cx);
+            let tab_id = state.navigation.focused_tab().id();
+            assert_eq!(
+                state.focused_directory().view().selected_ids(),
+                std::slice::from_ref(&selected)
+            );
+            assert_eq!(
+                state.focused_directory().view().focused_item_id(),
+                Some(&selected)
+            );
+            assert_eq!(
+                state.directory_scrolls[&(tab_id, 0)]
+                    .0
+                    .borrow()
+                    .base_handle
+                    .offset(),
+                saved_offset
             );
         });
     }
