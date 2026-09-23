@@ -1956,4 +1956,38 @@ mod tests {
                 .starts_with(REPLACE_BACKUP_PREFIX.as_bytes())
         }));
     }
+
+    #[test]
+    fn cross_device_replace_moves_a_nonempty_directory_completely() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let destination_root = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir_in("/dev/shm").unwrap();
+        if fs::metadata(destination_root.path()).unwrap().dev()
+            == fs::metadata(source_root.path()).unwrap().dev()
+        {
+            return;
+        }
+        let source = source_root.path().join("tree");
+        let destination = destination_root.path().join("tree");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("a"), b"a").unwrap();
+        fs::write(source.join("nested/b"), b"b").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("old"), b"old").unwrap();
+        let request = request(&source, &destination);
+
+        execute_replacing_transfer(
+            &mut LocalStore::new(),
+            &request,
+            OperationKind::Move,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("a")).unwrap(), b"a");
+        assert_eq!(fs::read(destination.join("nested/b")).unwrap(), b"b");
+        assert!(!destination.join("old").exists());
+    }
 }

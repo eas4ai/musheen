@@ -1195,11 +1195,17 @@ fn descriptor_identity(stat: &rustix::fs::Statx) -> Box<[u8]> {
     identity.extend_from_slice(&stat.stx_mnt_id.to_ne_bytes());
     identity.extend_from_slice(&stat.stx_ino.to_ne_bytes());
     identity.extend_from_slice(&stat.stx_mode.to_ne_bytes());
-    identity.extend_from_slice(&stat.stx_size.to_ne_bytes());
-    identity.extend_from_slice(&stat.stx_mtime.tv_sec.to_ne_bytes());
-    identity.extend_from_slice(&stat.stx_mtime.tv_nsec.to_ne_bytes());
-    identity.extend_from_slice(&stat.stx_ctime.tv_sec.to_ne_bytes());
-    identity.extend_from_slice(&stat.stx_ctime.tv_nsec.to_ne_bytes());
+    // Removing a directory's planned children necessarily changes its size,
+    // mtime, and ctime. Its descriptor, inode, type, mode, and exact child-name
+    // plan still prove that the entry is the directory we prepared. Non-directory
+    // entries retain content timestamps and size so a changed file is refused.
+    if !descriptor_is_directory(stat) {
+        identity.extend_from_slice(&stat.stx_size.to_ne_bytes());
+        identity.extend_from_slice(&stat.stx_mtime.tv_sec.to_ne_bytes());
+        identity.extend_from_slice(&stat.stx_mtime.tv_nsec.to_ne_bytes());
+        identity.extend_from_slice(&stat.stx_ctime.tv_sec.to_ne_bytes());
+        identity.extend_from_slice(&stat.stx_ctime.tv_nsec.to_ne_bytes());
+    }
     identity.into_boxed_slice()
 }
 
@@ -1538,6 +1544,23 @@ mod tests {
             Err(ProviderError::SourceChanged)
         );
         assert_eq!(fs::read(child).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn descriptor_removal_deletes_an_unchanged_directory_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("tree");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("first"), b"first").unwrap();
+        fs::write(source.join("nested/second"), b"second").unwrap();
+        let path = store_path(&source);
+        let mut provider = LocalStore::new();
+        let expected = provider.inspect(&path, false).unwrap();
+        let token = provider.prepare_source_removal(&path, &expected).unwrap();
+
+        provider.remove_source(&path, &expected, &token).unwrap();
+
+        assert!(!source.exists());
     }
 
     #[test]
