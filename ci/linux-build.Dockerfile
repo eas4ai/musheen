@@ -3,6 +3,7 @@ FROM rust:1.95-bookworm
 
 ENV CARGO_BUILD_JOBS=1 \
     CARGO_INCREMENTAL=0 \
+    RUST_TEST_THREADS=1 \
     RUST_MIN_STACK=16777216
 
 RUN apt-get update \

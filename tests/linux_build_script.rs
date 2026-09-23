@@ -168,6 +168,10 @@ fn linux_build_bounds_rust_compiler_resources() {
         "clean Docker builds must disable incremental compilation"
     );
     assert!(
+        dockerfile.contains("RUST_TEST_THREADS=1"),
+        "clean builds must bound native UI test concurrency"
+    );
+    assert!(
         dockerfile.contains("RUST_MIN_STACK=16777216"),
         "clean Docker builds must give rustc enough worker stack"
     );
