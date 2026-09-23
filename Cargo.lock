@@ -5241,6 +5241,8 @@ dependencies = [
  "musheen-desktop",
  "musheen-local",
  "musheen-ui",
+ "rustix",
+ "tempfile",
 ]
 
 [[package]]

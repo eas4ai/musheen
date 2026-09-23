@@ -105,6 +105,10 @@ zstd-safe = { version = "7", features = ["experimental"] }
 musheen-desktop = { path = "crates/musheen-desktop" }
 musheen-local = { path = "crates/musheen-local" }
 musheen-ui = { path = "crates/musheen-ui" }
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
