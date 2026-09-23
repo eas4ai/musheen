@@ -178,7 +178,10 @@ impl TerminalModel {
 
     #[must_use]
     pub fn encode_paste(&self, value: &str, bracketed: bool) -> Vec<u8> {
-        let sanitized = value.replace('\0', "");
+        let sanitized: String = value
+            .chars()
+            .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+            .collect();
         if bracketed {
             format!("\u{1b}[200~{sanitized}\u{1b}[201~").into_bytes()
         } else {

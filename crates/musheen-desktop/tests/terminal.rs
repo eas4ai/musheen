@@ -147,6 +147,22 @@ fn paste_confirmation_is_required_for_multiline_and_controls() {
 }
 
 #[test]
+fn paste_encoding_strips_terminal_controls_without_altering_text_controls() {
+    let terminal = TerminalModel::new(size());
+    let hostile = "printf safe\n\u{1b}[201~printf escaped\u{7}\u{8}\u{7f}\u{85}\r\tend";
+    let sanitized = b"printf safe\n[201~printf escaped\r\tend";
+
+    let encoded = terminal.encode_paste(hostile, true);
+
+    assert_eq!(
+        encoded,
+        b"\x1b[200~printf safe\n[201~printf escaped\r\tend\x1b[201~"
+    );
+    assert_eq!(encoded.iter().filter(|byte| **byte == 0x1b).count(), 2);
+    assert_eq!(terminal.encode_paste(hostile, false), sanitized);
+}
+
+#[test]
 fn scrollback_drops_oldest_complete_lines_at_both_limits() {
     let mut terminal = TerminalModel::new(size());
     for line in 0..1_000_000_u32 {

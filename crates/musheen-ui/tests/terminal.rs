@@ -2,8 +2,8 @@ use std::path::Path;
 
 use musheen_core::StorePath;
 use musheen_ui::{
-    FocusTarget, SemanticRegion, ShellModel, TerminalDrawer, TerminalDrawerAction, TerminalInput,
-    TerminalKey,
+    Catalog, FocusTarget, Locale, SemanticRegion, ShellModel, TerminalDrawer, TerminalDrawerAction,
+    TerminalInput, TerminalKey,
 };
 
 #[test]
@@ -116,4 +116,18 @@ fn paste_and_exit_flow_is_explicit_and_restartable() {
         TerminalDrawerAction::ConfirmTerminate
     );
     assert!(drawer.is_open());
+}
+
+#[test]
+fn paste_confirmation_explains_sanitization_and_execution_risk() {
+    let catalog = Catalog::load(Locale::EnUs).unwrap();
+
+    assert_eq!(
+        catalog.message("terminal-paste-warning").unwrap(),
+        "This paste contains multiple lines or unsafe terminal controls. Unsafe controls will be removed; the remaining text may run multiple commands. Review it before sending."
+    );
+    assert_eq!(
+        catalog.message("terminal-paste-continue").unwrap(),
+        "Paste sanitized text"
+    );
 }
