@@ -642,12 +642,16 @@ impl OperationHub {
     }
 
     pub fn submit_undo(&self, id: JobId) -> Result<JobId, OperationHubError> {
-        let paths = self
-            .queue
-            .lock()
-            .map_err(|_| OperationHubError::QueueLock)?
-            .undo_paths(id)
-            .ok_or(DropError::UndoUnavailable(id))?;
+        let (paths, kind) = {
+            let queue = self
+                .queue
+                .lock()
+                .map_err(|_| OperationHubError::QueueLock)?;
+            (
+                queue.undo_paths(id).ok_or(DropError::UndoUnavailable(id))?,
+                queue.undo_kind(id).ok_or(DropError::UndoUnavailable(id))?,
+            )
+        };
         let location = paths[0].clone();
         let undo_id = self.with_unreserved_queue(paths.iter(), |queue| queue.submit_undo(id))?;
         self.status
@@ -656,7 +660,7 @@ impl OperationHub {
             .register(
                 undo_id,
                 musheen_ops::EventGeneration::new(0),
-                OperationKind::Rename,
+                kind,
                 location,
                 Some(1),
             )?;
@@ -1542,6 +1546,56 @@ mod tests {
         operation.execute().unwrap();
         hub.queue.lock().unwrap().finish(undo_job, Ok(())).unwrap();
         assert_eq!(filesystem::read(source_path).unwrap(), b"contents");
+    }
+
+    #[test]
+    fn completed_move_undo_is_tracked_as_a_move() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_directory = temporary.path().join("original");
+        let moved_directory = temporary.path().join("moved");
+        filesystem::create_dir(&original_directory).unwrap();
+        filesystem::create_dir(&moved_directory).unwrap();
+        let original_path = original_directory.join("item.txt");
+        filesystem::write(&original_path, b"contents").unwrap();
+        let hub = OperationHub::new(&ResourceLimits::default());
+        let job = hub
+            .submit_drop(
+                FileDragPayload::new(
+                    vec![StorePath::from_unix_path(original_path.as_os_str())],
+                    DropAction::Move,
+                )
+                .unwrap(),
+                StorePath::from_unix_path(moved_directory.as_os_str()),
+            )
+            .unwrap()[0];
+        let operation = hub
+            .queue
+            .lock()
+            .unwrap()
+            .start_ready()
+            .unwrap()
+            .pop()
+            .unwrap();
+        operation.execute().unwrap();
+        hub.queue.lock().unwrap().finish(job, Ok(())).unwrap();
+        assert!(hub.can_undo(job));
+
+        let undo_job = hub.submit_undo(job).unwrap();
+        assert_eq!(
+            hub.status.lock().unwrap().entry(undo_job).unwrap().kind(),
+            OperationKind::Move
+        );
+        let operation = hub
+            .queue
+            .lock()
+            .unwrap()
+            .start_ready()
+            .unwrap()
+            .pop()
+            .unwrap();
+        operation.execute().unwrap();
+        hub.queue.lock().unwrap().finish(undo_job, Ok(())).unwrap();
+        assert_eq!(filesystem::read(original_path).unwrap(), b"contents");
     }
 
     #[test]

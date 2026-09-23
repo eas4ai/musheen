@@ -13206,7 +13206,7 @@ impl MusheenApp {
                         row.child(
                             Button::new(SharedString::from(format!("operation-undo-{id_value}")))
                                 .label("Undo")
-                                .tooltip("Undo if the renamed item is unchanged")
+                                .tooltip("Undo if the item and its location are unchanged")
                                 .small()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.undo_operation(id, cx);
