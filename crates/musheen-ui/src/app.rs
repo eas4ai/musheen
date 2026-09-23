@@ -557,6 +557,17 @@ struct FileClipboard {
     action: ClipboardAction,
 }
 
+fn clear_cancelled_cut_state(
+    id: JobId,
+    pending_cut_jobs: &mut std::collections::HashSet<JobId>,
+    file_clipboard: &mut Option<FileClipboard>,
+) {
+    if pending_cut_jobs.remove(&id) {
+        pending_cut_jobs.clear();
+        *file_clipboard = None;
+    }
+}
+
 struct PendingRestore {
     tab_id: TabId,
     receipt: musheen_ops::TrashReceipt,
@@ -8918,7 +8929,7 @@ impl MusheenApp {
         match result {
             Ok(true) => self.pump_operation_queue(cx),
             Ok(false) => {
-                self.pending_cut_jobs.remove(&id);
+                clear_cancelled_cut_state(id, &mut self.pending_cut_jobs, &mut self.file_clipboard);
                 self.pending_catalog_moves.remove(&id);
             }
             Err(error) => self.operation_error = Some(error.to_string().into()),
@@ -13357,6 +13368,26 @@ mod tests {
     };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[test]
+    fn keeping_source_clears_cut_visual_state() {
+        let reviewed = JobId::new(41).unwrap();
+        let another = JobId::new(42).unwrap();
+        let mut pending = std::collections::HashSet::from([reviewed, another]);
+        let mut clipboard = Some(FileClipboard {
+            targets: Vec::new(),
+            action: ClipboardAction::Cut,
+        });
+
+        clear_cancelled_cut_state(JobId::new(99).unwrap(), &mut pending, &mut clipboard);
+        assert_eq!(pending.len(), 2);
+        assert!(clipboard.is_some());
+
+        clear_cancelled_cut_state(reviewed, &mut pending, &mut clipboard);
+
+        assert!(pending.is_empty());
+        assert!(clipboard.is_none());
+    }
 
     #[gpui_kit::test]
     async fn volume_unlock_submission_clears_plaintext_and_hands_off_a_secret_buffer(
