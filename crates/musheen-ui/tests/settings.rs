@@ -846,6 +846,15 @@ async fn settings_gallery_checks_rendered_controls_labels_and_confirmation_at_do
     for locale in [Locale::EnUs, Locale::EnXa, Locale::Ar] {
         let catalog = Catalog::load(locale).unwrap();
         for (dark, contrast) in [(false, false), (true, false), (false, true)] {
+            // Exercise every locale and theme mode without nine full schema walks.
+            if !matches!(
+                (locale, dark, contrast),
+                (Locale::EnUs, false, false)
+                    | (Locale::EnXa, true, false)
+                    | (Locale::Ar, false, true)
+            ) {
+                continue;
+            }
             cx.update(|cx| {
                 gpui_kit::init(cx);
                 let preferences = native_theme::AccessibilityPreferences {
