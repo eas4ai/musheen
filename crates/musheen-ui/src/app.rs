@@ -7477,6 +7477,7 @@ impl MusheenApp {
             match operation {
                 NameOperation::Create { parent, kind } => hub
                     .submit_create(CreateRequest::new(parent, name.into(), kind))
+                    .map(|id| (id, None))
                     .map_err(|error| Box::<str>::from(error.to_string())),
                 NameOperation::Rename {
                     target,
@@ -7486,12 +7487,21 @@ impl MusheenApp {
                     let identity = MutationProvider::identity(&mut store, target.path())
                         .map_err(|error| Box::<str>::from(error.to_string()))?
                         .ok_or_else(|| Box::<str>::from("the selected item no longer exists"))?;
-                    hub.submit_rename(RenameRequest::new(
+                    let request = RenameRequest::new(
                         target.path().clone(),
                         submitted_rename_name(&original_name, &name),
                         identity.into_vec(),
-                    ))
-                    .map_err(|error| Box::<str>::from(error.to_string()))
+                    );
+                    let movement = PendingCatalogMove {
+                        source: target.id().clone(),
+                        source_path: target.path().clone(),
+                        target_path: request
+                            .destination()
+                            .map_err(|error| Box::<str>::from(error.to_string()))?,
+                    };
+                    hub.submit_rename(request)
+                        .map(|id| (id, Some(movement)))
+                        .map_err(|error| Box::<str>::from(error.to_string()))
                 }
             }
         });
@@ -7501,7 +7511,10 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| match result {
-                Ok(_) => {
+                Ok((id, movement)) => {
+                    if let Some(movement) = movement {
+                        state.pending_catalog_moves.insert(id, movement);
+                    }
                     state.operation_error = state.operation_hub.persistence_error();
                     state.pump_operation_queue(cx);
                 }
@@ -8681,9 +8694,17 @@ impl MusheenApp {
         let Some(movement) = self.pending_catalog_moves.remove(&id) else {
             return;
         };
-        let target = match outcome {
+        let result = match outcome {
             LocalOperationOutcome::Transfer(TransferOutcome::Skipped) => return,
-            LocalOperationOutcome::Transfer(TransferOutcome::Completed(target)) => target,
+            LocalOperationOutcome::Transfer(TransferOutcome::Completed(target)) => {
+                let capabilities = self.store.capabilities(target.path());
+                self.catalog_binding.complete_move(
+                    &movement.source,
+                    target.id().clone(),
+                    target.path().clone(),
+                    &capabilities,
+                )
+            }
             LocalOperationOutcome::Metadata => {
                 self.operation_error = Some(
                     format!(
@@ -8698,15 +8719,16 @@ impl MusheenApp {
                 );
                 return;
             }
-            LocalOperationOutcome::Mutation => return,
+            LocalOperationOutcome::Mutation => {
+                let capabilities = self.store.capabilities(&movement.target_path);
+                self.catalog_binding.complete_rename(
+                    &movement.source,
+                    movement.target_path.clone(),
+                    &capabilities,
+                )
+            }
         };
-        let capabilities = self.store.capabilities(target.path());
-        match self.catalog_binding.complete_move(
-            &movement.source,
-            target.id().clone(),
-            target.path().clone(),
-            &capabilities,
-        ) {
+        match result {
             Ok(TagMoveOutcome::Preserved) => {}
             Ok(TagMoveOutcome::UnsupportedDestination) => {
                 self.operation_error = Some(
@@ -13382,6 +13404,45 @@ mod tests {
         visual.run_until_parked();
 
         assert_eq!(selected_item_count(&app, cx), 1);
+    }
+
+    #[gpui_kit::test]
+    async fn completed_rename_updates_the_catalog_path(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("before.txt"), b"item").unwrap();
+        let (app, _) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let destination = StorePath::from_unix_path(temporary.path().join("after.txt"));
+
+        app.update(cx, |state, _| {
+            state.catalog_binding = CatalogBinding::in_memory();
+            let item = state.focused_directory().view().items()[0].clone();
+            let capabilities = state.store.capabilities(item.path());
+            state
+                .catalog_binding
+                .assign_tag(item.id(), item.path(), &capabilities, "tracked")
+                .unwrap();
+            filesystem::rename(
+                item.path().as_unix_path().unwrap(),
+                destination.as_unix_path().unwrap(),
+            )
+            .unwrap();
+            let job = JobId::new(91).unwrap();
+            state.pending_catalog_moves.insert(
+                job,
+                PendingCatalogMove {
+                    source: item.id().clone(),
+                    source_path: item.path().clone(),
+                    target_path: destination.clone(),
+                },
+            );
+
+            state.finish_catalog_move(job, LocalOperationOutcome::Mutation);
+
+            assert_eq!(
+                state.catalog_binding.path_hint(item.id()),
+                Some(destination)
+            );
+        });
     }
 
     #[gpui_kit::test]

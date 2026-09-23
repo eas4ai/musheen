@@ -62,14 +62,18 @@ impl CreateRequest {
     pub const fn kind(&self) -> CreateKind {
         self.kind
     }
+
+    pub fn destination(&self) -> Result<StorePath, MutationError> {
+        validate_local_name(self.name()).map_err(|_| MutationError::InvalidName)?;
+        child_path(self.parent(), self.name())
+    }
 }
 
 pub fn execute_create(
     provider: &mut impl MutationProvider,
     request: &CreateRequest,
 ) -> Result<StorePath, MutationError> {
-    validate_local_name(request.name()).map_err(|_| MutationError::InvalidName)?;
-    let destination = child_path(request.parent(), request.name())?;
+    let destination = request.destination()?;
     if !provider.allows_create(request.parent(), request.kind())? {
         return Err(MutationError::Unsupported);
     }

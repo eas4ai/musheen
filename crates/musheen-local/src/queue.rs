@@ -617,11 +617,7 @@ impl LocalOperationQueue {
             musheen_ops::CreateKind::File => OperationKind::CreateFile,
             musheen_ops::CreateKind::Directory => OperationKind::CreateDirectory,
         };
-        let parent = request
-            .parent()
-            .as_unix_path()
-            .ok_or_else(|| DropError::Plan("create requires a local directory".into()))?;
-        let destination = StorePath::from_unix_path(parent.join(request.name()).into_os_string());
+        let destination = request.destination()?;
         let store = LocalStore::new();
         let plan = OperationPlan::new(
             kind,
@@ -636,11 +632,7 @@ impl LocalOperationQueue {
 
     pub fn submit_rename(&mut self, request: RenameRequest) -> Result<JobId, DropError> {
         let source = request.source().clone();
-        let parent = source
-            .as_unix_path()
-            .and_then(Path::parent)
-            .ok_or_else(|| DropError::Plan("rename requires a local parent directory".into()))?;
-        let destination = StorePath::from_unix_path(parent.join(request.target_name()));
+        let destination = request.destination()?;
         let store = LocalStore::new();
         let plan = OperationPlan::new(
             OperationKind::Rename,
@@ -1299,5 +1291,37 @@ mod tests {
             .expect("delete is queued");
         assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
         assert!(!renamed_path.exists());
+    }
+
+    #[test]
+    fn create_and_rename_reject_invalid_names_before_queueing() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let parent = StorePath::from_unix_path(temporary.path().as_os_str());
+        let source_path = temporary.path().join("source");
+        fs::write(&source_path, b"source").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &source)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+
+        assert_eq!(
+            queue.submit_create(CreateRequest::new(
+                parent,
+                "../outside".into(),
+                musheen_ops::CreateKind::File,
+            )),
+            Err(DropError::Mutation(MutationError::InvalidName))
+        );
+        assert_eq!(
+            queue.submit_rename(RenameRequest::new(
+                source,
+                "../outside".into(),
+                identity.into_vec(),
+            )),
+            Err(DropError::Mutation(MutationError::InvalidName))
+        );
+        assert!(queue.start_ready().unwrap().is_empty());
     }
 }

@@ -34,14 +34,18 @@ impl RenameRequest {
     pub const fn expected_identity(&self) -> &[u8] {
         &self.expected_identity
     }
+
+    pub fn destination(&self) -> Result<StorePath, MutationError> {
+        validate_local_name(self.target_name()).map_err(|_| MutationError::InvalidName)?;
+        sibling_path(self.source(), self.target_name())
+    }
 }
 
 pub fn execute_rename(
     provider: &mut impl MutationProvider,
     request: &RenameRequest,
 ) -> Result<StorePath, MutationError> {
-    validate_local_name(request.target_name()).map_err(|_| MutationError::InvalidName)?;
-    let destination = sibling_path(request.source(), request.target_name())?;
+    let destination = request.destination()?;
     if !provider.allows_rename(request.source())? {
         return Err(MutationError::Unsupported);
     }
