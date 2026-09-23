@@ -1826,6 +1826,7 @@ pub fn run(initial_path: PathBuf) {
                 for (window_options, navigation, binding) in windows {
                     let limits = limits.clone();
                     let window_readiness = maintenance_readiness.clone();
+                    let initial_location = navigation.focused_tab().location().clone();
                     cx.open_window(window_options, move |window, cx| {
                         let view = cx.new(|cx| {
                             MusheenApp::new_with_navigation(
@@ -1836,6 +1837,9 @@ pub fn run(initial_path: PathBuf) {
                                 true,
                                 cx,
                             )
+                        });
+                        view.update(cx, |state, cx| {
+                            state.start_initial_load(initial_location, cx);
                         });
                         register_file_manager_window(&view, window, cx);
                         window.on_next_frame(move |_, _| {
@@ -2901,6 +2905,7 @@ struct MusheenApp {
     conflict_subscriptions: Vec<Subscription>,
     rubber_band: Option<RubberBandGesture>,
     directory_scrolls: HashMap<(TabId, usize), UniformListScrollHandle>,
+    startup_load_started: bool,
 }
 
 impl Drop for MusheenApp {
@@ -3610,6 +3615,7 @@ impl MusheenApp {
             conflict_subscriptions: Vec::new(),
             rubber_band: None,
             directory_scrolls: HashMap::new(),
+            startup_load_started: false,
         };
         this.install_volume_properties_cleanup(cx);
         this.sync_catalog_projection();
@@ -3618,7 +3624,7 @@ impl MusheenApp {
         // fast filesystems cannot finish and drop the initial result.
         let startup_owner = cx.entity().downgrade();
         cx.defer(move |cx| {
-            let _ = startup_owner.update(cx, |this, cx| this.start_load(location, cx));
+            let _ = startup_owner.update(cx, |this, cx| this.start_initial_load(location, cx));
         });
         this.start_operation_status_refresh(cx);
         this.start_pending_xattr_reconciliation(cx);
@@ -3762,6 +3768,14 @@ impl MusheenApp {
     fn start_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
         self.start_load_for_tab(tab_id, location, cx);
+    }
+
+    fn start_initial_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
+        if self.startup_load_started {
+            return;
+        }
+        self.startup_load_started = true;
+        self.start_load(location, cx);
     }
 
     fn start_load_for_tab(&mut self, tab_id: TabId, location: StorePath, cx: &mut Context<Self>) {
@@ -13101,6 +13115,41 @@ mod tests {
             ),
             vec![11]
         );
+    }
+
+    #[gpui_kit::test]
+    async fn explicit_window_startup_load_is_idempotent_with_the_deferred_fallback(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"visible").unwrap();
+        let location = StorePath::from_unix_path(temporary.path());
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            view.update(cx, |state, cx| {
+                state.start_initial_load(location.clone(), cx);
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        app.update(cx, |state, _| {
+            assert_eq!(state.focused_directory().generation(), 1);
+            assert_eq!(state.focused_directory().items().len(), 1);
+        });
     }
 
     struct NoopNotificationSink;
