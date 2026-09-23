@@ -141,13 +141,16 @@ impl OperationHub {
         let mut status = load_status(&store)?;
         let interrupted = status.mark_unfinished_interrupted();
         let mut local_store = LocalStore::new();
+        let mut recovery_error = None;
         for location in status
             .history()
             .into_iter()
             .map(|entry| entry.location().clone())
         {
-            if location.as_unix_path().is_some() {
-                local_store.recover_replacements_at(&location)?;
+            if location.as_unix_path().is_some()
+                && let Err(error) = local_store.recover_replacements_at(&location)
+            {
+                recovery_error.get_or_insert_with(|| error.to_string().into());
             }
         }
         let recovery_reconciled = status.reconcile_recovery_staging(
@@ -169,7 +172,7 @@ impl OperationHub {
             queue: Arc::new(Mutex::new(queue)),
             status: Arc::new(Mutex::new(status)),
             store: Some(store),
-            persistence_error: Arc::new(Mutex::new(None)),
+            persistence_error: Arc::new(Mutex::new(recovery_error)),
             status_revision: Arc::new(AtomicU64::new(0)),
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
@@ -293,26 +296,36 @@ impl OperationHub {
         };
         let sources = payload.sources().to_vec();
         let submitted_target = target.clone();
-        let ids = self
-            .with_unreserved_queue(sources.iter().chain(std::iter::once(&target)), |queue| {
-                queue.submit_drop_resolved(payload, submitted_target, decisions)
+        let submissions =
+            self.with_unreserved_queue(sources.iter().chain(std::iter::once(&target)), |queue| {
+                queue
+                    .submit_drop_resolved(payload, submitted_target, decisions)?
+                    .into_iter()
+                    .map(|id| {
+                        let destination = queue
+                            .operation_paths(id)
+                            .and_then(|paths| paths.into_iter().nth(1))
+                            .ok_or(DropError::MissingOperation(id))?;
+                        Ok((id, destination))
+                    })
+                    .collect::<Result<Vec<_>, DropError>>()
             })?;
         let mut status = self
             .status
             .lock()
             .map_err(|_| OperationHubError::StatusLock)?;
-        for (id, source) in ids.iter().copied().zip(sources) {
+        for (id, location) in submissions.iter().cloned() {
             status.register(
                 id,
                 musheen_ops::EventGeneration::new(0),
                 kind,
-                source,
+                location,
                 Some(1),
             )?;
         }
         drop(status);
         self.persist_status();
-        Ok(ids)
+        Ok(submissions.into_iter().map(|(id, _)| id).collect())
     }
 
     pub fn submit_metadata_changes(
@@ -1045,6 +1058,70 @@ mod tests {
         )
         .unwrap();
         id
+    }
+
+    fn hub_with_invalid_replacement_journal() -> (tempfile::TempDir, OperationHub, JobId) {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination_directory = temporary.path().join("destination");
+        filesystem::create_dir(&destination_directory).unwrap();
+        let destination = StorePath::from_unix_path(destination_directory.join("file.txt"));
+        let id = JobId::new(91).unwrap();
+        let mut status = StatusCenterModel::default();
+        status
+            .register(
+                id,
+                EventGeneration::new(0),
+                OperationKind::Copy,
+                destination,
+                Some(1),
+            )
+            .unwrap();
+        let store = StatusStore::at(temporary.path().join("status/operations.json"));
+        store.save(&status.to_json().unwrap()).unwrap();
+        filesystem::write(
+            destination_directory.join(".musheen-replace-journal-v1-invalid"),
+            b"invalid journal",
+        )
+        .unwrap();
+        let hub = OperationHub::with_status_store(&ResourceLimits::default(), store).unwrap();
+        (temporary, hub, id)
+    }
+
+    #[test]
+    fn transfer_history_records_destination_path_for_restart_recovery() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_directory = temporary.path().join("source");
+        let destination_directory = temporary.path().join("destination");
+        filesystem::create_dir(&source_directory).unwrap();
+        filesystem::create_dir(&destination_directory).unwrap();
+        let source = source_directory.join("file.txt");
+        filesystem::write(&source, b"source").unwrap();
+        let source = StorePath::from_unix_path(source);
+        let target = StorePath::from_unix_path(destination_directory.clone());
+        let hub = OperationHub::new(&ResourceLimits::default());
+
+        let id = hub
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Copy).unwrap(),
+                target,
+            )
+            .unwrap()[0];
+
+        assert_eq!(
+            hub.status.lock().unwrap().entry(id).unwrap().location(),
+            &StorePath::from_unix_path(destination_directory.join("file.txt"))
+        );
+    }
+
+    #[test]
+    fn invalid_replacement_journal_preserves_status_and_reports_error() {
+        let (_temporary, hub, id) = hub_with_invalid_replacement_journal();
+
+        assert!(hub.status.lock().unwrap().entry(id).is_some());
+        assert!(
+            hub.persistence_error()
+                .is_some_and(|error| error.contains("replacement journal"))
+        );
     }
 
     #[test]
