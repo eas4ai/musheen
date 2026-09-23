@@ -5276,6 +5276,7 @@ dependencies = [
  "musheen-local",
  "musheen-ui",
  "rustix",
+ "serde_json",
  "tempfile",
 ]
 

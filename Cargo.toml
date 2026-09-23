@@ -110,6 +110,7 @@ musheen-ui = { path = "crates/musheen-ui" }
 rustix.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

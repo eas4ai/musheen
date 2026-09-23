@@ -8,7 +8,7 @@ fn fixture(root: &Path, rust_version: &str) {
     fs::write(
         root.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"musheen\"\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"{rust_version}\"\n"
+            "[package]\nname = \"musheen\"\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"{rust_version}\"\nlicense = \"GPL-3.0-or-later\"\n"
         ),
     )
     .unwrap();
@@ -23,6 +23,62 @@ fn fixture(root: &Path, rust_version: &str) {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn sbom_and_license_notice_cover_the_locked_graph_without_build_paths() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/generate-sbom.py");
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = temporary.path().join("repository");
+    fixture(&repository, "1.95");
+    let sample = repository.join("vendor/sample");
+    fs::create_dir_all(sample.join("src")).unwrap();
+    fs::write(
+        sample.join("src/lib.rs"),
+        "pub fn ready() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        sample.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.2.0\"\nedition = \"2024\"\nlicense = \"MIT\"\n",
+    )
+    .unwrap();
+    let mut manifest = fs::read_to_string(repository.join("Cargo.toml")).unwrap();
+    manifest.push_str("\n[dependencies]\nsample = { path = \"vendor/sample\" }\n");
+    fs::write(repository.join("Cargo.toml"), manifest).unwrap();
+    let lock = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&repository)
+        .output()
+        .unwrap();
+    assert!(lock.status.success(), "{lock:?}");
+
+    let artifact_dir = temporary.path().join("artifacts");
+    let output = Command::new("python3")
+        .arg(&script)
+        .arg(&repository)
+        .arg(&artifact_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let raw = fs::read_to_string(artifact_dir.join("musheen.cdx.json")).unwrap();
+    let bom: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(bom["bomFormat"], "CycloneDX");
+    assert_eq!(bom["specVersion"], "1.6");
+    assert_eq!(bom["metadata"]["component"]["name"], "musheen");
+    assert_eq!(bom["components"][0]["name"], "sample");
+    assert_eq!(bom["components"][0]["licenses"][0]["expression"], "MIT");
+    assert!(
+        bom["dependencies"][0]["dependsOn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "pkg:cargo/sample@0.2.0")
+    );
+    let notice = fs::read_to_string(artifact_dir.join("THIRD_PARTY_LICENSES.md")).unwrap();
+    assert!(notice.contains("sample | 0.2.0 | MIT"));
+    assert!(!raw.contains(&repository.to_string_lossy().to_string()));
+    assert!(!notice.contains(&repository.to_string_lossy().to_string()));
 }
 
 #[test]
