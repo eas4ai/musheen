@@ -28,6 +28,8 @@ static TRASH_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_RESTORE_NAME: AtomicU64 = AtomicU64::new(1);
 const REPLACE_BACKUP_PREFIX: &str = ".musheen-replace-backup-v1-";
 const REPLACE_JOURNAL_PREFIX: &str = ".musheen-replace-journal-v1-";
+const REPLACE_PUBLISHED_PREFIX: &str = ".musheen-replace-published-v1-";
+const REPLACE_PUBLISHED_MARKER: &[u8] = b"musheen-replacement-published-v1\n";
 
 #[derive(Debug)]
 struct ReplacementJournal {
@@ -43,6 +45,7 @@ struct ReplacementJournal {
 struct ReplacementTransaction {
     backup: PathBuf,
     journal: PathBuf,
+    published: PathBuf,
 }
 
 #[derive(Debug)]
@@ -736,6 +739,7 @@ impl ReplacementTransaction {
         );
         let backup = parent.join(format!("{REPLACE_BACKUP_PREFIX}{suffix}"));
         let journal = parent.join(format!("{REPLACE_JOURNAL_PREFIX}{suffix}"));
+        let published = parent.join(format!("{REPLACE_PUBLISHED_PREFIX}{suffix}"));
         let staging = StagingPath::for_destination_with_nonce(
             request.destination(),
             request.job_id(),
@@ -779,10 +783,35 @@ impl ReplacementTransaction {
                 .into(),
             )
         })?;
-        Ok(Self { backup, journal })
+        Ok(Self {
+            backup,
+            journal,
+            published,
+        })
+    }
+
+    fn mark_published(&self) -> Result<(), MutationError> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&self.published)
+            .map_err(map_io_error)?;
+        file.write_all(REPLACE_PUBLISHED_MARKER)
+            .map_err(map_io_error)?;
+        file.sync_all().map_err(map_io_error)?;
+        sync_parent(&self.published).map_err(map_io_error)
     }
 
     fn remove_journal(&self) -> Result<(), MutationError> {
+        match fs::remove_file(&self.published) {
+            Ok(()) => sync_parent(&self.published).map_err(map_io_error)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(map_io_error(error)),
+        }
         match fs::remove_file(&self.journal) {
             Ok(()) => sync_parent(&self.journal).map_err(map_io_error),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -802,6 +831,7 @@ fn recover_replacement_journal(journal_path: &Path) -> Result<(), MutationError>
     let suffix = format!("{}-{}-{nonce_hex}", journal.job_id, journal.generation);
     let expected_backup = parent.join(format!("{REPLACE_BACKUP_PREFIX}{suffix}"));
     let expected_journal = parent.join(format!("{REPLACE_JOURNAL_PREFIX}{suffix}"));
+    let published = parent.join(format!("{REPLACE_PUBLISHED_PREFIX}{suffix}"));
     let staging_owned = StagingPath::is_for_destination(
         &StorePath::from_unix_path(staging.as_os_str()),
         &StorePath::from_unix_path(destination.as_os_str()),
@@ -818,6 +848,30 @@ fn recover_replacement_journal(journal_path: &Path) -> Result<(), MutationError>
         return Err(MutationError::RecoveryRequired(
             "replacement journal paths failed ownership validation".into(),
         ));
+    }
+    if published_marker_exists(&published)? {
+        if !destination.exists() {
+            return Err(MutationError::RecoveryRequired(
+                format!(
+                    "replacement recovery preserved {} because the published destination is missing",
+                    backup.display()
+                )
+                .into(),
+            ));
+        }
+        if backup.exists() {
+            remove_path(&backup)
+                .map_err(|error| MutationError::Provider(error.to_string().into()))?;
+            sync_parent(&backup).map_err(map_io_error)?;
+        }
+        if staging.exists() {
+            remove_path(&staging)
+                .map_err(|error| MutationError::Provider(error.to_string().into()))?;
+            sync_parent(&staging).map_err(map_io_error)?;
+        }
+        fs::remove_file(&published).map_err(map_io_error)?;
+        fs::remove_file(journal_path).map_err(map_io_error)?;
+        return sync_parent(journal_path).map_err(map_io_error);
     }
     if backup.exists() {
         if destination.exists() {
@@ -845,6 +899,26 @@ fn recover_replacement_journal(journal_path: &Path) -> Result<(), MutationError>
     }
     fs::remove_file(journal_path).map_err(map_io_error)?;
     sync_parent(journal_path).map_err(map_io_error)
+}
+
+fn published_marker_exists(path: &Path) -> Result<bool, MutationError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(map_io_error(error)),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(MutationError::RecoveryRequired(
+            "replacement published marker is not a regular file".into(),
+        ));
+    }
+    if fs::read(path).map_err(map_io_error)? == REPLACE_PUBLISHED_MARKER {
+        Ok(true)
+    } else {
+        Err(MutationError::RecoveryRequired(
+            "replacement published marker is invalid".into(),
+        ))
+    }
 }
 
 fn encode_replacement_journal(journal: &ReplacementJournal) -> Vec<u8> {
@@ -1007,6 +1081,15 @@ fn execute_replacing_transfer(
             .map_err(resolved_move_aside_failure)?;
         return Err(error);
     }
+    transaction.mark_published().map_err(|error| {
+        ResolvedTransferFailure::NeedsAttention(
+            format!(
+                "the destination was published, but cleanup cannot start safely because its durable marker failed: {error}; the previous destination remains at {}",
+                backup.display()
+            )
+            .into(),
+        )
+    })?;
     remove_path(&backup).map_err(|error| {
         ResolvedTransferFailure::NeedsAttention(
             format!(
@@ -1882,6 +1965,38 @@ mod tests {
             fs::read(temporary.path().join("destination (recovered original 1)")).unwrap(),
             b"original"
         );
+    }
+
+    #[test]
+    fn restart_never_exposes_a_partially_deleted_backup_as_an_original() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("preserved"), b"original").unwrap();
+        fs::write(destination.join("deleted-before-crash"), b"original").unwrap();
+        let request = request(&source, &destination);
+        let crashed = ReplacementTransaction::begin(&request, &destination).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("published"), b"new").unwrap();
+        crashed.mark_published().unwrap();
+        fs::remove_file(crashed.backup.join("deleted-before-crash")).unwrap();
+
+        LocalStore::new()
+            .recover_replacements_at(request.destination())
+            .unwrap();
+
+        assert_eq!(fs::read(destination.join("published")).unwrap(), b"new");
+        assert!(
+            !temporary
+                .path()
+                .join("destination (recovered original 1)")
+                .exists()
+        );
+        assert!(!crashed.backup.exists());
+        assert!(!crashed.journal.exists());
+        assert!(!crashed.published.exists());
     }
 
     #[test]
