@@ -163,6 +163,7 @@ volume-error-in-use = The volume is being used by an active file operation
 volume-error-cancellation = Could not cancel the active file operations
 volume-error-protocol = The storage service returned an invalid response
 volume-error-deadline = The storage operation exceeded its deadline
+volume-error-cancelled = The storage operation was canceled
 volume-error-worker-stopped = The storage worker stopped
 volume-error-unlock-secret = Enter the volume unlock secret
 volume-error-action-unavailable = The storage service does not offer this action

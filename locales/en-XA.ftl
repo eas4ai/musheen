@@ -163,6 +163,7 @@ volume-error-in-use = ⟦Ŧħḗ ṽǿŀŭḿḗ īş ƀḗīƞɠ ŭşḗḓ ƀ�
 volume-error-cancellation = ⟦Ƈǿŭŀḓ ƞǿŧ ƈȧƞƈḗŀ ŧħḗ ȧƈŧīṽḗ ƒīŀḗ ǿƥḗřȧŧīǿƞş··⟧
 volume-error-protocol = ⟦Ŧħḗ şŧǿřȧɠḗ şḗřṽīƈḗ řḗŧŭřƞḗḓ ȧƞ īƞṽȧŀīḓ řḗşƥǿƞşḗ··⟧
 volume-error-deadline = ⟦Ŧħḗ şŧǿřȧɠḗ ǿƥḗřȧŧīǿƞ ḗẋƈḗḗḓḗḓ īŧş ḓḗȧḓŀīƞḗ··⟧
+volume-error-cancelled = ⟦Ŧħḗ şŧǿřȧɠḗ ǿƥḗřȧŧīǿƞ ẇȧş ƈȧƞƈḗŀḗḓ··⟧
 volume-error-worker-stopped = ⟦Ŧħḗ şŧǿřȧɠḗ ẇǿřķḗř şŧǿƥƥḗḓ··⟧
 volume-error-unlock-secret = ⟦Ḗƞŧḗř ŧħḗ ṽǿŀŭḿḗ ŭƞŀǿƈķ şḗƈřḗŧ··⟧
 volume-error-action-unavailable = ⟦Ŧħḗ şŧǿřȧɠḗ şḗřṽīƈḗ ḓǿḗş ƞǿŧ ǿƒƒḗř ŧħīş ȧƈŧīǿƞ··⟧

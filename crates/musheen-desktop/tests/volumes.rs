@@ -1,11 +1,12 @@
 #![cfg(unix)]
 
+use musheen_core::CancellationToken;
 use musheen_desktop::{
     BackendSnapshot, Capacity, DeviceDescriptor, MountOperation, MountProvider, MountRecord,
-    OperationReservation, OperationUsage, OperationUse, ServiceState, UDisksBackend, UDisksError,
-    UDisksRequest, UsageResolution, ValidatedActionScope, VolumeAction, VolumeChange, VolumeError,
-    VolumeEvent, VolumeId, VolumeRuntime, VolumeService, VolumeSubscription, VolumeTrigger,
-    ZbusUDisksBackend,
+    OperationReservation, OperationUsage, OperationUse, SecretBuffer, ServiceState, UDisksBackend,
+    UDisksError, UDisksRequest, UsageResolution, ValidatedActionScope, VolumeAction, VolumeChange,
+    VolumeError, VolumeEvent, VolumeId, VolumeRuntime, VolumeService, VolumeSubscription,
+    VolumeTrigger, ZbusUDisksBackend,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1082,6 +1083,285 @@ fn runtime_snapshots_never_wait_for_a_slow_service_call() {
     assert_eq!(
         update.warning(),
         Some(&VolumeError::Timeout("fixture deadline".into()))
+    );
+}
+
+struct ActionBudgetBackend {
+    observed: Mutex<Option<Duration>>,
+}
+
+impl UDisksBackend for ActionBudgetBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        Ok(snapshot("owner", [device("sdb1", None)]))
+    }
+
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        unreachable!("runtime must use the request-bounded entry point")
+    }
+
+    fn perform_with_request(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        *self.observed.lock().unwrap() = Some(request.remaining());
+        Ok(())
+    }
+}
+
+#[test]
+fn runtime_mount_uses_an_operation_budget_instead_of_the_refresh_deadline() {
+    let backend = Arc::new(ActionBudgetBackend {
+        observed: Mutex::new(None),
+    });
+    let mut service = VolumeService::new(
+        backend.clone(),
+        Arc::new(FakeMounts::default()),
+        Arc::new(FakeUsage::default()),
+    );
+    service.refresh().unwrap();
+    let runtime = VolumeRuntime::from_service(service);
+
+    runtime
+        .perform(
+            id("sdb1"),
+            VolumeAction::Mount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap();
+
+    assert!(
+        backend.observed.lock().unwrap().unwrap() >= Duration::from_secs(119),
+        "mount must not inherit the two-second discovery deadline"
+    );
+}
+
+struct ReconciliationBudgetBackend {
+    snapshots: std::sync::atomic::AtomicUsize,
+    reconciliation_budget: Mutex<Option<Duration>>,
+}
+
+impl UDisksBackend for ReconciliationBudgetBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        Ok(snapshot("owner", [device("sdb1", None)]))
+    }
+
+    fn snapshot_with_request(
+        &self,
+        request: &UDisksRequest,
+    ) -> Result<BackendSnapshot, UDisksError> {
+        if self
+            .snapshots
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            > 0
+        {
+            *self.reconciliation_budget.lock().unwrap() = Some(request.remaining());
+            return Err(UDisksError::Timeout("reconciliation fixture".into()));
+        }
+        self.snapshot()
+    }
+
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn successful_action_reconciles_with_a_separate_discovery_budget() {
+    let backend = Arc::new(ReconciliationBudgetBackend {
+        snapshots: std::sync::atomic::AtomicUsize::new(0),
+        reconciliation_budget: Mutex::new(None),
+    });
+    let mut service = VolumeService::new(
+        backend.clone(),
+        Arc::new(FakeMounts::default()),
+        Arc::new(FakeUsage::default()),
+    );
+    service.refresh().unwrap();
+
+    let outcome = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Mount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        outcome.refresh().warning(),
+        Some(VolumeError::Timeout(_))
+    ));
+    assert!(
+        backend.reconciliation_budget.lock().unwrap().unwrap() <= Duration::from_millis(2_100),
+        "post-action reconciliation must not consume the action deadline"
+    );
+}
+
+#[test]
+fn successful_action_is_not_reported_failed_when_reconciliation_fails() {
+    let backend = Arc::new(FakeBackend::default());
+    let mounts = Arc::new(FakeMounts::default());
+    backend.queue_snapshot(Ok(snapshot("owner", [device("sdb1", None)])));
+    mounts.queue(Vec::new());
+    let mut service = service(
+        backend.clone(),
+        mounts.clone(),
+        Arc::new(FakeUsage::default()),
+    );
+    service.refresh().unwrap();
+    backend.queue_action(Ok(()));
+    mounts
+        .snapshots
+        .lock()
+        .unwrap()
+        .push_back(Err(VolumeError::MountTable("post-action fixture".into())));
+
+    let outcome = service
+        .perform(
+            &id("sdb1"),
+            VolumeAction::Mount,
+            UsageResolution::Refuse,
+            None,
+        )
+        .expect("completed UDisks action must remain successful");
+
+    assert_eq!(
+        outcome.refresh().warning(),
+        Some(&VolumeError::MountTable("post-action fixture".into()))
+    );
+}
+
+struct SecretCaptureBackend {
+    observed: Mutex<Option<Vec<u8>>>,
+}
+
+impl UDisksBackend for SecretCaptureBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        Ok(snapshot("owner", [device("sdb1", None)]))
+    }
+
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        action: VolumeAction,
+        unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        assert_eq!(action, VolumeAction::Unlock);
+        *self.observed.lock().unwrap() = unlock_secret.map(|secret| secret.as_bytes().to_vec());
+        Ok(())
+    }
+}
+
+#[test]
+fn runtime_carries_unlock_input_in_a_zeroizing_secret_buffer() {
+    let backend = Arc::new(SecretCaptureBackend {
+        observed: Mutex::new(None),
+    });
+    let mut service = VolumeService::new(
+        backend.clone(),
+        Arc::new(FakeMounts::default()),
+        Arc::new(FakeUsage::default()),
+    );
+    service.refresh().unwrap();
+    let runtime = VolumeRuntime::from_service(service);
+
+    runtime
+        .perform(
+            id("sdb1"),
+            VolumeAction::Unlock,
+            UsageResolution::Refuse,
+            Some(SecretBuffer::new(b"unlock fixture".to_vec())),
+        )
+        .unwrap();
+
+    assert_eq!(
+        backend.observed.lock().unwrap().as_deref(),
+        Some(&b"unlock fixture"[..])
+    );
+}
+
+struct CancellableActionBackend {
+    entered: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+}
+
+impl UDisksBackend for CancellableActionBackend {
+    fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
+        Ok(snapshot("owner", [device("sdb1", None)]))
+    }
+
+    fn perform(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+    ) -> Result<(), UDisksError> {
+        unreachable!("runtime must use the request-bounded entry point")
+    }
+
+    fn perform_with_request(
+        &self,
+        _volume: &DeviceDescriptor,
+        _action: VolumeAction,
+        _unlock_secret: Option<&str>,
+        request: &UDisksRequest,
+    ) -> Result<(), UDisksError> {
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            entered.send(()).unwrap();
+        }
+        loop {
+            request.check()?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+#[test]
+fn caller_cancellation_preempts_a_running_volume_action() {
+    let (entered, action_entered) = std::sync::mpsc::sync_channel(1);
+    let backend = Arc::new(CancellableActionBackend {
+        entered: Mutex::new(Some(entered)),
+    });
+    let mut service = VolumeService::new(
+        backend,
+        Arc::new(FakeMounts::default()),
+        Arc::new(FakeUsage::default()),
+    );
+    service.refresh().unwrap();
+    let runtime = VolumeRuntime::from_service(service);
+    let cancellation = CancellationToken::new();
+    let action_cancellation = cancellation.clone();
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = runtime.perform_cancellable(
+            id("sdb1"),
+            VolumeAction::Mount,
+            UsageResolution::Refuse,
+            None,
+            action_cancellation,
+        );
+        done.send(result).unwrap();
+    });
+    action_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    cancellation.cancel();
+
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(1)).unwrap(),
+        Err(VolumeError::Cancelled)
     );
 }
 

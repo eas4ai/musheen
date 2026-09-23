@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-const VOLUME_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const VOLUME_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 static SYSTEM_CAPACITY_PROBE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 pub struct VolumeSubscription {
@@ -150,6 +150,16 @@ pub enum VolumeAction {
     PowerOff,
 }
 
+impl VolumeAction {
+    pub(crate) const fn request_timeout(self) -> Duration {
+        match self {
+            Self::Mount | Self::Unmount => Duration::from_secs(120),
+            Self::Eject | Self::PowerOff => Duration::from_secs(60),
+            Self::Unlock => Duration::from_secs(300),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MountOperation(u64);
 
@@ -252,6 +262,7 @@ pub enum VolumeError {
     AuthorizationRequired(Box<str>),
     Busy(Box<str>),
     Unsupported(Box<str>),
+    Cancelled,
     DeadlineExceeded,
     WorkerStopped,
     UnlockSecretRequired,
@@ -291,6 +302,7 @@ impl fmt::Display for VolumeError {
             Self::Unsupported(reason) => {
                 write!(formatter, "the volume action is unsupported: {reason}")
             }
+            Self::Cancelled => formatter.write_str("the volume operation was cancelled"),
             Self::DeadlineExceeded => formatter.write_str("operation deadline exceeded"),
             Self::WorkerStopped => formatter.write_str("the volume worker stopped"),
             Self::UnlockSecretRequired => formatter.write_str("an unlock secret is required"),
@@ -324,6 +336,7 @@ impl From<UDisksError> for VolumeError {
             UDisksError::AuthorizationRequired(reason) => Self::AuthorizationRequired(reason),
             UDisksError::Busy(reason) => Self::Busy(reason),
             UDisksError::Unsupported(reason) => Self::Unsupported(reason),
+            UDisksError::Cancelled => Self::Cancelled,
             UDisksError::DeadlineExceeded => Self::DeadlineExceeded,
             UDisksError::WorkerStopped => Self::WorkerStopped,
             UDisksError::UnlockSecretRequired => Self::UnlockSecretRequired,
@@ -434,7 +447,7 @@ impl VolumeService {
     }
 
     pub fn refresh(&mut self) -> Result<RefreshReport, VolumeError> {
-        self.refresh_with_request(&UDisksRequest::with_timeout(VOLUME_REQUEST_TIMEOUT))
+        self.refresh_with_request(&UDisksRequest::with_timeout(VOLUME_DISCOVERY_TIMEOUT))
     }
 
     pub(crate) fn handle_with_request(
@@ -572,7 +585,7 @@ impl VolumeService {
             action,
             usage_resolution,
             unlock_secret,
-            &UDisksRequest::with_timeout(VOLUME_REQUEST_TIMEOUT),
+            &UDisksRequest::with_timeout(action.request_timeout()),
         )
     }
 
@@ -638,11 +651,27 @@ impl VolumeService {
         ) {
             return self.handle_action_error(id, error, request);
         }
-        let refresh = self.refresh_with_request(request)?;
+        let refresh = self.reconcile_after_action();
         Ok(OperationOutcome {
             volume_present: self.model.get(id).is_some(),
             refresh,
         })
+    }
+
+    fn reconcile_after_action(&mut self) -> RefreshReport {
+        let request = UDisksRequest::with_timeout(VOLUME_DISCOVERY_TIMEOUT);
+        self.refresh_with_request(&request)
+            .unwrap_or_else(|error| RefreshReport {
+                events: Vec::new(),
+                service_state: match error {
+                    VolumeError::Timeout(_) | VolumeError::DeadlineExceeded => ServiceState::Slow,
+                    VolumeError::Disconnected(_) | VolumeError::WorkerStopped => {
+                        ServiceState::Disconnected
+                    }
+                    _ => ServiceState::Unavailable,
+                },
+                warning: Some(error),
+            })
     }
 
     fn validate_action_scope(
@@ -792,7 +821,7 @@ impl ReconnectingUDisksBackend {
 
 impl UDisksBackend for ReconnectingUDisksBackend {
     fn snapshot(&self) -> Result<BackendSnapshot, UDisksError> {
-        ZbusUDisksBackend::connect(self.config.clone(), VOLUME_REQUEST_TIMEOUT)?.snapshot()
+        ZbusUDisksBackend::connect(self.config.clone(), VOLUME_DISCOVERY_TIMEOUT)?.snapshot()
     }
 
     fn perform(
@@ -801,11 +830,9 @@ impl UDisksBackend for ReconnectingUDisksBackend {
         action: VolumeAction,
         unlock_secret: Option<&str>,
     ) -> Result<(), UDisksError> {
-        ZbusUDisksBackend::connect(self.config.clone(), VOLUME_REQUEST_TIMEOUT)?.perform(
-            volume,
-            action,
-            unlock_secret,
-        )
+        let request = UDisksRequest::with_timeout(action.request_timeout());
+        let backend = self.connect(&request)?;
+        backend.perform_with_request(volume, action, unlock_secret, &request)
     }
 
     fn snapshot_with_request(

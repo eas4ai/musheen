@@ -1431,8 +1431,16 @@ impl Render for ContextReviewDialog {
 
 #[derive(Clone)]
 enum VolumeUnlockEvent {
-    Submitted(Box<str>),
+    Submitted,
     Cancelled,
+}
+
+struct VolumeCancellationGuard(CancellationToken);
+
+impl Drop for VolumeCancellationGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1540,10 +1548,14 @@ impl Render for NameOperationDialog {
 
 struct VolumeUnlockDialog {
     volume_label: Box<str>,
+    /// The third-party input owns the sole plaintext copy while editing. A
+    /// native window close drops this entity; submit moves a temporary copy
+    /// into `SecretBuffer` and immediately clears the input.
     secret: Entity<InputState>,
     focus: FocusHandle,
     pending_focus: bool,
     empty: bool,
+    submitted_secret: Option<SecretBuffer>,
     catalog: Catalog,
 }
 
@@ -1570,6 +1582,7 @@ impl VolumeUnlockDialog {
             focus: cx.focus_handle(),
             pending_focus: true,
             empty: false,
+            submitted_secret: None,
             catalog,
         }
     }
@@ -1581,7 +1594,10 @@ impl VolumeUnlockDialog {
             cx.notify();
             return;
         }
-        cx.emit(VolumeUnlockEvent::Submitted(secret.into()));
+        self.submitted_secret = Some(SecretBuffer::new(secret.into_bytes()));
+        self.secret
+            .update(cx, |secret, cx| secret.set_value("", window, cx));
+        cx.emit(VolumeUnlockEvent::Submitted);
         window.defer(cx, |window, _| window.remove_window());
     }
 }
@@ -1609,7 +1625,9 @@ impl Render for VolumeUnlockDialog {
             .flex_col()
             .gap_3()
             .p_4()
-            .on_action(cx.listener(|_, _: &Escape, window, cx| {
+            .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                this.secret
+                    .update(cx, |secret, cx| secret.set_value("", window, cx));
                 cx.emit(VolumeUnlockEvent::Cancelled);
                 window.defer(cx, |window, _| window.remove_window());
             }))
@@ -1657,7 +1675,9 @@ impl Render for VolumeUnlockDialog {
                             .message("dialog.cancel")
                             .expect("the cancel action is localized"),
                     )
-                    .on_click(cx.listener(|_, _, window, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.secret
+                            .update(cx, |secret, cx| secret.set_value("", window, cx));
                         cx.emit(VolumeUnlockEvent::Cancelled);
                         window.defer(cx, |window, _| window.remove_window());
                     })),
@@ -7391,14 +7411,22 @@ impl MusheenApp {
             .expect("Musheen could not open a volume unlock dialog");
         self.track_context_dialog_window(handle.window_id(), None, cx);
         let dialog = dialog.expect("the unlock dialog constructs its view");
+        let secret_dialog = dialog.downgrade();
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
-            VolumeUnlockEvent::Submitted(secret) => this.perform_volume_action(
-                id.clone(),
-                VolumeAction::Unlock,
-                UsageResolution::Refuse,
-                Some(secret.clone()),
-                cx,
-            ),
+            VolumeUnlockEvent::Submitted => {
+                let secret = secret_dialog.upgrade().and_then(|dialog| {
+                    dialog.update(cx, |dialog, _| dialog.submitted_secret.take())
+                });
+                if let Some(secret) = secret {
+                    this.perform_volume_action(
+                        id.clone(),
+                        VolumeAction::Unlock,
+                        UsageResolution::Refuse,
+                        Some(secret),
+                        cx,
+                    );
+                }
+            }
             VolumeUnlockEvent::Cancelled => cx.notify(),
         });
         self.conflict_subscriptions.push(subscription);
@@ -7409,13 +7437,17 @@ impl MusheenApp {
         id: VolumeId,
         volume_action: VolumeAction,
         usage: UsageResolution,
-        secret: Option<Box<str>>,
+        secret: Option<SecretBuffer>,
         cx: &mut Context<Self>,
     ) {
         let volumes = self.volumes.clone();
-        let work =
-            cx.background_spawn(async move { volumes.perform(id, volume_action, usage, secret) });
+        let cancellation = CancellationToken::new();
+        let cancellation_guard = VolumeCancellationGuard(cancellation.clone());
+        let work = cx.background_spawn(async move {
+            volumes.perform_cancellable(id, volume_action, usage, secret, cancellation)
+        });
         cx.spawn(async move |this, cx| {
+            let _cancellation_guard = cancellation_guard;
             let result = work.await;
             let Some(this) = this.upgrade() else {
                 return;
@@ -12460,7 +12492,8 @@ fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
         }
         VolumeError::Busy(reason) => with_detail("volume-error-busy", reason),
         VolumeError::Unsupported(reason) => with_detail("volume-error-unsupported", reason),
-        VolumeError::DeadlineExceeded
+        VolumeError::Cancelled
+        | VolumeError::DeadlineExceeded
         | VolumeError::WorkerStopped
         | VolumeError::UnlockSecretRequired
         | VolumeError::ActionUnavailable
@@ -12524,6 +12557,7 @@ fn localized_terminal_error(catalog: &Catalog, error: &TerminalError) -> Box<str
 
 const fn local_volume_error_key(error: &VolumeError) -> Option<&'static str> {
     match error {
+        VolumeError::Cancelled => Some("volume-error-cancelled"),
         VolumeError::DeadlineExceeded => Some("volume-error-deadline"),
         VolumeError::WorkerStopped => Some("volume-error-worker-stopped"),
         VolumeError::UnlockSecretRequired => Some("volume-error-unlock-secret"),
@@ -12872,6 +12906,43 @@ mod tests {
     };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[gpui_kit::test]
+    async fn volume_unlock_submission_clears_plaintext_and_hands_off_a_secret_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let mut dialog = None;
+        let handle = cx.open_window(size(px(520.), px(300.)), |window, cx| {
+            let view = cx.new(|cx| {
+                VolumeUnlockDialog::new(
+                    "Encrypted disk",
+                    Catalog::load(Locale::EnUs).unwrap(),
+                    window,
+                    cx,
+                )
+            });
+            dialog = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let dialog = dialog.unwrap();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let input = dialog.read(cx).secret.clone();
+            input.update(cx, |input, cx| {
+                input.set_value("unlock fixture", window, cx)
+            });
+            dialog.update(cx, |dialog, cx| dialog.submit(window, cx));
+
+            assert!(input.read(cx).value().is_empty());
+            let secret = dialog
+                .update(cx, |dialog, _| dialog.submitted_secret.take())
+                .unwrap();
+            assert_eq!(format!("{secret:?}"), "SecretBuffer([REDACTED])");
+            secret.expose_secret(|bytes| assert_eq!(bytes, b"unlock fixture"));
+        })
+        .unwrap();
+    }
 
     #[test]
     fn modified_dates_are_human_readable_and_locale_specific() {

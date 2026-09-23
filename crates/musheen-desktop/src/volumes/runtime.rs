@@ -2,6 +2,8 @@ use super::{
     OperationOutcome, OperationUsage, UDisksRequest, UsageResolution, VolumeAction, VolumeError,
     VolumeId, VolumeModel, VolumeService, VolumeSubscription, VolumeTrigger,
 };
+use crate::SecretBuffer;
+use musheen_core::CancellationToken;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak, mpsc};
 use std::thread;
@@ -31,7 +33,7 @@ enum RuntimeCommand {
         id: VolumeId,
         action: VolumeAction,
         usage: UsageResolution,
-        secret: Option<Box<str>>,
+        secret: Option<SecretBuffer>,
         request: UDisksRequest,
         reply: mpsc::SyncSender<Result<OperationOutcome, VolumeError>>,
     },
@@ -196,14 +198,18 @@ impl VolumeRuntime {
                             request,
                             reply,
                         } => {
-                            let result = service.perform_with_request(
+                            let result = perform_volume_request(
+                                &mut service,
                                 &id,
                                 action,
                                 usage,
-                                secret.as_deref(),
+                                secret.as_ref(),
                                 &request,
                             );
-                            let warning = result.as_ref().err().cloned();
+                            let warning = match &result {
+                                Ok(outcome) => outcome.refresh().warning().cloned(),
+                                Err(error) => Some(error.clone()),
+                            };
                             let _ = reply.send(result.clone());
                             warning
                         }
@@ -321,21 +327,36 @@ impl VolumeRuntime {
         id: VolumeId,
         action: VolumeAction,
         usage: UsageResolution,
-        secret: Option<Box<str>>,
+        secret: Option<SecretBuffer>,
+    ) -> Result<OperationOutcome, VolumeError> {
+        self.perform_cancellable(id, action, usage, secret, CancellationToken::new())
+    }
+
+    pub fn perform_cancellable(
+        &self,
+        id: VolumeId,
+        action: VolumeAction,
+        usage: UsageResolution,
+        secret: Option<SecretBuffer>,
+        cancellation: CancellationToken,
     ) -> Result<OperationOutcome, VolumeError> {
         let (reply, result) = mpsc::sync_channel(1);
-        let request =
-            UDisksRequest::with_cancel(Duration::from_secs(2), Arc::clone(&self.0.stopped));
+        let request = UDisksRequest::with_cancellation(
+            action.request_timeout(),
+            Arc::clone(&self.0.stopped),
+            cancellation,
+        );
         let deadline = std::time::Instant::now() + request.remaining();
         let mut command = RuntimeCommand::Perform {
             id,
             action,
             usage,
             secret,
-            request,
+            request: request.clone(),
             reply,
         };
         loop {
+            request.check()?;
             match self.0.commands.try_send(command) {
                 Ok(()) => break,
                 Err(mpsc::TrySendError::Full(returned)) => {
@@ -357,6 +378,24 @@ impl VolumeRuntime {
                 mpsc::RecvTimeoutError::Disconnected => VolumeError::WorkerStopped,
             })?
     }
+}
+
+fn perform_volume_request(
+    service: &mut VolumeService,
+    id: &VolumeId,
+    action: VolumeAction,
+    usage: UsageResolution,
+    secret: Option<&SecretBuffer>,
+    request: &UDisksRequest,
+) -> Result<OperationOutcome, VolumeError> {
+    let Some(secret) = secret else {
+        return service.perform_with_request(id, action, usage, None, request);
+    };
+    secret.expose_secret(|bytes| {
+        let secret = std::str::from_utf8(bytes)
+            .map_err(|_| VolumeError::Protocol("unlock secret is not valid UTF-8".into()))?;
+        service.perform_with_request(id, action, usage, Some(secret), request)
+    })
 }
 
 fn next_command(

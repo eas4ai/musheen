@@ -320,6 +320,7 @@ volume-error-in-use = تستخدم عملية ملفات نشطة وحدة ال�
 volume-error-cancellation = تعذر إلغاء عمليات الملفات النشطة
 volume-error-protocol = أعادت خدمة التخزين استجابة غير صالحة
 volume-error-deadline = تجاوزت عملية التخزين المهلة المحددة
+volume-error-cancelled = أُلغيت عملية التخزين
 volume-error-worker-stopped = توقف عامل التخزين
 volume-error-unlock-secret = أدخل سر فتح وحدة التخزين
 volume-error-action-unavailable = لا توفر خدمة التخزين هذا الإجراء

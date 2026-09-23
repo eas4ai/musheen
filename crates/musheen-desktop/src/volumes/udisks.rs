@@ -1,4 +1,5 @@
 use super::{DeviceDescriptor, VolumeAction, VolumeId};
+use musheen_core::CancellationToken;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt;
@@ -19,7 +20,7 @@ const FILESYSTEM: &str = "org.freedesktop.UDisks2.Filesystem";
 const DRIVE: &str = "org.freedesktop.UDisks2.Drive";
 const ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
 const PARTITION: &str = "org.freedesktop.UDisks2.Partition";
-const DEFAULT_METHOD_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UDisksBusConfig {
@@ -58,7 +59,8 @@ impl UDisksBusConfig {
 #[derive(Clone, Debug)]
 pub struct UDisksRequest {
     deadline: Instant,
-    cancelled: Arc<AtomicBool>,
+    worker_stopped: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 }
 
 impl UDisksRequest {
@@ -69,9 +71,19 @@ impl UDisksRequest {
 
     #[must_use]
     pub(crate) fn with_cancel(timeout: Duration, cancelled: Arc<AtomicBool>) -> Self {
+        Self::with_cancellation(timeout, cancelled, CancellationToken::new())
+    }
+
+    #[must_use]
+    pub(crate) fn with_cancellation(
+        timeout: Duration,
+        worker_stopped: Arc<AtomicBool>,
+        cancellation: CancellationToken,
+    ) -> Self {
         Self {
             deadline: Instant::now() + timeout,
-            cancelled,
+            worker_stopped,
+            cancellation,
         }
     }
 
@@ -81,7 +93,10 @@ impl UDisksRequest {
     }
 
     pub fn check(&self) -> Result<(), UDisksError> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancellation.is_cancelled() {
+            return Err(UDisksError::Cancelled);
+        }
+        if self.worker_stopped.load(Ordering::Acquire) {
             return Err(UDisksError::WorkerStopped);
         }
         if Instant::now() >= self.deadline {
@@ -92,7 +107,10 @@ impl UDisksRequest {
 
     async fn expiry(&self) -> UDisksError {
         loop {
-            if self.cancelled.load(Ordering::Acquire) {
+            if self.cancellation.is_cancelled() {
+                return UDisksError::Cancelled;
+            }
+            if self.worker_stopped.load(Ordering::Acquire) {
                 return UDisksError::WorkerStopped;
             }
             let remaining = self.remaining();
@@ -208,6 +226,7 @@ pub enum UDisksError {
     AuthorizationRequired(Box<str>),
     Busy(Box<str>),
     Unsupported(Box<str>),
+    Cancelled,
     DeadlineExceeded,
     WorkerStopped,
     UnlockSecretRequired,
@@ -231,6 +250,7 @@ impl fmt::Display for UDisksError {
             Self::Unsupported(reason) => {
                 write!(formatter, "the volume action is unsupported: {reason}")
             }
+            Self::Cancelled => formatter.write_str("the volume operation was cancelled"),
             Self::DeadlineExceeded => formatter.write_str("operation deadline exceeded"),
             Self::WorkerStopped => formatter.write_str("the volume worker stopped"),
             Self::UnlockSecretRequired => formatter.write_str("an unlock secret is required"),
@@ -320,7 +340,7 @@ impl fmt::Debug for ZbusUDisksBackend {
 
 impl ZbusUDisksBackend {
     pub fn connect_system() -> Result<Self, UDisksError> {
-        Self::connect_system_with_timeout(DEFAULT_METHOD_TIMEOUT)
+        Self::connect_system_with_timeout(DEFAULT_DISCOVERY_TIMEOUT)
     }
 
     pub fn connect_system_with_timeout(timeout: Duration) -> Result<Self, UDisksError> {
@@ -607,7 +627,7 @@ impl UDisksBackend for ZbusUDisksBackend {
             volume,
             action,
             unlock_secret,
-            &UDisksRequest::with_timeout(self.default_timeout),
+            &UDisksRequest::with_timeout(action.request_timeout()),
         )
     }
 
