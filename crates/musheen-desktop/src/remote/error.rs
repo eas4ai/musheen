@@ -14,6 +14,12 @@ pub enum RemoteErrorCategory {
     Cancelled,
     Saturated,
     Unavailable,
+    Retryable,
+    Conflict,
+    Quota,
+    Permission,
+    Unsupported,
+    Permanent,
 }
 
 /// A credential-safe provider error. Transport text is deliberately not kept

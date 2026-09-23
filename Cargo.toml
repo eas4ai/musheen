@@ -58,13 +58,18 @@ nix = { version = "0.31", features = ["fs", "poll"] }
 notify = "8"
 notify-rust = "4"
 open = "5"
+opendal = { version = "0.59.3", default-features = false, features = ["executors-tokio", "http-transport-reqwest", "layers-concurrent-limit", "layers-timeout", "services-ftp", "services-http", "services-memory", "services-sftp", "services-webdav"] }
+opendal-http-transport-reqwest = { version = "0.59.3", default-features = false, features = ["rustls"] }
 portable-pty = "0.9"
 proc-mounts = "0.3"
 posix-acl = "1.2"
 png = "0.18"
 reflink-copy = "0.1"
 ring = "0.17"
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+russh-sftp = "3.0.0"
 rcgen = "0.14"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
@@ -75,6 +80,7 @@ sha2 = "0.11"
 trybuild = "1"
 tempfile = "3"
 tar = "0.4"
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 tree_magic_mini = { version = "3.2", default-features = false }
 ureq = { version = "3.1.4", default-features = false, features = ["rustls"] }
 trash = "5"
