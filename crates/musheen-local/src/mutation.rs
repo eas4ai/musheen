@@ -28,6 +28,8 @@ static TRASH_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_RESTORE_NAME: AtomicU64 = AtomicU64::new(1);
 const REPLACE_BACKUP_PREFIX: &str = ".musheen-replace-backup-v1-";
 const REPLACE_JOURNAL_PREFIX: &str = ".musheen-replace-journal-v1-";
+const REPLACE_MERGING_PREFIX: &str = ".musheen-replace-merging-v1-";
+const REPLACE_MERGING_MARKER: &[u8] = b"musheen-replacement-merging-v1\n";
 const REPLACE_PUBLISHED_PREFIX: &str = ".musheen-replace-published-v1-";
 const REPLACE_PUBLISHED_MARKER: &[u8] = b"musheen-replacement-published-v1\n";
 
@@ -45,6 +47,7 @@ struct ReplacementJournal {
 struct ReplacementTransaction {
     backup: PathBuf,
     journal: PathBuf,
+    merging: PathBuf,
     published: PathBuf,
 }
 
@@ -580,6 +583,9 @@ fn merge_directory_entries(
                 )
                 .map_err(map_errno)?;
                 moved.push((source_child, destination_child));
+                let (source, destination) = moved.last().expect("the moved entry was recorded");
+                sync_parent(source).map_err(map_io_error)?;
+                sync_parent(destination).map_err(map_io_error)?;
             }
             Err(error) => return Err(map_io_error(error)),
         }
@@ -739,6 +745,7 @@ impl ReplacementTransaction {
         );
         let backup = parent.join(format!("{REPLACE_BACKUP_PREFIX}{suffix}"));
         let journal = parent.join(format!("{REPLACE_JOURNAL_PREFIX}{suffix}"));
+        let merging = parent.join(format!("{REPLACE_MERGING_PREFIX}{suffix}"));
         let published = parent.join(format!("{REPLACE_PUBLISHED_PREFIX}{suffix}"));
         let staging = StagingPath::for_destination_with_nonce(
             request.destination(),
@@ -786,37 +793,50 @@ impl ReplacementTransaction {
         Ok(Self {
             backup,
             journal,
+            merging,
             published,
         })
     }
 
-    fn mark_published(&self) -> Result<(), MutationError> {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
+    fn mark_merging(&self) -> Result<(), MutationError> {
+        write_replacement_marker(&self.merging, REPLACE_MERGING_MARKER)
+    }
 
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&self.published)
-            .map_err(map_io_error)?;
-        file.write_all(REPLACE_PUBLISHED_MARKER)
-            .map_err(map_io_error)?;
-        file.sync_all().map_err(map_io_error)?;
-        sync_parent(&self.published).map_err(map_io_error)
+    fn mark_published(&self) -> Result<(), MutationError> {
+        write_replacement_marker(&self.published, REPLACE_PUBLISHED_MARKER)
     }
 
     fn remove_journal(&self) -> Result<(), MutationError> {
-        match fs::remove_file(&self.published) {
-            Ok(()) => sync_parent(&self.published).map_err(map_io_error)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(map_io_error(error)),
-        }
+        remove_replacement_marker(&self.merging)?;
+        remove_replacement_marker(&self.published)?;
         match fs::remove_file(&self.journal) {
             Ok(()) => sync_parent(&self.journal).map_err(map_io_error),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(map_io_error(error)),
         }
+    }
+}
+
+fn write_replacement_marker(path: &Path, contents: &[u8]) -> Result<(), MutationError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(map_io_error)?;
+    file.write_all(contents).map_err(map_io_error)?;
+    file.sync_all().map_err(map_io_error)?;
+    sync_parent(path).map_err(map_io_error)
+}
+
+fn remove_replacement_marker(path: &Path) -> Result<(), MutationError> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_parent(path).map_err(map_io_error),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(map_io_error(error)),
     }
 }
 
@@ -831,6 +851,7 @@ fn recover_replacement_journal(journal_path: &Path) -> Result<(), MutationError>
     let suffix = format!("{}-{}-{nonce_hex}", journal.job_id, journal.generation);
     let expected_backup = parent.join(format!("{REPLACE_BACKUP_PREFIX}{suffix}"));
     let expected_journal = parent.join(format!("{REPLACE_JOURNAL_PREFIX}{suffix}"));
+    let merging = parent.join(format!("{REPLACE_MERGING_PREFIX}{suffix}"));
     let published = parent.join(format!("{REPLACE_PUBLISHED_PREFIX}{suffix}"));
     let staging_owned = StagingPath::is_for_destination(
         &StorePath::from_unix_path(staging.as_os_str()),
@@ -849,7 +870,53 @@ fn recover_replacement_journal(journal_path: &Path) -> Result<(), MutationError>
             "replacement journal paths failed ownership validation".into(),
         ));
     }
-    if published_marker_exists(&published)? {
+    let merging_exists = replacement_marker_exists(
+        &merging,
+        REPLACE_MERGING_MARKER,
+        "replacement merging marker",
+    )?;
+    let published_exists = replacement_marker_exists(
+        &published,
+        REPLACE_PUBLISHED_MARKER,
+        "replacement published marker",
+    )?;
+    if merging_exists && published_exists {
+        return Err(MutationError::RecoveryRequired(
+            "replacement journal has conflicting phase markers".into(),
+        ));
+    }
+    if merging_exists {
+        if !destination.exists() {
+            return Err(MutationError::RecoveryRequired(
+                format!(
+                    "replacement recovery preserved {} because the merging destination is missing",
+                    backup.display()
+                )
+                .into(),
+            ));
+        }
+        if backup.exists() {
+            let mut moved = Vec::new();
+            merge_directory_entries(&backup, &destination, &mut moved).map_err(|error| {
+                MutationError::RecoveryRequired(
+                    format!("replacement recovery could not finish its directory merge: {error}")
+                        .into(),
+                )
+            })?;
+            remove_path(&backup)
+                .map_err(|error| MutationError::Provider(error.to_string().into()))?;
+            sync_parent(&backup).map_err(map_io_error)?;
+        }
+        if staging.exists() {
+            remove_path(&staging)
+                .map_err(|error| MutationError::Provider(error.to_string().into()))?;
+            sync_parent(&staging).map_err(map_io_error)?;
+        }
+        fs::remove_file(&merging).map_err(map_io_error)?;
+        fs::remove_file(journal_path).map_err(map_io_error)?;
+        return sync_parent(journal_path).map_err(map_io_error);
+    }
+    if published_exists {
         if !destination.exists() {
             return Err(MutationError::RecoveryRequired(
                 format!(
@@ -901,7 +968,11 @@ fn recover_replacement_journal(journal_path: &Path) -> Result<(), MutationError>
     sync_parent(journal_path).map_err(map_io_error)
 }
 
-fn published_marker_exists(path: &Path) -> Result<bool, MutationError> {
+fn replacement_marker_exists(
+    path: &Path,
+    expected: &[u8],
+    label: &str,
+) -> Result<bool, MutationError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -909,14 +980,14 @@ fn published_marker_exists(path: &Path) -> Result<bool, MutationError> {
     };
     if !metadata.file_type().is_file() {
         return Err(MutationError::RecoveryRequired(
-            "replacement published marker is not a regular file".into(),
+            format!("{label} is not a regular file").into(),
         ));
     }
-    if fs::read(path).map_err(map_io_error)? == REPLACE_PUBLISHED_MARKER {
+    if fs::read(path).map_err(map_io_error)? == expected {
         Ok(true)
     } else {
         Err(MutationError::RecoveryRequired(
-            "replacement published marker is invalid".into(),
+            format!("{label} is invalid").into(),
         ))
     }
 }
@@ -1132,8 +1203,9 @@ fn execute_merging_transfer(
     })?;
     preflight_directory_merge(source, destination)
         .map_err(|error| ResolvedTransferFailure::Failed(error.to_string().into()))?;
-    let backup = move_destination_aside(destination, RestoreDisposition::Replace)
-        .map_err(resolved_move_aside_failure)?;
+    let transaction =
+        ReplacementTransaction::begin(request, destination).map_err(resolved_move_aside_failure)?;
+    let backup = transaction.backup.clone();
     if let Err(error) = execute_transfer(store, request, operation, cancellation) {
         let original_error = error.to_string();
         restore_moved_destination(&backup, destination).map_err(|rollback| {
@@ -1144,17 +1216,30 @@ fn execute_merging_transfer(
                 .into(),
             )
         })?;
+        transaction
+            .remove_journal()
+            .map_err(resolved_move_aside_failure)?;
         return Err(error);
     }
 
+    transaction.mark_merging().map_err(|error| {
+        ResolvedTransferFailure::NeedsAttention(
+            format!(
+                "the destination was published, but its directory merge cannot start safely because the durable marker failed: {error}; the previous destination remains at {}",
+                backup.display()
+            )
+            .into(),
+        )
+    })?;
     let mut moved = Vec::new();
     if let Err(error) = merge_directory_entries(&backup, destination, &mut moved) {
-        rollback_transfer_merge(&backup, request, operation, &moved).map_err(|rollback| {
-            ResolvedTransferFailure::NeedsAttention(
-                format!("{error}; merge rollback failed: {rollback}").into(),
+        return Err(ResolvedTransferFailure::NeedsAttention(
+            format!(
+                "the directory merge stopped after publishing its destination: {error}; startup recovery will resume from {}",
+                backup.display()
             )
-        })?;
-        return Err(ResolvedTransferFailure::Failed(error.to_string().into()));
+            .into(),
+        ));
     }
     remove_path(&backup).map_err(|error| {
         ResolvedTransferFailure::NeedsAttention(
@@ -1170,42 +1255,10 @@ fn execute_merging_transfer(
             format!("the merged destination was published but could not be made durable: {error}")
                 .into(),
         )
-    })
-}
-
-fn rollback_transfer_merge(
-    backup: &Path,
-    request: &CopyRequest,
-    operation: OperationKind,
-    moved: &[(PathBuf, PathBuf)],
-) -> Result<(), MutationError> {
-    let destination = request
-        .destination()
-        .as_unix_path()
-        .ok_or(MutationError::Unsupported)?;
-    fs::create_dir_all(backup).map_err(map_io_error)?;
-    for (source, target) in moved.iter().rev() {
-        if let Some(parent) = source.parent() {
-            fs::create_dir_all(parent).map_err(map_io_error)?;
-        }
-        renameat_with(CWD, target, CWD, source, RenameFlags::NOREPLACE).map_err(map_errno)?;
-    }
-    match operation {
-        OperationKind::Copy => {
-            remove_path(destination)
-                .map_err(|error| MutationError::Provider(error.to_string().into()))?;
-        }
-        OperationKind::Move => {
-            let source = request
-                .source()
-                .as_unix_path()
-                .ok_or(MutationError::Unsupported)?;
-            renameat_with(CWD, destination, CWD, source, RenameFlags::NOREPLACE)
-                .map_err(map_errno)?;
-        }
-        _ => return Err(MutationError::InvalidScope),
-    }
-    restore_moved_destination(backup, destination)
+    })?;
+    transaction
+        .remove_journal()
+        .map_err(resolved_move_aside_failure)
 }
 
 impl MutationProvider for LocalStore {
@@ -1997,6 +2050,36 @@ mod tests {
         assert!(!crashed.backup.exists());
         assert!(!crashed.journal.exists());
         assert!(!crashed.published.exists());
+    }
+
+    #[test]
+    fn restart_completes_a_partially_applied_directory_merge() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("old-a"), b"old").unwrap();
+        fs::create_dir(destination.join("nested")).unwrap();
+        fs::write(destination.join("nested/old-b"), b"old").unwrap();
+        let request = request(&source, &destination);
+        let crashed = ReplacementTransaction::begin(&request, &destination).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("new"), b"new").unwrap();
+        fs::create_dir(destination.join("nested")).unwrap();
+        crashed.mark_merging().unwrap();
+        fs::rename(crashed.backup.join("old-a"), destination.join("old-a")).unwrap();
+
+        LocalStore::new()
+            .recover_replacements_at(request.destination())
+            .unwrap();
+
+        assert_eq!(fs::read(destination.join("new")).unwrap(), b"new");
+        assert_eq!(fs::read(destination.join("old-a")).unwrap(), b"old");
+        assert_eq!(fs::read(destination.join("nested/old-b")).unwrap(), b"old");
+        assert!(!crashed.backup.exists());
+        assert!(!crashed.journal.exists());
+        assert!(!crashed.merging.exists());
     }
 
     #[test]
