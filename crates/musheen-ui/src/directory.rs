@@ -28,6 +28,11 @@ pub struct DirectoryLoad {
 
 impl DirectoryLoad {
     #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
     pub fn location(&self) -> &StorePath {
         &self.location
     }

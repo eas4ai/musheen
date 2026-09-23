@@ -2722,6 +2722,7 @@ impl PendingFileManagerCompletion {
 
 struct PendingFileManagerSelection {
     paths: Vec<StorePath>,
+    generation: u64,
     completion: Arc<PendingFileManagerCompletion>,
 }
 
@@ -4058,7 +4059,7 @@ impl MusheenApp {
                     page_items
                 };
                 self.remember_folder_location(load.location());
-                self.apply_pending_file_manager_selection(tab_id);
+                self.apply_pending_file_manager_selection(tab_id, cx);
 
                 // Catalog persistence can involve xattrs and fsync. Keep it
                 // outside GPUI's render thread even for very large folders.
@@ -4089,19 +4090,34 @@ impl MusheenApp {
                 })
                 .detach();
             }
-            Err(StoreError::Cancelled) => directory.page_failed(load),
             Err(error) => {
-                directory.page_failed(load);
-                if directory.items().is_empty() {
-                    directory.apply_error(load, error.to_string());
-                } else {
-                    self.operation_error = Some(error.to_string().into());
+                let (request_error, operation_error) =
+                    apply_directory_page_error(directory, load, error);
+                if let Some(operation_error) = operation_error {
+                    self.operation_error = Some(operation_error);
                 }
+                self.fail_pending_file_manager_selection(tab_id, load, request_error);
             }
         }
     }
 
-    fn apply_pending_file_manager_selection(&mut self, tab_id: TabId) {
+    fn fail_pending_file_manager_selection(
+        &mut self,
+        tab_id: TabId,
+        load: &DirectoryLoad,
+        error: musheen_desktop::FileManagerError,
+    ) {
+        let matches_load = self
+            .pending_file_manager_selections
+            .get(&tab_id)
+            .is_some_and(|pending| pending.generation == load.generation());
+        if matches_load && let Some(pending) = self.pending_file_manager_selections.remove(&tab_id)
+        {
+            pending.completion.complete_one(Err(error));
+        }
+    }
+
+    fn apply_pending_file_manager_selection(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         let Some(pending) = self.pending_file_manager_selections.remove(&tab_id) else {
             return;
         };
@@ -4111,6 +4127,12 @@ impl MusheenApp {
                 .complete_one(Err(musheen_desktop::FileManagerError::Unavailable));
             return;
         };
+        if directory.generation() != pending.generation {
+            pending
+                .completion
+                .complete_one(Err(musheen_desktop::FileManagerError::Unavailable));
+            return;
+        }
         let ids = directory
             .items()
             .iter()
@@ -4118,6 +4140,11 @@ impl MusheenApp {
             .map(|item| item.id().clone())
             .collect::<Vec<_>>();
         if ids.len() != pending.paths.len() {
+            if !directory.view().is_complete() {
+                self.pending_file_manager_selections.insert(tab_id, pending);
+                self.start_next_directory_page(tab_id, cx);
+                return;
+            }
             self.operation_error = Some(
                 self.catalog
                     .message("file-manager-items-not-found")
@@ -4145,6 +4172,33 @@ impl MusheenApp {
             tab.set_selection(ids);
         }
         pending.completion.complete_one(Ok(()));
+    }
+
+    fn track_pending_file_manager_selection(
+        &mut self,
+        tab_id: TabId,
+        paths: Vec<StorePath>,
+        completion: Arc<PendingFileManagerCompletion>,
+    ) -> Result<(), musheen_desktop::FileManagerError> {
+        let generation = self
+            .directories
+            .get(&tab_id)
+            .map(DirectoryModel::generation)
+            .ok_or(musheen_desktop::FileManagerError::Unavailable)?;
+        let replaced = self.pending_file_manager_selections.insert(
+            tab_id,
+            PendingFileManagerSelection {
+                paths,
+                generation,
+                completion,
+            },
+        );
+        if let Some(replaced) = replaced {
+            replaced
+                .completion
+                .complete_one(Err(musheen_desktop::FileManagerError::Busy));
+        }
+        Ok(())
     }
 
     fn apply_file_manager_request(
@@ -4193,27 +4247,23 @@ impl MusheenApp {
                 for (index, (parent, items)) in groups.into_iter().enumerate() {
                     if index == 0 {
                         let tab_id = self.navigation.focused_tab().id();
-                        self.pending_file_manager_selections.insert(
-                            tab_id,
-                            PendingFileManagerSelection {
-                                paths: items,
-                                completion: Arc::clone(&completion),
-                            },
-                        );
                         self.navigate(parent, true, cx);
+                        self.track_pending_file_manager_selection(
+                            tab_id,
+                            items,
+                            Arc::clone(&completion),
+                        )?;
                     } else {
                         let tab_id = self
                             .navigation
                             .new_tab(parent.clone())
                             .map_err(|_| musheen_desktop::FileManagerError::Busy)?;
-                        self.pending_file_manager_selections.insert(
-                            tab_id,
-                            PendingFileManagerSelection {
-                                paths: items,
-                                completion: Arc::clone(&completion),
-                            },
-                        );
                         self.start_load_for_tab(tab_id, parent, cx);
+                        self.track_pending_file_manager_selection(
+                            tab_id,
+                            items,
+                            Arc::clone(&completion),
+                        )?;
                     }
                 }
             }
@@ -12231,6 +12281,27 @@ impl MusheenApp {
     }
 }
 
+fn apply_directory_page_error(
+    directory: &mut DirectoryModel,
+    load: &DirectoryLoad,
+    error: StoreError,
+) -> (musheen_desktop::FileManagerError, Option<Box<str>>) {
+    directory.page_failed(load);
+    if error == StoreError::Cancelled {
+        return (musheen_desktop::FileManagerError::Unavailable, None);
+    }
+    let message = error.to_string();
+    if directory.items().is_empty() {
+        directory.apply_error(load, message);
+        (musheen_desktop::FileManagerError::Unreachable, None)
+    } else {
+        (
+            musheen_desktop::FileManagerError::Unreachable,
+            Some(message.into()),
+        )
+    }
+}
+
 impl Render for MusheenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_custom_actions(cx);
@@ -19754,6 +19825,130 @@ mod tests {
             cx.update(|cx| app.read(cx).last_file_manager_startup_id.clone())
                 .as_deref(),
             Some("multi-location-startup")
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn file_manager1_pages_until_the_requested_item_is_loaded(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = (0..700)
+            .map(|index| {
+                let path = temporary.path().join(format!("item-{index:04}.txt"));
+                filesystem::write(&path, b"item").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let location = StorePath::from_unix_path(temporary.path().as_os_str());
+        let first_page = futures_lite::future::block_on(LocalStore::new().read_directory(
+            &location,
+            PageRequest::first(&ResourceLimits::default()),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let first_paths = first_page
+            .items()
+            .iter()
+            .map(|item| item.path().clone())
+            .collect::<std::collections::HashSet<_>>();
+        let target = paths
+            .into_iter()
+            .map(|path| StorePath::from_unix_path(path.into_os_string()))
+            .find(|path| !first_paths.contains(path))
+            .expect("the fixture has an item beyond the first provider page");
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        let (acknowledgement, response) = musheen_desktop::FileManagerAcknowledgement::channel();
+
+        app.update(cx, |state, cx| {
+            state
+                .apply_file_manager_request(
+                    musheen_desktop::FileManagerRequest::ShowItems {
+                        locations: vec![target.clone()],
+                        startup_id: "paged-item".into(),
+                    },
+                    acknowledgement,
+                    cx,
+                )
+                .unwrap();
+        });
+
+        cx.wait_for(browser, Duration::from_secs(4), |_, _| !response.is_empty())
+            .await;
+        assert_eq!(response.try_recv().unwrap(), Ok(()));
+        let selected = cx.update(|cx| {
+            app.read(cx)
+                .navigation
+                .focused_tab()
+                .selection()
+                .first()
+                .cloned()
+        });
+        let selected_path = cx.update(|cx| {
+            selected.and_then(|id| {
+                app.read(cx)
+                    .focused_directory()
+                    .view()
+                    .item(&id)
+                    .map(|item| item.path().clone())
+            })
+        });
+        assert_eq!(selected_path.as_ref(), Some(&target));
+    }
+
+    #[gpui_kit::test]
+    fn file_manager1_completes_the_request_when_directory_loading_fails(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let mut app = None;
+        cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let (acknowledgement, response) = musheen_desktop::FileManagerAcknowledgement::channel();
+
+        app.update(cx, |state, cx| {
+            let tab_id = state.navigation.focused_tab().id();
+            let location = StorePath::from_unix_path(temporary.path().as_os_str());
+            let load = state
+                .directories
+                .get_mut(&tab_id)
+                .unwrap()
+                .begin_navigation(location.clone());
+            state.pending_file_manager_selections.insert(
+                tab_id,
+                PendingFileManagerSelection {
+                    paths: vec![location],
+                    generation: load.generation(),
+                    completion: PendingFileManagerCompletion::new(1, acknowledgement),
+                },
+            );
+            state.apply_directory_page_result(
+                tab_id,
+                &load,
+                Err(StoreError::Backend("fixture load failed".into())),
+                cx,
+            );
+        });
+
+        assert_eq!(
+            response.try_recv().unwrap(),
+            Err(musheen_desktop::FileManagerError::Unreachable)
         );
     }
 
