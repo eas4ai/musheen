@@ -653,6 +653,7 @@ notification-show-in-musheen = Show in Musheen
 update-view-information = View release information
 update-link-failed = Musheen could not open the release information.
 maintenance-task-failed = A background maintenance task failed.
+session-save-failed = Browsing session changes were not saved
 file-manager-item-parent-unavailable = The requested item's folder is unavailable.
 file-manager-properties-local-only = Properties are available only for local files.
 file-manager-items-not-found = One or more requested items could not be shown.

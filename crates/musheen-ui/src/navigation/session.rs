@@ -1,10 +1,10 @@
 use super::{NavigationError, PaneId, PaneState, TabId, TabState};
 use crate::views::{ViewPreferenceStore, ViewPreferences};
 use musheen_core::StorePath;
+use musheen_desktop::SESSION_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const SESSION_SCHEMA_VERSION: u32 = 1;
 const MAX_PANES: usize = 2;
 pub(crate) const MAX_WINDOWS: usize = 16;
 

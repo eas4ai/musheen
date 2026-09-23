@@ -653,6 +653,7 @@ notification-show-in-musheen = ⟦Šħöẅ ïñ Müšħëëñ⟧
 update-view-information = ⟦Vïëẅ ŕëŀëåšë ïñƒöŕɱåţïöñ⟧
 update-link-failed = ⟦Müšħëëñ çöüŀð ñöţ öþëñ ţħë ŕëŀëåšë ïñƒöŕɱåţïöñ.⟧
 maintenance-task-failed = ⟦Å ɓåçķğŕöüñð ɱåïñţëñåñçë ţåšķ ƒåïŀëð.⟧
+session-save-failed = ⟦Bŕöẅšïñğ šëššïöñ çħåñğëš ẅëŕë ñöţ šåṽëð··⟧
 file-manager-item-parent-unavailable = ⟦Ţħë ŕëɋüëšţëð ïţëɱ'š ƒöŀðëŕ ïš üñåṽåïŀåɓŀë.⟧
 file-manager-properties-local-only = ⟦Þŕöþëŕţïëš åŕë åṽåïŀåɓŀë öñŀÿ ƒöŕ ŀöçåŀ ƒïŀëš.⟧
 file-manager-items-not-found = ⟦Öñë öŕ ɱöŕë ŕëɋüëšţëð ïţëɱš çöüŀð ñöţ ɓë šħöẅñ.⟧

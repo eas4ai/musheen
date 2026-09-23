@@ -1,4 +1,4 @@
-use musheen_desktop::SessionStore;
+use musheen_desktop::{SessionStore, SessionStoreError};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
@@ -46,4 +46,42 @@ fn first_session_write_does_not_fabricate_a_backup() {
     store.save(b"first").expect("first session saves");
 
     assert_eq!(store.load_backup().expect("backup lookup succeeds"), None);
+}
+
+#[test]
+fn future_primary_session_is_not_replaced_by_an_older_build() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let backup = temporary.path().join("session.json.bak");
+    let store = SessionStore::at(&path);
+    let future = br#"{"schema_version":2,"windows":[],"future_field":true}"#;
+    let previous = br#"{"schema_version":1,"windows":[]}"#;
+    fs::write(&path, future).unwrap();
+    fs::write(&backup, previous).unwrap();
+
+    assert!(matches!(
+        store.save(previous),
+        Err(SessionStoreError::FutureSchema { version: 2, .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), future);
+    assert_eq!(fs::read(&backup).unwrap(), previous);
+}
+
+#[test]
+fn future_backup_session_is_not_lost_after_fallback_restore() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let backup = temporary.path().join("session.json.bak");
+    let store = SessionStore::at(&path);
+    let future = br#"{"schema_version":2,"windows":[],"future_field":true}"#;
+    let previous = br#"{"schema_version":1,"windows":[]}"#;
+    fs::write(&path, previous).unwrap();
+    fs::write(&backup, future).unwrap();
+
+    assert!(matches!(
+        store.save(previous),
+        Err(SessionStoreError::FutureSchema { version: 2, .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), previous);
+    assert_eq!(fs::read(&backup).unwrap(), future);
 }

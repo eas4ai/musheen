@@ -4788,6 +4788,14 @@ impl MusheenApp {
                 .await
             {
                 eprintln!("Musheen could not save its browsing session: {error}");
+                this.update(cx, |state, cx| {
+                    let label = state
+                        .catalog
+                        .message("session-save-failed")
+                        .expect("session save warning is localized");
+                    state.operation_error = Some(format!("{label}: {error}").into());
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -17738,6 +17746,47 @@ mod tests {
                 .expect("backup session restores");
 
         assert_eq!(restored.windows()[0].focused_tab().location(), &expected);
+    }
+
+    #[gpui_kit::test]
+    async fn newer_session_schema_save_failure_is_visible_without_replacing_the_file(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("session.json");
+        let future = br#"{"schema_version":2,"windows":[],"future_field":true}"#;
+        std::fs::write(&path, future).unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(
+                    temporary.path().to_path_buf(),
+                    Some(SessionStore::at(&path)),
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.update(|cx| app.update(cx, |state, cx| state.schedule_session_save(cx)));
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .operation_error
+                .as_deref()
+                .is_some_and(|error| error.contains("newer than supported"))
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            let state = app.read(cx);
+            let label = state.catalog.message("session-save-failed").unwrap();
+            assert!(state.operation_error.as_deref().unwrap().starts_with(label));
+            window.render_frame(cx);
+            assert!(window.find("operation-error").visible());
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), future);
     }
 
     #[test]

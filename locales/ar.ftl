@@ -482,6 +482,7 @@ notification-show-in-musheen = العرض في موشين
 update-view-information = عرض معلومات الإصدار
 update-link-failed = تعذّر على موشين فتح معلومات الإصدار.
 maintenance-task-failed = فشلت مهمة صيانة في الخلفية.
+session-save-failed = لم تُحفظ تغييرات جلسة التصفح
 file-manager-item-parent-unavailable = مجلد العنصر المطلوب غير متاح.
 file-manager-properties-local-only = الخصائص متاحة للملفات المحلية فقط.
 file-manager-items-not-found = تعذّر عرض عنصر واحد أو أكثر من العناصر المطلوبة.

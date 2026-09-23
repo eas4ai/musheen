@@ -249,6 +249,7 @@ mod tests {
             "application-open-items",
             "context-backend-unavailable",
             "context-target-changed",
+            "session-save-failed",
         ] {
             assert!(
                 catalog
@@ -258,6 +259,16 @@ mod tests {
                 "{key} is pseudo-localized"
             );
         }
+    }
+
+    #[test]
+    fn arabic_session_save_warning_is_translated() {
+        let english = Catalog::load(Locale::EnUs).unwrap();
+        let arabic = Catalog::load(Locale::Ar).unwrap();
+        assert_ne!(
+            arabic.message("session-save-failed").unwrap(),
+            english.message("session-save-failed").unwrap()
+        );
     }
 
     #[test]
