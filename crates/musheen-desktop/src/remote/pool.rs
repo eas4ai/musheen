@@ -2,8 +2,10 @@ use super::{ConnectionProfile, RemoteError, RemoteErrorCategory};
 use musheen_core::{BoxFuture, CancellationToken};
 use std::collections::VecDeque;
 use std::fmt;
-use std::future::poll_fn;
-use std::sync::{Arc, Mutex, Weak};
+use std::future::{Future, pending, poll_fn};
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -153,8 +155,7 @@ pub struct ProviderPool<C: RemoteConnector, R: PoolRuntime = SystemPoolRuntime> 
 }
 
 impl<C: RemoteConnector> ProviderPool<C, SystemPoolRuntime> {
-    #[must_use]
-    pub fn new(profile: ConnectionProfile, connector: C) -> Self {
+    pub fn new(profile: ConnectionProfile, connector: C) -> Result<Self, RemoteError> {
         Self::with_runtime(
             profile,
             connector,
@@ -165,13 +166,35 @@ impl<C: RemoteConnector> ProviderPool<C, SystemPoolRuntime> {
 }
 
 impl<C: RemoteConnector, R: PoolRuntime> ProviderPool<C, R> {
-    #[must_use]
     pub fn with_runtime(
         profile: ConnectionProfile,
         connector: C,
         runtime: R,
         limits: PoolLimits,
-    ) -> Self {
+    ) -> Result<Self, RemoteError> {
+        Self::with_maintenance(
+            profile,
+            connector,
+            runtime,
+            limits,
+            shared_maintenance_service(),
+        )
+    }
+
+    fn with_maintenance(
+        profile: ConnectionProfile,
+        connector: C,
+        runtime: R,
+        limits: PoolLimits,
+        maintenance: Result<&MaintenanceService, ()>,
+    ) -> Result<Self, RemoteError> {
+        let maintenance = maintenance.map_err(|()| {
+            RemoteError::new(
+                profile.protocol(),
+                RemoteErrorCategory::Unavailable,
+                Some(profile.host().clone()),
+            )
+        })?;
         let (maintenance_wake, maintenance_events) = async_channel::bounded(1);
         let maintenance_stop = CancellationToken::new();
         let inner = Arc::new(PoolInner {
@@ -182,21 +205,14 @@ impl<C: RemoteConnector, R: PoolRuntime> ProviderPool<C, R> {
             state: Mutex::new(PoolState::default()),
             maintenance_wake,
             maintenance_stop: maintenance_stop.clone(),
-            maintenance_thread: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
-        let handle = std::thread::Builder::new()
-            .name("musheen-remote-pool".to_owned())
-            .spawn(move || {
-                futures_lite::future::block_on(maintain_idle_connections(
-                    weak,
-                    maintenance_events,
-                    maintenance_stop,
-                ));
-            })
-            .expect("remote pool maintenance thread must start");
-        *lock(&inner.maintenance_thread) = Some(handle);
-        Self { inner }
+        maintenance.schedule(maintain_idle_connections(
+            weak,
+            maintenance_events,
+            maintenance_stop,
+        ));
+        Ok(Self { inner })
     }
 
     pub async fn acquire(
@@ -268,7 +284,6 @@ struct PoolInner<C: RemoteConnector, R: PoolRuntime> {
     state: Mutex<PoolState<C::Connection>>,
     maintenance_wake: async_channel::Sender<()>,
     maintenance_stop: CancellationToken,
-    maintenance_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl<C: RemoteConnector, R: PoolRuntime> PoolInner<C, R> {
@@ -406,16 +421,6 @@ impl<C: RemoteConnector, R: PoolRuntime> Drop for PoolInner<C, R> {
     fn drop(&mut self) {
         self.maintenance_stop.cancel();
         let _ = self.maintenance_wake.try_send(());
-        let handle = self
-            .maintenance_thread
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(handle) = handle
-            && handle.thread().id() != std::thread::current().id()
-        {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -681,4 +686,182 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+trait MaintenanceThreadSpawner {
+    fn spawn(
+        &self,
+        run: Box<dyn FnOnce() + Send + 'static>,
+    ) -> io::Result<std::thread::JoinHandle<()>>;
+}
+
+struct SystemMaintenanceThreadSpawner;
+
+impl MaintenanceThreadSpawner for SystemMaintenanceThreadSpawner {
+    fn spawn(
+        &self,
+        run: Box<dyn FnOnce() + Send + 'static>,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("musheen-remote-maintenance".to_owned())
+            .spawn(run)
+    }
+}
+
+struct MaintenanceService {
+    executor: Arc<async_executor::Executor<'static>>,
+    active_tasks: Arc<AtomicUsize>,
+    _worker: std::thread::JoinHandle<()>,
+}
+
+impl MaintenanceService {
+    fn start(spawner: &impl MaintenanceThreadSpawner) -> io::Result<Self> {
+        let executor = Arc::new(async_executor::Executor::new());
+        let worker_executor = executor.clone();
+        let worker = spawner.spawn(Box::new(move || {
+            futures_lite::future::block_on(worker_executor.run(pending::<()>()))
+        }))?;
+        Ok(Self {
+            executor,
+            active_tasks: Arc::new(AtomicUsize::new(0)),
+            _worker: worker,
+        })
+    }
+
+    fn schedule(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
+        let active_tasks = self.active_tasks.clone();
+        self.executor
+            .spawn(async move {
+                let _active = ActiveMaintenanceTask(active_tasks);
+                future.await;
+            })
+            .detach();
+    }
+}
+
+struct ActiveMaintenanceTask(Arc<AtomicUsize>);
+
+impl Drop for ActiveMaintenanceTask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+static MAINTENANCE_SERVICE: OnceLock<Result<MaintenanceService, io::ErrorKind>> = OnceLock::new();
+
+fn shared_maintenance_service() -> Result<&'static MaintenanceService, ()> {
+    MAINTENANCE_SERVICE
+        .get_or_init(|| {
+            MaintenanceService::start(&SystemMaintenanceThreadSpawner).map_err(|error| error.kind())
+        })
+        .as_ref()
+        .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::{HostKeyPolicy, RemoteHost, RemoteProtocol, SecurityPolicy};
+    use crate::{ConnectionId, CredentialReference};
+
+    #[derive(Clone)]
+    struct FixedRuntime;
+
+    impl PoolRuntime for FixedRuntime {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn sleep(&self, _: Duration) -> BoxFuture<'_, ()> {
+            Box::pin(pending())
+        }
+    }
+
+    struct NeverConnector;
+
+    impl RemoteConnector for NeverConnector {
+        type Connection = ();
+
+        fn connect<'a>(
+            &'a self,
+            _: &'a ConnectionProfile,
+            _: CancellationToken,
+        ) -> BoxFuture<'a, Result<Self::Connection, RemoteErrorCategory>> {
+            Box::pin(pending())
+        }
+    }
+
+    struct FailingSpawner;
+
+    impl MaintenanceThreadSpawner for FailingSpawner {
+        fn spawn(
+            &self,
+            _: Box<dyn FnOnce() + Send + 'static>,
+        ) -> io::Result<std::thread::JoinHandle<()>> {
+            Err(io::Error::from(io::ErrorKind::ResourceBusy))
+        }
+    }
+
+    fn profile() -> ConnectionProfile {
+        let protocol = RemoteProtocol::Sftp;
+        ConnectionProfile::new(
+            ConnectionId::new("pool-test").unwrap(),
+            "Pool test",
+            protocol,
+            RemoteHost::new(protocol, "files.example.test").unwrap(),
+            None,
+            "/",
+            Some("alice"),
+            Some(CredentialReference::persistent(
+                ConnectionId::new("pool-test-secret").unwrap(),
+            )),
+            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn worker_spawn_failure_is_typed_and_never_panics() {
+        let spawn_error = match MaintenanceService::start(&FailingSpawner) {
+            Ok(_) => panic!("failing spawner must not create a service"),
+            Err(error) => error,
+        };
+        assert_eq!(spawn_error.kind(), io::ErrorKind::ResourceBusy);
+        let result = ProviderPool::with_maintenance(
+            profile(),
+            NeverConnector,
+            FixedRuntime,
+            PoolLimits::default(),
+            Err(()),
+        );
+        let error = match result {
+            Ok(_) => panic!("maintenance failure must reject pool construction"),
+            Err(error) => error,
+        };
+        assert_eq!(error.category(), RemoteErrorCategory::Unavailable);
+    }
+
+    #[test]
+    fn dropping_pool_cancels_and_deregisters_shared_maintenance() {
+        let service = shared_maintenance_service().unwrap();
+        let before = service.active_tasks.load(Ordering::Acquire);
+        let pool = ProviderPool::with_runtime(
+            profile(),
+            NeverConnector,
+            FixedRuntime,
+            PoolLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(service.active_tasks.load(Ordering::Acquire), before + 1);
+        drop(pool);
+        for _ in 0..10_000 {
+            if service.active_tasks.load(Ordering::Acquire) == before {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("maintenance task did not deregister after pool drop");
+    }
 }

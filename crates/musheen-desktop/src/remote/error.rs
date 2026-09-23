@@ -9,6 +9,7 @@ pub enum RemoteErrorCategory {
     Tls,
     Network,
     Protocol,
+    Redirect,
     Timeout,
     Cancelled,
     Saturated,

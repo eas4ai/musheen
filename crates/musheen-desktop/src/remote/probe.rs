@@ -20,6 +20,7 @@ use musheen_core::{BoxFuture, CancellationToken};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::future::poll_fn;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::task::Poll;
 use zeroize::Zeroize;
@@ -34,6 +35,24 @@ pub trait CredentialResolver: Send + Sync + 'static {
         reference: &'a CredentialReference,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<SecretBuffer, RemoteErrorCategory>>;
+}
+
+pub trait RootCertificateProvider: Send + Sync + 'static {
+    fn load(&self) -> Result<Vec<CertificateDer<'static>>, RemoteErrorCategory>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeRootCertificateProvider;
+
+impl RootCertificateProvider for NativeRootCertificateProvider {
+    fn load(&self) -> Result<Vec<CertificateDer<'static>>, RemoteErrorCategory> {
+        let result = rustls_native_certs::load_native_certs();
+        if result.certs.is_empty() {
+            Err(RemoteErrorCategory::Unavailable)
+        } else {
+            Ok(result.certs)
+        }
+    }
 }
 
 pub struct SecretServiceCredentialResolver(CredentialVault<LinuxSecretService>);
@@ -74,22 +93,42 @@ pub trait ConnectionProbe: Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-pub struct ProtocolConnectionProbe<R = SecretServiceCredentialResolver>(Arc<R>);
+pub struct ProtocolConnectionProbe<
+    R = SecretServiceCredentialResolver,
+    T = NativeRootCertificateProvider,
+> {
+    credentials: Arc<R>,
+    roots: Arc<T>,
+}
 
-impl<R> ProtocolConnectionProbe<R> {
+impl<R> ProtocolConnectionProbe<R, NativeRootCertificateProvider> {
     #[must_use]
     pub fn new(credentials: Arc<R>) -> Self {
-        Self(credentials)
+        Self {
+            credentials,
+            roots: Arc::new(NativeRootCertificateProvider),
+        }
     }
 }
 
-impl Default for ProtocolConnectionProbe<SecretServiceCredentialResolver> {
+impl<R, T> ProtocolConnectionProbe<R, T> {
+    #[must_use]
+    pub fn with_root_provider(credentials: Arc<R>, roots: Arc<T>) -> Self {
+        Self { credentials, roots }
+    }
+}
+
+impl Default
+    for ProtocolConnectionProbe<SecretServiceCredentialResolver, NativeRootCertificateProvider>
+{
     fn default() -> Self {
         Self::new(Arc::new(SecretServiceCredentialResolver::default()))
     }
 }
 
-impl<R: CredentialResolver> ConnectionProbe for ProtocolConnectionProbe<R> {
+impl<R: CredentialResolver, T: RootCertificateProvider> ConnectionProbe
+    for ProtocolConnectionProbe<R, T>
+{
     fn connect<'a>(
         &'a self,
         profile: &'a ConnectionProfile,
@@ -98,10 +137,22 @@ impl<R: CredentialResolver> ConnectionProbe for ProtocolConnectionProbe<R> {
         Box::pin(async move {
             match profile.protocol() {
                 RemoteProtocol::Http | RemoteProtocol::WebDav => {
-                    probe_http(profile, self.0.as_ref(), cancellation).await
+                    probe_http(
+                        profile,
+                        self.credentials.as_ref(),
+                        self.roots.as_ref(),
+                        cancellation,
+                    )
+                    .await
                 }
                 RemoteProtocol::Ftp | RemoteProtocol::Ftps => {
-                    probe_ftp(profile, self.0.as_ref(), cancellation).await
+                    probe_ftp(
+                        profile,
+                        self.credentials.as_ref(),
+                        self.roots.as_ref(),
+                        cancellation,
+                    )
+                    .await
                 }
                 RemoteProtocol::Sftp => match profile.security() {
                     SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts)
@@ -116,7 +167,7 @@ impl<R: CredentialResolver> ConnectionProbe for ProtocolConnectionProbe<R> {
     }
 }
 
-impl<R> fmt::Debug for ProtocolConnectionProbe<R> {
+impl<R, T> fmt::Debug for ProtocolConnectionProbe<R, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ProtocolConnectionProbe(..)")
     }
@@ -178,24 +229,26 @@ impl<P: ConnectionProbe> ProfileConnectionTest for ProfileConnectionTester<P> {
     }
 }
 
-async fn probe_http<R: CredentialResolver>(
+async fn probe_http<R: CredentialResolver, T: RootCertificateProvider>(
     profile: &ConnectionProfile,
     credentials: &R,
+    roots: &T,
     cancellation: CancellationToken,
 ) -> Result<(), RemoteErrorCategory> {
     let mut stream = connect_transport(profile, credentials, cancellation.clone()).await?;
     if matches!(profile.security(), SecurityPolicy::Tls(_)) {
-        stream = connect_tls(stream, profile).await?;
+        stream = connect_tls(stream, profile, roots).await?;
     }
     let method = if profile.protocol() == RemoteProtocol::WebDav {
         "PROPFIND"
     } else {
         "HEAD"
     };
+    let target_port = profile.port().unwrap_or_else(|| default_port(profile));
     let mut request = format!(
         "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
         encode_http_path(profile.path()),
-        profile.host()
+        http_authority(profile.host().as_str(), target_port, default_port(profile))
     )
     .into_bytes();
     if profile.protocol() == RemoteProtocol::WebDav {
@@ -213,20 +266,22 @@ async fn probe_http<R: CredentialResolver>(
     request.zeroize();
     result.map_err(|_| RemoteErrorCategory::Network)?;
     match read_http_status(&mut stream).await? {
-        200..=399 => Ok(()),
+        200..=299 => Ok(()),
+        300..=399 => Err(RemoteErrorCategory::Redirect),
         401 | 407 => Err(RemoteErrorCategory::Authentication),
         _ => Err(RemoteErrorCategory::Protocol),
     }
 }
 
-async fn probe_ftp<R: CredentialResolver>(
+async fn probe_ftp<R: CredentialResolver, T: RootCertificateProvider>(
     profile: &ConnectionProfile,
     credentials: &R,
+    roots: &T,
     cancellation: CancellationToken,
 ) -> Result<(), RemoteErrorCategory> {
     let mut stream = connect_transport(profile, credentials, cancellation.clone()).await?;
     if profile.protocol() == RemoteProtocol::Ftps {
-        stream = connect_tls(stream, profile).await?;
+        stream = connect_tls(stream, profile, roots).await?;
     }
     expect_ftp(&mut stream, 220).await?;
     let username = profile.username().unwrap_or("anonymous");
@@ -400,7 +455,7 @@ async fn http_connect(
     username: Option<&str>,
     secret: Option<&SecretBuffer>,
 ) -> Result<(), RemoteErrorCategory> {
-    let authority = format!("{host}:{port}");
+    let authority = authority(host, Some(port));
     let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n").into_bytes();
     match (username, secret) {
         (None, None) => {}
@@ -433,12 +488,12 @@ fn append_basic_auth(request: &mut Vec<u8>, header: &[u8], username: &str, secre
     encoded.zeroize();
 }
 
-async fn connect_tls(
+async fn connect_tls<T: RootCertificateProvider>(
     stream: Transport,
     profile: &ConnectionProfile,
+    root_provider: &T,
 ) -> Result<Transport, RemoteErrorCategory> {
     let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let provider = Arc::new(futures_rustls::rustls::crypto::ring::default_provider());
     let algorithms = provider.signature_verification_algorithms;
     let builder = ClientConfig::builder_with_provider(provider)
@@ -446,6 +501,11 @@ async fn connect_tls(
         .map_err(|_| RemoteErrorCategory::Tls)?;
     let config = match profile.security() {
         SecurityPolicy::Tls(TlsPolicy::SystemRoots) => {
+            let certificates = root_provider.load()?;
+            let (added, _) = roots.add_parsable_certificates(certificates);
+            if added == 0 {
+                return Err(RemoteErrorCategory::Tls);
+            }
             builder.with_root_certificates(roots).with_no_client_auth()
         }
         SecurityPolicy::Tls(TlsPolicy::PinnedSha256(pin)) => builder
@@ -607,6 +667,19 @@ fn encode_http_path(path: &str) -> String {
         }
     }
     encoded
+}
+
+fn http_authority(host: &str, port: u16, default_port: u16) -> String {
+    authority(host, (port != default_port).then_some(port))
+}
+
+fn authority(host: &str, port: Option<u16>) -> String {
+    let host = if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    port.map_or(host.clone(), |port| format!("{host}:{port}"))
 }
 
 fn default_port(profile: &ConnectionProfile) -> u16 {

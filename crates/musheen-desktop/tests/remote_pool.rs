@@ -1,22 +1,25 @@
 use futures_lite::future::block_on;
 use futures_lite::future::poll_once;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::remote::{
     CONNECT_TIMEOUT, ConnectionProbe, ConnectionProfile, ConnectionProfiles, CredentialResolver,
-    HostKeyPolicy, PoolLimits, PoolRuntime, ProfileConnectionTest, ProfileConnectionTester,
-    ProtocolConnectionProbe, ProviderPool, ProxyKind, ProxySettings, RemoteConnector, RemoteError,
-    RemoteErrorCategory, RemoteHost, RemoteProtocol, SaveConfirmation, SaveRequirement,
-    SecurityPolicy, TLS_PIN_BYTES, TestReport, TlsPolicy,
+    HostKeyPolicy, NativeRootCertificateProvider, PoolLimits, PoolRuntime, ProfileConnectionTest,
+    ProfileConnectionTester, ProtocolConnectionProbe, ProviderPool, ProxyKind, ProxySettings,
+    RemoteConnector, RemoteError, RemoteErrorCategory, RemoteHost, RemoteProtocol,
+    RootCertificateProvider, SaveConfirmation, SaveRequirement, SecurityPolicy, TLS_PIN_BYTES,
+    TestReport, TlsPolicy,
 };
 use musheen_desktop::{ConnectionId, CredentialReference, SecretBuffer};
 use std::collections::VecDeque;
 use std::fmt;
-use std::future::pending;
+use std::future::{Future, pending};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::task::Waker;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 fn credential(id: &str) -> CredentialReference {
@@ -690,6 +693,329 @@ fn protocol_tester_sends_target_name_through_socks_without_direct_dns() {
     server.join().unwrap();
 }
 
+#[test]
+fn http_authority_includes_non_default_ports_and_brackets_ipv6() {
+    for (host, port, expected_connect, expected_host) in [
+        (
+            "files.example.test",
+            8443,
+            "CONNECT files.example.test:8443 HTTP/1.1",
+            "Host: files.example.test:8443",
+        ),
+        (
+            "2001:db8::1",
+            80,
+            "CONNECT [2001:db8::1]:80 HTTP/1.1",
+            "Host: [2001:db8::1]",
+        ),
+        (
+            "2001:db8::1",
+            8443,
+            "CONNECT [2001:db8::1]:8443 HTTP/1.1",
+            "Host: [2001:db8::1]:8443",
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let connect = read_headers(&mut stream);
+            stream.write_all(b"HTTP/1.1 200 Connected\r\n\r\n").unwrap();
+            let request = read_headers(&mut stream);
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+            (connect, request)
+        });
+        let protocol = RemoteProtocol::Http;
+        let proxy = ProxySettings::new(
+            protocol,
+            ProxyKind::HttpConnect,
+            RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+            proxy_port,
+            None::<&str>,
+            None,
+        )
+        .unwrap();
+        let profile = ConnectionProfile::new(
+            ConnectionId::new(format!("authority-{port}")).unwrap(),
+            "Authority",
+            protocol,
+            RemoteHost::new(protocol, host).unwrap(),
+            Some(port),
+            "/",
+            None::<&str>,
+            None,
+            SecurityPolicy::PlaintextConfirmed,
+            Some(proxy),
+        )
+        .unwrap();
+        let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::new(Arc::new(
+            StaticCredentialResolver,
+        )));
+        block_on(tester.test(&profile, CancellationToken::new())).unwrap();
+        let (connect, request) = server.join().unwrap();
+        assert!(connect.starts_with(expected_connect), "{connect:?}");
+        assert!(
+            request.lines().any(|line| line == expected_host),
+            "{request:?}"
+        );
+    }
+}
+
+#[test]
+fn redirects_require_explicit_decision_and_never_forward_credentials() {
+    for location in [
+        "/same-origin",
+        "http://other.example.test/login",
+        "http://127.0.0.1/loop",
+        "http://files.example.test/downgrade",
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location = location.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_headers(&mut stream);
+            let response =
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nConnection: close\r\n\r\n");
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        let protocol = RemoteProtocol::Http;
+        let profile = ConnectionProfile::new(
+            ConnectionId::new(format!("redirect-{port}")).unwrap(),
+            "Redirect",
+            protocol,
+            RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+            Some(port),
+            "/private",
+            Some("alice"),
+            Some(credential("target")),
+            SecurityPolicy::PlaintextConfirmed,
+            None,
+        )
+        .unwrap();
+        let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::new(Arc::new(
+            StaticCredentialResolver,
+        )));
+        let result = block_on(tester.test(&profile, CancellationToken::new()));
+        let request = server.join().unwrap();
+        assert!(request.contains("Authorization: Basic "));
+        assert_eq!(
+            result.unwrap_err().category(),
+            RemoteErrorCategory::Redirect
+        );
+    }
+}
+
+#[test]
+fn system_roots_use_the_linux_native_certificate_store() {
+    const CHILD: &str = "MUSHEEN_NATIVE_ROOT_TEST_CHILD";
+    const CERTIFICATE: &str = "MUSHEEN_NATIVE_ROOT_TEST_CERTIFICATE";
+    const KEY: &str = "MUSHEEN_NATIVE_ROOT_TEST_KEY";
+    if std::env::var_os(CHILD).is_some() {
+        let server_certificate = std::fs::read(std::env::var_os(CERTIFICATE).unwrap()).unwrap();
+        let server_key = std::fs::read(std::env::var_os(KEY).unwrap()).unwrap();
+        run_native_root_probe(server_certificate, server_key);
+        return;
+    }
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root_path = directory.path().join("root.pem");
+    let certificate_path = directory.path().join("server.der");
+    let key_path = directory.path().join("server-key.der");
+    std::fs::write(&root_path, cert.pem()).unwrap();
+    std::fs::write(&certificate_path, cert.der()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_der()).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("system_roots_use_the_linux_native_certificate_store")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .env("SSL_CERT_FILE", root_path)
+        .env(CERTIFICATE, certificate_path)
+        .env(KEY, key_path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn native_root_provider_loads_the_container_trust_store() {
+    assert!(!NativeRootCertificateProvider.load().unwrap().is_empty());
+}
+
+struct EmptyRootProvider;
+
+impl RootCertificateProvider for EmptyRootProvider {
+    fn load(
+        &self,
+    ) -> Result<Vec<futures_rustls::rustls::pki_types::CertificateDer<'static>>, RemoteErrorCategory>
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn injected_empty_root_store_maps_to_a_tls_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || listener.accept().unwrap());
+    let protocol = RemoteProtocol::Http;
+    let profile = ConnectionProfile::new(
+        ConnectionId::new("empty-roots").unwrap(),
+        "Empty roots",
+        protocol,
+        RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+        Some(port),
+        "/",
+        None::<&str>,
+        None,
+        SecurityPolicy::Tls(TlsPolicy::SystemRoots),
+        None,
+    )
+    .unwrap();
+    let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::with_root_provider(
+        Arc::new(StaticCredentialResolver),
+        Arc::new(EmptyRootProvider),
+    ));
+    let error = block_on(tester.test(&profile, CancellationToken::new())).unwrap_err();
+    server.join().unwrap();
+    assert_eq!(error.category(), RemoteErrorCategory::Tls);
+}
+
+#[test]
+fn ftp_and_webdav_probes_validate_authentication_and_paths() {
+    let ftp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ftp_port = ftp_listener.local_addr().unwrap().port();
+    let ftp_server = std::thread::spawn(move || {
+        let (mut stream, _) = ftp_listener.accept().unwrap();
+        stream.write_all(b"220 Ready\r\n").unwrap();
+        let user = read_ftp_command(&mut stream);
+        stream.write_all(b"331 Password required\r\n").unwrap();
+        let password = read_ftp_command(&mut stream);
+        stream.write_all(b"230 Logged in\r\n").unwrap();
+        let cwd = read_ftp_command(&mut stream);
+        stream.write_all(b"250 Directory changed\r\n").unwrap();
+        (user, password, cwd)
+    });
+    let ftp = ConnectionProfile::new(
+        ConnectionId::new("ftp-e2e").unwrap(),
+        "FTP",
+        RemoteProtocol::Ftp,
+        RemoteHost::new(RemoteProtocol::Ftp, "127.0.0.1").unwrap(),
+        Some(ftp_port),
+        "/folder with space",
+        Some("alice"),
+        Some(credential("ftp")),
+        SecurityPolicy::PlaintextConfirmed,
+        None,
+    )
+    .unwrap();
+    let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::new(Arc::new(
+        StaticCredentialResolver,
+    )));
+    block_on(tester.test(&ftp, CancellationToken::new())).unwrap();
+    let (user, password, cwd) = ftp_server.join().unwrap();
+    assert_eq!(user, "USER alice\r\n");
+    assert_eq!(password, "PASS correct horse\r\n");
+    assert_eq!(cwd, "CWD /folder with space\r\n");
+
+    let webdav_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let webdav_port = webdav_listener.local_addr().unwrap().port();
+    let webdav_server = std::thread::spawn(move || {
+        let (mut stream, _) = webdav_listener.accept().unwrap();
+        let request = read_headers(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 207 Multi-Status\r\n\r\n")
+            .unwrap();
+        request
+    });
+    let webdav = ConnectionProfile::new(
+        ConnectionId::new("webdav-e2e").unwrap(),
+        "WebDAV",
+        RemoteProtocol::WebDav,
+        RemoteHost::new(RemoteProtocol::WebDav, "127.0.0.1").unwrap(),
+        Some(webdav_port),
+        "/folder ",
+        None::<&str>,
+        None,
+        SecurityPolicy::PlaintextConfirmed,
+        None,
+    )
+    .unwrap();
+    block_on(tester.test(&webdav, CancellationToken::new())).unwrap();
+    let request = webdav_server.join().unwrap();
+    assert!(request.starts_with("PROPFIND /folder%20 HTTP/1.1\r\n"));
+    assert!(request.contains("Depth: 0\r\n"));
+}
+
+fn read_ftp_command(stream: &mut std::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+fn run_native_root_probe(server_certificate: Vec<u8>, server_key: Vec<u8>) {
+    let listener = block_on(async_net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_key = futures_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+        futures_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(server_key),
+    );
+    let provider = Arc::new(futures_rustls::rustls::crypto::ring::default_provider());
+    let server_config = futures_rustls::rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![futures_rustls::rustls::pki_types::CertificateDer::from(
+                server_certificate,
+            )],
+            server_key,
+        )
+        .unwrap();
+    let server = std::thread::spawn(move || {
+        block_on(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = futures_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let mut request = vec![0; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+    });
+    let protocol = RemoteProtocol::Http;
+    let profile = ConnectionProfile::new(
+        ConnectionId::new("native-root").unwrap(),
+        "Native root",
+        protocol,
+        RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+        Some(port),
+        "/",
+        None::<&str>,
+        None,
+        SecurityPolicy::Tls(TlsPolicy::SystemRoots),
+        None,
+    )
+    .unwrap();
+    let tester = ProfileConnectionTester::new(ProtocolConnectionProbe::new(Arc::new(
+        StaticCredentialResolver,
+    )));
+    let result = block_on(tester.test(&profile, CancellationToken::new()));
+    server.join().unwrap();
+    result.unwrap();
+}
+
 #[derive(Clone, Default)]
 struct ManualRuntime {
     inner: Arc<ManualRuntimeInner>,
@@ -698,7 +1024,8 @@ struct ManualRuntime {
 #[derive(Default)]
 struct ManualRuntimeInner {
     now_ms: AtomicU64,
-    sleepers: Mutex<Vec<(u64, Waker)>>,
+    next_sleeper: AtomicU64,
+    sleepers: Mutex<Vec<(u64, u64, Waker)>>,
     changed: Condvar,
 }
 
@@ -708,7 +1035,7 @@ impl ManualRuntime {
         let now = self.inner.now_ms.fetch_add(delta, Ordering::AcqRel) + delta;
         let mut sleepers = self.inner.sleepers.lock().unwrap();
         let mut wake = Vec::new();
-        sleepers.retain(|(deadline, waker)| {
+        sleepers.retain(|(_, deadline, waker)| {
             if *deadline <= now {
                 wake.push(waker.clone());
                 false
@@ -734,7 +1061,7 @@ impl ManualRuntime {
         let mut sleepers = self.inner.sleepers.lock().unwrap();
         while !sleepers
             .iter()
-            .any(|(registered, _)| *registered == deadline)
+            .any(|(_, registered, _)| *registered == deadline)
         {
             sleepers = self.inner.changed.wait(sleepers).unwrap();
         }
@@ -748,22 +1075,57 @@ impl PoolRuntime for ManualRuntime {
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'_, ()> {
         let deadline = self.now().saturating_add(duration);
-        Box::pin(std::future::poll_fn(move |context| {
-            if self.now() >= deadline {
-                return std::task::Poll::Ready(());
-            }
-            let mut sleepers = self.inner.sleepers.lock().unwrap();
-            if let Some(entry) = sleepers
-                .iter_mut()
-                .find(|(registered, _)| *registered == deadline.as_millis() as u64)
-            {
-                entry.1 = context.waker().clone();
-            } else {
-                sleepers.push((deadline.as_millis() as u64, context.waker().clone()));
-                self.inner.changed.notify_all();
-            }
-            std::task::Poll::Pending
-        }))
+        let id = self.inner.next_sleeper.fetch_add(1, Ordering::AcqRel);
+        Box::pin(ManualSleep {
+            runtime: self.clone(),
+            deadline,
+            id,
+            registered: false,
+        })
+    }
+}
+
+struct ManualSleep {
+    runtime: ManualRuntime,
+    deadline: Duration,
+    id: u64,
+    registered: bool,
+}
+
+impl Future for ManualSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.runtime.now() >= self.deadline {
+            return Poll::Ready(());
+        }
+        let mut sleepers = self.runtime.inner.sleepers.lock().unwrap();
+        if let Some((_, _, waker)) = sleepers.iter_mut().find(|(id, _, _)| *id == self.id) {
+            *waker = context.waker().clone();
+        } else {
+            sleepers.push((
+                self.id,
+                self.deadline.as_millis() as u64,
+                context.waker().clone(),
+            ));
+            self.runtime.inner.changed.notify_all();
+            drop(sleepers);
+            self.registered = true;
+        }
+        Poll::Pending
+    }
+}
+
+impl Drop for ManualSleep {
+    fn drop(&mut self) {
+        if self.registered {
+            self.runtime
+                .inner
+                .sleepers
+                .lock()
+                .unwrap()
+                .retain(|(id, _, _)| *id != self.id);
+        }
     }
 }
 
@@ -869,6 +1231,30 @@ fn pool(
         runtime,
         PoolLimits::default(),
     )
+    .unwrap()
+}
+
+fn remote_pool_worker_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
+        .filter(|name| name.trim().starts_with("musheen-remote"))
+        .count()
+}
+
+#[test]
+fn many_pools_share_one_maintenance_worker() {
+    let before = remote_pool_worker_threads();
+    let pools: Vec<_> = (0..32)
+        .map(|_| pool(FakeConnector::ready(), ManualRuntime::default()))
+        .collect();
+    let after = remote_pool_worker_threads();
+    assert!(
+        after.saturating_sub(before) <= 1,
+        "before={before}, after={after}"
+    );
+    drop(pools);
 }
 
 #[test]
@@ -913,15 +1299,18 @@ fn pool_waiters_are_fifo_and_cancellation_does_not_consume_the_next_wakeup() {
     let runtime = ManualRuntime::default();
     let connector = FakeConnector::ready();
     let limits = PoolLimits::new(Duration::from_secs(15), Duration::from_secs(60), 1, 1).unwrap();
-    let pool = Arc::new(ProviderPool::with_runtime(
-        profile(
-            RemoteProtocol::Sftp,
-            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
-        ),
-        connector,
-        runtime,
-        limits,
-    ));
+    let pool = Arc::new(
+        ProviderPool::with_runtime(
+            profile(
+                RemoteProtocol::Sftp,
+                SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            ),
+            connector,
+            runtime,
+            limits,
+        )
+        .unwrap(),
+    );
     let held = block_on(pool.acquire(CancellationToken::new())).unwrap();
     let order = Arc::new(Mutex::new(Vec::new()));
 
@@ -962,15 +1351,18 @@ fn dropping_queued_and_connecting_acquires_restores_fair_capacity() {
     let runtime = ManualRuntime::default();
     let connector = FakeConnector::ready();
     let limits = PoolLimits::new(Duration::from_secs(15), Duration::from_secs(60), 1, 1).unwrap();
-    let bounded_pool = Arc::new(ProviderPool::with_runtime(
-        profile(
-            RemoteProtocol::Sftp,
-            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
-        ),
-        connector,
-        runtime,
-        limits,
-    ));
+    let bounded_pool = Arc::new(
+        ProviderPool::with_runtime(
+            profile(
+                RemoteProtocol::Sftp,
+                SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            ),
+            connector,
+            runtime,
+            limits,
+        )
+        .unwrap(),
+    );
     let held = block_on(bounded_pool.acquire(CancellationToken::new())).unwrap();
     let mut dropped_head = Box::pin(bounded_pool.acquire(CancellationToken::new()));
     assert!(block_on(poll_once(dropped_head.as_mut())).is_none());
@@ -1033,7 +1425,8 @@ fn idle_connection_closes_at_deadline_without_another_acquire() {
         },
         runtime.clone(),
         PoolLimits::default(),
-    );
+    )
+    .unwrap();
     let lease = block_on(pool.acquire(CancellationToken::new())).unwrap();
     drop(lease);
     runtime.wait_for_sleeper_at(Duration::from_secs(60));
@@ -1049,7 +1442,7 @@ fn idle_connection_closes_at_deadline_without_another_acquire() {
 }
 
 #[test]
-fn dropping_pool_closes_idle_connection_and_joins_maintenance() {
+fn dropping_pool_closes_idle_connection_and_deregisters_maintenance() {
     let runtime = ManualRuntime::default();
     let drops = Arc::new(AtomicUsize::new(0));
     let pool = ProviderPool::with_runtime(
@@ -1062,7 +1455,8 @@ fn dropping_pool_closes_idle_connection_and_joins_maintenance() {
         },
         runtime,
         PoolLimits::default(),
-    );
+    )
+    .unwrap();
     drop(block_on(pool.acquire(CancellationToken::new())).unwrap());
     drop(pool);
     assert_eq!(drops.load(Ordering::Acquire), 1);

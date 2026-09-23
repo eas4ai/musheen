@@ -14,6 +14,7 @@ portal-backend = []
 [dependencies]
 alacritty_terminal.workspace = true
 async-channel.workspace = true
+async-executor.workspace = true
 async-io.workspace = true
 async-net.workspace = true
 ashpd.workspace = true
@@ -40,6 +41,7 @@ posix-acl.workspace = true
 proc-mounts.workspace = true
 rustix.workspace = true
 ring.workspace = true
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
@@ -52,7 +54,6 @@ tree_magic_mini.workspace = true
 ureq.workspace = true
 walkdir.workspace = true
 wax.workspace = true
-webpki-roots.workspace = true
 xattr.workspace = true
 xdg-mime.workspace = true
 zbus.workspace = true
@@ -62,3 +63,6 @@ zstd.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
