@@ -10,6 +10,7 @@ use musheen_core::{
 use std::fmt;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -413,6 +414,17 @@ impl fmt::Debug for ArchiveStore {
 }
 
 impl ArchiveStore {
+    pub fn from_local_path(
+        path: &Path,
+        label: impl Into<Box<str>>,
+        format: ArchiveFormat,
+        passwords: Arc<dyn ArchivePasswordProvider>,
+        limits: ArchiveLimits,
+    ) -> Result<Self, ArchiveError> {
+        let source = File::open(path).map_err(|_| ArchiveError::Io)?;
+        Self::from_file(source, label, format, passwords, limits)
+    }
+
     pub fn from_file(
         source: File,
         label: impl Into<Box<str>>,
@@ -895,6 +907,34 @@ fn store_error_to_archive(error: StoreError) -> ArchiveError {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn local_archive_path_opens_through_desktop_boundary() {
+        let file = NamedTempFile::new().unwrap();
+        let archive = ArchiveStore::from_local_path(
+            file.path(),
+            "fixture.zip",
+            ArchiveFormat::Zip,
+            Arc::new(|_: &PasswordRequest| Ok(None)),
+            ArchiveLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(archive.nesting_depth(), 0);
+    }
+
+    #[test]
+    fn missing_local_archive_path_reports_io_error() {
+        let temporary = tempfile::tempdir().unwrap();
+        let error = ArchiveStore::from_local_path(
+            &temporary.path().join("missing.zip"),
+            "missing.zip",
+            ArchiveFormat::Zip,
+            Arc::new(|_: &PasswordRequest| Ok(None)),
+            ArchiveLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ArchiveError::Io);
+    }
 
     #[test]
     fn archive_password_is_redacted_and_runs_secret_teardown() {

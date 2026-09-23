@@ -11,9 +11,11 @@ RUN apt-get update \
         libarchive-dev \
         libfontconfig1-dev \
         libfreetype6-dev \
+        libsmbclient-dev \
         libxcb1-dev \
         libxkbcommon-dev \
         libxkbcommon-x11-dev \
+        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add --toolchain 1.95.0 clippy rustfmt

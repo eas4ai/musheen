@@ -99,7 +99,6 @@ use native_theme::icons::FreedesktopLoader;
 use native_theme_gpui::{NativeTheme, geometry};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7384,10 +7383,9 @@ impl MusheenApp {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .ok_or_else(|| Box::<str>::from("the selected archive has no file name"))?;
-            let file = File::open(source).map_err(|error| error.to_string().into_boxed_str())?;
             let archive = Arc::new(
-                ArchiveStore::from_file(
-                    file,
+                ArchiveStore::from_local_path(
+                    source,
                     label.clone(),
                     format,
                     Arc::new(NoArchivePasswords),

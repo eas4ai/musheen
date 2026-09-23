@@ -75,9 +75,14 @@ fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
         rust_files_below(&crates_root.join(crate_name).join("src"), &mut rust_files);
         for file in rust_files {
             let source = fs::read_to_string(&file).expect("Rust source should be readable");
+            // Inline test modules at the end of source files may set up real
+            // filesystem fixtures without crossing the production boundary.
+            let production_source = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .map_or(source.as_str(), |(production, _)| production);
             if direct_filesystem_apis
                 .iter()
-                .any(|api| source.contains(api))
+                .any(|api| production_source.contains(api))
             {
                 violations.push(file);
             }

@@ -176,9 +176,11 @@ fn linux_build_installs_gpui_native_link_dependencies() {
         "libacl1-dev",
         "libfontconfig1-dev",
         "libfreetype6-dev",
+        "libsmbclient-dev",
         "libxcb1-dev",
         "libxkbcommon-dev",
         "libxkbcommon-x11-dev",
+        "pkg-config",
     ] {
         assert!(
             dockerfile.contains(package),
