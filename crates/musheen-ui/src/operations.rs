@@ -10,7 +10,9 @@ use gpui_kit::{AppContext, Context};
 use musheen_core::{ResourceLimits, StorePath};
 use musheen_desktop::StatusStore;
 use musheen_ops::{
-    ConflictDecision, ConflictRecord, JobId, JobState, MetadataChange, MetadataScope, OperationKind,
+    ConflictDecision, ConflictRecord, CreateRequest, DeleteTarget, JobId, JobState, MetadataChange,
+    MetadataScope, OperationKind, PermanentDeleteConfirmation, PermanentDeleteRequest,
+    RenameRequest,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -345,6 +347,101 @@ impl OperationHub {
         drop(status);
         self.persist_status();
         Ok(ids)
+    }
+
+    pub fn submit_create(&self, request: CreateRequest) -> Result<JobId, OperationHubError> {
+        let location = request.parent().clone();
+        let kind = match request.kind() {
+            musheen_ops::CreateKind::File => OperationKind::CreateFile,
+            musheen_ops::CreateKind::Directory => OperationKind::CreateDirectory,
+        };
+        let id = self.with_unreserved_queue([&location], |queue| queue.submit_create(request))?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                kind,
+                location,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(id)
+    }
+
+    pub fn submit_rename(&self, request: RenameRequest) -> Result<JobId, OperationHubError> {
+        let location = request.source().clone();
+        let id = self.with_unreserved_queue([&location], |queue| queue.submit_rename(request))?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                OperationKind::Rename,
+                location,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(id)
+    }
+
+    pub fn submit_trash(
+        &self,
+        targets: Vec<DeleteTarget>,
+    ) -> Result<Vec<JobId>, OperationHubError> {
+        let locations = targets
+            .iter()
+            .map(|target| target.path().clone())
+            .collect::<Vec<_>>();
+        let ids =
+            self.with_unreserved_queue(locations.iter(), |queue| queue.submit_trash(targets))?;
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?;
+        for (id, location) in ids.iter().copied().zip(locations) {
+            status.register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                OperationKind::Trash,
+                location,
+                Some(1),
+            )?;
+        }
+        drop(status);
+        self.persist_status();
+        Ok(ids)
+    }
+
+    pub fn submit_permanent_delete(
+        &self,
+        request: PermanentDeleteRequest,
+        confirmation: PermanentDeleteConfirmation,
+    ) -> Result<JobId, OperationHubError> {
+        let location = request.location().clone();
+        let item_count = request.targets().len() as u64;
+        let paths = request
+            .targets()
+            .iter()
+            .map(|target| target.path().clone())
+            .collect::<Vec<_>>();
+        let id = self.with_unreserved_queue(paths.iter(), |queue| {
+            queue.submit_permanent_delete(request, confirmation)
+        })?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                OperationKind::PermanentDelete,
+                location,
+                Some(item_count),
+            )?;
+        self.persist_status();
+        Ok(id)
     }
 
     pub fn pause(&self, id: JobId) -> Result<(), OperationHubError> {

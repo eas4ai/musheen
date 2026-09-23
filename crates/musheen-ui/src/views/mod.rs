@@ -21,6 +21,7 @@ use musheen_desktop::{
     FolderIdentity, FolderPreferenceCatalog, FolderSortDirection, FolderSortKey, FolderView,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
 
@@ -220,6 +221,7 @@ pub struct DirectoryViewModel {
     editing: Option<ItemId>,
     scroll_anchor: Option<ScrollAnchor>,
     complete: bool,
+    visible_order: RefCell<Option<Vec<usize>>>,
 }
 
 impl DirectoryViewModel {
@@ -234,10 +236,12 @@ impl DirectoryViewModel {
             editing: None,
             scroll_anchor: None,
             complete: false,
+            visible_order: RefCell::new(None),
         }
     }
 
     pub fn extend(&mut self, items: impl IntoIterator<Item = StoreItem>) {
+        self.invalidate_visible_order();
         let mut positions = self
             .items
             .iter()
@@ -256,6 +260,7 @@ impl DirectoryViewModel {
     }
 
     pub fn reset_items(&mut self) {
+        self.invalidate_visible_order();
         self.items.clear();
         self.selection.clear();
         self.editing = None;
@@ -284,23 +289,55 @@ impl DirectoryViewModel {
     }
 
     pub fn preferences_mut(&mut self) -> &mut ViewPreferences {
+        self.invalidate_visible_order();
         &mut self.preferences
     }
 
     #[must_use]
     pub fn visible_items(&self) -> Vec<&StoreItem> {
-        let mut items = self
+        self.ensure_visible_order();
+        self.visible_order
+            .borrow()
+            .as_ref()
+            .expect("visible order was populated")
+            .iter()
+            .map(|index| &self.items[*index])
+            .collect()
+    }
+
+    fn ensure_visible_order(&self) {
+        if self.visible_order.borrow().is_some() {
+            return;
+        }
+        let mut order = self
             .items
             .iter()
-            .filter(|item| {
+            .enumerate()
+            .filter(|(_, item)| {
                 self.preferences.show_hidden || !item.display_name().as_str().starts_with('.')
             })
+            .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        items.sort_by(|left, right| self.compare_items(left, right));
-        items
+        order.sort_by(|left, right| self.compare_items(&self.items[*left], &self.items[*right]));
+        *self.visible_order.borrow_mut() = Some(order);
+    }
+
+    /// Returns only the visible IDs addressed by `indices`. The cached order
+    /// avoids rebuilding or cloning the full sorted view during pointer drags.
+    #[must_use]
+    pub fn visible_item_ids_at(&self, indices: &[usize]) -> Vec<ItemId> {
+        self.ensure_visible_order();
+        let order = self.visible_order.borrow();
+        let order = order.as_ref().expect("visible order was populated");
+        indices
+            .iter()
+            .filter_map(|index| order.get(*index))
+            .map(|item_index| self.items[*item_index].id().clone())
+            .collect()
     }
 
     pub fn toggle_details_sort(&mut self, column: ColumnKey) {
+        self.invalidate_visible_order();
         let key = match column {
             ColumnKey::Name => SortKey::Name,
             ColumnKey::Size => SortKey::Size,
@@ -336,11 +373,47 @@ impl DirectoryViewModel {
         self.select_visible_range(range, mode);
     }
 
+    pub fn set_selected_ids(&mut self, ids: Vec<ItemId>) {
+        let ids = ids
+            .into_iter()
+            .filter(|id| self.item(id).is_some())
+            .collect();
+        self.selection.apply(ids, SelectionMode::Replace);
+        self.trim_unpinned();
+    }
+
+    pub fn rubber_band_select_indices(&mut self, indices: &[usize], mode: SelectionMode) {
+        let ids = self.visible_item_ids_at(indices);
+        self.selection.apply(ids, mode);
+        self.trim_unpinned();
+    }
+
     pub fn select_item(&mut self, id: ItemId, mode: SelectionMode) {
         if self.item(&id).is_some() {
             self.selection.apply(vec![id], mode);
             self.trim_unpinned();
         }
+    }
+
+    pub fn select_to_item(&mut self, id: &ItemId, mode: SelectionMode) {
+        let visible = self.visible_items();
+        let Some(end) = visible.iter().position(|item| item.id() == id) else {
+            return;
+        };
+        let original_anchor = self.selection.anchor().cloned();
+        let start = original_anchor
+            .as_ref()
+            .and_then(|anchor| visible.iter().position(|item| item.id() == anchor))
+            .unwrap_or(end);
+        let ids = visible[start.min(end)..=start.max(end)]
+            .iter()
+            .map(|item| item.id().clone())
+            .collect();
+        self.selection.apply(ids, mode);
+        if let Some(anchor) = original_anchor {
+            self.selection.restore_anchor(anchor);
+        }
+        self.trim_unpinned();
     }
 
     #[must_use]
@@ -445,6 +518,7 @@ impl DirectoryViewModel {
     }
 
     fn remove(&mut self, id: &ItemId) {
+        self.invalidate_visible_order();
         let removed = self.items.iter().position(|item| item.id() == id);
         self.items.retain(|item| item.id() != id);
         self.selection.remove(id);
@@ -474,6 +548,7 @@ impl DirectoryViewModel {
         if unpinned <= self.retention_limit {
             return;
         }
+        self.invalidate_visible_order();
         self.items.retain(|item| {
             if pinned.contains(item.id()) || unpinned <= self.retention_limit {
                 true
@@ -501,5 +576,9 @@ impl DirectoryViewModel {
         self.selection.contains(id)
             || self.editing.as_ref() == Some(id)
             || self.scroll_anchor.as_ref().map(ScrollAnchor::item) == Some(id)
+    }
+
+    fn invalidate_visible_order(&mut self) {
+        *self.visible_order.get_mut() = None;
     }
 }

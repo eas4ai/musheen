@@ -11,9 +11,7 @@ use crate::dialogs::{
     install_open_with_key_bindings, install_properties_key_bindings, open_with_window_options,
     properties_window_options,
 };
-use crate::directory::{
-    ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
-};
+use crate::directory::{ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState};
 use crate::elevated_browser::{PrivilegeBackend, RootedFilesystemStore, SystemPrivilegeBackend};
 use crate::i18n::{Catalog, Locale};
 use crate::icons::{ApplicationIdentity, ContentIdentity, freedesktop_icon_name};
@@ -56,10 +54,11 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Root, Selectable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, AnyWindowHandle, App, AppContext, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Global, ImageSource, IntoElement, KeyBinding, MouseButton, Pixels,
-    Point, Render, Role, SharedString, Subscription, TestSupportExt, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowId, WindowOptions, div, img, px, size, uniform_list,
+    AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, Context, DismissEvent,
+    Entity, EventEmitter, FocusHandle, Focusable, Global, ImageSource, IntoElement, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role,
+    SharedString, Subscription, TestSupportExt, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowId, WindowOptions, canvas, div, fill, img, point, px, size, uniform_list,
 };
 use musheen_core::{
     ActiveLayout, CancellationToken, CapabilityKind, CapabilityReason, CapabilityState,
@@ -86,7 +85,8 @@ use musheen_desktop::{
 use musheen_local::LocalStore;
 use musheen_ops::{
     ApplyScope, ConflictChoice, ConflictDecision, ConflictItemKind, ConflictPolicies,
-    ConflictRecord, EventGeneration, JobId, MutationError, MutationProvider, OperationKind,
+    ConflictRecord, CreateRequest, DeleteTarget, EventGeneration, JobId, MutationError,
+    MutationProvider, OperationKind, PermanentDeleteRequest, RenameRequest,
 };
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
@@ -148,6 +148,7 @@ const GRID_GAP: f32 = 8.0;
 const SESSION_SAVE_DELAY: Duration = Duration::from_millis(250);
 const OPERATION_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
 const XATTR_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
+const DIRECTORY_BROWSER_RETENTION: usize = 100_000;
 
 #[cfg(test)]
 type CommandDispatchProbe = Arc<Mutex<Vec<(Box<str>, bool)>>>;
@@ -181,6 +182,9 @@ gpui_kit::actions!(
         OpenContextMenuShortcut,
         FocusNextDirectoryItem,
         FocusPreviousDirectoryItem,
+        ActivateDirectoryItem,
+        ExtendNextDirectoryItem,
+        ExtendPreviousDirectoryItem,
         ToggleTerminalDrawer,
     ]
 );
@@ -235,6 +239,17 @@ fn install_navigation_key_bindings(cx: &mut App) {
         KeyBinding::new("menu", OpenContextMenuShortcut, None),
         KeyBinding::new("down", FocusNextDirectoryItem, Some("DirectoryContent")),
         KeyBinding::new("up", FocusPreviousDirectoryItem, Some("DirectoryContent")),
+        KeyBinding::new(
+            "shift-down",
+            ExtendNextDirectoryItem,
+            Some("DirectoryContent"),
+        ),
+        KeyBinding::new(
+            "shift-up",
+            ExtendPreviousDirectoryItem,
+            Some("DirectoryContent"),
+        ),
+        KeyBinding::new("enter", ActivateDirectoryItem, Some("DirectoryContent")),
         KeyBinding::new("f4", ToggleTerminalDrawer, None),
     ]);
 }
@@ -265,6 +280,110 @@ struct ItemRenderSpec {
 struct FileDragPreview {
     label: String,
     position: Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct RubberBandGesture {
+    tab_id: TabId,
+    start: Point<Pixels>,
+    current: Point<Pixels>,
+    base_selection: Vec<ItemId>,
+    mode: SelectionMode,
+    moved: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RubberBandSurface {
+    bounds: Bounds<Pixels>,
+    layout: Layout,
+    item_count: usize,
+    columns: usize,
+    top_inset: f32,
+}
+
+fn normalized_pointer_bounds(start: Point<Pixels>, end: Point<Pixels>) -> Bounds<Pixels> {
+    let left = start.x.as_f32().min(end.x.as_f32());
+    let top = start.y.as_f32().min(end.y.as_f32());
+    let right = start.x.as_f32().max(end.x.as_f32());
+    let bottom = start.y.as_f32().max(end.y.as_f32());
+    Bounds::from_corners(point(px(left), px(top)), point(px(right), px(bottom)))
+}
+
+fn rubber_band_indices(
+    selection: Bounds<Pixels>,
+    surface: Bounds<Pixels>,
+    layout: Layout,
+    item_count: usize,
+    columns: usize,
+    top_inset: f32,
+) -> Vec<usize> {
+    if item_count == 0 {
+        return Vec::new();
+    }
+    let content_left = surface.left().as_f32() + 16.0;
+    let content_top = surface.top().as_f32() + top_inset;
+    let selection_top = selection.top().as_f32();
+    let selection_bottom = selection.bottom().as_f32();
+    let first_row;
+    let last_row;
+    let row_height;
+    match layout {
+        Layout::Details | Layout::List | Layout::Columns => {
+            row_height = 36.0;
+            first_row = ((selection_top - content_top) / row_height)
+                .floor()
+                .max(0.0) as usize;
+            last_row = ((selection_bottom - content_top) / row_height)
+                .floor()
+                .max(0.0) as usize;
+            return (first_row..=last_row.min(item_count.saturating_sub(1)))
+                .filter(|index| {
+                    let item = Bounds::new(
+                        point(
+                            px(content_left),
+                            px(content_top + *index as f32 * row_height),
+                        ),
+                        size(px((surface.size.width.as_f32() - 32.0).max(0.0)), px(34.0)),
+                    );
+                    selection.intersects(&item)
+                })
+                .collect();
+        }
+        Layout::Cards | Layout::Grid | Layout::Adaptive => {
+            row_height = 116.0;
+            first_row = ((selection_top - content_top) / row_height)
+                .floor()
+                .max(0.0) as usize;
+            last_row = ((selection_bottom - content_top) / row_height)
+                .floor()
+                .max(0.0) as usize;
+        }
+    }
+    let columns = columns.max(1);
+    let item_width = if layout == Layout::Cards {
+        240.0
+    } else {
+        128.0
+    };
+    let gap = 8.0;
+    (first_row..=last_row.min(item_count.saturating_sub(1) / columns))
+        .flat_map(|row| {
+            (0..columns).filter_map(move |column| {
+                let index = row * columns + column;
+                (index < item_count).then_some((index, column))
+            })
+        })
+        .filter_map(|(index, column)| {
+            let item = Bounds::new(
+                point(
+                    px(content_left + column as f32 * (item_width + gap)),
+                    px(content_top + (index / columns) as f32 * row_height),
+                ),
+                size(px(item_width), px(108.0)),
+            );
+            selection.intersects(&item).then_some(index)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +506,18 @@ struct PendingDrop {
     decisions: Vec<ConflictDecision>,
     policies: ConflictPolicies,
     automatic_scope: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardAction {
+    Copy,
+    Cut,
+}
+
+#[derive(Clone, Debug)]
+struct FileClipboard {
+    targets: Vec<CommandTargetRef>,
+    action: ClipboardAction,
 }
 
 struct PendingRestore {
@@ -1303,6 +1434,109 @@ impl Render for ContextReviewDialog {
 enum VolumeUnlockEvent {
     Submitted(Box<str>),
     Cancelled,
+}
+
+#[derive(Clone, Debug)]
+enum NameOperation {
+    Create {
+        parent: StorePath,
+        kind: musheen_ops::CreateKind,
+    },
+    Rename(CommandTargetRef),
+}
+
+#[derive(Clone)]
+enum NameOperationEvent {
+    Submitted(String),
+    Cancelled,
+}
+
+struct NameOperationDialog {
+    title: SharedString,
+    input: Entity<InputState>,
+    focus: FocusHandle,
+    pending_focus: bool,
+    empty: bool,
+}
+
+impl EventEmitter<NameOperationEvent> for NameOperationDialog {}
+
+impl NameOperationDialog {
+    fn new(
+        title: impl Into<SharedString>,
+        initial: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial.into()));
+        Self {
+            title: title.into(),
+            input,
+            focus: cx.focus_handle(),
+            pending_focus: true,
+            empty: false,
+        }
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.input.read(cx).value().to_string();
+        if name.is_empty() {
+            self.empty = true;
+            cx.notify();
+            return;
+        }
+        cx.emit(NameOperationEvent::Submitted(name));
+        window.defer(cx, |window, _| window.remove_window());
+    }
+}
+
+impl Render for NameOperationDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.input.update(cx, |input, cx| input.focus(window, cx));
+            self.pending_focus = false;
+        }
+        div()
+            .id("name-operation-dialog")
+            .test_support()
+            .key_context("NameOperationDialog")
+            .role(Role::Dialog)
+            .aria_label(self.title.clone())
+            .track_focus(&self.focus)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .on_action(cx.listener(|_, _: &Escape, window, cx| {
+                cx.emit(NameOperationEvent::Cancelled);
+                window.defer(cx, |window, _| window.remove_window());
+            }))
+            .child(div().text_lg().child(self.title.clone()))
+            .child(Input::new(&self.input).id("name-operation-input"))
+            .when(self.empty, |dialog| {
+                dialog.child(
+                    div()
+                        .id("name-operation-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .child("A name is required"),
+                )
+            })
+            .child(
+                Button::new("name-operation-submit")
+                    .label("Save")
+                    .primary()
+                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+            )
+            .child(
+                Button::new("name-operation-cancel")
+                    .label("Cancel")
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        cx.emit(NameOperationEvent::Cancelled);
+                        window.defer(cx, |window, _| window.remove_window());
+                    })),
+            )
+    }
 }
 
 struct VolumeUnlockDialog {
@@ -2623,6 +2857,10 @@ struct MusheenApp {
     command_dispatch_probe: Option<CommandDispatchProbe>,
     pending_restores: HashMap<WindowId, PendingRestore>,
     pending_drop: Option<PendingDrop>,
+    transfer_preflights: usize,
+    file_clipboard: Option<FileClipboard>,
+    pending_cut_jobs: std::collections::HashSet<musheen_ops::JobId>,
+    pending_paste_cut: bool,
     pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
     pending_context_menu: Option<ContextMenu>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
@@ -2632,6 +2870,7 @@ struct MusheenApp {
     context_dialog_windows: Vec<ContextDialogWindow>,
     context_dialog_close_subscription: Option<Subscription>,
     conflict_subscriptions: Vec<Subscription>,
+    rubber_band: Option<RubberBandGesture>,
 }
 
 impl Drop for MusheenApp {
@@ -3161,7 +3400,8 @@ impl MusheenApp {
         let focused_tab = navigation.focused_tab().id();
         let (catalog_binding, pins, tag_names) = Self::catalog_models(session_binding.as_ref());
         let mut directories = HashMap::new();
-        let mut directory = DirectoryModel::new(limits.snapshot());
+        let mut directory =
+            DirectoryModel::new_with_retention(limits.snapshot(), DIRECTORY_BROWSER_RETENTION);
         *directory.view_mut().preferences_mut() =
             navigation.focused_tab().view_preferences().clone();
         directories.insert(focused_tab, directory);
@@ -3328,16 +3568,27 @@ impl MusheenApp {
             command_dispatch_probe: None,
             pending_restores: HashMap::new(),
             pending_drop: None,
+            transfer_preflights: 0,
+            file_clipboard: None,
+            pending_cut_jobs: std::collections::HashSet::new(),
+            pending_paste_cut: false,
             pending_catalog_moves: HashMap::new(),
             pending_context_menu: None,
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
             context_dialog_close_subscription: None,
             conflict_subscriptions: Vec::new(),
+            rubber_band: None,
         };
         this.install_volume_properties_cleanup(cx);
         this.sync_catalog_projection();
-        this.start_load(location, cx);
+        // Construction runs before the GPUI entity can be upgraded by an
+        // async completion. Defer the first load until the entity is live so
+        // fast filesystems cannot finish and drop the initial result.
+        let startup_owner = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = startup_owner.update(cx, |this, cx| this.start_load(location, cx));
+        });
         this.start_operation_status_refresh(cx);
         this.start_pending_xattr_reconciliation(cx);
         // Production windows enable filesystem watching and consume the same
@@ -3490,7 +3741,10 @@ impl MusheenApp {
         }
         let trash = is_trash_location(&location);
         if !self.directories.contains_key(&tab_id) {
-            let mut directory = DirectoryModel::new(self.limits.snapshot());
+            let mut directory = DirectoryModel::new_with_retention(
+                self.limits.snapshot(),
+                DIRECTORY_BROWSER_RETENTION,
+            );
             if let Some(tab) = self.navigation.tab(tab_id) {
                 let base = self.navigation.preferences_for(tab.location()).clone();
                 *directory.view_mut().preferences_mut() = self.preferences_with_catalog(
@@ -3510,7 +3764,12 @@ impl MusheenApp {
         let load = self
             .directories
             .entry(tab_id)
-            .or_insert_with(|| DirectoryModel::new(self.limits.snapshot()))
+            .or_insert_with(|| {
+                DirectoryModel::new_with_retention(
+                    self.limits.snapshot(),
+                    DIRECTORY_BROWSER_RETENTION,
+                )
+            })
             .begin_navigation(location);
         if is_home_location(load.location()) {
             cx.notify();
@@ -3521,28 +3780,44 @@ impl MusheenApp {
             return;
         }
         self.trash_states.remove(&tab_id);
+        self.start_next_directory_page(tab_id, cx);
+        if self.watch_directories {
+            self.start_watch(tab_id, load, cx);
+        }
+    }
+
+    fn start_next_directory_page(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let Some((load, request)) = self
+            .directories
+            .get_mut(&tab_id)
+            .and_then(DirectoryModel::begin_page)
+        else {
+            return;
+        };
         let worker_load = load.clone();
         let result_load = load.clone();
         let store = Arc::clone(&self.store);
-        let limits = self.limits.snapshot();
         let work = cx.background_spawn(async move {
-            enumerate_directory(store.as_ref(), &worker_load, &limits).await
+            worker_load.cancellation().check()?;
+            store
+                .read_directory(
+                    worker_load.location(),
+                    request,
+                    worker_load.cancellation().clone(),
+                )
+                .await
         });
-
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let Some(this) = this.upgrade() else {
                 return;
             };
             this.update(cx, |state, cx| {
-                state.apply_directory_result(tab_id, &result_load, result);
+                state.apply_directory_page_result(tab_id, &result_load, result, cx);
                 cx.notify();
             });
         })
         .detach();
-        if self.watch_directories {
-            self.start_watch(tab_id, load, cx);
-        }
     }
 
     fn start_trash_load(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
@@ -3605,8 +3880,13 @@ impl MusheenApp {
                     return;
                 };
                 this.update(cx, |state, cx| {
+                    let invalidated = matches!(event, WatchEvent::Invalidated { .. });
                     if state.apply_watch_event(tab_id, &load, event) {
-                        state.continue_watch(tab_id, load, watcher, cx);
+                        if invalidated {
+                            state.start_load_for_tab(tab_id, load.location().clone(), cx);
+                        } else {
+                            state.continue_watch(tab_id, load, watcher, cx);
+                        }
                         cx.notify();
                     }
                 });
@@ -3632,8 +3912,13 @@ impl MusheenApp {
                     return;
                 };
                 this.update(cx, |state, cx| {
+                    let invalidated = matches!(event, WatchEvent::Invalidated { .. });
                     if state.apply_watch_event(tab_id, &load, event) {
-                        state.continue_watch(tab_id, load, watcher, cx);
+                        if invalidated {
+                            state.start_load_for_tab(tab_id, load.location().clone(), cx);
+                        } else {
+                            state.continue_watch(tab_id, load, watcher, cx);
+                        }
                         cx.notify();
                     }
                 });
@@ -3672,45 +3957,67 @@ impl MusheenApp {
         applied
     }
 
-    fn apply_directory_result(
+    fn apply_directory_page_result(
         &mut self,
         tab_id: TabId,
         load: &DirectoryLoad,
-        result: Result<Vec<Page<StoreItem>>, StoreError>,
+        result: Result<Page<StoreItem>, StoreError>,
+        cx: &mut Context<Self>,
     ) {
         let Some(directory) = self.directories.get_mut(&tab_id) else {
             return;
         };
         match result {
-            Ok(pages) => {
-                for page in pages {
-                    if directory.apply_page(load, page) == ApplyPageResult::Stale {
-                        return;
-                    }
-                }
-                let items = directory.items().to_vec();
-                let observation = if directory.view().is_complete() {
-                    DirectoryObservation::Complete
-                } else {
-                    DirectoryObservation::Partial
-                };
-                if let Err(error) =
-                    self.catalog_binding
-                        .reconcile_directory(load.location(), &items, observation)
-                {
-                    self.operation_error = Some(error);
-                }
-                self.remember_folder_location(load.location());
-                self.apply_pending_file_manager_selection(tab_id);
-            }
-            Err(error) => {
-                if !directory.apply_error(load, error.to_string()) {
+            Ok(page) => {
+                let page_items = page.items().to_vec();
+                if directory.apply_page(load, page) == ApplyPageResult::Stale {
                     return;
                 }
-                if let Some(pending) = self.pending_file_manager_selections.remove(&tab_id) {
-                    pending
-                        .completion
-                        .complete_one(Err(musheen_desktop::FileManagerError::Unreachable));
+                let complete = directory.view().is_complete();
+                let items = if complete {
+                    directory.items().to_vec()
+                } else {
+                    page_items
+                };
+                self.remember_folder_location(load.location());
+                self.apply_pending_file_manager_selection(tab_id);
+
+                // Catalog persistence can involve xattrs and fsync. Keep it
+                // outside GPUI's render thread even for very large folders.
+                let binding = self.catalog_binding.clone();
+                let location = load.location().clone();
+                let work = cx.background_spawn(async move {
+                    binding.reconcile_directory(
+                        &location,
+                        &items,
+                        if complete {
+                            DirectoryObservation::Complete
+                        } else {
+                            DirectoryObservation::Partial
+                        },
+                    )
+                });
+                cx.spawn(async move |this, cx| {
+                    let result = work.await;
+                    let Some(this) = this.upgrade() else {
+                        return;
+                    };
+                    if let Err(error) = result {
+                        this.update(cx, |state, cx| {
+                            state.operation_error = Some(error);
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+            }
+            Err(StoreError::Cancelled) => directory.page_failed(load),
+            Err(error) => {
+                directory.page_failed(load);
+                if directory.items().is_empty() {
+                    directory.apply_error(load, error.to_string());
+                } else {
+                    self.operation_error = Some(error.to_string().into());
                 }
             }
         }
@@ -4666,6 +4973,16 @@ impl MusheenApp {
     }
 
     fn select_item(&mut self, tab_id: TabId, id: ItemId, cx: &mut Context<Self>) {
+        self.select_item_with_mode(tab_id, id, SelectionMode::Replace, cx);
+    }
+
+    fn select_item_with_mode(
+        &mut self,
+        tab_id: TabId,
+        id: ItemId,
+        mode: SelectionMode,
+        cx: &mut Context<Self>,
+    ) {
         if !self.context_dialog_windows.is_empty() {
             return;
         }
@@ -4673,7 +4990,13 @@ impl MusheenApp {
             let Some(directory) = self.directories.get_mut(&tab_id) else {
                 return;
             };
-            directory.view_mut().select_item(id, SelectionMode::Replace);
+            if mode == SelectionMode::Add {
+                directory
+                    .view_mut()
+                    .select_to_item(&id, SelectionMode::Replace);
+            } else {
+                directory.view_mut().select_item(id, mode);
+            }
             directory.view().selected_ids().to_vec()
         };
         if let Some(tab) = self.navigation.tab_mut(tab_id) {
@@ -4682,6 +5005,112 @@ impl MusheenApp {
         self.refresh_info_pane(tab_id, cx);
         self.schedule_session_save(cx);
         cx.notify();
+    }
+
+    fn begin_rubber_band(
+        &mut self,
+        tab_id: TabId,
+        position: Point<Pixels>,
+        modifiers: gpui_kit::Modifiers,
+    ) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
+        let base_selection = self
+            .directories
+            .get(&tab_id)
+            .map(|directory| directory.view().selected_ids().to_vec())
+            .unwrap_or_default();
+        let mode = if modifiers.shift {
+            SelectionMode::Add
+        } else if modifiers.secondary() {
+            SelectionMode::Toggle
+        } else {
+            SelectionMode::Replace
+        };
+        self.rubber_band = Some(RubberBandGesture {
+            tab_id,
+            start: position,
+            current: position,
+            base_selection,
+            mode,
+            moved: false,
+        });
+    }
+
+    fn cancel_rubber_band(&mut self, tab_id: TabId) {
+        if self
+            .rubber_band
+            .as_ref()
+            .is_some_and(|gesture| gesture.tab_id == tab_id)
+        {
+            self.rubber_band = None;
+        }
+    }
+
+    fn update_rubber_band(
+        &mut self,
+        tab_id: TabId,
+        position: Point<Pixels>,
+        surface: RubberBandSurface,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(gesture) = self
+            .rubber_band
+            .as_mut()
+            .filter(|gesture| gesture.tab_id == tab_id)
+        else {
+            return;
+        };
+        gesture.current = position;
+        let distance = (gesture.start.x.as_f32() - position.x.as_f32()).abs()
+            + (gesture.start.y.as_f32() - position.y.as_f32()).abs();
+        if !gesture.moved && distance < 4.0 {
+            return;
+        }
+        gesture.moved = true;
+        let selection = normalized_pointer_bounds(gesture.start, gesture.current);
+        let indices = rubber_band_indices(
+            selection,
+            surface.bounds,
+            surface.layout,
+            surface.item_count,
+            surface.columns,
+            surface.top_inset,
+        );
+        let base_selection = gesture.base_selection.clone();
+        let mode = gesture.mode;
+        let selected = {
+            let Some(directory) = self.directories.get_mut(&tab_id) else {
+                return;
+            };
+            if mode == SelectionMode::Replace {
+                directory.view_mut().set_selected_ids(Vec::new());
+            } else {
+                directory.view_mut().set_selected_ids(base_selection);
+            }
+            directory
+                .view_mut()
+                .rubber_band_select_indices(&indices, mode);
+            directory.view().selected_ids().to_vec()
+        };
+        if let Some(tab) = self.navigation.tab_mut(tab_id) {
+            tab.set_selection(selected);
+        }
+        self.refresh_info_pane(tab_id, cx);
+        cx.notify();
+    }
+
+    fn finish_rubber_band(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        if self
+            .rubber_band
+            .as_ref()
+            .is_some_and(|gesture| gesture.tab_id == tab_id)
+        {
+            self.rubber_band = None;
+            self.schedule_session_save(cx);
+            cx.notify();
+        }
     }
 
     fn focus_directory_item(&mut self, tab_id: TabId, id: Option<ItemId>, cx: &mut Context<Self>) {
@@ -4698,6 +5127,15 @@ impl MusheenApp {
     }
 
     fn move_directory_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.move_directory_focus_with_selection(delta, false, cx);
+    }
+
+    fn move_directory_focus_with_selection(
+        &mut self,
+        delta: isize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !self.context_dialog_windows.is_empty() {
             return;
         }
@@ -4741,8 +5179,58 @@ impl MusheenApp {
             .map(|index| (index as isize + delta).clamp(0, items.len() as isize - 1) as usize)
             .unwrap_or_else(|| if delta < 0 { items.len() - 1 } else { 0 });
         let next = items[index].id().clone();
-        directory.view_mut().focus_item(Some(next));
+        drop(items);
+        directory.view_mut().focus_item(Some(next.clone()));
+        if extend {
+            directory
+                .view_mut()
+                .select_to_item(&next, SelectionMode::Replace);
+        } else {
+            directory
+                .view_mut()
+                .select_item(next, SelectionMode::Replace);
+        }
+        let selected = directory.view().selected_ids().to_vec();
+        if let Some(tab) = self.navigation.tab_mut(tab_id) {
+            tab.set_selection(selected);
+        }
         cx.notify();
+    }
+
+    fn activate_focused_directory_item(&mut self, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        let Some(id) = self
+            .directories
+            .get(&tab_id)
+            .and_then(|directory| directory.view().focused_item_id().cloned())
+        else {
+            return;
+        };
+        self.activate_directory_item(tab_id, id, cx);
+    }
+
+    fn activate_directory_item(&mut self, tab_id: TabId, id: ItemId, cx: &mut Context<Self>) {
+        let Some(item) = self
+            .directories
+            .get(&tab_id)
+            .and_then(|directory| directory.view().item(&id))
+            .cloned()
+        else {
+            return;
+        };
+        if item.kind() == ItemKind::Directory {
+            if self.navigation.focused_tab().id() != tab_id {
+                self.activate_tab(tab_id, cx);
+            }
+            self.navigate(item.path().clone(), true, cx);
+        } else if let Ok(target) = CommandTargetRef::new(item.id().clone(), item.path().clone()) {
+            self.dispatch_local_target_command(
+                &CommandAction::Open,
+                &CommandParameters::targets(vec![target]),
+                Some(tab_id),
+                cx,
+            );
+        }
     }
 
     /// Builds a menu request from the pane that received the pointer event.
@@ -5405,6 +5893,7 @@ impl MusheenApp {
                     .is_some_and(SessionBinding::can_append_window),
             can_split_pane: self.navigation.can_split(),
             can_focus_next_pane: self.navigation.panes().len() > 1,
+            clipboard_has_contents: self.file_clipboard.is_some(),
             target: item_target,
             item_count,
             selection_count: selection.len(),
@@ -5470,7 +5959,6 @@ impl MusheenApp {
                     })
                     .collect(),
             ),
-            ..CommandContext::default()
         }
     }
 
@@ -6107,6 +6595,73 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         match (&action, &parameters) {
+            (
+                clipboard_action @ (CommandAction::Copy | CommandAction::Cut),
+                CommandParameters::Targets(targets),
+            ) => {
+                self.file_clipboard = Some(FileClipboard {
+                    targets: targets.clone(),
+                    action: if *clipboard_action == CommandAction::Cut {
+                        ClipboardAction::Cut
+                    } else {
+                        ClipboardAction::Copy
+                    },
+                });
+                self.operation_error = None;
+                cx.notify();
+            }
+            (CommandAction::PasteInto, CommandParameters::Location(destination)) => {
+                self.paste_file_clipboard(destination.clone(), cx);
+            }
+            (
+                create_action @ (CommandAction::NewDirectory | CommandAction::NewEmptyFile),
+                CommandParameters::Location(parent),
+            ) => {
+                self.open_name_operation(
+                    NameOperation::Create {
+                        parent: parent.clone(),
+                        kind: if *create_action == CommandAction::NewDirectory {
+                            musheen_ops::CreateKind::Directory
+                        } else {
+                            musheen_ops::CreateKind::File
+                        },
+                    },
+                    String::new(),
+                    origin_tab,
+                    cx,
+                );
+            }
+            (CommandAction::Rename, CommandParameters::Targets(targets)) => {
+                if let Some(target) = targets.first().filter(|_| targets.len() == 1) {
+                    let initial = target
+                        .path()
+                        .as_unix_path()
+                        .and_then(Path::file_name)
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.open_name_operation(
+                        NameOperation::Rename(target.clone()),
+                        initial,
+                        origin_tab,
+                        cx,
+                    );
+                }
+            }
+            (
+                delete_action @ (CommandAction::MoveToTrash | CommandAction::DeletePermanently),
+                CommandParameters::Targets(targets),
+            ) => {
+                if *delete_action == CommandAction::DeletePermanently && !confirmed {
+                    self.operation_error = Some("permanent deletion requires confirmation".into());
+                    cx.notify();
+                } else {
+                    self.submit_delete_targets(
+                        targets.clone(),
+                        *delete_action == CommandAction::DeletePermanently,
+                        cx,
+                    );
+                }
+            }
             (CommandAction::CustomAction, CommandParameters::CustomAction { .. }) => {
                 self.run_custom_action(parameters, origin_tab, confirmed, cx);
             }
@@ -6154,11 +6709,6 @@ impl MusheenApp {
                     destination,
                 },
             ) => {
-                if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-                    self.operation_error = Some(error);
-                    cx.notify();
-                    return;
-                }
                 let drop_action = if matches!(action, CommandAction::CopyTo | CommandAction::SendTo)
                 {
                     DropAction::Copy
@@ -6193,6 +6743,8 @@ impl MusheenApp {
             ) => self.dispatch_privilege_action(*action, targets, origin_tab, confirmed, cx),
             (
                 action @ (CommandAction::Open
+                | CommandAction::OpenInNewTab
+                | CommandAction::OpenInOtherPane
                 | CommandAction::OpenWith
                 | CommandAction::SetDefaultApplication
                 | CommandAction::ChooseApplication
@@ -6494,6 +7046,51 @@ impl MusheenApp {
             }
             _ => unreachable!("the caller accepts only target-based commands"),
         };
+        if matches!(
+            action,
+            CommandAction::Open | CommandAction::OpenInNewTab | CommandAction::OpenInOtherPane
+        ) && targets.len() == 1
+            && origin_tab
+                .and_then(|tab| self.directories.get(&tab))
+                .and_then(|directory| directory.view().item(targets[0].id()))
+                .is_some_and(|item| {
+                    item.path() == targets[0].path() && item.kind() == ItemKind::Directory
+                })
+        {
+            let location = targets[0].path().clone();
+            match action {
+                CommandAction::Open => {
+                    if let Some(tab_id) = origin_tab
+                        && self.navigation.focused_tab().id() != tab_id
+                    {
+                        self.activate_tab(tab_id, cx);
+                    }
+                    self.navigate(location, true, cx);
+                }
+                CommandAction::OpenInNewTab => {
+                    if let Ok(tab_id) = self.navigation.new_tab(location.clone()) {
+                        self.start_load_for_tab(tab_id, location, cx);
+                        self.schedule_session_save(cx);
+                    }
+                }
+                CommandAction::OpenInOtherPane => {
+                    let current = self.navigation.focused_pane_id();
+                    let other = self
+                        .navigation
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.id() != current)
+                        .map(|pane| pane.id())
+                        .or_else(|| self.navigation.split_focused(location.clone()).ok());
+                    if let Some(pane) = other {
+                        let _ = self.navigation.focus_pane(pane);
+                        self.navigate(location, true, cx);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            return;
+        }
         if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
             self.operation_error = Some(error);
             cx.notify();
@@ -6661,6 +7258,97 @@ impl MusheenApp {
             return;
         }
         self.perform_volume_action(id, volume_action, usage, None, cx);
+    }
+
+    fn open_name_operation(
+        &mut self,
+        operation: NameOperation,
+        initial: String,
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match &operation {
+            NameOperation::Create {
+                kind: musheen_ops::CreateKind::Directory,
+                ..
+            } => "New Folder",
+            NameOperation::Create {
+                kind: musheen_ops::CreateKind::File,
+                ..
+            } => "New Empty File",
+            NameOperation::Rename(_) => "Rename",
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(440.), px(220.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.into()),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(360.), px(190.))),
+            ..WindowOptions::default()
+        };
+        let mut dialog = None;
+        let handle = cx
+            .open_window(options, |window, cx| {
+                let view =
+                    cx.new(|cx| NameOperationDialog::new(title, initial.clone(), window, cx));
+                dialog = Some(view.clone());
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .expect("Musheen could not open the file-name dialog");
+        self.track_context_dialog_window(handle.window_id(), origin_tab, cx);
+        let dialog = dialog.expect("the file-name dialog constructs its view");
+        let subscription = cx.subscribe(&dialog, move |this, _, event, cx| {
+            if let NameOperationEvent::Submitted(name) = event {
+                this.submit_name_operation(operation.clone(), name.clone(), cx);
+            }
+        });
+        self.conflict_subscriptions.push(subscription);
+    }
+
+    fn submit_name_operation(
+        &mut self,
+        operation: NameOperation,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let hub = self.operation_hub.clone();
+        let work = cx.background_spawn(async move {
+            match operation {
+                NameOperation::Create { parent, kind } => hub
+                    .submit_create(CreateRequest::new(parent, name.into(), kind))
+                    .map_err(|error| Box::<str>::from(error.to_string())),
+                NameOperation::Rename(target) => {
+                    let mut store = LocalStore::new();
+                    let identity = MutationProvider::identity(&mut store, target.path())
+                        .map_err(|error| Box::<str>::from(error.to_string()))?
+                        .ok_or_else(|| Box::<str>::from("the selected item no longer exists"))?;
+                    hub.submit_rename(RenameRequest::new(
+                        target.path().clone(),
+                        name.into(),
+                        identity.into_vec(),
+                    ))
+                    .map_err(|error| Box::<str>::from(error.to_string()))
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(_) => {
+                    state.operation_error = state.operation_hub.persistence_error();
+                    state.pump_operation_queue(cx);
+                }
+                Err(error) => {
+                    state.operation_error = Some(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn open_volume_unlock(&mut self, id: VolumeId, cx: &mut Context<Self>) {
@@ -7233,6 +7921,8 @@ impl MusheenApp {
                 | CommandAction::Unpin
                 | CommandAction::ManageTags
                 | CommandAction::Open
+                | CommandAction::OpenInNewTab
+                | CommandAction::OpenInOtherPane
                 | CommandAction::OpenWith
                 | CommandAction::ChooseApplication
                 | CommandAction::SetDefaultApplication
@@ -7244,6 +7934,14 @@ impl MusheenApp {
                 | CommandAction::PowerOff
                 | CommandAction::OpenAsAdministrator
                 | CommandAction::RunAsAdministrator
+                | CommandAction::Copy
+                | CommandAction::Cut
+                | CommandAction::PasteInto
+                | CommandAction::MoveToTrash
+                | CommandAction::DeletePermanently
+                | CommandAction::Rename
+                | CommandAction::NewDirectory
+                | CommandAction::NewEmptyFile
         ) {
             return CapabilityState::Supported;
         }
@@ -7330,16 +8028,17 @@ impl MusheenApp {
             return None;
         }
         let view = self.directories.get(&spec.tab_id)?.view();
-        let sources = if spec.selected {
+        let targets = if spec.selected {
             view.selected_ids()
                 .iter()
                 .filter_map(|id| view.item(id))
-                .map(|item| item.path().clone())
+                .map(|item| (item.path().clone(), item.id().clone()))
                 .collect()
         } else {
-            vec![spec.path.clone()]
+            vec![(spec.path.clone(), spec.id.clone())]
         };
-        FileDragPayload::new(sources, DropAction::Move).ok()
+        let (sources, identities) = targets.into_iter().unzip();
+        FileDragPayload::with_expected_identities(sources, identities, DropAction::Move).ok()
     }
 
     fn submit_file_drop(
@@ -7354,6 +8053,106 @@ impl MusheenApp {
         self.submit_reviewed_transfer(payload, target, cx);
     }
 
+    fn paste_file_clipboard(&mut self, destination: StorePath, cx: &mut Context<Self>) {
+        let Some(clipboard) = self.file_clipboard.clone() else {
+            return;
+        };
+        let action = match clipboard.action {
+            ClipboardAction::Copy => DropAction::Copy,
+            ClipboardAction::Cut => DropAction::Move,
+        };
+        let payload = FileDragPayload::with_expected_identities(
+            clipboard
+                .targets
+                .iter()
+                .map(|target| target.path().clone())
+                .collect(),
+            clipboard
+                .targets
+                .iter()
+                .map(|target| target.id().clone())
+                .collect(),
+            action,
+        );
+        match payload {
+            Ok(payload) => {
+                self.pending_paste_cut = clipboard.action == ClipboardAction::Cut;
+                self.submit_reviewed_transfer(payload, destination, cx);
+            }
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn submit_delete_targets(
+        &mut self,
+        targets: Vec<CommandTargetRef>,
+        permanent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = targets
+            .into_iter()
+            .map(|target| target.path().clone())
+            .collect::<Vec<_>>();
+        let work = cx.background_spawn(async move {
+            let mut store = LocalStore::new();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let identity = MutationProvider::identity(&mut store, &path)
+                        .map_err(|error| Box::<str>::from(error.to_string()))?
+                        .ok_or_else(|| Box::<str>::from("the selected item no longer exists"))?;
+                    Ok(DeleteTarget::new(path, identity.into_vec()))
+                })
+                .collect::<Result<Vec<_>, Box<str>>>()
+        });
+        let hub = self.operation_hub.clone();
+        cx.spawn(async move |this, cx| {
+            let prepared = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let submitted = prepared.and_then(|targets| {
+                    if permanent {
+                        let location = targets
+                            .first()
+                            .and_then(|target| target.path().as_unix_path())
+                            .and_then(Path::parent)
+                            .map(|path| StorePath::from_unix_path(path.as_os_str()))
+                            .ok_or_else(|| Box::<str>::from("delete location is unavailable"))?;
+                        let request = PermanentDeleteRequest::new(location.clone(), targets)
+                            .map_err(|error| Box::<str>::from(error.to_string()))?;
+                        let confirmation = request
+                            .challenge()
+                            .confirm(request.targets().len(), &location, true)
+                            .map_err(|error| Box::<str>::from(error.to_string()))?;
+                        hub.submit_permanent_delete(request, confirmation)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string().into())
+                    } else {
+                        hub.submit_trash(targets)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string().into())
+                    }
+                });
+                match submitted {
+                    Ok(()) => {
+                        state.operation_error = state.operation_hub.persistence_error();
+                        state.pump_operation_queue(cx);
+                    }
+                    Err(error) => {
+                        state.operation_error = Some(error);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn submit_reviewed_transfer(
         &mut self,
         payload: FileDragPayload,
@@ -7363,15 +8162,50 @@ impl MusheenApp {
         if self.pending_drop.is_some() {
             return;
         }
-        let conflicts = match self.operation_hub.conflicts_for_drop(&payload, &target) {
+        self.transfer_preflights = self.transfer_preflights.saturating_add(1);
+        let hub = self.operation_hub.clone();
+        let worker_payload = payload.clone();
+        let worker_target = target.clone();
+        let work = cx.background_spawn(async move {
+            hub.conflicts_for_drop(&worker_payload, &worker_target)
+                .map_err(|error| Box::<str>::from(error.to_string()))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.finish_transfer_preflight(payload, target, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_transfer_preflight(
+        &mut self,
+        payload: FileDragPayload,
+        target: StorePath,
+        result: Result<Vec<ConflictRecord>, Box<str>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.transfer_preflights = self.transfer_preflights.saturating_sub(1);
+        let conflicts = match result {
             Ok(conflicts) => conflicts,
             Err(error) => {
-                self.operation_error = Some(error.to_string().into());
+                self.pending_paste_cut = false;
+                self.operation_error = Some(error);
                 cx.notify();
                 return;
             }
         };
         if !conflicts.is_empty() {
+            if self.pending_drop.is_some() {
+                self.pending_paste_cut = false;
+                self.operation_error = Some("another file conflict is awaiting a decision".into());
+                cx.notify();
+                return;
+            }
             self.pending_drop = Some(PendingDrop {
                 conflict_window: None,
                 conflict_dialog: None,
@@ -7407,13 +8241,7 @@ impl MusheenApp {
             .iter()
             .enumerate()
             .map(|(index, source)| {
-                let source_identity = payload.expected_identity(index).cloned().or_else(|| {
-                    self.store
-                        .resolve_item(source)
-                        .ok()
-                        .flatten()
-                        .map(|item| item.id().clone())
-                })?;
+                let source_identity = payload.expected_identity(index).cloned()?;
                 Some(PendingCatalogMove {
                     source: source_identity,
                     source_path: source.clone(),
@@ -7431,15 +8259,22 @@ impl MusheenApp {
     ) {
         match submitted {
             Ok(ids) => {
+                if self.pending_paste_cut {
+                    self.pending_cut_jobs.extend(ids.iter().copied());
+                }
+                self.pending_paste_cut = false;
                 self.pending_catalog_moves.extend(
                     ids.into_iter()
                         .zip(catalog_moves)
                         .filter_map(|(id, movement)| movement.map(|movement| (id, movement))),
                 );
-                self.operation_error = self.operation_hub.persistence_error();
+                if let Some(error) = self.operation_hub.persistence_error() {
+                    self.operation_error = Some(error);
+                }
                 self.pump_operation_queue(cx);
             }
             Err(error) => {
+                self.pending_paste_cut = false;
                 self.operation_error = Some(error);
                 cx.notify();
             }
@@ -7604,6 +8439,21 @@ impl MusheenApp {
             self.operation_hub.clone(),
             cx,
             |state: &mut Self, id, outcome, error, cx| {
+                if state.pending_cut_jobs.remove(&id) {
+                    let moved = matches!(
+                        &outcome,
+                        Some(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
+                            _
+                        )))
+                    ) && error.is_none();
+                    if !moved {
+                        // Preserve the cut clipboard after any failed or
+                        // skipped move so the user can retry safely.
+                        state.pending_cut_jobs.clear();
+                    } else if state.pending_cut_jobs.is_empty() {
+                        state.file_clipboard = None;
+                    }
+                }
                 if let Some(error) = error {
                     state.operation_error = Some(error);
                 }
@@ -7612,7 +8462,9 @@ impl MusheenApp {
                     // A background completion refreshes the current tab; it
                     // must not steal focus restored when a review closes.
                     let pending_content_focus = state.pending_content_focus;
-                    state.load_focused_tab(cx);
+                    let tab_id = state.navigation.focused_tab().id();
+                    let location = state.navigation.focused_tab().location().clone();
+                    state.start_load_for_tab(tab_id, location, cx);
                     state.pending_content_focus = pending_content_focus;
                 } else {
                     state.pending_catalog_moves.remove(&id);
@@ -7648,6 +8500,7 @@ impl MusheenApp {
                 );
                 return;
             }
+            LocalOperationOutcome::Mutation => return,
         };
         let capabilities = self.store.capabilities(target.path());
         match self.catalog_binding.complete_move(
@@ -8958,6 +9811,7 @@ impl MusheenApp {
                                             })
                                             .selected(selected)
                                             .w_full()
+                                            .justify_start()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(tag) = activation_tag.as_deref() {
                                                     this.apply_tag_filter(tag, cx);
@@ -10260,42 +11114,57 @@ impl MusheenApp {
         } else {
             configured
         };
-        let item_count = self.filtered_items(tab_id).len();
+        // Snapshot the stable order once per render. Row virtualization must
+        // not re-filter and re-sort the entire directory for every row.
+        let visible_item_ids = Arc::new(
+            self.filtered_items(tab_id)
+                .into_iter()
+                .map(|item| item.id().clone())
+                .collect::<Vec<_>>(),
+        );
+        let item_count = visible_item_ids.len();
         let filter_label = self.filters.get(&tab_id).map(|filter| {
             filter.error.as_deref().map_or_else(
                 || format!("Filtered view — {item_count} matches"),
                 |error| format!("Filter error — {error}"),
             )
         });
+        let has_filter_summary = filter_label.is_some();
+        let base_columns = grid_column_count(window.viewport_size().width.as_f32());
+        let grid_columns = if layout == Layout::Cards {
+            base_columns.div_ceil(2)
+        } else {
+            base_columns
+        };
         let list =
             match layout {
-                Layout::Details | Layout::List | Layout::Columns => uniform_list(
-                    SharedString::from(format!("directory-items-list-{pane_index}")),
-                    item_count,
-                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                        let items = range
-                            .filter_map(|index| {
-                                this.item_render_spec(tab_id, pane_index, index, layout)
-                            })
-                            .collect::<Vec<_>>();
-                        items
-                            .into_iter()
-                            .map(|item| div().h(px(40.)).child(this.render_item(item, cx)))
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .w_full()
-                .flex_grow(1.0)
-                .min_h(px(0.))
-                .p_4()
-                .into_any_element(),
+                Layout::Details | Layout::List | Layout::Columns => {
+                    let item_ids = Arc::clone(&visible_item_ids);
+                    uniform_list(
+                        SharedString::from(format!("directory-items-list-{pane_index}")),
+                        item_count,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            let items = range
+                                .filter_map(|index| {
+                                    let id = item_ids.get(index)?;
+                                    this.item_render_spec(tab_id, pane_index, index, id, layout)
+                                })
+                                .collect::<Vec<_>>();
+                            items
+                                .into_iter()
+                                .map(|item| div().h(px(36.)).child(this.render_item(item, cx)))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .w_full()
+                    .flex_grow(1.0)
+                    .min_h(px(0.))
+                    .p_4()
+                    .into_any_element()
+                }
                 Layout::Cards | Layout::Grid | Layout::Adaptive => {
-                    let base_columns = grid_column_count(window.viewport_size().width.as_f32());
-                    let columns = if layout == Layout::Cards {
-                        base_columns.div_ceil(2)
-                    } else {
-                        base_columns
-                    };
+                    let item_ids = Arc::clone(&visible_item_ids);
+                    let columns = grid_columns;
                     uniform_list(
                         SharedString::from(format!("directory-items-grid-{pane_index}")),
                         grid_row_count(item_count, columns),
@@ -10303,7 +11172,8 @@ impl MusheenApp {
                             rows.map(|row| {
                                 let items = grid_item_range(row, item_count, columns)
                                     .filter_map(|index| {
-                                        this.item_render_spec(tab_id, pane_index, index, layout)
+                                        let id = item_ids.get(index)?;
+                                        this.item_render_spec(tab_id, pane_index, index, id, layout)
                                     })
                                     .collect::<Vec<_>>();
                                 div().h(px(116.)).flex().gap_2().children(
@@ -10326,12 +11196,72 @@ impl MusheenApp {
         } else {
             SharedString::from(format!("directory-items-{pane_index}"))
         };
+        let view = cx.entity();
+        let selection_color = cx.theme().colors.primary;
+        let top_inset = 16.0
+            + if has_filter_summary { 32.0 } else { 0.0 }
+            + if layout == Layout::Details { 32.0 } else { 0.0 };
+        let rubber_band = canvas(
+            |_, _, _| (),
+            move |surface, _, window, cx| {
+                if let Some(gesture) = view
+                    .read(cx)
+                    .rubber_band
+                    .as_ref()
+                    .filter(|gesture| gesture.tab_id == tab_id && gesture.moved)
+                {
+                    window.paint_quad(fill(
+                        normalized_pointer_bounds(gesture.start, gesture.current),
+                        selection_color.opacity(0.18),
+                    ));
+                }
+                let down_view = view.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                    if phase.capture()
+                        && event.button == MouseButton::Left
+                        && surface.contains(&event.position)
+                    {
+                        down_view.update(cx, |this, _| {
+                            this.begin_rubber_band(tab_id, event.position, event.modifiers);
+                        });
+                    }
+                });
+                let move_view = view.clone();
+                let rubber_band_surface = RubberBandSurface {
+                    bounds: surface,
+                    layout,
+                    item_count,
+                    columns: grid_columns,
+                    top_inset,
+                };
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase.capture() && event.dragging() {
+                        move_view.update(cx, |this, cx| {
+                            this.update_rubber_band(
+                                tab_id,
+                                event.position,
+                                rubber_band_surface,
+                                cx,
+                            );
+                        });
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase.capture() && event.button == MouseButton::Left {
+                        view.update(cx, |this, cx| this.finish_rubber_band(tab_id, cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
         div()
             .id(items_id)
             .test_support()
             .role(Role::List)
             .aria_label("Items")
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .when_some(filter_label, |items, label| {
@@ -10353,6 +11283,10 @@ impl MusheenApp {
                 items.child(self.render_details_header(tab_id, cx))
             })
             .child(list)
+            .child(rubber_band)
+            .on_scroll_wheel(cx.listener(move |this, _, _, cx| {
+                this.start_next_directory_page(tab_id, cx);
+            }))
             .into_any_element()
     }
 
@@ -10437,7 +11371,7 @@ impl MusheenApp {
             .test_support()
             .role(Role::Toolbar)
             .aria_label("Details columns")
-            .h(px(36.))
+            .h(px(32.))
             .flex()
             .items_center()
             .gap_2()
@@ -10495,10 +11429,11 @@ impl MusheenApp {
         tab_id: TabId,
         pane_index: usize,
         index: usize,
+        id: &ItemId,
         layout: Layout,
     ) -> Option<ItemRenderSpec> {
         let view = self.directories.get(&tab_id)?.view();
-        let item = self.filtered_items(tab_id).get(index)?.to_owned();
+        let item = view.item(id)?;
         Some(ItemRenderSpec {
             tab_id,
             pane_index,
@@ -10519,11 +11454,7 @@ impl MusheenApp {
     }
 
     fn render_item(&mut self, spec: ItemRenderSpec, cx: &mut Context<Self>) -> AnyElement {
-        let identity = match spec.kind {
-            ItemKind::Directory => ContentIdentity::directory(),
-            ItemKind::SymbolicLink => ContentIdentity::symbolic_link(),
-            ItemKind::RegularFile | ItemKind::Other => ContentIdentity::GenericFile,
-        };
+        let identity = content_identity_for_item(spec.kind, &spec.path);
         let icon_name = freedesktop_icon_name(&identity);
         let icon = self.content_icon(icon_name).map_or_else(
             || {
@@ -10554,6 +11485,7 @@ impl MusheenApp {
                 .test_support()
                 .role(Role::ListItem)
                 .aria_label(spec.name.clone())
+                .aria_selected(spec.selected)
                 .w(if spec.layout == Layout::Cards {
                     px(240.)
                 } else {
@@ -10566,7 +11498,6 @@ impl MusheenApp {
                 .justify_center()
                 .gap_2()
                 .px_2()
-                .rounded_md()
                 .when(spec.selected, |item| {
                     item.bg(colors.list_active)
                         .border_1()
@@ -10577,7 +11508,6 @@ impl MusheenApp {
                 .child(
                     div()
                         .w_full()
-                        .text_sm()
                         .text_center()
                         .overflow_hidden()
                         .child(spec.name),
@@ -10587,13 +11517,13 @@ impl MusheenApp {
                 .test_support()
                 .role(Role::ListItem)
                 .aria_label(spec.name.clone())
-                .h(px(38.))
+                .aria_selected(spec.selected)
+                .h(px(34.))
                 .w_full()
                 .flex()
                 .items_center()
                 .gap_3()
                 .px_2()
-                .rounded_sm()
                 .when(spec.selected, |item| {
                     item.bg(colors.list_active)
                         .border_1()
@@ -10601,7 +11531,7 @@ impl MusheenApp {
                 })
                 .hover(|style| style.bg(colors.list_hover))
                 .child(div().w(px(28.)).flex().justify_center().child(icon))
-                .child(div().flex_grow(1.0).text_sm().child(spec.name))
+                .child(div().flex_grow(1.0).child(spec.name))
                 .child(
                     div()
                         .w(px(96.))
@@ -10612,51 +11542,55 @@ impl MusheenApp {
                 ),
             Layout::Details | Layout::Columns => {
                 let mut icon = Some(icon);
-                let cells = spec
-                    .columns
-                    .iter()
-                    .map(|(column, width)| {
-                        let cell = div().w(px(f32::from(*width))).text_xs();
-                        match column {
-                            ColumnKey::Name => cell
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .w(px(28.))
-                                        .flex()
-                                        .justify_center()
-                                        .child(icon.take().expect("name is a required column")),
-                                )
-                                .child(spec.name.clone()),
-                            ColumnKey::Size => cell
-                                .text_right()
-                                .text_color(colors.muted_foreground)
-                                .child(spec.size.map_or_else(|| "—".to_owned(), format_size)),
-                            ColumnKey::Kind => cell
-                                .text_color(colors.muted_foreground)
-                                .child(item_kind_label(spec.kind)),
-                            ColumnKey::Modified => cell.text_color(colors.muted_foreground).child(
-                                spec.modified_unix_seconds
-                                    .map_or_else(|| "—".to_owned(), |value| value.to_string()),
-                            ),
-                        }
-                        .into_any_element()
-                    })
-                    .collect::<Vec<_>>();
+                let cells =
+                    spec.columns
+                        .iter()
+                        .map(|(column, width)| {
+                            let cell = div().w(px(f32::from(*width)));
+                            match column {
+                                ColumnKey::Name => {
+                                    cell.flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div().w(px(28.)).flex().justify_center().child(
+                                                icon.take().expect("name is a required column"),
+                                            ),
+                                        )
+                                        .child(spec.name.clone())
+                                }
+                                ColumnKey::Size => cell
+                                    .text_sm()
+                                    .text_right()
+                                    .text_color(colors.muted_foreground)
+                                    .child(spec.size.map_or_else(|| "—".to_owned(), format_size)),
+                                ColumnKey::Kind => cell
+                                    .text_sm()
+                                    .text_color(colors.muted_foreground)
+                                    .child(item_kind_label(spec.kind)),
+                                ColumnKey::Modified => cell
+                                    .text_sm()
+                                    .text_color(colors.muted_foreground)
+                                    .child(spec.modified_unix_seconds.map_or_else(
+                                        || "—".to_owned(),
+                                        |value| format_modified(value, self.catalog.locale()),
+                                    )),
+                            }
+                            .into_any_element()
+                        })
+                        .collect::<Vec<_>>();
                 div()
                     .id(item_id)
                     .test_support()
                     .role(Role::ListItem)
                     .aria_label(spec.name)
-                    .h(px(38.))
+                    .aria_selected(spec.selected)
+                    .h(px(34.))
                     .w_full()
                     .flex()
                     .items_center()
                     .gap_2()
                     .px_4()
-                    .rounded_sm()
                     .when(spec.selected, |item| {
                         item.bg(colors.list_active)
                             .border_1()
@@ -10675,10 +11609,25 @@ impl MusheenApp {
                 item.border_1().border_color(colors.ring)
             })
             .child(item);
-        item.on_click(cx.listener(move |this, _, _, cx| {
-            this.select_item(tab_id, stable_id.clone(), cx);
+        item.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            let modifiers = event.modifiers();
+            let mode = if modifiers.shift {
+                SelectionMode::Add
+            } else if modifiers.secondary() {
+                SelectionMode::Toggle
+            } else {
+                SelectionMode::Replace
+            };
+            this.select_item_with_mode(tab_id, stable_id.clone(), mode, cx);
             this.focus_directory_item(tab_id, Some(focused_id.clone()), cx);
+            if event.click_count() == 2 && !modifiers.modified() {
+                this.activate_directory_item(tab_id, stable_id.clone(), cx);
+            }
         }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, _| this.cancel_rubber_band(tab_id)),
+        )
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| {
@@ -11246,6 +12195,15 @@ impl Render for MusheenApp {
             .on_action(cx.listener(|this, _: &FocusPreviousDirectoryItem, _, cx| {
                 this.move_directory_focus(-1, cx);
             }))
+            .on_action(cx.listener(|this, _: &ExtendNextDirectoryItem, _, cx| {
+                this.move_directory_focus_with_selection(1, true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExtendPreviousDirectoryItem, _, cx| {
+                this.move_directory_focus_with_selection(-1, true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateDirectoryItem, _, cx| {
+                this.activate_focused_directory_item(cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleTerminalDrawer, window, cx| {
                 this.toggle_terminal_drawer(window, cx);
             }))
@@ -11732,6 +12690,45 @@ fn default_sidebar_model(pins: PinStore) -> SidebarModel {
     model
 }
 
+fn format_modified(unix_seconds: i64, locale: Locale) -> String {
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds = unix_seconds.rem_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_parameter = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_parameter + 2) / 5 + 1;
+    let month = month_parameter + if month_parameter < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let value = match locale {
+        Locale::EnUs => format!("{month:02}/{day:02}/{year:04}, {hour:02}:{minute:02} UTC"),
+        Locale::EnXa => format!("⟦{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC⟧"),
+        Locale::Ar => format!("{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}"),
+    };
+    if locale == Locale::Ar {
+        value
+            .chars()
+            .map(|character| match character {
+                '0'..='9' => char::from_u32('٠' as u32 + character as u32 - '0' as u32)
+                    .expect("Arabic decimal digit"),
+                _ => character,
+            })
+            .collect()
+    } else {
+        value
+    }
+}
+
 fn format_size(bytes: u64) -> String {
     const KIB: u64 = 1_024;
     const MIB: u64 = KIB * 1_024;
@@ -11753,6 +12750,34 @@ fn item_kind_label(kind: ItemKind) -> &'static str {
         ItemKind::RegularFile => "File",
         ItemKind::SymbolicLink => "Link",
         ItemKind::Other => "Other",
+    }
+}
+
+fn content_identity_for_item(kind: ItemKind, path: &StorePath) -> ContentIdentity {
+    match kind {
+        ItemKind::Directory => ContentIdentity::directory(),
+        ItemKind::SymbolicLink => ContentIdentity::symbolic_link(),
+        ItemKind::RegularFile | ItemKind::Other => {
+            let mime = path
+                .as_unix_path()
+                .and_then(Path::extension)
+                .and_then(|extension| extension.to_str())
+                .and_then(|extension| match extension.to_ascii_lowercase().as_str() {
+                    "png" => Some("image/png"),
+                    "jpg" | "jpeg" => Some("image/jpeg"),
+                    "gif" => Some("image/gif"),
+                    "svg" => Some("image/svg+xml"),
+                    "pdf" => Some("application/pdf"),
+                    "zip" => Some("application/zip"),
+                    "gz" => Some("application/gzip"),
+                    "tar" => Some("application/x-tar"),
+                    "rs" | "txt" | "md" | "toml" | "json" | "yaml" | "yml" => Some("text/plain"),
+                    "mp3" | "flac" | "wav" => Some("audio/x-generic"),
+                    "mp4" | "mkv" | "webm" => Some("video/x-generic"),
+                    _ => None,
+                });
+            mime.map_or(ContentIdentity::GenericFile, ContentIdentity::mime)
+        }
     }
 }
 
@@ -11847,6 +12872,49 @@ mod tests {
     };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[test]
+    fn modified_dates_are_human_readable_and_locale_specific() {
+        assert_eq!(format_modified(0, Locale::EnUs), "01/01/1970, 00:00 UTC");
+        assert_eq!(format_modified(0, Locale::EnXa), "⟦1970-01-01 00:00 UTC⟧");
+        assert_eq!(format_modified(0, Locale::Ar), "١٩٧٠/٠١/٠١ ٠٠:٠٠");
+    }
+
+    #[test]
+    fn file_extensions_choose_mime_theme_icons_without_reading_contents() {
+        let image = StorePath::from_unix_path("/tmp/photo.png");
+        let unknown = StorePath::from_unix_path("/tmp/blob.unknown");
+        assert_eq!(
+            content_identity_for_item(ItemKind::RegularFile, &image),
+            ContentIdentity::mime("image/png")
+        );
+        assert_eq!(
+            content_identity_for_item(ItemKind::RegularFile, &unknown),
+            ContentIdentity::GenericFile
+        );
+    }
+
+    #[test]
+    fn rubber_band_geometry_selects_only_intersected_rows_and_grid_cells() {
+        let surface = Bounds::new(point(px(100.), px(50.)), size(px(800.), px(600.)));
+        let list_selection = Bounds::from_corners(
+            point(px(110.), px(50. + 16. + 36.)),
+            point(px(400.), px(50. + 16. + 36. * 3. - 1.)),
+        );
+        assert_eq!(
+            rubber_band_indices(list_selection, surface, Layout::List, 20, 1, 16.0),
+            vec![1, 2]
+        );
+
+        let grid_selection = Bounds::from_corners(
+            point(px(100. + 16. + 128. + 8.), px(50. + 16.)),
+            point(px(100. + 16. + 128. * 2. + 8. - 1.), px(50. + 16. + 108.)),
+        );
+        assert_eq!(
+            rubber_band_indices(grid_selection, surface, Layout::Grid, 12, 4, 16.0),
+            vec![1]
+        );
+    }
 
     struct NoopNotificationSink;
 
@@ -15459,6 +16527,10 @@ mod tests {
                 window.click("context-review-confirm", cx);
             })
             .unwrap();
+            cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+                app.read(cx).pending_drop.is_some()
+            })
+            .await;
             let conflict = cx
                 .windows()
                 .into_iter()
@@ -15673,12 +16745,9 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.press("down", cx);
-            assert!(
-                app.read(cx)
-                    .focused_directory()
-                    .view()
-                    .selected_ids()
-                    .is_empty()
+            assert_eq!(
+                app.read(cx).focused_directory().view().selected_ids().len(),
+                1
             );
             assert!(
                 app.read(cx)
@@ -17713,7 +18782,8 @@ mod tests {
             }
         });
         cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
-            app.read(cx).pending_catalog_moves.is_empty()
+            let state = app.read(cx);
+            state.transfer_preflights == 0 && state.pending_catalog_moves.is_empty()
         })
         .await;
 
@@ -17909,7 +18979,8 @@ mod tests {
             }
         });
         cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
-            app.read(cx).pending_catalog_moves.is_empty()
+            let state = app.read(cx);
+            state.transfer_preflights == 0 && state.pending_catalog_moves.is_empty()
         })
         .await;
         app.update(cx, |state, _| {
@@ -18484,5 +19555,212 @@ mod tests {
                 Err(musheen_desktop::FileManagerError::Blocked)
             );
         });
+    }
+
+    #[gpui_kit::test]
+    async fn local_browser_navigates_and_runs_core_file_verbs_through_the_hub(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let child = temporary.path().join("child");
+        filesystem::create_dir(&child).unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let browser: AnyWindowHandle = handle.into();
+        let app = app.unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let item = state
+                .focused_directory()
+                .items()
+                .iter()
+                .find(|item| item.path().as_unix_path() == Some(child.as_path()))
+                .unwrap();
+            state.focus_directory_item(tab, Some(item.id().clone()), cx);
+            state.activate_focused_directory_item(cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .navigation
+                .focused_tab()
+                .location()
+                .as_unix_path()
+                == Some(child.as_path())
+        })
+        .await;
+
+        app.update(cx, |state, cx| {
+            state.navigate(
+                StorePath::from_unix_path(temporary.path().as_os_str()),
+                true,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            let state = app.read(cx);
+            state.navigation.focused_tab().location().as_unix_path() == Some(temporary.path())
+                && state.focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            state.submit_name_operation(
+                NameOperation::Create {
+                    parent: StorePath::from_unix_path(temporary.path().as_os_str()),
+                    kind: musheen_ops::CreateKind::Directory,
+                },
+                "created".to_owned(),
+                cx,
+            );
+        });
+        let created = temporary.path().join("created");
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| created.is_dir())
+            .await;
+
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .focused_directory()
+                .items()
+                .iter()
+                .any(|item| item.path().as_unix_path() == Some(created.as_path()))
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let item = state
+                .focused_directory()
+                .items()
+                .iter()
+                .find(|item| item.path().as_unix_path() == Some(created.as_path()))
+                .unwrap();
+            let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+            state.submit_name_operation(NameOperation::Rename(target), "renamed".to_owned(), cx);
+        });
+        let renamed = temporary.path().join("renamed");
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| renamed.is_dir())
+            .await;
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .focused_directory()
+                .items()
+                .iter()
+                .any(|item| item.path().as_unix_path() == Some(renamed.as_path()))
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let item = state
+                .focused_directory()
+                .items()
+                .iter()
+                .find(|item| item.path().as_unix_path() == Some(renamed.as_path()))
+                .unwrap();
+            state.submit_delete_targets(
+                vec![CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()],
+                true,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| !renamed.exists())
+            .await;
+
+        let copy_source = temporary.path().join("copy-me.txt");
+        filesystem::write(&copy_source, b"copy").unwrap();
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.start_load_for_tab(
+                tab,
+                StorePath::from_unix_path(temporary.path().as_os_str()),
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .focused_directory()
+                .items()
+                .iter()
+                .any(|item| item.path().as_unix_path() == Some(copy_source.as_path()))
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let item = state
+                .focused_directory()
+                .items()
+                .iter()
+                .find(|item| item.path().as_unix_path() == Some(copy_source.as_path()))
+                .unwrap();
+            let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+            state.dispatch_typed_context_command(
+                CommandAction::Copy,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+            state.paste_file_clipboard(StorePath::from_unix_path(child.as_os_str()), cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            child.join("copy-me.txt").is_file()
+        })
+        .await;
+        assert!(copy_source.is_file());
+
+        let cut_source = temporary.path().join("cut-me.txt");
+        filesystem::write(&cut_source, b"cut").unwrap();
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.start_load_for_tab(
+                tab,
+                StorePath::from_unix_path(temporary.path().as_os_str()),
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .focused_directory()
+                .items()
+                .iter()
+                .any(|item| item.path().as_unix_path() == Some(cut_source.as_path()))
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let item = state
+                .focused_directory()
+                .items()
+                .iter()
+                .find(|item| item.path().as_unix_path() == Some(cut_source.as_path()))
+                .unwrap();
+            let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+            state.dispatch_typed_context_command(
+                CommandAction::Cut,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+            state.paste_file_clipboard(StorePath::from_unix_path(child.as_os_str()), cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            !cut_source.exists()
+                && child.join("cut-me.txt").is_file()
+                && app.read(cx).file_clipboard.is_none()
+        })
+        .await;
     }
 }

@@ -174,6 +174,16 @@ impl PermanentDeleteRequest {
             digest: self.digest,
         }
     }
+
+    #[must_use]
+    pub const fn location(&self) -> &StorePath {
+        &self.location
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> &[DeleteTarget] {
+        &self.targets
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

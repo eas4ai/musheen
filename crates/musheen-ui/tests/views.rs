@@ -169,6 +169,53 @@ fn external_changes_preserve_stable_identity_selection_and_anchor() {
 }
 
 #[test]
+fn ctrl_toggle_and_shift_ranges_keep_the_original_anchor() {
+    let mut model = DirectoryViewModel::new(16);
+    model.extend((0..6).map(|index| {
+        item(
+            index + 1,
+            &format!("item-{index}"),
+            ItemKind::RegularFile,
+            Some(index),
+        )
+    }));
+    let ordered = model
+        .visible_items()
+        .iter()
+        .map(|item| item.id().clone())
+        .collect::<Vec<_>>();
+
+    model.select_item(ordered[1].clone(), SelectionMode::Replace);
+    model.select_item(ordered[4].clone(), SelectionMode::Toggle);
+    assert_eq!(
+        model.selected_ids(),
+        &[ordered[1].clone(), ordered[4].clone()]
+    );
+
+    model.select_item(ordered[1].clone(), SelectionMode::Replace);
+    model.select_to_item(&ordered[4], SelectionMode::Replace);
+    assert_eq!(model.selected_ids(), &ordered[1..=4]);
+    model.select_to_item(&ordered[2], SelectionMode::Replace);
+    assert_eq!(model.selected_ids(), &ordered[1..=2]);
+}
+
+#[test]
+fn cached_visible_order_invalidates_for_items_and_preferences() {
+    let mut model = DirectoryViewModel::new(16);
+    model.extend([
+        item(1, "b", ItemKind::RegularFile, Some(1)),
+        item(2, "a", ItemKind::RegularFile, Some(2)),
+    ]);
+    assert_eq!(names(&model), vec!["a", "b"]);
+    assert_eq!(names(&model), vec!["a", "b"]);
+
+    model.preferences_mut().sort.direction = SortDirection::Descending;
+    assert_eq!(names(&model), vec!["b", "a"]);
+    model.extend([item(3, "c", ItemKind::RegularFile, Some(3))]);
+    assert_eq!(names(&model), vec!["c", "b", "a"]);
+}
+
+#[test]
 fn per_directory_preferences_keep_lossless_paths_and_column_layouts() {
     let first = StorePath::from_unix_bytes(b"/one/bad-\xff".to_vec());
     let second = StorePath::from_unix_path("/two");

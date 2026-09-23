@@ -1,6 +1,6 @@
 use musheen_core::{
-    DisplayPath, ItemId, ItemKind, Page, PageRequest, ProviderId, ResourceLimits, StoreItem,
-    StorePath, TotalHint,
+    Continuation, DisplayPath, ItemId, ItemKind, Page, PageRequest, ProviderId, ResourceLimits,
+    StoreItem, StorePath, TotalHint,
 };
 use musheen_local::LocalStore;
 use musheen_ui::{
@@ -204,6 +204,31 @@ fn directory_model_retains_4096_items_and_renders_three_viewports() {
     let range = model.rendered_range(1_000, 24);
     assert_eq!(range, 1_000..1_072);
     assert!(range.len() <= 24 * 3);
+}
+
+#[test]
+fn streaming_directory_model_pages_through_one_hundred_thousand_items() {
+    let limits = ResourceLimits::default();
+    let mut model = DirectoryModel::new_with_retention(limits.clone(), 100_000);
+    let load = model.begin_navigation(StorePath::from_unix_path("/huge"));
+    let mut offset = 0usize;
+
+    while offset < 100_000 {
+        let (_, request) = model.begin_page().expect("scroll requests the next page");
+        let count = request.page_size().min(100_000 - offset);
+        let items = (offset..offset + count)
+            .map(|index| item(index, &format!("/huge/{index}")))
+            .collect();
+        offset += count;
+        let next = (offset < 100_000).then(|| Continuation::from_usize(offset));
+        let page = Page::try_new(&request, items, next, TotalHint::Exact(100_000))
+            .expect("provider page is valid");
+        assert_eq!(model.apply_page(&load, page), ApplyPageResult::Applied);
+    }
+
+    assert_eq!(model.items().len(), 100_000);
+    assert!(model.view().is_complete());
+    assert!(model.begin_page().is_none());
 }
 
 #[test]

@@ -45,17 +45,30 @@ pub struct DirectoryModel {
     active: Option<DirectoryLoad>,
     state: DirectoryState,
     view: DirectoryViewModel,
+    next_request: Option<PageRequest>,
+    page_loading: bool,
 }
 
 impl DirectoryModel {
     #[must_use]
     pub fn new(limits: ResourceLimits) -> Self {
+        let retention_limit = limits.directory_retained_items();
+        Self::new_with_retention(limits, retention_limit)
+    }
+
+    /// Creates a directory model whose presentation window may be larger than
+    /// the provider's normal prefetch budget. The desktop browser uses this to
+    /// page through very large local folders without truncating navigation.
+    #[must_use]
+    pub fn new_with_retention(limits: ResourceLimits, retention_limit: usize) -> Self {
         Self {
             limits: limits.snapshot(),
             generation: 0,
             active: None,
             state: DirectoryState::Empty,
-            view: DirectoryViewModel::new(limits.directory_retained_items()),
+            view: DirectoryViewModel::new(retention_limit),
+            next_request: None,
+            page_loading: false,
         }
     }
 
@@ -65,6 +78,8 @@ impl DirectoryModel {
         }
         self.generation = self.generation.wrapping_add(1);
         self.view.reset_items();
+        self.next_request = Some(PageRequest::first(&self.limits));
+        self.page_loading = false;
         self.state = DirectoryState::Loading;
         let load = DirectoryLoad {
             generation: self.generation,
@@ -117,7 +132,9 @@ impl DirectoryModel {
             return ApplyPageResult::Stale;
         }
 
-        let complete = page.next_request().is_none();
+        self.next_request = page.next_request();
+        self.page_loading = false;
+        let complete = self.next_request.is_none();
         self.view.extend(page.into_items());
         self.view.set_complete(complete);
         self.state = if self.view.items().is_empty() {
@@ -126,6 +143,22 @@ impl DirectoryModel {
             DirectoryState::Ready
         };
         ApplyPageResult::Applied
+    }
+
+    pub fn begin_page(&mut self) -> Option<(DirectoryLoad, PageRequest)> {
+        if self.page_loading {
+            return None;
+        }
+        let load = self.active.clone()?;
+        let request = self.next_request.clone()?;
+        self.page_loading = true;
+        Some((load, request))
+    }
+
+    pub fn page_failed(&mut self, load: &DirectoryLoad) {
+        if self.is_current(load) {
+            self.page_loading = false;
+        }
     }
 
     pub fn apply_error(&mut self, load: &DirectoryLoad, message: impl Into<Box<str>>) -> bool {

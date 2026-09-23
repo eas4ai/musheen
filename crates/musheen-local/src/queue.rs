@@ -4,10 +4,12 @@ use crate::mutation::{
 };
 use musheen_core::{CommandTargetRef, DisplayPath, ItemId, ResourceLimits, Store, StorePath};
 use musheen_ops::{
-    ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest, CopySession, EventGeneration,
-    JobId, JobState, MetadataChange, MetadataPlan, MetadataScope, MutationError, MutationProvider,
-    OperationFailure, OperationKind, OperationPlan, ProviderLimits, ProviderSnapshot,
-    PublicationState, Scheduler, SchedulerError, SourceState, execute_move,
+    ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest, CopySession, CreateRequest,
+    DeleteTarget, EventGeneration, JobId, JobState, MetadataChange, MetadataPlan, MetadataScope,
+    MutationError, MutationProvider, OperationFailure, OperationKind, OperationPlan,
+    PermanentDeleteConfirmation, PermanentDeleteRequest, ProviderLimits, ProviderSnapshot,
+    PublicationState, RenameRequest, Scheduler, SchedulerError, SourceState, execute_create,
+    execute_delete, execute_move, execute_permanent_delete, execute_rename,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -96,6 +98,13 @@ enum LocalOperation {
         provider_route: Option<Arc<dyn ProviderTransferRoute>>,
     },
     Metadata(MetadataPlan),
+    Create(CreateRequest),
+    Rename(RenameRequest),
+    Trash(DeleteTarget),
+    PermanentDelete {
+        request: PermanentDeleteRequest,
+        confirmation: PermanentDeleteConfirmation,
+    },
 }
 
 impl LocalOperation {
@@ -109,6 +118,13 @@ impl LocalOperation {
                     OperationKind::SetOwnership
                 }
             }
+            Self::Create(request) => match request.kind() {
+                musheen_ops::CreateKind::File => OperationKind::CreateFile,
+                musheen_ops::CreateKind::Directory => OperationKind::CreateDirectory,
+            },
+            Self::Rename(_) => OperationKind::Rename,
+            Self::Trash(_) => OperationKind::Trash,
+            Self::PermanentDelete { .. } => OperationKind::PermanentDelete,
         }
     }
 
@@ -116,6 +132,10 @@ impl LocalOperation {
         match self {
             Self::Transfer { source, .. } => source,
             Self::Metadata(plan) => plan.root(),
+            Self::Create(request) => request.parent(),
+            Self::Rename(request) => request.source(),
+            Self::Trash(target) => target.path(),
+            Self::PermanentDelete { request, .. } => request.location(),
         }
     }
 
@@ -127,6 +147,14 @@ impl LocalOperation {
                 ..
             } => vec![source.clone(), destination.clone()],
             Self::Metadata(plan) => vec![plan.root().clone()],
+            Self::Create(request) => vec![request.parent().clone()],
+            Self::Rename(request) => vec![request.source().clone()],
+            Self::Trash(target) => vec![target.path().clone()],
+            Self::PermanentDelete { request, .. } => request
+                .targets()
+                .iter()
+                .map(|target| target.path().clone())
+                .collect(),
         }
     }
 }
@@ -156,6 +184,7 @@ pub enum TransferOutcome {
 pub enum LocalOperationOutcome {
     Transfer(TransferOutcome),
     Metadata,
+    Mutation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -414,6 +443,33 @@ impl ReadyLocalOperation {
                 .execute_controlled(&mut store, &self.cancellation)
                 .map(|()| LocalOperationOutcome::Metadata)
                 .map_err(|error| LocalOperationFailure::failed(error.to_string())),
+            LocalOperation::Create(request) => execute_create(&mut store, &request)
+                .map(|_| LocalOperationOutcome::Mutation)
+                .map_err(|error| LocalOperationFailure::failed(error.to_string())),
+            LocalOperation::Rename(request) => execute_rename(&mut store, &request)
+                .map(|_| LocalOperationOutcome::Mutation)
+                .map_err(|error| LocalOperationFailure::failed(error.to_string())),
+            LocalOperation::Trash(target) => execute_delete(&mut store, vec![target])
+                .and_then(|outcome| {
+                    outcome
+                        .failures()
+                        .first()
+                        .map_or(Ok(()), |failure| Err(failure.error().clone()))
+                })
+                .map(|()| LocalOperationOutcome::Mutation)
+                .map_err(|error| LocalOperationFailure::failed(error.to_string())),
+            LocalOperation::PermanentDelete {
+                request,
+                confirmation,
+            } => execute_permanent_delete(&mut store, &request, &confirmation)
+                .and_then(|outcome| {
+                    outcome
+                        .failures()
+                        .first()
+                        .map_or(Ok(()), |failure| Err(failure.error().clone()))
+                })
+                .map(|()| LocalOperationOutcome::Mutation)
+                .map_err(|error| LocalOperationFailure::failed(error.to_string())),
         }
     }
 }
@@ -554,6 +610,93 @@ impl LocalOperationQueue {
             })
             .collect::<Result<Vec<_>, MutationError>>()?;
         self.submit_metadata(plans)
+    }
+
+    pub fn submit_create(&mut self, request: CreateRequest) -> Result<JobId, DropError> {
+        let kind = match request.kind() {
+            musheen_ops::CreateKind::File => OperationKind::CreateFile,
+            musheen_ops::CreateKind::Directory => OperationKind::CreateDirectory,
+        };
+        let parent = request
+            .parent()
+            .as_unix_path()
+            .ok_or_else(|| DropError::Plan("create requires a local directory".into()))?;
+        let destination = StorePath::from_unix_path(parent.join(request.name()).into_os_string());
+        let store = LocalStore::new();
+        let plan = OperationPlan::new(
+            kind,
+            provider_snapshot(&store, request.parent()),
+            None,
+            destination,
+        )
+        .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(plan, LocalOperation::Create(request))])
+            .map(|mut ids| ids.remove(0))
+    }
+
+    pub fn submit_rename(&mut self, request: RenameRequest) -> Result<JobId, DropError> {
+        let source = request.source().clone();
+        let parent = source
+            .as_unix_path()
+            .and_then(Path::parent)
+            .ok_or_else(|| DropError::Plan("rename requires a local parent directory".into()))?;
+        let destination = StorePath::from_unix_path(parent.join(request.target_name()));
+        let store = LocalStore::new();
+        let plan = OperationPlan::new(
+            OperationKind::Rename,
+            provider_snapshot(&store, &source),
+            Some(source),
+            destination,
+        )
+        .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(plan, LocalOperation::Rename(request))])
+            .map(|mut ids| ids.remove(0))
+    }
+
+    pub fn submit_trash(&mut self, targets: Vec<DeleteTarget>) -> Result<Vec<JobId>, DropError> {
+        if targets.is_empty() {
+            return Err(DropError::EmptySelection);
+        }
+        let store = LocalStore::new();
+        let planned = targets
+            .into_iter()
+            .map(|target| {
+                let location = target.path().clone();
+                let plan = OperationPlan::new(
+                    OperationKind::Trash,
+                    provider_snapshot(&store, &location),
+                    None,
+                    location,
+                )
+                .map_err(|error| DropError::Plan(error.to_string().into()))?;
+                Ok((plan, LocalOperation::Trash(target)))
+            })
+            .collect::<Result<Vec<_>, DropError>>()?;
+        self.enqueue_planned(planned)
+    }
+
+    pub fn submit_permanent_delete(
+        &mut self,
+        request: PermanentDeleteRequest,
+        confirmation: PermanentDeleteConfirmation,
+    ) -> Result<JobId, DropError> {
+        let location = request.location().clone();
+        let store = LocalStore::new();
+        let plan = OperationPlan::new(
+            OperationKind::PermanentDelete,
+            provider_snapshot(&store, &location),
+            None,
+            location,
+        )
+        .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(
+            plan,
+            LocalOperation::PermanentDelete {
+                request,
+                confirmation,
+            },
+        )])
+        .map(|mut ids| ids.remove(0))
     }
 
     pub fn start_ready(&mut self) -> Result<Vec<ReadyLocalOperation>, DropError> {
@@ -1075,6 +1218,19 @@ impl From<SchedulerError> for DropError {
 mod tests {
     use super::*;
 
+    fn finish_one(queue: &mut LocalOperationQueue) -> LocalOperationOutcome {
+        let operation = queue
+            .start_ready()
+            .expect("operation starts")
+            .into_iter()
+            .next()
+            .expect("one operation is ready");
+        let id = operation.id();
+        let outcome = operation.execute_detailed().expect("operation succeeds");
+        queue.finish(id, Ok(())).expect("operation finishes");
+        outcome
+    }
+
     #[test]
     fn resolved_transaction_attention_is_never_flattened_to_retryable_failure() {
         let failure =
@@ -1090,5 +1246,58 @@ mod tests {
             failure.message(),
             "the published destination needs inspection"
         );
+    }
+
+    #[test]
+    fn queued_create_rename_and_permanent_delete_mutate_real_files_safely() {
+        let temporary = tempfile::tempdir().expect("temporary directory is available");
+        let parent = StorePath::from_unix_path(temporary.path().as_os_str());
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+
+        queue
+            .submit_create(CreateRequest::new(
+                parent.clone(),
+                "folder".into(),
+                musheen_ops::CreateKind::Directory,
+            ))
+            .expect("create is queued");
+        assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
+        let source_path = temporary.path().join("folder");
+        assert!(source_path.is_dir());
+
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &source)
+            .expect("identity lookup succeeds")
+            .expect("created folder exists");
+        queue
+            .submit_rename(RenameRequest::new(
+                source,
+                "renamed".into(),
+                identity.into_vec(),
+            ))
+            .expect("rename is queued");
+        assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
+        let renamed_path = temporary.path().join("renamed");
+        assert!(renamed_path.is_dir());
+
+        let renamed = StorePath::from_unix_path(renamed_path.as_os_str());
+        let identity = MutationProvider::identity(&mut store, &renamed)
+            .expect("identity lookup succeeds")
+            .expect("renamed folder exists");
+        let request = PermanentDeleteRequest::new(
+            parent.clone(),
+            vec![DeleteTarget::new(renamed, identity.into_vec())],
+        )
+        .expect("delete request is valid");
+        let confirmation = request
+            .challenge()
+            .confirm(1, &parent, true)
+            .expect("explicit confirmation is valid");
+        queue
+            .submit_permanent_delete(request, confirmation)
+            .expect("delete is queued");
+        assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
+        assert!(!renamed_path.exists());
     }
 }

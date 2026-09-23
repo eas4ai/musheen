@@ -63,4 +63,14 @@ impl SelectionModel {
     pub fn contains(&self, id: &ItemId) -> bool {
         self.selected.contains(id)
     }
+
+    pub fn anchor(&self) -> Option<&ItemId> {
+        self.anchor.as_ref()
+    }
+
+    pub fn restore_anchor(&mut self, anchor: ItemId) {
+        if self.selected.contains(&anchor) {
+            self.anchor = Some(anchor);
+        }
+    }
 }
