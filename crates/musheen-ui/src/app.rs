@@ -16255,14 +16255,15 @@ mod tests {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
         });
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../musheen-test-support/fixtures/shell-gallery");
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("sample.txt"), b"sample").unwrap();
+        let fixture_path = fixture.path().to_path_buf();
         let probe = Arc::new(Mutex::new(Vec::new()));
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
             let probe = Arc::clone(&probe);
             let view = cx.new(|cx| {
-                let mut state = MusheenApp::new_with_session_store(fixture, None, cx);
+                let mut state = MusheenApp::new_with_session_store(fixture_path, None, cx);
                 state.command_dispatch_probe = Some(probe);
                 state
             });
