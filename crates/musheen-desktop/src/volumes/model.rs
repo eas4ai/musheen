@@ -88,6 +88,7 @@ pub struct DeviceDescriptor {
     read_only: bool,
     locked: bool,
     size_bytes: Option<u64>,
+    sidebar_visible: bool,
 }
 
 impl DeviceDescriptor {
@@ -105,6 +106,7 @@ impl DeviceDescriptor {
             read_only: false,
             locked: false,
             size_bytes: None,
+            sidebar_visible: true,
         }
     }
 
@@ -172,6 +174,12 @@ impl DeviceDescriptor {
     }
 
     #[must_use]
+    pub const fn with_sidebar_visible(mut self, visible: bool) -> Self {
+        self.sidebar_visible = visible;
+        self
+    }
+
+    #[must_use]
     pub(crate) fn with_ambiguous_identity(mut self, id: VolumeId) -> Self {
         self.id = id;
         self.capabilities = VolumeCapabilities::default();
@@ -226,6 +234,11 @@ impl DeviceDescriptor {
     #[must_use]
     pub const fn size_bytes(&self) -> Option<u64> {
         self.size_bytes
+    }
+
+    #[must_use]
+    pub const fn is_sidebar_visible(&self) -> bool {
+        self.sidebar_visible
     }
 }
 

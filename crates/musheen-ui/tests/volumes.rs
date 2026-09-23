@@ -59,6 +59,7 @@ fn descriptor() -> DeviceDescriptor {
     )
     .with_label("Photos")
     .with_device("/dev/sdb1")
+    .with_size_bytes(1_000)
     .with_mount_points([PathBuf::from("/media/photos")])
     .with_capabilities(false, true, true, false, true)
 }
@@ -140,10 +141,69 @@ fn unmounted_sidebar_refusal_is_a_localizable_reason_key() {
         .unwrap();
     let entry = &storage.items()[0];
 
+    assert_eq!(entry.volume_capacity(), None);
     let reason = entry.unavailable_reason().unwrap();
     assert_eq!(reason, "volume-mount-before-opening");
     let arabic = Catalog::load(Locale::Ar).unwrap().localize_reason(reason);
     assert!(!arabic.contains("mount the volume"));
+}
+
+#[test]
+fn sidebar_hides_devices_marked_for_non_file_manager_use() {
+    let mounts = Arc::new(Mounts::default());
+    let hidden = DeviceDescriptor::new(
+        VolumeId::new("loop0").unwrap(),
+        "/org/freedesktop/UDisks2/block_devices/loop0",
+    )
+    .with_label("loop0")
+    .with_device("/dev/loop0")
+    .with_sidebar_visible(false);
+    let mut service = VolumeService::new(
+        Arc::new(Backend(Mutex::new(BackendSnapshot::new("owner", [hidden])))),
+        mounts,
+        Arc::new(NoOperationUsage),
+    );
+    service.refresh().unwrap();
+    let mut sidebar = SidebarModel::new(PinStore::default());
+
+    sidebar.sync_volumes(service.model());
+
+    assert!(
+        sidebar
+            .sections()
+            .into_iter()
+            .all(|section| section.kind() != SidebarSectionKind::Mounts)
+    );
+}
+
+#[test]
+fn sidebar_hides_loop_mounts_when_udisks_is_unavailable() {
+    let mounts = Arc::new(Mounts::default());
+    *mounts.records.lock().unwrap() = vec![MountRecord::new(
+        "/dev/loop0",
+        "/snap/example",
+        "squashfs",
+        true,
+    )];
+    let mut service = VolumeService::new(
+        Arc::new(Backend(Mutex::new(BackendSnapshot::new(
+            "owner",
+            Vec::<DeviceDescriptor>::new(),
+        )))),
+        mounts,
+        Arc::new(NoOperationUsage),
+    );
+    service.refresh().unwrap();
+    let mut sidebar = SidebarModel::new(PinStore::default());
+
+    sidebar.sync_volumes(service.model());
+
+    assert!(
+        sidebar
+            .sections()
+            .into_iter()
+            .all(|section| section.kind() != SidebarSectionKind::Mounts)
+    );
 }
 
 #[test]

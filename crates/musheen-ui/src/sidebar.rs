@@ -145,7 +145,7 @@ impl SidebarEntry {
             unavailable_reason: (!volume.is_mounted())
                 .then(|| Box::<str>::from("volume-mount-before-opening")),
             volume_id: Some(volume.id().clone()),
-            volume_capacity: volume.capacity(),
+            volume_capacity: volume.capacity().filter(|_| volume.is_mounted()),
             volume_read_only: volume.is_read_only(),
             volume_capabilities: Some(volume.capabilities()),
         }
@@ -313,7 +313,11 @@ impl SidebarModel {
     pub fn sync_volumes(&mut self, volumes: &VolumeModel) {
         self.set_section_items(
             SidebarSectionKind::Mounts,
-            volumes.volumes().into_iter().map(SidebarEntry::volume),
+            volumes
+                .volumes()
+                .into_iter()
+                .filter(|volume| is_sidebar_volume(volume))
+                .map(SidebarEntry::volume),
         );
     }
 
@@ -362,6 +366,21 @@ impl Default for SidebarModel {
     fn default() -> Self {
         Self::new(PinStore::default())
     }
+}
+
+fn is_sidebar_volume(volume: &Volume) -> bool {
+    let descriptor_visible = volume
+        .descriptor()
+        .is_none_or(|descriptor| descriptor.is_sidebar_visible());
+    let loop_device = volume
+        .device()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("loop"))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    descriptor_visible && !loop_device
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

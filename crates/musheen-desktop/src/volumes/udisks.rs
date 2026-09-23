@@ -19,8 +19,46 @@ const BLOCK: &str = "org.freedesktop.UDisks2.Block";
 const FILESYSTEM: &str = "org.freedesktop.UDisks2.Filesystem";
 const DRIVE: &str = "org.freedesktop.UDisks2.Drive";
 const ENCRYPTED: &str = "org.freedesktop.UDisks2.Encrypted";
+const LOOP: &str = "org.freedesktop.UDisks2.Loop";
 const PARTITION: &str = "org.freedesktop.UDisks2.Partition";
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+const fn block_is_sidebar_volume(
+    hint_ignore: bool,
+    hint_system: bool,
+    is_loop: bool,
+    has_filesystem: bool,
+    has_encrypted: bool,
+) -> bool {
+    !hint_ignore && !hint_system && !is_loop && (has_filesystem || has_encrypted)
+}
+
+async fn block_is_sidebar_visible(
+    block: &zbus::Proxy<'_>,
+    interfaces: &HashMap<
+        zbus::names::OwnedInterfaceName,
+        HashMap<String, zbus::zvariant::OwnedValue>,
+    >,
+) -> bool {
+    let hint_ignore = block
+        .get_property::<bool>("HintIgnore")
+        .await
+        .unwrap_or(false);
+    let hint_system = block
+        .get_property::<bool>("HintSystem")
+        .await
+        .unwrap_or(false);
+    let has_filesystem = interfaces.keys().any(|name| name.as_str() == FILESYSTEM);
+    let has_encrypted = interfaces.keys().any(|name| name.as_str() == ENCRYPTED);
+    let is_loop = interfaces.keys().any(|name| name.as_str() == LOOP);
+    block_is_sidebar_volume(
+        hint_ignore,
+        hint_system,
+        is_loop,
+        has_filesystem,
+        has_encrypted,
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UDisksBusConfig {
@@ -430,6 +468,9 @@ impl ZbusUDisksBackend {
             return Ok(None);
         }
         let block = self.proxy(path, BLOCK).await?;
+        let has_filesystem = interfaces.keys().any(|name| name.as_str() == FILESYSTEM);
+        let has_encrypted = interfaces.keys().any(|name| name.as_str() == ENCRYPTED);
+        let sidebar_visible = block_is_sidebar_visible(&block, interfaces).await;
         let mut device = block
             .get_property::<Vec<u8>>("Device")
             .await
@@ -456,9 +497,7 @@ impl ZbusUDisksBackend {
             .get_property::<Vec<Vec<u8>>>("Symlinks")
             .await
             .unwrap_or_default();
-        let has_filesystem = interfaces.keys().any(|name| name.as_str() == FILESYSTEM);
         let mount_points = self.mount_points(path, has_filesystem).await?;
-        let has_encrypted = interfaces.keys().any(|name| name.as_str() == ENCRYPTED);
         let has_partition = interfaces.keys().any(|name| name.as_str() == PARTITION);
         let locked = self.is_locked(path, has_encrypted).await?;
         let (can_eject, can_power_off, drive_identity) =
@@ -498,7 +537,8 @@ impl ZbusUDisksBackend {
                 identity_stable && can_power_off,
             )
             .with_read_only(read_only)
-            .with_locked(locked);
+            .with_locked(locked)
+            .with_sidebar_visible(sidebar_visible);
         if let Some(path) = drive_path.as_ref().filter(|path| path.as_str() != "/") {
             descriptor = descriptor.with_drive_path(path.to_string());
         }
@@ -1219,6 +1259,16 @@ async fn connect_async(config: &UDisksBusConfig) -> Result<zbus::Connection, UDi
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn sidebar_volume_filter_hides_internal_raw_and_loop_blocks() {
+        assert!(!block_is_sidebar_volume(true, false, false, true, false));
+        assert!(!block_is_sidebar_volume(false, true, false, true, false));
+        assert!(!block_is_sidebar_volume(false, false, true, true, false));
+        assert!(!block_is_sidebar_volume(false, false, false, false, false));
+        assert!(block_is_sidebar_volume(false, false, false, true, false));
+        assert!(block_is_sidebar_volume(false, false, false, false, true));
+    }
 
     #[test]
     fn cloned_filesystem_uuids_have_distinct_stable_device_ids() {
