@@ -253,6 +253,53 @@ fn recovery_staging_can_be_discarded_only_through_an_app_owned_name() {
 }
 
 #[test]
+fn startup_cleanup_removes_only_unprotected_app_owned_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let destination = StorePath::from_unix_path(root.path().join("destination"));
+    let stale = StagingPath::for_destination_with_nonce(
+        &destination,
+        JobId::new(9).unwrap(),
+        EventGeneration::new(2),
+        [0x11; 16],
+    )
+    .unwrap()
+    .path()
+    .clone();
+    let protected = StagingPath::for_destination_with_nonce(
+        &destination,
+        JobId::new(10).unwrap(),
+        EventGeneration::new(3),
+        [0x22; 16],
+    )
+    .unwrap()
+    .path()
+    .clone();
+    let lookalike = root.path().join(".musheen-stage-v1-not-a-job");
+    let unrelated = root.path().join("notes.txt");
+    fs::create_dir(stale.as_unix_path().unwrap()).unwrap();
+    fs::write(stale.as_unix_path().unwrap().join("partial"), b"stale").unwrap();
+    fs::write(protected.as_unix_path().unwrap(), b"resume me").unwrap();
+    fs::write(&lookalike, b"user data").unwrap();
+    fs::write(&unrelated, b"user data").unwrap();
+    let mut provider = LocalStore::new();
+
+    assert_eq!(
+        provider
+            .cleanup_stale_staging_at(&destination, std::slice::from_ref(&protected))
+            .unwrap(),
+        1
+    );
+
+    assert!(!stale.as_unix_path().unwrap().exists());
+    assert_eq!(
+        fs::read(protected.as_unix_path().unwrap()).unwrap(),
+        b"resume me"
+    );
+    assert_eq!(fs::read(lookalike).unwrap(), b"user data");
+    assert_eq!(fs::read(unrelated).unwrap(), b"user data");
+}
+
+#[test]
 fn local_copy_preserves_extended_attributes_and_access_control_lists() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source-with-metadata");

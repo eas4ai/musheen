@@ -147,6 +147,45 @@ impl LocalStore {
         Ok(())
     }
 
+    pub fn cleanup_stale_staging_at(
+        &mut self,
+        location: &StorePath,
+        protected: &[StorePath],
+    ) -> Result<usize, MutationError> {
+        let location = location.as_unix_path().ok_or(MutationError::Unsupported)?;
+        let parent = location.parent().ok_or(MutationError::InvalidScope)?;
+        let entries = match fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(map_io_error(error)),
+        };
+        let mut removed = 0_usize;
+        for entry in entries {
+            let path = entry.map_err(map_io_error)?.path();
+            let staging = StorePath::from_unix_path(path.as_os_str());
+            if !StagingPath::is_owned_path(&staging)
+                || protected.iter().any(|protected| protected == &staging)
+            {
+                continue;
+            }
+            remove_path(&path)
+                .map_err(|error| MutationError::Provider(error.to_string().into()))?;
+            removed = removed.saturating_add(1);
+        }
+        if removed > 0 {
+            sync_parent(location).map_err(|error| {
+                MutationError::RecoveryRequired(
+                    format!(
+                        "stale staging was removed, but the directory update could not be made \
+                         durable: {error}"
+                    )
+                    .into(),
+                )
+            })?;
+        }
+        Ok(removed)
+    }
+
     #[must_use]
     pub fn recovery_staging_available(&self, staging: &StorePath) -> bool {
         StagingPath::is_owned_path(staging)

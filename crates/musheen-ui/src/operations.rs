@@ -14,7 +14,7 @@ use musheen_ops::{
     MetadataScope, OperationKind, PermanentDeleteConfirmation, PermanentDeleteRequest,
     RenameRequest,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -253,18 +253,7 @@ impl OperationHub {
         let mut status = load_status(&store)?;
         let interrupted = status.mark_unfinished_interrupted();
         let mut local_store = LocalStore::new();
-        let mut recovery_error = None;
-        for location in status
-            .history()
-            .into_iter()
-            .map(|entry| entry.location().clone())
-        {
-            if location.as_unix_path().is_some()
-                && let Err(error) = local_store.recover_replacements_at(&location)
-            {
-                recovery_error.get_or_insert_with(|| error.to_string().into());
-            }
-        }
+        let recovery_error = recover_local_operation_artifacts(&status, &mut local_store);
         let recovery_reconciled = status.reconcile_recovery_staging(
             |path| local_store.recovery_staging_available(path),
             |_| false,
@@ -1156,9 +1145,45 @@ fn load_status(store: &StatusStore) -> Result<StatusCenterModel, OperationHubErr
     }
 }
 
+fn recover_local_operation_artifacts(
+    status: &StatusCenterModel,
+    local_store: &mut LocalStore,
+) -> Option<Box<str>> {
+    let protected_staging = status
+        .history()
+        .into_iter()
+        .flat_map(|entry| entry.failures())
+        .filter_map(|failure| failure.recovery_staging().cloned())
+        .collect::<Vec<_>>();
+    let recovery_locations = status
+        .history()
+        .into_iter()
+        .map(|entry| entry.location().clone())
+        .collect::<Vec<_>>();
+    let mut recovered_directories = BTreeSet::new();
+    let mut recovery_error = None;
+    for location in recovery_locations {
+        let Some(parent) = location.as_unix_path().and_then(std::path::Path::parent) else {
+            continue;
+        };
+        if !recovered_directories.insert(parent.to_path_buf()) {
+            continue;
+        }
+        if let Err(error) = local_store.recover_replacements_at(&location) {
+            recovery_error.get_or_insert_with(|| error.to_string().into());
+            continue;
+        }
+        if let Err(error) = local_store.cleanup_stale_staging_at(&location, &protected_staging) {
+            recovery_error.get_or_insert_with(|| error.to_string().into());
+        }
+    }
+    recovery_error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OperationStatus;
     use musheen_ops::{EventGeneration, StagingPath};
     use standard_library::fs as filesystem;
     use std as standard_library;
@@ -1362,6 +1387,86 @@ mod tests {
         assert!(
             hub.persistence_error()
                 .is_some_and(|error| error.contains("replacement journal"))
+        );
+    }
+
+    #[test]
+    fn startup_removes_stale_staging_from_interrupted_operations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = StorePath::from_unix_path(temporary.path().join("destination.txt"));
+        let id = JobId::new(92).unwrap();
+        let generation = EventGeneration::new(4);
+        let mut status = StatusCenterModel::default();
+        status
+            .register(
+                id,
+                generation,
+                OperationKind::Copy,
+                destination.clone(),
+                Some(1),
+            )
+            .unwrap();
+        let store = StatusStore::at(temporary.path().join("status/operations.json"));
+        store.save(&status.to_json().unwrap()).unwrap();
+        let staging =
+            StagingPath::for_destination_with_nonce(&destination, id, generation, [0x33; 16])
+                .unwrap();
+        filesystem::write(staging.path().as_unix_path().unwrap(), b"partial").unwrap();
+
+        let hub = OperationHub::with_status_store(&ResourceLimits::default(), store).unwrap();
+
+        assert!(!staging.path().as_unix_path().unwrap().exists());
+        assert_eq!(
+            hub.status.lock().unwrap().entry(id).unwrap().status(),
+            OperationStatus::Interrupted
+        );
+    }
+
+    #[test]
+    fn startup_preserves_recorded_recovery_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = StorePath::from_unix_path(temporary.path().join("destination.txt"));
+        let id = JobId::new(93).unwrap();
+        let generation = EventGeneration::new(5);
+        let staging =
+            StagingPath::for_destination_with_nonce(&destination, id, generation, [0x44; 16])
+                .unwrap()
+                .path()
+                .clone();
+        filesystem::write(staging.as_unix_path().unwrap(), b"recoverable").unwrap();
+        let mut status = StatusCenterModel::default();
+        status
+            .register(
+                id,
+                generation,
+                OperationKind::Copy,
+                destination.clone(),
+                Some(1),
+            )
+            .unwrap();
+        status.mark_running(id).unwrap();
+        status
+            .record_recoverable_failure(id, destination, staging.clone(), "resume available")
+            .unwrap();
+        status.mark_recoverable(id).unwrap();
+        let store = StatusStore::at(temporary.path().join("status/operations.json"));
+        store.save(&status.to_json().unwrap()).unwrap();
+
+        let hub = OperationHub::with_status_store(&ResourceLimits::default(), store).unwrap();
+
+        assert_eq!(
+            filesystem::read(staging.as_unix_path().unwrap()).unwrap(),
+            b"recoverable"
+        );
+        assert!(
+            hub.status
+                .lock()
+                .unwrap()
+                .entry(id)
+                .unwrap()
+                .failures()
+                .iter()
+                .any(|failure| failure.recovery_staging() == Some(&staging))
         );
     }
 
