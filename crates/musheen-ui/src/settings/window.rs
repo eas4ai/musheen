@@ -976,6 +976,23 @@ mod tests {
     use gpui_kit::TestAppContext;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 
+    fn init_settings_pointer_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn settings_pointer_tests_use_stable_dialog_geometry(cx: &mut TestAppContext) {
+        init_settings_pointer_test(cx);
+
+        assert!(
+            cx.update(|cx| cx.reduce_motion()),
+            "pointer tests require settled dialog geometry"
+        );
+    }
+
     fn install_native_pair(
         preset: &str,
         active_dark: bool,
@@ -1001,7 +1018,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn toolbar_keyboard_move_previews_and_cancel_restores_runtime(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
+        init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         let mut view = None;
         let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
@@ -1060,7 +1077,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn localized_choices_are_controls_not_serialized_input_values(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
+        init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         for locale in [Locale::Ar, Locale::EnXa] {
             let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
@@ -1100,7 +1117,7 @@ mod tests {
     async fn localized_numeric_edits_round_trip_and_empty_credentials_remain_empty(
         cx: &mut TestAppContext,
     ) {
-        cx.update(gpui_kit::init);
+        init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         let mut view = None;
         let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
@@ -1451,7 +1468,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn reset_confirmation_traps_focus_and_escape_restores_trigger(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
+        init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         let mut view = None;
         let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
@@ -1516,7 +1533,7 @@ mod tests {
 
     #[gpui_kit::test]
     async fn apply_persists_the_ui_draft_before_marking_it_clean(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
+        init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         let store = SettingsStore::from_config_home(root.path());
         let mut view = None;
@@ -1581,7 +1598,7 @@ mod tests {
     async fn search_result_focuses_the_owning_control_and_retains_the_query(
         cx: &mut TestAppContext,
     ) {
-        cx.update(gpui_kit::init);
+        init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         let mut view = None;
         let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
