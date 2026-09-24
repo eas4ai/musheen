@@ -321,8 +321,48 @@ impl DirectoryRowsSource {
 
 struct IndexedViewport {
     generation: u64,
-    loaded: Option<(std::ops::Range<usize>, Vec<StoreItem>)>,
+    loaded: VecDeque<(std::ops::Range<usize>, Vec<StoreItem>)>,
     pending: Option<std::ops::Range<usize>>,
+}
+
+impl IndexedViewport {
+    const MAX_RANGES: usize = 16;
+    const MAX_ITEMS: usize = 4_096;
+
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            loaded: VecDeque::new(),
+            pending: None,
+        }
+    }
+
+    fn covers(&self, range: &std::ops::Range<usize>) -> bool {
+        self.loaded
+            .iter()
+            .any(|(loaded, _)| loaded.start <= range.start && loaded.end >= range.end)
+    }
+
+    fn item(&self, position: usize) -> Option<StoreItem> {
+        self.loaded
+            .iter()
+            .rev()
+            .find_map(|(range, items)| items.get(position.checked_sub(range.start)?).cloned())
+    }
+
+    fn insert(&mut self, range: std::ops::Range<usize>, items: Vec<StoreItem>) {
+        self.loaded.push_back((range, items));
+        while self.loaded.len() > Self::MAX_RANGES
+            || self
+                .loaded
+                .iter()
+                .map(|(_, items)| items.len())
+                .sum::<usize>()
+                > Self::MAX_ITEMS
+        {
+            self.loaded.pop_front();
+        }
+    }
 }
 
 struct ColumnParentRenderSpec {
@@ -12944,22 +12984,11 @@ impl MusheenApp {
         let viewport = self
             .indexed_viewports
             .entry(tab_id)
-            .or_insert_with(|| IndexedViewport {
-                generation,
-                loaded: None,
-                pending: None,
-            });
+            .or_insert_with(|| IndexedViewport::new(generation));
         if viewport.generation != generation {
-            *viewport = IndexedViewport {
-                generation,
-                loaded: None,
-                pending: None,
-            };
+            *viewport = IndexedViewport::new(generation);
         }
-        if viewport.loaded.as_ref().is_some_and(|(loaded, _)| {
-            loaded.start <= requested.start && loaded.end >= requested.end
-        }) || viewport.pending.is_some()
-        {
+        if viewport.covers(&requested) || viewport.pending.is_some() {
             return;
         }
         let padding = requested.len().min(1_024);
@@ -12997,7 +13026,7 @@ impl MusheenApp {
                 }
                 viewport.pending = None;
                 match result {
-                    Ok(items) => viewport.loaded = Some((result_range, items)),
+                    Ok(items) => viewport.insert(result_range, items),
                     Err(error) => state.operation_error = Some(error.to_string().into()),
                 }
                 cx.notify();
@@ -13016,8 +13045,7 @@ impl MusheenApp {
         if viewport.generation != generation {
             return None;
         }
-        let (range, items) = viewport.loaded.as_ref()?;
-        items.get(position.checked_sub(range.start)?).cloned()
+        viewport.item(position)
     }
 
     fn directory_order_matches(&self, tab_id: TabId, expected: &Arc<Vec<usize>>) -> bool {
@@ -18576,7 +18604,7 @@ mod tests {
             app.read(cx)
                 .indexed_viewports
                 .get(&tab_id)
-                .is_some_and(|viewport| viewport.loaded.is_some())
+                .is_some_and(|viewport| !viewport.loaded.is_empty())
         })
         .await;
         cx.update_window(handle.into(), |_, window, cx| {
@@ -18584,6 +18612,90 @@ mod tests {
             assert!(window.find("directory-item-0-0").visible());
         })
         .unwrap();
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state
+                    .directory_scrolls
+                    .get(&(tab_id, 0))
+                    .unwrap()
+                    .scroll_to_item_strict(4_096, gpui_kit::ScrollStrategy::Top);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .indexed_viewports
+                .get(&tab_id)
+                .is_some_and(|viewport| viewport.item(4_096).is_some())
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("directory-item-0-4096").visible());
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let viewport = app.read(cx).indexed_viewports.get(&tab_id).unwrap();
+            assert!(viewport.item(0).is_some());
+            assert!(viewport.item(4_096).is_some());
+            assert!(
+                viewport
+                    .loaded
+                    .iter()
+                    .map(|(_, items)| items.len())
+                    .sum::<usize>()
+                    <= 4_096
+            );
+        });
+        for position in [8_191, 0] {
+            cx.update(|cx| {
+                app.update(cx, |state, cx| {
+                    state
+                        .directory_scrolls
+                        .get(&(tab_id, 0))
+                        .unwrap()
+                        .scroll_to_item_strict(position, gpui_kit::ScrollStrategy::Top);
+                    cx.notify();
+                });
+            });
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+                app.read(cx)
+                    .indexed_viewports
+                    .get(&tab_id)
+                    .is_some_and(|viewport| viewport.item(position).is_some())
+            })
+            .await;
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(
+                    window
+                        .find(SharedString::from(format!("directory-item-0-{position}")))
+                        .visible()
+                );
+            })
+            .unwrap();
+            cx.update(|cx| {
+                let viewport = app.read(cx).indexed_viewports.get(&tab_id).unwrap();
+                assert!(
+                    viewport
+                        .loaded
+                        .iter()
+                        .map(|(_, items)| items.len())
+                        .sum::<usize>()
+                        <= 4_096
+                );
+            });
+        }
     }
 
     #[gpui_kit::test]
