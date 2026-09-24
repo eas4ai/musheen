@@ -349,7 +349,11 @@ impl Default for ThumbnailLimits {
 
 impl ThumbnailLimits {
     pub fn new(workers: usize, timeout: Duration) -> Result<Self, ThumbnailError> {
-        if workers == 0 || timeout.is_zero() {
+        if workers == 0
+            || workers > DEFAULT_WORKERS
+            || timeout.is_zero()
+            || timeout > DEFAULT_TIMEOUT
+        {
             return Err(ThumbnailError::InvalidLimits);
         }
         Ok(Self { workers, timeout })
@@ -589,7 +593,9 @@ pub enum ThumbnailError {
 impl fmt::Display for ThumbnailError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidLimits => formatter.write_str("thumbnail limits must be positive"),
+            Self::InvalidLimits => formatter.write_str(
+                "thumbnail limits must be positive and within the worker and timeout budgets",
+            ),
             Self::Cancelled => formatter.write_str("thumbnail generation cancelled"),
             Self::Timeout => formatter.write_str("thumbnail generation timed out"),
             Self::Io(error) => write!(formatter, "thumbnail I/O failed: {error}"),

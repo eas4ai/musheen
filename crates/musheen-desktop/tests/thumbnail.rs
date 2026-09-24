@@ -61,6 +61,20 @@ fn cache_only_misses_never_start_a_worker() {
     );
 }
 
+#[test]
+fn thumbnail_limits_reject_work_above_the_documented_budget() {
+    assert!(ThumbnailLimits::new(1, Duration::from_millis(1)).is_ok());
+    assert!(ThumbnailLimits::new(4, Duration::from_secs(10)).is_ok());
+    assert!(matches!(
+        ThumbnailLimits::new(5, Duration::from_secs(10)),
+        Err(ThumbnailError::InvalidLimits)
+    ));
+    assert!(matches!(
+        ThumbnailLimits::new(4, Duration::from_secs(10) + Duration::from_nanos(1)),
+        Err(ThumbnailError::InvalidLimits)
+    ));
+}
+
 #[cfg(unix)]
 fn worker_script(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
