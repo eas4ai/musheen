@@ -30,3 +30,22 @@ fn operation_status_documents_are_private_atomic_and_separate_from_sessions() {
         0o600
     );
 }
+
+#[test]
+fn valid_status_backup_tracks_the_previous_write() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = StatusStore::from_config_home(temporary.path());
+    let first = br#"{"schema_version":1,"entries":[],"marker":"first"}"#;
+    let second = br#"{"schema_version":1,"entries":[],"marker":"second"}"#;
+    let third = br#"{"schema_version":1,"entries":[],"marker":"third"}"#;
+
+    store.save(first).unwrap();
+    store.save(second).unwrap();
+    store.save(third).unwrap();
+
+    assert_eq!(store.load().unwrap().as_deref(), Some(third.as_slice()));
+    assert_eq!(
+        store.load_backup().unwrap().as_deref(),
+        Some(second.as_slice())
+    );
+}

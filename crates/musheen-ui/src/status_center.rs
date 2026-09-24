@@ -1,4 +1,5 @@
 use musheen_core::{DisplayPath, StorePath};
+use musheen_desktop::STATUS_SCHEMA_VERSION;
 pub(crate) mod custom_actions;
 use custom_actions::CustomActionStatus;
 use musheen_ops::{EventGeneration, JobId, OperationKind, StagingPath, TrashReceipt};
@@ -6,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-
-const STATUS_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

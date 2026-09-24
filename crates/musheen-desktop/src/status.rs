@@ -2,6 +2,7 @@ use crate::{SessionStore, SessionStoreError};
 use std::path::{Path, PathBuf};
 
 const STATUS_FILE_NAME: &str = "operations.json";
+pub const STATUS_SCHEMA_VERSION: u32 = 1;
 
 /// Private, atomically replaced storage for operation status history.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,8 +42,22 @@ impl StatusStore {
     }
 
     pub fn save(&self, document: &[u8]) -> Result<(), StatusStoreError> {
-        self.document.save(document)
+        self.document
+            .save_with_schema(document, STATUS_SCHEMA_VERSION, has_supported_status_shape)
     }
 }
 
 pub type StatusStoreError = SessionStoreError;
+
+fn has_supported_status_shape(document: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(document) else {
+        return false;
+    };
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(u64::from(STATUS_SCHEMA_VERSION))
+        && value
+            .get("entries")
+            .is_some_and(serde_json::Value::is_array)
+}

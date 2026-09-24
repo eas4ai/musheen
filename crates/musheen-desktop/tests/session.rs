@@ -145,6 +145,72 @@ fn unrecognized_primary_schema_is_not_replaced_by_an_older_build() {
 }
 
 #[test]
+fn missing_primary_schema_is_not_replaced_by_an_older_build() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let backup = temporary.path().join("session.json.bak");
+    let store = SessionStore::at(&path);
+    let newer = br#"{"windows":[{"future_field":true}]}"#;
+    let previous = br#"{"schema_version":1,"windows":[{"name":"previous"}]}"#;
+    fs::write(&path, newer).unwrap();
+    fs::write(&backup, previous).unwrap();
+
+    assert!(matches!(
+        store.save(previous),
+        Err(SessionStoreError::UnrecognizedSchema { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), newer);
+    assert_eq!(fs::read(&backup).unwrap(), previous);
+}
+
+#[test]
+fn missing_backup_schema_is_not_replaced_by_an_older_build() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let backup = temporary.path().join("session.json.bak");
+    let store = SessionStore::at(&path);
+    let previous = br#"{"schema_version":1,"windows":[{"name":"previous"}]}"#;
+    let newer = br#"{"windows":[{"future_field":true}]}"#;
+    fs::write(&path, previous).unwrap();
+    fs::write(&backup, newer).unwrap();
+
+    assert!(matches!(
+        store.save(previous),
+        Err(SessionStoreError::UnrecognizedSchema { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), previous);
+    assert_eq!(fs::read(&backup).unwrap(), newer);
+}
+
+#[test]
+fn older_build_does_not_write_a_future_session_document() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let store = SessionStore::at(&path);
+    let future = br#"{"schema_version":2,"windows":[],"future_field":true}"#;
+
+    assert!(matches!(
+        store.save(future),
+        Err(SessionStoreError::FutureSchema { version: 2, .. })
+    ));
+    assert!(!path.exists());
+}
+
+#[test]
+fn older_build_does_not_write_a_versionless_session_document() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let store = SessionStore::at(&path);
+    let unknown = br#"{"windows":[{"future_field":true}]}"#;
+
+    assert!(matches!(
+        store.save(unknown),
+        Err(SessionStoreError::UnrecognizedSchema { .. })
+    ));
+    assert!(!path.exists());
+}
+
+#[test]
 fn unrecognized_backup_schema_is_not_replaced_by_an_older_build() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("session.json");

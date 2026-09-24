@@ -42,19 +42,35 @@ impl SessionStore {
     }
 
     pub fn save(&self, document: &[u8]) -> Result<(), SessionStoreError> {
+        self.save_with_schema(
+            document,
+            SESSION_SCHEMA_VERSION,
+            has_supported_session_shape,
+        )
+    }
+
+    pub(crate) fn save_with_schema(
+        &self,
+        document: &[u8],
+        supported_version: u32,
+        supported_backup_shape: fn(&[u8]) -> bool,
+    ) -> Result<(), SessionStoreError> {
+        if let Some(error) = unsupported_schema(document, &self.path, supported_version) {
+            return Err(error);
+        }
         let current = self.load()?;
         let backup_path = self.backup_path();
         let backup = self.load_backup()?;
         for (path, stored) in [(&self.path, &current), (&backup_path, &backup)] {
             if let Some(error) = stored
                 .as_deref()
-                .and_then(|document| unsupported_schema(document, path))
+                .and_then(|document| unsupported_schema(document, path, supported_version))
             {
                 return Err(error);
             }
         }
         if let Some(current) =
-            current.filter(|bytes| backup.is_none() || has_supported_session_shape(bytes))
+            current.filter(|bytes| backup.is_none() || supported_backup_shape(bytes))
         {
             atomic_replace(&self.backup_path(), &current).map_err(SessionStoreError::from)?;
         }
@@ -68,14 +84,23 @@ impl SessionStore {
     }
 }
 
-fn unsupported_schema(document: &[u8], path: &Path) -> Option<SessionStoreError> {
+fn unsupported_schema(
+    document: &[u8],
+    path: &Path,
+    supported_version: u32,
+) -> Option<SessionStoreError> {
     let value = serde_json::from_slice::<serde_json::Value>(document).ok()?;
-    let schema = value.get("schema_version")?;
+    let Some(schema) = value.get("schema_version") else {
+        return Some(SessionStoreError::UnrecognizedSchema {
+            path: path.to_path_buf(),
+        });
+    };
     match schema.as_u64() {
-        Some(version) if version > u64::from(SESSION_SCHEMA_VERSION) => {
+        Some(version) if version > u64::from(supported_version) => {
             Some(SessionStoreError::FutureSchema {
                 path: path.to_path_buf(),
                 version,
+                supported_version,
             })
         }
         Some(_) => None,
@@ -129,6 +154,7 @@ pub enum SessionStoreError {
     FutureSchema {
         path: PathBuf,
         version: u64,
+        supported_version: u32,
     },
     UnrecognizedSchema {
         path: PathBuf,
@@ -148,9 +174,13 @@ impl fmt::Display for SessionStoreError {
                 path.display()
             ),
             Self::Storage(error) => write!(formatter, "atomic session storage failed: {error}"),
-            Self::FutureSchema { path, version } => write!(
+            Self::FutureSchema {
+                path,
+                version,
+                supported_version,
+            } => write!(
                 formatter,
-                "session schema {version} in {} is newer than supported schema {SESSION_SCHEMA_VERSION}; refusing to overwrite it",
+                "document schema {version} in {} is newer than supported schema {supported_version}; refusing to overwrite it",
                 path.display()
             ),
             Self::UnrecognizedSchema { path } => write!(
