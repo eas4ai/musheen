@@ -157,6 +157,16 @@ fn release_workflow_has_no_development_triggers() {
 fn release_container_tests_both_toolchains_features_and_profiles() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dockerfile = fs::read_to_string(root.join("ci/release.Dockerfile")).unwrap();
+    let base_image = dockerfile
+        .lines()
+        .find(|line| line.starts_with("FROM rust:"))
+        .unwrap();
+    let digest = base_image
+        .strip_prefix("FROM rust:1.95-bookworm@sha256:")
+        .and_then(|line| line.strip_suffix(" AS verify"))
+        .expect("release image must pin the Rust 1.95 Bookworm image by digest");
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let matrix = fs::read_to_string(root.join("scripts/verify-release-matrix.sh")).unwrap();
     assert!(dockerfile.contains("verify-release-matrix.sh"));
     assert!(dockerfile.contains("scripts/check-budgets.sh"));

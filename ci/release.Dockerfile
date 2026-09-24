@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.95-bookworm AS verify
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS verify
 
 ENV CARGO_BUILD_JOBS=1 \
     CARGO_INCREMENTAL=0 \
