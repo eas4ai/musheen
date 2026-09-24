@@ -128,3 +128,37 @@ fn future_backup_session_is_not_lost_after_fallback_restore() {
     assert_eq!(fs::read(&path).unwrap(), previous);
     assert_eq!(fs::read(&backup).unwrap(), future);
 }
+
+#[test]
+fn unrecognized_primary_schema_is_not_replaced_by_an_older_build() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let store = SessionStore::at(&path);
+    let newer = br#"{"schema_version":"next","windows":[],"future_field":true}"#;
+    fs::write(&path, newer).unwrap();
+
+    assert!(matches!(
+        store.save(br#"{"schema_version":1,"windows":[]}"#),
+        Err(SessionStoreError::UnrecognizedSchema { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), newer);
+}
+
+#[test]
+fn unrecognized_backup_schema_is_not_replaced_by_an_older_build() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let backup = temporary.path().join("session.json.bak");
+    let store = SessionStore::at(&path);
+    let older = br#"{"schema_version":1,"windows":[]}"#;
+    let newer = br#"{"schema_version":"next","windows":[],"future_field":true}"#;
+    fs::write(&path, older).unwrap();
+    fs::write(&backup, newer).unwrap();
+
+    assert!(matches!(
+        store.save(older),
+        Err(SessionStoreError::UnrecognizedSchema { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), older);
+    assert_eq!(fs::read(&backup).unwrap(), newer);
+}

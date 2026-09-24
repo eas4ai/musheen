@@ -46,11 +46,11 @@ impl SessionStore {
         let backup_path = self.backup_path();
         let backup = self.load_backup()?;
         for (path, stored) in [(&self.path, &current), (&backup_path, &backup)] {
-            if let Some(version) = stored.as_deref().and_then(future_schema_version) {
-                return Err(SessionStoreError::FutureSchema {
-                    path: path.clone(),
-                    version,
-                });
+            if let Some(error) = stored
+                .as_deref()
+                .and_then(|document| unsupported_schema(document, path))
+            {
+                return Err(error);
             }
         }
         if let Some(current) =
@@ -68,12 +68,21 @@ impl SessionStore {
     }
 }
 
-fn future_schema_version(document: &[u8]) -> Option<u64> {
-    serde_json::from_slice::<serde_json::Value>(document)
-        .ok()?
-        .get("schema_version")?
-        .as_u64()
-        .filter(|version| *version > u64::from(SESSION_SCHEMA_VERSION))
+fn unsupported_schema(document: &[u8], path: &Path) -> Option<SessionStoreError> {
+    let value = serde_json::from_slice::<serde_json::Value>(document).ok()?;
+    let schema = value.get("schema_version")?;
+    match schema.as_u64() {
+        Some(version) if version > u64::from(SESSION_SCHEMA_VERSION) => {
+            Some(SessionStoreError::FutureSchema {
+                path: path.to_path_buf(),
+                version,
+            })
+        }
+        Some(_) => None,
+        None => Some(SessionStoreError::UnrecognizedSchema {
+            path: path.to_path_buf(),
+        }),
+    }
 }
 
 fn has_supported_session_shape(document: &[u8]) -> bool {
@@ -121,6 +130,9 @@ pub enum SessionStoreError {
         path: PathBuf,
         version: u64,
     },
+    UnrecognizedSchema {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for SessionStoreError {
@@ -141,6 +153,11 @@ impl fmt::Display for SessionStoreError {
                 "session schema {version} in {} is newer than supported schema {SESSION_SCHEMA_VERSION}; refusing to overwrite it",
                 path.display()
             ),
+            Self::UnrecognizedSchema { path } => write!(
+                formatter,
+                "session schema in {} is unrecognized; refusing to overwrite it",
+                path.display()
+            ),
         }
     }
 }
@@ -150,7 +167,7 @@ impl Error for SessionStoreError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Storage(source) => Some(source),
-            Self::FutureSchema { .. } => None,
+            Self::FutureSchema { .. } | Self::UnrecognizedSchema { .. } => None,
         }
     }
 }
