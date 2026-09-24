@@ -6020,7 +6020,22 @@ impl MusheenApp {
                 return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
             };
             let view = directory.view();
-            let Some(item) = view.item(&clicked) else {
+            let viewport = self
+                .indexed_viewports
+                .get(&tab_id)
+                .filter(|viewport| viewport.generation == directory.order_epoch());
+            let cached_item = |id: &ItemId| {
+                view.item(id).or_else(|| {
+                    viewport.and_then(|viewport| {
+                        viewport
+                            .loaded
+                            .iter()
+                            .flat_map(|(_, items)| items)
+                            .find(|item| item.id() == id)
+                    })
+                })
+            };
+            let Some(item) = cached_item(&clicked) else {
                 return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
             };
             let clicked_target = CommandTargetRef::new(item.id().clone(), item.path().clone())
@@ -6028,11 +6043,12 @@ impl MusheenApp {
             let selected = view
                 .selected_ids()
                 .iter()
-                .filter_map(|id| view.item(id))
-                .filter_map(|item| {
+                .map(|id| {
+                    let item = cached_item(id)?;
                     CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
                 })
-                .collect::<Vec<_>>();
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default();
             (clicked_target, selected)
         };
         let prepared = self
@@ -18717,6 +18733,26 @@ mod tests {
         .unwrap();
         cx.update(|cx| {
             app.update(cx, |state, cx| {
+                let item = state
+                    .indexed_cached_item(tab_id, state.focused_directory().order_epoch(), 0)
+                    .unwrap();
+                let menu = state.item_context_menu(tab_id, item.id().clone(), cx);
+                assert!(MusheenApp::menu_entry_by_id(&menu, "file.rename").is_some());
+                let far = ItemId::new(ProviderId::new("local").unwrap(), 8_191usize.to_be_bytes())
+                    .unwrap();
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .set_selected_ids(vec![item.id().clone(), far]);
+                state.item_context_menu(tab_id, item.id().clone(), cx);
+                assert_eq!(
+                    state.focused_directory().view().selected_ids(),
+                    std::slice::from_ref(item.id())
+                );
+            });
+        });
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
                 state
                     .directory_scrolls
                     .get(&(tab_id, 0))
@@ -18813,7 +18849,7 @@ mod tests {
         .await;
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert_eq!(window.find("status-bar").label(), Some("1 item"));
+            assert_eq!(window.find("status-bar").label(), Some("1 item selected"));
         })
         .unwrap();
         cx.update(|cx| {
