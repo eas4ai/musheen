@@ -351,6 +351,12 @@ enum IndexedContextSource {
     Keyboard,
 }
 
+impl IndexedContextSource {
+    fn focus_matches(self, requested: &ItemId, current: Option<&ItemId>) -> bool {
+        matches!(self, Self::Pointer) || current == Some(requested)
+    }
+}
+
 impl IndexedViewport {
     const MAX_RANGES: usize = 16;
     const MAX_ITEMS: usize = 4_096;
@@ -6422,6 +6428,11 @@ impl MusheenApp {
         }
     }
 
+    fn queue_plain_context_menu(&mut self, menu: ContextMenu) {
+        self.pending_indexed_context_menu = None;
+        self.pending_context_menu = Some(menu);
+    }
+
     /// Builds a menu request from the pane that received the pointer event.
     /// Capturing the pane's tab id here prevents the other pane's selection
     /// from becoming an accidental target after focus changes.
@@ -6591,6 +6602,7 @@ impl MusheenApp {
                             && directory.order_epoch() == order_epoch
                             && directory.indexed_selection_epoch() == selection_epoch
                             && directory.view().selected_ids() == selected_ids
+                            && source.focus_matches(&clicked, directory.view().focused_item_id())
                     });
                 if !current {
                     Self::rebuild_indexed_context_status(
@@ -11735,20 +11747,19 @@ impl MusheenApp {
                                                 if !this.context_dialog_windows.is_empty() {
                                                     return;
                                                 }
-                                                this.pending_context_menu =
-                                                    Some(this.sidebar_entry_context_menu(
-                                                        sidebar_tab,
-                                                        if kind == SidebarSectionKind::Tags {
-                                                            MenuTarget::Tag
-                                                        } else if kind == SidebarSectionKind::Mounts
-                                                        {
-                                                            MenuTarget::Mount
-                                                        } else {
-                                                            MenuTarget::SidebarLocation
-                                                        },
-                                                        context_location.clone(),
-                                                        context_identity.clone(),
-                                                    ));
+                                                let menu = this.sidebar_entry_context_menu(
+                                                    sidebar_tab,
+                                                    if kind == SidebarSectionKind::Tags {
+                                                        MenuTarget::Tag
+                                                    } else if kind == SidebarSectionKind::Mounts {
+                                                        MenuTarget::Mount
+                                                    } else {
+                                                        MenuTarget::SidebarLocation
+                                                    },
+                                                    context_location.clone(),
+                                                    context_identity.clone(),
+                                                );
+                                                this.queue_plain_context_menu(menu);
                                             }),
                                         )
                                         .child(
@@ -11850,9 +11861,11 @@ impl MusheenApp {
                     .update(popup_cx, |this, cx| {
                         if this.browser_input_blocked() {
                             this.pending_context_menu = None;
+                            this.pending_indexed_context_menu = None;
                             return None;
                         }
                         this.remember_context_invocation_focus(window, cx);
+                        this.pending_indexed_context_menu = None;
                         Some(
                             this.pending_context_menu
                                 .take()
@@ -12007,8 +12020,9 @@ impl MusheenApp {
                         return;
                     }
                     this.focus_directory_item(tab_id, None, cx);
-                    this.pending_context_menu =
-                        Some(this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new()));
+                    let menu =
+                        this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+                    this.queue_plain_context_menu(menu);
                 }),
             )
             .context_menu(move |popup, window, popup_cx| {
@@ -12145,11 +12159,12 @@ impl MusheenApp {
                                         _ => None,
                                     })
                                     .unwrap_or_else(|| vec![pointer_target.clone()]);
-                                this.pending_context_menu = Some(this.compose_context_menu(
+                                let menu = this.compose_context_menu(
                                     tab_id,
                                     MenuTarget::TrashItem,
                                     selection,
-                                ));
+                                );
+                                this.queue_plain_context_menu(menu);
                                 cx.notify();
                             }),
                         )
@@ -13603,12 +13618,13 @@ impl MusheenApp {
                     let selection = vec![target.clone()];
                     this.preflight_custom_actions(&selection, context_location.clone(), cx);
                     this.refresh_application_snapshot(&selection, cx);
-                    this.pending_context_menu = Some(this.compose_context_menu_at(
+                    let menu = this.compose_context_menu_at(
                         tab_id,
                         MenuTarget::Item,
                         context_location.clone(),
                         selection,
-                    ));
+                    );
+                    this.queue_plain_context_menu(menu);
                 }),
             )
             .into_any_element()
@@ -15646,6 +15662,18 @@ mod tests {
         assert!(!viewport.matches_pending(6, &(100..120)));
         assert!(!viewport.matches_pending(7, &(120..140)));
         assert!(viewport.matches_pending(7, &(100..120)));
+    }
+
+    #[test]
+    fn indexed_keyboard_context_rejects_changed_focus() {
+        let provider = ProviderId::new("local").unwrap();
+        let requested = ItemId::new(provider.clone(), b"requested".to_vec()).unwrap();
+        let moved = ItemId::new(provider, b"moved".to_vec()).unwrap();
+
+        assert!(IndexedContextSource::Pointer.focus_matches(&requested, Some(&moved)));
+        assert!(IndexedContextSource::Keyboard.focus_matches(&requested, Some(&requested)));
+        assert!(!IndexedContextSource::Keyboard.focus_matches(&requested, Some(&moved)));
+        assert!(!IndexedContextSource::Keyboard.focus_matches(&requested, None));
     }
 
     #[test]
@@ -19832,6 +19860,19 @@ mod tests {
             window.click("status-bar", cx);
         })
         .unwrap();
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let item = state
+                    .indexed_cached_item(tab_id, state.focused_directory().order_epoch(), 0)
+                    .unwrap();
+                state.item_context_menu(tab_id, item.id().clone(), cx);
+                assert!(state.pending_indexed_context_menu.is_some());
+                let background =
+                    state.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+                state.queue_plain_context_menu(background);
+                assert!(state.pending_indexed_context_menu.is_none());
+            });
+        });
         cx.update(|cx| {
             app.update(cx, |state, cx| {
                 state
