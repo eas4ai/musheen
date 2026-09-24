@@ -14,7 +14,10 @@ use crate::dialogs::{
     install_open_with_key_bindings, install_properties_key_bindings,
     metadata_review_window_options, open_with_window_options, properties_window_options,
 };
-use crate::directory::{ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState};
+use crate::directory::{
+    ApplyPageResult, DirectoryIndexResult, DirectoryIndexWork, DirectoryLoad, DirectoryModel,
+    DirectoryState,
+};
 use crate::elevated_browser::{PrivilegeBackend, RootedFilesystemStore, SystemPrivilegeBackend};
 use crate::i18n::{Catalog, Locale};
 use crate::icons::{ApplicationIdentity, ContentIdentity, freedesktop_icon_name};
@@ -157,7 +160,6 @@ const SESSION_SAVE_DELAY: Duration = Duration::from_millis(250);
 const OPERATION_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
 const UNDO_AVAILABILITY_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const XATTR_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
-const DIRECTORY_BROWSER_RETENTION: usize = 100_000;
 
 #[cfg(test)]
 type CommandDispatchProbe = Arc<Mutex<Vec<(Box<str>, bool)>>>;
@@ -293,9 +295,34 @@ struct DirectoryRows {
     layout: Layout,
     row_height: Pixels,
     columns: usize,
-    positions: Arc<Vec<usize>>,
-    base_order: Arc<Vec<usize>>,
+    source: DirectoryRowsSource,
     scroll: UniformListScrollHandle,
+}
+
+enum DirectoryRowsSource {
+    InMemory {
+        positions: Arc<Vec<usize>>,
+        base_order: Arc<Vec<usize>>,
+    },
+    Indexed {
+        visible_count: usize,
+        generation: u64,
+    },
+}
+
+impl DirectoryRowsSource {
+    fn len(&self) -> usize {
+        match self {
+            Self::InMemory { positions, .. } => positions.len(),
+            Self::Indexed { visible_count, .. } => *visible_count,
+        }
+    }
+}
+
+struct IndexedViewport {
+    generation: u64,
+    loaded: Option<(std::ops::Range<usize>, Vec<StoreItem>)>,
+    pending: Option<std::ops::Range<usize>>,
 }
 
 struct ColumnParentRenderSpec {
@@ -2970,6 +2997,7 @@ impl OperationUsage for HubVolumeUsage {
 
 struct MusheenApp {
     directories: HashMap<TabId, DirectoryModel>,
+    indexed_viewports: HashMap<TabId, IndexedViewport>,
     column_trails: HashMap<TabId, ColumnTrail>,
     searches: HashMap<TabId, ActiveSearch>,
     filters: HashMap<TabId, ActiveFilter>,
@@ -3608,8 +3636,7 @@ impl MusheenApp {
         let focused_tab = navigation.focused_tab().id();
         let (catalog_binding, pins, tag_names) = Self::catalog_models(session_binding.as_ref());
         let mut directories = HashMap::new();
-        let mut directory =
-            DirectoryModel::new_with_retention(limits.snapshot(), DIRECTORY_BROWSER_RETENTION);
+        let mut directory = DirectoryModel::new(limits.snapshot());
         *directory.view_mut().preferences_mut() =
             navigation.focused_tab().view_preferences().clone();
         directories.insert(focused_tab, directory);
@@ -3691,6 +3718,7 @@ impl MusheenApp {
             live_application_popups: Vec::new(),
             customization_keys: None,
             directories,
+            indexed_viewports: HashMap::new(),
             column_trails: HashMap::new(),
             searches: HashMap::new(),
             filters: HashMap::new(),
@@ -3980,6 +4008,7 @@ impl MusheenApp {
 
     fn start_load_for_tab(&mut self, tab_id: TabId, location: StorePath, cx: &mut Context<Self>) {
         self.pending_directory_restores.remove(&tab_id);
+        self.indexed_viewports.remove(&tab_id);
         if let Err(error) = self.validate_elevated_location(&location) {
             self.operation_error = Some(localized_privilege_error(&self.catalog, &error));
             cx.notify();
@@ -3987,10 +4016,7 @@ impl MusheenApp {
         }
         let trash = is_trash_location(&location);
         if !self.directories.contains_key(&tab_id) {
-            let mut directory = DirectoryModel::new_with_retention(
-                self.limits.snapshot(),
-                DIRECTORY_BROWSER_RETENTION,
-            );
+            let mut directory = DirectoryModel::new(self.limits.snapshot());
             if let Some(tab) = self.navigation.tab(tab_id) {
                 let base = self.navigation.preferences_for(tab.location()).clone();
                 *directory.view_mut().preferences_mut() = self.preferences_with_catalog(
@@ -4010,12 +4036,7 @@ impl MusheenApp {
         let load = self
             .directories
             .entry(tab_id)
-            .or_insert_with(|| {
-                DirectoryModel::new_with_retention(
-                    self.limits.snapshot(),
-                    DIRECTORY_BROWSER_RETENTION,
-                )
-            })
+            .or_insert_with(|| DirectoryModel::new(self.limits.snapshot()))
             .begin_navigation(location);
         if is_home_location(load.location()) {
             cx.notify();
@@ -4255,68 +4276,163 @@ impl MusheenApp {
         };
         match result {
             Ok(page) => {
-                let page_items = page.items().to_vec();
-                if directory.apply_page(load, page) == ApplyPageResult::Stale {
+                if !directory.is_current(load) {
                     return;
                 }
-                let complete = directory.view().is_complete();
-                let should_prefetch = !complete && directory.view().has_retention_capacity();
-                let items = if complete {
-                    directory.items().to_vec()
-                } else {
-                    page_items
-                };
-                self.remember_folder_location(load.location());
-                self.apply_pending_file_manager_selection(tab_id, cx);
-                self.advance_directory_restore(tab_id, cx);
-
-                // Catalog persistence can involve xattrs and fsync. Keep it
-                // outside GPUI's render thread even for very large folders.
-                let binding = self.catalog_binding.clone();
-                let location = load.location().clone();
-                let work = cx.background_spawn(async move {
-                    binding.reconcile_directory(
-                        &location,
-                        &items,
-                        if complete {
-                            DirectoryObservation::Complete
-                        } else {
-                            DirectoryObservation::Partial
-                        },
-                    )
-                });
-                cx.spawn(async move |this, cx| {
-                    let result = work.await;
-                    let Some(this) = this.upgrade() else {
+                let page_items = page.items().to_vec();
+                if directory.needs_index(&page) {
+                    let index_work = directory.prepare_index_page(page);
+                    self.spawn_index_page_work(tab_id, load.clone(), index_work, page_items, cx);
+                    return;
+                }
+                match directory.apply_page(load, page) {
+                    ApplyPageResult::Stale => return,
+                    ApplyPageResult::Failed => {
+                        if let DirectoryState::Error(message) = directory.state() {
+                            self.operation_error = Some(message.clone());
+                        }
                         return;
-                    };
-                    if let Err(error) = result {
-                        this.update(cx, |state, cx| {
-                            state.operation_error = Some(error);
-                            cx.notify();
-                        });
                     }
-                })
-                .detach();
-                if should_prefetch {
-                    self.start_next_directory_page(tab_id, cx);
+                    ApplyPageResult::Applied => {}
+                }
+                self.finish_directory_page(tab_id, load, page_items, cx);
+            }
+            Err(error) => self.handle_directory_page_error(tab_id, load, error),
+        }
+    }
+
+    fn spawn_index_page_work(
+        &mut self,
+        tab_id: TabId,
+        load: DirectoryLoad,
+        index_work: DirectoryIndexWork,
+        page_items: Vec<StoreItem>,
+        cx: &mut Context<Self>,
+    ) {
+        let work = cx.background_spawn(async move { index_work.run() });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.finish_index_page_work(tab_id, &load, result, page_items, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn finish_index_page_work(
+        &mut self,
+        tab_id: TabId,
+        load: &DirectoryLoad,
+        result: std::io::Result<DirectoryIndexResult>,
+        page_items: Vec<StoreItem>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(directory) = self.directories.get_mut(&tab_id) else {
+            return;
+        };
+        match directory.finish_index_page(load, result) {
+            ApplyPageResult::Applied => {
+                if directory.view().is_complete() {
+                    self.indexed_viewports.remove(&tab_id);
+                }
+                self.finish_directory_page(tab_id, load, page_items, cx);
+            }
+            ApplyPageResult::Failed => {
+                if let DirectoryState::Error(message) = directory.state() {
+                    self.operation_error = Some(message.clone());
                 }
             }
-            Err(error) => {
-                let (request_error, operation_error) =
-                    apply_directory_page_error(directory, load, error);
-                if let Some(operation_error) = operation_error {
-                    self.operation_error = Some(operation_error);
+            ApplyPageResult::Stale => {}
+        }
+    }
+
+    fn handle_directory_page_error(
+        &mut self,
+        tab_id: TabId,
+        load: &DirectoryLoad,
+        error: StoreError,
+    ) {
+        let Some(directory) = self.directories.get_mut(&tab_id) else {
+            return;
+        };
+        let (request_error, operation_error) = apply_directory_page_error(directory, load, error);
+        if let Some(operation_error) = operation_error {
+            self.operation_error = Some(operation_error);
+        }
+        self.fail_pending_file_manager_selection(tab_id, load, request_error);
+        if self
+            .pending_directory_restores
+            .get(&tab_id)
+            .is_some_and(|restore| restore.generation == load.generation())
+        {
+            self.pending_directory_restores.remove(&tab_id);
+        }
+    }
+
+    fn finish_directory_page(
+        &mut self,
+        tab_id: TabId,
+        load: &DirectoryLoad,
+        page_items: Vec<StoreItem>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(directory) = self.directories.get(&tab_id) else {
+            return;
+        };
+        let complete = directory.view().is_complete();
+        let indexed = directory.indexed_count() > directory.items().len();
+        let prefetch_after_reconcile = indexed && !complete;
+        let items = if complete && !indexed {
+            directory.items().to_vec()
+        } else {
+            page_items
+        };
+        self.remember_folder_location(load.location());
+        self.apply_pending_file_manager_selection(tab_id, cx);
+        self.advance_directory_restore(tab_id, cx);
+
+        let binding = self.catalog_binding.clone();
+        let location = load.location().clone();
+        let generation = load.generation();
+        let work = cx.background_spawn(async move {
+            binding.reconcile_directory(
+                &location,
+                &items,
+                if complete && !indexed {
+                    DirectoryObservation::Complete
+                } else {
+                    DirectoryObservation::Partial
+                },
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    state.operation_error = Some(error);
                 }
-                self.fail_pending_file_manager_selection(tab_id, load, request_error);
-                if self
-                    .pending_directory_restores
-                    .get(&tab_id)
-                    .is_some_and(|restore| restore.generation == load.generation())
+                if prefetch_after_reconcile
+                    && state
+                        .directories
+                        .get(&tab_id)
+                        .map(DirectoryModel::generation)
+                        == Some(generation)
                 {
-                    self.pending_directory_restores.remove(&tab_id);
+                    state.start_next_directory_page(tab_id, cx);
                 }
-            }
+                cx.notify();
+            });
+        })
+        .detach();
+        if !complete && !indexed {
+            self.start_next_directory_page(tab_id, cx);
         }
     }
 
@@ -9563,6 +9679,18 @@ impl MusheenApp {
             .iter()
             .flat_map(|pane| pane.tabs().iter().map(|tab| tab.id()))
             .collect::<std::collections::HashSet<_>>();
+        self.directories.retain(|tab, directory| {
+            if open_tabs.contains(tab) {
+                true
+            } else {
+                directory.cancel();
+                false
+            }
+        });
+        self.indexed_viewports
+            .retain(|tab, _| open_tabs.contains(tab));
+        self.directory_scrolls
+            .retain(|(tab, _), _| open_tabs.contains(tab));
         self.column_trails.retain(|tab, _| open_tabs.contains(tab));
         self.column_scrolls
             .retain(|(tab, _), _| open_tabs.contains(tab));
@@ -9606,6 +9734,7 @@ impl MusheenApp {
             if let Some(directory) = self.directories.remove(&old_id) {
                 self.directories.insert(new_id, directory);
             }
+            self.indexed_viewports.remove(&old_id);
             if let Some(trail) = self.column_trails.remove(&old_id) {
                 self.column_trails.insert(new_id, trail);
             }
@@ -12048,8 +12177,22 @@ impl MusheenApp {
         };
         // The sorted order is shared across frames. Render only viewport rows
         // without cloning every item ID or linearly searching for each row.
-        let (base_order, visible_positions) = self.visible_positions_for_render(tab_id);
-        let item_count = visible_positions.len();
+        let indexed = self
+            .directories
+            .get(&tab_id)
+            .is_some_and(DirectoryModel::is_indexed);
+        let (base_order, visible_positions) = if indexed {
+            (Arc::new(Vec::new()), Arc::new(Vec::new()))
+        } else {
+            self.visible_positions_for_render(tab_id)
+        };
+        let item_count = if indexed {
+            self.directories
+                .get(&tab_id)
+                .map_or(0, DirectoryModel::visible_count)
+        } else {
+            visible_positions.len()
+        };
         let scroll = self
             .directory_scrolls
             .entry((tab_id, pane_index))
@@ -12081,7 +12224,9 @@ impl MusheenApp {
             .get(&tab_id)
             .map(|directory| directory.state().clone())
             .unwrap_or(DirectoryState::Loading);
-        let list = if layout == Layout::Columns && column_state != DirectoryState::Ready {
+        let list = if (layout == Layout::Columns || item_count == 0)
+            && column_state != DirectoryState::Ready
+        {
             match column_state {
                 DirectoryState::Loading => self.render_loading(cx.theme().colors.skeleton),
                 DirectoryState::Empty => self.render_empty(cx.theme().colors.muted_foreground),
@@ -12089,6 +12234,20 @@ impl MusheenApp {
                 DirectoryState::Ready => unreachable!(),
             }
         } else {
+            let source = if indexed {
+                DirectoryRowsSource::Indexed {
+                    visible_count: item_count,
+                    generation: self
+                        .directories
+                        .get(&tab_id)
+                        .map_or(0, DirectoryModel::generation),
+                }
+            } else {
+                DirectoryRowsSource::InMemory {
+                    positions: visible_positions,
+                    base_order,
+                }
+            };
             Self::render_virtualized_rows(
                 DirectoryRows {
                     tab_id,
@@ -12096,8 +12255,7 @@ impl MusheenApp {
                     layout,
                     row_height: list_row_height,
                     columns: grid_columns,
-                    positions: visible_positions,
-                    base_order,
+                    source,
                     scroll: scroll.clone(),
                 },
                 cx,
@@ -12653,30 +12811,29 @@ impl MusheenApp {
             layout,
             row_height,
             columns,
-            positions,
-            base_order,
+            source,
             scroll,
         } = rows;
-        let item_count = positions.len();
+        let item_count = source.len();
         match layout {
             Layout::Details | Layout::List | Layout::Columns => uniform_list(
                 SharedString::from(format!("directory-items-list-{pane_index}")),
                 item_count,
                 cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                    if !this.directory_order_matches(tab_id, &base_order) {
+                    if !this.prepare_directory_rows(tab_id, &source, range.clone(), cx) {
                         return Vec::new();
                     }
-                    let items = range
-                        .filter_map(|index| {
-                            let item_index = *positions.get(index)?;
-                            this.item_render_spec(
-                                tab_id, pane_index, index, item_index, layout, row_height,
-                            )
+                    range
+                        .map(|index| {
+                            let item = this.source_render_spec(
+                                tab_id, pane_index, index, &source, layout, row_height,
+                            );
+                            let content = item.map_or_else(
+                                || div().child("Loading…").into_any_element(),
+                                |item| this.render_item(item, cx),
+                            );
+                            div().h(row_height).child(content)
                         })
-                        .collect::<Vec<_>>();
-                    items
-                        .into_iter()
-                        .map(|item| div().h(row_height).child(this.render_item(item, cx)))
                         .collect::<Vec<_>>()
                 }),
             )
@@ -12690,23 +12847,27 @@ impl MusheenApp {
                 SharedString::from(format!("directory-items-grid-{pane_index}")),
                 grid_row_count(item_count, columns),
                 cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
-                    if !this.directory_order_matches(tab_id, &base_order) {
+                    let first = rows.start.saturating_mul(columns);
+                    let last = rows.end.saturating_mul(columns).min(item_count);
+                    if !this.prepare_directory_rows(tab_id, &source, first..last, cx) {
                         return Vec::new();
                     }
                     rows.map(|row| {
-                        let items = grid_item_range(row, item_count, columns)
-                            .filter_map(|index| {
-                                let item_index = *positions.get(index)?;
-                                this.item_render_spec(
-                                    tab_id, pane_index, index, item_index, layout, row_height,
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        div()
-                            .h(px(116.))
-                            .flex()
-                            .gap_2()
-                            .children(items.into_iter().map(|item| this.render_item(item, cx)))
+                        let items = grid_item_range(row, item_count, columns).map(|index| {
+                            this.source_render_spec(
+                                tab_id, pane_index, index, &source, layout, row_height,
+                            )
+                            .map_or_else(
+                                || {
+                                    div()
+                                        .w(px(GRID_ITEM_WIDTH))
+                                        .child("Loading…")
+                                        .into_any_element()
+                                },
+                                |item| this.render_item(item, cx),
+                            )
+                        });
+                        div().h(px(116.)).flex().gap_2().children(items)
                     })
                     .collect::<Vec<_>>()
                 }),
@@ -12718,6 +12879,145 @@ impl MusheenApp {
             .p_4()
             .into_any_element(),
         }
+    }
+
+    fn prepare_directory_rows(
+        &mut self,
+        tab_id: TabId,
+        source: &DirectoryRowsSource,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match source {
+            DirectoryRowsSource::InMemory { base_order, .. } => {
+                self.directory_order_matches(tab_id, base_order)
+            }
+            DirectoryRowsSource::Indexed { generation, .. } => {
+                self.request_indexed_range(tab_id, *generation, range, cx);
+                true
+            }
+        }
+    }
+
+    fn source_render_spec(
+        &self,
+        tab_id: TabId,
+        pane_index: usize,
+        index: usize,
+        source: &DirectoryRowsSource,
+        layout: Layout,
+        row_height: Pixels,
+    ) -> Option<ItemRenderSpec> {
+        match source {
+            DirectoryRowsSource::InMemory { positions, .. } => self.item_render_spec(
+                tab_id,
+                pane_index,
+                index,
+                *positions.get(index)?,
+                layout,
+                row_height,
+            ),
+            DirectoryRowsSource::Indexed { generation, .. } => {
+                let item = self.indexed_cached_item(tab_id, *generation, index)?;
+                self.item_render_spec_for_item(tab_id, pane_index, index, &item, layout, row_height)
+            }
+        }
+    }
+
+    fn request_indexed_range(
+        &mut self,
+        tab_id: TabId,
+        generation: u64,
+        requested: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(directory) = self.directories.get(&tab_id) else {
+            return;
+        };
+        if directory.generation() != generation || requested.is_empty() {
+            return;
+        }
+        let visible_count = directory.visible_count();
+        let Some(reader) = directory.index_reader() else {
+            return;
+        };
+        let viewport = self
+            .indexed_viewports
+            .entry(tab_id)
+            .or_insert_with(|| IndexedViewport {
+                generation,
+                loaded: None,
+                pending: None,
+            });
+        if viewport.generation != generation {
+            *viewport = IndexedViewport {
+                generation,
+                loaded: None,
+                pending: None,
+            };
+        }
+        if viewport.loaded.as_ref().is_some_and(|(loaded, _)| {
+            loaded.start <= requested.start && loaded.end >= requested.end
+        }) || viewport.pending.is_some()
+        {
+            return;
+        }
+        let padding = requested.len().min(1_024);
+        let start = requested.start.saturating_sub(padding);
+        let end = requested
+            .end
+            .saturating_add(padding)
+            .min(visible_count)
+            .min(start.saturating_add(4_096));
+        let range = start..end;
+        viewport.pending = Some(range.clone());
+        let result_range = range.clone();
+        let work = cx.background_spawn(async move { reader.read_range(range) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if state
+                    .directories
+                    .get(&tab_id)
+                    .map(DirectoryModel::generation)
+                    != Some(generation)
+                {
+                    return;
+                }
+                let Some(viewport) = state.indexed_viewports.get_mut(&tab_id) else {
+                    return;
+                };
+                if viewport.generation != generation
+                    || viewport.pending.as_ref() != Some(&result_range)
+                {
+                    return;
+                }
+                viewport.pending = None;
+                match result {
+                    Ok(items) => viewport.loaded = Some((result_range, items)),
+                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn indexed_cached_item(
+        &self,
+        tab_id: TabId,
+        generation: u64,
+        position: usize,
+    ) -> Option<StoreItem> {
+        let viewport = self.indexed_viewports.get(&tab_id)?;
+        if viewport.generation != generation {
+            return None;
+        }
+        let (range, items) = viewport.loaded.as_ref()?;
+        items.get(position.checked_sub(range.start)?).cloned()
     }
 
     fn directory_order_matches(&self, tab_id: TabId, expected: &Arc<Vec<usize>>) -> bool {
@@ -12737,6 +13037,19 @@ impl MusheenApp {
     ) -> Option<ItemRenderSpec> {
         let view = self.directories.get(&tab_id)?.view();
         let item = view.items().get(item_index)?;
+        self.item_render_spec_for_item(tab_id, pane_index, index, item, layout, row_height)
+    }
+
+    fn item_render_spec_for_item(
+        &self,
+        tab_id: TabId,
+        pane_index: usize,
+        index: usize,
+        item: &StoreItem,
+        layout: Layout,
+        row_height: Pixels,
+    ) -> Option<ItemRenderSpec> {
+        let view = self.directories.get(&tab_id)?.view();
         Some(ItemRenderSpec {
             tab_id,
             pane_index,
@@ -13034,8 +13347,13 @@ impl MusheenApp {
         if let Some(search) = self.searches.get(&tab_id) {
             return search.status_text();
         }
-        let visible_count = self.filtered_items(tab_id).len();
-        let view = self.focused_directory().view();
+        let directory = self.focused_directory();
+        let visible_count = if directory.is_indexed() {
+            directory.visible_count()
+        } else {
+            self.filtered_items(tab_id).len()
+        };
+        let view = directory.view();
         let selected_bytes = view
             .selected_ids()
             .iter()
@@ -18198,6 +18516,74 @@ mod tests {
             assert_eq!(window.find("directory-content").focused(), Some(true));
         })
         .expect("test window remains open");
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_directory_rows_use_full_count_and_load_viewport(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_480.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let tab_id = cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let tab_id = state.navigation.focused_tab().id();
+                let directory = state.directories.get_mut(&tab_id).unwrap();
+                let load = directory.begin_navigation(StorePath::from_unix_path("/synthetic"));
+                let request = PageRequest::first(&ResourceLimits::default());
+                let provider = ProviderId::new("local").unwrap();
+                for first in (0usize..8_192).step_by(512) {
+                    let items = (first..first + 512)
+                        .map(|number| {
+                            StoreItem::new(
+                                ItemId::new(provider.clone(), number.to_be_bytes()).unwrap(),
+                                StorePath::from_unix_path(format!("/synthetic/{number}")),
+                                DisplayPath::new(number.to_string()),
+                                ItemKind::RegularFile,
+                                None,
+                            )
+                        })
+                        .collect();
+                    let page =
+                        Page::try_new(&request, items, None, musheen_core::TotalHint::Unknown)
+                            .unwrap();
+                    assert_eq!(directory.apply_page(&load, page), ApplyPageResult::Applied);
+                }
+                directory.view_mut().preferences_mut().layout = Layout::Details;
+                assert_eq!(directory.visible_count(), 8_192);
+                cx.notify();
+                tab_id
+            })
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("status-bar").label(), Some("8192 items"));
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .indexed_viewports
+                .get(&tab_id)
+                .is_some_and(|viewport| viewport.loaded.is_some())
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("directory-item-0-0").visible());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

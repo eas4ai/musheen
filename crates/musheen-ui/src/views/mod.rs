@@ -275,6 +275,11 @@ impl DirectoryViewModel {
         &self.items
     }
 
+    pub(crate) fn take_items_for_index(&mut self) -> Vec<StoreItem> {
+        self.invalidate_visible_order();
+        std::mem::take(&mut self.items)
+    }
+
     #[must_use]
     pub fn visible_count(&self) -> usize {
         self.items
@@ -562,7 +567,15 @@ impl DirectoryViewModel {
     }
 
     fn compare_items(&self, left: &StoreItem, right: &StoreItem) -> std::cmp::Ordering {
-        if self.preferences.directories_first {
+        Self::compare_with_preferences(&self.preferences, left, right)
+    }
+
+    pub(crate) fn compare_with_preferences(
+        preferences: &ViewPreferences,
+        left: &StoreItem,
+        right: &StoreItem,
+    ) -> std::cmp::Ordering {
+        if preferences.directories_first {
             let left_directory = left.kind() == ItemKind::Directory;
             let right_directory = right.kind() == ItemKind::Directory;
             let directory_order = right_directory.cmp(&left_directory);
@@ -570,8 +583,8 @@ impl DirectoryViewModel {
                 return directory_order;
             }
         }
-        group::compare(self.preferences.group, left, right)
-            .then_with(|| sort::compare(self.preferences.sort, left, right))
+        group::compare(preferences.group, left, right)
+            .then_with(|| sort::compare(preferences.sort, left, right))
     }
 
     fn remove(&mut self, id: &ItemId) {
