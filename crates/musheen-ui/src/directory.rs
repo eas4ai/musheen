@@ -1,15 +1,15 @@
 use crate::search::DirectoryFilter;
 use crate::views::{DirectoryViewModel, ViewPreferences};
 use musheen_core::{
-    CancellationToken, Page, PageRequest, ResourceLimits, Store, StoreError, StoreItem, StorePath,
-    WatchEvent,
+    CancellationToken, CommandTargetRef, ItemId, Page, PageRequest, ResourceLimits, Store,
+    StoreError, StoreItem, StorePath, WatchEvent,
 };
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod index;
-use index::DiskDirectoryIndex;
+use index::{DiskDirectoryIndex, IndexedSelection, ResolvedIndexedSelection};
 
 const MAX_RESIDENT_ITEMS: usize = 4_096;
 
@@ -21,11 +21,22 @@ pub(crate) struct DirectoryIndexReader {
 }
 
 impl DirectoryIndexReader {
+    #[cfg(test)]
     pub(crate) fn read_range(&self, range: Range<usize>) -> std::io::Result<Vec<StoreItem>> {
         self.index
             .lock()
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
             .read_range(range)
+    }
+
+    pub(crate) fn read_range_with_arrivals(
+        &self,
+        range: Range<usize>,
+    ) -> std::io::Result<Vec<(StoreItem, u64)>> {
+        self.index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
+            .read_range_with_arrivals(range)
     }
 
     pub(crate) fn lookup_id(
@@ -66,6 +77,52 @@ impl DirectoryIndexReader {
             }
         }
         Ok(Some((paths, first_item)))
+    }
+
+    pub(crate) fn select_visible_range(
+        &self,
+        range: Range<usize>,
+    ) -> std::io::Result<IndexedSelection> {
+        self.index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
+            .selection_bitmap(range)
+    }
+
+    pub(crate) fn resolve_bitmap(
+        &self,
+        selection: &IndexedSelection,
+    ) -> std::io::Result<ResolvedIndexedSelection> {
+        self.index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
+            .resolve_bitmap(selection)
+    }
+
+    pub(crate) fn resolve_command_targets(
+        &self,
+        ids: &[ItemId],
+        bitmap: Option<&IndexedSelection>,
+    ) -> std::io::Result<Option<(Vec<CommandTargetRef>, Option<StoreItem>)>> {
+        let selected = if let Some(bitmap) = bitmap {
+            let resolved = self.resolve_bitmap(bitmap)?;
+            Some((resolved.targets, resolved.first_item))
+        } else {
+            self.resolve_selection(ids)?
+                .map(|(paths, first_item)| (ids.iter().cloned().zip(paths).collect(), first_item))
+        };
+        selected
+            .map(|(pairs, first_item)| {
+                let targets = pairs
+                    .into_iter()
+                    .map(|(id, path)| {
+                        CommandTargetRef::new(id, path)
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                Ok((targets, first_item))
+            })
+            .transpose()
     }
 }
 
@@ -250,6 +307,8 @@ pub struct DirectoryModel {
     state: DirectoryState,
     view: DirectoryViewModel,
     index: Option<SharedIndex>,
+    indexed_selection: Option<IndexedSelection>,
+    indexed_selection_epoch: u64,
     indexed_count: usize,
     indexed_visible_count: usize,
     next_request: Option<PageRequest>,
@@ -276,6 +335,8 @@ impl DirectoryModel {
             state: DirectoryState::Empty,
             view: DirectoryViewModel::new(retention_limit.min(MAX_RESIDENT_ITEMS)),
             index: None,
+            indexed_selection: None,
+            indexed_selection_epoch: 0,
             indexed_count: 0,
             indexed_visible_count: 0,
             next_request: None,
@@ -292,6 +353,8 @@ impl DirectoryModel {
         self.order_token.fetch_add(1, Ordering::AcqRel);
         self.view.reset_items();
         self.index = None;
+        self.indexed_selection = None;
+        self.indexed_selection_epoch = self.indexed_selection_epoch.wrapping_add(1);
         self.indexed_count = 0;
         self.indexed_visible_count = 0;
         self.next_request = Some(PageRequest::first(&self.limits));
@@ -450,6 +513,37 @@ impl DirectoryModel {
     #[must_use]
     pub(crate) fn is_indexed(&self) -> bool {
         self.index.is_some()
+    }
+
+    pub(crate) fn set_indexed_selection(&mut self, selection: IndexedSelection) {
+        self.view.clear_selection();
+        self.indexed_selection = Some(selection);
+        self.indexed_selection_epoch = self.indexed_selection_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn clear_indexed_selection(&mut self) {
+        self.indexed_selection = None;
+        self.indexed_selection_epoch = self.indexed_selection_epoch.wrapping_add(1);
+    }
+
+    pub(crate) fn indexed_selection_epoch(&self) -> u64 {
+        self.indexed_selection_epoch
+    }
+
+    pub(crate) fn indexed_selected_count(&self) -> usize {
+        self.indexed_selection
+            .as_ref()
+            .map_or(0, IndexedSelection::count)
+    }
+
+    pub(crate) fn indexed_selection(&self) -> Option<&IndexedSelection> {
+        self.indexed_selection.as_ref()
+    }
+
+    pub(crate) fn is_indexed_arrival_selected(&self, arrival: u64) -> bool {
+        self.indexed_selection
+            .as_ref()
+            .is_some_and(|selection| selection.contains(arrival))
     }
 
     pub(crate) fn index_reader(&self) -> Option<DirectoryIndexReader> {

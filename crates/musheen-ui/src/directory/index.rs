@@ -15,7 +15,7 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const SORT_RUN_ITEMS: usize = 4_096;
 const MERGE_FAN_IN: usize = 32;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IndexRecord {
     id: ItemId,
@@ -106,6 +106,68 @@ struct SortedOrder {
     file: File,
     _path: TempPath,
     len: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IndexedSelection {
+    bits: Vec<u64>,
+    count: usize,
+}
+
+pub(crate) struct ResolvedIndexedSelection {
+    pub(crate) targets: Vec<(ItemId, StorePath)>,
+    pub(crate) first_item: Option<StoreItem>,
+}
+
+impl IndexedSelection {
+    fn new(record_count: u64) -> io::Result<Self> {
+        let count = usize::try_from(record_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "directory count exceeds selection limits",
+            )
+        })?;
+        Ok(Self {
+            bits: vec![0; count.div_ceil(64)],
+            count: 0,
+        })
+    }
+
+    fn insert(&mut self, arrival: u64) -> io::Result<()> {
+        let ordinal = usize::try_from(arrival).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "arrival exceeds selection limits",
+            )
+        })?;
+        let Some(word) = self.bits.get_mut(ordinal / 64) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "arrival exceeds index count",
+            ));
+        };
+        let mask = 1u64 << (ordinal % 64);
+        if *word & mask == 0 {
+            *word |= mask;
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn contains(&self, arrival: u64) -> bool {
+        usize::try_from(arrival)
+            .ok()
+            .and_then(|ordinal| {
+                self.bits
+                    .get(ordinal / 64)
+                    .map(|word| word & (1u64 << (ordinal % 64)) != 0)
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
 }
 
 struct SortEntry {
@@ -394,6 +456,14 @@ impl DiskDirectoryIndex {
     }
 
     pub(super) fn read_range(&mut self, range: Range<usize>) -> io::Result<Vec<StoreItem>> {
+        self.read_range_with_arrivals(range)
+            .map(|rows| rows.into_iter().map(|(item, _)| item).collect())
+    }
+
+    pub(super) fn read_range_with_arrivals(
+        &mut self,
+        range: Range<usize>,
+    ) -> io::Result<Vec<(StoreItem, u64)>> {
         let order = self.order.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
         })?;
@@ -413,9 +483,68 @@ impl DiskDirectoryIndex {
         for _ in range {
             let mut offset = [0; 8];
             order.file.read_exact(&mut offset)?;
-            items.push(Self::read_record(&mut self.records, u64::from_le_bytes(offset))?.0);
+            items.push(Self::read_record(
+                &mut self.records,
+                u64::from_le_bytes(offset),
+            )?);
         }
         Ok(items)
+    }
+
+    pub(super) fn selection_bitmap(&mut self, range: Range<usize>) -> io::Result<IndexedSelection> {
+        let order = self.order.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
+        })?;
+        if range.start > range.end || range.end > order.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "selection range exceeds the visible order",
+            ));
+        }
+        let mut selection = IndexedSelection::new(self.record_count)?;
+        let byte_offset = range
+            .start
+            .checked_mul(8)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range offset overflow"))?;
+        order.file.seek(SeekFrom::Start(byte_offset))?;
+        for _ in range {
+            let offset = read_next_offset(&mut order.file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "directory order is truncated")
+            })?;
+            let record = Self::read_index_record(&mut self.records, offset)?;
+            selection.insert(record.arrival)?;
+        }
+        Ok(selection)
+    }
+
+    pub(super) fn resolve_bitmap(
+        &mut self,
+        selection: &IndexedSelection,
+    ) -> io::Result<ResolvedIndexedSelection> {
+        let order = self.order.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
+        })?;
+        order.file.seek(SeekFrom::Start(0))?;
+        let mut targets = Vec::new();
+        let mut first_item = None;
+        for _ in 0..order.len {
+            let offset = read_next_offset(&mut order.file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "directory order is truncated")
+            })?;
+            let record = Self::read_index_record(&mut self.records, offset)?;
+            if !selection.contains(record.arrival) {
+                continue;
+            }
+            if first_item.is_none() {
+                first_item = Some(record.clone().into_item()?.0);
+            }
+            targets.push((record.id, record.path));
+        }
+        Ok(ResolvedIndexedSelection {
+            targets,
+            first_item,
+        })
     }
 
     pub(super) fn lookup_id(&mut self, id: &ItemId) -> io::Result<Option<StoreItem>> {
@@ -635,6 +764,50 @@ mod tests {
         }
         let missing = ItemId::new(provider, 8_200u64.to_be_bytes().to_vec()).unwrap();
         assert!(index.lookup_id(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn visible_range_selection_uses_arrival_bits_and_excludes_new_arrivals() {
+        let provider = ProviderId::new("local").unwrap();
+        let mut index = DiskDirectoryIndex::new().unwrap();
+        for (number, name) in [(0u64, "c"), (1, ".hidden"), (2, "a"), (3, "b")] {
+            let entry = StoreItem::new(
+                ItemId::new(provider.clone(), number.to_be_bytes()).unwrap(),
+                StorePath::from_unix_path(format!("/many/{name}")),
+                DisplayPath::new(name),
+                ItemKind::RegularFile,
+                None,
+            );
+            index.append(&entry, number).unwrap();
+        }
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+
+        let selection = index.selection_bitmap(0..3).unwrap();
+        assert_eq!(selection.count(), 3);
+        assert!(selection.contains(0));
+        assert!(!selection.contains(1));
+        assert!(selection.contains(2));
+        assert!(selection.contains(3));
+        let resolved = index.resolve_bitmap(&selection).unwrap();
+        assert_eq!(resolved.targets.len(), 3);
+        assert_eq!(resolved.targets[0].1, StorePath::from_unix_path("/many/a"));
+        assert_eq!(resolved.first_item.unwrap().path(), &resolved.targets[0].1);
+
+        let newcomer = StoreItem::new(
+            ItemId::new(provider, 4u64.to_be_bytes()).unwrap(),
+            StorePath::from_unix_path("/many/d"),
+            DisplayPath::new("d"),
+            ItemKind::RegularFile,
+            None,
+        );
+        index.append(&newcomer, 4).unwrap();
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+        assert!(!selection.contains(4));
+        assert_eq!(index.resolve_bitmap(&selection).unwrap().targets.len(), 3);
     }
 
     #[test]

@@ -321,9 +321,11 @@ impl DirectoryRowsSource {
 
 struct IndexedViewport {
     generation: u64,
-    loaded: VecDeque<(std::ops::Range<usize>, Vec<StoreItem>)>,
+    loaded: VecDeque<IndexedLoadedRange>,
     pending: Option<std::ops::Range<usize>>,
 }
+
+type IndexedLoadedRange = (std::ops::Range<usize>, Vec<(StoreItem, u64)>);
 
 impl IndexedViewport {
     const MAX_RANGES: usize = 16;
@@ -343,14 +345,19 @@ impl IndexedViewport {
             .any(|(loaded, _)| loaded.start <= range.start && loaded.end >= range.end)
     }
 
+    #[cfg(test)]
     fn item(&self, position: usize) -> Option<StoreItem> {
+        self.row(position).map(|(item, _)| item)
+    }
+
+    fn row(&self, position: usize) -> Option<(StoreItem, u64)> {
         self.loaded
             .iter()
             .rev()
             .find_map(|(range, items)| items.get(position.checked_sub(range.start)?).cloned())
     }
 
-    fn insert(&mut self, range: std::ops::Range<usize>, items: Vec<StoreItem>) {
+    fn insert(&mut self, range: std::ops::Range<usize>, items: Vec<(StoreItem, u64)>) {
         self.loaded.push_back((range, items));
         while self.loaded.len() > Self::MAX_RANGES
             || self
@@ -5112,18 +5119,25 @@ impl MusheenApp {
         let Some(directory) = self.directories.get(&tab_id) else {
             return false;
         };
-        if !directory.is_indexed() || directory.view().selected_ids().is_empty() {
+        if !directory.is_indexed()
+            || (directory.view().selected_ids().is_empty()
+                && directory.indexed_selected_count() == 0)
+        {
             return false;
         }
         let Some(reader) = directory.index_reader() else {
             return false;
         };
         let selected_ids = directory.view().selected_ids().to_vec();
+        let bitmap = directory.indexed_selection().cloned();
         let generation = directory.generation();
         let order_epoch = directory.order_epoch();
+        let selection_epoch = directory.indexed_selection_epoch();
         let command_id = command_id.to_owned();
         let lookup_ids = selected_ids.clone();
-        let task = cx.background_spawn(async move { reader.resolve_selection(&lookup_ids) });
+        let task = cx.background_spawn(async move {
+            reader.resolve_command_targets(&lookup_ids, bitmap.as_ref())
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let Some(this) = this.upgrade() else {
@@ -5134,38 +5148,29 @@ impl MusheenApp {
                     && state.directories.get(&tab_id).is_some_and(|directory| {
                         directory.generation() == generation
                             && directory.order_epoch() == order_epoch
+                            && directory.indexed_selection_epoch() == selection_epoch
                             && directory.view().selected_ids() == selected_ids
                     });
                 if !still_selected {
                     return;
                 }
                 match result {
-                    Ok(Some((paths, first_item))) => {
-                        let targets = selected_ids
-                            .into_iter()
-                            .zip(paths)
-                            .map(|(id, path)| CommandTargetRef::new(id, path))
-                            .collect::<Result<Vec<_>, _>>();
-                        match targets {
-                            Ok(targets) => {
-                                let request = state.context_menu_request_with_item(
-                                    tab_id,
-                                    MenuTarget::Item,
-                                    location,
-                                    targets,
-                                    first_item.as_ref(),
-                                );
-                                let request = if action == CommandAction::SendTo {
-                                    request.with_send_to(&state.send_to_destinations(tab_id))
-                                } else {
-                                    request
-                                };
-                                state.dispatch_command_request(&command_id, request, cx);
-                            }
-                            Err(error) => state.operation_error = Some(error.to_string().into()),
-                        }
+                    Ok(Some((targets, first_item))) if !targets.is_empty() => {
+                        let request = state.context_menu_request_with_item(
+                            tab_id,
+                            MenuTarget::Item,
+                            location,
+                            targets,
+                            first_item.as_ref(),
+                        );
+                        let request = if action == CommandAction::SendTo {
+                            request.with_send_to(&state.send_to_destinations(tab_id))
+                        } else {
+                            request
+                        };
+                        state.dispatch_command_request(&command_id, request, cx);
                     }
-                    Ok(None) => {
+                    Ok(None | Some(_)) => {
                         state.operation_error = Some("A selected file no longer exists".into());
                     }
                     Err(error) => state.operation_error = Some(error.to_string().into()),
@@ -5758,18 +5763,23 @@ impl MusheenApp {
     }
 
     fn dispatch_selection_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
+        let tab_id = self.navigation.focused_tab().id();
+        if action == CommandAction::SelectAll && self.select_all_indexed_for_tab(tab_id, cx) {
+            return;
+        }
         match action {
             CommandAction::SelectAll => {
                 self.focused_directory_mut().view_mut().select_all_visible()
             }
             CommandAction::ClearSelection => {
-                self.focused_directory_mut().view_mut().clear_selection()
+                let directory = self.focused_directory_mut();
+                directory.clear_indexed_selection();
+                directory.view_mut().clear_selection();
             }
             _ => return,
         }
         let selected = self.focused_directory().view().selected_ids().to_vec();
         self.navigation.focused_tab_mut().set_selection(selected);
-        let tab_id = self.navigation.focused_tab().id();
         self.refresh_info_pane(tab_id, cx);
         self.schedule_session_save(cx);
         cx.notify();
@@ -5782,12 +5792,18 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         let tab_id = origin_tab.unwrap_or_else(|| self.navigation.focused_tab().id());
+        if action == CommandAction::SelectAll && self.select_all_indexed_for_tab(tab_id, cx) {
+            return;
+        }
         let Some(directory) = self.directories.get_mut(&tab_id) else {
             return;
         };
         match action {
             CommandAction::SelectAll => directory.view_mut().select_all_visible(),
-            CommandAction::ClearSelection => directory.view_mut().clear_selection(),
+            CommandAction::ClearSelection => {
+                directory.clear_indexed_selection();
+                directory.view_mut().clear_selection();
+            }
             _ => return,
         }
         let selected = directory.view().selected_ids().to_vec();
@@ -5797,6 +5813,53 @@ impl MusheenApp {
         self.refresh_info_pane(tab_id, cx);
         self.schedule_session_save(cx);
         cx.notify();
+    }
+
+    fn select_all_indexed_for_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) -> bool {
+        let Some(directory) = self.directories.get(&tab_id) else {
+            return false;
+        };
+        let Some(reader) = directory.index_reader() else {
+            return false;
+        };
+        let generation = directory.generation();
+        let order_epoch = directory.order_epoch();
+        let selection_epoch = directory.indexed_selection_epoch();
+        let selected_ids = directory.view().selected_ids().to_vec();
+        let count = directory.visible_count();
+        let work = cx.background_spawn(async move { reader.select_visible_range(0..count) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let Some(directory) = state.directories.get_mut(&tab_id) else {
+                    return;
+                };
+                if directory.generation() != generation
+                    || directory.order_epoch() != order_epoch
+                    || directory.indexed_selection_epoch() != selection_epoch
+                    || directory.view().selected_ids() != selected_ids
+                {
+                    return;
+                }
+                match result {
+                    Ok(selection) => {
+                        directory.set_indexed_selection(selection);
+                        if let Some(tab) = state.navigation.tab_mut(tab_id) {
+                            tab.set_selection(Vec::new());
+                        }
+                        state.refresh_info_pane(tab_id, cx);
+                        state.schedule_session_save(cx);
+                    }
+                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
     }
 
     fn dispatch_context_view_action(
@@ -5887,6 +5950,7 @@ impl MusheenApp {
             let Some(directory) = self.directories.get_mut(&tab_id) else {
                 return;
             };
+            directory.clear_indexed_selection();
             if mode == SelectionMode::Add {
                 directory.view_mut().select_to_item_in_order(
                     &id,
@@ -6176,6 +6240,7 @@ impl MusheenApp {
                             .loaded
                             .iter()
                             .flat_map(|(_, items)| items)
+                            .map(|(item, _)| item)
                             .find(|item| item.id() == id)
                     })
                 })
@@ -9829,6 +9894,18 @@ impl MusheenApp {
     }
 
     fn refresh_info_pane(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        if let Some(count) = self
+            .directories
+            .get(&tab_id)
+            .map(DirectoryModel::indexed_selected_count)
+            .filter(|count| *count > 0)
+        {
+            self.info_panes
+                .entry(tab_id)
+                .or_default()
+                .show_multiple(count);
+            return;
+        }
         let selected = self
             .directories
             .get(&tab_id)
@@ -9849,6 +9926,7 @@ impl MusheenApp {
                                 .loaded
                                 .iter()
                                 .flat_map(|(_, items)| items)
+                                .map(|(item, _)| item)
                                 .find(|item| item.id() == id)
                                 .cloned()
                         })
@@ -13300,8 +13378,15 @@ impl MusheenApp {
                 row_height,
             ),
             DirectoryRowsSource::Indexed { generation, .. } => {
-                let item = self.indexed_cached_item(tab_id, *generation, index)?;
-                self.item_render_spec_for_item(tab_id, pane_index, index, &item, layout, row_height)
+                let (item, arrival) = self.indexed_cached_row(tab_id, *generation, index)?;
+                let mut spec = self.item_render_spec_for_item(
+                    tab_id, pane_index, index, &item, layout, row_height,
+                )?;
+                spec.selected |= self
+                    .directories
+                    .get(&tab_id)
+                    .is_some_and(|directory| directory.is_indexed_arrival_selected(arrival));
+                Some(spec)
             }
         }
     }
@@ -13343,7 +13428,7 @@ impl MusheenApp {
         let range = start..end;
         viewport.pending = Some(range.clone());
         let result_range = range.clone();
-        let work = cx.background_spawn(async move { reader.read_range(range) });
+        let work = cx.background_spawn(async move { reader.read_range_with_arrivals(range) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let Some(this) = this.upgrade() else {
@@ -13377,6 +13462,7 @@ impl MusheenApp {
         .detach();
     }
 
+    #[cfg(test)]
     fn indexed_cached_item(
         &self,
         tab_id: TabId,
@@ -13388,6 +13474,19 @@ impl MusheenApp {
             return None;
         }
         viewport.item(position)
+    }
+
+    fn indexed_cached_row(
+        &self,
+        tab_id: TabId,
+        generation: u64,
+        position: usize,
+    ) -> Option<(StoreItem, u64)> {
+        let viewport = self.indexed_viewports.get(&tab_id)?;
+        if viewport.generation != generation {
+            return None;
+        }
+        viewport.row(position)
     }
 
     fn directory_order_matches(&self, tab_id: TabId, expected: &Arc<Vec<usize>>) -> bool {
@@ -13724,15 +13823,18 @@ impl MusheenApp {
             self.filtered_items(tab_id).len()
         };
         let view = directory.view();
-        let selected_bytes = view
-            .selected_ids()
-            .iter()
-            .map(|id| view.item(id).and_then(StoreItem::size))
-            .collect::<Option<Vec<_>>>()
-            .map(|sizes| sizes.into_iter().sum());
+        let selected_bytes = (directory.indexed_selected_count() == 0)
+            .then(|| {
+                view.selected_ids()
+                    .iter()
+                    .map(|id| view.item(id).and_then(StoreItem::size))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|sizes| sizes.into_iter().sum())
+            })
+            .flatten();
         status_text_with_size(
             visible_count,
-            view.selected_ids().len(),
+            directory.indexed_selected_count() + view.selected_ids().len(),
             selected_bytes,
             view.is_complete(),
         )
@@ -18994,6 +19096,55 @@ mod tests {
             "indexed command state: {:?}",
             probe.lock().unwrap().as_slice()
         );
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_selection_action(CommandAction::SelectAll, cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).focused_directory().indexed_selected_count() == 8_192
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("status-bar").label(),
+                Some("8192 items selected")
+            );
+        })
+        .unwrap();
+        let first_row_selected = cx.read(|cx| {
+            let state = app.read(cx);
+            let source = DirectoryRowsSource::Indexed {
+                visible_count: 8_192,
+                generation: state.focused_directory().order_epoch(),
+            };
+            state
+                .source_render_spec(tab_id, 0, 0, &source, Layout::Details, px(32.))
+                .unwrap()
+                .selected
+        });
+        assert!(first_row_selected);
+        probe.lock().unwrap().clear();
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_command("item.properties", cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, _| {
+            !probe.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(
+            probe.lock().unwrap().as_slice(),
+            &[("item.properties".into(), true)]
+        );
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_selection_action(CommandAction::ClearSelection, cx);
+                assert_eq!(state.focused_directory().indexed_selected_count(), 0);
+            });
+        });
         cx.update(|cx| {
             app.update(cx, |state, cx| {
                 let item = state
