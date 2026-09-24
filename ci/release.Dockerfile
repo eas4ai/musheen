@@ -26,13 +26,18 @@ RUN scripts/verify-msrv.sh /workspace \
     && scripts/verify-dependencies.sh /workspace \
     && cargo +1.95.0 fmt --all --check
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/workspace/target \
+RUN useradd --create-home --uid 10001 musheen \
+    && mkdir /release \
+    && chown -R musheen:musheen /workspace /usr/local/cargo /release
+USER musheen
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
+    --mount=type=cache,target=/usr/local/cargo/git,uid=10001,gid=10001 \
+    --mount=type=cache,target=/workspace/target,uid=10001,gid=10001 \
     scripts/verify-release-matrix.sh /workspace
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
+    --mount=type=cache,target=/usr/local/cargo/git,uid=10001,gid=10001 \
     python3 scripts/generate-sbom.py /workspace /release
 
 FROM scratch AS artifact
