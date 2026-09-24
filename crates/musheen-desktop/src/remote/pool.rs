@@ -158,6 +158,14 @@ pub struct ProviderPool<C: RemoteConnector, R: PoolRuntime = SystemPoolRuntime> 
     inner: Arc<PoolInner<C, R>>,
 }
 
+impl<C: RemoteConnector, R: PoolRuntime> Drop for ProviderPool<C, R> {
+    fn drop(&mut self) {
+        self.inner.maintenance_stop.cancel();
+        self.inner.wake_maintenance();
+        lock(&self.inner.state).slots.clear();
+    }
+}
+
 impl<C: RemoteConnector> ProviderPool<C, SystemPoolRuntime> {
     pub fn new(profile: ConnectionProfile, connector: C) -> Result<Self, RemoteError> {
         Self::with_runtime(
