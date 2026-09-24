@@ -7,13 +7,13 @@ use musheen_core::{
 };
 use musheen_ops::{
     ArchiveOperationPlan, ConflictDecision, ConflictItemKind, ConflictRecord, CopyRequest,
-    CopySession, CreateRequest, DeleteTarget, EventGeneration, JobId, JobState, MetadataChange,
-    MetadataPlan, MetadataScope, MoveMetadataReview, MutationError, MutationProvider,
-    OperationFailure, OperationKind, OperationPlan, PermanentDeleteConfirmation,
+    CopySession, CreateRequest, DeleteTarget, EventGeneration, HardLinkRequest, JobId, JobState,
+    MetadataChange, MetadataPlan, MetadataScope, MoveMetadataReview, MutationError,
+    MutationProvider, OperationFailure, OperationKind, OperationPlan, PermanentDeleteConfirmation,
     PermanentDeleteRequest, ProviderLimits, ProviderSnapshot, PublicationState, RenameRequest,
-    Scheduler, SchedulerError, SourceState, TrashReceipt, complete_move_after_metadata_review,
-    execute_create, execute_delete, execute_move, execute_permanent_delete, execute_rename,
-    execute_restore,
+    Scheduler, SchedulerError, SourceState, SymbolicLinkRequest, TrashReceipt,
+    complete_move_after_metadata_review, execute_create, execute_delete, execute_hard_link,
+    execute_move, execute_permanent_delete, execute_rename, execute_restore, execute_symbolic_link,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
@@ -106,6 +106,14 @@ enum LocalOperation {
     FinalizeMove(Box<MoveMetadataReview>),
     Metadata(MetadataPlan),
     Create(CreateRequest),
+    SymbolicLink {
+        request: SymbolicLinkRequest,
+        source: CommandTargetRef,
+    },
+    HardLink {
+        request: HardLinkRequest,
+        source: CommandTargetRef,
+    },
     Rename(RenameRequest),
     Trash(DeleteTarget),
     Restore {
@@ -318,6 +326,8 @@ impl LocalOperation {
                 musheen_ops::CreateKind::File => OperationKind::CreateFile,
                 musheen_ops::CreateKind::Directory => OperationKind::CreateDirectory,
             },
+            Self::SymbolicLink { .. } => OperationKind::SymbolicLink,
+            Self::HardLink { .. } => OperationKind::HardLink,
             Self::Rename(_) => OperationKind::Rename,
             Self::Trash(_) => OperationKind::Trash,
             Self::Restore { .. } => OperationKind::Restore,
@@ -332,6 +342,8 @@ impl LocalOperation {
             Self::FinalizeMove(review) => review.source(),
             Self::Metadata(plan) => plan.root(),
             Self::Create(request) => request.parent(),
+            Self::SymbolicLink { source, .. } => source.path(),
+            Self::HardLink { source, .. } => source.path(),
             Self::Rename(request) => request.source(),
             Self::Trash(target) => target.path(),
             Self::Restore { receipt, .. } => receipt.original_path(),
@@ -352,6 +364,12 @@ impl LocalOperation {
             }
             Self::Metadata(plan) => vec![plan.root().clone()],
             Self::Create(request) => vec![request.parent().clone()],
+            Self::SymbolicLink { request, source } => {
+                vec![source.path().clone(), request.parent().clone()]
+            }
+            Self::HardLink { request, source } => {
+                vec![source.path().clone(), request.parent().clone()]
+            }
             Self::Rename(request) => vec![request.source().clone()],
             Self::Trash(target) => vec![target.path().clone()],
             Self::Restore { receipt, .. } => vec![receipt.original_path().clone()],
@@ -718,6 +736,28 @@ impl ReadyLocalOperation {
             LocalOperation::Create(request) => execute_create(&mut store, &request)
                 .map(|_| LocalOperationOutcome::Mutation)
                 .map_err(|error| LocalOperationFailure::failed(error.to_string())),
+            LocalOperation::SymbolicLink { request, source } => {
+                let current = store
+                    .resolve_item(source.path())
+                    .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+                if current.as_ref().is_none_or(|item| item.id() != source.id()) {
+                    return Err(LocalOperationFailure::failed("the selected item changed"));
+                }
+                execute_symbolic_link(&mut store, &request)
+                    .map(|_| LocalOperationOutcome::Mutation)
+                    .map_err(|error| LocalOperationFailure::failed(error.to_string()))
+            }
+            LocalOperation::HardLink { request, source } => {
+                let current = store
+                    .resolve_item(source.path())
+                    .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+                if current.as_ref().is_none_or(|item| item.id() != source.id()) {
+                    return Err(LocalOperationFailure::failed("the selected item changed"));
+                }
+                execute_hard_link(&mut store, &request)
+                    .map(|_| LocalOperationOutcome::Mutation)
+                    .map_err(|error| LocalOperationFailure::failed(error.to_string()))
+            }
             LocalOperation::Rename(request) => execute_rename(&mut store, &request)
                 .map(|_| LocalOperationOutcome::Mutation)
                 .map_err(|error| LocalOperationFailure::failed(error.to_string())),
@@ -971,6 +1011,55 @@ impl LocalOperationQueue {
         )
         .map_err(|error| DropError::Plan(error.to_string().into()))?;
         self.enqueue_planned(vec![(plan, LocalOperation::Create(request))])
+            .map(|mut ids| ids.remove(0))
+    }
+
+    pub fn submit_symbolic_link(
+        &mut self,
+        request: SymbolicLinkRequest,
+        source: CommandTargetRef,
+    ) -> Result<JobId, DropError> {
+        let source_path = source
+            .path()
+            .as_unix_path()
+            .ok_or_else(|| DropError::Plan("symbolic links require a local source".into()))?;
+        if source_path.as_os_str() != request.target() {
+            return Err(DropError::Plan("symbolic link target changed".into()));
+        }
+        let destination = request.destination()?;
+        let store = LocalStore::new();
+        let plan = OperationPlan::new(
+            OperationKind::SymbolicLink,
+            provider_snapshot(&store, source.path()),
+            Some(source.path().clone()),
+            destination,
+        )
+        .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(
+            plan,
+            LocalOperation::SymbolicLink { request, source },
+        )])
+        .map(|mut ids| ids.remove(0))
+    }
+
+    pub fn submit_hard_link(
+        &mut self,
+        request: HardLinkRequest,
+        source: CommandTargetRef,
+    ) -> Result<JobId, DropError> {
+        if source.path() != request.source() {
+            return Err(DropError::Plan("hard link source changed".into()));
+        }
+        let destination = request.destination()?;
+        let store = LocalStore::new();
+        let plan = OperationPlan::new(
+            OperationKind::HardLink,
+            provider_snapshot(&store, source.path()),
+            Some(source.path().clone()),
+            destination,
+        )
+        .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(plan, LocalOperation::HardLink { request, source })])
             .map(|mut ids| ids.remove(0))
     }
 
@@ -1954,6 +2043,100 @@ mod tests {
             .expect("delete is queued");
         assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
         assert!(!renamed_path.exists());
+    }
+
+    #[test]
+    fn queued_symbolic_link_refuses_a_replaced_selected_item() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        let link_path = temporary.path().join("Link to source.txt");
+        fs::write(&source_path, b"original").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let item = LocalStore::new().resolve_item(&source).unwrap().unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), source.clone()).unwrap();
+        let parent = StorePath::from_unix_path(temporary.path().as_os_str());
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        queue
+            .submit_symbolic_link(
+                SymbolicLinkRequest::new(
+                    parent,
+                    "Link to source.txt".into(),
+                    source_path.as_os_str().to_os_string(),
+                ),
+                target,
+            )
+            .unwrap();
+
+        fs::rename(&source_path, temporary.path().join("moved.txt")).unwrap();
+        fs::write(&source_path, b"replacement").unwrap();
+        let ready = queue.start_ready().unwrap().remove(0);
+        assert!(ready.execute_detailed().is_err());
+        assert!(!link_path.exists());
+        assert_eq!(fs::read(source_path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn queued_hard_link_refuses_a_replaced_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        let link_path = temporary.path().join("source.txt (hard link)");
+        fs::write(&source_path, b"original").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let parent = StorePath::from_unix_path(temporary.path().as_os_str());
+        let mut store = LocalStore::new();
+        let item = store.resolve_item(&source).unwrap().unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), source.clone()).unwrap();
+        let identity = MutationProvider::identity(&mut store, &source)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        queue
+            .submit_hard_link(
+                HardLinkRequest::new(
+                    source,
+                    parent,
+                    "source.txt (hard link)".into(),
+                    identity.into_vec(),
+                ),
+                target,
+            )
+            .unwrap();
+
+        fs::rename(&source_path, temporary.path().join("moved.txt")).unwrap();
+        fs::write(&source_path, b"replacement").unwrap();
+        let ready = queue.start_ready().unwrap().remove(0);
+        assert!(ready.execute_detailed().is_err());
+        assert!(!link_path.exists());
+        assert_eq!(fs::read(source_path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn queued_hard_link_refuses_a_symbolic_link_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target_path = temporary.path().join("target.txt");
+        let source_path = temporary.path().join("source-link");
+        let destination_path = temporary.path().join("hard-link");
+        fs::write(&target_path, b"target").unwrap();
+        std::os::unix::fs::symlink(&target_path, &source_path).unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let parent = StorePath::from_unix_path(temporary.path().as_os_str());
+        let mut store = LocalStore::new();
+        let item = store.resolve_item(&source).unwrap().unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), source.clone()).unwrap();
+        let identity = MutationProvider::identity(&mut store, &source)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        queue
+            .submit_hard_link(
+                HardLinkRequest::new(source, parent, "hard-link".into(), identity.into_vec()),
+                target,
+            )
+            .unwrap();
+
+        let ready = queue.start_ready().unwrap().remove(0);
+        assert!(ready.execute_detailed().is_err());
+        assert!(!destination_path.exists());
     }
 
     #[test]

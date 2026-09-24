@@ -47,6 +47,20 @@ impl SymbolicLinkRequest {
             target,
         }
     }
+
+    #[must_use]
+    pub const fn parent(&self) -> &StorePath {
+        &self.parent
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &OsStr {
+        &self.target
+    }
+
+    pub fn destination(&self) -> Result<StorePath, MutationError> {
+        child_path(&self.parent, &self.name)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +85,20 @@ impl HardLinkRequest {
             name,
             expected_identity: expected_identity.into_boxed_slice(),
         }
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &StorePath {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn parent(&self) -> &StorePath {
+        &self.parent
+    }
+
+    pub fn destination(&self) -> Result<StorePath, MutationError> {
+        child_path(&self.parent, &self.name)
     }
 }
 

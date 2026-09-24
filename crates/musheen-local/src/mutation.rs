@@ -1394,8 +1394,15 @@ impl LinkProvider for LocalStore {
         source: &StorePath,
         parent: &StorePath,
     ) -> Result<bool, MutationError> {
-        Ok(supported_capability(source, CapabilityKind::HardLinks)?
-            && supported_capability(parent, CapabilityKind::HardLinks)?)
+        if !supported_capability(source, CapabilityKind::HardLinks)?
+            || !supported_capability(parent, CapabilityKind::HardLinks)?
+        {
+            return Ok(false);
+        }
+        let source = ParentEntry::open(source)?;
+        Ok(is_regular_file(
+            read_statx(&source).map_err(map_errno)?.stx_mode,
+        ))
     }
 
     fn identity(&mut self, path: &StorePath) -> Result<Option<Box<[u8]>>, MutationError> {
@@ -1432,6 +1439,9 @@ impl LinkProvider for LocalStore {
         let destination = ParentEntry::open(destination)?;
         if read_identity(&source).map_err(map_errno)?.as_ref() != expected_identity {
             return Err(MutationError::SourceChanged);
+        }
+        if !is_regular_file(read_statx(&source).map_err(map_errno)?.stx_mode) {
+            return Err(MutationError::Unsupported);
         }
         match linkat(
             &source.parent,
@@ -1768,6 +1778,10 @@ fn proc_fd_path(fd: &OwnedFd) -> PathBuf {
 
 const fn is_directory(mode: u16) -> bool {
     mode & 0o170_000 == 0o040_000
+}
+
+const fn is_regular_file(mode: u16) -> bool {
+    mode & 0o170_000 == 0o100_000
 }
 
 fn filesystem_identity(stat: &rustix::fs::Statx) -> u64 {

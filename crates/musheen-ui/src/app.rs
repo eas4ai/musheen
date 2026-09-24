@@ -94,8 +94,8 @@ use musheen_local::LocalStore;
 use musheen_ops::{
     ApplyScope, ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, ConflictChoice,
     ConflictDecision, ConflictItemKind, ConflictPolicies, ConflictRecord, CreateRequest,
-    DeleteTarget, EventGeneration, JobId, MutationError, MutationProvider, OperationKind,
-    PermanentDeleteRequest, RenameRequest,
+    DeleteTarget, EventGeneration, HardLinkRequest, JobId, MutationError, MutationProvider,
+    OperationKind, PermanentDeleteRequest, RenameRequest, SymbolicLinkRequest,
 };
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
@@ -1696,6 +1696,10 @@ enum NameOperation {
         target: CommandTargetRef,
         original_name: OsString,
     },
+    Link {
+        target: CommandTargetRef,
+        hard: bool,
+    },
 }
 
 impl NameOperation {
@@ -1715,6 +1719,18 @@ impl NameOperation {
         match self {
             Self::Rename { original_name, .. } => original_name.to_string_lossy().into_owned(),
             Self::Create { .. } => String::new(),
+            Self::Link { target, hard } => {
+                let name = target
+                    .path()
+                    .as_unix_path()
+                    .and_then(Path::file_name)
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                if *hard {
+                    format!("{name} (hard link)")
+                } else {
+                    format!("Link to {name}")
+                }
+            }
         }
     }
 }
@@ -8261,6 +8277,19 @@ impl MusheenApp {
                 }
             }
             (
+                link_action @ (CommandAction::CreateSymbolicLink | CommandAction::CreateHardLink),
+                CommandParameters::Targets(targets),
+            ) => {
+                if let Some(target) = targets.first().filter(|_| targets.len() == 1) {
+                    let operation = NameOperation::Link {
+                        target: target.clone(),
+                        hard: *link_action == CommandAction::CreateHardLink,
+                    };
+                    let initial = operation.initial_name();
+                    self.open_name_operation(operation, initial, origin_tab, cx);
+                }
+            }
+            (
                 visibility_action @ (CommandAction::Hide | CommandAction::Unhide),
                 CommandParameters::Targets(targets),
             ) => {
@@ -9202,6 +9231,8 @@ impl MusheenApp {
                 ..
             } => "New Empty File",
             NameOperation::Rename { .. } => "Rename",
+            NameOperation::Link { hard: false, .. } => "Create Symbolic Link",
+            NameOperation::Link { hard: true, .. } => "Create Hard Link",
         };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(440.), px(220.)), cx)),
@@ -9267,6 +9298,50 @@ impl MusheenApp {
                     hub.submit_rename(request)
                         .map(|id| (id, Some(movement)))
                         .map_err(|error| Box::<str>::from(error.to_string()))
+                }
+                NameOperation::Link { target, hard } => {
+                    let source_path = target
+                        .path()
+                        .as_unix_path()
+                        .ok_or_else(|| Box::<str>::from("links require a local item"))?;
+                    let parent = source_path
+                        .parent()
+                        .ok_or_else(|| Box::<str>::from("the selected item has no parent"))?;
+                    let parent = StorePath::from_unix_path(parent.as_os_str());
+                    let target_path = source_path.as_os_str().to_os_string();
+                    let mut store = LocalStore::new();
+                    let current = store
+                        .resolve_item(target.path())
+                        .map_err(|error| Box::<str>::from(error.to_string()))?
+                        .ok_or_else(|| Box::<str>::from("the selected item no longer exists"))?;
+                    if current.id() != target.id() {
+                        return Err(Box::<str>::from("the selected item changed"));
+                    }
+                    if hard {
+                        let identity = MutationProvider::identity(&mut store, target.path())
+                            .map_err(|error| Box::<str>::from(error.to_string()))?
+                            .ok_or_else(|| {
+                                Box::<str>::from("the selected item no longer exists")
+                            })?;
+                        hub.submit_hard_link(
+                            HardLinkRequest::new(
+                                target.path().clone(),
+                                parent,
+                                name.into(),
+                                identity.into_vec(),
+                            ),
+                            target,
+                        )
+                        .map(|id| (id, None))
+                        .map_err(|error| Box::<str>::from(error.to_string()))
+                    } else {
+                        hub.submit_symbolic_link(
+                            SymbolicLinkRequest::new(parent, name.into(), target_path),
+                            target,
+                        )
+                        .map(|id| (id, None))
+                        .map_err(|error| Box::<str>::from(error.to_string()))
+                    }
                 }
             }
         });
@@ -9962,6 +10037,8 @@ impl MusheenApp {
                 | CommandAction::MoveToTrash
                 | CommandAction::DeletePermanently
                 | CommandAction::Rename
+                | CommandAction::CreateSymbolicLink
+                | CommandAction::CreateHardLink
                 | CommandAction::Hide
                 | CommandAction::Unhide
                 | CommandAction::NewDirectory
@@ -19809,6 +19886,8 @@ mod tests {
             CommandAction::Compress,
             CommandAction::Extract,
             CommandAction::ExtractHere,
+            CommandAction::CreateSymbolicLink,
+            CommandAction::CreateHardLink,
             CommandAction::Hide,
             CommandAction::Unhide,
         ] {
@@ -19950,6 +20029,97 @@ mod tests {
         assert_eq!(filesystem::read(conflict_destination).unwrap(), b"existing");
         assert!(!other_source.exists());
         assert_eq!(filesystem::read(other_destination).unwrap(), b"other");
+    }
+
+    #[gpui_kit::test]
+    async fn symbolic_link_context_action_creates_a_queued_link(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("original.txt");
+        let link = temporary.path().join("Link to original.txt");
+        filesystem::write(&source, b"original").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(source.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::CreateSymbolicLink,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            !app.read(cx).context_dialog_windows.is_empty()
+        })
+        .await;
+        let dialog = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("name-operation-submit", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| link.exists())
+            .await;
+        assert_eq!(filesystem::read_link(link).unwrap(), source);
+    }
+
+    #[gpui_kit::test]
+    async fn hard_link_context_action_shares_the_source_inode(cx: &mut TestAppContext) {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("original.txt");
+        let link = temporary.path().join("original.txt (hard link)");
+        filesystem::write(&source, b"original").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(source.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::CreateHardLink,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            !app.read(cx).context_dialog_windows.is_empty()
+        })
+        .await;
+        let dialog = cx
+            .windows()
+            .into_iter()
+            .find(|window| *window != browser)
+            .unwrap();
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("name-operation-submit", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| link.exists())
+            .await;
+        assert_eq!(
+            filesystem::metadata(link).unwrap().ino(),
+            filesystem::metadata(source).unwrap().ino()
+        );
     }
 
     #[gpui_kit::test]

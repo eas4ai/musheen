@@ -7,15 +7,15 @@ pub use musheen_local::{
 use crate::providers::ProviderRuntime;
 use crate::{RecoveryAction, StatusCenterError, StatusCenterModel};
 use gpui_kit::{AppContext, Context};
-use musheen_core::{ResourceLimits, StorePath};
+use musheen_core::{CommandTargetRef, ResourceLimits, StorePath};
 use musheen_desktop::{
     ArchiveError, ArchiveOperationLimits, ArchivePassword, ArchivePasswordProvider,
     FileJournalStorage, PasswordRequest, StatusStore, execute_archive_plan,
 };
 use musheen_ops::{
-    ArchiveOperationPlan, ConflictDecision, ConflictRecord, CreateRequest, DeleteTarget, JobId,
-    JobState, Journal, MetadataChange, MetadataScope, OperationKind, PermanentDeleteConfirmation,
-    PermanentDeleteRequest, RenameRequest,
+    ArchiveOperationPlan, ConflictDecision, ConflictRecord, CreateRequest, DeleteTarget,
+    HardLinkRequest, JobId, JobState, Journal, MetadataChange, MetadataScope, OperationKind,
+    PermanentDeleteConfirmation, PermanentDeleteRequest, RenameRequest, SymbolicLinkRequest,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -557,6 +557,51 @@ impl OperationHub {
                 id,
                 musheen_ops::EventGeneration::new(0),
                 kind,
+                location,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(id)
+    }
+
+    pub fn submit_symbolic_link(
+        &self,
+        request: SymbolicLinkRequest,
+        source: CommandTargetRef,
+    ) -> Result<JobId, OperationHubError> {
+        let location = source.path().clone();
+        let id = self.with_unreserved_queue([&location], |queue| {
+            queue.submit_symbolic_link(request, source)
+        })?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                OperationKind::SymbolicLink,
+                location,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(id)
+    }
+
+    pub fn submit_hard_link(
+        &self,
+        request: HardLinkRequest,
+        source: CommandTargetRef,
+    ) -> Result<JobId, OperationHubError> {
+        let location = source.path().clone();
+        let id = self
+            .with_unreserved_queue([&location], |queue| queue.submit_hard_link(request, source))?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                OperationKind::HardLink,
                 location,
                 Some(1),
             )?;
