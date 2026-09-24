@@ -175,16 +175,12 @@ fn release_container_tests_both_toolchains_features_and_profiles() {
     assert!(dockerfile.contains("cargo fetch --locked"));
 }
 
-#[test]
-fn benchmark_runner_isolates_temporary_files_and_rejects_missing_results() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let temporary = tempfile::tempdir().unwrap();
-    let fake_bin = temporary.path().join("bin");
-    fs::create_dir(&fake_bin).unwrap();
+fn install_fake_benchmarks(fake_bin: &Path) {
+    fs::create_dir(fake_bin).unwrap();
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s' \"$*\" > \"$MUSHEEN_CARGO_ARGS\"\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"directory\"},\"executable\":\"%s\"}\n' \"$MUSHEEN_FAKE_BENCH\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -195,44 +191,88 @@ fn benchmark_runner_isolates_temporary_files_and_rejects_missing_results() {
     )
     .unwrap();
     fs::set_permissions(&fake_bench, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_search_bench = fake_bin.join("search-bench");
+    fs::write(
+        &fake_search_bench,
+        "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_SEARCH_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_SEARCH_BENCH_ARGS\"\nprintf '%s\\n' '{\"case\":\"search_backpressure_saturation\",\"potential_matches\":1000000,\"queued_matches_max\":2048,\"producer_inflight_matches_max\":256,\"produced_while_stalled\":2304,\"retained_models_max\":0,\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"temporary_bytes\":0}'\nif [ \"${MUSHEEN_FAKE_SEARCH_MISSING:-0}\" = 0 ]; then printf '%s\\n' '{\"case\":\"million_result_search_refinement\",\"potential_matches\":1000000,\"displayed_matches\":100000,\"produced_matches\":102000,\"accepted_batches\":391,\"queued_matches_max\":2048,\"retained_models_max\":4096,\"state\":\"refine_required\",\"wall_ns\":2,\"cpu_ns\":2,\"peak_rss_kib\":2,\"open_fds\":4,\"temporary_bytes\":0}'; fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_search_bench, fs::Permissions::from_mode(0o755)).unwrap();
+}
 
-    let run = |missing| {
-        Command::new(root.join("scripts/run-benchmarks.sh"))
-            .env(
-                "PATH",
-                format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
-            )
-            .env("CARGO_TARGET_DIR", temporary.path().join("target"))
-            .env("MUSHEEN_BENCH_TMP_PARENT", temporary.path())
-            .env("MUSHEEN_FAKE_BENCH", &fake_bench)
-            .env("MUSHEEN_FAKE_MISSING", missing)
-            .env("MUSHEEN_CARGO_ARGS", temporary.path().join("cargo-args"))
-            .env("MUSHEEN_BENCH_ARGS", temporary.path().join("bench-args"))
-            .env(
-                "MUSHEEN_BENCH_TMP_RECORD",
-                temporary.path().join("bench-temp"),
-            )
-            .output()
-            .unwrap()
-    };
-    let complete = run("0");
-    assert!(complete.status.success(), "{complete:?}");
-    assert!(
-        fs::read_to_string(temporary.path().join("cargo-args"))
-            .unwrap()
-            .contains("--no-run --bench directory")
-    );
+fn run_benchmark_fixture(
+    root: &Path,
+    temporary: &Path,
+    fake_bin: &Path,
+    missing_directory: bool,
+    missing_search: bool,
+) -> std::process::Output {
+    Command::new(root.join("scripts/run-benchmarks.sh"))
+        .env(
+            "PATH",
+            format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("CARGO_TARGET_DIR", temporary.join("target"))
+        .env("MUSHEEN_BENCH_TMP_PARENT", temporary)
+        .env("MUSHEEN_FAKE_BENCH", fake_bin.join("directory-bench"))
+        .env("MUSHEEN_FAKE_SEARCH_BENCH", fake_bin.join("search-bench"))
+        .env(
+            "MUSHEEN_FAKE_MISSING",
+            if missing_directory { "1" } else { "0" },
+        )
+        .env(
+            "MUSHEEN_FAKE_SEARCH_MISSING",
+            if missing_search { "1" } else { "0" },
+        )
+        .env("MUSHEEN_CARGO_ARGS", temporary.join("cargo-args"))
+        .env("MUSHEEN_BENCH_ARGS", temporary.join("bench-args"))
+        .env("MUSHEEN_SEARCH_BENCH_ARGS", temporary.join("search-args"))
+        .env(
+            "MUSHEEN_SEARCH_BENCH_TMP_RECORD",
+            temporary.join("search-temp"),
+        )
+        .env("MUSHEEN_BENCH_TMP_RECORD", temporary.join("bench-temp"))
+        .output()
+        .unwrap()
+}
+
+fn assert_benchmark_fixture_records(temporary: &Path) {
+    let cargo_args = fs::read_to_string(temporary.join("cargo-args")).unwrap();
+    assert!(cargo_args.contains("--no-run --bench directory"));
+    assert!(cargo_args.contains("--no-run --bench search"));
     assert_eq!(
-        fs::read_to_string(temporary.path().join("bench-args")).unwrap(),
+        fs::read_to_string(temporary.join("bench-args")).unwrap(),
         "--bench"
     );
-    let benchmark_temp = fs::read_to_string(temporary.path().join("bench-temp")).unwrap();
-    assert!(benchmark_temp.starts_with(temporary.path().to_str().unwrap()));
-    assert_ne!(benchmark_temp, temporary.path().to_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(temporary.join("search-args")).unwrap(),
+        "--bench"
+    );
+    let benchmark_temp = fs::read_to_string(temporary.join("bench-temp")).unwrap();
+    let search_temp = fs::read_to_string(temporary.join("search-temp")).unwrap();
+    assert!(benchmark_temp.starts_with(temporary.to_str().unwrap()));
+    assert_ne!(benchmark_temp, temporary.to_str().unwrap());
+    assert!(search_temp.starts_with(temporary.to_str().unwrap()));
+    assert_ne!(search_temp, benchmark_temp);
+}
 
-    let missing = run("1");
+#[test]
+fn benchmark_runner_isolates_temporary_files_and_rejects_missing_results() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temporary = tempfile::tempdir().unwrap();
+    let fake_bin = temporary.path().join("bin");
+    install_fake_benchmarks(&fake_bin);
+    let complete = run_benchmark_fixture(root, temporary.path(), &fake_bin, false, false);
+    assert!(complete.status.success(), "{complete:?}");
+    assert_benchmark_fixture_records(temporary.path());
+    let missing = run_benchmark_fixture(root, temporary.path(), &fake_bin, true, false);
     assert!(
         !missing.status.success(),
         "missing benchmark case must fail"
+    );
+    let missing_search = run_benchmark_fixture(root, temporary.path(), &fake_bin, false, true);
+    assert!(
+        !missing_search.status.success(),
+        "missing search benchmark case must fail"
     );
 }

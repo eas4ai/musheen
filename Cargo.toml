@@ -110,6 +110,7 @@ musheen-ui = { path = "crates/musheen-ui" }
 rustix.workspace = true
 
 [dev-dependencies]
+async-channel.workspace = true
 musheen-test-support = { path = "crates/musheen-test-support" }
 serde_json.workspace = true
 tempfile.workspace = true
@@ -119,6 +120,10 @@ workspace = true
 
 [[bench]]
 name = "directory"
+harness = false
+
+[[bench]]
+name = "search"
 harness = false
 
 [patch.crates-io]
