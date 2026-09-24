@@ -566,20 +566,28 @@ fn invocation_preserves_command_id_contracts_and_confirmation_routes() {
     let menu = surface.compose(request);
     let mut dispatcher = RecordingDispatcher::default();
 
+    let rename = surface.invoke(menu.entry("file.rename").unwrap(), &mut dispatcher);
+    assert!(rename.is_dispatched());
+    assert_eq!(dispatcher.calls[0].0, CommandAction::Rename);
+    assert!(matches!(
+        dispatcher.calls[0].1,
+        CommandParameters::Targets(_)
+    ));
+
     let copy_to = surface.invoke(menu.entry("clipboard.copy_to").unwrap(), &mut dispatcher);
     assert!(copy_to.needs_destination_chooser());
-    assert!(dispatcher.calls.is_empty());
+    assert_eq!(dispatcher.calls.len(), 1);
 
     let delete = surface.invoke(
         menu.entry("file.delete_permanently").unwrap(),
         &mut dispatcher,
     );
     assert!(delete.needs_confirmation());
-    assert!(dispatcher.calls.is_empty());
+    assert_eq!(dispatcher.calls.len(), 1);
     surface.confirm(delete, &mut dispatcher).unwrap();
-    assert_eq!(dispatcher.calls[0].0, CommandAction::DeletePermanently);
+    assert_eq!(dispatcher.calls[1].0, CommandAction::DeletePermanently);
     assert!(matches!(
-        dispatcher.calls[0].1,
+        dispatcher.calls[1].1,
         CommandParameters::Targets(_)
     ));
 }

@@ -1770,7 +1770,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             P::WritableExactlyOneSelection,
             A::Rename,
             G::Organization,
-            D::Review,
+            D::None,
         ),
         command(
             "file.duplicate",
