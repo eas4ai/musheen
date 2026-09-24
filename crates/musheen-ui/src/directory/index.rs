@@ -3,10 +3,10 @@ use crate::views::{DirectoryViewModel, ViewPreferences};
 use musheen_core::{DisplayPath, ItemId, ItemKind, StoreItem, StorePath};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use tempfile::{Builder, NamedTempFile, TempDir, TempPath};
 
@@ -227,7 +227,10 @@ enum OrderPolicy<'a> {
 
 impl DiskDirectoryIndex {
     pub(super) fn new() -> io::Result<Self> {
-        let scratch = Builder::new().prefix("musheen-directory-").tempdir()?;
+        let scratch = Builder::new()
+            .prefix("musheen-directory-")
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir()?;
         let mut records = OpenOptions::new()
             .read(true)
             .write(true)
@@ -754,6 +757,8 @@ mod tests {
     use crate::search::DirectoryFilter;
     use crate::views::{SortDirection, SortKey, ViewPreferences};
     use musheen_core::{DisplayPath, ItemId, ItemKind, ProviderId, StoreItem, StorePath};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
 
     fn item(path: StorePath) -> StoreItem {
         StoreItem::new(
@@ -849,10 +854,67 @@ mod tests {
     }
 
     #[test]
+    fn full_device_append_preserves_last_published_order() {
+        let mut index = DiskDirectoryIndex::new().unwrap();
+        let original = item(StorePath::from_unix_path("/tmp/item"));
+        index.append(&original, 0).unwrap();
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+        let records_len = index.records.metadata().unwrap().len();
+        let full_device = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let writable_offsets = std::mem::replace(&mut index.offsets, full_device);
+
+        let error = index.append(&original, 1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(28));
+        assert_eq!(index.record_count(), 1);
+        assert_eq!(index.records.metadata().unwrap().len(), records_len);
+        assert_eq!(index.visible_count(), Some(1));
+        assert_eq!(index.read_range(0..1).unwrap(), vec![original]);
+
+        index.offsets = writable_offsets;
+    }
+
+    #[test]
+    fn corrupt_new_record_cannot_replace_last_valid_order() {
+        let mut index = DiskDirectoryIndex::new().unwrap();
+        let original = item(StorePath::from_unix_path("/tmp/original"));
+        index.append(&original, 0).unwrap();
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+        let new_record = item(StorePath::from_unix_path("/tmp/new"));
+        let offset = index.append(&new_record, 1).unwrap();
+        index.records.seek(SeekFrom::Start(offset)).unwrap();
+        index.records.write_all(&0u32.to_le_bytes()).unwrap();
+
+        assert!(
+            index
+                .rebuild_order(&ViewPreferences::default(), None)
+                .is_err()
+        );
+        assert_eq!(index.visible_count(), Some(1));
+        assert_eq!(index.active_count(), Some(1));
+        assert_eq!(index.read_range(0..1).unwrap(), vec![original]);
+    }
+
+    #[test]
     fn private_record_directory_is_removed_on_drop() {
         let index = DiskDirectoryIndex::new().unwrap();
         let path = index.scratch.path().to_path_buf();
         assert!(path.is_dir());
+        for entry in [&path, &path.join("records"), &path.join("offsets")] {
+            let mode = entry.metadata().unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "index scratch must be owner-only: {entry:?}"
+            );
+        }
 
         drop(index);
 

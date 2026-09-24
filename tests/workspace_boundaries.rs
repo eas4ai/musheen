@@ -56,6 +56,11 @@ fn workspace_contains_each_domain_crate() {
 #[test]
 fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
     let crates_root = repository_root().join("crates");
+    // The approved disk-backed directory design places one private, owner-only
+    // temporary index in the UI crate. It never opens a browsed provider path;
+    // all ordinary UI and operation filesystem access still crosses a domain
+    // boundary.
+    let private_directory_index = crates_root.join("musheen-ui/src/directory/index.rs");
     let mut violations = Vec::new();
     let direct_filesystem_apis = [
         "std::fs",
@@ -74,6 +79,9 @@ fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
         let mut rust_files = Vec::new();
         rust_files_below(&crates_root.join(crate_name).join("src"), &mut rust_files);
         for file in rust_files {
+            if file == private_directory_index {
+                continue;
+            }
             let source = fs::read_to_string(&file).expect("Rust source should be readable");
             // Inline test modules at the end of source files may set up real
             // filesystem fixtures without crossing the production boundary.

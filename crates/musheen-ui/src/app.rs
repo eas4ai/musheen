@@ -369,6 +369,10 @@ impl IndexedViewport {
             .any(|(loaded, _)| loaded.start <= range.start && loaded.end >= range.end)
     }
 
+    fn matches_pending(&self, generation: u64, range: &std::ops::Range<usize>) -> bool {
+        self.generation == generation && self.pending.as_ref() == Some(range)
+    }
+
     #[cfg(test)]
     fn item(&self, position: usize) -> Option<StoreItem> {
         self.row(position).map(|(item, _)| item)
@@ -13927,9 +13931,7 @@ impl MusheenApp {
                 let Some(viewport) = state.indexed_viewports.get_mut(&tab_id) else {
                     return;
                 };
-                if viewport.generation != generation
-                    || viewport.pending.as_ref() != Some(&result_range)
-                {
+                if !viewport.matches_pending(generation, &result_range) {
                     return;
                 }
                 viewport.pending = None;
@@ -15635,6 +15637,16 @@ mod tests {
     };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[test]
+    fn indexed_viewport_rejects_stale_range_completions() {
+        let mut viewport = IndexedViewport::new(7);
+        viewport.pending = Some(100..120);
+
+        assert!(!viewport.matches_pending(6, &(100..120)));
+        assert!(!viewport.matches_pending(7, &(120..140)));
+        assert!(viewport.matches_pending(7, &(100..120)));
+    }
 
     #[test]
     fn large_sizes_use_tib_instead_of_four_digit_gib_values() {
