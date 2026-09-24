@@ -95,6 +95,12 @@ fn native_installer_stages_app_metadata_icons_and_broker_without_host_writes() {
             .unwrap_or_else(|error| panic!("missing staged {relative}: {error}"));
         assert_eq!(metadata.permissions().mode() & 0o777, mode, "{relative}");
     }
+    assert!(
+        !stage
+            .join("usr/share/dbus-1/services/org.freedesktop.FileManager1.service")
+            .exists(),
+        "the package must not replace another file manager's D-Bus activation"
+    );
 }
 
 #[test]

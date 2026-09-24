@@ -15,11 +15,15 @@ desktop-file-validate "$stage/usr/share/applications/org.musheen.Musheen.desktop
 appstreamcli validate --no-net \
     "$stage/usr/share/metainfo/org.musheen.Musheen.metainfo.xml"
 
-file_manager_service="$stage/usr/share/dbus-1/services/org.freedesktop.FileManager1.service"
-if [[ ! -f "$file_manager_service" ]] \
-    || ! grep -Fxq 'Name=org.freedesktop.FileManager1' "$file_manager_service" \
-    || ! grep -Fxq 'Exec=/usr/bin/musheen' "$file_manager_service"; then
-    echo "package is missing FileManager1 D-Bus activation" >&2
+private_service="$stage/usr/share/dbus-1/services/org.musheen.Musheen.service"
+if [[ ! -f "$private_service" ]] \
+    || ! grep -Fxq 'Name=org.musheen.Musheen' "$private_service" \
+    || ! grep -Fxq 'Exec=/usr/bin/musheen' "$private_service"; then
+    echo "package is missing Musheen D-Bus activation" >&2
+    exit 1
+fi
+if [[ -e "$stage/usr/share/dbus-1/services/org.freedesktop.FileManager1.service" ]]; then
+    echo "package must not replace another file manager's D-Bus activation" >&2
     exit 1
 fi
 
