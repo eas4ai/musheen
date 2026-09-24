@@ -94,10 +94,24 @@ def terminal:
     and .lines == 1000000 and .scrollback_lines == 10000
     and .scrollback_bytes <= 67108864 and .retained_models_max == 10000);
 
+def remote:
+  length == 2
+  and cases(["remote_pool_capacity_and_reuse", "remote_pool_waiter_backpressure"])
+  and all(.[]; measurements and .pool_connections_max <= 8
+    and .active_requests_max <= 32 and .queued_work_max <= 1
+    and .retained_models_max == 0 and .temporary_bytes == 0)
+  and any(.[]; .case == "remote_pool_capacity_and_reuse"
+    and .acquisitions == 3200 and .pool_connections_max == 8
+    and .active_requests_max == 32 and .connector_calls == 8)
+  and any(.[]; .case == "remote_pool_waiter_backpressure"
+    and .waiting_requests_max == 1 and .awakened == true
+    and .queued_work_max == 1);
+
 if $benchmark == "directory" then directory
 elif $benchmark == "search" then search
 elif $benchmark == "operations" then operations
 elif $benchmark == "thumbnail" then thumbnail
 elif $benchmark == "archive" then archive
 elif $benchmark == "terminal" then terminal
+elif $benchmark == "remote" then remote
 else false end

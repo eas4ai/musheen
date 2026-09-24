@@ -180,7 +180,7 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\n  if [ \"$argument\" = thumbnail ]; then name=thumbnail; executable=$MUSHEEN_FAKE_THUMBNAIL_BENCH; fi\n  if [ \"$argument\" = archive ]; then name=archive; executable=$MUSHEEN_FAKE_ARCHIVE_BENCH; fi\n  if [ \"$argument\" = terminal ]; then name=terminal; executable=$MUSHEEN_FAKE_TERMINAL_BENCH; fi\n  if [ \"$argument\" = musheen-thumbnail-worker ]; then name=musheen-thumbnail-worker; executable=$MUSHEEN_FAKE_THUMBNAIL_WORKER; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\n  if [ \"$argument\" = thumbnail ]; then name=thumbnail; executable=$MUSHEEN_FAKE_THUMBNAIL_BENCH; fi\n  if [ \"$argument\" = archive ]; then name=archive; executable=$MUSHEEN_FAKE_ARCHIVE_BENCH; fi\n  if [ \"$argument\" = terminal ]; then name=terminal; executable=$MUSHEEN_FAKE_TERMINAL_BENCH; fi\n  if [ \"$argument\" = remote ]; then name=remote; executable=$MUSHEEN_FAKE_REMOTE_BENCH; fi\n  if [ \"$argument\" = musheen-thumbnail-worker ]; then name=musheen-thumbnail-worker; executable=$MUSHEEN_FAKE_THUMBNAIL_WORKER; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -229,6 +229,13 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     )
     .unwrap();
     fs::set_permissions(&fake_terminal_bench, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_remote_bench = fake_bin.join("remote-bench");
+    fs::write(
+        &fake_remote_bench,
+        "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_REMOTE_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_REMOTE_BENCH_ARGS\"\nprintf '%s\\n' '{\"case\":\"remote_pool_capacity_and_reuse\",\"acquisitions\":3200,\"pool_connections_max\":8,\"active_requests_max\":32,\"connector_calls\":8,\"queued_work_max\":0,\"retained_models_max\":0,\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"temporary_bytes\":0}'\nif [ \"${MUSHEEN_FAKE_REMOTE_MISSING:-0}\" = 0 ]; then printf '%s\\n' '{\"case\":\"remote_pool_waiter_backpressure\",\"waiting_requests_max\":1,\"awakened\":true,\"pool_connections_max\":8,\"active_requests_max\":32,\"queued_work_max\":1,\"retained_models_max\":0,\"wall_ns\":2,\"cpu_ns\":2,\"peak_rss_kib\":2,\"open_fds\":4,\"temporary_bytes\":0}'; fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_remote_bench, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn run_benchmark_fixture(
@@ -259,6 +266,7 @@ fn run_benchmark_fixture(
             "MUSHEEN_FAKE_TERMINAL_BENCH",
             fake_bin.join("terminal-bench"),
         )
+        .env("MUSHEEN_FAKE_REMOTE_BENCH", fake_bin.join("remote-bench"))
         .env(
             "MUSHEEN_FAKE_THUMBNAIL_WORKER",
             fake_bin.join("musheen-thumbnail-worker"),
@@ -295,6 +303,14 @@ fn run_benchmark_fixture(
                 "0"
             },
         )
+        .env(
+            "MUSHEEN_FAKE_REMOTE_MISSING",
+            if missing_case == Some("remote") {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("MUSHEEN_CARGO_ARGS", temporary.join("cargo-args"))
         .env("MUSHEEN_BENCH_ARGS", temporary.join("bench-args"))
         .env("MUSHEEN_SEARCH_BENCH_ARGS", temporary.join("search-args"))
@@ -311,6 +327,7 @@ fn run_benchmark_fixture(
             "MUSHEEN_TERMINAL_BENCH_ARGS",
             temporary.join("terminal-args"),
         )
+        .env("MUSHEEN_REMOTE_BENCH_ARGS", temporary.join("remote-args"))
         .env(
             "MUSHEEN_SEARCH_BENCH_TMP_RECORD",
             temporary.join("search-temp"),
@@ -333,6 +350,10 @@ fn run_benchmark_fixture(
             temporary.join("terminal-temp"),
         )
         .env(
+            "MUSHEEN_REMOTE_BENCH_TMP_RECORD",
+            temporary.join("remote-temp"),
+        )
+        .env(
             "MUSHEEN_THUMBNAIL_WORKER_RECORD",
             temporary.join("thumbnail-worker-record"),
         )
@@ -348,6 +369,7 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     assert!(cargo_args.contains("--no-run --bench thumbnail"));
     assert!(cargo_args.contains("--no-run --bench archive"));
     assert!(cargo_args.contains("--no-run --bench terminal"));
+    assert!(cargo_args.contains("--no-run --bench remote"));
     assert!(cargo_args.contains("--bin musheen-thumbnail-worker"));
     assert_eq!(
         fs::read_to_string(temporary.join("bench-args")).unwrap(),
@@ -374,6 +396,10 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
         "--bench"
     );
     assert_eq!(
+        fs::read_to_string(temporary.join("remote-args")).unwrap(),
+        "--bench"
+    );
+    assert_eq!(
         fs::read_to_string(temporary.join("thumbnail-worker-record")).unwrap(),
         temporary
             .join("bin/musheen-thumbnail-worker")
@@ -385,6 +411,7 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     let thumbnail_temp = fs::read_to_string(temporary.join("thumbnail-temp")).unwrap();
     let archive_temp = fs::read_to_string(temporary.join("archive-temp")).unwrap();
     let terminal_temp = fs::read_to_string(temporary.join("terminal-temp")).unwrap();
+    let remote_temp = fs::read_to_string(temporary.join("remote-temp")).unwrap();
     assert!(benchmark_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(benchmark_temp, temporary.to_str().unwrap());
     assert!(search_temp.starts_with(temporary.to_str().unwrap()));
@@ -397,6 +424,8 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     assert_ne!(archive_temp, thumbnail_temp);
     assert!(terminal_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(terminal_temp, archive_temp);
+    assert!(remote_temp.starts_with(temporary.to_str().unwrap()));
+    assert_ne!(remote_temp, terminal_temp);
 }
 
 #[test]
@@ -428,5 +457,10 @@ fn benchmark_runner_isolates_temporary_files_and_rejects_missing_results() {
     assert!(
         !missing_terminal.status.success(),
         "missing terminal benchmark case must fail"
+    );
+    let missing_remote = run_benchmark_fixture(root, temporary.path(), &fake_bin, Some("remote"));
+    assert!(
+        !missing_remote.status.success(),
+        "missing remote benchmark case must fail"
     );
 }
