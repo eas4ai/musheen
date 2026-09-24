@@ -1,6 +1,6 @@
 use musheen_ops::{
-    CorruptSource, Durability, EventGeneration, JobId, Journal, JournalPhase, JournalStorage,
-    StorageAction,
+    CorruptSource, Durability, EventGeneration, JobId, Journal, JournalError, JournalPhase,
+    JournalStorage, StorageAction,
 };
 use std::io;
 
@@ -225,4 +225,48 @@ fn corrupt_records_are_quarantined_without_discarding_valid_prefixes() {
     assert_eq!(recovered.records().len(), 2);
     assert_eq!(recovered.quarantined_records(), 0);
     assert_eq!(recovered.storage().quarantine.len(), 1);
+}
+
+#[test]
+fn newer_journal_layout_is_not_quarantined_as_corruption() {
+    let storage = storage_with_newer_record(serde_json::json!(2));
+    assert!(matches!(
+        Journal::open(storage),
+        Err(JournalError::UnsupportedSchema(2))
+    ));
+}
+
+#[test]
+fn unrecognized_journal_schema_is_not_quarantined_as_corruption() {
+    let storage = storage_with_newer_record(serde_json::json!("next"));
+    assert!(matches!(
+        Journal::open(storage),
+        Err(JournalError::UnrecognizedSchema)
+    ));
+}
+
+fn storage_with_newer_record(version: serde_json::Value) -> RecordingStorage {
+    let mut journal = Journal::open(RecordingStorage::default()).unwrap();
+    journal
+        .append(
+            JobId::new(1).unwrap(),
+            EventGeneration::new(0),
+            JournalPhase::Planned,
+            Durability::CrashDurable,
+        )
+        .unwrap();
+    let mut storage = journal.into_storage();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(storage.journal.trim_ascii()).unwrap();
+    let mut payload: serde_json::Value =
+        serde_json::from_str(envelope["payload"].as_str().unwrap()).unwrap();
+    payload["schema_version"] = version;
+    payload.as_object_mut().unwrap().remove("phase");
+    let payload = serde_json::to_string(&payload).unwrap();
+    envelope["checksum"] = serde_json::json!(blake3::hash(payload.as_bytes()).to_hex().to_string());
+    envelope["payload"] = serde_json::json!(payload);
+    storage.journal = serde_json::to_vec(&envelope).unwrap();
+    storage.journal.push(b'\n');
+
+    storage
 }

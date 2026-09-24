@@ -619,7 +619,7 @@ fn append_snapshot_prefix<S: JournalStorage>(
     plans: &mut std::collections::BTreeMap<[u8; 32], Arc<ArchiveOperationPlan>>,
     storage: &mut S,
 ) -> Result<usize, JournalError> {
-    let decoded = decode_lines(bytes, plans);
+    let decoded = decode_lines(bytes, plans)?;
     let mut corrupt_at = decoded.corrupt_at;
     for line in decoded.lines {
         let expected = u64::try_from(records.len())
@@ -641,7 +641,7 @@ fn append_journal_prefix<S: JournalStorage>(
     plans: &mut std::collections::BTreeMap<[u8; 32], Arc<ArchiveOperationPlan>>,
     storage: &mut S,
 ) -> Result<usize, JournalError> {
-    let decoded = decode_lines(bytes, plans);
+    let decoded = decode_lines(bytes, plans)?;
     let mut corrupt_at = decoded.corrupt_at;
     for line in decoded.lines {
         let sequence_index = line
@@ -703,7 +703,7 @@ struct DecodedLines {
 fn decode_lines(
     bytes: &[u8],
     plans: &mut std::collections::BTreeMap<[u8; 32], Arc<ArchiveOperationPlan>>,
-) -> DecodedLines {
+) -> Result<DecodedLines, JournalError> {
     let mut lines = Vec::new();
     let mut offset = 0;
     for encoded in bytes.split_inclusive(|byte| *byte == b'\n') {
@@ -714,19 +714,24 @@ fn decode_lines(
         }
         match decode_record(line, plans) {
             Ok(record) => lines.push(DecodedLine { record, offset }),
+            Err(
+                error @ (JournalError::UnsupportedSchema(_) | JournalError::UnrecognizedSchema),
+            ) => {
+                return Err(error);
+            }
             Err(_) => {
-                return DecodedLines {
+                return Ok(DecodedLines {
                     lines,
                     corrupt_at: Some(offset),
-                };
+                });
             }
         }
         offset += encoded.len();
     }
-    DecodedLines {
+    Ok(DecodedLines {
         lines,
         corrupt_at: None,
-    }
+    })
 }
 
 fn encode_record(record: &JournalRecord, include_plan: bool) -> Result<Vec<u8>, JournalError> {
@@ -781,10 +786,25 @@ fn decode_record(
     if envelope.checksum.as_ref() != expected.as_str() {
         return Err(JournalError::ChecksumMismatch);
     }
-    let document: RecordDocument =
-        serde_json::from_str(&envelope.payload).map_err(JournalError::Decode)?;
+    let document: RecordDocument = serde_json::from_str(&envelope.payload).map_err(|error| {
+        let version = serde_json::from_str::<serde_json::Value>(&envelope.payload)
+            .ok()
+            .and_then(|value| value.get("schema_version").cloned());
+        match version {
+            Some(version) => match version.as_u64() {
+                Some(version) if version != u64::from(JOURNAL_SCHEMA_VERSION) => {
+                    JournalError::UnsupportedSchema(version)
+                }
+                Some(_) => JournalError::Decode(error),
+                None => JournalError::UnrecognizedSchema,
+            },
+            _ => JournalError::Decode(error),
+        }
+    })?;
     if document.schema_version != JOURNAL_SCHEMA_VERSION {
-        return Err(JournalError::UnsupportedSchema(document.schema_version));
+        return Err(JournalError::UnsupportedSchema(u64::from(
+            document.schema_version,
+        )));
     }
     let job_id = JobId::new(document.job_id).ok_or(JournalError::InvalidJobId)?;
     let archive = document
@@ -849,7 +869,8 @@ pub enum JournalError {
     Encode(serde_json::Error),
     Decode(serde_json::Error),
     ChecksumMismatch,
-    UnsupportedSchema(u32),
+    UnsupportedSchema(u64),
+    UnrecognizedSchema,
     InvalidJobId,
     SequenceExhausted,
     MissingArchivePlan,
@@ -866,6 +887,7 @@ impl fmt::Display for JournalError {
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "journal schema {version} is unsupported")
             }
+            Self::UnrecognizedSchema => formatter.write_str("journal schema is unrecognized"),
             Self::InvalidJobId => formatter.write_str("journal contains an invalid job ID"),
             Self::SequenceExhausted => formatter.write_str("journal sequence is exhausted"),
             Self::MissingArchivePlan => {
@@ -885,6 +907,7 @@ impl Error for JournalError {
             Self::Encode(error) | Self::Decode(error) => error,
             Self::ChecksumMismatch
             | Self::UnsupportedSchema(_)
+            | Self::UnrecognizedSchema
             | Self::InvalidJobId
             | Self::SequenceExhausted
             | Self::MissingArchivePlan

@@ -189,6 +189,10 @@ impl CatalogStore {
     }
 
     fn save_unlocked(&self, document: &CatalogDocument) -> Result<(), CatalogError> {
+        match load_document(&self.backup_path) {
+            Ok(_) | Err(CatalogError::Corrupt { .. }) => {}
+            Err(error) => return Err(error),
+        }
         ensure_parent(&self.path)?;
         match load_document(&self.path) {
             Ok(Some(previous)) => atomic_replace(&self.backup_path, &serialize(&previous)?)?,
@@ -272,6 +276,23 @@ fn load_document(path: &Path) -> Result<Option<CatalogDocument>, CatalogError> {
             path: path.to_path_buf(),
             message: error.to_string().into(),
         })?;
+    let schema_version = value
+        .get("schema_version")
+        .ok_or_else(|| CatalogError::Corrupt {
+            path: path.to_path_buf(),
+            message: "catalog schema_version is missing".into(),
+        })?;
+    let version = schema_version
+        .as_u64()
+        .ok_or_else(|| CatalogError::UnrecognizedVersion {
+            path: path.to_path_buf(),
+        })?;
+    if version != u64::from(CATALOG_SCHEMA_VERSION) {
+        return Err(CatalogError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            version,
+        });
+    }
     validate_catalog_value(&value).map_err(|message| CatalogError::Corrupt {
         path: path.to_path_buf(),
         message,
@@ -281,12 +302,6 @@ fn load_document(path: &Path) -> Result<Option<CatalogDocument>, CatalogError> {
             path: path.to_path_buf(),
             message: error.to_string().into(),
         })?;
-    if document.schema_version != CATALOG_SCHEMA_VERSION {
-        return Err(CatalogError::UnsupportedVersion {
-            path: path.to_path_buf(),
-            version: document.schema_version,
-        });
-    }
     Ok(Some(document))
 }
 
@@ -419,7 +434,10 @@ pub enum CatalogError {
     },
     UnsupportedVersion {
         path: PathBuf,
-        version: u32,
+        version: u64,
+    },
+    UnrecognizedVersion {
+        path: PathBuf,
     },
     UpdateConflict,
     Update(Box<str>),
@@ -450,6 +468,11 @@ impl fmt::Display for CatalogError {
                 "unsupported catalog schema {version} at {}",
                 path.display()
             ),
+            Self::UnrecognizedVersion { path } => write!(
+                formatter,
+                "unrecognized catalog schema at {}; refusing to replace it",
+                path.display()
+            ),
             Self::UpdateConflict => formatter.write_str(
                 "catalog changed before the update could be committed safely; retry the action",
             ),
@@ -466,6 +489,7 @@ impl Error for CatalogError {
             Self::Serialize(error) => Some(error),
             Self::Corrupt { .. }
             | Self::UnsupportedVersion { .. }
+            | Self::UnrecognizedVersion { .. }
             | Self::UpdateConflict
             | Self::Update(_) => None,
         }

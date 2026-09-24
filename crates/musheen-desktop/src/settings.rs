@@ -139,7 +139,12 @@ impl SettingsStore {
         ensure_parent(&self.path)?;
 
         match load_document_with_bytes(&self.path) {
-            Ok(Some((_, previous_bytes))) => atomic_replace(&self.backup_path, &previous_bytes)?,
+            Ok(Some((_, previous_bytes, source_version))) => {
+                if source_version < SETTINGS_SCHEMA_VERSION {
+                    self.preserve_migration_source(&previous_bytes)?;
+                }
+                atomic_replace(&self.backup_path, &previous_bytes)?;
+            }
             Ok(None) | Err(SettingsError::Corrupt { .. }) => {}
             Err(error) => return Err(error),
         }
@@ -159,6 +164,21 @@ impl SettingsStore {
         ensure_parent(&self.path)?;
         atomic_replace(&self.path, serialize(&document).as_bytes())?;
         Ok(document)
+    }
+
+    fn preserve_migration_source(&self, bytes: &[u8]) -> Result<(), SettingsError> {
+        let mut path = self.path.as_os_str().to_os_string();
+        path.push(".pre-migration");
+        let path = PathBuf::from(path);
+        let exists = path.try_exists().map_err(|source| SettingsError::Io {
+            operation: "inspect migration backup",
+            path: path.clone(),
+            source,
+        })?;
+        if !exists {
+            atomic_replace(&path, bytes)?;
+        }
+        Ok(())
     }
 }
 
@@ -181,6 +201,9 @@ pub enum SettingsError {
         path: PathBuf,
         version: u32,
     },
+    UnrecognizedVersion {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for SettingsError {
@@ -190,6 +213,11 @@ impl fmt::Display for SettingsError {
             Self::UnsupportedVersion { path, version } => write!(
                 formatter,
                 "unsupported settings schema {version} at {}",
+                path.display()
+            ),
+            Self::UnrecognizedVersion { path } => write!(
+                formatter,
+                "unrecognized settings schema at {}; refusing to replace it",
                 path.display()
             ),
             Self::Io {
@@ -218,20 +246,21 @@ impl Error for SettingsError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::InvalidLimits(source) => Some(source),
-            Self::Corrupt { .. } | Self::InvalidValue { .. } | Self::UnsupportedVersion { .. } => {
-                None
-            }
+            Self::Corrupt { .. }
+            | Self::InvalidValue { .. }
+            | Self::UnsupportedVersion { .. }
+            | Self::UnrecognizedVersion { .. } => None,
         }
     }
 }
 
 fn load_document(path: &Path) -> Result<Option<SettingsDocument>, SettingsError> {
-    load_document_with_bytes(path).map(|loaded| loaded.map(|(document, _)| document))
+    load_document_with_bytes(path).map(|loaded| loaded.map(|(document, _, _)| document))
 }
 
 fn load_document_with_bytes(
     path: &Path,
-) -> Result<Option<(SettingsDocument, Vec<u8>)>, SettingsError> {
+) -> Result<Option<(SettingsDocument, Vec<u8>, u32)>, SettingsError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -249,11 +278,11 @@ fn load_document_with_bytes(
         path: path.to_path_buf(),
         message: error.to_string().into(),
     })?;
-    let document = parse_document(path, text)?;
-    Ok(Some((document, bytes)))
+    let (document, source_version) = parse_document(path, text)?;
+    Ok(Some((document, bytes, source_version)))
 }
 
-fn parse_document(path: &Path, text: &str) -> Result<SettingsDocument, SettingsError> {
+fn parse_document(path: &Path, text: &str) -> Result<(SettingsDocument, u32), SettingsError> {
     let mut entries = BTreeMap::<Box<str>, Box<str>>::new();
     let mut seen = HashSet::new();
     for (index, line) in text.lines().enumerate() {
@@ -288,12 +317,10 @@ fn parse_document(path: &Path, text: &str) -> Result<SettingsDocument, SettingsE
             )
         })?
         .parse::<u32>()
-        .map_err(|error| {
-            settings_error(
-                path,
-                SettingsFailure::Corrupt(format!("schema_version is invalid: {error}").into()),
-            )
+        .map_err(|_| SettingsError::UnrecognizedVersion {
+            path: path.to_path_buf(),
         })?;
+    let source_version = version;
     let version = migrate::migrate_version(path, version)?;
 
     if entries
@@ -320,12 +347,15 @@ fn parse_document(path: &Path, text: &str) -> Result<SettingsDocument, SettingsE
         }
     }
 
-    Ok(SettingsDocument {
-        schema_version: version,
-        resource_limits,
-        unknown: entries,
-        values,
-    })
+    Ok((
+        SettingsDocument {
+            schema_version: version,
+            resource_limits,
+            unknown: entries,
+            values,
+        },
+        source_version,
+    ))
 }
 
 fn parse_resource_limits(entries: &mut BTreeMap<Box<str>, Box<str>>) -> ResourceLimitConfig {

@@ -41,8 +41,12 @@ Status: Draft
 The settings store has an explicit schema version, writes by temporary-file
 sync and atomic replacement, preserves the last valid backup, and applies
 ordered migrations before exposing values.
+The first migrated save also keeps the original bytes in
+`settings.conf.pre-migration`; later saves rotate `settings.conf.bak` without
+replacing that downgrade copy.
 Falsifier: interruption can replace valid settings with a partial file or a
-supported old schema loads without its migration.
+supported old schema loads without its migration, or a later save destroys the
+original downgrade copy.
 Mechanism: kill-during-write tests and one migration fixture per schema version.
 
 [CUSTOM-005]
