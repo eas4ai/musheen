@@ -773,8 +773,11 @@ fn probe_capacity(
     if std::thread::Builder::new()
         .name("musheen-capacity-probe".into())
         .spawn(move || {
-            let _lease = CapacityProbeLease(probe_active);
+            let lease = CapacityProbeLease(probe_active);
             let result = provider.capacity(&path).ok();
+            // A received result must imply that the probe slot is free for a
+            // subsequent refresh, even if this worker has not exited yet.
+            drop(lease);
             let _ = sender.send(result);
         })
         .is_err()

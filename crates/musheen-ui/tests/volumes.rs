@@ -164,6 +164,29 @@ fn sidebar_projection_uses_live_mount_location_capacity_and_read_only_state() {
 }
 
 #[test]
+fn rapid_volume_refreshes_reprobe_capacity() {
+    let mounts = Arc::new(Mounts::default());
+    *mounts.records.lock().unwrap() = vec![MountRecord::new(
+        "/dev/sdb1",
+        "/media/photos",
+        "ext4",
+        false,
+    )];
+    let mut service = build_service(mounts.clone());
+
+    for available in 1..=32 {
+        mounts
+            .capacities
+            .lock()
+            .unwrap()
+            .insert("/media/photos".into(), Capacity::new(1_000, available));
+        service.refresh().unwrap();
+        let volume = service.model().volumes().into_iter().next().unwrap();
+        assert_eq!(volume.capacity(), Some(Capacity::new(1_000, available)));
+    }
+}
+
+#[test]
 fn unmounted_sidebar_refusal_is_a_localizable_reason_key() {
     let mounts = Arc::new(Mounts::default());
     let mut service = build_service(mounts);
