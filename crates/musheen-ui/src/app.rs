@@ -4299,10 +4299,14 @@ impl MusheenApp {
         event: WatchEvent,
         cx: &mut Context<Self>,
     ) {
+        let filter = self
+            .filters
+            .get(&tab_id)
+            .and_then(|active| active.filter.clone());
         if let Some(work) = self
             .directories
             .get(&tab_id)
-            .and_then(|directory| directory.prepare_index_watch_event(&load, event.clone()))
+            .and_then(|directory| directory.prepare_index_watch_event(&load, event.clone(), filter))
         {
             let task = cx.background_spawn(async move { work.run() });
             cx.spawn(async move |this, cx| {
@@ -4341,6 +4345,42 @@ impl MusheenApp {
         }
     }
 
+    fn schedule_index_order(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let filter = self
+            .filters
+            .get(&tab_id)
+            .and_then(|active| active.filter.clone());
+        let Some((load, revision, work)) =
+            self.directories.get_mut(&tab_id).and_then(|directory| {
+                let load = directory.active_load()?;
+                let (revision, work) = directory.prepare_index_order(&load, filter)?;
+                Some((load, revision, work))
+            })
+        else {
+            return;
+        };
+        let task = cx.background_spawn(async move { work.run() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let Some(directory) = state.directories.get_mut(&tab_id) else {
+                    return;
+                };
+                if directory.finish_index_order(&load, revision, result) {
+                    if let DirectoryState::Error(message) = directory.state() {
+                        state.operation_error = Some(message.clone());
+                    }
+                    state.indexed_viewports.remove(&tab_id);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn apply_directory_page_result(
         &mut self,
         tab_id: TabId,
@@ -4348,6 +4388,10 @@ impl MusheenApp {
         result: Result<Page<StoreItem>, StoreError>,
         cx: &mut Context<Self>,
     ) {
+        let filter = self
+            .filters
+            .get(&tab_id)
+            .and_then(|active| active.filter.clone());
         let Some(directory) = self.directories.get_mut(&tab_id) else {
             self.pending_directory_restores.remove(&tab_id);
             return;
@@ -4359,7 +4403,7 @@ impl MusheenApp {
                 }
                 let page_items = page.items().to_vec();
                 if directory.needs_index(&page) {
-                    let index_work = directory.prepare_index_page(page);
+                    let index_work = directory.prepare_index_page(page).with_filter(filter);
                     self.spawn_index_page_work(tab_id, load.clone(), index_work, page_items, cx);
                     return;
                 }
@@ -5501,6 +5545,15 @@ impl MusheenApp {
         };
         if changed {
             self.persist_focused_view_preferences(cx);
+            if matches!(
+                action,
+                CommandAction::CycleSort
+                    | CommandAction::CycleGroup
+                    | CommandAction::ToggleDirectoriesFirst
+                    | CommandAction::ToggleHidden
+            ) {
+                self.schedule_index_order(self.navigation.focused_tab().id(), cx);
+            }
         }
         cx.notify();
     }
@@ -5652,6 +5705,15 @@ impl MusheenApp {
         }
         if changed {
             self.persist_view_preferences(tab_id, cx);
+            if matches!(
+                action,
+                CommandAction::CycleSort
+                    | CommandAction::CycleGroup
+                    | CommandAction::ToggleDirectoriesFirst
+                    | CommandAction::ToggleHidden
+            ) {
+                self.schedule_index_order(tab_id, cx);
+            }
         }
         cx.notify();
     }
@@ -10029,6 +10091,7 @@ impl MusheenApp {
         let tab_id = self.navigation.focused_tab().id();
         if expression.trim().is_empty() {
             self.filters.remove(&tab_id);
+            self.schedule_index_order(tab_id, cx);
             cx.notify();
             return;
         }
@@ -10056,6 +10119,7 @@ impl MusheenApp {
             },
         };
         self.filters.insert(tab_id, active);
+        self.schedule_index_order(tab_id, cx);
         cx.notify();
     }
 
@@ -12318,7 +12382,7 @@ impl MusheenApp {
                     generation: self
                         .directories
                         .get(&tab_id)
-                        .map_or(0, DirectoryModel::generation),
+                        .map_or(0, DirectoryModel::order_epoch),
                 }
             } else {
                 DirectoryRowsSource::InMemory {
@@ -12844,6 +12908,7 @@ impl MusheenApp {
             directory.view_mut().toggle_details_sort(column);
         }
         self.persist_view_preferences(tab_id, cx);
+        self.schedule_index_order(tab_id, cx);
         cx.notify();
     }
 
@@ -13012,7 +13077,7 @@ impl MusheenApp {
         let Some(directory) = self.directories.get(&tab_id) else {
             return;
         };
-        if directory.generation() != generation || requested.is_empty() {
+        if directory.order_epoch() != generation || requested.is_empty() {
             return;
         }
         let visible_count = directory.visible_count();
@@ -13049,7 +13114,7 @@ impl MusheenApp {
                 if state
                     .directories
                     .get(&tab_id)
-                    .map(DirectoryModel::generation)
+                    .map(DirectoryModel::order_epoch)
                     != Some(generation)
                 {
                     return;
@@ -18734,6 +18799,35 @@ mod tests {
                 );
             });
         }
+        cx.update(|cx| {
+            app.update(cx, |state, cx| state.apply_filter("4096".into(), cx));
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .directories
+                .get(&tab_id)
+                .unwrap()
+                .visible_count()
+                == 1
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("status-bar").label(), Some("1 item"));
+        })
+        .unwrap();
+        cx.update(|cx| {
+            app.update(cx, |state, cx| state.apply_filter(String::new(), cx));
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .directories
+                .get(&tab_id)
+                .unwrap()
+                .visible_count()
+                == 8_192
+        })
+        .await;
     }
 
     #[gpui_kit::test]

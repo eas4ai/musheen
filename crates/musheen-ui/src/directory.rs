@@ -1,9 +1,11 @@
+use crate::search::DirectoryFilter;
 use crate::views::{DirectoryViewModel, ViewPreferences};
 use musheen_core::{
     CancellationToken, Page, PageRequest, ResourceLimits, Store, StoreError, StoreItem, StorePath,
     WatchEvent,
 };
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod index;
@@ -32,6 +34,7 @@ pub(crate) struct DirectoryIndexWork {
     prior_items: Vec<StoreItem>,
     page_items: Vec<StoreItem>,
     preferences: ViewPreferences,
+    filter: Option<DirectoryFilter>,
     next_request: Option<PageRequest>,
 }
 
@@ -40,18 +43,45 @@ pub(crate) struct DirectoryIndexResult {
     indexed_count: usize,
     visible_count: usize,
     next_request: Option<PageRequest>,
+    order_rebuilt: bool,
 }
 
 pub(crate) struct DirectoryIndexWatchWork {
     index: SharedIndex,
     event: WatchEvent,
     preferences: ViewPreferences,
+    filter: Option<DirectoryFilter>,
 }
 
 pub(crate) struct DirectoryIndexWatchResult {
     indexed_count: usize,
     visible_count: usize,
     removed: Option<musheen_core::ItemId>,
+}
+
+pub(crate) struct DirectoryIndexOrderWork {
+    index: SharedIndex,
+    preferences: ViewPreferences,
+    filter: Option<DirectoryFilter>,
+    token: Arc<AtomicU64>,
+    revision: u64,
+}
+
+impl DirectoryIndexOrderWork {
+    pub(crate) fn run(self) -> std::io::Result<Option<(usize, usize)>> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
+        if self.token.load(Ordering::Acquire) != self.revision {
+            return Ok(None);
+        }
+        index.rebuild_order(&self.preferences, self.filter.as_ref())?;
+        Ok(Some((
+            index.active_count().unwrap_or(0),
+            index.visible_count().unwrap_or(0),
+        )))
+    }
 }
 
 impl DirectoryIndexWatchWork {
@@ -79,7 +109,7 @@ impl DirectoryIndexWatchWork {
                 ));
             }
         };
-        index.rebuild_order(&self.preferences, None)?;
+        index.rebuild_order(&self.preferences, self.filter.as_ref())?;
         Ok(DirectoryIndexWatchResult {
             indexed_count: index.active_count().unwrap_or(0),
             visible_count: index.visible_count().unwrap_or(0),
@@ -89,12 +119,17 @@ impl DirectoryIndexWatchWork {
 }
 
 impl DirectoryIndexWork {
+    pub(crate) fn with_filter(mut self, filter: Option<DirectoryFilter>) -> Self {
+        self.filter = filter;
+        self
+    }
+
     pub(crate) fn run(self) -> std::io::Result<DirectoryIndexResult> {
         let index = match self.index {
             Some(index) => index,
             None => Arc::new(Mutex::new(DiskDirectoryIndex::new()?)),
         };
-        let (indexed_count, visible_count) = {
+        let (indexed_count, visible_count, order_rebuilt) = {
             let mut index_guard = index.lock().map_err(|_| {
                 std::io::Error::other("directory index worker stopped unexpectedly")
             })?;
@@ -102,19 +137,26 @@ impl DirectoryIndexWork {
                 let arrival = index_guard.record_count();
                 index_guard.append(&item, arrival)?;
             }
-            if self.next_request.is_none() || index_guard.visible_count().is_none() {
-                index_guard.rebuild_order(&self.preferences, None)?;
+            let order_rebuilt =
+                self.next_request.is_none() || index_guard.visible_count().is_none();
+            if order_rebuilt {
+                index_guard.rebuild_order(&self.preferences, self.filter.as_ref())?;
             }
             let count = usize::try_from(index_guard.record_count()).map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "directory count overflow")
             })?;
-            (count, index_guard.visible_count().unwrap_or(0))
+            (
+                count,
+                index_guard.visible_count().unwrap_or(0),
+                order_rebuilt,
+            )
         };
         Ok(DirectoryIndexResult {
             index,
             indexed_count,
             visible_count,
             next_request: self.next_request,
+            order_rebuilt,
         })
     }
 }
@@ -162,6 +204,8 @@ impl DirectoryLoad {
 pub struct DirectoryModel {
     limits: ResourceLimits,
     generation: u64,
+    order_epoch: u64,
+    order_token: Arc<AtomicU64>,
     active: Option<DirectoryLoad>,
     state: DirectoryState,
     view: DirectoryViewModel,
@@ -186,6 +230,8 @@ impl DirectoryModel {
         Self {
             limits: limits.snapshot(),
             generation: 0,
+            order_epoch: 0,
+            order_token: Arc::new(AtomicU64::new(0)),
             active: None,
             state: DirectoryState::Empty,
             view: DirectoryViewModel::new(retention_limit.min(MAX_RESIDENT_ITEMS)),
@@ -202,6 +248,8 @@ impl DirectoryModel {
             active.cancellation.cancel();
         }
         self.generation = self.generation.wrapping_add(1);
+        self.order_epoch = self.order_epoch.wrapping_add(1);
+        self.order_token.fetch_add(1, Ordering::AcqRel);
         self.view.reset_items();
         self.index = None;
         self.indexed_count = 0;
@@ -234,6 +282,15 @@ impl DirectoryModel {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[must_use]
+    pub(crate) const fn order_epoch(&self) -> u64 {
+        self.order_epoch
+    }
+
+    pub(crate) fn active_load(&self) -> Option<DirectoryLoad> {
+        self.active.clone()
     }
 
     #[must_use]
@@ -296,6 +353,7 @@ impl DirectoryModel {
             },
             page_items: page.into_items(),
             preferences: self.view.preferences().clone(),
+            filter: None,
             next_request,
         }
     }
@@ -319,6 +377,9 @@ impl DirectoryModel {
             }
         };
         self.index = Some(result.index);
+        if result.order_rebuilt {
+            self.order_epoch = self.order_epoch.wrapping_add(1);
+        }
         self.indexed_count = result.indexed_count;
         self.indexed_visible_count = result.visible_count;
         self.next_request = result.next_request;
@@ -355,6 +416,57 @@ impl DirectoryModel {
         self.index.as_ref().map(|index| DirectoryIndexReader {
             index: Arc::clone(index),
         })
+    }
+
+    pub(crate) fn prepare_index_order(
+        &mut self,
+        load: &DirectoryLoad,
+        filter: Option<DirectoryFilter>,
+    ) -> Option<(u64, DirectoryIndexOrderWork)> {
+        if !self.is_current(load) {
+            return None;
+        }
+        let index = Arc::clone(self.index.as_ref()?);
+        let revision = self.order_token.fetch_add(1, Ordering::AcqRel) + 1;
+        Some((
+            revision,
+            DirectoryIndexOrderWork {
+                index,
+                preferences: self.view.preferences().clone(),
+                filter,
+                token: Arc::clone(&self.order_token),
+                revision,
+            },
+        ))
+    }
+
+    pub(crate) fn finish_index_order(
+        &mut self,
+        load: &DirectoryLoad,
+        revision: u64,
+        result: std::io::Result<Option<(usize, usize)>>,
+    ) -> bool {
+        if !self.is_current(load) || self.order_token.load(Ordering::Acquire) != revision {
+            return false;
+        }
+        match result {
+            Ok(Some((indexed_count, visible_count))) => {
+                self.indexed_count = indexed_count;
+                self.indexed_visible_count = visible_count;
+                self.order_epoch = self.order_epoch.wrapping_add(1);
+                self.state = if self.indexed_count == 0 {
+                    DirectoryState::Empty
+                } else {
+                    DirectoryState::Ready
+                };
+            }
+            Ok(None) => return false,
+            Err(error) => {
+                self.state =
+                    DirectoryState::Error(format!("Directory index failed: {error}").into());
+            }
+        }
+        true
     }
 
     pub fn indexed_range(
@@ -396,6 +508,7 @@ impl DirectoryModel {
         &self,
         load: &DirectoryLoad,
         event: WatchEvent,
+        filter: Option<DirectoryFilter>,
     ) -> Option<DirectoryIndexWatchWork> {
         if !self.is_current(load) || matches!(event, WatchEvent::Invalidated { .. }) {
             return None;
@@ -404,6 +517,7 @@ impl DirectoryModel {
             index: Arc::clone(self.index.as_ref()?),
             event,
             preferences: self.view.preferences().clone(),
+            filter,
         })
     }
 
@@ -417,6 +531,7 @@ impl DirectoryModel {
         }
         match result {
             Ok(result) => {
+                self.order_epoch = self.order_epoch.wrapping_add(1);
                 self.indexed_count = result.indexed_count;
                 self.indexed_visible_count = result.visible_count;
                 if let Some(id) = result.removed {
@@ -493,6 +608,8 @@ impl DirectoryModel {
 #[cfg(test)]
 mod indexed_watch_tests {
     use super::*;
+    use crate::search::DirectoryFilter;
+    use crate::views::{SortDirection, SortKey};
     use musheen_core::{DisplayPath, ItemId, ItemKind, ProviderId, TotalHint};
 
     fn item(number: u64, name: &str) -> StoreItem {
@@ -518,25 +635,75 @@ mod indexed_watch_tests {
             assert_eq!(model.apply_page(&load, page), ApplyPageResult::Applied);
         }
         let id = item(0, "item-0").id().clone();
+        let first_order = model.order_epoch();
         model
             .view_mut()
             .select_item(id.clone(), crate::views::SelectionMode::Replace);
         let renamed = item(0, "renamed");
         let work = model
-            .prepare_index_watch_event(&load, WatchEvent::Changed(renamed.clone()))
+            .prepare_index_watch_event(&load, WatchEvent::Changed(renamed.clone()), None)
             .unwrap();
         assert!(model.finish_index_watch_event(&load, work.run()));
+        assert!(model.order_epoch() > first_order);
         assert_eq!(model.indexed_count(), 4_608);
         assert_eq!(model.indexed_item(&id).unwrap(), Some(renamed));
         assert_eq!(model.view().selected_ids(), std::slice::from_ref(&id));
 
         let work = model
-            .prepare_index_watch_event(&load, WatchEvent::Removed(id.clone()))
+            .prepare_index_watch_event(&load, WatchEvent::Removed(id.clone()), None)
             .unwrap();
         assert!(model.finish_index_watch_event(&load, work.run()));
         assert_eq!(model.indexed_count(), 4_607);
         assert!(model.indexed_item(&id).unwrap().is_none());
         assert!(model.view().selected_ids().is_empty());
+    }
+
+    #[test]
+    fn indexed_preferences_and_filter_rebuild_global_order() {
+        let mut model = DirectoryModel::new(ResourceLimits::default());
+        let load = model.begin_navigation(StorePath::from_unix_path("/many"));
+        for batch in 0..9 {
+            let request = PageRequest::first(&ResourceLimits::default());
+            let items = (batch * 512..(batch + 1) * 512)
+                .map(|number| {
+                    let name = if number == 0 {
+                        ".hidden".to_owned()
+                    } else {
+                        format!("item-{number}")
+                    };
+                    item(number, &name)
+                })
+                .collect();
+            let page = Page::try_new(&request, items, None, TotalHint::Unknown).unwrap();
+            assert_eq!(model.apply_page(&load, page), ApplyPageResult::Applied);
+        }
+        assert_eq!(model.visible_count(), 4_607);
+        let old_epoch = model.order_epoch();
+        model.view_mut().preferences_mut().show_hidden = true;
+        model.view_mut().preferences_mut().sort.key = SortKey::Name;
+        model.view_mut().preferences_mut().sort.direction = SortDirection::Descending;
+        let (revision, work) = model.prepare_index_order(&load, None).unwrap();
+        assert!(model.finish_index_order(&load, revision, work.run()));
+        assert!(model.order_epoch() > old_epoch);
+        assert_eq!(model.visible_count(), 4_608);
+        assert_eq!(
+            model.indexed_range(0..1).unwrap().unwrap()[0]
+                .display_name()
+                .as_str(),
+            "item-4607"
+        );
+
+        let (revision, work) = model
+            .prepare_index_order(&load, Some(DirectoryFilter::new("item-45")))
+            .unwrap();
+        assert!(model.finish_index_order(&load, revision, work.run()));
+        assert_eq!(model.visible_count(), 111);
+        assert_eq!(
+            model.indexed_range(0..1).unwrap().unwrap()[0]
+                .display_name()
+                .as_str(),
+            "item-4599"
+        );
     }
 }
 
