@@ -5089,7 +5089,106 @@ impl MusheenApp {
         let Some(command) = self.shell.commands().get(command_id) else {
             return;
         };
-        let request = self.active_command_request(command.action());
+        let action = command.action();
+        if self.dispatch_indexed_selection_command(command_id, action, cx) {
+            return;
+        }
+        let request = self.active_command_request(action);
+        self.dispatch_command_request(command_id, request, cx);
+    }
+
+    fn dispatch_indexed_selection_command(
+        &mut self,
+        command_id: &str,
+        action: CommandAction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !is_contextual_command(action) || action == CommandAction::PasteInto {
+            return false;
+        }
+        let tab = self.navigation.focused_tab();
+        let tab_id = tab.id();
+        let location = tab.location().clone();
+        let Some(directory) = self.directories.get(&tab_id) else {
+            return false;
+        };
+        if !directory.is_indexed() || directory.view().selected_ids().is_empty() {
+            return false;
+        }
+        let Some(reader) = directory.index_reader() else {
+            return false;
+        };
+        let selected_ids = directory.view().selected_ids().to_vec();
+        let generation = directory.generation();
+        let order_epoch = directory.order_epoch();
+        let command_id = command_id.to_owned();
+        let lookup_ids = selected_ids.clone();
+        let task = cx.background_spawn(async move { reader.resolve_selection(&lookup_ids) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let still_selected = state.navigation.focused_tab().id() == tab_id
+                    && state.directories.get(&tab_id).is_some_and(|directory| {
+                        directory.generation() == generation
+                            && directory.order_epoch() == order_epoch
+                            && directory.view().selected_ids() == selected_ids
+                    });
+                if !still_selected {
+                    return;
+                }
+                match result {
+                    Ok(Some((paths, first_item))) => {
+                        let targets = selected_ids
+                            .into_iter()
+                            .zip(paths)
+                            .map(|(id, path)| CommandTargetRef::new(id, path))
+                            .collect::<Result<Vec<_>, _>>();
+                        match targets {
+                            Ok(targets) => {
+                                let request = state.context_menu_request_with_item(
+                                    tab_id,
+                                    MenuTarget::Item,
+                                    location,
+                                    targets,
+                                    first_item.as_ref(),
+                                );
+                                let request = if action == CommandAction::SendTo {
+                                    request.with_send_to(&state.send_to_destinations(tab_id))
+                                } else {
+                                    request
+                                };
+                                state.dispatch_command_request(&command_id, request, cx);
+                            }
+                            Err(error) => state.operation_error = Some(error.to_string().into()),
+                        }
+                    }
+                    Ok(None) => {
+                        state.operation_error = Some("A selected file no longer exists".into());
+                    }
+                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
+    }
+
+    fn dispatch_command_request(
+        &mut self,
+        command_id: &str,
+        request: crate::ContextMenuRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
+        let Some(command) = self.shell.commands().get(command_id) else {
+            return;
+        };
         let state = command
             .state(request.context())
             .map_disabled_reason(|reason| self.catalog.localize_reason(reason));
@@ -6226,6 +6325,17 @@ impl MusheenApp {
         location: StorePath,
         selection: Vec<CommandTargetRef>,
     ) -> crate::ContextMenuRequest {
+        self.context_menu_request_with_item(tab_id, target, location, selection, None)
+    }
+
+    fn context_menu_request_with_item(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        selection: Vec<CommandTargetRef>,
+        resolved_item: Option<&StoreItem>,
+    ) -> crate::ContextMenuRequest {
         let target = if target == MenuTarget::Background && is_trash_location(&location) {
             MenuTarget::TrashBackground
         } else {
@@ -6241,7 +6351,11 @@ impl MusheenApp {
         } else {
             selection
         };
-        let context = self.context_for_menu(tab_id, target, &location, &selection);
+        let context = if let Some(item) = resolved_item {
+            self.context_for_menu_with_item(tab_id, target, &location, &selection, Some(item))
+        } else {
+            self.context_for_menu(tab_id, target, &location, &selection)
+        };
         let trash_contents = if target == MenuTarget::TrashBackground {
             selection.clone()
         } else {
@@ -6550,6 +6664,17 @@ impl MusheenApp {
         location: &StorePath,
         selection: &[CommandTargetRef],
     ) -> CommandContext {
+        self.context_for_menu_with_item(tab_id, target, location, selection, None)
+    }
+
+    fn context_for_menu_with_item(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: &StorePath,
+        selection: &[CommandTargetRef],
+        resolved_item: Option<&StoreItem>,
+    ) -> CommandContext {
         let column_parent = self.column_trails.get(&tab_id).and_then(|trail| {
             trail
                 .parents()
@@ -6560,15 +6685,19 @@ impl MusheenApp {
             || {
                 self.directories
                     .get(&tab_id)
-                    .map_or(0, |directory| directory.view().items().len())
+                    .map_or(0, |directory| directory.visible_count())
             },
             |pane| pane.items().len(),
         );
         let selected_item = selection.first().and_then(|target| {
-            self.directories
-                .get(&tab_id)
-                .and_then(|directory| directory.view().item(target.id()))
-                .filter(|item| item.path() == target.path())
+            resolved_item
+                .filter(|item| item.id() == target.id() && item.path() == target.path())
+                .or_else(|| {
+                    self.directories
+                        .get(&tab_id)
+                        .and_then(|directory| directory.view().item(target.id()))
+                        .filter(|item| item.path() == target.path())
+                })
                 .or_else(|| {
                     column_parent.and_then(|pane| {
                         pane.items()
@@ -18845,6 +18974,26 @@ mod tests {
             )
         })
         .await;
+        let probe: CommandDispatchProbe = Arc::new(Mutex::new(Vec::new()));
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.command_dispatch_probe = Some(Arc::clone(&probe));
+                state.dispatch_command("item.properties", cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, _| {
+            !probe.lock().unwrap().is_empty()
+        })
+        .await;
+        assert!(
+            probe
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, enabled)| id.as_ref() == "item.properties" && *enabled),
+            "indexed command state: {:?}",
+            probe.lock().unwrap().as_slice()
+        );
         cx.update(|cx| {
             app.update(cx, |state, cx| {
                 let item = state

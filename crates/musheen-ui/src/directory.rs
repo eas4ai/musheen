@@ -42,18 +42,30 @@ impl DirectoryIndexReader {
         &self,
         ids: &[musheen_core::ItemId],
     ) -> std::io::Result<Option<Vec<StorePath>>> {
+        self.resolve_selection(ids)
+            .map(|selection| selection.map(|(paths, _)| paths))
+    }
+
+    pub(crate) fn resolve_selection(
+        &self,
+        ids: &[musheen_core::ItemId],
+    ) -> std::io::Result<Option<(Vec<StorePath>, Option<StoreItem>)>> {
         let mut index = self
             .index
             .lock()
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
         let mut paths = Vec::with_capacity(ids.len());
+        let mut first_item = None;
         for id in ids {
             let Some(item) = index.lookup_id(id)? else {
                 return Ok(None);
             };
             paths.push(item.path().clone());
+            if first_item.is_none() {
+                first_item = Some(item);
+            }
         }
-        Ok(Some(paths))
+        Ok(Some((paths, first_item)))
     }
 }
 
@@ -689,10 +701,26 @@ mod indexed_watch_tests {
         let paths = model
             .index_reader()
             .unwrap()
-            .resolve_paths(&[offscreen])
+            .resolve_paths(&[offscreen.clone()])
             .unwrap()
             .unwrap();
         assert_eq!(paths, [StorePath::from_unix_path("/many/item-4096")]);
+        let (paths, first_item) = model
+            .index_reader()
+            .unwrap()
+            .resolve_selection(&[offscreen.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(paths, [StorePath::from_unix_path("/many/item-4096")]);
+        assert_eq!(first_item.unwrap().id(), &offscreen);
+        assert!(
+            model
+                .index_reader()
+                .unwrap()
+                .resolve_selection(&[id])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
