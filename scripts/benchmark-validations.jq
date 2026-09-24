@@ -107,6 +107,14 @@ def remote:
     and .waiting_requests_max == 1 and .awakened == true
     and .queued_work_max == 1);
 
+def startup:
+  length == 1
+  and cases(["first_window_startup"])
+  and all(.[]; measurements and .window_visible == true
+    and .display_backend == "x11"
+    and .queued_work_max == null and .retained_models_max == null
+    and .internal_counters_sampled == false);
+
 if $benchmark == "directory" then directory
 elif $benchmark == "search" then search
 elif $benchmark == "operations" then operations
@@ -114,4 +122,5 @@ elif $benchmark == "thumbnail" then thumbnail
 elif $benchmark == "archive" then archive
 elif $benchmark == "terminal" then terminal
 elif $benchmark == "remote" then remote
+elif $benchmark == "startup" then startup
 else false end

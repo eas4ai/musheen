@@ -150,6 +150,10 @@ harness = false
 name = "remote"
 harness = false
 
+[[bench]]
+name = "startup"
+harness = false
+
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 gpui-pre = { path = "vendor/gpui-pre" }

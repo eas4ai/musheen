@@ -167,7 +167,7 @@ fn release_container_tests_both_toolchains_features_and_profiles() {
     assert!(matrix.contains("--release"));
     assert!(matrix.contains("Cargo.lock changed"));
     assert!(dockerfile.contains("CARGO_INCREMENTAL=0"));
-    assert!(dockerfile.contains("CARGO_BUILD_JOBS=8"));
+    assert!(dockerfile.contains("CARGO_BUILD_JOBS=4"));
     assert!(dockerfile.contains("CARGO_PROFILE_TEST_DEBUG=0"));
     assert!(dockerfile.contains("verify-msrv.sh"));
     assert!(dockerfile.contains("verify-dependencies.sh"));
@@ -180,7 +180,7 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\n  if [ \"$argument\" = thumbnail ]; then name=thumbnail; executable=$MUSHEEN_FAKE_THUMBNAIL_BENCH; fi\n  if [ \"$argument\" = archive ]; then name=archive; executable=$MUSHEEN_FAKE_ARCHIVE_BENCH; fi\n  if [ \"$argument\" = terminal ]; then name=terminal; executable=$MUSHEEN_FAKE_TERMINAL_BENCH; fi\n  if [ \"$argument\" = remote ]; then name=remote; executable=$MUSHEEN_FAKE_REMOTE_BENCH; fi\n  if [ \"$argument\" = musheen-thumbnail-worker ]; then name=musheen-thumbnail-worker; executable=$MUSHEEN_FAKE_THUMBNAIL_WORKER; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\n  if [ \"$argument\" = thumbnail ]; then name=thumbnail; executable=$MUSHEEN_FAKE_THUMBNAIL_BENCH; fi\n  if [ \"$argument\" = archive ]; then name=archive; executable=$MUSHEEN_FAKE_ARCHIVE_BENCH; fi\n  if [ \"$argument\" = terminal ]; then name=terminal; executable=$MUSHEEN_FAKE_TERMINAL_BENCH; fi\n  if [ \"$argument\" = remote ]; then name=remote; executable=$MUSHEEN_FAKE_REMOTE_BENCH; fi\n  if [ \"$argument\" = startup ]; then name=startup; executable=$MUSHEEN_FAKE_STARTUP_BENCH; fi\n  if [ \"$argument\" = musheen ]; then name=musheen; executable=$MUSHEEN_FAKE_APP; fi\n  if [ \"$argument\" = musheen-thumbnail-worker ]; then name=musheen-thumbnail-worker; executable=$MUSHEEN_FAKE_THUMBNAIL_WORKER; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -236,6 +236,24 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     )
     .unwrap();
     fs::set_permissions(&fake_remote_bench, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_app = fake_bin.join("musheen");
+    fs::write(&fake_app, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_app, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_startup_bench = fake_bin.join("startup-bench");
+    fs::write(
+        &fake_startup_bench,
+        "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_STARTUP_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_STARTUP_BENCH_ARGS\"\nprintf '%s' \"$MUSHEEN_STARTUP_APP\" > \"$MUSHEEN_STARTUP_APP_RECORD\"\nif [ \"${MUSHEEN_FAKE_STARTUP_MISSING:-0}\" = 0 ]; then printf '%s\\n' '{\"case\":\"first_window_startup\",\"window_visible\":true,\"display_backend\":\"x11\",\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"temporary_bytes\":0,\"queued_work_max\":null,\"retained_models_max\":null,\"internal_counters_sampled\":false}'; fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_startup_bench, fs::Permissions::from_mode(0o755)).unwrap();
+    for (name, script) in [
+        ("dbus-run-session", "#!/bin/sh\nshift\nexec \"$@\"\n"),
+        ("xvfb-run", "#!/bin/sh\nshift\nexec \"$@\"\n"),
+    ] {
+        let wrapper = fake_bin.join(name);
+        fs::write(&wrapper, script).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 fn run_benchmark_fixture(
@@ -267,6 +285,8 @@ fn run_benchmark_fixture(
             fake_bin.join("terminal-bench"),
         )
         .env("MUSHEEN_FAKE_REMOTE_BENCH", fake_bin.join("remote-bench"))
+        .env("MUSHEEN_FAKE_STARTUP_BENCH", fake_bin.join("startup-bench"))
+        .env("MUSHEEN_FAKE_APP", fake_bin.join("musheen"))
         .env(
             "MUSHEEN_FAKE_THUMBNAIL_WORKER",
             fake_bin.join("musheen-thumbnail-worker"),
@@ -311,6 +331,14 @@ fn run_benchmark_fixture(
                 "0"
             },
         )
+        .env(
+            "MUSHEEN_FAKE_STARTUP_MISSING",
+            if missing_case == Some("startup") {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("MUSHEEN_CARGO_ARGS", temporary.join("cargo-args"))
         .env("MUSHEEN_BENCH_ARGS", temporary.join("bench-args"))
         .env("MUSHEEN_SEARCH_BENCH_ARGS", temporary.join("search-args"))
@@ -328,6 +356,7 @@ fn run_benchmark_fixture(
             temporary.join("terminal-args"),
         )
         .env("MUSHEEN_REMOTE_BENCH_ARGS", temporary.join("remote-args"))
+        .env("MUSHEEN_STARTUP_BENCH_ARGS", temporary.join("startup-args"))
         .env(
             "MUSHEEN_SEARCH_BENCH_TMP_RECORD",
             temporary.join("search-temp"),
@@ -354,6 +383,11 @@ fn run_benchmark_fixture(
             temporary.join("remote-temp"),
         )
         .env(
+            "MUSHEEN_STARTUP_BENCH_TMP_RECORD",
+            temporary.join("startup-temp"),
+        )
+        .env("MUSHEEN_STARTUP_APP_RECORD", temporary.join("startup-app"))
+        .env(
             "MUSHEEN_THUMBNAIL_WORKER_RECORD",
             temporary.join("thumbnail-worker-record"),
         )
@@ -370,6 +404,8 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     assert!(cargo_args.contains("--no-run --bench archive"));
     assert!(cargo_args.contains("--no-run --bench terminal"));
     assert!(cargo_args.contains("--no-run --bench remote"));
+    assert!(cargo_args.contains("--no-run --bench startup"));
+    assert!(cargo_args.contains("--bin musheen"));
     assert!(cargo_args.contains("--bin musheen-thumbnail-worker"));
     assert_eq!(
         fs::read_to_string(temporary.join("bench-args")).unwrap(),
@@ -400,6 +436,14 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
         "--bench"
     );
     assert_eq!(
+        fs::read_to_string(temporary.join("startup-args")).unwrap(),
+        "--bench"
+    );
+    assert_eq!(
+        fs::read_to_string(temporary.join("startup-app")).unwrap(),
+        temporary.join("bin/musheen").to_string_lossy()
+    );
+    assert_eq!(
         fs::read_to_string(temporary.join("thumbnail-worker-record")).unwrap(),
         temporary
             .join("bin/musheen-thumbnail-worker")
@@ -412,6 +456,7 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     let archive_temp = fs::read_to_string(temporary.join("archive-temp")).unwrap();
     let terminal_temp = fs::read_to_string(temporary.join("terminal-temp")).unwrap();
     let remote_temp = fs::read_to_string(temporary.join("remote-temp")).unwrap();
+    let startup_temp = fs::read_to_string(temporary.join("startup-temp")).unwrap();
     assert!(benchmark_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(benchmark_temp, temporary.to_str().unwrap());
     assert!(search_temp.starts_with(temporary.to_str().unwrap()));
@@ -426,6 +471,8 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     assert_ne!(terminal_temp, archive_temp);
     assert!(remote_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(remote_temp, terminal_temp);
+    assert!(startup_temp.starts_with(temporary.to_str().unwrap()));
+    assert_ne!(startup_temp, remote_temp);
 }
 
 #[test]
@@ -462,5 +509,10 @@ fn benchmark_runner_isolates_temporary_files_and_rejects_missing_results() {
     assert!(
         !missing_remote.status.success(),
         "missing remote benchmark case must fail"
+    );
+    let missing_startup = run_benchmark_fixture(root, temporary.path(), &fake_bin, Some("startup"));
+    assert!(
+        !missing_startup.status.success(),
+        "missing startup benchmark case must fail"
     );
 }
