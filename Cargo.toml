@@ -142,6 +142,10 @@ harness = false
 name = "archive"
 harness = false
 
+[[bench]]
+name = "terminal"
+harness = false
+
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 gpui-pre = { path = "vendor/gpui-pre" }

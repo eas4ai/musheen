@@ -81,9 +81,23 @@ def archive:
   and any(.[]; .case == "archive_nesting_rejected"
     and .resource == "archive nesting");
 
+def terminal:
+  length == 2
+  and cases(["terminal_flood_backpressure", "terminal_million_line_scrollback"])
+  and all(.[]; measurements and nonnegative(.queued_work_max)
+    and .queued_work_max <= 64 and nonnegative(.retained_models_max)
+    and .retained_models_max <= 10000 and .temporary_bytes == 0)
+  and any(.[]; .case == "terminal_flood_backpressure"
+    and .bytes == 4194304 and .received_bytes == .bytes
+    and .queue_capacity == 64 and .queued_work_max == 64)
+  and any(.[]; .case == "terminal_million_line_scrollback"
+    and .lines == 1000000 and .scrollback_lines == 10000
+    and .scrollback_bytes <= 67108864 and .retained_models_max == 10000);
+
 if $benchmark == "directory" then directory
 elif $benchmark == "search" then search
 elif $benchmark == "operations" then operations
 elif $benchmark == "thumbnail" then thumbnail
 elif $benchmark == "archive" then archive
+elif $benchmark == "terminal" then terminal
 else false end

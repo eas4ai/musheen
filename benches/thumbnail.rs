@@ -1,5 +1,8 @@
+#[path = "support/record.rs"]
+mod benchmark_record;
 mod support;
 
+use benchmark_record::record;
 use musheen_core::CancellationToken;
 use musheen_desktop::{
     ThumbnailCache, ThumbnailError, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
@@ -76,29 +79,6 @@ fn run_worker(worker: &Path, source: &Path, cache_root: &Path) -> BenchResult<u6
     }
 }
 
-fn record(case: &str, before: &Sample, after: &Sample, details: serde_json::Value) {
-    let mut result = json!({
-        "case": case,
-        "wall_ns": after.captured.duration_since(before.captured).as_nanos(),
-        "cpu_ns": after.cpu_nanoseconds.saturating_sub(before.cpu_nanoseconds),
-        "peak_rss_kib": after.peak_rss_kib,
-        "open_fds": after.open_fds,
-        "queued_work_max": 0,
-        "retained_models_max": 0,
-        "temporary_bytes": after.temporary_bytes,
-    });
-    result
-        .as_object_mut()
-        .expect("benchmark record is an object")
-        .extend(
-            details
-                .as_object()
-                .expect("benchmark details are an object")
-                .clone(),
-        );
-    println!("{result}");
-}
-
 fn run() -> BenchResult<()> {
     let worker = PathBuf::from(std::env::var_os("MUSHEEN_THUMBNAIL_WORKER").ok_or_else(|| {
         io::Error::new(
@@ -129,6 +109,8 @@ fn run() -> BenchResult<()> {
             "decoded_pixels": VALID_EDGE * VALID_EDGE,
             "cache_hit": true,
             "worker_peak_rss_kib_sampled_max": worker_peak_rss,
+            "queued_work_max": 0,
+            "retained_models_max": 0,
         }),
     );
 
@@ -157,6 +139,8 @@ fn run() -> BenchResult<()> {
             "pixels": u64::from(OVERSIZED_WIDTH) * u64::from(OVERSIZED_HEIGHT),
             "failure_record": true,
             "pool_workers_max": pool_workers_max,
+            "queued_work_max": 0,
+            "retained_models_max": 0,
         }),
     );
     Ok(())

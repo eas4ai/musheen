@@ -58,3 +58,4 @@ run_benchmark search
 run_benchmark operations
 run_benchmark thumbnail
 run_benchmark archive
+run_benchmark terminal
