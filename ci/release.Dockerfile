@@ -29,28 +29,7 @@ RUN scripts/verify-msrv.sh /workspace \
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/target \
-    bash -euo pipefail -c '
-        before=$(sha256sum Cargo.lock | cut -d " " -f 1)
-        for toolchain in 1.95.0 stable; do
-            for profile in debug release; do
-                for features in minimal all; do
-                    feature_args=(--no-default-features)
-                    if [[ "$features" == all ]]; then
-                        feature_args=(--all-features)
-                    fi
-                    profile_args=()
-                    if [[ "$profile" == release ]]; then
-                        profile_args=(--release)
-                    fi
-                    echo "Release matrix: Rust $toolchain, $features features, $profile"
-                    cargo +"$toolchain" test --workspace --locked --jobs 8 \
-                        "${feature_args[@]}" "${profile_args[@]}"
-                done
-            done
-        done
-        after=$(sha256sum Cargo.lock | cut -d " " -f 1)
-        [[ "$before" == "$after" ]] || { echo "Cargo.lock changed during release matrix" >&2; exit 1; }
-    '
+    scripts/verify-release-matrix.sh /workspace
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

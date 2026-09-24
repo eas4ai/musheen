@@ -156,11 +156,13 @@ fn release_workflow_has_no_development_triggers() {
 fn release_container_tests_both_toolchains_features_and_profiles() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dockerfile = fs::read_to_string(root.join("ci/release.Dockerfile")).unwrap();
-    assert!(dockerfile.contains("1.95.0"));
-    assert!(dockerfile.contains("stable"));
-    assert!(dockerfile.contains("--no-default-features"));
-    assert!(dockerfile.contains("--all-features"));
-    assert!(dockerfile.contains("--release"));
+    let matrix = fs::read_to_string(root.join("scripts/verify-release-matrix.sh")).unwrap();
+    assert!(dockerfile.contains("verify-release-matrix.sh"));
+    assert!(matrix.contains("1.95.0 stable"));
+    assert!(matrix.contains("--no-default-features"));
+    assert!(matrix.contains("--all-features"));
+    assert!(matrix.contains("--release"));
+    assert!(matrix.contains("Cargo.lock changed"));
     assert!(dockerfile.contains("CARGO_INCREMENTAL=0"));
     assert!(dockerfile.contains("CARGO_BUILD_JOBS=8"));
     assert!(dockerfile.contains("verify-msrv.sh"));
