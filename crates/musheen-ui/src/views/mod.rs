@@ -609,30 +609,20 @@ impl DirectoryViewModel {
     }
 
     fn trim_unpinned(&mut self) {
-        let pinned = self.pinned_ids();
-        let mut unpinned = self
-            .items
-            .iter()
-            .filter(|item| !pinned.contains(item.id()))
-            .count();
-        if unpinned <= self.retention_limit {
+        let mut excess = self.items.len().saturating_sub(self.retention_limit);
+        if excess == 0 {
             return;
         }
+        let pinned = self.pinned_ids();
         self.invalidate_visible_order();
         self.items.retain(|item| {
-            if pinned.contains(item.id()) || unpinned <= self.retention_limit {
-                true
-            } else {
-                unpinned -= 1;
-                false
-            }
+            let evict = excess > 0 && !pinned.contains(item.id());
+            excess -= usize::from(evict);
+            !evict
         });
-        let present = self
-            .items
-            .iter()
-            .map(|item| item.id().clone())
-            .collect::<HashSet<_>>();
-        self.selection.retain(|id| present.contains(id));
+        if excess > 0 {
+            self.items.drain(..excess);
+        }
     }
 
     fn pinned_ids(&self) -> HashSet<ItemId> {

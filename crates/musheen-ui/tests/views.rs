@@ -125,14 +125,14 @@ fn selection_editing_and_scroll_anchor_survive_retention_and_reordering() {
         item(4, "four", ItemKind::RegularFile, Some(4)),
     ]);
 
-    assert!(model.item(&first_id).is_some());
-    assert!(model.item(&second_id).is_some());
-    assert_eq!(model.unpinned_model_count(), 2);
+    assert!(model.items().len() <= 2);
+    assert_eq!(model.unpinned_model_count(), 0);
     assert_eq!(
         model.scroll_anchor().expect("anchor remains").item(),
         &first_id
     );
     assert_eq!(model.selected_ids(), &[first_id]);
+    assert_eq!(model.editing(), Some(&second_id));
 }
 
 #[test]

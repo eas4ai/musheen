@@ -49,13 +49,6 @@ impl SelectionModel {
         }
     }
 
-    pub fn retain(&mut self, mut exists: impl FnMut(&ItemId) -> bool) {
-        self.selected.retain(&mut exists);
-        if self.anchor.as_ref().is_some_and(|id| !exists(id)) {
-            self.anchor = self.selected.last().cloned();
-        }
-    }
-
     pub fn ids(&self) -> &[ItemId] {
         &self.selected
     }
