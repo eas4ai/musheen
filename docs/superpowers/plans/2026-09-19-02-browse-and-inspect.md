@@ -42,8 +42,9 @@ modify `sidebar.rs` and `directory.rs`; create `crates/musheen-ui/tests/views.rs
   rubber-band selection, rename retention, and scroll anchoring across pages.
 - [ ] Run `cargo test -p musheen-ui --test views`; expect failure.
 - [ ] Implement a shared virtualized item model so presentation changes do not
-  reload the store. Keep selected and edited items pinned outside the normal
-  4,096-model retention cap.
+  reload the store. Preserve selected and edited item identities without
+  pinning their models outside the absolute 4,096-model retention cap. For
+  large folders, use the disk-backed index in the later dedicated plan.
 - [ ] Render sidebar sections for Home, pins, devices, cloud/remote locations,
   tags, and network; hide empty sections instead of showing false providers.
   Keep expansion state per tab while shared pin changes update every tab.

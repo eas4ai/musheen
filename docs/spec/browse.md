@@ -160,9 +160,15 @@ Mechanism: multi-tab interaction tests with hidden selections and active search.
 Status: Draft
 Directory views virtualize rendered items and request provider pages ahead
 of the viewport, while preserving selection and focus by stable item identity.
+After 4,096 items, each tab uses a private temporary disk index for global
+sorting and back-scrolling. At most 4,096 item models remain in memory,
+including selected, focused, and edited items. The status bar marks counts
+partial until the provider's final page is indexed; then it shows the full
+count, including folders with at least one million entries. Closing or
+navigating away from a tab removes its temporary index.
 Falsifier: opening a million-item fixture creates one rendered component per
-item or loses selection as pages arrive.
-Mechanism: viewport, memory, scrolling, and selection tests with a paged provider.
+item, loses selection as pages arrive, or cannot scroll back to an evicted row.
+Mechanism: viewport, memory, back-scroll, and selection tests with a paged provider.
 
 [BROWSE-020]
 Status: Draft
