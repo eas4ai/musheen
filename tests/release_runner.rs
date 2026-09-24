@@ -166,6 +166,7 @@ fn release_container_tests_both_toolchains_features_and_profiles() {
     assert!(matrix.contains("Cargo.lock changed"));
     assert!(dockerfile.contains("CARGO_INCREMENTAL=0"));
     assert!(dockerfile.contains("CARGO_BUILD_JOBS=8"));
+    assert!(dockerfile.contains("CARGO_PROFILE_TEST_DEBUG=0"));
     assert!(dockerfile.contains("verify-msrv.sh"));
     assert!(dockerfile.contains("verify-dependencies.sh"));
     assert!(dockerfile.contains("generate-sbom.py"));
