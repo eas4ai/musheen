@@ -24,9 +24,13 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 app_binary=${MUSHEEN_APP_BINARY:-"$repository_root/target/release/musheen"}
 broker_binary=${MUSHEEN_BROKER_BINARY:-"$repository_root/target/release/musheen-broker"}
+archive_worker_binary=${MUSHEEN_ARCHIVE_WORKER_BINARY:-"$repository_root/target/release/musheen-archive-worker"}
+thumbnail_worker_binary=${MUSHEEN_THUMBNAIL_WORKER_BINARY:-"$repository_root/target/release/musheen-thumbnail-worker"}
 icon="$repository_root/assets/icons/musheen.svg"
 
 install -D -m 0755 "$app_binary" "$DESTDIR/usr/bin/musheen"
+install -D -m 0755 "$archive_worker_binary" "$DESTDIR/usr/bin/musheen-archive-worker"
+install -D -m 0755 "$thumbnail_worker_binary" "$DESTDIR/usr/bin/musheen-thumbnail-worker"
 install -D -m 0644 \
     "$script_dir/org.musheen.Musheen.desktop" \
     "$DESTDIR/usr/share/applications/org.musheen.Musheen.desktop"

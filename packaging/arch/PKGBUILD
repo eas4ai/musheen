@@ -44,5 +44,7 @@ package() {
   cd "${srcdir}/${pkgname}-${pkgver}"
   MUSHEEN_APP_BINARY="${CARGO_TARGET_DIR:-${srcdir}/target}/release/musheen" \
   MUSHEEN_BROKER_BINARY="${CARGO_TARGET_DIR:-${srcdir}/target}/release/musheen-broker" \
+  MUSHEEN_ARCHIVE_WORKER_BINARY="${CARGO_TARGET_DIR:-${srcdir}/target}/release/musheen-archive-worker" \
+  MUSHEEN_THUMBNAIL_WORKER_BINARY="${CARGO_TARGET_DIR:-${srcdir}/target}/release/musheen-thumbnail-worker" \
   DESTDIR="$pkgdir" ./packaging/install-app.sh
 }

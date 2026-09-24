@@ -34,12 +34,18 @@ COPY --from=build /export/ /export/
 RUN pacman -Syu --noconfirm \
     && pacman -U --noconfirm /export/musheen-*.pkg.tar.zst \
     && test -x /usr/bin/musheen \
+    && test -x /usr/bin/musheen-archive-worker \
+    && test -x /usr/bin/musheen-thumbnail-worker \
     && test -x /usr/lib/musheen/musheen-broker \
     && test -f /usr/share/applications/org.musheen.Musheen.desktop \
     && ! ldd /usr/bin/musheen | grep -q 'not found' \
+    && ! ldd /usr/bin/musheen-archive-worker | grep -q 'not found' \
+    && ! ldd /usr/bin/musheen-thumbnail-worker | grep -q 'not found' \
     && ! ldd /usr/lib/musheen/musheen-broker | grep -q 'not found' \
     && pacman -Rns --noconfirm musheen \
     && test ! -e /usr/bin/musheen \
+    && test ! -e /usr/bin/musheen-archive-worker \
+    && test ! -e /usr/bin/musheen-thumbnail-worker \
     && test ! -e /usr/lib/musheen/musheen-broker
 
 FROM scratch AS artifact

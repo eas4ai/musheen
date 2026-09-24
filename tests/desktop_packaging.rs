@@ -33,7 +33,7 @@ fn desktop_and_appstream_metadata_use_the_runtime_application_id() {
 }
 
 #[test]
-fn native_installer_stages_app_metadata_icons_and_broker_without_host_writes() {
+fn native_installer_stages_app_workers_metadata_icons_and_broker_without_host_writes() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let temporary = tempfile::tempdir().unwrap();
     let stage = temporary.path().join("stage");
@@ -41,8 +41,12 @@ fn native_installer_stages_app_metadata_icons_and_broker_without_host_writes() {
     fs::create_dir(&fake_bin).unwrap();
     let app = temporary.path().join("musheen");
     let broker = temporary.path().join("musheen-broker");
+    let archive_worker = temporary.path().join("musheen-archive-worker");
+    let thumbnail_worker = temporary.path().join("musheen-thumbnail-worker");
     fs::write(&app, b"app fixture").unwrap();
     fs::write(&broker, b"broker fixture").unwrap();
+    fs::write(&archive_worker, b"archive fixture").unwrap();
+    fs::write(&thumbnail_worker, b"thumbnail fixture").unwrap();
     let rasterizer = fake_bin.join("rsvg-convert");
     fs::write(
         &rasterizer,
@@ -56,6 +60,8 @@ fn native_installer_stages_app_metadata_icons_and_broker_without_host_writes() {
         .env("DESTDIR", &stage)
         .env("MUSHEEN_APP_BINARY", &app)
         .env("MUSHEEN_BROKER_BINARY", &broker)
+        .env("MUSHEEN_ARCHIVE_WORKER_BINARY", &archive_worker)
+        .env("MUSHEEN_THUMBNAIL_WORKER_BINARY", &thumbnail_worker)
         .env("PATH", path)
         .output()
         .unwrap();
@@ -63,6 +69,8 @@ fn native_installer_stages_app_metadata_icons_and_broker_without_host_writes() {
 
     for (relative, mode) in [
         ("usr/bin/musheen", 0o755),
+        ("usr/bin/musheen-archive-worker", 0o755),
+        ("usr/bin/musheen-thumbnail-worker", 0o755),
         ("usr/lib/musheen/musheen-broker", 0o755),
         ("usr/share/applications/org.musheen.Musheen.desktop", 0o644),
         ("usr/share/metainfo/org.musheen.Musheen.metainfo.xml", 0o644),
@@ -95,6 +103,14 @@ fn native_installer_stages_app_metadata_icons_and_broker_without_host_writes() {
             .unwrap_or_else(|error| panic!("missing staged {relative}: {error}"));
         assert_eq!(metadata.permissions().mode() & 0o777, mode, "{relative}");
     }
+    assert_eq!(
+        fs::read(stage.join("usr/bin/musheen-archive-worker")).unwrap(),
+        b"archive fixture"
+    );
+    assert_eq!(
+        fs::read(stage.join("usr/bin/musheen-thumbnail-worker")).unwrap(),
+        b"thumbnail fixture"
+    );
     assert!(
         !stage
             .join("usr/share/dbus-1/services/org.freedesktop.FileManager1.service")
@@ -132,6 +148,8 @@ fn arch_package_builds_all_features_and_stages_the_native_installer() {
     assert!(recipe.contains("--release --locked --all-features --jobs 8"));
     assert!(recipe.contains("CARGO_INCREMENTAL=0"));
     assert!(recipe.contains("DESTDIR=\"$pkgdir\" ./packaging/install-app.sh"));
+    assert!(recipe.contains("MUSHEEN_ARCHIVE_WORKER_BINARY="));
+    assert!(recipe.contains("MUSHEEN_THUMBNAIL_WORKER_BINARY="));
     assert!(recipe.contains("sha256sums=('__SOURCE_SHA256__')"));
     assert!(recipe.contains("options=('!debug' '!lto')"));
     assert!(recipe.contains("'git'"));
@@ -155,6 +173,8 @@ fn arch_container_checks_package_install_and_removal() {
     assert!(container.contains("makepkg --noconfirm"));
     assert!(container.contains("pacman -U --noconfirm"));
     assert!(container.contains("FROM archlinux:base-devel AS runtime-check"));
+    assert!(container.contains("test -x /usr/bin/musheen-archive-worker"));
+    assert!(container.contains("test -x /usr/bin/musheen-thumbnail-worker"));
     assert!(container.contains("pacman -Rns --noconfirm musheen"));
     assert!(container.contains("FROM scratch AS artifact"));
     let runner = fs::read_to_string(root.join("scripts/build-arch-package.sh")).unwrap();

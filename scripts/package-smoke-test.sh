@@ -35,10 +35,16 @@ for size in 48 128 256; do
     fi
 done
 
-if [[ ! -x "$stage/usr/bin/musheen" || ! -x "$stage/usr/lib/musheen/musheen-broker" ]]; then
-    echo "package is missing an executable application or broker" >&2
-    exit 1
-fi
+for executable in \
+    "$stage/usr/bin/musheen" \
+    "$stage/usr/bin/musheen-archive-worker" \
+    "$stage/usr/bin/musheen-thumbnail-worker" \
+    "$stage/usr/lib/musheen/musheen-broker"; do
+    if [[ ! -x "$executable" ]]; then
+        echo "package is missing executable: $executable" >&2
+        exit 1
+    fi
+done
 if [[ -n $(find "$stage" -type f \( -perm /002 -o -perm /6000 \) -print -quit) ]]; then
     echo "package contains a world-writable or setuid/setgid file" >&2
     exit 1

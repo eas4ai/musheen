@@ -191,6 +191,15 @@ fn linux_build_installs_native_and_package_validation_dependencies() {
     let dockerfile = fs::read_to_string(root.join("ci/linux-build.Dockerfile"))
         .expect("Linux build Dockerfile should be readable");
 
+    assert!(
+        dockerfile.contains(
+            "MUSHEEN_ARCHIVE_WORKER_BINARY=/workspace/target/debug/musheen-archive-worker"
+        )
+    );
+    assert!(dockerfile.contains(
+        "MUSHEEN_THUMBNAIL_WORKER_BINARY=/workspace/target/debug/musheen-thumbnail-worker"
+    ));
+
     for package in [
         "appstream",
         "desktop-file-utils",

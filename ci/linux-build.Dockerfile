@@ -51,4 +51,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN --mount=type=cache,target=/workspace/target \
     MUSHEEN_APP_BINARY=/workspace/target/debug/musheen \
     MUSHEEN_BROKER_BINARY=/workspace/target/debug/musheen-broker \
+    MUSHEEN_ARCHIVE_WORKER_BINARY=/workspace/target/debug/musheen-archive-worker \
+    MUSHEEN_THUMBNAIL_WORKER_BINARY=/workspace/target/debug/musheen-thumbnail-worker \
     scripts/package-smoke-test.sh
