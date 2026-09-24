@@ -37,73 +37,13 @@ run_benchmark() (
 
     output=$(TMPDIR="$benchmark_temp" "$benchmark" --bench)
     printf '%s\n' "$output"
-    if [[ $name == directory ]]; then
-        validate_directory "$output"
-    else
-        validate_search "$output"
+    if ! printf '%s\n' "$output" | jq -e -s --arg benchmark "$name" \
+        -f scripts/benchmark-validations.jq >/dev/null; then
+        printf '%s benchmark did not emit complete bounded measurements\n' "$name" >&2
+        exit 1
     fi
 )
 
-validate_directory() {
-    local output=$1
-    if printf '%s\n' "$output" | jq -e -s '
-    length == 3
-    and (map(.case) | sort == ["first_directory_page", "million_item_directory_enumeration", "million_item_directory_scroll"])
-    and all(.[];
-        (.wall_ns | type) == "number" and .wall_ns >= 0
-        and (.cpu_ns | type) == "number" and .cpu_ns >= 0
-        and (.peak_rss_kib | type) == "number" and .peak_rss_kib > 0
-        and ((.open_fds // .open_fds_sampled_max) | type) == "number"
-        and (.queued_pages_max | type) == "number"
-        and ((.temporary_bytes // .temporary_bytes_sampled_max) | type) == "number"
-        and .retained_models_max <= 4096)
-    and any(.[]; .case == "first_directory_page" and .items == 512 and .queued_pages_max <= 2 and (.temporary_bytes | type) == "number")
-    and any(.[]; .case == "million_item_directory_enumeration" and .items == 1000000 and .pages == 1954 and .queued_pages_max <= 2 and (.temporary_bytes_sampled_max | type) == "number")
-    and any(.[]; .case == "million_item_directory_scroll" and .items == 1000000 and .viewports >= 100 and (.temporary_bytes | type) == "number")
-' >/dev/null; then
-        return 0
-    fi
-    printf 'directory benchmark did not emit complete bounded measurements\n' >&2
-    return 1
-}
-
-validate_search() {
-    local output=$1
-    if printf '%s\n' "$output" | jq -e -s '
-        length == 2
-        and (map(.case) | sort == ["million_result_search_refinement", "search_backpressure_saturation"])
-        and all(.[];
-            (.wall_ns | type) == "number" and .wall_ns >= 0
-            and (.cpu_ns | type) == "number" and .cpu_ns >= 0
-            and (.peak_rss_kib | type) == "number" and .peak_rss_kib > 0
-            and (.open_fds | type) == "number" and .open_fds >= 0
-            and (.temporary_bytes | type) == "number" and .temporary_bytes >= 0
-            and (.queued_matches_max | type) == "number" and .queued_matches_max <= 2048
-            and (.retained_models_max | type) == "number" and .retained_models_max <= 4096)
-        and any(.[];
-            .case == "search_backpressure_saturation"
-            and .potential_matches == 1000000
-            and .queued_matches_max == 2048
-            and .producer_inflight_matches_max == 256
-            and .produced_while_stalled >= 2048
-            and .produced_while_stalled <= 2304
-            and .retained_models_max == 0)
-        and any(.[];
-            .case == "million_result_search_refinement"
-            and .potential_matches == 1000000
-            and .displayed_matches == 100000
-            and .produced_matches >= 100000
-            and .produced_matches <= 102400
-            and .accepted_batches == 391
-            and .queued_matches_max == 2048
-            and .retained_models_max == 4096
-            and .state == "refine_required")
-    ' >/dev/null; then
-        return 0
-    fi
-    printf 'search benchmark did not emit complete bounded measurements\n' >&2
-    return 1
-}
-
 run_benchmark directory
 run_benchmark search
+run_benchmark operations

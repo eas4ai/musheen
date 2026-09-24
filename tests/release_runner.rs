@@ -180,7 +180,7 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -198,6 +198,13 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     )
     .unwrap();
     fs::set_permissions(&fake_search_bench, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_operations_bench = fake_bin.join("operations-bench");
+    fs::write(
+        &fake_operations_bench,
+        "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_OPERATIONS_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_OPERATIONS_BENCH_ARGS\"\nprintf '%s\\n' '{\"case\":\"large_copy_streamed\",\"bytes\":67108864,\"strategy\":\"streamed\",\"verified\":true,\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"queued_work_max\":0,\"retained_models_max\":0,\"temporary_bytes\":134217728}' '{\"case\":\"large_copy_transaction\",\"bytes\":67108864,\"strategy\":\"reflink\",\"verified\":true,\"wall_ns\":2,\"cpu_ns\":2,\"peak_rss_kib\":2,\"open_fds\":4,\"queued_work_max\":0,\"retained_models_max\":0,\"temporary_bytes\":134217728}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_operations_bench, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn run_benchmark_fixture(
@@ -217,6 +224,10 @@ fn run_benchmark_fixture(
         .env("MUSHEEN_FAKE_BENCH", fake_bin.join("directory-bench"))
         .env("MUSHEEN_FAKE_SEARCH_BENCH", fake_bin.join("search-bench"))
         .env(
+            "MUSHEEN_FAKE_OPERATIONS_BENCH",
+            fake_bin.join("operations-bench"),
+        )
+        .env(
             "MUSHEEN_FAKE_MISSING",
             if missing_directory { "1" } else { "0" },
         )
@@ -228,10 +239,18 @@ fn run_benchmark_fixture(
         .env("MUSHEEN_BENCH_ARGS", temporary.join("bench-args"))
         .env("MUSHEEN_SEARCH_BENCH_ARGS", temporary.join("search-args"))
         .env(
+            "MUSHEEN_OPERATIONS_BENCH_ARGS",
+            temporary.join("operations-args"),
+        )
+        .env(
             "MUSHEEN_SEARCH_BENCH_TMP_RECORD",
             temporary.join("search-temp"),
         )
         .env("MUSHEEN_BENCH_TMP_RECORD", temporary.join("bench-temp"))
+        .env(
+            "MUSHEEN_OPERATIONS_BENCH_TMP_RECORD",
+            temporary.join("operations-temp"),
+        )
         .output()
         .unwrap()
 }
@@ -240,6 +259,7 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     let cargo_args = fs::read_to_string(temporary.join("cargo-args")).unwrap();
     assert!(cargo_args.contains("--no-run --bench directory"));
     assert!(cargo_args.contains("--no-run --bench search"));
+    assert!(cargo_args.contains("--no-run --bench operations"));
     assert_eq!(
         fs::read_to_string(temporary.join("bench-args")).unwrap(),
         "--bench"
@@ -248,12 +268,19 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
         fs::read_to_string(temporary.join("search-args")).unwrap(),
         "--bench"
     );
+    assert_eq!(
+        fs::read_to_string(temporary.join("operations-args")).unwrap(),
+        "--bench"
+    );
     let benchmark_temp = fs::read_to_string(temporary.join("bench-temp")).unwrap();
     let search_temp = fs::read_to_string(temporary.join("search-temp")).unwrap();
+    let operations_temp = fs::read_to_string(temporary.join("operations-temp")).unwrap();
     assert!(benchmark_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(benchmark_temp, temporary.to_str().unwrap());
     assert!(search_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(search_temp, benchmark_temp);
+    assert!(operations_temp.starts_with(temporary.to_str().unwrap()));
+    assert_ne!(operations_temp, search_temp);
 }
 
 #[test]
