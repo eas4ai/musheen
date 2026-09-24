@@ -82,7 +82,7 @@ impl DirectoryFilter {
             .collect()
     }
 
-    fn matches(&self, item: &StoreItem) -> bool {
+    pub(crate) fn matches(&self, item: &StoreItem) -> bool {
         if self
             .tagged_items
             .as_ref()

@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Layout {
@@ -222,7 +223,7 @@ pub struct DirectoryViewModel {
     editing: Option<ItemId>,
     scroll_anchor: Option<ScrollAnchor>,
     complete: bool,
-    visible_order: RefCell<Option<Vec<usize>>>,
+    visible_order: RefCell<Option<Arc<Vec<usize>>>>,
 }
 
 impl DirectoryViewModel {
@@ -306,6 +307,19 @@ impl DirectoryViewModel {
             .collect()
     }
 
+    /// A shared snapshot of sorted positions in `items`. Reusing this order
+    /// avoids copying every item identity on each immediate-mode render.
+    #[must_use]
+    pub fn visible_item_indices(&self) -> Arc<Vec<usize>> {
+        self.ensure_visible_order();
+        Arc::clone(
+            self.visible_order
+                .borrow()
+                .as_ref()
+                .expect("visible order was populated"),
+        )
+    }
+
     /// Move the ordered visible items into a column pane before this view is
     /// reset for child navigation. Large directories must not clone every path
     /// and metadata record on the UI thread.
@@ -317,7 +331,8 @@ impl DirectoryViewModel {
             .map(Some)
             .collect::<Vec<_>>();
         let visible = order
-            .into_iter()
+            .iter()
+            .copied()
             .filter_map(|index| items.get_mut(index).and_then(Option::take))
             .collect();
         self.reset_items();
@@ -338,7 +353,7 @@ impl DirectoryViewModel {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         order.sort_by(|left, right| self.compare_items(&self.items[*left], &self.items[*right]));
-        *self.visible_order.borrow_mut() = Some(order);
+        *self.visible_order.borrow_mut() = Some(Arc::new(order));
     }
 
     /// Returns only the visible IDs addressed by `indices`. The cached order

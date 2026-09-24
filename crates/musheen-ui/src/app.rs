@@ -287,6 +287,17 @@ struct ItemRenderSpec {
     focused: bool,
 }
 
+struct DirectoryRows {
+    tab_id: TabId,
+    pane_index: usize,
+    layout: Layout,
+    row_height: Pixels,
+    columns: usize,
+    positions: Arc<Vec<usize>>,
+    base_order: Arc<Vec<usize>>,
+    scroll: UniformListScrollHandle,
+}
+
 struct ColumnParentRenderSpec {
     tab_id: TabId,
     parent_index: usize,
@@ -4725,6 +4736,35 @@ impl MusheenApp {
                 || directory.view().visible_items(),
                 |filter| filter.apply(directory.view()),
             )
+    }
+
+    fn visible_positions_for_render(&self, tab_id: TabId) -> (Arc<Vec<usize>>, Arc<Vec<usize>>) {
+        let Some(directory) = self.directories.get(&tab_id) else {
+            return (Arc::new(Vec::new()), Arc::new(Vec::new()));
+        };
+        let view = directory.view();
+        let order = view.visible_item_indices();
+        let visible = self
+            .filters
+            .get(&tab_id)
+            .and_then(|filter| filter.filter.as_ref())
+            .map_or_else(
+                || Arc::clone(&order),
+                |filter| {
+                    Arc::new(
+                        order
+                            .iter()
+                            .copied()
+                            .filter(|index| {
+                                view.items()
+                                    .get(*index)
+                                    .is_some_and(|item| filter.matches(item))
+                            })
+                            .collect(),
+                    )
+                },
+            );
+        (order, visible)
     }
 
     fn activate_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
@@ -12006,15 +12046,10 @@ impl MusheenApp {
         } else {
             configured
         };
-        // Snapshot the stable order once per render. Row virtualization must
-        // not re-filter and re-sort the entire directory for every row.
-        let visible_item_ids = Arc::new(
-            self.filtered_items(tab_id)
-                .into_iter()
-                .map(|item| item.id().clone())
-                .collect::<Vec<_>>(),
-        );
-        let item_count = visible_item_ids.len();
+        // The sorted order is shared across frames. Render only viewport rows
+        // without cloning every item ID or linearly searching for each row.
+        let (base_order, visible_positions) = self.visible_positions_for_render(tab_id);
+        let item_count = visible_positions.len();
         let scroll = self
             .directory_scrolls
             .entry((tab_id, pane_index))
@@ -12054,77 +12089,19 @@ impl MusheenApp {
                 DirectoryState::Ready => unreachable!(),
             }
         } else {
-            match layout {
-                Layout::Details | Layout::List | Layout::Columns => {
-                    let item_ids = Arc::clone(&visible_item_ids);
-                    uniform_list(
-                        SharedString::from(format!("directory-items-list-{pane_index}")),
-                        item_count,
-                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                            let items = range
-                                .filter_map(|index| {
-                                    let id = item_ids.get(index)?;
-                                    this.item_render_spec(
-                                        tab_id,
-                                        pane_index,
-                                        index,
-                                        id,
-                                        layout,
-                                        list_row_height,
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            items
-                                .into_iter()
-                                .map(|item| {
-                                    div().h(list_row_height).child(this.render_item(item, cx))
-                                })
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .track_scroll(&scroll)
-                    .w_full()
-                    .flex_grow(1.0)
-                    .min_h(px(0.))
-                    .p_4()
-                    .into_any_element()
-                }
-                Layout::Cards | Layout::Grid | Layout::Adaptive => {
-                    let item_ids = Arc::clone(&visible_item_ids);
-                    let columns = grid_columns;
-                    uniform_list(
-                        SharedString::from(format!("directory-items-grid-{pane_index}")),
-                        grid_row_count(item_count, columns),
-                        cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
-                            rows.map(|row| {
-                                let items = grid_item_range(row, item_count, columns)
-                                    .filter_map(|index| {
-                                        let id = item_ids.get(index)?;
-                                        this.item_render_spec(
-                                            tab_id,
-                                            pane_index,
-                                            index,
-                                            id,
-                                            layout,
-                                            list_row_height,
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
-                                div().h(px(116.)).flex().gap_2().children(
-                                    items.into_iter().map(|item| this.render_item(item, cx)),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                        }),
-                    )
-                    .track_scroll(&scroll)
-                    .w_full()
-                    .flex_grow(1.0)
-                    .min_h(px(0.))
-                    .p_4()
-                    .into_any_element()
-                }
-            }
+            Self::render_virtualized_rows(
+                DirectoryRows {
+                    tab_id,
+                    pane_index,
+                    layout,
+                    row_height: list_row_height,
+                    columns: grid_columns,
+                    positions: visible_positions,
+                    base_order,
+                    scroll: scroll.clone(),
+                },
+                cx,
+            )
         };
 
         let items_id = if pane_index == 0 {
@@ -12669,17 +12646,97 @@ impl MusheenApp {
         }
     }
 
+    fn render_virtualized_rows(rows: DirectoryRows, cx: &mut Context<Self>) -> AnyElement {
+        let DirectoryRows {
+            tab_id,
+            pane_index,
+            layout,
+            row_height,
+            columns,
+            positions,
+            base_order,
+            scroll,
+        } = rows;
+        let item_count = positions.len();
+        match layout {
+            Layout::Details | Layout::List | Layout::Columns => uniform_list(
+                SharedString::from(format!("directory-items-list-{pane_index}")),
+                item_count,
+                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                    if !this.directory_order_matches(tab_id, &base_order) {
+                        return Vec::new();
+                    }
+                    let items = range
+                        .filter_map(|index| {
+                            let item_index = *positions.get(index)?;
+                            this.item_render_spec(
+                                tab_id, pane_index, index, item_index, layout, row_height,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    items
+                        .into_iter()
+                        .map(|item| div().h(row_height).child(this.render_item(item, cx)))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(&scroll)
+            .w_full()
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .p_4()
+            .into_any_element(),
+            Layout::Cards | Layout::Grid | Layout::Adaptive => uniform_list(
+                SharedString::from(format!("directory-items-grid-{pane_index}")),
+                grid_row_count(item_count, columns),
+                cx.processor(move |this, rows: std::ops::Range<usize>, _, cx| {
+                    if !this.directory_order_matches(tab_id, &base_order) {
+                        return Vec::new();
+                    }
+                    rows.map(|row| {
+                        let items = grid_item_range(row, item_count, columns)
+                            .filter_map(|index| {
+                                let item_index = *positions.get(index)?;
+                                this.item_render_spec(
+                                    tab_id, pane_index, index, item_index, layout, row_height,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        div()
+                            .h(px(116.))
+                            .flex()
+                            .gap_2()
+                            .children(items.into_iter().map(|item| this.render_item(item, cx)))
+                    })
+                    .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(&scroll)
+            .w_full()
+            .flex_grow(1.0)
+            .min_h(px(0.))
+            .p_4()
+            .into_any_element(),
+        }
+    }
+
+    fn directory_order_matches(&self, tab_id: TabId, expected: &Arc<Vec<usize>>) -> bool {
+        self.directories.get(&tab_id).is_some_and(|directory| {
+            Arc::ptr_eq(expected, &directory.view().visible_item_indices())
+        })
+    }
+
     fn item_render_spec(
         &self,
         tab_id: TabId,
         pane_index: usize,
         index: usize,
-        id: &ItemId,
+        item_index: usize,
         layout: Layout,
         row_height: Pixels,
     ) -> Option<ItemRenderSpec> {
         let view = self.directories.get(&tab_id)?.view();
-        let item = view.item(id)?;
+        let item = view.items().get(item_index)?;
         Some(ItemRenderSpec {
             tab_id,
             pane_index,

@@ -8,6 +8,7 @@ use musheen_ui::views::{
     AdaptiveLayout, ColumnKey, DirectoryViewModel, GroupKey, Layout, SelectionMode, SortDirection,
     SortKey, ViewPreferenceStore, ViewPreferences,
 };
+use std::sync::Arc;
 
 fn item(index: u64, name: &str, kind: ItemKind, size: Option<u64>) -> StoreItem {
     let provider = ProviderId::new("local").expect("provider ID is valid");
@@ -239,6 +240,26 @@ fn cached_visible_order_invalidates_for_items_and_preferences() {
     assert_eq!(names(&model), vec!["b", "a"]);
     model.extend([item(3, "c", ItemKind::RegularFile, Some(3))]);
     assert_eq!(names(&model), vec!["c", "b", "a"]);
+}
+
+#[test]
+fn visible_positions_reuse_the_order_until_items_or_preferences_change() {
+    let mut model = DirectoryViewModel::new(16);
+    model.extend([
+        item(1, "b", ItemKind::RegularFile, Some(1)),
+        item(2, "a", ItemKind::RegularFile, Some(2)),
+    ]);
+    let first = model.visible_item_indices();
+    assert_eq!(first.as_slice(), &[1, 0]);
+    assert!(Arc::ptr_eq(&first, &model.visible_item_indices()));
+
+    model.extend([item(3, "c", ItemKind::RegularFile, Some(3))]);
+    let changed = model.visible_item_indices();
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert_eq!(changed.as_slice(), &[1, 0, 2]);
+
+    model.preferences_mut().sort.direction = SortDirection::Descending;
+    assert_eq!(model.visible_item_indices().as_slice(), &[2, 0, 1]);
 }
 
 #[test]
