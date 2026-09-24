@@ -15,6 +15,14 @@ desktop-file-validate "$stage/usr/share/applications/org.musheen.Musheen.desktop
 appstreamcli validate --no-net \
     "$stage/usr/share/metainfo/org.musheen.Musheen.metainfo.xml"
 
+file_manager_service="$stage/usr/share/dbus-1/services/org.freedesktop.FileManager1.service"
+if [[ ! -f "$file_manager_service" ]] \
+    || ! grep -Fxq 'Name=org.freedesktop.FileManager1' "$file_manager_service" \
+    || ! grep -Fxq 'Exec=/usr/bin/musheen' "$file_manager_service"; then
+    echo "package is missing FileManager1 D-Bus activation" >&2
+    exit 1
+fi
+
 for size in 48 128 256; do
     icon="$stage/usr/share/icons/hicolor/${size}x${size}/apps/org.musheen.Musheen.png"
     if [[ $(file --brief --mime-type "$icon") != image/png ]]; then

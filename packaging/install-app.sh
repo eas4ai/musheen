@@ -37,6 +37,9 @@ install -D -m 0644 \
     "$script_dir/org.musheen.Musheen.service" \
     "$DESTDIR/usr/share/dbus-1/services/org.musheen.Musheen.service"
 install -D -m 0644 \
+    "$script_dir/org.freedesktop.FileManager1.service" \
+    "$DESTDIR/usr/share/dbus-1/services/org.freedesktop.FileManager1.service"
+install -D -m 0644 \
     "$icon" \
     "$DESTDIR/usr/share/icons/hicolor/scalable/apps/org.musheen.Musheen.svg"
 
