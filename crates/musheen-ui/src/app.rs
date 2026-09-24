@@ -1727,6 +1727,28 @@ fn submitted_rename_name(original_name: &OsStr, submitted: &str) -> OsString {
     }
 }
 
+fn visibility_rename_name(path: &StorePath, hide: bool) -> Result<OsString, Box<str>> {
+    let name = path
+        .as_unix_path()
+        .and_then(Path::file_name)
+        .ok_or_else(|| Box::<str>::from("hide and unhide require a local item"))?;
+    let bytes = name.as_bytes();
+    if hide {
+        if bytes.starts_with(b".") {
+            return Err("the selected item is already hidden".into());
+        }
+        let mut hidden = Vec::with_capacity(bytes.len() + 1);
+        hidden.push(b'.');
+        hidden.extend_from_slice(bytes);
+        Ok(OsString::from_vec(hidden))
+    } else {
+        if !bytes.starts_with(b".") {
+            return Err("the selected item is not hidden".into());
+        }
+        Ok(OsString::from_vec(bytes[1..].to_vec()))
+    }
+}
+
 #[derive(Clone)]
 enum NameOperationEvent {
     Submitted(String),
@@ -8238,6 +8260,16 @@ impl MusheenApp {
                     }
                 }
             }
+            (
+                visibility_action @ (CommandAction::Hide | CommandAction::Unhide),
+                CommandParameters::Targets(targets),
+            ) => {
+                self.submit_visibility_renames(
+                    targets.clone(),
+                    *visibility_action == CommandAction::Hide,
+                    cx,
+                );
+            }
             (CommandAction::BrowseArchive, CommandParameters::Targets(targets)) => {
                 self.open_archive_window(targets, cx);
             }
@@ -9260,6 +9292,75 @@ impl MusheenApp {
         .detach();
     }
 
+    fn submit_visibility_renames(
+        &mut self,
+        targets: Vec<CommandTargetRef>,
+        hide: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let hub = self.operation_hub.clone();
+        let work = cx.background_spawn(async move {
+            let mut store = LocalStore::new();
+            targets
+                .into_iter()
+                .map(|target| {
+                    let name = visibility_rename_name(target.path(), hide)?;
+                    let current = store
+                        .resolve_item(target.path())
+                        .map_err(|error| Box::<str>::from(error.to_string()))?
+                        .ok_or_else(|| Box::<str>::from("the selected item no longer exists"))?;
+                    if current.id() != target.id() {
+                        return Err(Box::<str>::from("the selected item changed"));
+                    }
+                    let identity = MutationProvider::identity(&mut store, target.path())
+                        .map_err(|error| Box::<str>::from(error.to_string()))?
+                        .ok_or_else(|| Box::<str>::from("the selected item no longer exists"))?;
+                    let request =
+                        RenameRequest::new(target.path().clone(), name, identity.into_vec());
+                    let movement = PendingCatalogMove {
+                        source: target.id().clone(),
+                        source_path: target.path().clone(),
+                        target_path: request
+                            .destination()
+                            .map_err(|error| Box::<str>::from(error.to_string()))?,
+                    };
+                    hub.submit_rename(request)
+                        .map(|id| (id, movement))
+                        .map_err(|error| Box::<str>::from(error.to_string()))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let results = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let mut first_error = None;
+                let mut submitted = false;
+                for result in results {
+                    match result {
+                        Ok((id, movement)) => {
+                            state.pending_catalog_moves.insert(id, movement);
+                            submitted = true;
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                state.operation_error =
+                    first_error.or_else(|| state.operation_hub.persistence_error());
+                if submitted {
+                    state.pump_operation_queue(cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn open_volume_unlock(&mut self, id: VolumeId, cx: &mut Context<Self>) {
         let label: Option<Box<str>> = Some(self.volumes.snapshot()).and_then(|model| {
             model
@@ -9861,6 +9962,8 @@ impl MusheenApp {
                 | CommandAction::MoveToTrash
                 | CommandAction::DeletePermanently
                 | CommandAction::Rename
+                | CommandAction::Hide
+                | CommandAction::Unhide
                 | CommandAction::NewDirectory
                 | CommandAction::NewEmptyFile
                 | CommandAction::BrowseArchive
@@ -19706,6 +19809,8 @@ mod tests {
             CommandAction::Compress,
             CommandAction::Extract,
             CommandAction::ExtractHere,
+            CommandAction::Hide,
+            CommandAction::Unhide,
         ] {
             assert_eq!(
                 MusheenApp::backend_action_state(action),
@@ -19728,6 +19833,123 @@ mod tests {
             MusheenApp::backend_action_state(CommandAction::ChooseApplication),
             CapabilityState::Supported
         );
+    }
+
+    #[gpui_kit::test]
+    async fn hide_context_action_renames_the_selected_local_item(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let visible = temporary.path().join("notes.txt");
+        let hidden = temporary.path().join(".notes.txt");
+        filesystem::write(&visible, b"notes").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let (tab, target) = cx.read(|cx| {
+            let state = app.read(cx);
+            let item = state
+                .focused_directory()
+                .view()
+                .items()
+                .iter()
+                .find(|item| item.path().as_unix_path() == Some(visible.as_path()))
+                .unwrap();
+            (
+                state.navigation.focused_tab().id(),
+                CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap(),
+            )
+        });
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::Hide,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| hidden.exists())
+            .await;
+        assert!(!visible.exists());
+        assert_eq!(filesystem::read(hidden).unwrap(), b"notes");
+    }
+
+    #[gpui_kit::test]
+    async fn unhide_context_action_removes_only_one_dot_from_a_non_utf8_name(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"other").unwrap();
+        let hidden = temporary
+            .path()
+            .join(OsString::from_vec(vec![b'.', b'n', 0xff]));
+        let visible = temporary.path().join(OsString::from_vec(vec![b'n', 0xff]));
+        filesystem::write(&hidden, b"secret").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(hidden.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::Unhide,
+                CommandParameters::targets(vec![target]),
+                None,
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| visible.exists())
+            .await;
+        assert!(!hidden.exists());
+        assert_eq!(filesystem::read(visible).unwrap(), b"secret");
+    }
+
+    #[gpui_kit::test]
+    async fn hide_context_action_keeps_a_conflicting_sibling_and_continues_other_items(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let conflict_source = temporary.path().join("one.txt");
+        let conflict_destination = temporary.path().join(".one.txt");
+        let other_source = temporary.path().join("two.txt");
+        let other_destination = temporary.path().join(".two.txt");
+        filesystem::write(&conflict_source, b"source").unwrap();
+        filesystem::write(&conflict_destination, b"existing").unwrap();
+        filesystem::write(&other_source, b"other").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let store = LocalStore::new();
+        let targets = [&conflict_source, &other_source]
+            .into_iter()
+            .map(|path| {
+                let item = store
+                    .resolve_item(&StorePath::from_unix_path(path.as_os_str()))
+                    .unwrap()
+                    .unwrap();
+                CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()
+            })
+            .collect();
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::Hide,
+                CommandParameters::targets(targets),
+                None,
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            other_destination.exists()
+        })
+        .await;
+        assert_eq!(filesystem::read(conflict_source).unwrap(), b"source");
+        assert_eq!(filesystem::read(conflict_destination).unwrap(), b"existing");
+        assert!(!other_source.exists());
+        assert_eq!(filesystem::read(other_destination).unwrap(), b"other");
     }
 
     #[gpui_kit::test]
