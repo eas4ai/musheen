@@ -289,6 +289,20 @@ struct ItemRenderSpec {
     focused: bool,
 }
 
+struct InlineRename {
+    generation: u64,
+    tab_id: TabId,
+    item_id: ItemId,
+    target: CommandTargetRef,
+    original_name: OsString,
+    input: Option<Entity<InputState>>,
+    subscription: Option<Subscription>,
+    pending_focus: bool,
+    error: Option<Box<str>>,
+    error_value: Option<String>,
+    checking_destination: bool,
+}
+
 struct DirectoryRows {
     tab_id: TabId,
     pane_index: usize,
@@ -3094,6 +3108,8 @@ struct MusheenApp {
     omnibar: OmnibarState,
     omnibar_input: Option<Entity<InputState>>,
     omnibar_subscription: Option<Subscription>,
+    inline_rename: Option<InlineRename>,
+    inline_rename_generation: u64,
     requested_omnibar_mode: Option<OmnibarMode>,
     pending_omnibar_value: Option<String>,
     content_focus: FocusHandle,
@@ -3821,6 +3837,8 @@ impl MusheenApp {
             omnibar: OmnibarState::default(),
             omnibar_input: None,
             omnibar_subscription: None,
+            inline_rename: None,
+            inline_rename_generation: 0,
             requested_omnibar_mode: None,
             pending_omnibar_value: None,
             content_focus: cx.focus_handle(),
@@ -4898,6 +4916,7 @@ impl MusheenApp {
                 && self.directories.get(&tab_id).is_some_and(|directory| {
                     directory.view().preferences().layout == Layout::Columns
                 }));
+        self.cancel_inline_rename(cx);
         if preserve_columns {
             self.column_reveal_counts
                 .retain(|(tab, _), _| *tab != tab_id);
@@ -4946,6 +4965,13 @@ impl MusheenApp {
     }
 
     fn load_focused_tab(&mut self, cx: &mut Context<Self>) {
+        if self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|rename| rename.tab_id != self.navigation.focused_tab().id())
+        {
+            self.cancel_inline_rename(cx);
+        }
         let location = self.navigation.focused_tab().location().clone();
         self.sync_terminal_location(&location, cx);
         let display = DisplayPath::from_store_path(&location).as_str().to_owned();
@@ -6005,6 +6031,13 @@ impl MusheenApp {
         if !self.context_dialog_windows.is_empty() {
             return;
         }
+        if self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|rename| rename.tab_id == tab_id && rename.item_id != id)
+        {
+            self.cancel_inline_rename(cx);
+        }
         if mode == SelectionMode::Add
             && self.start_indexed_selection(
                 tab_id,
@@ -6182,8 +6215,26 @@ impl MusheenApp {
         }
     }
 
-    fn move_directory_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
-        self.move_directory_focus_with_selection(delta, false, cx);
+    fn directory_keyboard_action_allowed(&self, window: &Window) -> bool {
+        self.inline_rename.is_none() && self.content_focus.is_focused(window)
+    }
+
+    fn handle_directory_focus_key(
+        &mut self,
+        delta: isize,
+        extend: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.directory_keyboard_action_allowed(window) {
+            self.move_directory_focus_with_selection(delta, extend, cx);
+        }
+    }
+
+    fn handle_directory_activate_key(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.directory_keyboard_action_allowed(window) {
+            self.activate_focused_directory_item(cx);
+        }
     }
 
     fn move_directory_focus_with_selection(
@@ -8173,9 +8224,12 @@ impl MusheenApp {
             }
             (CommandAction::Rename, CommandParameters::Targets(targets)) => {
                 if let Some(target) = targets.first().filter(|_| targets.len() == 1) {
-                    let operation = NameOperation::rename(target.clone());
-                    let initial = operation.initial_name();
-                    self.open_name_operation(operation, initial, origin_tab, cx);
+                    let tab_id = origin_tab.unwrap_or_else(|| self.navigation.focused_tab().id());
+                    if !self.begin_inline_rename(tab_id, target, cx) {
+                        let operation = NameOperation::rename(target.clone());
+                        let initial = operation.initial_name();
+                        self.open_name_operation(operation, initial, origin_tab, cx);
+                    }
                 }
             }
             (CommandAction::BrowseArchive, CommandParameters::Targets(targets)) => {
@@ -8899,6 +8953,192 @@ impl MusheenApp {
             return;
         }
         self.perform_volume_action(id, volume_action, usage, None, cx);
+    }
+
+    fn begin_inline_rename(
+        &mut self,
+        tab_id: TabId,
+        target: &CommandTargetRef,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if target.path().as_unix_path().is_none()
+            || self
+                .directories
+                .get(&tab_id)
+                .is_none_or(|directory| directory.view().item(target.id()).is_none())
+        {
+            return false;
+        }
+        if let Some(previous) = self.inline_rename.take()
+            && let Some(directory) = self.directories.get_mut(&previous.tab_id)
+        {
+            directory.view_mut().set_editing(None);
+        }
+        let NameOperation::Rename { original_name, .. } = NameOperation::rename(target.clone())
+        else {
+            unreachable!("a rename target always creates a rename operation")
+        };
+        self.directories
+            .get_mut(&tab_id)
+            .expect("the inline rename target has a directory")
+            .view_mut()
+            .set_editing(Some(target.id().clone()));
+        self.inline_rename_generation = self.inline_rename_generation.wrapping_add(1);
+        self.inline_rename = Some(InlineRename {
+            generation: self.inline_rename_generation,
+            tab_id,
+            item_id: target.id().clone(),
+            target: target.clone(),
+            original_name,
+            input: None,
+            subscription: None,
+            pending_focus: true,
+            error: None,
+            error_value: None,
+            checking_destination: false,
+        });
+        cx.notify();
+        true
+    }
+
+    fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(rename) = self.inline_rename.take() {
+            if let Some(directory) = self.directories.get_mut(&rename.tab_id) {
+                directory.view_mut().set_editing(None);
+            }
+            self.pending_content_focus = true;
+            cx.notify();
+        }
+    }
+
+    fn submit_inline_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_ref() else {
+            return;
+        };
+        if rename.checking_destination {
+            return;
+        }
+        let name = rename
+            .input
+            .as_ref()
+            .expect("an active rename has an input")
+            .read(cx)
+            .value()
+            .to_string();
+        let proposed = submitted_rename_name(&rename.original_name, &name);
+        if let Err(error) = musheen_ops::validate_local_name(&proposed) {
+            let message = match error {
+                musheen_ops::NameError::Empty => "inline-rename-empty",
+                musheen_ops::NameError::Dot => "inline-rename-dot",
+                musheen_ops::NameError::ContainsSeparator => "inline-rename-separator",
+                musheen_ops::NameError::ContainsNul => "inline-rename-nul",
+            };
+            let rename = self.inline_rename.as_mut().expect("rename is active");
+            rename.error = Some(
+                self.catalog
+                    .message(message)
+                    .expect("inline rename errors are localized")
+                    .into(),
+            );
+            rename.error_value = Some(name);
+            cx.notify();
+            return;
+        }
+        let source = rename.target.path().clone();
+        let destination =
+            match RenameRequest::new(source.clone(), proposed, Vec::new()).destination() {
+                Ok(destination) => destination,
+                Err(error) => {
+                    self.inline_rename.as_mut().expect("rename is active").error =
+                        Some(error.to_string().into());
+                    cx.notify();
+                    return;
+                }
+            };
+        if destination == source {
+            self.cancel_inline_rename(cx);
+            return;
+        }
+        let generation = rename.generation;
+        self.inline_rename
+            .as_mut()
+            .expect("rename is active")
+            .checking_destination = true;
+        let check = cx.background_spawn(async move {
+            let mut store = LocalStore::new();
+            let source_identity = MutationProvider::identity(&mut store, &source)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "the selected item no longer exists".to_owned())?;
+            let destination_identity = MutationProvider::identity(&mut store, &destination)
+                .map_err(|error| error.to_string())?;
+            Ok::<bool, String>(destination_identity.is_none_or(|id| id == source_identity))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = check.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let Some(rename) = state.inline_rename.as_mut() else {
+                    return;
+                };
+                if rename.generation != generation {
+                    return;
+                }
+                rename.checking_destination = false;
+                let current_name = rename
+                    .input
+                    .as_ref()
+                    .expect("an active rename has an input")
+                    .read(cx)
+                    .value()
+                    .to_string();
+                if current_name != name {
+                    return;
+                }
+                match result {
+                    Ok(false) => {
+                        rename.error = Some(
+                            state
+                                .catalog
+                                .message("inline-rename-conflict")
+                                .expect("the collision message is localized")
+                                .into(),
+                        );
+                        rename.error_value = Some(name);
+                    }
+                    Err(error) => {
+                        rename.error = Some(
+                            state
+                                .catalog
+                                .message("inline-rename-check-failed")
+                                .expect("the preflight error is localized")
+                                .into(),
+                        );
+                        rename.error_value = Some(name);
+                        state.operation_error = Some(error.into());
+                    }
+                    Ok(true) => {
+                        let rename = state.inline_rename.take().expect("rename is active");
+                        if let Some(directory) = state.directories.get_mut(&rename.tab_id) {
+                            directory.view_mut().set_editing(None);
+                        }
+                        state.pending_content_focus = true;
+                        state.submit_name_operation(
+                            NameOperation::Rename {
+                                target: rename.target,
+                                original_name: rename.original_name,
+                            },
+                            name,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn open_name_operation(
@@ -10741,6 +10981,43 @@ impl MusheenApp {
         self.omnibar_subscription = Some(subscription);
     }
 
+    fn ensure_inline_rename_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_mut() else {
+            return;
+        };
+        let input = rename
+            .input
+            .get_or_insert_with(|| {
+                let initial = rename.original_name.to_string_lossy().into_owned();
+                cx.new(|cx| InputState::new(window, cx).default_value(initial))
+            })
+            .clone();
+        if rename.subscription.is_none() {
+            rename.subscription =
+                Some(cx.subscribe(&input, |this, input, event, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit_inline_rename(cx),
+                    InputEvent::Change => {
+                        if let Some(rename) = this.inline_rename.as_mut() {
+                            let value = input.read(cx).value().to_string();
+                            if rename.error_value.as_ref() != Some(&value) {
+                                rename.error = None;
+                                rename.error_value = None;
+                            }
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                }));
+        }
+        if rename.pending_focus {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+                input.select_all(window, cx);
+            });
+            rename.pending_focus = false;
+        }
+    }
+
     fn activate_omnibar(&mut self, mode: OmnibarMode, window: &mut Window, cx: &mut Context<Self>) {
         let value = match mode {
             OmnibarMode::Path => self.current_location_text().to_string(),
@@ -10990,7 +11267,9 @@ impl MusheenApp {
     }
 
     fn handle_escape(&mut self, cx: &mut Context<Self>) {
-        if self.keyboard_context_popup.take().is_some() {
+        if self.inline_rename.is_some() {
+            self.cancel_inline_rename(cx);
+        } else if self.keyboard_context_popup.take().is_some() {
             self.pending_content_focus = true;
             cx.notify();
         } else if self.omnibar.mode() != OmnibarMode::Path {
@@ -14038,6 +14317,39 @@ impl MusheenApp {
         })
     }
 
+    fn item_name_element(&self, spec: &ItemRenderSpec) -> AnyElement {
+        if let Some((input, error)) = self.inline_rename.as_ref().and_then(|rename| {
+            (rename.tab_id == spec.tab_id && rename.item_id == spec.id)
+                .then_some(
+                    rename
+                        .input
+                        .as_ref()
+                        .map(|input| (input, rename.error.as_ref())),
+                )
+                .flatten()
+        }) {
+            let mut name = div().w_full().flex().items_center().gap_1().child(
+                div()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .child(Input::new(input).id("inline-rename-input")),
+            );
+            if let Some(error) = error {
+                name = name.child(
+                    div()
+                        .id("inline-rename-error")
+                        .test_support()
+                        .role(Role::Alert)
+                        .text_xs()
+                        .child(error.to_string()),
+                );
+            }
+            name.into_any_element()
+        } else {
+            div().child(spec.name.clone()).into_any_element()
+        }
+    }
+
     fn render_item(&mut self, spec: ItemRenderSpec, cx: &mut Context<Self>) -> AnyElement {
         let identity = content_identity_for_item(spec.kind, &spec.path);
         let icon_name = freedesktop_icon_name(&identity);
@@ -14075,6 +14387,11 @@ impl MusheenApp {
         let drag_payload = self.drag_payload(&spec);
         let is_drop_target = spec.kind == ItemKind::Directory;
         let drop_target = spec.path.clone();
+        let is_editing = self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|rename| rename.tab_id == spec.tab_id && rename.item_id == spec.id);
+        let mut name = Some(self.item_name_element(&spec));
         let item = match spec.layout {
             Layout::Cards | Layout::Grid | Layout::Adaptive => div()
                 .id(item_id)
@@ -14106,7 +14423,7 @@ impl MusheenApp {
                         .w_full()
                         .text_center()
                         .overflow_hidden()
-                        .child(spec.name),
+                        .child(name.take().expect("an item has one name")),
                 ),
             Layout::List => div()
                 .id(item_id)
@@ -14127,7 +14444,11 @@ impl MusheenApp {
                 })
                 .hover(|style| style.bg(colors.list_hover))
                 .child(div().w(px(28.)).flex().justify_center().child(icon))
-                .child(div().flex_grow(1.0).child(spec.name))
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .child(name.take().expect("an item has one name")),
+                )
                 .child(
                     div()
                         .w(px(96.))
@@ -14155,7 +14476,12 @@ impl MusheenApp {
                 })
                 .hover(|style| style.bg(colors.list_hover))
                 .child(div().w(px(28.)).flex().justify_center().child(icon))
-                .child(div().flex_grow(1.0).overflow_hidden().child(spec.name))
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .overflow_hidden()
+                        .child(name.take().expect("an item has one name")),
+                )
                 .when(spec.kind == ItemKind::Directory, |item| {
                     item.child(Icon::new(IconName::ArrowRight).small())
                 }),
@@ -14176,7 +14502,7 @@ impl MusheenApp {
                                                 icon.take().expect("name is a required column"),
                                             ),
                                         )
-                                        .child(spec.name.clone())
+                                        .child(name.take().expect("name is a required column"))
                                 }
                                 ColumnKey::Size => cell
                                     .text_sm()
@@ -14229,6 +14555,9 @@ impl MusheenApp {
             })
             .child(item);
         item.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            if is_editing {
+                return;
+            }
             let modifiers = event.modifiers();
             let mode = if modifiers.shift {
                 SelectionMode::Add
@@ -14789,6 +15118,7 @@ impl Render for MusheenApp {
             }));
         }
         self.ensure_omnibar(window, cx);
+        self.ensure_inline_rename_input(window, cx);
         if let Some(mode) = self.requested_omnibar_mode.take() {
             self.activate_omnibar(mode, window, cx);
         } else if let Some(value) = self.pending_omnibar_value.take()
@@ -14878,20 +15208,26 @@ impl Render for MusheenApp {
                     this.open_keyboard_context_menu(window, cx);
                 }),
             )
-            .on_action(cx.listener(|this, _: &FocusNextDirectoryItem, _, cx| {
-                this.move_directory_focus(1, cx);
+            .on_action(cx.listener(|this, _: &FocusNextDirectoryItem, window, cx| {
+                this.handle_directory_focus_key(1, false, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &FocusPreviousDirectoryItem, _, cx| {
-                this.move_directory_focus(-1, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ExtendNextDirectoryItem, _, cx| {
-                this.move_directory_focus_with_selection(1, true, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ExtendPreviousDirectoryItem, _, cx| {
-                this.move_directory_focus_with_selection(-1, true, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ActivateDirectoryItem, _, cx| {
-                this.activate_focused_directory_item(cx);
+            .on_action(
+                cx.listener(|this, _: &FocusPreviousDirectoryItem, window, cx| {
+                    this.handle_directory_focus_key(-1, false, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ExtendNextDirectoryItem, window, cx| {
+                    this.handle_directory_focus_key(1, true, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ExtendPreviousDirectoryItem, window, cx| {
+                    this.handle_directory_focus_key(-1, true, window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ActivateDirectoryItem, window, cx| {
+                this.handle_directory_activate_key(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminalDrawer, window, cx| {
                 this.toggle_terminal_drawer(window, cx);
@@ -16101,6 +16437,389 @@ mod tests {
 
     fn selected_item_count(app: &Entity<MusheenApp>, cx: &TestAppContext) -> usize {
         cx.read(|cx| app.read(cx).focused_directory().view().selected_ids().len())
+    }
+
+    #[gpui_kit::test]
+    async fn f2_edits_the_selected_name_in_its_row(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("before.txt"), b"item").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            assert!(window.find("inline-rename-input").visible());
+            let input = app
+                .read(cx)
+                .inline_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .as_ref()
+                .unwrap();
+            assert!(input.read(cx).focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui_kit::test]
+    async fn escape_cancels_inline_rename_and_keeps_the_selection(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("before.txt");
+        filesystem::write(&original, b"item").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            window.press("escape", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        cx.read(|cx| {
+            let state = app.read(cx);
+            assert!(state.inline_rename.is_none());
+            assert!(state.focused_directory().view().editing().is_none());
+            assert_eq!(state.focused_directory().view().selected_ids().len(), 1);
+        });
+        assert!(original.exists());
+    }
+
+    #[gpui_kit::test]
+    async fn enter_submits_inline_rename_through_the_operation_queue(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("before.txt");
+        let renamed = temporary.path().join("after.txt");
+        filesystem::write(&original, b"item").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            let input = app
+                .read(cx)
+                .inline_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .clone()
+                .unwrap();
+            input.update(cx, |input, cx| input.set_value("after.txt", window, cx));
+            window.press("enter", cx);
+        })
+        .unwrap();
+
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| renamed.exists())
+            .await;
+        assert!(!original.exists());
+        assert_eq!(filesystem::read(renamed).unwrap(), b"item");
+        cx.read(|cx| assert!(app.read(cx).inline_rename.is_none()));
+    }
+
+    #[gpui_kit::test]
+    async fn inline_rename_rejects_invalid_names_without_submitting(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("before.txt");
+        filesystem::write(&original, b"item").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        for invalid in ["", ".", "bad/name"] {
+            cx.update_window(browser, |_, window, cx| {
+                let input = app
+                    .read(cx)
+                    .inline_rename
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .clone()
+                    .unwrap();
+                input.update(cx, |input, cx| input.set_value(invalid, window, cx));
+                window.press("enter", cx);
+            })
+            .unwrap();
+            cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+                app.read(cx)
+                    .inline_rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.error.is_some())
+            })
+            .await;
+            cx.update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                assert!(window.find("inline-rename-error").visible());
+            })
+            .unwrap();
+            cx.read(|cx| assert!(app.read(cx).operation_error.is_none()));
+        }
+
+        assert!(original.exists());
+        cx.read(|cx| {
+            assert!(
+                app.read(cx)
+                    .operation_hub
+                    .status()
+                    .lock()
+                    .unwrap()
+                    .history()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn directory_arrows_do_not_steal_inline_rename_focus(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("first.txt"), b"first").unwrap();
+        filesystem::write(temporary.path().join("second.txt"), b"second").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            window.press("down", cx);
+            window.render_frame(cx);
+            assert!(window.find("inline-rename-input").visible());
+            let input = app
+                .read(cx)
+                .inline_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .as_ref()
+                .unwrap();
+            assert!(input.read(cx).focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+        cx.read(|cx| assert!(app.read(cx).inline_rename.is_some()));
+    }
+
+    #[gpui_kit::test]
+    async fn unchanged_inline_rename_closes_without_a_job(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("before.txt");
+        filesystem::write(&original, b"item").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).inline_rename.is_none()
+        })
+        .await;
+
+        assert_eq!(filesystem::read(original).unwrap(), b"item");
+        cx.read(|cx| {
+            assert!(
+                app.read(cx)
+                    .operation_hub
+                    .status()
+                    .lock()
+                    .unwrap()
+                    .history()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn inline_rename_reports_a_sibling_collision_before_submitting(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("before.txt");
+        let sibling = temporary.path().join("taken.txt");
+        filesystem::write(&original, b"original").unwrap();
+        filesystem::write(&sibling, b"sibling").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let id = state
+                .focused_directory()
+                .view()
+                .items()
+                .iter()
+                .find(|item| item.path().as_unix_path() == Some(original.as_path()))
+                .unwrap()
+                .id()
+                .clone();
+            state.select_item(tab, id, cx);
+        });
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            let input = app
+                .read(cx)
+                .inline_rename
+                .as_ref()
+                .unwrap()
+                .input
+                .clone()
+                .unwrap();
+            input.update(cx, |input, cx| input.set_value("taken.txt", window, cx));
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx)
+                .inline_rename
+                .as_ref()
+                .is_some_and(|rename| rename.error.is_some())
+        })
+        .await;
+
+        assert_eq!(filesystem::read(original).unwrap(), b"original");
+        assert_eq!(filesystem::read(sibling).unwrap(), b"sibling");
+        cx.read(|cx| {
+            assert!(
+                app.read(cx)
+                    .operation_hub
+                    .status()
+                    .lock()
+                    .unwrap()
+                    .history()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn navigating_away_cancels_inline_rename(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("before.txt"), b"item").unwrap();
+        let child = temporary.path().join("child");
+        filesystem::create_dir(&child).unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let id = state
+                .focused_directory()
+                .view()
+                .items()
+                .iter()
+                .find(|item| {
+                    item.path().as_unix_path()
+                        == Some(temporary.path().join("before.txt").as_path())
+                })
+                .unwrap()
+                .id()
+                .clone();
+            state.select_item(tab, id, cx);
+        });
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            assert!(window.find("inline-rename-input").visible());
+        })
+        .unwrap();
+
+        app.update(cx, |state, cx| {
+            state.navigate(StorePath::from_unix_path(&child), true, cx);
+        });
+        cx.read(|cx| assert!(app.read(cx).inline_rename.is_none()));
+    }
+
+    #[gpui_kit::test]
+    async fn switching_tabs_cancels_inline_rename(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("before.txt"), b"item").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            assert!(window.find("inline-rename-input").visible());
+        })
+        .unwrap();
+
+        app.update(cx, |state, cx| {
+            state.dispatch_tab_action(CommandAction::NewTab, cx);
+        });
+        cx.read(|cx| {
+            let state = app.read(cx);
+            assert!(state.inline_rename.is_none());
+            assert!(
+                state
+                    .directories
+                    .values()
+                    .all(|directory| directory.view().editing().is_none())
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn selecting_another_item_cancels_inline_rename(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first.txt");
+        let second = temporary.path().join("second.txt");
+        filesystem::write(&first, b"first").unwrap();
+        filesystem::write(&second, b"second").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let focus = app.read(cx).content_focus.clone();
+            focus.focus(window, cx);
+            window.press("f2", cx);
+            window.render_frame(cx);
+            assert!(window.find("inline-rename-input").visible());
+        })
+        .unwrap();
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let editing = state.inline_rename.as_ref().unwrap().item_id.clone();
+            let next = state
+                .focused_directory()
+                .view()
+                .items()
+                .iter()
+                .find(|item| item.id() != &editing)
+                .unwrap()
+                .id()
+                .clone();
+            state.select_item(tab, next, cx);
+        });
+        cx.read(|cx| assert!(app.read(cx).inline_rename.is_none()));
+        assert!(first.exists() && second.exists());
     }
 
     #[gpui_kit::test]

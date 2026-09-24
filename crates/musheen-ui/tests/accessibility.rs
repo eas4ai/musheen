@@ -68,6 +68,24 @@ fn pseudo_locale_covers_and_expands_every_english_message() {
 }
 
 #[test]
+fn inline_rename_errors_are_available_in_every_locale() {
+    let english = Catalog::load(Locale::EnUs).unwrap();
+    for locale in [Locale::EnXa, Locale::Ar] {
+        let catalog = Catalog::load(locale).unwrap();
+        for key in [
+            "inline-rename-empty",
+            "inline-rename-dot",
+            "inline-rename-separator",
+            "inline-rename-nul",
+            "inline-rename-conflict",
+            "inline-rename-check-failed",
+        ] {
+            assert_ne!(catalog.message(key).unwrap(), english.message(key).unwrap());
+        }
+    }
+}
+
+#[test]
 fn application_and_content_icons_keep_distinct_identity_sources() {
     assert_eq!(ApplicationIdentity::ID, "org.musheen.Musheen");
     assert_eq!(ApplicationIdentity::ICON_NAME, "musheen");
