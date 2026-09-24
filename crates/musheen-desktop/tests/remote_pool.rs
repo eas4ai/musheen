@@ -4,11 +4,11 @@ use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::remote::{
     CONNECT_TIMEOUT, ConnectionProbe, ConnectionProfile, ConnectionProfiles, CredentialResolver,
-    HostKeyPolicy, NativeRootCertificateProvider, PoolLimits, PoolRuntime, ProfileConnectionTest,
-    ProfileConnectionTester, ProtocolConnectionProbe, ProviderPool, ProxyKind, ProxySettings,
-    RemoteConnector, RemoteError, RemoteErrorCategory, RemoteHost, RemoteProtocol,
-    RootCertificateProvider, SaveConfirmation, SaveRequirement, SecurityPolicy, TLS_PIN_BYTES,
-    TestReport, TlsPolicy,
+    HostKeyPolicy, IDLE_TIMEOUT, NativeRootCertificateProvider, PoolLimits, PoolRuntime,
+    ProfileConnectionTest, ProfileConnectionTester, ProtocolConnectionProbe, ProviderPool,
+    ProxyKind, ProxySettings, RemoteConnector, RemoteError, RemoteErrorCategory, RemoteHost,
+    RemoteProtocol, RootCertificateProvider, SaveConfirmation, SaveRequirement, SecurityPolicy,
+    TLS_PIN_BYTES, TestReport, TlsPolicy,
 };
 use musheen_desktop::{ConnectionId, CredentialReference, SecretBuffer};
 use std::collections::VecDeque;
@@ -1265,6 +1265,31 @@ fn defaults_are_fifteen_second_connect_sixty_second_idle_four_by_eight() {
     assert_eq!(limits.idle_timeout(), Duration::from_secs(60));
     assert_eq!(limits.requests_per_connection(), 4);
     assert_eq!(limits.connections_per_provider(), 8);
+}
+
+#[test]
+fn configured_pool_rejects_values_above_the_documented_budgets() {
+    let defaults = PoolLimits::default();
+    assert!(
+        PoolLimits::new(
+            defaults.connect_timeout(),
+            defaults.idle_timeout(),
+            defaults.requests_per_connection(),
+            defaults.connections_per_provider(),
+        )
+        .is_ok()
+    );
+    for limits in [
+        PoolLimits::new(Duration::from_secs(16), IDLE_TIMEOUT, 4, 8),
+        PoolLimits::new(CONNECT_TIMEOUT, Duration::from_secs(61), 4, 8),
+        PoolLimits::new(CONNECT_TIMEOUT, IDLE_TIMEOUT, 5, 8),
+        PoolLimits::new(CONNECT_TIMEOUT, IDLE_TIMEOUT, 4, 9),
+    ] {
+        assert!(
+            matches!(limits, Err(error) if error.category() == RemoteErrorCategory::InvalidProfile),
+            "an over-budget pool configuration was accepted"
+        );
+    }
 }
 
 #[test]

@@ -3032,7 +3032,15 @@ fn every_archive_budget_trips_independently_and_in_combination() {
     drop(lease);
     assert_eq!(combined.counters().memory_bytes, 0);
     let lease = combined.reserve_memory(8).expect("phase-one allocation");
-    let next_phase = combined.next_phase();
+    let mut next_phase = combined.next_phase();
+    assert!(matches!(
+        next_phase.charge_temporary(1),
+        Err(ArchiveOperationError::LimitExceeded {
+            resource: "temporary bytes",
+            value: 10,
+            maximum: 9,
+        })
+    ));
     assert!(matches!(
         next_phase.reserve_memory(1),
         Err(ArchiveOperationError::LimitExceeded {
@@ -3260,6 +3268,14 @@ fn production_archive_ceiling_values_trip_without_large_allocations() {
         ArchiveBudget::new(limits.clone())
             .charge_temporary(limits.max_temporary_bytes + 1)
             .is_err()
+    );
+}
+
+#[test]
+fn default_archive_staging_budget_does_not_exceed_ten_gib() {
+    assert_eq!(
+        ArchiveOperationLimits::default().max_temporary_bytes,
+        10 * 1_024 * 1_024 * 1_024
     );
 }
 

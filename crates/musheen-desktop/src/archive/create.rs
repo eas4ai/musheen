@@ -217,8 +217,18 @@ fn run_archive_creation<S: JournalStorage>(
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
     cancellation.wait_if_paused()?;
+    let destination = local_path(plan.destination())?;
+    if let Some(outcome) = existing_destination_outcome(&destination, plan.conflict_policy())? {
+        return Ok(outcome);
+    }
+    let staging_parent = destination
+        .parent()
+        .ok_or(ArchiveOperationError::UnsafePath(
+            "archive destination needs a parent",
+        ))?;
+    let operation_limits = limits.for_staging(staging_parent)?;
     let budget = Rc::new(RefCell::new(
-        ArchiveBudget::with_accounting(limits.clone(), accounting.clone())
+        ArchiveBudget::with_accounting(operation_limits, accounting.clone())
             .with_identity_cancellation(cancellation.clone()),
     ));
     let plan_path_bytes = plan
@@ -233,10 +243,6 @@ fn run_archive_creation<S: JournalStorage>(
     let _plan_paths_memory = budget
         .borrow()
         .reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
-    let destination = local_path(plan.destination())?;
-    if let Some(outcome) = existing_destination_outcome(&destination, plan.conflict_policy())? {
-        return Ok(outcome);
-    }
     let entries = collect_create_entries(plan, &mut budget.borrow_mut(), cancellation)?;
     let staging = staging_path(plan, job_id, generation)?;
     let rollback = cleanup_path(&staging)?;

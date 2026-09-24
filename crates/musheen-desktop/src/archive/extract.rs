@@ -55,20 +55,6 @@ pub(crate) fn execute_extract<S: JournalStorage>(
 ) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
     report_phase(ArchiveEventPhase::Preflight)?;
     cancellation.wait_if_paused()?;
-    let mut budget = ArchiveBudget::with_accounting(limits.clone(), accounting.clone())
-        .with_identity_cancellation(cancellation.clone());
-    let plan_path_bytes = plan
-        .sources()
-        .iter()
-        .chain(std::iter::once(plan.destination()))
-        .map(|path| {
-            path.as_unix_path()
-                .map_or(0, |value| value.as_os_str().len())
-        })
-        .sum::<usize>();
-    let _plan_paths_memory =
-        budget.reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
-    let counters = DecodeCounterState::with_memory_budget(budget.shared_memory());
     let source = local_path(
         plan.sources()
             .first()
@@ -82,15 +68,30 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             ArchiveConflictPolicy::Replace => {}
         }
     }
-    let source_file = open_archive_source(&source)?;
-    let source_identity = file_identity(&source_file)?;
-    let source_metadata = source_file.metadata().map_err(|error| map_io(&error))?;
-    let source_bytes = source_metadata.len();
     let snapshot_parent = destination
         .parent()
         .ok_or(ArchiveOperationError::UnsafePath(
             "archive destination needs a parent",
         ))?;
+    let operation_limits = limits.for_staging(snapshot_parent)?;
+    let mut budget = ArchiveBudget::with_accounting(operation_limits.clone(), accounting.clone())
+        .with_identity_cancellation(cancellation.clone());
+    let plan_path_bytes = plan
+        .sources()
+        .iter()
+        .chain(std::iter::once(plan.destination()))
+        .map(|path| {
+            path.as_unix_path()
+                .map_or(0, |value| value.as_os_str().len())
+        })
+        .sum::<usize>();
+    let _plan_paths_memory =
+        budget.reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
+    let counters = DecodeCounterState::with_memory_budget(budget.shared_memory());
+    let source_file = open_archive_source(&source)?;
+    let source_identity = file_identity(&source_file)?;
+    let source_metadata = source_file.metadata().map_err(|error| map_io(&error))?;
+    let source_bytes = source_metadata.len();
     budget.charge_temporary(source_bytes)?;
     let mut source_snapshot =
         tempfile::tempfile_in(snapshot_parent).map_err(|error| map_io(&error))?;
@@ -113,7 +114,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         .seek(SeekFrom::Start(0))
         .map_err(|error| map_io(&error))?;
     let format = archive_format(plan.codec());
-    let decode_limits = decode_limits(limits);
+    let decode_limits = decode_limits(&operation_limits);
     let entries = collect_extract_entries(
         &source_snapshot,
         source_bytes,

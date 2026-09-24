@@ -30,9 +30,13 @@ impl PoolLimits {
         connections_per_provider: usize,
     ) -> Result<Self, RemoteError> {
         if connect_timeout.is_zero()
+            || connect_timeout > CONNECT_TIMEOUT
             || idle_timeout.is_zero()
+            || idle_timeout > IDLE_TIMEOUT
             || requests_per_connection == 0
+            || requests_per_connection > REQUESTS_PER_CONNECTION
             || connections_per_provider == 0
+            || connections_per_provider > CONNECTIONS_PER_PROVIDER
         {
             return Err(RemoteError::new(
                 super::RemoteProtocol::Http,

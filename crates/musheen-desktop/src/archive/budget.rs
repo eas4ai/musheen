@@ -1,9 +1,13 @@
 use super::ArchiveError;
 use musheen_core::CancellationToken;
+use nix::sys::statvfs::statvfs;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+
+const MAX_TEMPORARY_BYTES: u64 = 10 * 1_024 * 1_024 * 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveOperationLimits {
@@ -26,9 +30,29 @@ impl Default for ArchiveOperationLimits {
             max_nesting: 8,
             max_path_bytes: 4_096,
             max_memory_bytes: 512 * 1_024 * 1_024,
-            max_temporary_bytes: 20 * 1_024 * 1_024 * 1_024,
+            max_temporary_bytes: MAX_TEMPORARY_BYTES,
             max_identity_millis: 30_000,
         }
+    }
+}
+
+impl ArchiveOperationLimits {
+    pub(crate) fn for_staging(&self, parent: &Path) -> Result<Self, ArchiveOperationError> {
+        let space = statvfs(parent)
+            .map_err(|error| map_io(&std::io::Error::from_raw_os_error(error as i32)))?;
+        let available = space
+            .blocks_available()
+            .saturating_mul(space.fragment_size());
+        Ok(self.with_available_temporary_bytes(available))
+    }
+
+    fn with_available_temporary_bytes(&self, available: u64) -> Self {
+        let mut limits = self.clone();
+        limits.max_temporary_bytes = limits
+            .max_temporary_bytes
+            .min(MAX_TEMPORARY_BYTES)
+            .min(available / 2);
+        limits
     }
 }
 
@@ -236,14 +260,14 @@ impl ArchiveBudget {
         }
     }
 
-    /// Starts a new accounting phase while retaining the shared live-memory total.
+    /// Starts a new phase while retaining live memory and staging-space charges.
     #[must_use]
     pub fn next_phase(&self) -> Self {
         Self {
             limits: self.limits.clone(),
             entries: 0,
             expanded_bytes: 0,
-            temporary_bytes: 0,
+            temporary_bytes: self.temporary_bytes,
             memory: self.memory.clone(),
             accounting: self.accounting.clone(),
             identity_cancellation: self.identity_cancellation.clone(),
@@ -698,6 +722,38 @@ pub(crate) fn map_io(error: &std::io::Error) -> ArchiveOperationError {
 mod tests {
     use super::{ArchiveBudget, ArchiveOperationError, ArchiveOperationLimits};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn staging_limit_uses_the_lower_of_configured_and_half_free_space() {
+        const GIB: u64 = 1_024 * 1_024 * 1_024;
+        let limits = ArchiveOperationLimits::default();
+        assert_eq!(
+            limits
+                .with_available_temporary_bytes(12 * GIB)
+                .max_temporary_bytes,
+            6 * GIB
+        );
+        assert_eq!(
+            limits
+                .with_available_temporary_bytes(40 * GIB)
+                .max_temporary_bytes,
+            10 * GIB
+        );
+        let lower = ArchiveOperationLimits {
+            max_temporary_bytes: 2 * GIB,
+            ..limits
+        };
+        assert_eq!(
+            lower
+                .with_available_temporary_bytes(12 * GIB)
+                .max_temporary_bytes,
+            2 * GIB
+        );
+        assert_eq!(
+            lower.with_available_temporary_bytes(1).max_temporary_bytes,
+            0
+        );
+    }
 
     #[test]
     fn identity_deadline_starts_when_each_walk_starts() {
