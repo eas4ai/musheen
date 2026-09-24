@@ -176,6 +176,7 @@ pub(crate) struct DirectoryIndexWatchResult {
     indexed_count: usize,
     visible_count: usize,
     removed: Option<musheen_core::ItemId>,
+    selection_transition: Option<(u64, Option<u64>)>,
 }
 
 pub(crate) struct DirectoryIndexOrderWork {
@@ -210,6 +211,18 @@ impl DirectoryIndexWatchWork {
             .lock()
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
         let arrival = index.record_count();
+        let event_id = match &self.event {
+            WatchEvent::Created(item)
+            | WatchEvent::Changed(item)
+            | WatchEvent::Renamed { item, .. } => Some(item.id()),
+            WatchEvent::Removed(id) => Some(id),
+            WatchEvent::Invalidated { .. } => None,
+        };
+        let previous_arrival = event_id
+            .map(|id| index.lookup_id_with_arrival(id))
+            .transpose()?
+            .flatten()
+            .map(|(_, arrival)| arrival);
         let removed = match self.event {
             WatchEvent::Created(item)
             | WatchEvent::Changed(item)
@@ -232,6 +245,16 @@ impl DirectoryIndexWatchWork {
         Ok(DirectoryIndexWatchResult {
             indexed_count: index.active_count().unwrap_or(0),
             visible_count: index.visible_count().unwrap_or(0),
+            selection_transition: previous_arrival.map(|old| {
+                (
+                    old,
+                    if removed.is_some() {
+                        None
+                    } else {
+                        Some(arrival)
+                    },
+                )
+            }),
             removed,
         })
     }
@@ -700,6 +723,15 @@ impl DirectoryModel {
         }
         match result {
             Ok(result) => {
+                if let (Some(selection), Some((old, new))) =
+                    (&mut self.indexed_selection, result.selection_transition)
+                    && let Err(error) = selection.carry_forward(old, new)
+                {
+                    self.state = DirectoryState::Error(
+                        format!("Directory selection failed: {error}").into(),
+                    );
+                    return true;
+                }
                 self.order_epoch = self.order_epoch.wrapping_add(1);
                 self.indexed_count = result.indexed_count;
                 self.indexed_visible_count = result.visible_count;
@@ -850,6 +882,54 @@ mod indexed_watch_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn indexed_bitmap_selection_follows_changed_identity_and_removal() {
+        let mut model = DirectoryModel::new(ResourceLimits::default());
+        let load = model.begin_navigation(StorePath::from_unix_path("/many"));
+        for batch in 0..9 {
+            let request = PageRequest::first(&ResourceLimits::default());
+            let items = (batch * 512..(batch + 1) * 512)
+                .map(|number| item(number, &format!("item-{number}")))
+                .collect();
+            let page = Page::try_new(&request, items, None, TotalHint::Unknown).unwrap();
+            assert_eq!(model.apply_page(&load, page), ApplyPageResult::Applied);
+        }
+        let selection = model
+            .index_reader()
+            .unwrap()
+            .select_visible_range(0..model.visible_count())
+            .unwrap();
+        model.set_indexed_selection(selection, None);
+        assert_eq!(model.indexed_selected_count(), 4_608);
+
+        let renamed = item(0, "renamed");
+        let work = model
+            .prepare_index_watch_event(&load, WatchEvent::Changed(renamed.clone()), None)
+            .unwrap();
+        assert!(model.finish_index_watch_event(&load, work.run()));
+        let targets = model
+            .index_reader()
+            .unwrap()
+            .resolve_command_targets(&[], model.indexed_selection())
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(targets.len(), 4_608);
+        assert!(targets.iter().any(|target| target.path() == renamed.path()));
+
+        let work = model
+            .prepare_index_watch_event(&load, WatchEvent::Removed(renamed.id().clone()), None)
+            .unwrap();
+        assert!(model.finish_index_watch_event(&load, work.run()));
+        assert_eq!(model.indexed_selected_count(), 4_607);
+
+        let work = model
+            .prepare_index_watch_event(&load, WatchEvent::Created(item(9_000, "new")), None)
+            .unwrap();
+        assert!(model.finish_index_watch_event(&load, work.run()));
+        assert_eq!(model.indexed_selected_count(), 4_607);
     }
 
     #[test]

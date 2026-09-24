@@ -169,6 +169,48 @@ impl IndexedSelection {
     pub(crate) fn count(&self) -> usize {
         self.count
     }
+
+    pub(crate) fn carry_forward(
+        &mut self,
+        old_arrival: u64,
+        new_arrival: Option<u64>,
+    ) -> io::Result<()> {
+        if !self.contains(old_arrival) {
+            return Ok(());
+        }
+        if let Some(new_arrival) = new_arrival {
+            let ordinal = usize::try_from(new_arrival).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "arrival exceeds selection limits",
+                )
+            })?;
+            let required = ordinal
+                .checked_div(64)
+                .and_then(|word| word.checked_add(1))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "selection size overflow")
+                })?;
+            if required > self.bits.len() {
+                self.bits
+                    .try_reserve(required - self.bits.len())
+                    .map_err(io::Error::other)?;
+                self.bits.resize(required, 0);
+            }
+        }
+        let old = usize::try_from(old_arrival).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "arrival exceeds selection limits",
+            )
+        })?;
+        self.bits[old / 64] &= !(1u64 << (old % 64));
+        self.count -= 1;
+        if let Some(new_arrival) = new_arrival {
+            self.insert(new_arrival)?;
+        }
+        Ok(())
+    }
 }
 
 struct SortEntry {
@@ -525,8 +567,11 @@ impl DiskDirectoryIndex {
         &mut self,
         selection: &IndexedSelection,
     ) -> io::Result<ResolvedIndexedSelection> {
-        let order = self.order.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
+        let order = self.id_order.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "directory identity order is not ready",
+            )
         })?;
         order.file.seek(SeekFrom::Start(0))?;
         let mut targets = Vec::new();
@@ -553,6 +598,14 @@ impl DiskDirectoryIndex {
     pub(super) fn lookup_id(&mut self, id: &ItemId) -> io::Result<Option<StoreItem>> {
         self.lookup_id_entry(id)
             .map(|entry| entry.map(|entry| entry.item))
+    }
+
+    pub(super) fn lookup_id_with_arrival(
+        &mut self,
+        id: &ItemId,
+    ) -> io::Result<Option<(StoreItem, u64)>> {
+        self.lookup_id_entry(id)
+            .map(|entry| entry.map(|entry| (entry.item, entry.arrival)))
     }
 
     pub(super) fn position_of_id(&mut self, id: &ItemId) -> io::Result<Option<usize>> {
@@ -837,7 +890,12 @@ mod tests {
         assert!(selection.contains(3));
         let resolved = index.resolve_bitmap(&selection).unwrap();
         assert_eq!(resolved.targets.len(), 3);
-        assert_eq!(resolved.targets[0].1, StorePath::from_unix_path("/many/a"));
+        assert!(
+            resolved
+                .targets
+                .iter()
+                .any(|(_, path)| path == &StorePath::from_unix_path("/many/a"))
+        );
         assert_eq!(resolved.first_item.unwrap().path(), &resolved.targets[0].1);
 
         let newcomer = StoreItem::new(
@@ -852,6 +910,14 @@ mod tests {
             .rebuild_order(&ViewPreferences::default(), None)
             .unwrap();
         assert!(!selection.contains(4));
+        assert_eq!(index.resolve_bitmap(&selection).unwrap().targets.len(), 3);
+        index
+            .rebuild_order(
+                &ViewPreferences::default(),
+                Some(&DirectoryFilter::new("a")),
+            )
+            .unwrap();
+        assert_eq!(index.visible_count(), Some(1));
         assert_eq!(index.resolve_bitmap(&selection).unwrap().targets.len(), 3);
     }
 
