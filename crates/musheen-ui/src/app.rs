@@ -5155,11 +5155,17 @@ impl MusheenApp {
             // reach a background pane while an immutable decision is open.
             return;
         }
+        let in_trash = is_trash_location(self.navigation.focused_tab().location());
+        let command_id = if in_trash && command_id == "file.move_to_trash" {
+            "file.delete_permanently"
+        } else {
+            command_id
+        };
         let Some(command) = self.shell.commands().get(command_id) else {
             return;
         };
         let action = command.action();
-        if self.dispatch_indexed_selection_command(command_id, action, cx) {
+        if !in_trash && self.dispatch_indexed_selection_command(command_id, action, cx) {
             return;
         }
         let request = self.active_command_request(action);
@@ -8248,6 +8254,12 @@ impl MusheenApp {
                 if *delete_action == CommandAction::DeletePermanently && !confirmed {
                     self.operation_error = Some("permanent deletion requires confirmation".into());
                     cx.notify();
+                } else if *delete_action == CommandAction::DeletePermanently
+                    && targets
+                        .iter()
+                        .any(|target| target.id().provider().as_str() == "musheen.trash")
+                {
+                    self.delete_trash_targets(origin_tab, targets, cx);
                 } else {
                     self.submit_delete_targets(
                         targets.clone(),
@@ -12794,6 +12806,33 @@ impl MusheenApp {
         self.confirm_context_review(invocation, Vec::new(), None, cx);
     }
 
+    fn delete_trash_targets(
+        &mut self,
+        origin_tab: Option<TabId>,
+        targets: &[CommandTargetRef],
+        cx: &mut Context<Self>,
+    ) {
+        let captured_items = origin_tab.and_then(|tab_id| {
+            self.trash_items_for_targets(tab_id, targets)
+                .map(|items| (tab_id, items))
+        });
+        if let Some((tab_id, items)) = captured_items {
+            self.purge_trash_receipts(
+                tab_id,
+                items.iter().map(|item| item.receipt().clone()).collect(),
+                cx,
+            );
+        } else {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.target-changed")
+                    .expect("target refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+        }
+    }
+
     fn empty_trash(
         &mut self,
         tab_id: TabId,
@@ -12813,6 +12852,15 @@ impl MusheenApp {
             cx.notify();
             return;
         }
+        self.purge_trash_receipts(tab_id, receipts, cx);
+    }
+
+    fn purge_trash_receipts(
+        &mut self,
+        tab_id: TabId,
+        receipts: Vec<musheen_ops::TrashReceipt>,
+        cx: &mut Context<Self>,
+    ) {
         #[cfg(test)]
         if let Some(probe) = &self.trash_purge_probe {
             probe
@@ -22332,6 +22380,98 @@ mod tests {
                 state.operation_error.as_deref(),
                 Some(state.catalog.message("context.target-changed").unwrap())
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn trash_delete_key_and_menu_purge_only_confirmed_live_receipts(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("ordinary.txt"), b"ordinary file").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let tab_id = state.navigation.focused_tab().id();
+            let receipt = musheen_ops::TrashReceipt::new(
+                StorePath::from_unix_path(temporary.path().join("first")),
+                b"first-receipt".to_vec(),
+            );
+            let other = musheen_ops::TrashReceipt::new(
+                StorePath::from_unix_path(temporary.path().join("second")),
+                b"second-receipt".to_vec(),
+            );
+            let items = vec![TrashItem::new(receipt.clone(), 1), TrashItem::new(other, 1)];
+            let target = trash_command_target(&items[0]);
+            state.navigation.navigate_focused(trash_store_path());
+            state
+                .trash_states
+                .insert(tab_id, TrashState::Ready(TrashSurfaceModel::new(items)));
+            state
+                .navigation
+                .tab_mut(tab_id)
+                .unwrap()
+                .set_selection(vec![target.id().clone()]);
+            let dispatch_probe = Arc::new(Mutex::new(Vec::new()));
+            state.command_dispatch_probe = Some(Arc::clone(&dispatch_probe));
+            state.dispatch_command("file.move_to_trash", cx);
+            assert_eq!(
+                dispatch_probe.lock().unwrap().as_slice(),
+                &[("file.delete_permanently".into(), true)],
+                "Delete in Trash must use the reviewed permanent-delete action",
+            );
+            state.command_dispatch_probe = None;
+            let purge_probe = Arc::new(Mutex::new(Vec::new()));
+            state.trash_purge_probe = Some(Arc::clone(&purge_probe));
+            let delete_menu = state.compose_context_request(
+                state.active_command_request(CommandAction::DeletePermanently),
+            );
+            let delete_entry =
+                MusheenApp::menu_entry_by_id(&delete_menu, "file.delete_permanently").unwrap();
+            assert!(delete_entry.state().is_enabled());
+            let invocation = state
+                .shell
+                .context_menus()
+                .invoke(delete_entry, &mut AppMenuDispatcher::default());
+            assert!(matches!(invocation, MenuInvocation::NeedsConfirmation(_)));
+            state.confirm_context_review(invocation, Vec::new(), None, cx);
+            assert_eq!(
+                purge_probe.lock().unwrap().as_slice(),
+                &[vec![receipt]],
+                "confirmed deletion must purge only the selected receipt",
+            );
+            purge_probe.lock().unwrap().clear();
+
+            let stale_menu = state.compose_context_request(
+                state.active_command_request(CommandAction::DeletePermanently),
+            );
+            let stale_entry =
+                MusheenApp::menu_entry_by_id(&stale_menu, "file.delete_permanently").unwrap();
+            let stale_invocation = state
+                .shell
+                .context_menus()
+                .invoke(stale_entry, &mut AppMenuDispatcher::default());
+            state
+                .navigation
+                .navigate_focused(StorePath::from_unix_path(temporary.path().as_os_str()));
+            state.operation_error = None;
+            state.confirm_context_review(stale_invocation, Vec::new(), None, cx);
+            assert_eq!(
+                state.operation_error.as_deref(),
+                Some(state.catalog.message("context.target-changed").unwrap()),
+                "a Trash item confirmation must refuse after its tab navigates away",
+            );
+            assert!(purge_probe.lock().unwrap().is_empty());
         });
     }
 

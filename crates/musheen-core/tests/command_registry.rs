@@ -473,6 +473,37 @@ fn selection_and_destination_rules_are_enforced_before_dispatch() {
 }
 
 #[test]
+fn permanent_delete_allows_trash_receipts_without_writable_virtual_location() {
+    let registry = CommandRegistry::built_in();
+    let delete = registry.get("file.delete_permanently").unwrap();
+    let trash = CommandContext {
+        target: CommandTarget::TrashItem,
+        selection_count: 2,
+        location_is_writable: false,
+        mutation_is_supported: false,
+        ..CommandContext::default()
+    };
+    assert!(delete.state(&trash).is_enabled());
+    assert!(
+        !delete
+            .state(&CommandContext {
+                selection_count: 0,
+                ..trash.clone()
+            })
+            .is_enabled()
+    );
+    assert!(
+        !delete
+            .state(&CommandContext {
+                target: CommandTarget::File,
+                ..trash
+            })
+            .is_enabled(),
+        "regular files must still require a writable location",
+    );
+}
+
+#[test]
 fn checked_and_dangerous_actions_have_explicit_metadata() {
     let registry = CommandRegistry::built_in();
     let context = CommandContext {

@@ -580,6 +580,7 @@ fn is_presentable(
         | CommandPredicate::WritableLocation
         | CommandPredicate::WritableDestination
         | CommandPredicate::WritableSelection
+        | CommandPredicate::PermanentDeleteSelection
         | CommandPredicate::WritableExactlyOneSelection
         | CommandPredicate::WritableSelectionCapability(_)
         | CommandPredicate::WritableExactlyOneSelectionCapability(_)

@@ -60,7 +60,7 @@ Surface tokens cover the **Navigation toolbar**, wide controls, **Compact overfl
 | `file.hide` | `Hide` | archive, directory, executable, file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
 | `file.unhide` | `Unhide` | hidden-file | command-mode, customizable |
 | `file.move_to_trash` | `WritableSelectionCapability(Trash)` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable, shortcut-default |
-| `file.delete_permanently` | `WritableSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, trash-item, unsupported-file | command-mode, customizable, shortcut-default |
+| `file.delete_permanently` | `PermanentDeleteSelection` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, trash-item, unsupported-file | command-mode, customizable, shortcut-default |
 | `item.permissions` | `Capability(Permissions)` | archive, directory, executable, file, hidden-file, multi-selection, pinned-directory, read-only-file, unsupported-file | command-mode, customizable |
 | `directory.open_as_administrator` | `LocalDirectory` | directory, pinned-directory | command-mode, customizable |
 | `file.run_as_administrator` | `LocalExecutable` | executable | command-mode, customizable |

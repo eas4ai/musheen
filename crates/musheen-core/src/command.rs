@@ -781,6 +781,7 @@ pub enum CommandPredicate {
     TrashBackground,
     CustomActionSupportsRemote,
     WritableSelection,
+    PermanentDeleteSelection,
     WritableExactlyOneSelection,
     WritableSelectionCapability(CapabilityKind),
     WritableExactlyOneSelectionCapability(CapabilityKind),
@@ -985,6 +986,11 @@ impl CommandPredicate {
             Self::WritableLocation => Some(writable_location_state(context)),
             Self::WritableDestination => Some(writable_destination_state(context)),
             Self::WritableSelection => Some(writable_selection_state(context)),
+            Self::PermanentDeleteSelection => Some(if context.target == CommandTarget::TrashItem {
+                selection_state(context)
+            } else {
+                writable_selection_state(context)
+            }),
             Self::WritableExactlyOneSelection => {
                 Some(writable_exactly_one_selection_state(context))
             }
@@ -1867,7 +1873,7 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             "command.delete-permanently",
             "trash",
             &[("Shift+Delete", Browser)],
-            P::WritableSelection,
+            P::PermanentDeleteSelection,
             A::DeletePermanently,
             G::Destructive,
             D::Destructive,
