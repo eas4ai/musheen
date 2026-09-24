@@ -113,11 +113,16 @@ Mechanism: notification policy tests across focused, hidden, and closed-window s
 Status: Draft
 Background maintenance rotates logs and performs user-enabled update checks
 without delaying application startup. Update metadata must be HTTPS-fetched,
-cryptographically signed by a pinned project key, and never auto-install.
+cryptographically signed by a pinned project key, and never auto-install. The
+signed v2 payload binds its release channel and monotonic sequence. Musheen
+accepts only its selected channel, stores the highest seen sequence in private
+atomic state, and rejects older signed metadata after restart. The same valid
+sequence may be offered again if delivery failed. Legacy and unsigned metadata
+cannot produce an update offer.
 Falsifier: maintenance blocks first-window readiness, runs a disabled check,
-or presents unsigned metadata as an update.
+or presents unsigned, wrong-channel, or rolled-back metadata as an update.
 Mechanism: startup timing and update-policy tests with delayed, disabled,
-tampered, expired, and valid providers.
+tampered, expired, replayed, wrong-channel, and valid providers.
 
 ## Terminal
 
