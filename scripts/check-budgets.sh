@@ -25,6 +25,7 @@ run_case() {
 
 run_case LIMIT-001 musheen-desktop settings operations_capture_an_immutable_resource_limit_snapshot
 run_case LIMIT-002 musheen-core limits default_directory_limits_match_the_production_budget
+run_case LIMIT-002 musheen-core limits zero_and_above_maximum_limits_are_rejected
 run_case LIMIT-002 musheen-core limits directory_retention_hard_max_matches_the_resident_model_cap
 run_case LIMIT-003 musheen-ui search million_result_producer_requests_refinement_without_unbounded_models
 run_case LIMIT-003 musheen-local search cancellation_interrupts_a_stalled_search_consumer

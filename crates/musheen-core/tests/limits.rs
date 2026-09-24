@@ -33,13 +33,7 @@ fn zero_and_above_maximum_limits_are_rejected() {
         directory_page_items: 0,
         ..ResourceLimitConfig::default()
     });
-    let too_many = ResourceLimits::try_from(ResourceLimitConfig {
-        directory_page_items: ResourceLimitConfig::MAX_DIRECTORY_PAGE_ITEMS + 1,
-        ..ResourceLimitConfig::default()
-    });
-
     assert!(zero.is_err());
-    assert!(too_many.is_err());
 
     for invalid in [
         ResourceLimitConfig {
@@ -64,6 +58,39 @@ fn zero_and_above_maximum_limits_are_rejected() {
         },
         ResourceLimitConfig {
             operation_hash_preview_jobs: 0,
+            ..ResourceLimitConfig::default()
+        },
+    ] {
+        assert!(ResourceLimits::try_from(invalid).is_err());
+    }
+
+    for invalid in [
+        ResourceLimitConfig {
+            directory_page_items: ResourceLimitConfig::MAX_DIRECTORY_PAGE_ITEMS + 1,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            directory_prefetch_pages: ResourceLimitConfig::MAX_DIRECTORY_PREFETCH_PAGES + 1,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            directory_retained_items: ResourceLimitConfig::MAX_DIRECTORY_RETAINED_ITEMS + 1,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            directory_rendered_viewports: ResourceLimitConfig::MAX_DIRECTORY_RENDERED_VIEWPORTS + 1,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            operation_data_mutations: ResourceLimitConfig::MAX_OPERATION_DATA_MUTATIONS + 1,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            operation_metadata_jobs: ResourceLimitConfig::MAX_OPERATION_METADATA_JOBS + 1,
+            ..ResourceLimitConfig::default()
+        },
+        ResourceLimitConfig {
+            operation_hash_preview_jobs: ResourceLimitConfig::MAX_OPERATION_HASH_PREVIEW_JOBS + 1,
             ..ResourceLimitConfig::default()
         },
     ] {
