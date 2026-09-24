@@ -18,10 +18,11 @@ Mechanism: delayed-operation test that edits every limit while work runs.
 [LIMIT-002]
 Status: Draft
 Directory enumeration requests 512 items per page, prefetches at most two
-pages, retains at most 4,096 item models outside selected items, and renders
-at most three viewport heights of rows or tiles.
-Falsifier: a large directory exceeds any default without selection or edit
-state accounting for the retained item.
+pages, retains at most 4,096 item models including selected and edited items,
+and renders at most three viewport heights of rows or tiles. Stable selected
+IDs may outlive their resident item models.
+Falsifier: a large directory exceeds any default or loses selection when an
+item model leaves the resident window.
 Mechanism: million-item paging test with model and component counters.
 
 [LIMIT-003]
