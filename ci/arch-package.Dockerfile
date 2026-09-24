@@ -17,7 +17,7 @@ RUN tar -C /work -czf /work/musheen-0.1.0.tar.gz musheen-0.1.0 \
 
 USER builder
 WORKDIR /work
-ENV CARGO_BUILD_JOBS=8 CARGO_INCREMENTAL=0 \
+ENV CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 \
     CARGO_HOME=/home/builder/.cargo CARGO_TARGET_DIR=/work/target \
     RUST_TEST_THREADS=1 RUST_MIN_STACK=16777216
 RUN --mount=type=cache,target=/home/builder/.cargo,uid=1000,gid=1000 \

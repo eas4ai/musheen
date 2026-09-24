@@ -17,7 +17,7 @@ for toolchain in 1.95.0 stable; do
                 profile_args=(--release)
             fi
             echo "Release matrix: Rust $toolchain, $features features, $profile"
-            cargo +"$toolchain" test --workspace --locked --jobs 8 \
+            cargo +"$toolchain" test --workspace --locked --jobs 1 \
                 "${feature_args[@]}" "${profile_args[@]}"
         done
     done

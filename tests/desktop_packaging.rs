@@ -145,7 +145,7 @@ fn arch_package_builds_all_features_and_stages_the_native_installer() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let recipe = fs::read_to_string(root.join("packaging/arch/PKGBUILD")).unwrap();
     assert!(recipe.contains("pkgname=musheen"));
-    assert!(recipe.contains("--release --locked --all-features --jobs 8"));
+    assert!(recipe.contains("--release --locked --all-features --jobs 1"));
     assert!(recipe.contains("CARGO_INCREMENTAL=0"));
     assert!(recipe.contains("DESTDIR=\"$pkgdir\" ./packaging/install-app.sh"));
     assert!(recipe.contains("MUSHEEN_ARCHIVE_WORKER_BINARY="));

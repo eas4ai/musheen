@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.95-bookworm AS verify
 
-ENV CARGO_BUILD_JOBS=4 \
+ENV CARGO_BUILD_JOBS=1 \
     CARGO_INCREMENTAL=0 \
     CARGO_PROFILE_DEV_DEBUG=0 \
     CARGO_PROFILE_TEST_DEBUG=0 \
@@ -19,7 +19,7 @@ RUN apt-get update \
 RUN rustup toolchain install stable --profile minimal --component clippy,rustfmt
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo install cargo-deny --locked --version 0.20.2 --jobs 4
+    cargo install cargo-deny --locked --version 0.20.2 --jobs 1
 
 WORKDIR /workspace
 COPY . .

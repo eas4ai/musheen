@@ -2,7 +2,7 @@
 set -euo pipefail
 
 : "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR to the Musheen target directory}"
-export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}
 export CARGO_INCREMENTAL=0
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)

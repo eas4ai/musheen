@@ -15,7 +15,7 @@ DOCKER_CONFIG="$docker_config" docker run --rm \
     --name "$container" \
     --volume "$repository:/work:ro" \
     --workdir /work \
-    --env CARGO_BUILD_JOBS=8 \
+    --env CARGO_BUILD_JOBS=1 \
     --env CARGO_TARGET_DIR=/tmp/musheen-target \
     "$image" \
     scripts/check-smb-provider-container.sh

@@ -167,7 +167,20 @@ fn release_container_tests_both_toolchains_features_and_profiles() {
     assert!(matrix.contains("--release"));
     assert!(matrix.contains("Cargo.lock changed"));
     assert!(dockerfile.contains("CARGO_INCREMENTAL=0"));
-    assert!(dockerfile.contains("CARGO_BUILD_JOBS=4"));
+    assert!(dockerfile.contains("CARGO_BUILD_JOBS=1"));
+    assert!(dockerfile.contains("cargo install cargo-deny --locked --version 0.20.2 --jobs 1"));
+    assert!(matrix.contains("--jobs 1"));
+    assert!(!matrix.contains("--jobs 8"));
+    assert!(
+        fs::read_to_string(root.join("scripts/run-benchmarks.sh"))
+            .unwrap()
+            .contains("CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}")
+    );
+    assert!(
+        fs::read_to_string(root.join("scripts/check-budgets.sh"))
+            .unwrap()
+            .contains("CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-1}")
+    );
     assert!(dockerfile.contains("CARGO_PROFILE_TEST_DEBUG=0"));
     assert!(dockerfile.contains("verify-msrv.sh"));
     assert!(dockerfile.contains("verify-dependencies.sh"));

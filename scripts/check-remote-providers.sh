@@ -77,5 +77,5 @@ MUSHEEN_LIVE_SSH_SHA256="$ssh_sha256" \
 MUSHEEN_REMOTE_CONTAINER="$container" \
 MUSHEEN_REMOTE_LIVE=1 \
 SSL_CERT_FILE="$certificate_file" \
-CARGO_BUILD_JOBS=8 \
+CARGO_BUILD_JOBS=1 \
 cargo test -p musheen-desktop --test remote_live_contract --locked -- --nocapture
