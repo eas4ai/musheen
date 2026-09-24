@@ -53,7 +53,9 @@ impl SessionStore {
                 });
             }
         }
-        if let Some(current) = current {
+        if let Some(current) =
+            current.filter(|bytes| backup.is_none() || has_supported_session_shape(bytes))
+        {
             atomic_replace(&self.backup_path(), &current).map_err(SessionStoreError::from)?;
         }
         atomic_replace(&self.path, document).map_err(SessionStoreError::from)
@@ -72,6 +74,24 @@ fn future_schema_version(document: &[u8]) -> Option<u64> {
         .get("schema_version")?
         .as_u64()
         .filter(|version| *version > u64::from(SESSION_SCHEMA_VERSION))
+}
+
+fn has_supported_session_shape(document: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(document) else {
+        return false;
+    };
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        == Some(u64::from(SESSION_SCHEMA_VERSION))
+        && (value
+            .get("window")
+            .is_some_and(serde_json::Value::is_object)
+            || value.get("windows").is_some_and(|windows| {
+                windows
+                    .as_array()
+                    .is_some_and(|windows| !windows.is_empty())
+            }))
 }
 
 fn read_optional(

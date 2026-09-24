@@ -9,16 +9,15 @@ fn session_documents_replace_atomically_with_private_permissions() {
     let store = SessionStore::at(&path);
 
     assert_eq!(store.load().expect("missing session is not an error"), None);
-    store.save(b"first").expect("first session saves");
-    store.save(b"second").expect("replacement session saves");
+    let first = br#"{"schema_version":1,"windows":[{"name":"first"}]}"#;
+    let second = br#"{"schema_version":1,"windows":[{"name":"second"}]}"#;
+    store.save(first).expect("first session saves");
+    store.save(second).expect("replacement session saves");
 
-    assert_eq!(
-        store.load().expect("session loads"),
-        Some(b"second".to_vec())
-    );
+    assert_eq!(store.load().expect("session loads"), Some(second.to_vec()));
     assert_eq!(
         store.load_backup().expect("session backup loads"),
-        Some(b"first".to_vec()),
+        Some(first.to_vec()),
         "the previous valid document remains recoverable"
     );
     assert_eq!(
@@ -43,9 +42,53 @@ fn first_session_write_does_not_fabricate_a_backup() {
     let temporary = tempfile::tempdir().expect("temporary directory is available");
     let store = SessionStore::at(temporary.path().join("session.json"));
 
-    store.save(b"first").expect("first session saves");
+    store
+        .save(br#"{"schema_version":1,"windows":[{"name":"first"}]}"#)
+        .expect("first session saves");
 
     assert_eq!(store.load_backup().expect("backup lookup succeeds"), None);
+}
+
+#[test]
+fn damaged_primary_does_not_replace_the_last_good_session_backup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let store = SessionStore::at(&path);
+    let first = br#"{"schema_version":1,"windows":[{"name":"first"}]}"#;
+    let last_good = br#"{"schema_version":1,"windows":[{"name":"last-good"}]}"#;
+    let next = br#"{"schema_version":1,"windows":[{"name":"next"}]}"#;
+
+    store.save(first).unwrap();
+    store.save(last_good).unwrap();
+    fs::write(&path, b"{ interrupted").unwrap();
+
+    store.save(next).unwrap();
+
+    assert_eq!(store.load().unwrap().as_deref(), Some(next.as_slice()));
+    assert_eq!(
+        store.load_backup().unwrap().as_deref(),
+        Some(first.as_slice())
+    );
+}
+
+#[test]
+fn malformed_session_shape_does_not_replace_the_last_good_backup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("session.json");
+    let store = SessionStore::at(&path);
+    let first = br#"{"schema_version":1,"windows":[{"name":"first"}]}"#;
+    let second = br#"{"schema_version":1,"windows":[{"name":"second"}]}"#;
+    let next = br#"{"schema_version":1,"windows":[{"name":"next"}]}"#;
+    store.save(first).unwrap();
+    store.save(second).unwrap();
+    fs::write(&path, br#"{"schema_version":1,"windows":"not an array"}"#).unwrap();
+
+    store.save(next).unwrap();
+
+    assert_eq!(
+        store.load_backup().unwrap().as_deref(),
+        Some(first.as_slice())
+    );
 }
 
 #[test]

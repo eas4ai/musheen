@@ -1,6 +1,6 @@
 mod settings {
     use musheen_core::ResourceLimitConfig;
-    use musheen_desktop::{SettingsDocument, SettingsStore};
+    use musheen_desktop::{SettingsDocument, SettingsError, SettingsStore};
     use std::fs;
 
     #[test]
@@ -55,6 +55,43 @@ mod settings {
             loaded.resource_limits().operation_data_mutations,
             ResourceLimitConfig::default().operation_data_mutations
         );
+    }
+
+    #[test]
+    fn first_migrated_save_preserves_original_settings_bytes_in_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        let original = b"# version one fixture\nschema_version=1\ndirectory_page_items=256\nfuture.setting=keep-me\n";
+        fs::write(store.path(), original).unwrap();
+
+        let migrated = store.load().unwrap();
+        store.save(&migrated).unwrap();
+
+        assert_eq!(fs::read(store.backup_path()).unwrap(), original);
+        assert!(
+            fs::read_to_string(store.path())
+                .unwrap()
+                .starts_with("schema_version=3\n")
+        );
+    }
+
+    #[test]
+    fn older_build_refuses_to_replace_a_newer_settings_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        let current = b"schema_version=3\n";
+        let newer_backup = b"schema_version=999\nfuture=keep\n";
+        fs::write(store.path(), current).unwrap();
+        fs::write(store.backup_path(), newer_backup).unwrap();
+
+        assert!(matches!(
+            store.save(&SettingsDocument::default()),
+            Err(SettingsError::UnsupportedVersion { version: 999, .. })
+        ));
+        assert_eq!(fs::read(store.path()).unwrap(), current);
+        assert_eq!(fs::read(store.backup_path()).unwrap(), newer_backup);
     }
 
     #[test]

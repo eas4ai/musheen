@@ -132,12 +132,14 @@ impl SettingsStore {
 
     pub fn save(&self, document: &SettingsDocument) -> Result<(), SettingsError> {
         document.validate()?;
+        match load_document(&self.backup_path) {
+            Ok(_) | Err(SettingsError::Corrupt { .. }) => {}
+            Err(error) => return Err(error),
+        }
         ensure_parent(&self.path)?;
 
-        match load_document(&self.path) {
-            Ok(Some(previous)) => {
-                atomic_replace(&self.backup_path, serialize(&previous).as_bytes())?
-            }
+        match load_document_with_bytes(&self.path) {
+            Ok(Some((_, previous_bytes))) => atomic_replace(&self.backup_path, &previous_bytes)?,
             Ok(None) | Err(SettingsError::Corrupt { .. }) => {}
             Err(error) => return Err(error),
         }
@@ -224,6 +226,12 @@ impl Error for SettingsError {
 }
 
 fn load_document(path: &Path) -> Result<Option<SettingsDocument>, SettingsError> {
+    load_document_with_bytes(path).map(|loaded| loaded.map(|(document, _)| document))
+}
+
+fn load_document_with_bytes(
+    path: &Path,
+) -> Result<Option<(SettingsDocument, Vec<u8>)>, SettingsError> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -241,7 +249,8 @@ fn load_document(path: &Path) -> Result<Option<SettingsDocument>, SettingsError>
         path: path.to_path_buf(),
         message: error.to_string().into(),
     })?;
-    parse_document(path, text).map(Some)
+    let document = parse_document(path, text)?;
+    Ok(Some((document, bytes)))
 }
 
 fn parse_document(path: &Path, text: &str) -> Result<SettingsDocument, SettingsError> {
