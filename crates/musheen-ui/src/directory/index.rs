@@ -274,14 +274,34 @@ impl DiskDirectoryIndex {
                 "directory item record is too large",
             )
         })?;
-        let offset = self.records.seek(SeekFrom::End(0))?;
-        self.records.write_all(&length.to_le_bytes())?;
-        self.records.write_all(&bytes)?;
-        self.offsets.seek(SeekFrom::End(0))?;
-        self.offsets.write_all(&offset.to_le_bytes())?;
-        self.record_count = self.record_count.checked_add(1).ok_or_else(|| {
+        let next_count = self.record_count.checked_add(1).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "directory index count overflow")
         })?;
+        let offset = self.records.seek(SeekFrom::End(0))?;
+        let offsets_len = self.offsets.seek(SeekFrom::End(0))?;
+        let written = (|| {
+            self.records.write_all(&length.to_le_bytes())?;
+            self.records.write_all(&bytes)?;
+            self.offsets.write_all(&offset.to_le_bytes())
+        })();
+        if let Err(error) = written {
+            let rollback = (|| -> io::Result<()> {
+                if self.records.metadata()?.len() != offset {
+                    self.records.set_len(offset)?;
+                }
+                if self.offsets.metadata()?.len() != offsets_len {
+                    self.offsets.set_len(offsets_len)?;
+                }
+                Ok(())
+            })();
+            if let Err(rollback_error) = rollback {
+                return Err(io::Error::other(format!(
+                    "directory index append failed: {error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        self.record_count = next_count;
         Ok(offset)
     }
 
@@ -782,6 +802,50 @@ mod tests {
         index.records.set_len(offset + 2).unwrap();
 
         assert!(index.read(offset).is_err());
+    }
+
+    #[test]
+    fn failed_offset_write_rolls_back_record_append() {
+        let mut index = DiskDirectoryIndex::new().unwrap();
+        let original = item(StorePath::from_unix_path("/tmp/item"));
+        index.append(&original, 0).unwrap();
+        let records_len = index.records.metadata().unwrap().len();
+        let offsets_len = index.offsets.metadata().unwrap().len();
+        let read_only_offsets = std::fs::File::open(index.scratch.path().join("offsets")).unwrap();
+        let writable_offsets = std::mem::replace(&mut index.offsets, read_only_offsets);
+
+        assert!(index.append(&original, 1).is_err());
+        assert_eq!(index.record_count(), 1);
+        assert_eq!(index.records.metadata().unwrap().len(), records_len);
+        assert_eq!(index.offsets.metadata().unwrap().len(), offsets_len);
+
+        index.offsets = writable_offsets;
+        let offset = index.append(&original, 1).unwrap();
+        assert_eq!(offset, records_len);
+        assert_eq!(index.record_count(), 2);
+    }
+
+    #[test]
+    fn failed_record_write_keeps_existing_index() {
+        let mut index = DiskDirectoryIndex::new().unwrap();
+        let original = item(StorePath::from_unix_path("/tmp/item"));
+        index.append(&original, 0).unwrap();
+        let records_len = index.records.metadata().unwrap().len();
+        let offsets_len = index.offsets.metadata().unwrap().len();
+        let read_only_records = std::fs::File::open(index.scratch.path().join("records")).unwrap();
+        let writable_records = std::mem::replace(&mut index.records, read_only_records);
+
+        let error = index.append(&original, 1).unwrap_err();
+        assert!(!error.to_string().contains("rollback failed"));
+        assert_eq!(index.record_count(), 1);
+        assert_eq!(index.records.metadata().unwrap().len(), records_len);
+        assert_eq!(index.offsets.metadata().unwrap().len(), offsets_len);
+
+        index.records = writable_records;
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+        assert_eq!(index.read_range(0..1).unwrap(), vec![original]);
     }
 
     #[test]

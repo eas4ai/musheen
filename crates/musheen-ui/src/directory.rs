@@ -923,14 +923,14 @@ mod indexed_watch_tests {
         let paths = model
             .index_reader()
             .unwrap()
-            .resolve_paths(&[offscreen.clone()])
+            .resolve_paths(std::slice::from_ref(&offscreen))
             .unwrap()
             .unwrap();
         assert_eq!(paths, [StorePath::from_unix_path("/many/item-4096")]);
         let (paths, first_item) = model
             .index_reader()
             .unwrap()
-            .resolve_selection(&[offscreen.clone()])
+            .resolve_selection(std::slice::from_ref(&offscreen))
             .unwrap()
             .unwrap();
         assert_eq!(paths, [StorePath::from_unix_path("/many/item-4096")]);
