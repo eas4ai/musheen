@@ -476,6 +476,10 @@ impl DirectoryViewModel {
         self.focused_item = id.filter(|id| self.item(id).is_some());
     }
 
+    pub(crate) fn focus_indexed_item(&mut self, id: ItemId) {
+        self.focused_item = Some(id);
+    }
+
     pub fn select_all_visible(&mut self) {
         let ids = self
             .visible_items()

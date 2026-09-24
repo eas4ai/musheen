@@ -6143,7 +6143,10 @@ impl MusheenApp {
             self.trash_focus.remove(&tab_id);
         }
         if let Some(directory) = self.directories.get_mut(&tab_id) {
-            directory.view_mut().focus_item(id);
+            match (directory.is_indexed(), id) {
+                (true, Some(id)) => directory.view_mut().focus_indexed_item(id),
+                (_, id) => directory.view_mut().focus_item(id),
+            }
             cx.notify();
         }
     }
@@ -6185,6 +6188,9 @@ impl MusheenApp {
             cx.notify();
             return;
         }
+        if self.move_indexed_directory_focus(tab_id, delta, extend, cx) {
+            return;
+        }
         let items = self
             .filtered_items(tab_id)
             .into_iter()
@@ -6222,6 +6228,102 @@ impl MusheenApp {
         cx.notify();
     }
 
+    fn move_indexed_directory_focus(
+        &mut self,
+        tab_id: TabId,
+        delta: isize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(directory) = self.directories.get(&tab_id) else {
+            return false;
+        };
+        let Some(reader) = directory.index_reader() else {
+            return false;
+        };
+        let current = directory.view().focused_item_id().cloned();
+        let anchor = directory
+            .indexed_selection_anchor()
+            .or_else(|| directory.view().selection_anchor())
+            .or(current.as_ref())
+            .cloned();
+        let generation = directory.generation();
+        let order_epoch = directory.order_epoch();
+        let selection_epoch = directory.indexed_selection_epoch();
+        let selected_ids = directory.view().selected_ids().to_vec();
+        let lookup_current = current.clone();
+        let lookup_anchor = anchor.clone();
+        let work = cx.background_spawn(async move {
+            reader.move_focus(
+                lookup_current.as_ref(),
+                lookup_anchor.as_ref(),
+                delta,
+                extend,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let Some(directory) = state.directories.get_mut(&tab_id) else {
+                    return;
+                };
+                if directory.generation() != generation
+                    || directory.order_epoch() != order_epoch
+                    || directory.indexed_selection_epoch() != selection_epoch
+                    || directory.view().selected_ids() != selected_ids
+                    || directory.view().focused_item_id() != current.as_ref()
+                {
+                    return;
+                }
+                match result {
+                    Ok(Some(next)) => {
+                        directory.view_mut().focus_indexed_item(next.id.clone());
+                        if let Some(selection) = next.selection {
+                            directory.set_indexed_selection(
+                                selection,
+                                Some(anchor.unwrap_or_else(|| next.id.clone())),
+                            );
+                            if let Some(tab) = state.navigation.tab_mut(tab_id) {
+                                tab.set_selection(Vec::new());
+                            }
+                        } else {
+                            directory.clear_indexed_selection();
+                            directory
+                                .view_mut()
+                                .select_item(next.id, SelectionMode::Replace);
+                            if let Some(tab) = state.navigation.tab_mut(tab_id) {
+                                tab.set_selection(directory.view().selected_ids().to_vec());
+                            }
+                        }
+                        if matches!(
+                            directory.view().preferences().layout,
+                            Layout::Details | Layout::List
+                        ) {
+                            for ((scroll_tab, _), scroll) in &state.directory_scrolls {
+                                if *scroll_tab == tab_id {
+                                    scroll.scroll_to_item_strict(
+                                        next.position,
+                                        gpui_kit::ScrollStrategy::Nearest,
+                                    );
+                                }
+                            }
+                        }
+                        state.refresh_info_pane(tab_id, cx);
+                        state.schedule_session_save(cx);
+                    }
+                    Ok(None) => directory.view_mut().focus_item(None),
+                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        true
+    }
+
     fn activate_focused_directory_item(&mut self, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
         let Some(id) = self
@@ -6235,14 +6337,51 @@ impl MusheenApp {
     }
 
     fn activate_directory_item(&mut self, tab_id: TabId, id: ItemId, cx: &mut Context<Self>) {
-        let Some(item) = self
-            .directories
-            .get(&tab_id)
-            .and_then(|directory| directory.view().item(&id))
-            .cloned()
-        else {
+        let Some(directory) = self.directories.get(&tab_id) else {
             return;
         };
+        if let Some(item) = directory.view().item(&id).cloned() {
+            self.activate_resolved_directory_item(tab_id, item, cx);
+            return;
+        }
+        let Some(reader) = directory.index_reader() else {
+            return;
+        };
+        let generation = directory.generation();
+        let order_epoch = directory.order_epoch();
+        let lookup_id = id.clone();
+        let work = cx.background_spawn(async move { reader.lookup_id(&lookup_id) });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let current = state.directories.get(&tab_id).is_some_and(|directory| {
+                    directory.generation() == generation && directory.order_epoch() == order_epoch
+                });
+                if !current {
+                    return;
+                }
+                match result {
+                    Ok(Some(item)) if item.id() == &id => {
+                        state.activate_resolved_directory_item(tab_id, item, cx);
+                    }
+                    Ok(_) => state.operation_error = Some("Selected file no longer exists".into()),
+                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn activate_resolved_directory_item(
+        &mut self,
+        tab_id: TabId,
+        item: StoreItem,
+        cx: &mut Context<Self>,
+    ) {
         if item.kind() == ItemKind::Directory {
             if self.navigation.focused_tab().id() != tab_id {
                 self.activate_tab(tab_id, cx);
@@ -19056,6 +19195,7 @@ mod tests {
             app.update(cx, |state, cx| {
                 let tab_id = state.navigation.focused_tab().id();
                 let directory = state.directories.get_mut(&tab_id).unwrap();
+                directory.view_mut().preferences_mut().directories_first = false;
                 let load = directory.begin_navigation(StorePath::from_unix_path("/synthetic"));
                 let request = PageRequest::first(&ResourceLimits::default());
                 let provider = ProviderId::new("local").unwrap();
@@ -19066,7 +19206,11 @@ mod tests {
                                 ItemId::new(provider.clone(), number.to_be_bytes()).unwrap(),
                                 StorePath::from_unix_path(format!("/synthetic/{number}")),
                                 DisplayPath::new(number.to_string()),
-                                ItemKind::RegularFile,
+                                if number == 4_096 {
+                                    ItemKind::Directory
+                                } else {
+                                    ItemKind::RegularFile
+                                },
                                 None,
                             )
                         })
@@ -19195,6 +19339,30 @@ mod tests {
         });
         cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
             app.read(cx).focused_directory().indexed_selected_count() == 4_097
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_selection_action(CommandAction::ClearSelection, cx);
+                state.move_directory_focus_with_selection(1, false, cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx)
+                .focused_directory()
+                .view()
+                .selected_ids()
+                .first()
+                .is_some_and(|id| id.opaque_key() == 0usize.to_be_bytes())
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.move_directory_focus_with_selection(1, true, cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).focused_directory().indexed_selected_count() == 2
         })
         .await;
         cx.update(|cx| {
@@ -19333,6 +19501,23 @@ mod tests {
                 .unwrap()
                 .visible_count()
                 == 8_192
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let far = ItemId::new(ProviderId::new("local").unwrap(), 4_096usize.to_be_bytes())
+                    .unwrap();
+                state.focus_directory_item(tab_id, Some(far.clone()), cx);
+                assert_eq!(
+                    state.focused_directory().view().focused_item_id(),
+                    Some(&far)
+                );
+                state.activate_directory_item(tab_id, far, cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).navigation.focused_tab().location()
+                == &StorePath::from_unix_path("/synthetic/4096")
         })
         .await;
     }

@@ -20,6 +20,12 @@ pub(crate) struct DirectoryIndexReader {
     index: SharedIndex,
 }
 
+pub(crate) struct IndexedFocusMove {
+    pub(crate) id: ItemId,
+    pub(crate) position: usize,
+    pub(crate) selection: Option<IndexedSelection>,
+}
+
 impl DirectoryIndexReader {
     #[cfg(test)]
     pub(crate) fn read_range(&self, range: Range<usize>) -> std::io::Result<Vec<StoreItem>> {
@@ -109,6 +115,61 @@ impl DirectoryIndexReader {
         index
             .selection_bitmap(start.min(end)..start.max(end) + 1)
             .map(Some)
+    }
+
+    pub(crate) fn move_focus(
+        &self,
+        current: Option<&ItemId>,
+        anchor: Option<&ItemId>,
+        delta: isize,
+        extend: bool,
+    ) -> std::io::Result<Option<IndexedFocusMove>> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
+        let count = index.visible_count().unwrap_or(0);
+        if count == 0 {
+            return Ok(None);
+        }
+        let current_position = current
+            .map(|id| index.position_of_id(id))
+            .transpose()?
+            .flatten();
+        let position = current_position.map_or_else(
+            || if delta < 0 { count - 1 } else { 0 },
+            |current| {
+                if delta < 0 {
+                    current.saturating_sub(delta.unsigned_abs())
+                } else {
+                    current.saturating_add(delta as usize).min(count - 1)
+                }
+            },
+        );
+        let id = index
+            .read_range_with_arrivals(position..position + 1)?
+            .pop()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "focused row is missing")
+            })?
+            .0
+            .id()
+            .clone();
+        let selection = if extend {
+            let start = anchor
+                .map(|id| index.position_of_id(id))
+                .transpose()?
+                .flatten()
+                .unwrap_or(position);
+            Some(index.selection_bitmap(start.min(position)..start.max(position) + 1)?)
+        } else {
+            None
+        };
+        Ok(Some(IndexedFocusMove {
+            id,
+            position,
+            selection,
+        }))
     }
 
     pub(crate) fn resolve_bitmap(
