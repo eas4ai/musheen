@@ -6,7 +6,7 @@ arch=('x86_64')
 url='https://github.com/eas4ai/musheen'
 license=('GPL-3.0-or-later')
 depends=(
-  'acl' 'fontconfig' 'freetype2' 'gcc-libs' 'glibc' 'hicolor-icon-theme'
+  'acl' 'adwaita-fonts' 'fontconfig' 'freetype2' 'gcc-libs' 'glibc' 'hicolor-icon-theme'
   'libarchive' 'libxcb'
   'libxkbcommon' 'libxkbcommon-x11' 'polkit' 'smbclient' 'udisks2'
   'vulkan-icd-loader' 'wayland'

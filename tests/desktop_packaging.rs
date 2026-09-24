@@ -157,6 +157,7 @@ fn arch_package_builds_all_features_and_stages_the_native_installer() {
     assert!(recipe.contains("'dbus'"));
     assert!(recipe.contains("'python'"));
     assert!(recipe.contains("'hicolor-icon-theme'"));
+    assert!(recipe.contains("'adwaita-fonts'"));
     assert!(recipe.contains("'acl'"));
 }
 
@@ -165,6 +166,7 @@ fn arch_container_checks_package_install_and_removal() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let container = fs::read_to_string(root.join("ci/arch-package.Dockerfile")).unwrap();
     assert!(container.contains("FROM archlinux:base-devel"));
+    assert!(container.contains("appstream adwaita-fonts cargo"));
     assert!(container.contains(" git "));
     assert!(container.contains(" jq "));
     assert!(container.contains(" dbus "));
@@ -173,6 +175,10 @@ fn arch_container_checks_package_install_and_removal() {
     assert!(container.contains("makepkg --noconfirm"));
     assert!(container.contains("pacman -U --noconfirm"));
     assert!(container.contains("FROM archlinux:base-devel AS runtime-check"));
+    assert!(container.contains("xorg-server-xvfb"));
+    assert!(container.contains("vulkan-swrast"));
+    assert!(container.contains("package-launch-smoke.sh"));
+    assert!(container.contains("timeout --signal=TERM --kill-after=5s 45s"));
     assert!(container.contains("test -x /usr/bin/musheen-archive-worker"));
     assert!(container.contains("test -x /usr/bin/musheen-thumbnail-worker"));
     assert!(container.contains("pacman -Rns --noconfirm musheen"));

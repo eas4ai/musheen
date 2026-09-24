@@ -2,7 +2,7 @@
 FROM archlinux:base-devel AS build
 
 RUN pacman -Syu --needed --noconfirm \
-      appstream cargo dbus desktop-file-utils file fontconfig freetype2 git hicolor-icon-theme jq \
+      appstream adwaita-fonts cargo dbus desktop-file-utils file fontconfig freetype2 git hicolor-icon-theme jq \
       libarchive librsvg libxcb libxkbcommon libxkbcommon-x11 \
       namcap pkgconf polkit python rust smbclient udisks2 vulkan-icd-loader wayland \
     && pacman -Scc --noconfirm
@@ -31,7 +31,8 @@ RUN namcap /work/musheen-*.pkg.tar.zst \
 
 FROM archlinux:base-devel AS runtime-check
 COPY --from=build /export/ /export/
-RUN pacman -Syu --noconfirm \
+COPY scripts/package-launch-smoke.sh /usr/local/bin/package-launch-smoke.sh
+RUN pacman -Syu --noconfirm xorg-server-xvfb xorg-xwininfo vulkan-swrast \
     && pacman -U --noconfirm /export/musheen-*.pkg.tar.zst \
     && test -x /usr/bin/musheen \
     && test -x /usr/bin/musheen-archive-worker \
@@ -42,6 +43,9 @@ RUN pacman -Syu --noconfirm \
     && ! ldd /usr/bin/musheen-archive-worker | grep -q 'not found' \
     && ! ldd /usr/bin/musheen-thumbnail-worker | grep -q 'not found' \
     && ! ldd /usr/lib/musheen/musheen-broker | grep -q 'not found' \
+    && useradd --create-home smoke \
+    && timeout --signal=TERM --kill-after=5s 45s \
+       runuser --user smoke -- bash /usr/local/bin/package-launch-smoke.sh \
     && pacman -Rns --noconfirm musheen \
     && test ! -e /usr/bin/musheen \
     && test ! -e /usr/bin/musheen-archive-worker \
