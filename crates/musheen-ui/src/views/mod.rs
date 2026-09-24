@@ -413,10 +413,6 @@ impl DirectoryViewModel {
     }
 
     pub fn set_selected_ids(&mut self, ids: Vec<ItemId>) {
-        let ids = ids
-            .into_iter()
-            .filter(|id| self.item(id).is_some())
-            .collect();
         self.selection.apply(ids, SelectionMode::Replace);
         self.trim_unpinned();
     }
@@ -437,10 +433,8 @@ impl DirectoryViewModel {
     }
 
     pub fn select_item(&mut self, id: ItemId, mode: SelectionMode) {
-        if self.item(&id).is_some() {
-            self.selection.apply(vec![id], mode);
-            self.trim_unpinned();
-        }
+        self.selection.apply(vec![id], mode);
+        self.trim_unpinned();
     }
 
     pub fn select_to_item(&mut self, id: &ItemId, mode: SelectionMode) {

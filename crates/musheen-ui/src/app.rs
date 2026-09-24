@@ -4226,15 +4226,7 @@ impl MusheenApp {
                     return;
                 };
                 this.update(cx, |state, cx| {
-                    let invalidated = matches!(event, WatchEvent::Invalidated { .. });
-                    if state.apply_watch_event(tab_id, &load, event) {
-                        if invalidated {
-                            state.start_load_for_tab(tab_id, load.location().clone(), cx);
-                        } else {
-                            state.continue_watch(tab_id, load, watcher, cx);
-                        }
-                        cx.notify();
-                    }
+                    state.handle_watch_event(tab_id, load, watcher, event, cx);
                 });
             }
             Err(StoreError::Cancelled) => {}
@@ -4258,15 +4250,7 @@ impl MusheenApp {
                     return;
                 };
                 this.update(cx, |state, cx| {
-                    let invalidated = matches!(event, WatchEvent::Invalidated { .. });
-                    if state.apply_watch_event(tab_id, &load, event) {
-                        if invalidated {
-                            state.start_load_for_tab(tab_id, load.location().clone(), cx);
-                        } else {
-                            state.continue_watch(tab_id, load, watcher, cx);
-                        }
-                        cx.notify();
-                    }
+                    state.handle_watch_event(tab_id, load, watcher, event, cx);
                 });
             }
             Err(StoreError::Cancelled) => {}
@@ -4287,20 +4271,74 @@ impl MusheenApp {
             .get_mut(&tab_id)
             .is_some_and(|directory| directory.apply_watch_event(load, event));
         if applied {
-            let result = match observed {
-                WatchEvent::Created(item)
-                | WatchEvent::Changed(item)
-                | WatchEvent::Renamed { item, .. } => self
-                    .catalog_binding
-                    .observe_present(item.id(), item.path().clone()),
-                WatchEvent::Removed(item) => self.catalog_binding.observe_missing(&item),
-                WatchEvent::Invalidated { .. } => Ok(()),
-            };
-            if let Err(error) = result {
-                self.operation_error = Some(error);
-            }
+            self.observe_watch_event(observed);
         }
         applied
+    }
+
+    fn observe_watch_event(&mut self, event: WatchEvent) {
+        let result = match event {
+            WatchEvent::Created(item)
+            | WatchEvent::Changed(item)
+            | WatchEvent::Renamed { item, .. } => self
+                .catalog_binding
+                .observe_present(item.id(), item.path().clone()),
+            WatchEvent::Removed(item) => self.catalog_binding.observe_missing(&item),
+            WatchEvent::Invalidated { .. } => Ok(()),
+        };
+        if let Err(error) = result {
+            self.operation_error = Some(error);
+        }
+    }
+
+    fn handle_watch_event(
+        &mut self,
+        tab_id: TabId,
+        load: DirectoryLoad,
+        watcher: Box<dyn DirectoryWatch>,
+        event: WatchEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(work) = self
+            .directories
+            .get(&tab_id)
+            .and_then(|directory| directory.prepare_index_watch_event(&load, event.clone()))
+        {
+            let task = cx.background_spawn(async move { work.run() });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let succeeded = result.is_ok();
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |state, cx| {
+                    let applied = state
+                        .directories
+                        .get_mut(&tab_id)
+                        .is_some_and(|directory| directory.finish_index_watch_event(&load, result));
+                    if !applied {
+                        return;
+                    }
+                    if succeeded {
+                        state.observe_watch_event(event);
+                        state.indexed_viewports.remove(&tab_id);
+                    }
+                    state.continue_watch(tab_id, load, watcher, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
+        let invalidated = matches!(event, WatchEvent::Invalidated { .. });
+        if self.apply_watch_event(tab_id, &load, event) {
+            if invalidated {
+                self.start_load_for_tab(tab_id, load.location().clone(), cx);
+            } else {
+                self.continue_watch(tab_id, load, watcher, cx);
+            }
+            cx.notify();
+        }
     }
 
     fn apply_directory_page_result(

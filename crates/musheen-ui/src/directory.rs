@@ -42,6 +42,52 @@ pub(crate) struct DirectoryIndexResult {
     next_request: Option<PageRequest>,
 }
 
+pub(crate) struct DirectoryIndexWatchWork {
+    index: SharedIndex,
+    event: WatchEvent,
+    preferences: ViewPreferences,
+}
+
+pub(crate) struct DirectoryIndexWatchResult {
+    indexed_count: usize,
+    visible_count: usize,
+    removed: Option<musheen_core::ItemId>,
+}
+
+impl DirectoryIndexWatchWork {
+    pub(crate) fn run(self) -> std::io::Result<DirectoryIndexWatchResult> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
+        let arrival = index.record_count();
+        let removed = match self.event {
+            WatchEvent::Created(item)
+            | WatchEvent::Changed(item)
+            | WatchEvent::Renamed { item, .. } => {
+                index.append(&item, arrival)?;
+                None
+            }
+            WatchEvent::Removed(id) => {
+                index.append_tombstone(&id, arrival)?;
+                Some(id)
+            }
+            WatchEvent::Invalidated { .. } => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalidated directory must be reloaded",
+                ));
+            }
+        };
+        index.rebuild_order(&self.preferences, None)?;
+        Ok(DirectoryIndexWatchResult {
+            indexed_count: index.active_count().unwrap_or(0),
+            visible_count: index.visible_count().unwrap_or(0),
+            removed,
+        })
+    }
+}
+
 impl DirectoryIndexWork {
     pub(crate) fn run(self) -> std::io::Result<DirectoryIndexResult> {
         let index = match self.index {
@@ -346,6 +392,50 @@ impl DirectoryModel {
             .map(Option::flatten)
     }
 
+    pub(crate) fn prepare_index_watch_event(
+        &self,
+        load: &DirectoryLoad,
+        event: WatchEvent,
+    ) -> Option<DirectoryIndexWatchWork> {
+        if !self.is_current(load) || matches!(event, WatchEvent::Invalidated { .. }) {
+            return None;
+        }
+        Some(DirectoryIndexWatchWork {
+            index: Arc::clone(self.index.as_ref()?),
+            event,
+            preferences: self.view.preferences().clone(),
+        })
+    }
+
+    pub(crate) fn finish_index_watch_event(
+        &mut self,
+        load: &DirectoryLoad,
+        result: std::io::Result<DirectoryIndexWatchResult>,
+    ) -> bool {
+        if !self.is_current(load) {
+            return false;
+        }
+        match result {
+            Ok(result) => {
+                self.indexed_count = result.indexed_count;
+                self.indexed_visible_count = result.visible_count;
+                if let Some(id) = result.removed {
+                    self.view.apply_watch_event(WatchEvent::Removed(id));
+                }
+                self.state = if self.indexed_count == 0 {
+                    DirectoryState::Empty
+                } else {
+                    DirectoryState::Ready
+                };
+            }
+            Err(error) => {
+                self.state =
+                    DirectoryState::Error(format!("Directory index failed: {error}").into());
+            }
+        }
+        true
+    }
+
     pub fn begin_page(&mut self) -> Option<(DirectoryLoad, PageRequest)> {
         if self.page_loading {
             return None;
@@ -397,6 +487,56 @@ impl DirectoryModel {
                 && active.location == load.location
                 && !load.cancellation.is_cancelled()
         })
+    }
+}
+
+#[cfg(test)]
+mod indexed_watch_tests {
+    use super::*;
+    use musheen_core::{DisplayPath, ItemId, ItemKind, ProviderId, TotalHint};
+
+    fn item(number: u64, name: &str) -> StoreItem {
+        StoreItem::new(
+            ItemId::new(ProviderId::new("local").unwrap(), number.to_be_bytes()).unwrap(),
+            StorePath::from_unix_path(format!("/many/{name}")),
+            DisplayPath::new(name),
+            ItemKind::RegularFile,
+            Some(number),
+        )
+    }
+
+    #[test]
+    fn indexed_watch_updates_visible_order_and_preserves_selection() {
+        let mut model = DirectoryModel::new(ResourceLimits::default());
+        let load = model.begin_navigation(StorePath::from_unix_path("/many"));
+        for batch in 0..9 {
+            let request = PageRequest::first(&ResourceLimits::default());
+            let items = (batch * 512..(batch + 1) * 512)
+                .map(|number| item(number, &format!("item-{number}")))
+                .collect();
+            let page = Page::try_new(&request, items, None, TotalHint::Unknown).unwrap();
+            assert_eq!(model.apply_page(&load, page), ApplyPageResult::Applied);
+        }
+        let id = item(0, "item-0").id().clone();
+        model
+            .view_mut()
+            .select_item(id.clone(), crate::views::SelectionMode::Replace);
+        let renamed = item(0, "renamed");
+        let work = model
+            .prepare_index_watch_event(&load, WatchEvent::Changed(renamed.clone()))
+            .unwrap();
+        assert!(model.finish_index_watch_event(&load, work.run()));
+        assert_eq!(model.indexed_count(), 4_608);
+        assert_eq!(model.indexed_item(&id).unwrap(), Some(renamed));
+        assert_eq!(model.view().selected_ids(), std::slice::from_ref(&id));
+
+        let work = model
+            .prepare_index_watch_event(&load, WatchEvent::Removed(id.clone()))
+            .unwrap();
+        assert!(model.finish_index_watch_event(&load, work.run()));
+        assert_eq!(model.indexed_count(), 4_607);
+        assert!(model.indexed_item(&id).unwrap().is_none());
+        assert!(model.view().selected_ids().is_empty());
     }
 }
 

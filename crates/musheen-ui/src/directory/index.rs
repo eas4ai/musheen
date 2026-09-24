@@ -25,6 +25,8 @@ struct IndexRecord {
     size: Option<u64>,
     modified_unix_seconds: Option<i64>,
     arrival: u64,
+    #[serde(default)]
+    deleted: bool,
 }
 
 impl IndexRecord {
@@ -43,6 +45,22 @@ impl IndexRecord {
             size: item.size(),
             modified_unix_seconds: item.modified_unix_seconds(),
             arrival,
+            deleted: false,
+        }
+    }
+
+    fn tombstone(id: &ItemId, arrival: u64) -> Self {
+        Self {
+            id: id.clone(),
+            // Tombstones are considered only by ID and arrival. These fields
+            // are never returned from the active identity or visible orders.
+            path: StorePath::from_unix_path("/"),
+            display_name: String::new(),
+            kind: 3,
+            size: None,
+            modified_unix_seconds: None,
+            arrival,
+            deleted: true,
         }
     }
 
@@ -129,7 +147,15 @@ impl DiskDirectoryIndex {
     }
 
     pub(super) fn append(&mut self, item: &StoreItem, arrival: u64) -> io::Result<u64> {
-        let bytes = serde_json::to_vec(&IndexRecord::from_item(item, arrival))?;
+        self.append_record(IndexRecord::from_item(item, arrival))
+    }
+
+    pub(super) fn append_tombstone(&mut self, id: &ItemId, arrival: u64) -> io::Result<u64> {
+        self.append_record(IndexRecord::tombstone(id, arrival))
+    }
+
+    fn append_record(&mut self, record: IndexRecord) -> io::Result<u64> {
+        let bytes = serde_json::to_vec(&record)?;
         if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -165,7 +191,15 @@ impl DiskDirectoryIndex {
         self.order.as_ref().map(|order| order.len)
     }
 
+    pub(super) fn active_count(&self) -> Option<usize> {
+        self.id_order.as_ref().map(|order| order.len)
+    }
+
     fn read_record(records: &mut File, offset: u64) -> io::Result<(StoreItem, u64)> {
+        Self::read_index_record(records, offset)?.into_item()
+    }
+
+    fn read_index_record(records: &mut File, offset: u64) -> io::Result<IndexRecord> {
         if offset < MAGIC.len() as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -184,8 +218,7 @@ impl DiskDirectoryIndex {
         }
         let mut bytes = vec![0; length];
         records.read_exact(&mut bytes)?;
-        let record: IndexRecord = serde_json::from_slice(&bytes)?;
-        record.into_item()
+        serde_json::from_slice(&bytes).map_err(Into::into)
     }
 
     pub(super) fn rebuild_order(
@@ -193,24 +226,60 @@ impl DiskDirectoryIndex {
         preferences: &ViewPreferences,
         filter: Option<&DirectoryFilter>,
     ) -> io::Result<()> {
-        let order = self.build_order(OrderPolicy::Visible(preferences), filter)?;
-        let id_order = self.build_order(OrderPolicy::Identity, None)?;
+        let source = self.scratch.path().join("offsets");
+        let all_ids = self.build_order(OrderPolicy::Identity, None, &source, self.record_count)?;
+        let id_order = self.deduplicate_id_order(all_ids)?;
+        let order = self.build_order(
+            OrderPolicy::Visible(preferences),
+            filter,
+            &id_order._path,
+            id_order.len as u64,
+        )?;
         self.order = Some(order);
         self.id_order = Some(id_order);
         Ok(())
+    }
+
+    fn deduplicate_id_order(&mut self, mut all_ids: SortedOrder) -> io::Result<SortedOrder> {
+        let mut active = NamedTempFile::new_in(self.scratch.path())?;
+        let mut previous = None;
+        let mut len = 0usize;
+        for _ in 0..all_ids.len {
+            let offset = read_next_offset(&mut all_ids.file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "identity offset is missing")
+            })?;
+            let record = Self::read_index_record(&mut self.records, offset)?;
+            let id = record.id;
+            if previous.as_ref() == Some(&id) {
+                continue;
+            }
+            if !record.deleted {
+                active.write_all(&offset.to_le_bytes())?;
+                len += 1;
+            }
+            previous = Some(id);
+        }
+        let path = active.into_temp_path();
+        Ok(SortedOrder {
+            file: File::open(&path)?,
+            _path: path,
+            len,
+        })
     }
 
     fn build_order(
         &mut self,
         policy: OrderPolicy<'_>,
         filter: Option<&DirectoryFilter>,
+        source: &Path,
+        source_count: u64,
     ) -> io::Result<SortedOrder> {
-        let offsets = File::open(self.scratch.path().join("offsets"))?;
+        let offsets = File::open(source)?;
         let mut offsets = BufReader::new(offsets);
         let mut chunk = Vec::with_capacity(SORT_RUN_ITEMS);
         let mut levels: Vec<Vec<TempPath>> = Vec::new();
         let mut visible_count = 0usize;
-        for _ in 0..self.record_count {
+        for _ in 0..source_count {
             let offset = read_next_offset(&mut offsets)?.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "directory offset is missing")
             })?;
@@ -566,6 +635,46 @@ mod tests {
         }
         let missing = ItemId::new(provider, 8_200u64.to_be_bytes().to_vec()).unwrap();
         assert!(index.lookup_id(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn later_record_replaces_same_identity_in_visible_order_and_lookup() {
+        let mut index = DiskDirectoryIndex::new().unwrap();
+        let old = item(StorePath::from_unix_bytes(b"/many/old-\xff".to_vec()));
+        let replacement = item(StorePath::from_unix_bytes(b"/many/new-\xff".to_vec()));
+        index.append(&old, 0).unwrap();
+        index.append(&replacement, 1).unwrap();
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+
+        assert_eq!(index.visible_count(), Some(1));
+        assert_eq!(
+            index.read_range(0..1).unwrap(),
+            std::slice::from_ref(&replacement)
+        );
+        assert_eq!(index.lookup_id(old.id()).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn removal_tombstone_hides_identity_until_a_later_create() {
+        let mut index = DiskDirectoryIndex::new().unwrap();
+        let original = item(StorePath::from_unix_path("/many/original"));
+        let recreated = item(StorePath::from_unix_path("/many/recreated"));
+        index.append(&original, 0).unwrap();
+        index.append_tombstone(original.id(), 1).unwrap();
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+        assert_eq!(index.visible_count(), Some(0));
+        assert_eq!(index.lookup_id(original.id()).unwrap(), None);
+
+        index.append(&recreated, 2).unwrap();
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+        assert_eq!(index.visible_count(), Some(1));
+        assert_eq!(index.lookup_id(original.id()).unwrap(), Some(recreated));
     }
 
     #[test]

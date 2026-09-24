@@ -136,6 +136,27 @@ fn selection_editing_and_scroll_anchor_survive_retention_and_reordering() {
 }
 
 #[test]
+fn offscreen_selection_keeps_stable_ids_without_retaining_item_models() {
+    let first = item(1, "one", ItemKind::RegularFile, Some(1));
+    let first_id = first.id().clone();
+    let mut model = DirectoryViewModel::new(2);
+    model.extend([
+        first,
+        item(2, "two", ItemKind::RegularFile, Some(2)),
+        item(3, "three", ItemKind::RegularFile, Some(3)),
+    ]);
+    assert!(model.item(&first_id).is_none());
+
+    model.select_item(first_id.clone(), SelectionMode::Replace);
+    assert_eq!(model.selected_ids(), std::slice::from_ref(&first_id));
+    assert!(model.items().len() <= 2);
+
+    model.set_selected_ids(vec![first_id.clone()]);
+    assert_eq!(model.selected_ids(), &[first_id]);
+    assert!(model.items().len() <= 2);
+}
+
+#[test]
 fn external_changes_preserve_stable_identity_selection_and_anchor() {
     let original = item(7, "old-name", ItemKind::RegularFile, Some(7));
     let id = original.id().clone();
