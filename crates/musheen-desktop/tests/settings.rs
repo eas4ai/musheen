@@ -1,7 +1,10 @@
 mod settings {
     use musheen_core::ResourceLimitConfig;
     use musheen_desktop::{SettingsDocument, SettingsError, SettingsStore};
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn uses_the_musheen_xdg_config_location() {
@@ -74,6 +77,99 @@ mod settings {
                 .unwrap()
                 .starts_with("schema_version=3\n")
         );
+    }
+
+    #[test]
+    fn save_waits_for_the_settings_lock_before_replacing_migration_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        let original = b"schema_version=1\ndirectory_page_items=256\n";
+        fs::write(store.path(), original).unwrap();
+        let document = store.load().unwrap();
+
+        let lock_path = store.path().with_file_name("settings.conf.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(lock_path)
+            .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(store.save(&document)).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(lock);
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(
+            fs::read(root.path().join("musheen/settings.conf.pre-migration")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn recovery_waits_for_the_settings_lock_before_restoring_a_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        store.save(&SettingsDocument::default()).unwrap();
+        store.save(&SettingsDocument::default()).unwrap();
+        fs::write(store.path(), "invalid settings\n").unwrap();
+
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(store.path().with_file_name("settings.conf.lock"))
+            .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx.send(store.load()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(lock);
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn loading_valid_settings_does_not_create_a_lock_file() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), "schema_version=3\n").unwrap();
+
+        store.load().unwrap();
+
+        assert!(!store.path().with_file_name("settings.conf.lock").exists());
     }
 
     #[test]

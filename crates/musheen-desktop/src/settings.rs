@@ -83,6 +83,7 @@ impl Default for SettingsDocument {
 pub struct SettingsStore {
     path: PathBuf,
     backup_path: PathBuf,
+    lock_path: PathBuf,
 }
 
 impl SettingsStore {
@@ -106,9 +107,12 @@ impl SettingsStore {
         let path = path.into();
         let mut backup = path.as_os_str().to_os_string();
         backup.push(".bak");
+        let mut lock = path.as_os_str().to_os_string();
+        lock.push(".lock");
         Self {
             path,
             backup_path: PathBuf::from(backup),
+            lock_path: PathBuf::from(lock),
         }
     }
 
@@ -125,13 +129,21 @@ impl SettingsStore {
     pub fn load(&self) -> Result<SettingsDocument, SettingsError> {
         match load_document(&self.path) {
             Ok(Some(document)) => Ok(document),
-            Ok(None) | Err(SettingsError::Corrupt { .. }) => self.recover_or_default(),
+            Ok(None) | Err(SettingsError::Corrupt { .. }) => {
+                let _lock = self.lock_exclusive()?;
+                match load_document(&self.path) {
+                    Ok(Some(document)) => Ok(document),
+                    Ok(None) | Err(SettingsError::Corrupt { .. }) => self.recover_or_default(),
+                    Err(error) => Err(error),
+                }
+            }
             Err(error) => Err(error),
         }
     }
 
     pub fn save(&self, document: &SettingsDocument) -> Result<(), SettingsError> {
         document.validate()?;
+        let _lock = self.lock_exclusive()?;
         match load_document(&self.backup_path) {
             Ok(_) | Err(SettingsError::Corrupt { .. }) => {}
             Err(error) => return Err(error),
@@ -149,6 +161,30 @@ impl SettingsStore {
             Err(error) => return Err(error),
         }
         atomic_replace(&self.path, serialize(document).as_bytes())
+    }
+
+    fn lock_exclusive(&self) -> Result<File, SettingsError> {
+        ensure_parent(&self.lock_path)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&self.lock_path)
+            .map_err(|source| SettingsError::Io {
+                operation: "open settings lock",
+                path: self.lock_path.clone(),
+                source,
+            })?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).map_err(|source| {
+            SettingsError::Io {
+                operation: "lock settings",
+                path: self.lock_path.clone(),
+                source: std::io::Error::from(source),
+            }
+        })?;
+        Ok(lock)
     }
 
     fn recover_or_default(&self) -> Result<SettingsDocument, SettingsError> {
