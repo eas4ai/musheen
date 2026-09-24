@@ -8,6 +8,9 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 
 use super::{TerminalError, TerminalProfile, TerminalSize};
 
+// At most 2 MiB of PTY output can wait for a slow UI consumer.
+const MAX_PENDING_PTY_EVENTS: usize = 64;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalExit {
     Code(u32),
@@ -75,7 +78,7 @@ impl TerminalSession {
             .map_err(|error| TerminalError::Io(error.to_string().into()))?;
         let child_pid = child.process_id();
         let killer = child.clone_killer();
-        let (sender, receiver) = async_channel::unbounded();
+        let (sender, receiver) = async_channel::bounded(MAX_PENDING_PTY_EVENTS);
         let running = Arc::new(AtomicBool::new(true));
         spawn_reader(reader, sender.clone());
         let wait_running = Arc::clone(&running);

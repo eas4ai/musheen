@@ -62,8 +62,11 @@ Mechanism: independent and combined archive-bomb fixtures for every budget.
 Status: Draft
 Each terminal defaults to 10,000 scrollback lines and 64 MiB of retained
 terminal state; the lower bound wins and truncation removes oldest complete lines.
+The PTY output queue holds at most 64 chunks of 32 KiB (2 MiB) and
+backpressures a child when the UI cannot consume output fast enough.
 Falsifier: either bound is exceeded or truncation splits the active line.
-Mechanism: long-line, wide-cell, escape-heavy, and million-line PTY tests.
+Mechanism: long-line, wide-cell, escape-heavy, million-line, and stalled-consumer
+PTY tests.
 
 [LIMIT-008]
 Status: Draft

@@ -225,3 +225,40 @@ fn portable_pty_reports_normal_signal_and_loaded_child_exit_and_can_restart() {
         session.terminate().unwrap();
     }
 }
+
+#[test]
+fn pty_output_backpressures_a_slow_consumer_without_losing_bytes() {
+    const OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+    const MAX_PENDING_EVENTS: usize = 64;
+    let profile = TerminalProfile::new(
+        "flood",
+        "/bin/sh",
+        ["-c", "exec /usr/bin/head -c 4194304 /dev/zero"],
+    )
+    .unwrap();
+    let session =
+        TerminalSession::spawn(profile, &StorePath::from_unix_path("/tmp"), size()).unwrap();
+    let events = session.events();
+
+    assert_eq!(events.capacity(), Some(MAX_PENDING_EVENTS));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while events.len() < MAX_PENDING_EVENTS && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(events.len(), MAX_PENDING_EVENTS);
+
+    let mut received = 0_usize;
+    let mut exited = false;
+    while Instant::now() < deadline {
+        match session.recv_timeout(Duration::from_millis(100)) {
+            Ok(PtyEvent::Output(bytes)) => received += bytes.len(),
+            Ok(PtyEvent::Exited(TerminalExit::Code(0))) => exited = true,
+            Ok(PtyEvent::Exited(status)) => panic!("flood exited unexpectedly: {status:?}"),
+            Ok(PtyEvent::ReadFailed) => panic!("PTY reader failed during flood"),
+            Err(musheen_desktop::TerminalError::NotRunning) => break,
+            Err(_) => {}
+        }
+    }
+    assert!(exited, "flood did not exit before the deadline");
+    assert_eq!(received, OUTPUT_BYTES);
+}
