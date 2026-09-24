@@ -23,10 +23,17 @@ impl CancellationToken {
     }
 
     pub fn cancel(&self) {
-        if self.0.cancelled.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            let _guard = self
+                .0
+                .pause_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.0.cancelled.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            self.0.pause_waiters.notify_all();
         }
-        self.0.pause_waiters.notify_all();
         let mut waiters = self
             .0
             .waiters
@@ -62,6 +69,11 @@ impl CancellationToken {
     }
 
     pub fn resume(&self) {
+        let _guard = self
+            .0
+            .pause_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.0.paused.swap(false, Ordering::AcqRel) {
             self.0.pause_waiters.notify_all();
         }
@@ -106,5 +118,58 @@ impl CancellationToken {
         } else if !waiters.iter().any(|waiter| waiter.will_wake(waker)) {
             waiters.push(waker.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CancellationToken;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn cancel_serializes_with_a_paused_worker_before_notifying() {
+        let token = CancellationToken::new();
+        token.pause();
+        let pause_guard = token.0.pause_lock.lock().unwrap();
+        let worker_token = token.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_token.cancel();
+            finished_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let finished_while_locked = finished_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        drop(pause_guard);
+        worker.join().unwrap();
+
+        assert!(!finished_while_locked);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn resume_serializes_with_a_paused_worker_before_notifying() {
+        let token = CancellationToken::new();
+        token.pause();
+        let pause_guard = token.0.pause_lock.lock().unwrap();
+        let worker_token = token.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            worker_token.resume();
+            finished_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let finished_while_locked = finished_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        drop(pause_guard);
+        worker.join().unwrap();
+
+        assert!(!finished_while_locked);
+        assert!(!token.is_paused());
     }
 }
