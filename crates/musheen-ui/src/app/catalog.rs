@@ -2010,55 +2010,47 @@ mod tests {
 
     #[test]
     fn slow_provider_resolution_does_not_block_an_independent_catalog_update() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store =
-            musheen_desktop::CatalogStore::at(temporary.path().join("private/catalog.json"));
         let pinned = item("remote", b"slow-pin");
         let pinned_path = remote_path("remote", b"slow-pin");
-        let mut document = musheen_desktop::CatalogDocument::default();
-        document
-            .pins_mut()
-            .pin(pinned, pinned_path, "Slow")
+        let binding = CatalogBinding::in_memory();
+        binding
+            .update(|document| {
+                document
+                    .pins_mut()
+                    .pin(pinned, pinned_path, "Slow")
+                    .unwrap();
+            })
             .unwrap();
-        store.save(&document).unwrap();
-        let binding = CatalogBinding::persistent(store.clone(), document);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let resolving = binding.clone();
         let worker = std::thread::spawn(move || {
-            binding.reconcile_pins(|_| {
+            resolving.reconcile_pins(|_| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(None)
             })
         });
         entered_rx.recv().unwrap();
-
-        let available_store = store.clone();
-        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
-        let updater = std::thread::spawn(move || {
-            let result = available_store.update(|catalog| {
-                catalog
+        assert!(
+            binding.document.try_lock().is_ok(),
+            "provider resolution must not hold the catalog lock"
+        );
+        binding
+            .update(|document| {
+                document
                     .pins_mut()
                     .pin(
                         item("local", b"available"),
                         StorePath::from_unix_path("/available"),
                         "Available",
                     )
-                    .map_err(|error| Box::<str>::from(error.to_string()))?;
-                Ok(())
-            });
-            updated_tx.send(result).unwrap();
-        });
-        updated_rx
-            // The resolver stays blocked until after this receive, so a
-            // longer timeout still catches lock coupling under host load.
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("catalog update must not wait for provider resolution")
+                    .unwrap();
+            })
             .unwrap();
         release_tx.send(()).unwrap();
         worker.join().unwrap().unwrap();
-        updater.join().unwrap();
-        assert_eq!(store.load().unwrap().pins().entries().len(), 2);
+        assert_eq!(binding.snapshot().pins().entries().len(), 2);
     }
 
     #[test]
