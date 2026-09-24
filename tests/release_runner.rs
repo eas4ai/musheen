@@ -2,6 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[test]
 fn local_release_runner_builds_the_committed_tree_in_one_docker_build() {
@@ -255,12 +256,15 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     let fake_startup_bench = fake_bin.join("startup-bench");
     fs::write(
         &fake_startup_bench,
-        "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_STARTUP_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_STARTUP_BENCH_ARGS\"\nprintf '%s' \"$MUSHEEN_STARTUP_APP\" > \"$MUSHEEN_STARTUP_APP_RECORD\"\nif [ \"${MUSHEEN_FAKE_STARTUP_MISSING:-0}\" = 0 ]; then printf '%s\\n' '{\"case\":\"first_window_startup\",\"window_visible\":true,\"display_backend\":\"x11\",\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"temporary_bytes\":0,\"queued_work_max\":null,\"retained_models_max\":null,\"internal_counters_sampled\":false}'; fi\n",
+        "#!/bin/sh\n: \"${MUSHEEN_BENCH_RESULT_FILE:?}\"\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_STARTUP_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_STARTUP_BENCH_ARGS\"\nprintf '%s' \"$MUSHEEN_STARTUP_APP\" > \"$MUSHEEN_STARTUP_APP_RECORD\"\nprintf '%s\\n' 'unrelated desktop service message'\nif [ \"${MUSHEEN_FAKE_STARTUP_MISSING:-0}\" = 0 ]; then printf '%s\\n' '{\"case\":\"first_window_startup\",\"window_visible\":true,\"display_backend\":\"x11\",\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"temporary_bytes\":0,\"queued_work_max\":null,\"retained_models_max\":null,\"internal_counters_sampled\":false}' > \"$MUSHEEN_BENCH_RESULT_FILE\"; fi\n",
     )
     .unwrap();
     fs::set_permissions(&fake_startup_bench, fs::Permissions::from_mode(0o755)).unwrap();
     for (name, script) in [
-        ("dbus-run-session", "#!/bin/sh\nshift\nexec \"$@\"\n"),
+        (
+            "dbus-run-session",
+            "#!/bin/sh\nif [ -f \"$MUSHEEN_FAKE_STICKY_STDOUT_FILE\" ]; then sleep 3 2>/dev/null & fi\nshift\nexec \"$@\"\n",
+        ),
         ("xvfb-run", "#!/bin/sh\nshift\nexec \"$@\"\n"),
     ] {
         let wrapper = fake_bin.join(name);
@@ -300,6 +304,10 @@ fn run_benchmark_fixture(
         .env("MUSHEEN_FAKE_REMOTE_BENCH", fake_bin.join("remote-bench"))
         .env("MUSHEEN_FAKE_STARTUP_BENCH", fake_bin.join("startup-bench"))
         .env("MUSHEEN_FAKE_APP", fake_bin.join("musheen"))
+        .env(
+            "MUSHEEN_FAKE_STICKY_STDOUT_FILE",
+            temporary.join("sticky-stdout"),
+        )
         .env(
             "MUSHEEN_FAKE_THUMBNAIL_WORKER",
             fake_bin.join("musheen-thumbnail-worker"),
@@ -527,5 +535,23 @@ fn benchmark_runner_isolates_temporary_files_and_rejects_missing_results() {
     assert!(
         !missing_startup.status.success(),
         "missing startup benchmark case must fail"
+    );
+}
+
+#[test]
+fn startup_benchmark_does_not_wait_for_an_unrelated_stdout_holder() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temporary = tempfile::tempdir().unwrap();
+    let fake_bin = temporary.path().join("bin");
+    install_fake_benchmarks(&fake_bin);
+    fs::write(temporary.path().join("sticky-stdout"), b"active").unwrap();
+
+    let started = Instant::now();
+    let result = run_benchmark_fixture(root, temporary.path(), &fake_bin, None);
+
+    assert!(result.status.success(), "{result:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "runner waited for a session service after the benchmark exited"
     );
 }

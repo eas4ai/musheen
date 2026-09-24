@@ -16,7 +16,7 @@ fi
 
 run_benchmark() (
     local name=$1
-    local benchmark benchmark_temp output worker app
+    local benchmark benchmark_temp output_file worker app
     benchmark=$(cargo bench --locked --no-run --bench "$name" --message-format=json \
         | jq -r --arg target "$name" 'select(.reason == "compiler-artifact" and .target.name == $target and .executable != null) | .executable')
     if [[ ! -x $benchmark ]]; then
@@ -43,8 +43,12 @@ run_benchmark() (
     fi
 
     benchmark_temp=$(mktemp -d -p "$temporary_parent" musheen-bench.XXXXXX)
+    output_file=$benchmark_temp/output.jsonl
     cleanup() {
         local status=$?
+        if [[ -e $output_file ]] && ! rm -- "$output_file"; then
+            status=1
+        fi
         if ! rmdir "$benchmark_temp"; then
             printf 'benchmark left temporary files in %s\n' "$benchmark_temp" >&2
             status=1
@@ -54,14 +58,16 @@ run_benchmark() (
     trap cleanup EXIT
 
     if [[ $name == startup ]]; then
-        output=$(TMPDIR="$benchmark_temp" MUSHEEN_STARTUP_APP="$app" \
-            dbus-run-session -- xvfb-run -a "$benchmark" --bench)
+        TMPDIR="$benchmark_temp" MUSHEEN_STARTUP_APP="$app" \
+            MUSHEEN_BENCH_RESULT_FILE="$output_file" \
+            dbus-run-session -- xvfb-run -a "$benchmark" --bench >/dev/null
     else
-        output=$(TMPDIR="$benchmark_temp" MUSHEEN_THUMBNAIL_WORKER="${worker:-}" "$benchmark" --bench)
+        TMPDIR="$benchmark_temp" MUSHEEN_THUMBNAIL_WORKER="${worker:-}" \
+            "$benchmark" --bench >"$output_file"
     fi
-    printf '%s\n' "$output"
-    if ! printf '%s\n' "$output" | jq -e -s --arg benchmark "$name" \
-        -f scripts/benchmark-validations.jq >/dev/null; then
+    cat "$output_file"
+    if ! jq -e -s --arg benchmark "$name" \
+        -f scripts/benchmark-validations.jq "$output_file" >/dev/null; then
         printf '%s benchmark did not emit complete bounded measurements\n' "$name" >&2
         exit 1
     fi

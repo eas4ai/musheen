@@ -2,7 +2,7 @@ mod support;
 
 use serde_json::json;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -92,6 +92,7 @@ fn run() -> BenchResult<()> {
             .env("XDG_SESSION_TYPE", "x11")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("MUSHEEN_THEME_PREVIEW")
+            .env_remove("MUSHEEN_BENCH_RESULT_FILE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -124,25 +125,31 @@ fn run() -> BenchResult<()> {
     if metrics.peak_rss_kib == 0 || metrics.open_fds == 0 {
         return Err(io::Error::other("Musheen process resources were not sampled").into());
     }
-    println!(
-        "{}",
-        json!({
-            "case": "first_window_startup",
-            "window_visible": true,
-            "display_backend": "x11",
-            "wall_ns": after.captured.duration_since(before.captured).as_nanos(),
-            "cpu_ns": metrics.cpu_ns,
-            "peak_rss_kib": metrics.peak_rss_kib,
-            "open_fds": metrics.open_fds,
-            "temporary_bytes": after.temporary_bytes,
-            "benchmark_cpu_ns": after.cpu_nanoseconds.saturating_sub(before.cpu_nanoseconds),
-            "benchmark_peak_rss_kib": after.peak_rss_kib,
-            "benchmark_open_fds": after.open_fds,
-            "queued_work_max": null,
-            "retained_models_max": null,
-            "internal_counters_sampled": false,
-        })
-    );
+    let result = json!({
+        "case": "first_window_startup",
+        "window_visible": true,
+        "display_backend": "x11",
+        "wall_ns": after.captured.duration_since(before.captured).as_nanos(),
+        "cpu_ns": metrics.cpu_ns,
+        "peak_rss_kib": metrics.peak_rss_kib,
+        "open_fds": metrics.open_fds,
+        "temporary_bytes": after.temporary_bytes,
+        "benchmark_cpu_ns": after.cpu_nanoseconds.saturating_sub(before.cpu_nanoseconds),
+        "benchmark_peak_rss_kib": after.peak_rss_kib,
+        "benchmark_open_fds": after.open_fds,
+        "queued_work_max": null,
+        "retained_models_max": null,
+        "internal_counters_sampled": false,
+    });
+    if let Some(path) = std::env::var_os("MUSHEEN_BENCH_RESULT_FILE") {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        writeln!(file, "{result}")?;
+    } else {
+        println!("{result}");
+    }
     Ok(())
 }
 
