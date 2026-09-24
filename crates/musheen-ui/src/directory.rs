@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod index;
-use index::{DiskDirectoryIndex, IndexedSelection, ResolvedIndexedSelection};
+pub(crate) use index::IndexedSelection;
+use index::{DiskDirectoryIndex, ResolvedIndexedSelection};
 
 const MAX_RESIDENT_ITEMS: usize = 4_096;
 
@@ -206,6 +207,31 @@ impl DirectoryIndexReader {
                 Ok((targets, first_item))
             })
             .transpose()
+    }
+
+    pub(crate) fn resolve_focused_context_targets(
+        &self,
+        focused: &ItemId,
+        selected_ids: &[ItemId],
+        bitmap: Option<&IndexedSelection>,
+    ) -> std::io::Result<Option<(Vec<CommandTargetRef>, Option<StoreItem>)>> {
+        let Some((item, arrival)) = self
+            .index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
+            .lookup_id_with_arrival(focused)?
+        else {
+            return Ok(None);
+        };
+        if bitmap.is_some_and(|bitmap| bitmap.contains(arrival)) {
+            return self.resolve_command_targets(&[], bitmap);
+        }
+        if selected_ids.contains(focused) {
+            return self.resolve_command_targets(selected_ids, None);
+        }
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(Some((vec![target], Some(item))))
     }
 }
 

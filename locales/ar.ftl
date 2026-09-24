@@ -61,6 +61,7 @@ context-archive-unavailable = استخراج الأرشيف غير متاح لأ
 context-authorization-unavailable = صلاحيات المسؤول غير متاحة لأن خدمة التفويض غير مثبتة
 context-association-unavailable = اختيار التطبيق غير متاح لأن خدمة ربط التطبيقات غير مثبتة
 context-target-changed = تغير العنصر المحدد أو لم يعد موجودًا؛ افتح قائمة السياق مجددًا
+context-menu-loading = جارٍ تحميل قائمة السياق…
 context-origin-unavailable = اللوحة الأصلية لم تعد متاحة
 context-target-verification = تعذر على الموفر التحقق من العنصر قبل العملية
 context-directory-verification = تعذر على الموفر التحقق من الوصول إلى المجلد

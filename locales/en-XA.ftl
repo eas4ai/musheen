@@ -196,6 +196,7 @@ context-archive-unavailable = ⟦Archive extraction is unavailable because no ar
 context-authorization-unavailable = ⟦Privilege elevation is unavailable because no authorization broker is installed······⟧
 context-association-unavailable = ⟦Desktop application association is unavailable because no association backend is installed······⟧
 context-target-changed = ⟦the selected item changed or no longer exists; reopen the context menu······⟧
+context-menu-loading = ⟦Loading context menu…··⟧
 context-origin-unavailable = ⟦the originating pane is no longer available······⟧
 context-target-verification = ⟦the provider could not verify the selected item before this operation······⟧
 context-directory-verification = ⟦the provider could not verify directory access······⟧

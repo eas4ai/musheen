@@ -15,8 +15,8 @@ use crate::dialogs::{
     metadata_review_window_options, open_with_window_options, properties_window_options,
 };
 use crate::directory::{
-    ApplyPageResult, DirectoryIndexResult, DirectoryIndexWork, DirectoryLoad, DirectoryModel,
-    DirectoryState,
+    ApplyPageResult, DirectoryIndexReader, DirectoryIndexResult, DirectoryIndexWork, DirectoryLoad,
+    DirectoryModel, DirectoryState, IndexedSelection,
 };
 use crate::elevated_browser::{PrivilegeBackend, RootedFilesystemStore, SystemPrivilegeBackend};
 use crate::i18n::{Catalog, Locale};
@@ -330,6 +330,25 @@ type IndexedLoadedRange = (std::ops::Range<usize>, Vec<(StoreItem, u64)>);
 enum IndexedSelectionRequest {
     All,
     Through(ItemId),
+}
+
+struct DeferredIndexedContextMenu {
+    tab_id: TabId,
+    location: StorePath,
+    clicked: ItemId,
+    selected_ids: Vec<ItemId>,
+    bitmap: Option<IndexedSelection>,
+    source: IndexedContextSource,
+    reader: DirectoryIndexReader,
+    generation: u64,
+    order_epoch: u64,
+    selection_epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+enum IndexedContextSource {
+    Pointer,
+    Keyboard,
 }
 
 impl IndexedViewport {
@@ -3149,6 +3168,7 @@ struct MusheenApp {
     pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
     pending_directory_restores: HashMap<TabId, PendingDirectoryRestore>,
     pending_context_menu: Option<ContextMenu>,
+    pending_indexed_context_menu: Option<DeferredIndexedContextMenu>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
     /// Dialog windows are tracked by their GPUI identity. The close observer
     /// clears only its own immutable pending workflow; opening a second review
@@ -3867,6 +3887,7 @@ impl MusheenApp {
             pending_catalog_moves: HashMap::new(),
             pending_directory_restores: HashMap::new(),
             pending_context_menu: None,
+            pending_indexed_context_menu: None,
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
             context_dialog_close_subscription: None,
@@ -6406,7 +6427,7 @@ impl MusheenApp {
         clicked: ItemId,
         cx: &mut Context<Self>,
     ) -> ContextMenu {
-        let (clicked_target, selected) = {
+        let (clicked_target, selected, deferred) = {
             let Some(directory) = self.directories.get(&tab_id) else {
                 return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
             };
@@ -6432,17 +6453,64 @@ impl MusheenApp {
             };
             let clicked_target = CommandTargetRef::new(item.id().clone(), item.path().clone())
                 .expect("directory items have stable command targets");
-            let selected = view
-                .selected_ids()
-                .iter()
-                .map(|id| {
-                    let item = cached_item(id)?;
-                    CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+            let selected_ids = view.selected_ids().to_vec();
+            let selected_in_bitmap = viewport
+                .and_then(|viewport| {
+                    viewport
+                        .loaded
+                        .iter()
+                        .flat_map(|(_, items)| items)
+                        .find(|(item, _)| item.id() == &clicked)
+                        .map(|(_, arrival)| *arrival)
                 })
-                .collect::<Option<Vec<_>>>()
-                .unwrap_or_default();
-            (clicked_target, selected)
+                .is_some_and(|arrival| directory.is_indexed_arrival_selected(arrival));
+            let deferred = if directory.is_indexed()
+                && (selected_in_bitmap
+                    || (selected_ids.len() > 1 && selected_ids.contains(&clicked)))
+            {
+                directory
+                    .index_reader()
+                    .map(|reader| DeferredIndexedContextMenu {
+                        tab_id,
+                        location: self
+                            .navigation
+                            .tab(tab_id)
+                            .expect("context tab exists")
+                            .location()
+                            .clone(),
+                        clicked: clicked.clone(),
+                        selected_ids: selected_ids.clone(),
+                        bitmap: selected_in_bitmap
+                            .then(|| directory.indexed_selection().cloned())
+                            .flatten(),
+                        source: IndexedContextSource::Pointer,
+                        reader,
+                        generation: directory.generation(),
+                        order_epoch: directory.order_epoch(),
+                        selection_epoch: directory.indexed_selection_epoch(),
+                    })
+            } else {
+                None
+            };
+            let selected = if deferred.is_some() {
+                Vec::new()
+            } else {
+                selected_ids
+                    .iter()
+                    .map(|id| {
+                        let item = cached_item(id)?;
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .unwrap_or_default()
+            };
+            (clicked_target, selected, deferred)
         };
+        self.pending_indexed_context_menu = deferred;
+        if self.pending_indexed_context_menu.is_some() {
+            self.focus_directory_item(tab_id, Some(clicked_target.id().clone()), cx);
+            return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+        }
         let prepared = self
             .shell
             .context_menus()
@@ -6467,6 +6535,185 @@ impl MusheenApp {
         self.compose_context_menu(tab_id, MenuTarget::Item, prepared.selection().to_vec())
     }
 
+    fn start_indexed_context_menu(
+        &mut self,
+        request: DeferredIndexedContextMenu,
+        popup: WeakEntity<PopupMenu>,
+        window: AnyWindowHandle,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let DeferredIndexedContextMenu {
+            tab_id,
+            location,
+            clicked,
+            selected_ids,
+            bitmap,
+            source,
+            reader,
+            generation,
+            order_epoch,
+            selection_epoch,
+        } = request;
+        let lookup_ids = selected_ids.clone();
+        let lookup_clicked = clicked.clone();
+        let work = cx.background_spawn(async move {
+            match source {
+                IndexedContextSource::Pointer => {
+                    reader.resolve_command_targets(&lookup_ids, bitmap.as_ref())
+                }
+                IndexedContextSource::Keyboard => reader.resolve_focused_context_targets(
+                    &lookup_clicked,
+                    &lookup_ids,
+                    bitmap.as_ref(),
+                ),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if popup.upgrade().is_none() {
+                    return;
+                }
+                let current = state
+                    .navigation
+                    .tab(tab_id)
+                    .is_some_and(|tab| tab.location() == &location)
+                    && state.directories.get(&tab_id).is_some_and(|directory| {
+                        directory.generation() == generation
+                            && directory.order_epoch() == order_epoch
+                            && directory.indexed_selection_epoch() == selection_epoch
+                            && directory.view().selected_ids() == selected_ids
+                    });
+                if !current {
+                    Self::rebuild_indexed_context_status(
+                        popup,
+                        window,
+                        state
+                            .catalog
+                            .message("context-target-changed")
+                            .expect("stale menu status is localized")
+                            .to_owned(),
+                        cx,
+                    );
+                    return;
+                }
+                let (targets, first_item) = match result {
+                    Ok(Some((targets, first_item)))
+                        if targets.iter().any(|target| target.id() == &clicked) =>
+                    {
+                        (targets, first_item)
+                    }
+                    Ok(_) => {
+                        Self::rebuild_indexed_context_status(
+                            popup,
+                            window,
+                            state
+                                .catalog
+                                .message("context-target-changed")
+                                .expect("stale menu status is localized")
+                                .to_owned(),
+                            cx,
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        state.operation_error = Some(error.to_string().into());
+                        Self::rebuild_indexed_context_status(
+                            popup,
+                            window,
+                            state
+                                .catalog
+                                .message("context-target-verification")
+                                .expect("menu failure is localized")
+                                .to_owned(),
+                            cx,
+                        );
+                        cx.notify();
+                        return;
+                    }
+                };
+                state.preflight_custom_actions(&targets, location.clone(), cx);
+                state.refresh_application_snapshot(&targets, cx);
+                let send_to = state.send_to_destinations(tab_id);
+                let open_with = state.open_with_applications(&targets);
+                let menu = state.compose_context_request(
+                    state
+                        .context_menu_request_with_item(
+                            tab_id,
+                            MenuTarget::Item,
+                            location,
+                            targets,
+                            first_item.as_ref(),
+                        )
+                        .with_send_to(&send_to)
+                        .with_open_with(&open_with),
+                );
+                let live = custom_actions::LiveActionPopup {
+                    popup,
+                    window,
+                    menu: menu.clone(),
+                    path,
+                    projection: Vec::new(),
+                    target: MenuTarget::Item,
+                };
+                state
+                    .live_application_popups
+                    .retain(|popup| popup.popup.upgrade().is_some());
+                state.live_application_popups.push(live.clone());
+                live.rebuild(menu, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn rebuild_indexed_context_status(
+        popup: WeakEntity<PopupMenu>,
+        window: AnyWindowHandle,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(popup) = popup.upgrade() else {
+            return;
+        };
+        let _ = window.update(cx, move |_, window, cx| {
+            popup.update(cx, |popup, cx| {
+                popup.rebuild(window, cx, |popup, _, _| {
+                    popup.item(PopupMenuItem::label(label))
+                })
+            });
+        });
+    }
+
+    fn indexed_keyboard_context_request(
+        &self,
+        tab_id: TabId,
+    ) -> Option<DeferredIndexedContextMenu> {
+        let tab = self.navigation.tab(tab_id)?;
+        if is_trash_location(tab.location()) {
+            return None;
+        }
+        let directory = self.directories.get(&tab_id)?;
+        if !directory.is_indexed() {
+            return None;
+        }
+        Some(DeferredIndexedContextMenu {
+            tab_id,
+            location: tab.location().clone(),
+            clicked: directory.view().focused_item_id()?.clone(),
+            selected_ids: directory.view().selected_ids().to_vec(),
+            bitmap: directory.indexed_selection().cloned(),
+            source: IndexedContextSource::Keyboard,
+            reader: directory.index_reader()?,
+            generation: directory.generation(),
+            order_epoch: directory.order_epoch(),
+            selection_epoch: directory.indexed_selection_epoch(),
+        })
+    }
+
     fn sidebar_context_menu(&self, tab_id: TabId) -> ContextMenu {
         self.compose_context_menu(tab_id, MenuTarget::SidebarLocation, Vec::new())
     }
@@ -6478,6 +6725,7 @@ impl MusheenApp {
         self.remember_context_invocation_focus(window, cx);
         let tab_id = self.navigation.focused_tab().id();
         let trash = is_trash_location(self.navigation.focused_tab().location());
+        let deferred = self.indexed_keyboard_context_request(tab_id);
         let focused = if trash {
             self.trash_focus.get(&tab_id).cloned()
         } else {
@@ -6491,27 +6739,52 @@ impl MusheenApp {
                     })
             })
         };
-        let prepared = self.shell.context_menus().prepare_keyboard_target(focused);
-        let menu_target = if prepared.selection().is_empty() {
-            MenuTarget::Background
-        } else if trash {
-            MenuTarget::TrashItem
+        let menu = if deferred.is_none() {
+            let prepared = self.shell.context_menus().prepare_keyboard_target(focused);
+            let menu_target = if prepared.selection().is_empty() {
+                MenuTarget::Background
+            } else if trash {
+                MenuTarget::TrashItem
+            } else {
+                MenuTarget::Item
+            };
+            self.refresh_application_snapshot(prepared.selection(), cx);
+            Some(self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec()))
         } else {
-            MenuTarget::Item
+            None
         };
-        self.refresh_application_snapshot(prepared.selection(), cx);
-        let menu = self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec());
+        let loading_label = deferred.as_ref().map(|_| {
+            self.catalog
+                .message("context-menu-loading")
+                .expect("selection loading status is localized")
+                .to_owned()
+        });
         let app = cx.entity().downgrade();
         let popup = PopupMenu::build(window, cx, move |popup, window, popup_cx| {
-            Self::populate_context_popup(
-                popup,
-                menu,
-                app.clone(),
-                format!("keyboard-{tab_id:?}"),
-                window,
-                popup_cx,
-            )
+            if let Some(menu) = menu {
+                Self::populate_context_popup(
+                    popup,
+                    menu,
+                    app.clone(),
+                    format!("keyboard-{tab_id:?}"),
+                    window,
+                    popup_cx,
+                )
+            } else {
+                popup.item(PopupMenuItem::label(
+                    loading_label.expect("deferred menus have a loading label"),
+                ))
+            }
         });
+        if let Some(deferred) = deferred {
+            self.start_indexed_context_menu(
+                deferred,
+                popup.downgrade(),
+                window.window_handle(),
+                format!("keyboard-{tab_id:?}"),
+                cx,
+            );
+        }
         let popup_for_focus = popup.clone();
         popup.update(cx, |popup, cx| {
             popup.focus_handle(cx).focus(window, cx);
@@ -11735,22 +12008,48 @@ impl MusheenApp {
                 }),
             )
             .context_menu(move |popup, window, popup_cx| {
-                let Some(menu) = context_menu_host
+                let Some((menu, deferred, loading_label)) = context_menu_host
                     .update(popup_cx, |this, cx| {
                         if this.browser_input_blocked() {
                             this.pending_context_menu = None;
+                            this.pending_indexed_context_menu = None;
                             return None;
                         }
                         this.remember_context_invocation_focus(window, cx);
-                        Some(this.pending_context_menu.take().unwrap_or_else(|| {
+                        let menu = this.pending_context_menu.take().unwrap_or_else(|| {
                             this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new())
-                        }))
+                        });
+                        let deferred = this.pending_indexed_context_menu.take();
+                        let loading_label = deferred.as_ref().map(|_| {
+                            this.catalog
+                                .message("context-menu-loading")
+                                .expect("selection loading status is localized")
+                                .to_owned()
+                        });
+                        Some((menu, deferred, loading_label))
                     })
                     .ok()
                     .flatten()
                 else {
                     return popup;
                 };
+                if let Some(deferred) = deferred {
+                    let popup_ref = popup_cx.entity().downgrade();
+                    let window_handle = window.window_handle();
+                    let path = format!("pane-{tab_id:?}");
+                    let _ = context_menu_host.update(popup_cx, |this, cx| {
+                        this.start_indexed_context_menu(
+                            deferred,
+                            popup_ref,
+                            window_handle,
+                            path,
+                            cx,
+                        );
+                    });
+                    return popup.item(PopupMenuItem::label(
+                        loading_label.expect("deferred menus have a loading label"),
+                    ));
+                }
                 Self::populate_context_popup(
                     popup,
                     menu,
@@ -19222,6 +19521,12 @@ mod tests {
                 }
                 directory.view_mut().preferences_mut().layout = Layout::Details;
                 assert_eq!(directory.visible_count(), 8_192);
+                let preferences = directory.view().preferences().clone();
+                state
+                    .navigation
+                    .tab_mut(tab_id)
+                    .unwrap()
+                    .set_view_preferences(preferences);
                 cx.notify();
                 tab_id
             })
@@ -19312,6 +19617,64 @@ mod tests {
                 .selected
         });
         assert!(first_row_selected);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.right_click("directory-item-0-0", cx);
+            assert_eq!(
+                app.read(cx).focused_directory().indexed_selected_count(),
+                8_192
+            );
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |_, cx| {
+            app.read(cx).live_application_popups.iter().any(|popup| {
+                popup
+                    .menu
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.captured_targets().len() == 8_192)
+            })
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert_eq!(
+                app.read(cx).focused_directory().indexed_selected_count(),
+                8_192
+            );
+            window.click("status-bar", cx);
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            app.update(cx, |state, cx| {
+                let far = ItemId::new(ProviderId::new("local").unwrap(), 4_096usize.to_be_bytes())
+                    .unwrap();
+                state.focus_directory_item(tab_id, Some(far), cx);
+                state.open_keyboard_context_menu(window, cx);
+                assert_eq!(state.focused_directory().indexed_selected_count(), 8_192);
+            });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |_, cx| {
+            app.read(cx).live_application_popups.iter().any(|popup| {
+                popup.path.starts_with("keyboard-")
+                    && popup
+                        .menu
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.captured_targets().len() == 8_192)
+            })
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).keyboard_context_popup.is_none()
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| state.focus_directory_item(tab_id, None, cx));
+        });
         probe.lock().unwrap().clear();
         cx.update(|cx| {
             app.update(cx, |state, cx| {
@@ -19341,6 +19704,46 @@ mod tests {
             app.read(cx).focused_directory().indexed_selected_count() == 4_097
         })
         .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            app.update(cx, |state, cx| {
+                let unselected =
+                    ItemId::new(ProviderId::new("local").unwrap(), 8_191usize.to_be_bytes())
+                        .unwrap();
+                state.focus_directory_item(tab_id, Some(unselected), cx);
+                state.open_keyboard_context_menu(window, cx);
+                assert_eq!(state.focused_directory().indexed_selected_count(), 4_097);
+            });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |_, cx| {
+            app.read(cx)
+                .live_application_popups
+                .iter()
+                .rev()
+                .find(|popup| popup.path.starts_with("keyboard-"))
+                .is_some_and(|popup| {
+                    popup.menu.entries().iter().any(|entry| {
+                        entry.captured_targets().len() == 1
+                            && entry.captured_targets()[0].id().opaque_key()
+                                == 8_191usize.to_be_bytes()
+                    })
+                })
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).keyboard_context_popup.is_none()
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                assert_eq!(state.focused_directory().indexed_selected_count(), 4_097);
+                state.focus_directory_item(tab_id, None, cx);
+            });
+        });
         cx.update(|cx| {
             app.update(cx, |state, cx| {
                 state.dispatch_selection_action(CommandAction::ClearSelection, cx);
@@ -19382,14 +19785,41 @@ mod tests {
                 state
                     .focused_directory_mut()
                     .view_mut()
-                    .set_selected_ids(vec![item.id().clone(), far]);
-                state.item_context_menu(tab_id, item.id().clone(), cx);
+                    .set_selected_ids(vec![item.id().clone(), far.clone()]);
                 assert_eq!(
                     state.focused_directory().view().selected_ids(),
-                    std::slice::from_ref(item.id())
+                    &[item.id().clone(), far]
                 );
             });
         });
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.find("directory-item-0-0").visible());
+            window.right_click("directory-item-0-0", cx);
+            assert_eq!(
+                app.read(cx).focused_directory().view().selected_ids().len(),
+                2
+            );
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |_, cx| {
+            app.read(cx)
+                .live_application_popups
+                .iter()
+                .rev()
+                .find(|popup| popup.path.starts_with("pane-"))
+                .is_some_and(|popup| {
+                    popup
+                        .menu
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.captured_targets().len() == 2)
+                })
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("status-bar", cx);
+        })
+        .unwrap();
         cx.update(|cx| {
             app.update(cx, |state, cx| {
                 state
@@ -19412,11 +19842,13 @@ mod tests {
                 .is_some_and(|viewport| viewport.item(4_096).is_some())
         })
         .await;
-        cx.update_window(handle.into(), |_, window, cx| {
+        cx.wait_for(handle.into(), Duration::from_secs(3), |window, cx| {
             window.render_frame(cx);
-            assert!(window.find("directory-item-0-4096").visible());
+            window
+                .try_find("directory-item-0-4096")
+                .is_some_and(|item| item.visible())
         })
-        .unwrap();
+        .await;
         cx.update(|cx| {
             let viewport = app.read(cx).indexed_viewports.get(&tab_id).unwrap();
             assert!(viewport.item(0).is_some());
@@ -19488,7 +19920,7 @@ mod tests {
         .await;
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert_eq!(window.find("status-bar").label(), Some("1 item selected"));
+            assert_eq!(window.find("status-bar").label(), Some("2 items selected"));
         })
         .unwrap();
         cx.update(|cx| {

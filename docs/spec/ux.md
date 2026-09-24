@@ -156,8 +156,9 @@ Mechanism: keyboard interaction test across two windows and both drawer states.
 Status: Draft
 Right-clicking an unselected item selects only that item before opening its
 menu; right-clicking an item already in a multi-selection preserves that
-selection. A keyboard-opened menu targets the focused item or the view
-background when no item is focused.
+selection. A keyboard-opened menu uses the focused item: if it belongs to a
+multi-selection, actions target that selection; otherwise they target only the
+focused item. With no focused item, the menu targets the view background.
 Falsifier: opening a menu silently changes an existing multi-selection or
 targets an item other than the one visually indicated.
 Mechanism: pointer and keyboard menu tests over empty, single, and multi-selection states.
