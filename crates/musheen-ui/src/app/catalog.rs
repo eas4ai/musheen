@@ -2050,7 +2050,9 @@ mod tests {
             updated_tx.send(result).unwrap();
         });
         updated_rx
-            .recv_timeout(std::time::Duration::from_millis(250))
+            // The resolver stays blocked until after this receive, so a
+            // longer timeout still catches lock coupling under host load.
+            .recv_timeout(std::time::Duration::from_secs(2))
             .expect("catalog update must not wait for provider resolution")
             .unwrap();
         release_tx.send(()).unwrap();
