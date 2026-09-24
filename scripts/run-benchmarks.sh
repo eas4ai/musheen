@@ -57,3 +57,4 @@ run_benchmark directory
 run_benchmark search
 run_benchmark operations
 run_benchmark thumbnail
+run_benchmark archive

@@ -180,7 +180,7 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\n  if [ \"$argument\" = thumbnail ]; then name=thumbnail; executable=$MUSHEEN_FAKE_THUMBNAIL_BENCH; fi\n  if [ \"$argument\" = musheen-thumbnail-worker ]; then name=musheen-thumbnail-worker; executable=$MUSHEEN_FAKE_THUMBNAIL_WORKER; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\n  if [ \"$argument\" = thumbnail ]; then name=thumbnail; executable=$MUSHEEN_FAKE_THUMBNAIL_BENCH; fi\n  if [ \"$argument\" = archive ]; then name=archive; executable=$MUSHEEN_FAKE_ARCHIVE_BENCH; fi\n  if [ \"$argument\" = musheen-thumbnail-worker ]; then name=musheen-thumbnail-worker; executable=$MUSHEEN_FAKE_THUMBNAIL_WORKER; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -215,6 +215,13 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     )
     .unwrap();
     fs::set_permissions(&fake_thumbnail_bench, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_archive_bench = fake_bin.join("archive-bench");
+    fs::write(
+        &fake_archive_bench,
+        "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_ARCHIVE_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_ARCHIVE_BENCH_ARGS\"\nprintf '%s\\n' '{\"case\":\"archive_expanded_bytes_rejected\",\"resource\":\"expanded bytes\",\"rejected\":true,\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"queued_work_max\":0,\"retained_models_max\":0,\"temporary_bytes\":100}' '{\"case\":\"archive_compression_ratio_rejected\",\"resource\":\"compression ratio\",\"rejected\":true,\"wall_ns\":2,\"cpu_ns\":2,\"peak_rss_kib\":2,\"open_fds\":4,\"queued_work_max\":0,\"retained_models_max\":0,\"temporary_bytes\":100}'\nif [ \"${MUSHEEN_FAKE_ARCHIVE_MISSING:-0}\" = 0 ]; then printf '%s\\n' '{\"case\":\"archive_nesting_rejected\",\"resource\":\"archive nesting\",\"rejected\":true,\"wall_ns\":3,\"cpu_ns\":3,\"peak_rss_kib\":2,\"open_fds\":4,\"queued_work_max\":0,\"retained_models_max\":0,\"temporary_bytes\":100}'; fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_archive_bench, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn run_benchmark_fixture(
@@ -223,6 +230,7 @@ fn run_benchmark_fixture(
     fake_bin: &Path,
     missing_directory: bool,
     missing_search: bool,
+    missing_archive: bool,
 ) -> std::process::Output {
     Command::new(root.join("scripts/run-benchmarks.sh"))
         .env(
@@ -241,6 +249,7 @@ fn run_benchmark_fixture(
             "MUSHEEN_FAKE_THUMBNAIL_BENCH",
             fake_bin.join("thumbnail-bench"),
         )
+        .env("MUSHEEN_FAKE_ARCHIVE_BENCH", fake_bin.join("archive-bench"))
         .env(
             "MUSHEEN_FAKE_THUMBNAIL_WORKER",
             fake_bin.join("musheen-thumbnail-worker"),
@@ -253,6 +262,10 @@ fn run_benchmark_fixture(
             "MUSHEEN_FAKE_SEARCH_MISSING",
             if missing_search { "1" } else { "0" },
         )
+        .env(
+            "MUSHEEN_FAKE_ARCHIVE_MISSING",
+            if missing_archive { "1" } else { "0" },
+        )
         .env("MUSHEEN_CARGO_ARGS", temporary.join("cargo-args"))
         .env("MUSHEEN_BENCH_ARGS", temporary.join("bench-args"))
         .env("MUSHEEN_SEARCH_BENCH_ARGS", temporary.join("search-args"))
@@ -264,6 +277,7 @@ fn run_benchmark_fixture(
             "MUSHEEN_THUMBNAIL_BENCH_ARGS",
             temporary.join("thumbnail-args"),
         )
+        .env("MUSHEEN_ARCHIVE_BENCH_ARGS", temporary.join("archive-args"))
         .env(
             "MUSHEEN_SEARCH_BENCH_TMP_RECORD",
             temporary.join("search-temp"),
@@ -276,6 +290,10 @@ fn run_benchmark_fixture(
         .env(
             "MUSHEEN_THUMBNAIL_BENCH_TMP_RECORD",
             temporary.join("thumbnail-temp"),
+        )
+        .env(
+            "MUSHEEN_ARCHIVE_BENCH_TMP_RECORD",
+            temporary.join("archive-temp"),
         )
         .env(
             "MUSHEEN_THUMBNAIL_WORKER_RECORD",
@@ -291,6 +309,7 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     assert!(cargo_args.contains("--no-run --bench search"));
     assert!(cargo_args.contains("--no-run --bench operations"));
     assert!(cargo_args.contains("--no-run --bench thumbnail"));
+    assert!(cargo_args.contains("--no-run --bench archive"));
     assert!(cargo_args.contains("--bin musheen-thumbnail-worker"));
     assert_eq!(
         fs::read_to_string(temporary.join("bench-args")).unwrap(),
@@ -309,6 +328,10 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
         "--bench"
     );
     assert_eq!(
+        fs::read_to_string(temporary.join("archive-args")).unwrap(),
+        "--bench"
+    );
+    assert_eq!(
         fs::read_to_string(temporary.join("thumbnail-worker-record")).unwrap(),
         temporary
             .join("bin/musheen-thumbnail-worker")
@@ -318,6 +341,7 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     let search_temp = fs::read_to_string(temporary.join("search-temp")).unwrap();
     let operations_temp = fs::read_to_string(temporary.join("operations-temp")).unwrap();
     let thumbnail_temp = fs::read_to_string(temporary.join("thumbnail-temp")).unwrap();
+    let archive_temp = fs::read_to_string(temporary.join("archive-temp")).unwrap();
     assert!(benchmark_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(benchmark_temp, temporary.to_str().unwrap());
     assert!(search_temp.starts_with(temporary.to_str().unwrap()));
@@ -326,6 +350,8 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     assert_ne!(operations_temp, search_temp);
     assert!(thumbnail_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(thumbnail_temp, operations_temp);
+    assert!(archive_temp.starts_with(temporary.to_str().unwrap()));
+    assert_ne!(archive_temp, thumbnail_temp);
 }
 
 #[test]
@@ -334,17 +360,24 @@ fn benchmark_runner_isolates_temporary_files_and_rejects_missing_results() {
     let temporary = tempfile::tempdir().unwrap();
     let fake_bin = temporary.path().join("bin");
     install_fake_benchmarks(&fake_bin);
-    let complete = run_benchmark_fixture(root, temporary.path(), &fake_bin, false, false);
+    let complete = run_benchmark_fixture(root, temporary.path(), &fake_bin, false, false, false);
     assert!(complete.status.success(), "{complete:?}");
     assert_benchmark_fixture_records(temporary.path());
-    let missing = run_benchmark_fixture(root, temporary.path(), &fake_bin, true, false);
+    let missing = run_benchmark_fixture(root, temporary.path(), &fake_bin, true, false, false);
     assert!(
         !missing.status.success(),
         "missing benchmark case must fail"
     );
-    let missing_search = run_benchmark_fixture(root, temporary.path(), &fake_bin, false, true);
+    let missing_search =
+        run_benchmark_fixture(root, temporary.path(), &fake_bin, false, true, false);
     assert!(
         !missing_search.status.success(),
         "missing search benchmark case must fail"
+    );
+    let missing_archive =
+        run_benchmark_fixture(root, temporary.path(), &fake_bin, false, false, true);
+    assert!(
+        !missing_archive.status.success(),
+        "missing archive benchmark case must fail"
     );
 }

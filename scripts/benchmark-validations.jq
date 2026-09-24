@@ -68,8 +68,22 @@ def thumbnail:
     and .pixels == 60000000 and .failure_record == true
     and .pool_workers_max >= 1 and .pool_workers_max <= 4);
 
+def archive:
+  length == 3
+  and cases(["archive_compression_ratio_rejected", "archive_expanded_bytes_rejected", "archive_nesting_rejected"])
+  and all(.[]; measurements and .rejected == true
+    and .queued_work_max == 0 and .retained_models_max == 0
+    and .temporary_bytes <= 67108864)
+  and any(.[]; .case == "archive_expanded_bytes_rejected"
+    and .resource == "expanded bytes")
+  and any(.[]; .case == "archive_compression_ratio_rejected"
+    and .resource == "compression ratio")
+  and any(.[]; .case == "archive_nesting_rejected"
+    and .resource == "archive nesting");
+
 if $benchmark == "directory" then directory
 elif $benchmark == "search" then search
 elif $benchmark == "operations" then operations
 elif $benchmark == "thumbnail" then thumbnail
+elif $benchmark == "archive" then archive
 else false end
