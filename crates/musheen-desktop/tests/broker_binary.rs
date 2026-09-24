@@ -6,7 +6,7 @@ use musheen_desktop::privilege::{
 };
 
 fn broker_arguments(request: &BrokerRequest) -> Vec<std::ffi::OsString> {
-    BrokerLaunch::new("/usr/libexec/musheen-broker", PrivilegeProvider::Polkit)
+    BrokerLaunch::new("/usr/lib/musheen/musheen-broker", PrivilegeProvider::Polkit)
         .arguments_for(request)
         .into_iter()
         .skip(2)

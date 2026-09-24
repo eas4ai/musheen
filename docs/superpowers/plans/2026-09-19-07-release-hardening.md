@@ -92,7 +92,8 @@ catalogs; create `scripts/check-ui-baselines.sh`.
 
 **Files:** Create `packaging/org.musheen.Musheen.desktop`,
 `packaging/org.musheen.Musheen.metainfo.xml`, D-Bus service and Polkit
-policy files, icon install rules, and `scripts/package-smoke-test.sh`.
+policy files, icon install rules, `packaging/arch/PKGBUILD`,
+`ci/arch-package.Dockerfile`, and the local packaging scripts.
 
 - [ ] Adopt `org.musheen.Musheen` as the application, desktop, AppStream, and
   private D-Bus identity; FileManager1 keeps its standard interface name.

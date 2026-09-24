@@ -1,0 +1,48 @@
+pkgname=musheen
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Linux file manager with local and remote browsing'
+arch=('x86_64')
+url='https://github.com/eas4ai/musheen'
+license=('GPL-3.0-or-later')
+depends=(
+  'acl' 'fontconfig' 'freetype2' 'gcc-libs' 'glibc' 'hicolor-icon-theme'
+  'libarchive' 'libxcb'
+  'libxkbcommon' 'libxkbcommon-x11' 'polkit' 'smbclient' 'udisks2'
+  'vulkan-icd-loader' 'wayland'
+)
+makedepends=(
+  'appstream' 'cargo' 'dbus' 'desktop-file-utils' 'file' 'git' 'jq'
+  'librsvg' 'pkgconf' 'python'
+)
+source=("${pkgname}-${pkgver}.tar.gz")
+sha256sums=('__SOURCE_SHA256__')
+options=('!debug' '!lto')
+
+prepare() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  cargo fetch --locked
+}
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${srcdir}/target}"
+  export CARGO_INCREMENTAL=0
+  cargo build --workspace --release --locked --all-features --jobs 8 --offline
+}
+
+check() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${srcdir}/target}"
+  export CARGO_INCREMENTAL=0
+  cargo test --workspace --release --locked --all-features --jobs 8 --offline
+  desktop-file-validate packaging/org.musheen.Musheen.desktop
+  appstreamcli validate --no-net packaging/org.musheen.Musheen.metainfo.xml
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  MUSHEEN_APP_BINARY="${CARGO_TARGET_DIR:-${srcdir}/target}/release/musheen" \
+  MUSHEEN_BROKER_BINARY="${CARGO_TARGET_DIR:-${srcdir}/target}/release/musheen-broker" \
+  DESTDIR="$pkgdir" ./packaging/install-app.sh
+}

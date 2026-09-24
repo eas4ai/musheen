@@ -13,7 +13,7 @@
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/musheen-broker</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/musheen/musheen-broker</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.open-directory-as-administrator</annotate>
   </action>
 
@@ -25,7 +25,7 @@
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/musheen-broker</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/musheen/musheen-broker</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.run-executable-as-administrator</annotate>
   </action>
 
@@ -37,7 +37,7 @@
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/musheen-broker</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/musheen/musheen-broker</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.browse-directory-as-administrator</annotate>
   </action>
 </policyconfig>

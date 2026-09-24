@@ -22,7 +22,7 @@ use musheen_core::CancellationToken;
 pub const SUDO_BROKER_READY: &str = "MUSHEEN_BROKER_READY";
 pub const BROKER_REQUEST_FRAME: &str = "MUSHEEN_REQUEST ";
 pub const BROKER_RESPONSE_FRAME: &str = "MUSHEEN_RESPONSE ";
-pub const INSTALLED_BROKER_PATH: &str = "/usr/libexec/musheen-broker";
+pub const INSTALLED_BROKER_PATH: &str = "/usr/lib/musheen/musheen-broker";
 const MAX_BROKER_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

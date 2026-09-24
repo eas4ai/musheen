@@ -29,7 +29,7 @@ fn polkit_installer_stages_fixed_paths_and_modes() {
         .unwrap();
 
     assert!(status.success());
-    let broker = stage.join("usr/libexec/musheen-broker");
+    let broker = stage.join("usr/lib/musheen/musheen-broker");
     let policy = stage.join("usr/share/polkit-1/actions/org.musheen.Musheen.policy");
     assert_eq!(
         fs::metadata(broker).unwrap().permissions().mode() & 0o777,
@@ -103,7 +103,7 @@ fn installed_polkit_policy_covers_every_exact_broker_action() {
     let installer = fs::read_to_string(root.join("packaging/install-polkit-policy.sh"))
         .expect("the policy must have a package installation entrypoint");
     assert!(installer.contains("/usr/share/polkit-1/actions/org.musheen.Musheen.policy"));
-    assert!(installer.contains("/usr/libexec/musheen-broker"));
+    assert!(installer.contains("/usr/lib/musheen/musheen-broker"));
     assert!(installer.contains("DESTDIR"));
     assert!(installer.contains("-m 0644"));
     assert!(installer.contains("-m 0755"));

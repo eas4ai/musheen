@@ -35,7 +35,7 @@ for size in 48 128 256; do
     fi
 done
 
-if [[ ! -x "$stage/usr/bin/musheen" || ! -x "$stage/usr/libexec/musheen-broker" ]]; then
+if [[ ! -x "$stage/usr/bin/musheen" || ! -x "$stage/usr/lib/musheen/musheen-broker" ]]; then
     echo "package is missing an executable application or broker" >&2
     exit 1
 fi

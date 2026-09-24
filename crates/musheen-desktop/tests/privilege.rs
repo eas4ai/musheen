@@ -432,7 +432,7 @@ fn json_audit_log_is_private_append_only_and_contains_one_record_per_attempt() {
 
 #[test]
 fn broker_launches_are_fixed_argument_vectors_and_never_relaunch_the_gui() {
-    let broker = Path::new("/usr/libexec/musheen-broker");
+    let broker = Path::new("/usr/lib/musheen/musheen-broker");
     let request = BrokerRequest::run_executable("/usr/bin/true", ["--safe"]).unwrap();
     let polkit = BrokerLaunch::new(broker, PrivilegeProvider::Polkit);
     assert_eq!(polkit.program(), Path::new("/usr/bin/pkexec"));
@@ -440,7 +440,7 @@ fn broker_launches_are_fixed_argument_vectors_and_never_relaunch_the_gui() {
         polkit.arguments_for(&request),
         [
             "--disable-internal-agent",
-            "/usr/libexec/musheen-broker",
+            "/usr/lib/musheen/musheen-broker",
             "--action-id=org.musheen.run-executable-as-administrator",
             "--stdio",
             "--provider=polkit",
@@ -455,7 +455,7 @@ fn broker_launches_are_fixed_argument_vectors_and_never_relaunch_the_gui() {
         sudo.arguments_for(&request),
         [
             "--",
-            "/usr/libexec/musheen-broker",
+            "/usr/lib/musheen/musheen-broker",
             "--action-id=org.musheen.run-executable-as-administrator",
             "--stdio",
             "--provider=sudo",

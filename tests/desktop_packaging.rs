@@ -63,7 +63,7 @@ fn native_installer_stages_app_metadata_icons_and_broker_without_host_writes() {
 
     for (relative, mode) in [
         ("usr/bin/musheen", 0o755),
-        ("usr/libexec/musheen-broker", 0o755),
+        ("usr/lib/musheen/musheen-broker", 0o755),
         ("usr/share/applications/org.musheen.Musheen.desktop", 0o644),
         ("usr/share/metainfo/org.musheen.Musheen.metainfo.xml", 0o644),
         (
@@ -122,4 +122,43 @@ fn native_installer_rejects_a_symlinked_destination_before_writing() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("symlink"));
     assert!(!destination.join("usr/bin/musheen").exists());
+}
+
+#[test]
+fn arch_package_builds_all_features_and_stages_the_native_installer() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let recipe = fs::read_to_string(root.join("packaging/arch/PKGBUILD")).unwrap();
+    assert!(recipe.contains("pkgname=musheen"));
+    assert!(recipe.contains("--release --locked --all-features --jobs 8"));
+    assert!(recipe.contains("CARGO_INCREMENTAL=0"));
+    assert!(recipe.contains("DESTDIR=\"$pkgdir\" ./packaging/install-app.sh"));
+    assert!(recipe.contains("sha256sums=('__SOURCE_SHA256__')"));
+    assert!(recipe.contains("options=('!debug' '!lto')"));
+    assert!(recipe.contains("'git'"));
+    assert!(recipe.contains("'jq'"));
+    assert!(recipe.contains("'dbus'"));
+    assert!(recipe.contains("'python'"));
+    assert!(recipe.contains("'hicolor-icon-theme'"));
+    assert!(recipe.contains("'acl'"));
+}
+
+#[test]
+fn arch_container_checks_package_install_and_removal() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let container = fs::read_to_string(root.join("ci/arch-package.Dockerfile")).unwrap();
+    assert!(container.contains("FROM archlinux:base-devel"));
+    assert!(container.contains(" git "));
+    assert!(container.contains(" jq "));
+    assert!(container.contains(" dbus "));
+    assert!(container.contains(" python "));
+    assert!(container.contains(" hicolor-icon-theme "));
+    assert!(container.contains("makepkg --noconfirm"));
+    assert!(container.contains("pacman -U --noconfirm"));
+    assert!(container.contains("FROM archlinux:base-devel AS runtime-check"));
+    assert!(container.contains("pacman -Rns --noconfirm musheen"));
+    assert!(container.contains("FROM scratch AS artifact"));
+    let runner = fs::read_to_string(root.join("scripts/build-arch-package.sh")).unwrap();
+    assert!(runner.contains("MUSHEEN_SCRATCH_BASE"));
+    assert!(runner.contains("flock -n 9"));
+    assert!(runner.contains("--output"));
 }
