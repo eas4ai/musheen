@@ -9662,38 +9662,60 @@ impl MusheenApp {
         match selected.as_slice() {
             [] => self.info_panes.entry(tab_id).or_default().clear(),
             [id] => {
-                let item = self
-                    .directories
-                    .get(&tab_id)
-                    .and_then(|directory| directory.view().item(id))
-                    .cloned();
-                let Some(item) = item else {
-                    self.info_panes.entry(tab_id).or_default().clear();
+                let Some(directory) = self.directories.get(&tab_id) else {
                     return;
                 };
-                let details = InfoPaneDetails::new(
-                    item.display_name().as_str(),
-                    item.kind(),
-                    item.size(),
-                    item.modified_unix_seconds(),
-                );
-                let Some(path) = item.path().as_unix_path().map(Path::to_path_buf) else {
-                    let model = self.info_panes.entry(tab_id).or_default();
-                    let work = model.begin(details, PathBuf::new());
-                    model.complete(
-                        work.generation(),
-                        InfoPaneResult::Details {
-                            mime_type: "application/octet-stream".into(),
-                        },
-                    );
+                let item = directory.view().item(id).cloned().or_else(|| {
+                    self.indexed_viewports
+                        .get(&tab_id)
+                        .filter(|viewport| viewport.generation == directory.order_epoch())
+                        .and_then(|viewport| {
+                            viewport
+                                .loaded
+                                .iter()
+                                .flat_map(|(_, items)| items)
+                                .find(|item| item.id() == id)
+                                .cloned()
+                        })
+                });
+                if let Some(item) = item {
+                    self.show_info_item(tab_id, item, cx);
+                    return;
+                }
+                self.info_panes.entry(tab_id).or_default().clear();
+                let Some(reader) = directory.index_reader() else {
                     return;
                 };
-                let work = self
-                    .info_panes
-                    .entry(tab_id)
-                    .or_default()
-                    .begin(details, path);
-                self.start_info_work(tab_id, work, cx);
+                let generation = directory.generation();
+                let id = id.clone();
+                let lookup_id = id.clone();
+                let task = cx.background_spawn(async move { reader.lookup_id(&lookup_id) });
+                cx.spawn(async move |this, cx| {
+                    let result = task.await;
+                    let Some(this) = this.upgrade() else {
+                        return;
+                    };
+                    this.update(cx, |state, cx| {
+                        let still_selected =
+                            state.directories.get(&tab_id).is_some_and(|directory| {
+                                directory.generation() == generation
+                                    && directory.view().selected_ids() == std::slice::from_ref(&id)
+                            });
+                        if !still_selected {
+                            return;
+                        }
+                        match result {
+                            Ok(Some(item)) => state.show_info_item(tab_id, item, cx),
+                            Ok(None) => state.info_panes.entry(tab_id).or_default().clear(),
+                            Err(error) => {
+                                state.operation_error = Some(error.to_string().into());
+                                state.info_panes.entry(tab_id).or_default().clear();
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
             _ => self
                 .info_panes
@@ -9701,6 +9723,32 @@ impl MusheenApp {
                 .or_default()
                 .show_multiple(selected.len()),
         }
+    }
+
+    fn show_info_item(&mut self, tab_id: TabId, item: StoreItem, cx: &mut Context<Self>) {
+        let details = InfoPaneDetails::new(
+            item.display_name().as_str(),
+            item.kind(),
+            item.size(),
+            item.modified_unix_seconds(),
+        );
+        let Some(path) = item.path().as_unix_path().map(Path::to_path_buf) else {
+            let model = self.info_panes.entry(tab_id).or_default();
+            let work = model.begin(details, PathBuf::new());
+            model.complete(
+                work.generation(),
+                InfoPaneResult::Details {
+                    mime_type: "application/octet-stream".into(),
+                },
+            );
+            return;
+        };
+        let work = self
+            .info_panes
+            .entry(tab_id)
+            .or_default()
+            .begin(details, path);
+        self.start_info_work(tab_id, work, cx);
     }
 
     fn start_info_work(&mut self, tab_id: TabId, work: InfoPaneWork, cx: &mut Context<Self>) {
@@ -18731,6 +18779,26 @@ mod tests {
             assert!(window.find("directory-item-0-0").visible());
         })
         .unwrap();
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let far = ItemId::new(ProviderId::new("local").unwrap(), 4_096usize.to_be_bytes())
+                    .unwrap();
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .set_selected_ids(vec![far]);
+                state.refresh_info_pane(tab_id, cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            matches!(
+                app.read(cx).info_panes.get(&tab_id).map(InfoPaneModel::state),
+                Some(InfoPaneState::Loading { details, .. }
+                    | InfoPaneState::Ready { details, .. }
+                    | InfoPaneState::Error { details, .. }) if details.name() == "4096"
+            )
+        })
+        .await;
         cx.update(|cx| {
             app.update(cx, |state, cx| {
                 let item = state

@@ -27,6 +27,16 @@ impl DirectoryIndexReader {
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
             .read_range(range)
     }
+
+    pub(crate) fn lookup_id(
+        &self,
+        id: &musheen_core::ItemId,
+    ) -> std::io::Result<Option<StoreItem>> {
+        self.index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
+            .lookup_id(id)
+    }
 }
 
 pub(crate) struct DirectoryIndexWork {
