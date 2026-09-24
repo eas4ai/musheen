@@ -217,6 +217,21 @@ mod settings {
         );
     }
 
+    #[test]
+    fn settings_reject_retention_above_the_resident_model_cap() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(
+            store.path(),
+            "schema_version=3\ndirectory_retained_items=65536\n",
+        )
+        .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.resource_limits().directory_retained_items, 4_096);
+    }
+
     fn assert_no_temporary_files(store: &SettingsStore) {
         let entries = fs::read_dir(store.path().parent().unwrap())
             .expect("the settings directory is readable")

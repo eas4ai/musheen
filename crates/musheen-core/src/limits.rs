@@ -16,7 +16,7 @@ pub struct ResourceLimitConfig {
 impl ResourceLimitConfig {
     pub const MAX_DIRECTORY_PAGE_ITEMS: usize = 4_096;
     pub const MAX_DIRECTORY_PREFETCH_PAGES: usize = 8;
-    pub const MAX_DIRECTORY_RETAINED_ITEMS: usize = 65_536;
+    pub const MAX_DIRECTORY_RETAINED_ITEMS: usize = 4_096;
     pub const MAX_DIRECTORY_RENDERED_VIEWPORTS: usize = 8;
     pub const MAX_OPERATION_DATA_MUTATIONS: usize = 32;
     pub const MAX_OPERATION_METADATA_JOBS: usize = 64;

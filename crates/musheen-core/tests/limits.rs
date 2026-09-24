@@ -70,3 +70,14 @@ fn zero_and_above_maximum_limits_are_rejected() {
         assert!(ResourceLimits::try_from(invalid).is_err());
     }
 }
+
+#[test]
+fn directory_retention_hard_max_matches_the_resident_model_cap() {
+    assert_eq!(ResourceLimitConfig::MAX_DIRECTORY_RETAINED_ITEMS, 4_096);
+
+    let above_cap = ResourceLimits::try_from(ResourceLimitConfig {
+        directory_retained_items: 4_097,
+        ..ResourceLimitConfig::default()
+    });
+    assert!(above_cap.is_err());
+}
