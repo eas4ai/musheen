@@ -37,6 +37,24 @@ impl DirectoryIndexReader {
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
             .lookup_id(id)
     }
+
+    pub(crate) fn resolve_paths(
+        &self,
+        ids: &[musheen_core::ItemId],
+    ) -> std::io::Result<Option<Vec<StorePath>>> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
+        let mut paths = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(item) = index.lookup_id(id)? else {
+                return Ok(None);
+            };
+            paths.push(item.path().clone());
+        }
+        Ok(Some(paths))
+    }
 }
 
 pub(crate) struct DirectoryIndexWork {
@@ -666,6 +684,15 @@ mod indexed_watch_tests {
         assert_eq!(model.indexed_count(), 4_607);
         assert!(model.indexed_item(&id).unwrap().is_none());
         assert!(model.view().selected_ids().is_empty());
+
+        let offscreen = item(4_096, "item-4096").id().clone();
+        let paths = model
+            .index_reader()
+            .unwrap()
+            .resolve_paths(&[offscreen])
+            .unwrap()
+            .unwrap();
+        assert_eq!(paths, [StorePath::from_unix_path("/many/item-4096")]);
     }
 
     #[test]

@@ -5143,7 +5143,13 @@ impl MusheenApp {
     }
 
     fn open_selected_properties_page(&mut self, page: PropertiesPage, cx: &mut Context<Self>) {
-        let view = self.focused_directory().view();
+        let tab_id = self.navigation.focused_tab().id();
+        let directory = self.focused_directory();
+        let view = directory.view();
+        let selected_ids = view.selected_ids().to_vec();
+        if selected_ids.is_empty() {
+            return;
+        }
         let selected = view
             .selected_ids()
             .iter()
@@ -5154,14 +5160,54 @@ impl MusheenApp {
                     .map(|path| (item.display_name().as_str().to_owned(), path.to_path_buf()))
             })
             .collect::<Vec<_>>();
-        if selected.is_empty() {
+        if selected.len() == selected_ids.len() {
+            self.open_properties_paths(
+                selected.into_iter().map(|(_, path)| path).collect(),
+                page,
+                cx,
+            );
             return;
         }
-        self.open_properties_paths(
-            selected.into_iter().map(|(_, path)| path).collect(),
-            page,
-            cx,
-        );
+        let Some(reader) = directory.index_reader() else {
+            return;
+        };
+        let generation = directory.generation();
+        let lookup_ids = selected_ids.clone();
+        let task = cx.background_spawn(async move { reader.resolve_paths(&lookup_ids) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let still_selected = state.directories.get(&tab_id).is_some_and(|directory| {
+                    directory.generation() == generation
+                        && directory.view().selected_ids() == selected_ids
+                });
+                if !still_selected {
+                    return;
+                }
+                match result {
+                    Ok(Some(paths)) => {
+                        let targets = selected_ids
+                            .into_iter()
+                            .zip(paths)
+                            .map(|(id, path)| CommandTargetRef::new(id, path))
+                            .collect::<Result<Vec<_>, _>>();
+                        match targets {
+                            Ok(targets) => state.open_properties_targets(&targets, page, cx),
+                            Err(error) => state.operation_error = Some(error.to_string().into()),
+                        }
+                    }
+                    Ok(None) => {
+                        state.operation_error = Some("A selected file no longer exists".into());
+                    }
+                    Err(error) => state.operation_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_properties_targets(
