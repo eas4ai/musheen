@@ -1,6 +1,7 @@
 use musheen_core::CancellationToken;
 use musheen_desktop::{
-    PREVIEW_INITIAL_BYTES, PreviewDocument, PreviewError, PreviewKind, PreviewLimits,
+    PREVIEW_INITIAL_BYTES, PREVIEW_LOAD_MORE_BYTES, PREVIEW_MAX_BYTES, PreviewDocument,
+    PreviewError, PreviewKind, PreviewLimits,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -58,4 +59,31 @@ fn cancelled_preview_work_fails_before_reading() {
         PreviewDocument::open(&path, cancellation),
         Err(PreviewError::Cancelled)
     ));
+}
+
+#[test]
+fn preview_limits_reject_values_above_the_read_and_retention_budgets() {
+    assert!(
+        PreviewLimits::new(
+            PREVIEW_INITIAL_BYTES,
+            PREVIEW_LOAD_MORE_BYTES,
+            PREVIEW_MAX_BYTES,
+        )
+        .is_ok()
+    );
+
+    for (initial, load_more, ceiling) in [
+        (PREVIEW_INITIAL_BYTES + 1, 1, PREVIEW_MAX_BYTES),
+        (1, PREVIEW_LOAD_MORE_BYTES + 1, PREVIEW_MAX_BYTES),
+        (1, 1, PREVIEW_MAX_BYTES + 1),
+        (usize::MAX, 1, usize::MAX),
+    ] {
+        assert!(
+            matches!(
+                PreviewLimits::new(initial, load_more, ceiling),
+                Err(PreviewError::InvalidLimits)
+            ),
+            "accepted preview limits ({initial}, {load_more}, {ceiling})"
+        );
+    }
 }

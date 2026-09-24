@@ -34,7 +34,14 @@ impl Default for PreviewLimits {
 
 impl PreviewLimits {
     pub fn new(initial: usize, load_more: usize, ceiling: usize) -> Result<Self, PreviewError> {
-        if initial == 0 || load_more == 0 || ceiling == 0 || initial > ceiling {
+        if initial == 0
+            || load_more == 0
+            || ceiling == 0
+            || initial > ceiling
+            || initial > PREVIEW_INITIAL_BYTES
+            || load_more > PREVIEW_LOAD_MORE_BYTES
+            || ceiling > PREVIEW_MAX_BYTES
+        {
             return Err(PreviewError::InvalidLimits);
         }
         Ok(Self {
