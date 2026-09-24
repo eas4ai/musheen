@@ -514,6 +514,10 @@ impl DirectoryViewModel {
         self.selection.ids()
     }
 
+    pub(crate) fn selection_anchor(&self) -> Option<&ItemId> {
+        self.selection.anchor()
+    }
+
     #[must_use]
     pub fn item(&self, id: &ItemId) -> Option<&StoreItem> {
         self.items.iter().find(|item| item.id() == id)

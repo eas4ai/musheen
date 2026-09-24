@@ -89,6 +89,28 @@ impl DirectoryIndexReader {
             .selection_bitmap(range)
     }
 
+    pub(crate) fn select_between_ids(
+        &self,
+        anchor: Option<&ItemId>,
+        end: &ItemId,
+    ) -> std::io::Result<Option<IndexedSelection>> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
+        let Some(end) = index.position_of_id(end)? else {
+            return Ok(None);
+        };
+        let start = anchor
+            .map(|id| index.position_of_id(id))
+            .transpose()?
+            .flatten()
+            .unwrap_or(end);
+        index
+            .selection_bitmap(start.min(end)..start.max(end) + 1)
+            .map(Some)
+    }
+
     pub(crate) fn resolve_bitmap(
         &self,
         selection: &IndexedSelection,
@@ -308,6 +330,7 @@ pub struct DirectoryModel {
     view: DirectoryViewModel,
     index: Option<SharedIndex>,
     indexed_selection: Option<IndexedSelection>,
+    indexed_selection_anchor: Option<ItemId>,
     indexed_selection_epoch: u64,
     indexed_count: usize,
     indexed_visible_count: usize,
@@ -336,6 +359,7 @@ impl DirectoryModel {
             view: DirectoryViewModel::new(retention_limit.min(MAX_RESIDENT_ITEMS)),
             index: None,
             indexed_selection: None,
+            indexed_selection_anchor: None,
             indexed_selection_epoch: 0,
             indexed_count: 0,
             indexed_visible_count: 0,
@@ -354,6 +378,7 @@ impl DirectoryModel {
         self.view.reset_items();
         self.index = None;
         self.indexed_selection = None;
+        self.indexed_selection_anchor = None;
         self.indexed_selection_epoch = self.indexed_selection_epoch.wrapping_add(1);
         self.indexed_count = 0;
         self.indexed_visible_count = 0;
@@ -515,14 +540,20 @@ impl DirectoryModel {
         self.index.is_some()
     }
 
-    pub(crate) fn set_indexed_selection(&mut self, selection: IndexedSelection) {
+    pub(crate) fn set_indexed_selection(
+        &mut self,
+        selection: IndexedSelection,
+        anchor: Option<ItemId>,
+    ) {
         self.view.clear_selection();
         self.indexed_selection = Some(selection);
+        self.indexed_selection_anchor = anchor;
         self.indexed_selection_epoch = self.indexed_selection_epoch.wrapping_add(1);
     }
 
     pub(crate) fn clear_indexed_selection(&mut self) {
         self.indexed_selection = None;
+        self.indexed_selection_anchor = None;
         self.indexed_selection_epoch = self.indexed_selection_epoch.wrapping_add(1);
     }
 
@@ -538,6 +569,10 @@ impl DirectoryModel {
 
     pub(crate) fn indexed_selection(&self) -> Option<&IndexedSelection> {
         self.indexed_selection.as_ref()
+    }
+
+    pub(crate) fn indexed_selection_anchor(&self) -> Option<&ItemId> {
+        self.indexed_selection_anchor.as_ref()
     }
 
     pub(crate) fn is_indexed_arrival_selected(&self, arrival: u64) -> bool {

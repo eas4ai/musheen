@@ -97,6 +97,7 @@ pub(super) struct DiskDirectoryIndex {
     offsets: File,
     record_count: u64,
     order: Option<SortedOrder>,
+    order_preferences: Option<ViewPreferences>,
     id_order: Option<SortedOrder>,
     scratch: TempDir,
 }
@@ -203,6 +204,7 @@ impl DiskDirectoryIndex {
             offsets,
             record_count: 0,
             order: None,
+            order_preferences: None,
             id_order: None,
             scratch,
         })
@@ -298,6 +300,7 @@ impl DiskDirectoryIndex {
             id_order.len as u64,
         )?;
         self.order = Some(order);
+        self.order_preferences = Some(preferences.clone());
         self.id_order = Some(id_order);
         Ok(())
     }
@@ -548,6 +551,44 @@ impl DiskDirectoryIndex {
     }
 
     pub(super) fn lookup_id(&mut self, id: &ItemId) -> io::Result<Option<StoreItem>> {
+        self.lookup_id_entry(id)
+            .map(|entry| entry.map(|entry| entry.item))
+    }
+
+    pub(super) fn position_of_id(&mut self, id: &ItemId) -> io::Result<Option<usize>> {
+        let Some(target) = self.lookup_id_entry(id)? else {
+            return Ok(None);
+        };
+        let preferences = self.order_preferences.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "directory order policy is not ready",
+            )
+        })?;
+        let order = self.order.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
+        })?;
+        let mut low = 0;
+        let mut high = order.len;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let candidate = Self::order_entry_at(order, &mut self.records, middle)?;
+            if compare_entries(&candidate, &target, OrderPolicy::Visible(preferences))
+                == Ordering::Less
+            {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if low == order.len {
+            return Ok(None);
+        }
+        let candidate = Self::order_entry_at(order, &mut self.records, low)?;
+        Ok((candidate.item.id() == id).then_some(low))
+    }
+
+    fn lookup_id_entry(&mut self, id: &ItemId) -> io::Result<Option<SortEntry>> {
         let order = self.id_order.as_mut().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -558,21 +599,8 @@ impl DiskDirectoryIndex {
         let mut high = order.len;
         while low < high {
             let middle = low + (high - low) / 2;
-            let position = u64::try_from(middle)
-                .ok()
-                .and_then(|value| value.checked_mul(8))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "identity offset overflow")
-                })?;
-            order.file.seek(SeekFrom::Start(position))?;
-            let offset = read_next_offset(&mut order.file)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "directory identity offset is missing",
-                )
-            })?;
-            let item = Self::read_record(&mut self.records, offset)?.0;
-            match item.id().cmp(id) {
+            let candidate = Self::order_entry_at(order, &mut self.records, middle)?;
+            match candidate.item.id().cmp(id) {
                 Ordering::Less => low = middle + 1,
                 Ordering::Equal | Ordering::Greater => high = middle,
             }
@@ -580,21 +608,34 @@ impl DiskDirectoryIndex {
         if low == order.len {
             return Ok(None);
         }
-        let position = u64::try_from(low)
+        let candidate = Self::order_entry_at(order, &mut self.records, low)?;
+        Ok((candidate.item.id() == id).then_some(candidate))
+    }
+
+    fn order_entry_at(
+        order: &mut SortedOrder,
+        records: &mut File,
+        position: usize,
+    ) -> io::Result<SortEntry> {
+        let byte_offset = u64::try_from(position)
             .ok()
             .and_then(|value| value.checked_mul(8))
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "identity offset overflow")
+                io::Error::new(io::ErrorKind::InvalidData, "directory offset overflow")
             })?;
-        order.file.seek(SeekFrom::Start(position))?;
+        order.file.seek(SeekFrom::Start(byte_offset))?;
         let offset = read_next_offset(&mut order.file)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "directory identity offset is missing",
+                "directory order offset is missing",
             )
         })?;
-        let item = Self::read_record(&mut self.records, offset)?.0;
-        Ok((item.id() == id).then_some(item))
+        let (item, arrival) = Self::read_record(records, offset)?;
+        Ok(SortEntry {
+            item,
+            arrival,
+            offset,
+        })
     }
 }
 
@@ -733,6 +774,10 @@ mod tests {
         assert_eq!(names(4_095..4_098), ["item-4095", "item-4096", "item-4097"]);
         assert_eq!(names(8_197..8_200), ["item-8197", "item-8198", "item-8199"]);
         assert_eq!(names(0..1), ["item-0"]);
+        for number in [0u64, 4_096, 8_199] {
+            let id = ItemId::new(provider.clone(), number.to_be_bytes().to_vec()).unwrap();
+            assert_eq!(index.position_of_id(&id).unwrap(), Some(number as usize));
+        }
     }
 
     #[test]
@@ -892,7 +937,22 @@ mod tests {
             duplicate_ids[0],
             ItemId::new(provider.clone(), vec![4]).unwrap()
         );
-        assert_eq!(duplicate_ids[1], ItemId::new(provider, vec![5]).unwrap());
+        assert_eq!(
+            duplicate_ids[1],
+            ItemId::new(provider.clone(), vec![5]).unwrap()
+        );
+        assert_eq!(
+            index
+                .position_of_id(&ItemId::new(provider.clone(), vec![2]).unwrap())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            index
+                .position_of_id(&ItemId::new(provider.clone(), vec![1]).unwrap())
+                .unwrap(),
+            Some(1)
+        );
 
         let mut preferences = ViewPreferences {
             show_hidden: true,
@@ -911,6 +971,12 @@ mod tests {
             names,
             ["folder", ".hidden", "item-10", "same", "same", "item-2"]
         );
+        assert_eq!(
+            index
+                .position_of_id(&ItemId::new(provider.clone(), vec![2]).unwrap())
+                .unwrap(),
+            Some(1)
+        );
 
         index
             .rebuild_order(&preferences, Some(&DirectoryFilter::new("item")))
@@ -922,6 +988,18 @@ mod tests {
             .map(|item| item.display_name().as_str().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(names, ["item-10", "item-2"]);
+        assert_eq!(
+            index
+                .position_of_id(&ItemId::new(provider.clone(), vec![2]).unwrap())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            index
+                .position_of_id(&ItemId::new(provider, vec![1]).unwrap())
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[test]

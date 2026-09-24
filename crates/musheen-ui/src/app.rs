@@ -327,6 +327,11 @@ struct IndexedViewport {
 
 type IndexedLoadedRange = (std::ops::Range<usize>, Vec<(StoreItem, u64)>);
 
+enum IndexedSelectionRequest {
+    All,
+    Through(ItemId),
+}
+
 impl IndexedViewport {
     const MAX_RANGES: usize = 16;
     const MAX_ITEMS: usize = 4_096;
@@ -5764,7 +5769,9 @@ impl MusheenApp {
 
     fn dispatch_selection_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
-        if action == CommandAction::SelectAll && self.select_all_indexed_for_tab(tab_id, cx) {
+        if action == CommandAction::SelectAll
+            && self.start_indexed_selection(tab_id, IndexedSelectionRequest::All, cx)
+        {
             return;
         }
         match action {
@@ -5792,7 +5799,9 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         let tab_id = origin_tab.unwrap_or_else(|| self.navigation.focused_tab().id());
-        if action == CommandAction::SelectAll && self.select_all_indexed_for_tab(tab_id, cx) {
+        if action == CommandAction::SelectAll
+            && self.start_indexed_selection(tab_id, IndexedSelectionRequest::All, cx)
+        {
             return;
         }
         let Some(directory) = self.directories.get_mut(&tab_id) else {
@@ -5815,7 +5824,12 @@ impl MusheenApp {
         cx.notify();
     }
 
-    fn select_all_indexed_for_tab(&mut self, tab_id: TabId, cx: &mut Context<Self>) -> bool {
+    fn start_indexed_selection(
+        &mut self,
+        tab_id: TabId,
+        request: IndexedSelectionRequest,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(directory) = self.directories.get(&tab_id) else {
             return false;
         };
@@ -5827,7 +5841,24 @@ impl MusheenApp {
         let selection_epoch = directory.indexed_selection_epoch();
         let selected_ids = directory.view().selected_ids().to_vec();
         let count = directory.visible_count();
-        let work = cx.background_spawn(async move { reader.select_visible_range(0..count) });
+        let anchor = directory
+            .indexed_selection_anchor()
+            .or_else(|| directory.view().selection_anchor())
+            .cloned();
+        let retained_anchor = match &request {
+            IndexedSelectionRequest::All => None,
+            IndexedSelectionRequest::Through(end) => {
+                Some(anchor.clone().unwrap_or_else(|| end.clone()))
+            }
+        };
+        let work = cx.background_spawn(async move {
+            match request {
+                IndexedSelectionRequest::All => reader.select_visible_range(0..count).map(Some),
+                IndexedSelectionRequest::Through(end) => {
+                    reader.select_between_ids(anchor.as_ref(), &end)
+                }
+            }
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let Some(this) = this.upgrade() else {
@@ -5845,13 +5876,16 @@ impl MusheenApp {
                     return;
                 }
                 match result {
-                    Ok(selection) => {
-                        directory.set_indexed_selection(selection);
+                    Ok(Some(selection)) => {
+                        directory.set_indexed_selection(selection, retained_anchor);
                         if let Some(tab) = state.navigation.tab_mut(tab_id) {
                             tab.set_selection(Vec::new());
                         }
                         state.refresh_info_pane(tab_id, cx);
                         state.schedule_session_save(cx);
+                    }
+                    Ok(None) => {
+                        state.operation_error = Some("Selected file is no longer visible".into())
                     }
                     Err(error) => state.operation_error = Some(error.to_string().into()),
                 }
@@ -5938,6 +5972,15 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         if !self.context_dialog_windows.is_empty() {
+            return;
+        }
+        if mode == SelectionMode::Add
+            && self.start_indexed_selection(
+                tab_id,
+                IndexedSelectionRequest::Through(id.clone()),
+                cx,
+            )
+        {
             return;
         }
         let rendered_order = (mode == SelectionMode::Add).then(|| {
@@ -19143,6 +19186,20 @@ mod tests {
             app.update(cx, |state, cx| {
                 state.dispatch_selection_action(CommandAction::ClearSelection, cx);
                 assert_eq!(state.focused_directory().indexed_selected_count(), 0);
+                let provider = ProviderId::new("local").unwrap();
+                let first = ItemId::new(provider.clone(), 0usize.to_be_bytes()).unwrap();
+                let far = ItemId::new(provider, 4_096usize.to_be_bytes()).unwrap();
+                state.select_item(tab_id, first, cx);
+                state.select_item_with_mode(tab_id, far, SelectionMode::Add, cx);
+            });
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
+            app.read(cx).focused_directory().indexed_selected_count() == 4_097
+        })
+        .await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_selection_action(CommandAction::ClearSelection, cx);
             });
         });
         cx.update(|cx| {
