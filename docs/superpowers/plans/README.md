@@ -37,9 +37,11 @@ musheen (binary)
 - `musheen-test-support`: recording providers, hostile fixtures, fake desktop
   services, deterministic clocks, and fault injection.
 
-No crate above `musheen-core` may call `std::fs` directly. UI code requests
-commands; command handlers consult provider capabilities before invoking the
-operation or desktop boundary.
+Only `musheen-local` and `musheen-desktop` access browsed filesystem paths.
+`musheen-ui` has one narrow exception for its owner-only temporary directory
+index in `src/directory/index.rs`; it never opens a browsed path. UI commands
+still consult provider capabilities before crossing the operation or desktop
+boundary.
 
 ## Plan order
 
@@ -50,6 +52,9 @@ operation or desktop boundary.
 5. [Linux desktop integration](2026-09-19-05-linux-desktop-integration.md)
 6. [Archives and remote stores](2026-09-19-06-archives-and-remote-stores.md)
 7. [Release hardening](2026-09-19-07-release-hardening.md)
+
+The [disk-backed directory index](2026-09-24-disk-backed-directory-index.md)
+extends the browse phase with million-item pagination and bounded UI memory.
 
 ## Requirement ownership
 
