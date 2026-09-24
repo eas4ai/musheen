@@ -984,20 +984,21 @@ mod tests {
     }
 
     #[test]
-    fn dropping_pool_cancels_and_deregisters_shared_maintenance() {
-        let service = shared_maintenance_service().unwrap();
-        let before = service.active_tasks.load(Ordering::Acquire);
-        let pool = ProviderPool::with_runtime(
+    fn dropping_pool_cancels_and_deregisters_maintenance() {
+        let service = Arc::new(MaintenanceService::start(&SystemMaintenanceThreadSpawner).unwrap());
+        let pool = ProviderPool::with_maintenance(
             profile(),
             NeverConnector,
             FixedRuntime,
             PoolLimits::default(),
+            Ok(service.clone()),
         )
         .unwrap();
-        assert_eq!(service.active_tasks.load(Ordering::Acquire), before + 1);
+        assert_eq!(service.active_tasks.load(Ordering::Acquire), 1);
         drop(pool);
-        for _ in 0..10_000 {
-            if service.active_tasks.load(Ordering::Acquire) == before {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if service.active_tasks.load(Ordering::Acquire) == 0 {
                 return;
             }
             std::thread::yield_now();

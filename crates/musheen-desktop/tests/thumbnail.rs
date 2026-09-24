@@ -4,6 +4,7 @@ use musheen_desktop::{
     ThumbnailRequest, ThumbnailService, ThumbnailSize,
 };
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,8 +80,13 @@ fn thumbnail_limits_reject_work_above_the_documented_budget() {
 fn worker_script(path: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    let staged = path.with_extension("staged");
+    let mut file = File::create(&staged).unwrap();
+    write!(file, "#!/bin/sh\n{body}\n").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(staged, path).unwrap();
 }
 
 #[cfg(unix)]
@@ -88,7 +94,7 @@ fn worker_script(path: &Path, body: &str) {
 fn worker_timeout_writes_a_failure_record() {
     let temporary = tempfile::tempdir().unwrap();
     let worker = temporary.path().join("slow-worker");
-    worker_script(&worker, "sleep 1");
+    worker_script(&worker, "exec sleep 1");
     let source = temporary.path().join("source.png");
     fs::write(&source, b"image").unwrap();
     let cache = ThumbnailCache::new(temporary.path().join("cache"));
@@ -99,10 +105,11 @@ fn worker_timeout_writes_a_failure_record() {
     );
     let request = request(&source, 1);
 
-    assert!(matches!(
-        service.resolve(&request, ThumbnailMode::Generate, CancellationToken::new()),
-        Err(ThumbnailError::Timeout)
-    ));
+    let result = service.resolve(&request, ThumbnailMode::Generate, CancellationToken::new());
+    assert!(
+        matches!(result, Err(ThumbnailError::Timeout)),
+        "unexpected thumbnail result: {result:?}"
+    );
     assert!(matches!(
         cache.lookup(&request).unwrap(),
         ThumbnailLookup::Failed { .. }
