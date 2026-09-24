@@ -7,6 +7,7 @@ use musheen_core::{
     CommandTargetRef, DangerLevel, StorePath,
 };
 use std::fmt;
+use std::sync::Arc;
 
 pub const MAX_VARIABLE_CONTRIBUTIONS: usize = 8;
 
@@ -372,7 +373,7 @@ impl MenuEntry {
     pub fn captured_targets(&self) -> &[CommandTargetRef] {
         self.invocation
             .as_ref()
-            .map(|invocation| invocation.selection.as_slice())
+            .map(|invocation| invocation.selection.as_ref())
             .unwrap_or_default()
     }
 
@@ -437,7 +438,7 @@ pub(crate) struct InvocationData {
     pub(crate) id: CommandId,
     pub(crate) action: CommandAction,
     pub(crate) context: CommandContext,
-    pub(crate) selection: Vec<CommandTargetRef>,
+    pub(crate) selection: Arc<[CommandTargetRef]>,
     pub(crate) location: StorePath,
     pub(crate) destination: Option<StorePath>,
     pub(crate) origin_tab: Option<crate::navigation::TabId>,
@@ -655,7 +656,7 @@ fn plain_command_entry(
             id: command.id().clone(),
             action: command.action(),
             context: context.clone(),
-            selection: request.captured_targets().to_vec(),
+            selection: request.captured_targets_arc(),
             location: selected_directory_location(command.action(), context, request),
             destination: None,
             origin_tab: request.origin_tab(),
@@ -1163,5 +1164,53 @@ impl fmt::Display for MenuDirection {
             Self::LeftToRight => formatter.write_str("ltr"),
             Self::RightToLeft => formatter.write_str("rtl"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use musheen_core::{CommandTarget, ItemId, ProviderId};
+
+    #[test]
+    fn menu_rows_share_the_captured_selection() {
+        let provider = ProviderId::new("local").unwrap();
+        let selected = (0u64..512)
+            .map(|number| {
+                CommandTargetRef::new(
+                    ItemId::new(provider.clone(), number.to_be_bytes().to_vec()).unwrap(),
+                    StorePath::from_unix_path(format!("/many/item-{number}")),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let request = ContextMenuRequest::new(
+            CommandContext {
+                target: CommandTarget::MultiSelection,
+                selection_count: selected.len(),
+                ..CommandContext::default()
+            },
+            MenuTarget::Item,
+            StorePath::from_unix_path("/many"),
+            selected,
+        );
+        let menu = compose(
+            &CommandRegistry::built_in(),
+            Locale::EnUs,
+            crate::ThemeProfile::new(crate::AppearanceMode::Light, false),
+            request,
+        );
+        let rows = menu
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.invocation.as_ref())
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].selection.len(), 512);
+        assert!(std::ptr::eq(
+            rows[0].selection.as_ptr(),
+            rows[1].selection.as_ptr()
+        ));
     }
 }

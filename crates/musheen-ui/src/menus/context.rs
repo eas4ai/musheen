@@ -1,4 +1,5 @@
 use musheen_core::{CommandContext, CommandTargetRef, StorePath};
+use std::sync::Arc;
 
 /// The user-visible surface that supplied the menu target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,8 +26,8 @@ pub struct ContextMenuRequest {
     context: CommandContext,
     target: MenuTarget,
     location: StorePath,
-    selection: Vec<CommandTargetRef>,
-    trash_contents: Vec<CommandTargetRef>,
+    selection: Arc<[CommandTargetRef]>,
+    trash_contents: Arc<[CommandTargetRef]>,
     source: ContextMenuSource,
     origin_tab: Option<crate::navigation::TabId>,
     pub(crate) open_with: Vec<crate::menus::OpenWithApplication>,
@@ -56,8 +57,8 @@ impl ContextMenuRequest {
             context,
             target,
             location,
-            selection,
-            trash_contents: Vec::new(),
+            selection: selection.into(),
+            trash_contents: Arc::from([]),
             source: ContextMenuSource::Pointer,
             origin_tab: None,
             open_with: Vec::new(),
@@ -71,16 +72,25 @@ impl ContextMenuRequest {
     /// into a selection command. Confirmation retains this exact snapshot.
     pub(crate) fn with_trash_contents(mut self, contents: Vec<CommandTargetRef>) -> Self {
         if self.target == MenuTarget::TrashBackground {
-            self.trash_contents = contents;
+            self.trash_contents = contents.into();
         }
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn captured_targets(&self) -> &[CommandTargetRef] {
         if self.target == MenuTarget::TrashBackground {
             &self.trash_contents
         } else {
             &self.selection
+        }
+    }
+
+    pub(crate) fn captured_targets_arc(&self) -> Arc<[CommandTargetRef]> {
+        if self.target == MenuTarget::TrashBackground {
+            Arc::clone(&self.trash_contents)
+        } else {
+            Arc::clone(&self.selection)
         }
     }
 

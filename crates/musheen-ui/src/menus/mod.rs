@@ -206,7 +206,10 @@ impl ContextMenuSurface {
         }
         let pending = PendingInvocation {
             context,
-            parameters: CommandParameters::destination(pending.selection.clone(), destination),
+            parameters: CommandParameters::destination(
+                pending.selection.as_ref().to_vec(),
+                destination,
+            ),
             ..pending
         };
         self.dispatch_or_confirm(command.danger_level(), pending, dispatcher)
@@ -258,7 +261,7 @@ impl ContextMenuSurface {
 pub struct PendingInvocation {
     id: musheen_core::CommandId,
     context: musheen_core::CommandContext,
-    selection: Vec<musheen_core::CommandTargetRef>,
+    selection: std::sync::Arc<[musheen_core::CommandTargetRef]>,
     parameters: CommandParameters,
     origin_tab: Option<crate::navigation::TabId>,
 }
@@ -305,9 +308,11 @@ fn pending_with_parameters(
     let parameters = match data.action.parameter_contract() {
         CommandParameterContract::None => CommandParameters::None,
         CommandParameterContract::Location => CommandParameters::Location(data.location.clone()),
-        CommandParameterContract::Targets(_) => CommandParameters::targets(data.selection.clone()),
+        CommandParameterContract::Targets(_) => {
+            CommandParameters::targets(data.selection.as_ref().to_vec())
+        }
         CommandParameterContract::Destination(_) => CommandParameters::destination(
-            data.selection.clone(),
+            data.selection.as_ref().to_vec(),
             data.destination
                 .clone()
                 .ok_or(MenuInvocationError::DestinationRequired)?,
@@ -316,7 +321,7 @@ fn pending_with_parameters(
             return Err(MenuInvocationError::DestinationRequired);
         }
         CommandParameterContract::CustomAction(_) => CommandParameters::CustomAction {
-            targets: data.selection.clone(),
+            targets: data.selection.as_ref().to_vec(),
             supports_provider_uris: data.context.supports_provider_uris,
             action_id: data
                 .custom_action
@@ -341,7 +346,7 @@ fn pending_with_parameters(
                 }
                 _ => return Err(MenuInvocationError::ApplicationRequired),
             };
-            CommandParameters::open_with(data.selection.clone(), application, intent)
+            CommandParameters::open_with(data.selection.as_ref().to_vec(), application, intent)
         }
     };
     Ok(PendingInvocation {

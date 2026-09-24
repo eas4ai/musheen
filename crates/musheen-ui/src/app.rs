@@ -6817,7 +6817,7 @@ impl MusheenApp {
                     tab,
                     popup.target,
                     invocation.location.clone(),
-                    invocation.selection.clone(),
+                    invocation.selection.as_ref().to_vec(),
                 );
                 let menu = context_menu_projection(&menu, &popup.projection, &popup.menu)?.clone();
                 Some((popup.clone(), menu))
