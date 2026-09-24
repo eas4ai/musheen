@@ -1,9 +1,9 @@
 use futures_lite::future::block_on;
-use musheen_core::{ResourceLimits, StorePath};
+use musheen_core::{ResourceLimits, Store, StorePath};
 use musheen_test_support::{
     FaultCase, FaultCoverage, FaultPhase, FaultingReadStore, MillionItemFixture, RecordingStore,
 };
-use musheen_ui::{DirectoryModel, enumerate_directory};
+use musheen_ui::{ApplyPageResult, DirectoryModel, DirectoryState, enumerate_directory};
 
 #[test]
 fn matrix_names_missing_boundary_evidence() {
@@ -62,4 +62,46 @@ fn paged_directory_failure_is_bounded_reported_and_retryable() {
         "uncovered boundary IDs: {:?}",
         coverage.uncovered()
     );
+}
+
+#[test]
+fn directory_page_failure_after_publication_preserves_items_and_retries() {
+    let limits = ResourceLimits::default();
+    let fixture = MillionItemFixture::new(600).unwrap().with_delay_yields(0);
+    let store = FaultingReadStore::new(RecordingStore::read_only(fixture), 1);
+    let mut model = DirectoryModel::new(limits.clone());
+    let load = model.begin_navigation(StorePath::from_unix_path("/fixture"));
+
+    let (_, first_request) = model.begin_page().unwrap();
+    let first_page =
+        block_on(store.read_directory(load.location(), first_request, load.cancellation().clone()))
+            .unwrap();
+    assert_eq!(
+        model.apply_page(&load, first_page),
+        ApplyPageResult::Applied
+    );
+    let published_count = model.items().len();
+    assert_eq!(published_count, limits.directory_page_items());
+
+    let (_, next_request) = model.begin_page().unwrap();
+    let failure =
+        block_on(store.read_directory(load.location(), next_request, load.cancellation().clone()))
+            .unwrap_err();
+    model.page_failed(&load);
+    assert!(model.apply_error(&load, failure.to_string()));
+    assert!(matches!(model.state(), DirectoryState::Error(_)));
+    assert_eq!(model.items().len(), published_count);
+
+    let (_, retry_request) = model.begin_page().unwrap();
+    let retry_page =
+        block_on(store.read_directory(load.location(), retry_request, load.cancellation().clone()))
+            .unwrap();
+    assert_eq!(
+        model.apply_page(&load, retry_page),
+        ApplyPageResult::Applied
+    );
+    assert_eq!(model.items().len(), 600);
+    assert_eq!(model.state(), &DirectoryState::Ready);
+    assert!(model.begin_page().is_none());
+    assert_eq!(store.read_calls(), 3);
 }
