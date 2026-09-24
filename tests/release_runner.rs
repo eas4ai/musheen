@@ -158,6 +158,7 @@ fn release_container_tests_both_toolchains_features_and_profiles() {
     let dockerfile = fs::read_to_string(root.join("ci/release.Dockerfile")).unwrap();
     let matrix = fs::read_to_string(root.join("scripts/verify-release-matrix.sh")).unwrap();
     assert!(dockerfile.contains("verify-release-matrix.sh"));
+    assert!(dockerfile.contains("scripts/check-budgets.sh"));
     assert!(dockerfile.contains("USER musheen"));
     assert!(matrix.contains("1.95.0 stable"));
     assert!(matrix.contains("--no-default-features"));

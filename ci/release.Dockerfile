@@ -36,7 +36,8 @@ USER musheen
 RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
     --mount=type=cache,target=/usr/local/cargo/git,uid=10001,gid=10001 \
     --mount=type=cache,target=/workspace/target,uid=10001,gid=10001 \
-    scripts/verify-release-matrix.sh /workspace
+    scripts/verify-release-matrix.sh /workspace \
+    && CARGO_TARGET_DIR=/workspace/target scripts/check-budgets.sh
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
     --mount=type=cache,target=/usr/local/cargo/git,uid=10001,gid=10001 \

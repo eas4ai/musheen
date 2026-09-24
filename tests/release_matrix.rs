@@ -1,6 +1,7 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 fn fixture(root: &Path, rust_version: &str) {
     fs::create_dir_all(root.join("src")).unwrap();
@@ -165,4 +166,68 @@ fn dependency_policy_rejects_expired_advisory_exceptions_and_duplicate_role_crat
         !duplicate.status.success(),
         "duplicate GPUI Kit versions must fail"
     );
+}
+
+#[test]
+fn budget_checker_rejects_a_cargo_run_with_no_tests() {
+    let (output, _temporary) = run_budget_checker_with_fake_cargo(
+        "printf 'test result: ok. 0 passed; 0 failed; 0 ignored\\n'",
+    );
+    assert!(!output.status.success(), "empty test filter must fail");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no budget test ran"));
+}
+
+#[test]
+fn budget_checker_runs_a_case_for_every_resource_limit() {
+    let (output, temporary) = run_budget_checker_with_fake_cargo(
+        "printf '%s\\n' \"$*\" >> \"$MUSHEEN_BUDGET_CALL_LOG\"\nprintf 'test result: ok. 1 passed; 0 failed; 0 ignored\\n'",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(temporary.path().join("calls")).unwrap();
+    for case in [
+        "operations_capture_an_immutable_resource_limit_snapshot",
+        "streaming_directory_model_pages_through_one_million_items",
+        "million_result_producer_requests_refinement_without_unbounded_models",
+        "preview_limits_reject_values_above_the_read_and_retention_budgets",
+        "thumbnail_limits_reject_work_above_the_documented_budget",
+        "default_archive_staging_budget_does_not_exceed_ten_gib",
+        "scrollback_drops_oldest_complete_lines_at_both_limits",
+        "configured_pool_rejects_values_above_the_documented_budgets",
+        "defaults_provider_limits_and_fifo_progress_are_enforced",
+    ] {
+        assert!(calls.contains(case), "budget case not run: {case}");
+    }
+    assert!(
+        calls.contains("--ignored"),
+        "the million-item case must run"
+    );
+}
+
+fn run_budget_checker_with_fake_cargo(body: &str) -> (Output, tempfile::TempDir) {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-budgets.sh");
+    let temporary = tempfile::tempdir().unwrap();
+    let fake_cargo = temporary.path().join("cargo");
+    fs::write(&fake_cargo, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        temporary.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+
+    let output = Command::new(&script)
+        .env("PATH", path)
+        .env("MUSHEEN_BUDGET_CALL_LOG", temporary.path().join("calls"))
+        .env(
+            "CARGO_TARGET_DIR",
+            std::env::var("CARGO_TARGET_DIR")
+                .unwrap_or_else(|_| temporary.path().join("target").display().to_string()),
+        )
+        .output()
+        .unwrap();
+    (output, temporary)
 }
