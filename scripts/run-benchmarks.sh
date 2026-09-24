@@ -16,12 +16,21 @@ fi
 
 run_benchmark() (
     local name=$1
-    local benchmark benchmark_temp output
+    local benchmark benchmark_temp output worker
     benchmark=$(cargo bench --locked --no-run --bench "$name" --message-format=json \
         | jq -r --arg target "$name" 'select(.reason == "compiler-artifact" and .target.name == $target and .executable != null) | .executable')
     if [[ ! -x $benchmark ]]; then
         printf '%s benchmark executable is missing: %s\n' "$name" "$benchmark" >&2
         exit 1
+    fi
+    if [[ $name == thumbnail ]]; then
+        worker=$(cargo build --locked --release --package musheen-desktop \
+            --bin musheen-thumbnail-worker --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "musheen-thumbnail-worker" and .executable != null) | .executable')
+        if [[ ! -x $worker ]]; then
+            printf 'thumbnail worker executable is missing: %s\n' "$worker" >&2
+            exit 1
+        fi
     fi
 
     benchmark_temp=$(mktemp -d -p "$temporary_parent" musheen-bench.XXXXXX)
@@ -35,7 +44,7 @@ run_benchmark() (
     }
     trap cleanup EXIT
 
-    output=$(TMPDIR="$benchmark_temp" "$benchmark" --bench)
+    output=$(TMPDIR="$benchmark_temp" MUSHEEN_THUMBNAIL_WORKER="${worker:-}" "$benchmark" --bench)
     printf '%s\n' "$output"
     if ! printf '%s\n' "$output" | jq -e -s --arg benchmark "$name" \
         -f scripts/benchmark-validations.jq >/dev/null; then
@@ -47,3 +56,4 @@ run_benchmark() (
 run_benchmark directory
 run_benchmark search
 run_benchmark operations
+run_benchmark thumbnail

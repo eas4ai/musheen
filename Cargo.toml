@@ -113,6 +113,7 @@ rustix.workspace = true
 async-channel.workspace = true
 musheen-test-support = { path = "crates/musheen-test-support" }
 musheen-ops = { path = "crates/musheen-ops" }
+png.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
@@ -129,6 +130,10 @@ harness = false
 
 [[bench]]
 name = "operations"
+harness = false
+
+[[bench]]
+name = "thumbnail"
 harness = false
 
 [patch.crates-io]

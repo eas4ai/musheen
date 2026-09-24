@@ -180,7 +180,7 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     let fake_cargo = fake_bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MUSHEEN_CARGO_ARGS\"\nname=directory\nexecutable=$MUSHEEN_FAKE_BENCH\nfor argument in \"$@\"; do\n  if [ \"$argument\" = search ]; then name=search; executable=$MUSHEEN_FAKE_SEARCH_BENCH; fi\n  if [ \"$argument\" = operations ]; then name=operations; executable=$MUSHEEN_FAKE_OPERATIONS_BENCH; fi\n  if [ \"$argument\" = thumbnail ]; then name=thumbnail; executable=$MUSHEEN_FAKE_THUMBNAIL_BENCH; fi\n  if [ \"$argument\" = musheen-thumbnail-worker ]; then name=musheen-thumbnail-worker; executable=$MUSHEEN_FAKE_THUMBNAIL_WORKER; fi\ndone\nprintf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"%s\"},\"executable\":\"%s\"}\\n' \"$name\" \"$executable\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cargo, fs::Permissions::from_mode(0o755)).unwrap();
@@ -205,6 +205,16 @@ fn install_fake_benchmarks(fake_bin: &Path) {
     )
     .unwrap();
     fs::set_permissions(&fake_operations_bench, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_thumbnail_worker = fake_bin.join("musheen-thumbnail-worker");
+    fs::write(&fake_thumbnail_worker, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_thumbnail_worker, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_thumbnail_bench = fake_bin.join("thumbnail-bench");
+    fs::write(
+        &fake_thumbnail_bench,
+        "#!/bin/sh\nprintf '%s' \"$TMPDIR\" > \"$MUSHEEN_THUMBNAIL_BENCH_TMP_RECORD\"\nprintf '%s' \"$*\" > \"$MUSHEEN_THUMBNAIL_BENCH_ARGS\"\nprintf '%s' \"$MUSHEEN_THUMBNAIL_WORKER\" > \"$MUSHEEN_THUMBNAIL_WORKER_RECORD\"\nprintf '%s\\n' '{\"case\":\"thumbnail_worker_decode\",\"decoded_pixels\":4194304,\"cache_hit\":true,\"worker_peak_rss_kib_sampled_max\":4096,\"wall_ns\":1,\"cpu_ns\":1,\"peak_rss_kib\":1,\"open_fds\":4,\"queued_work_max\":0,\"retained_models_max\":0,\"temporary_bytes\":100}' '{\"case\":\"thumbnail_oversized_header_rejected\",\"pixels\":60000000,\"failure_record\":true,\"pool_workers_max\":1,\"wall_ns\":2,\"cpu_ns\":2,\"peak_rss_kib\":2,\"open_fds\":4,\"queued_work_max\":0,\"retained_models_max\":0,\"temporary_bytes\":100}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_thumbnail_bench, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn run_benchmark_fixture(
@@ -228,6 +238,14 @@ fn run_benchmark_fixture(
             fake_bin.join("operations-bench"),
         )
         .env(
+            "MUSHEEN_FAKE_THUMBNAIL_BENCH",
+            fake_bin.join("thumbnail-bench"),
+        )
+        .env(
+            "MUSHEEN_FAKE_THUMBNAIL_WORKER",
+            fake_bin.join("musheen-thumbnail-worker"),
+        )
+        .env(
             "MUSHEEN_FAKE_MISSING",
             if missing_directory { "1" } else { "0" },
         )
@@ -243,6 +261,10 @@ fn run_benchmark_fixture(
             temporary.join("operations-args"),
         )
         .env(
+            "MUSHEEN_THUMBNAIL_BENCH_ARGS",
+            temporary.join("thumbnail-args"),
+        )
+        .env(
             "MUSHEEN_SEARCH_BENCH_TMP_RECORD",
             temporary.join("search-temp"),
         )
@@ -250,6 +272,14 @@ fn run_benchmark_fixture(
         .env(
             "MUSHEEN_OPERATIONS_BENCH_TMP_RECORD",
             temporary.join("operations-temp"),
+        )
+        .env(
+            "MUSHEEN_THUMBNAIL_BENCH_TMP_RECORD",
+            temporary.join("thumbnail-temp"),
+        )
+        .env(
+            "MUSHEEN_THUMBNAIL_WORKER_RECORD",
+            temporary.join("thumbnail-worker-record"),
         )
         .output()
         .unwrap()
@@ -260,6 +290,8 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
     assert!(cargo_args.contains("--no-run --bench directory"));
     assert!(cargo_args.contains("--no-run --bench search"));
     assert!(cargo_args.contains("--no-run --bench operations"));
+    assert!(cargo_args.contains("--no-run --bench thumbnail"));
+    assert!(cargo_args.contains("--bin musheen-thumbnail-worker"));
     assert_eq!(
         fs::read_to_string(temporary.join("bench-args")).unwrap(),
         "--bench"
@@ -272,15 +304,28 @@ fn assert_benchmark_fixture_records(temporary: &Path) {
         fs::read_to_string(temporary.join("operations-args")).unwrap(),
         "--bench"
     );
+    assert_eq!(
+        fs::read_to_string(temporary.join("thumbnail-args")).unwrap(),
+        "--bench"
+    );
+    assert_eq!(
+        fs::read_to_string(temporary.join("thumbnail-worker-record")).unwrap(),
+        temporary
+            .join("bin/musheen-thumbnail-worker")
+            .to_string_lossy()
+    );
     let benchmark_temp = fs::read_to_string(temporary.join("bench-temp")).unwrap();
     let search_temp = fs::read_to_string(temporary.join("search-temp")).unwrap();
     let operations_temp = fs::read_to_string(temporary.join("operations-temp")).unwrap();
+    let thumbnail_temp = fs::read_to_string(temporary.join("thumbnail-temp")).unwrap();
     assert!(benchmark_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(benchmark_temp, temporary.to_str().unwrap());
     assert!(search_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(search_temp, benchmark_temp);
     assert!(operations_temp.starts_with(temporary.to_str().unwrap()));
     assert_ne!(operations_temp, search_temp);
+    assert!(thumbnail_temp.starts_with(temporary.to_str().unwrap()));
+    assert_ne!(thumbnail_temp, operations_temp);
 }
 
 #[test]

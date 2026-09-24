@@ -5278,6 +5278,7 @@ dependencies = [
  "musheen-ops",
  "musheen-test-support",
  "musheen-ui",
+ "png 0.18.1",
  "rustix",
  "serde_json",
  "tempfile",

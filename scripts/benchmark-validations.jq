@@ -55,7 +55,21 @@ def operations:
   and any(.[]; .case == "large_copy_transaction"
     and (.strategy == "reflink" or .strategy == "sparse" or .strategy == "streamed"));
 
+def thumbnail:
+  length == 2
+  and cases(["thumbnail_oversized_header_rejected", "thumbnail_worker_decode"])
+  and all(.[]; measurements and .queued_work_max == 0
+    and .retained_models_max == 0 and .temporary_bytes <= 67108864)
+  and any(.[]; .case == "thumbnail_worker_decode"
+    and .decoded_pixels == 4194304 and .cache_hit == true
+    and (.worker_peak_rss_kib_sampled_max | type) == "number"
+    and .worker_peak_rss_kib_sampled_max > 0)
+  and any(.[]; .case == "thumbnail_oversized_header_rejected"
+    and .pixels == 60000000 and .failure_record == true
+    and .pool_workers_max >= 1 and .pool_workers_max <= 4);
+
 if $benchmark == "directory" then directory
 elif $benchmark == "search" then search
 elif $benchmark == "operations" then operations
+elif $benchmark == "thumbnail" then thumbnail
 else false end
