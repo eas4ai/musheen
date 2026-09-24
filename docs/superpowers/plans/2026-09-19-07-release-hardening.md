@@ -92,8 +92,7 @@ catalogs; create `scripts/check-ui-baselines.sh`.
 
 **Files:** Create `packaging/org.musheen.Musheen.desktop`,
 `packaging/org.musheen.Musheen.metainfo.xml`, D-Bus service and Polkit
-policy files, icon install rules, `packaging/flatpak/` manifest, and
-`scripts/package-smoke-test.sh`.
+policy files, icon install rules, and `scripts/package-smoke-test.sh`.
 
 - [ ] Adopt `org.musheen.Musheen` as the application, desktop, AppStream, and
   private D-Bus identity; FileManager1 keeps its standard interface name.
@@ -103,7 +102,7 @@ policy files, icon install rules, `packaging/flatpak/` manifest, and
 - [ ] Install the release binary under the unprivileged package root and verify
   no writable executable, setuid GUI, bundled credential, absolute build path,
   or unlicensed asset exists.
-- [ ] Exercise native and Flatpak launches, Open With registration, default file
+- [ ] Exercise native launch, Open With registration, default file
   manager activation, themes, portals, mounted devices, and update-check policy.
 - [ ] Make package creation consume `assets/icons/musheen.svg` and generated
   raster sizes without introducing another app-icon design.
