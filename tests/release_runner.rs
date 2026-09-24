@@ -170,4 +170,5 @@ fn release_container_tests_both_toolchains_features_and_profiles() {
     assert!(dockerfile.contains("verify-msrv.sh"));
     assert!(dockerfile.contains("verify-dependencies.sh"));
     assert!(dockerfile.contains("generate-sbom.py"));
+    assert!(dockerfile.contains("cargo fetch --locked"));
 }

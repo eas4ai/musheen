@@ -40,7 +40,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,uid=10001,gid=10001 \
     --mount=type=cache,target=/usr/local/cargo/git,uid=10001,gid=10001 \
-    python3 scripts/generate-sbom.py /workspace /release
+    cargo fetch --locked \
+    && python3 scripts/generate-sbom.py /workspace /release
 
 FROM scratch AS artifact
 COPY --from=verify /release/ /
