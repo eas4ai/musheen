@@ -77,7 +77,11 @@ fn sidebar_and_content_drops_use_one_copy_move_queue() {
         .submit_drop(move_payload, StorePath::from_unix_path(&destination))
         .unwrap();
     run_ready(&mut queue);
-    assert_eq!(queue.state(move_jobs[0]), Some(JobState::Completed));
+    assert_eq!(
+        queue.state(move_jobs[0]),
+        None,
+        "a completed job keeps no scheduler record"
+    );
     assert_eq!(
         fs::read(destination.join("move-source.txt")).unwrap(),
         b"move me"
