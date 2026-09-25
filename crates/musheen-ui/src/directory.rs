@@ -13,7 +13,7 @@ mod index;
 mod termination;
 pub(crate) use index::IndexedSelection;
 use index::{DiskDirectoryIndex, ResolvedIndexedSelection};
-pub(crate) use index::{directory_index_root, sweep_stale_indexes};
+pub(crate) use index::{directory_index_root, missing_index_root_error, sweep_stale_indexes};
 pub(crate) use termination::install_index_cleanup_on_termination;
 
 const MAX_RESIDENT_ITEMS: usize = 4_096;
@@ -272,7 +272,7 @@ impl DirectoryIndexReader {
 
 pub(crate) struct DirectoryIndexWork {
     index: Option<SharedIndex>,
-    index_root: PathBuf,
+    index_root: Option<PathBuf>,
     prior_items: Vec<StoreItem>,
     page_items: Vec<StoreItem>,
     preferences: ViewPreferences,
@@ -392,7 +392,10 @@ impl DirectoryIndexWork {
     pub(crate) fn run(self) -> std::io::Result<DirectoryIndexResult> {
         let index = match self.index {
             Some(index) => index,
-            None => Arc::new(Mutex::new(DiskDirectoryIndex::new_in(&self.index_root)?)),
+            None => {
+                let root = self.index_root.as_deref().ok_or_else(missing_index_root_error)?;
+                Arc::new(Mutex::new(DiskDirectoryIndex::new_in(root)?))
+            }
         };
         let (indexed_count, visible_count, order_rebuilt) = {
             let mut index_guard = index.lock().map_err(|_| {
@@ -474,7 +477,9 @@ pub struct DirectoryModel {
     active: Option<DirectoryLoad>,
     state: DirectoryState,
     view: DirectoryViewModel,
-    index_root: PathBuf,
+    /// Where this tab's index lives; `None` when no cache directory is
+    /// available, so a folder that needs an index reports the error.
+    index_root: Option<PathBuf>,
     index: Option<SharedIndex>,
     /// Why the index stopped: the folder keeps what it already shows.
     index_error: Option<Box<str>>,
@@ -520,15 +525,16 @@ impl DirectoryModel {
     }
 
     /// Keeps this tab's disk index under `root` instead of the user's cache
-    /// directory.
+    /// directory. `None` means no cache directory is available: a folder
+    /// that needs an index keeps what it shows and reports the error.
     #[must_use]
-    pub fn with_index_root(mut self, root: PathBuf) -> Self {
+    pub fn with_index_root(mut self, root: Option<PathBuf>) -> Self {
         self.index_root = root;
         self
     }
 
     #[cfg(test)]
-    pub(crate) fn set_index_root(&mut self, root: PathBuf) {
+    pub(crate) fn set_index_root(&mut self, root: Option<PathBuf>) {
         self.index_root = root;
     }
 
@@ -1003,7 +1009,7 @@ mod indexed_watch_tests {
         // A file where the index root should be makes every index write fail.
         let blocked = tempfile::NamedTempFile::new().unwrap();
         let mut model = DirectoryModel::new(ResourceLimits::default())
-            .with_index_root(blocked.path().to_path_buf());
+            .with_index_root(Some(blocked.path().to_path_buf()));
         let load = model.begin_navigation(StorePath::from_unix_path("/many"));
         let request = PageRequest::first(&ResourceLimits::default());
 
@@ -1041,6 +1047,38 @@ mod indexed_watch_tests {
         assert!(
             model.begin_page().is_none(),
             "no further page is requested after the index failed"
+        );
+    }
+
+    #[test]
+    fn indexed_folder_reports_a_missing_cache_directory_and_keeps_the_shown_items() {
+        let mut model = DirectoryModel::new(ResourceLimits::default()).with_index_root(None);
+        let load = model.begin_navigation(StorePath::from_unix_path("/many"));
+        let request = PageRequest::first(&ResourceLimits::default());
+
+        for first in (0..4_608).step_by(512) {
+            let items = (first..first + 512)
+                .map(|number| item(number, &format!("item-{number:05}")))
+                .collect();
+            let page = Page::try_new(&request, items, None, TotalHint::Unknown).unwrap();
+            let expected = if first < 4_096 {
+                ApplyPageResult::Applied
+            } else {
+                ApplyPageResult::Failed
+            };
+            assert_eq!(model.apply_page(&load, page), expected, "page at {first}");
+        }
+
+        assert_eq!(model.view().items().len(), 4_096);
+        assert_eq!(model.state(), &DirectoryState::Ready);
+        assert!(!model.is_indexed(), "nothing is written anywhere else");
+        assert!(!model.view().is_complete());
+        assert!(
+            model
+                .index_error()
+                .is_some_and(|error| error.contains("no cache directory")),
+            "the error names the missing cache directory: {:?}",
+            model.index_error()
         );
     }
 

@@ -24,14 +24,23 @@ const INDEX_DIRECTORY_PREFIX: &str = "musheen-directory-";
 const INDEX_LOCK_NAME: &str = "lock";
 
 /// The directory that holds every tab's index: `$XDG_CACHE_HOME/musheen/directory-index`,
-/// or `~/.cache/musheen/directory-index` when `XDG_CACHE_HOME` is unset. Without a
-/// usable home the index falls back to the temporary directory.
-pub(crate) fn directory_index_root() -> PathBuf {
+/// or `~/.cache/musheen/directory-index` when `XDG_CACHE_HOME` is unset. `None`
+/// when neither variable names a cache directory: the index is never written
+/// anywhere else, so a folder that needs one reports the error instead.
+pub(crate) fn directory_index_root() -> Option<PathBuf> {
     directory_index_root_from(
         std::env::var_os("XDG_CACHE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
     )
-    .unwrap_or_else(|| std::env::temp_dir().join("musheen-directory-index"))
+}
+
+/// The error a folder shows when no cache directory is available for its
+/// index.
+pub(crate) fn missing_index_root_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "no cache directory: neither XDG_CACHE_HOME nor HOME names one",
+    )
 }
 
 /// Resolves the index root from the cache and home variables, following the

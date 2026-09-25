@@ -2075,10 +2075,16 @@ pub fn run(initial_path: PathBuf) {
     if let Err(error) = crate::directory::install_index_cleanup_on_termination() {
         eprintln!("Musheen could not watch for termination signals: {error}");
     }
-    if let Err(error) =
-        crate::directory::sweep_stale_indexes(&crate::directory::directory_index_root())
-    {
-        eprintln!("Musheen could not remove stale directory indexes: {error}");
+    match crate::directory::directory_index_root() {
+        Some(root) => {
+            if let Err(error) = crate::directory::sweep_stale_indexes(&root) {
+                eprintln!("Musheen could not remove stale directory indexes: {error}");
+            }
+        }
+        None => eprintln!(
+            "Musheen cannot locate the cache directory: {}; large folders will not be indexed",
+            crate::directory::missing_index_root_error()
+        ),
     }
     gpui_kit::application()
         .with_assets(MusheenAssets)
@@ -5327,7 +5333,7 @@ impl MusheenApp {
     fn new_directory_model(&self) -> DirectoryModel {
         let directory = DirectoryModel::new(self.limits.snapshot());
         match &self.index_root_override {
-            Some(root) => directory.with_index_root(root.clone()),
+            Some(root) => directory.with_index_root(Some(root.clone())),
             None => directory,
         }
     }
@@ -5337,7 +5343,7 @@ impl MusheenApp {
     #[cfg(test)]
     fn set_index_root_override(&mut self, root: PathBuf) {
         for directory in self.directories.values_mut() {
-            directory.set_index_root(root.clone());
+            directory.set_index_root(Some(root.clone()));
         }
         self.index_root_override = Some(root);
     }
@@ -18526,7 +18532,7 @@ mod tests {
             app.update(cx, |state, cx| {
                 let directory = state.directories.get_mut(&tab_id).unwrap();
                 directory.view_mut().preferences_mut().directories_first = false;
-                directory.set_index_root(blocked);
+                directory.set_index_root(Some(blocked));
                 let load = directory.begin_navigation(StorePath::from_unix_path("/synthetic"));
                 for first in (0..4_608).step_by(512) {
                     let page = synthetic_page(first..first + 512);
