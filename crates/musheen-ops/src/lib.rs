@@ -15,6 +15,7 @@ mod r#move;
 mod mutation;
 mod plan;
 mod recovery;
+mod remote;
 mod rename;
 mod scheduler;
 mod staging;
@@ -52,6 +53,10 @@ pub use plan::{
     OperationPlan, PlanError, ProviderLimits, ProviderSnapshot, WorkClass,
 };
 pub use recovery::{RecoveryContext, RecoveryDecision, decide_recovery};
+pub use remote::{
+    RemoteTransferCapabilities, RemoteTransferGap, RemoteTransferPlan, RemoteTransferPlanError,
+    RemoteTransferStrategy, ResumePolicy,
+};
 pub use rename::{RenameRequest, execute_rename};
 pub use scheduler::{Clock, ScheduledJob, Scheduler, SchedulerError, SystemClock};
 pub use staging::{StagingError, StagingPath};
