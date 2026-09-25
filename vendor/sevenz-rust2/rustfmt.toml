@@ -1,2 +1,0 @@
-# Keep formatting compatible with the repository's stable Rust toolchain.
-use_try_shorthand = true
