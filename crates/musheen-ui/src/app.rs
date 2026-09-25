@@ -380,6 +380,8 @@ struct LocationFacts {
 #[derive(Clone, Debug)]
 struct LocationResolution {
     item: Option<StoreItem>,
+    /// What a link at the location leads to; `None` for a dangling link.
+    link_target: Option<StoreItem>,
     /// The item is a link whose target is gone.
     dead_link: bool,
 }
@@ -427,6 +429,43 @@ impl MenuRecompose {
             Self::Request { target, .. } | Self::Sidebar { target, .. } => *target,
         }
     }
+}
+
+/// A command target the store confirmed off the UI thread: the item at the
+/// path and, for a link, what it leads to.
+#[derive(Clone, Debug)]
+struct ResolvedTarget {
+    item: StoreItem,
+    link_target: Option<StoreItem>,
+}
+
+impl ResolvedTarget {
+    /// A directory, or a link that leads to one. Sidebar places such as
+    /// $HOME/Desktop are often links, and they get the directory commands.
+    fn opens_as_directory(&self) -> bool {
+        match self.item.kind() {
+            ItemKind::Directory => true,
+            ItemKind::SymbolicLink => self
+                .link_target
+                .as_ref()
+                .is_some_and(|target| target.kind() == ItemKind::Directory),
+            ItemKind::RegularFile | ItemKind::Other => false,
+        }
+    }
+}
+
+/// The one directory a target-based command acts on: a single target that
+/// opens as a directory.
+fn single_directory_target(
+    targets: &[CommandTargetRef],
+    resolved: &[ResolvedTarget],
+) -> Option<StorePath> {
+    let ([target], [resolved]) = (targets, resolved) else {
+        return None;
+    };
+    resolved
+        .opens_as_directory()
+        .then(|| target.path().clone())
 }
 
 /// The probes a menu composition queued, and how to compose it again.
@@ -2930,20 +2969,23 @@ fn resolve_targets(
     targets: &[CommandTargetRef],
     verification: &str,
     changed: &str,
-) -> Result<Vec<StoreItem>, Box<str>> {
-    let mut items = Vec::with_capacity(targets.len());
+) -> Result<Vec<ResolvedTarget>, Box<str>> {
+    let mut resolved = Vec::with_capacity(targets.len());
     for target in targets {
         let current = store
             .resolve_item(target.path())
             .map_err(|error| Box::<str>::from(format!("{verification}: {error}")))?;
         match current {
             Some(item) if item.id() == target.id() && item.path() == target.path() => {
-                items.push(item);
+                let link_target = (item.kind() == ItemKind::SymbolicLink)
+                    .then(|| store.resolve_link_target(item.path()).ok().flatten())
+                    .flatten();
+                resolved.push(ResolvedTarget { item, link_target });
             }
             _ => return Err(Box::<str>::from(changed)),
         }
     }
-    Ok(items)
+    Ok(resolved)
 }
 
 /// Asks the store one of a menu's questions. Runs on a background thread.
@@ -2967,15 +3009,18 @@ fn run_store_probe(
             });
             let resolution = resolve.then(|| {
                 let item = store.resolve_item(&location).ok().flatten();
-                let dead_link = item.as_ref().is_some_and(|item| {
-                    item.kind() == ItemKind::SymbolicLink
-                        && store
-                            .resolve_link_target(item.path())
-                            .ok()
-                            .flatten()
-                            .is_none()
-                });
-                LocationResolution { item, dead_link }
+                let is_link = item
+                    .as_ref()
+                    .is_some_and(|item| item.kind() == ItemKind::SymbolicLink);
+                let link_target = item
+                    .as_ref()
+                    .filter(|_| is_link)
+                    .and_then(|item| store.resolve_link_target(item.path()).ok().flatten());
+                LocationResolution {
+                    item,
+                    dead_link: is_link && link_target.is_none(),
+                    link_target,
+                }
             });
             StoreProbeResult::Location {
                 location,
@@ -7686,6 +7731,36 @@ impl MusheenApp {
         self.compose_context_request(request)
     }
 
+    /// A directory, or a link the cached resolution says leads to one. A
+    /// link the store has not been asked about is probed and read as a file
+    /// until the answer arrives.
+    fn opens_as_directory_by_facts(&self, item: &StoreItem) -> bool {
+        match item.kind() {
+            ItemKind::Directory => true,
+            ItemKind::SymbolicLink => match self
+                .location_facts
+                .get(item.path())
+                .and_then(|facts| facts.resolution.as_ref())
+            {
+                Some(resolution) => resolution
+                    .link_target
+                    .as_ref()
+                    .is_some_and(|target| target.kind() == ItemKind::Directory),
+                None => {
+                    self.queue_store_probe(
+                        StoreProbe::Location {
+                            location: item.path().clone(),
+                            resolve: true,
+                        },
+                        true,
+                    );
+                    false
+                }
+            },
+            ItemKind::RegularFile | ItemKind::Other => false,
+        }
+    }
+
     /// The reason a menu shows for a fact the store has not answered yet.
     fn checking_store_reason(&self) -> CapabilityReason {
         CapabilityReason::new(
@@ -8435,7 +8510,7 @@ impl MusheenApp {
             CommandTarget::Mount
         } else if target == MenuTarget::SidebarLocation
             && (selected_is_pinned || selection.len() == 1)
-            && selected_item.is_none_or(|item| self.opens_as_directory(item))
+            && selected_item.is_none_or(|item| self.opens_as_directory_by_facts(item))
         {
             CommandTarget::Directory
         } else if target == MenuTarget::SidebarLocation && selected_item.is_none() {
@@ -9966,7 +10041,39 @@ impl MusheenApp {
             }
             _ => unreachable!("the caller accepts only target-based commands"),
         };
-        if let Some(location) = self.single_directory_target(origin_tab, targets) {
+        let action = *action;
+        let parameters = parameters.clone();
+        self.with_revalidated_targets(
+            origin_tab,
+            targets.clone(),
+            cx,
+            move |this, targets, resolved, cx| {
+                this.dispatch_local_target_command_revalidated(
+                    &action,
+                    &parameters,
+                    targets,
+                    &resolved,
+                    origin_tab,
+                    cx,
+                );
+            },
+        );
+    }
+
+    /// The rest of a local target command, once the store confirmed the
+    /// targets. A single directory target takes the directory commands
+    /// without asking the store again: the resolution carries what a link
+    /// leads to.
+    fn dispatch_local_target_command_revalidated(
+        &mut self,
+        action: &CommandAction,
+        parameters: &CommandParameters,
+        targets: &[CommandTargetRef],
+        resolved: &[ResolvedTarget],
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(location) = single_directory_target(targets, resolved) {
             let handled = match action {
                 CommandAction::Open => {
                     if let Some(tab_id) = origin_tab
@@ -10019,34 +10126,6 @@ impl MusheenApp {
                 return;
             }
         }
-        let action = *action;
-        let parameters = parameters.clone();
-        self.with_revalidated_targets(
-            origin_tab,
-            targets.clone(),
-            cx,
-            move |this, targets, _, cx| {
-                this.dispatch_local_target_command_revalidated(
-                    &action,
-                    &parameters,
-                    targets,
-                    origin_tab,
-                    cx,
-                );
-            },
-        );
-    }
-
-    /// The rest of a local target command, once the store confirmed the
-    /// targets.
-    fn dispatch_local_target_command_revalidated(
-        &mut self,
-        action: &CommandAction,
-        parameters: &CommandParameters,
-        targets: &[CommandTargetRef],
-        origin_tab: Option<TabId>,
-        cx: &mut Context<Self>,
-    ) {
         if matches!(
             action,
             CommandAction::Open
@@ -10159,46 +10238,6 @@ impl MusheenApp {
     /// is a resident item of the origin tab (a content row) or a location the
     /// store resolves directly (a sidebar entry). The stable identity must
     /// match in both cases.
-    fn single_directory_target(
-        &self,
-        origin_tab: Option<TabId>,
-        targets: &[CommandTargetRef],
-    ) -> Option<StorePath> {
-        let [target] = targets else {
-            return None;
-        };
-        let resident = origin_tab
-            .and_then(|tab| self.directories.get(&tab))
-            .and_then(|directory| directory.view().item(target.id()))
-            .map(|item| item.path() == target.path() && self.opens_as_directory(item));
-        let is_directory = match resident {
-            Some(resident) => resident,
-            None => self
-                .store
-                .resolve_item(target.path())
-                .ok()
-                .flatten()
-                .is_some_and(|item| item.id() == target.id() && self.opens_as_directory(&item)),
-        };
-        is_directory.then(|| target.path().clone())
-    }
-
-    /// A directory, or a symbolic link that leads to one. Sidebar places
-    /// such as $HOME/Desktop are often links, and the sidebar menu offers
-    /// them the directory commands.
-    fn opens_as_directory(&self, item: &StoreItem) -> bool {
-        match item.kind() {
-            ItemKind::Directory => true,
-            ItemKind::SymbolicLink => self
-                .store
-                .resolve_link_target(item.path())
-                .ok()
-                .flatten()
-                .is_some_and(|target| target.kind() == ItemKind::Directory),
-            ItemKind::RegularFile | ItemKind::Other => false,
-        }
-    }
-
     fn launch_external_terminal(&mut self, location: StorePath, cx: &mut Context<Self>) {
         if self.open_terminal_embedded {
             let next = location.as_unix_path().map(Path::to_path_buf);
@@ -11338,7 +11377,7 @@ impl MusheenApp {
         &self,
         origin_tab: Option<TabId>,
         targets: &[CommandTargetRef],
-    ) -> Result<Vec<StoreItem>, Box<str>> {
+    ) -> Result<Vec<ResolvedTarget>, Box<str>> {
         self.check_cached_targets(origin_tab, targets)?;
         resolve_targets(
             &*self.store,
@@ -11385,15 +11424,15 @@ impl MusheenApp {
     }
 
     /// Checks the targets against the store off the UI thread, then runs
-    /// `then` with them and the items the store resolved. A target that is
-    /// gone or replaced is refused with the menu's own messages. Without an
-    /// origin tab there is nothing to compare, as before.
+    /// `then` with them and what the store resolved. A target that is gone
+    /// or replaced is refused with the menu's own messages.
     fn with_revalidated_targets(
         &mut self,
         origin_tab: Option<TabId>,
         targets: Vec<CommandTargetRef>,
         cx: &mut Context<Self>,
-        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<StoreItem>, &mut Context<Self>) + 'static,
+        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<ResolvedTarget>, &mut Context<Self>)
+        + 'static,
     ) {
         self.with_revalidated_targets_or(
             origin_tab,
@@ -11415,14 +11454,11 @@ impl MusheenApp {
         targets: Vec<CommandTargetRef>,
         cx: &mut Context<Self>,
         on_error: impl FnOnce(&mut Self, Box<str>, &mut Context<Self>) + 'static,
-        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<StoreItem>, &mut Context<Self>) + 'static,
+        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<ResolvedTarget>, &mut Context<Self>)
+        + 'static,
     ) {
         if let Err(error) = self.check_cached_targets(origin_tab, &targets) {
             on_error(self, error, cx);
-            return;
-        }
-        if origin_tab.is_none() {
-            then(self, &targets, Vec::new(), cx);
             return;
         }
         let store = Arc::clone(&self.store);
@@ -11491,7 +11527,7 @@ impl MusheenApp {
             targets.to_vec(),
             cx,
             move |this, _, items, cx| {
-                let Some(item) = items.into_iter().next() else {
+                let Some(item) = items.into_iter().next().map(|resolved| resolved.item) else {
                     return;
                 };
                 if item.kind() != ItemKind::RegularFile {
