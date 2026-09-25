@@ -2878,7 +2878,7 @@ fn activate_notification_action(action: musheen_desktop::NotificationAction, cx:
             .is_ok_and(|status| status.entry(action.job_id()).is_some())
         {
             state.status_center_open = true;
-            state.refresh_undo_availability();
+            state.refresh_undo_availability(cx);
             cx.notify();
         }
     });
@@ -4424,7 +4424,7 @@ impl MusheenApp {
                         state.operation_status_revision = revision;
                         state.sync_operation_persistence_error();
                         if state.status_center_open {
-                            state.refresh_undo_availability();
+                            state.refresh_undo_availability(cx);
                         }
                         changed = true;
                     }
@@ -4438,9 +4438,7 @@ impl MusheenApp {
                             checked.elapsed() >= UNDO_AVAILABILITY_REFRESH_INTERVAL
                         })
                     {
-                        let previous = std::mem::take(&mut state.undo_available);
-                        state.refresh_undo_availability();
-                        changed |= state.undo_available != previous;
+                        state.refresh_undo_availability(cx);
                     }
                     if changed {
                         cx.notify();
@@ -6058,14 +6056,41 @@ impl MusheenApp {
         if targets.len() == 1 && self.open_volume_properties_target(&targets[0], cx) {
             return;
         }
+        // The capability probes run off the UI thread; the window opens when
+        // they answer.
+        let store = Arc::clone(&self.store);
+        let probed = targets.to_vec();
+        let work = cx.background_spawn(async move {
+            probed
+                .iter()
+                .map(|target| store.capabilities(target.path()))
+                .collect::<Vec<_>>()
+        });
+        let targets = targets.to_vec();
+        cx.spawn(async move |this, cx| {
+            let capabilities = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.open_properties_targets_with_capabilities(&targets, capabilities, page, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn open_properties_targets_with_capabilities(
+        &mut self,
+        targets: &[CommandTargetRef],
+        capabilities: Vec<musheen_core::CapabilityMatrix>,
+        page: PropertiesPage,
+        cx: &mut Context<Self>,
+    ) {
         let tag_targets = targets
             .iter()
-            .map(|target| {
-                (
-                    target.id().clone(),
-                    target.path().clone(),
-                    self.store.capabilities(target.path()),
-                )
+            .zip(capabilities)
+            .map(|(target, capabilities)| {
+                (target.id().clone(), target.path().clone(), capabilities)
             })
             .collect::<Vec<TagTarget>>();
         let provider_targets = targets
@@ -11337,27 +11362,39 @@ impl MusheenApp {
         target: &CommandTargetRef,
         cx: &mut Context<Self>,
     ) {
-        let result = if action == CommandAction::Pin {
-            let item = target.id().clone();
-            let path = target.path().clone();
-            let label = DisplayPath::from_store_path(target.path())
-                .as_str()
-                .to_owned();
-            self.catalog_binding.update(|document| {
-                let _ = document.pins_mut().pin(item, path, label);
-            })
-        } else {
-            let item = target.id().clone();
-            self.catalog_binding.update(|document| {
-                document.pins_mut().unpin(&item);
-            })
-        };
-        if let Err(error) = result {
-            self.operation_error = Some(error);
-        } else {
-            self.sync_catalog_projection();
-        }
-        cx.notify();
+        // The catalog file is locked and rewritten off the UI thread.
+        let binding = self.catalog_binding.clone();
+        let item = target.id().clone();
+        let path = target.path().clone();
+        let label = DisplayPath::from_store_path(target.path())
+            .as_str()
+            .to_owned();
+        let work = cx.background_spawn(async move {
+            if action == CommandAction::Pin {
+                binding.update(|document| {
+                    let _ = document.pins_mut().pin(item, path, label);
+                })
+            } else {
+                binding.update(|document| {
+                    document.pins_mut().unpin(&item);
+                })
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    state.operation_error = Some(error);
+                } else {
+                    state.sync_catalog_projection();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn dispatch_manage_tags(
@@ -16945,18 +16982,36 @@ impl MusheenApp {
             .unwrap_or_default()
     }
 
-    fn refresh_undo_availability(&mut self) {
-        self.undo_available = self
+    /// Recomputes which finished jobs can be undone, off the UI thread: the
+    /// checks stat the original locations and the trash records.
+    fn refresh_undo_availability(&mut self, cx: &mut Context<Self>) {
+        self.undo_availability_checked_at = Some(Instant::now());
+        let candidates = self
             .operation_status_entries()
             .into_iter()
-            .filter(|entry| {
-                entry.status() == OperationStatus::Completed
-                    && self.operation_hub.has_undo_candidate(entry.id())
-                    && self.operation_hub.can_undo(entry.id())
-            })
+            .filter(|entry| entry.status() == OperationStatus::Completed)
             .map(|entry| entry.id())
-            .collect();
-        self.undo_availability_checked_at = Some(Instant::now());
+            .collect::<Vec<_>>();
+        let hub = self.operation_hub.clone();
+        let work = cx.background_spawn(async move {
+            candidates
+                .into_iter()
+                .filter(|id| hub.has_undo_candidate(*id) && hub.can_undo(*id))
+                .collect::<HashSet<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let available = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if state.undo_available != available {
+                    state.undo_available = available;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn record_operation_control_error(
@@ -17005,7 +17060,7 @@ impl MusheenApp {
         if self.record_operation_control_error(result, cx) {
             self.pump_operation_queue(cx);
         }
-        self.refresh_undo_availability();
+        self.refresh_undo_availability(cx);
     }
 
     fn resume_recovery_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
@@ -17565,7 +17620,7 @@ impl Render for MusheenApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.status_center_open = !this.status_center_open;
                                 if this.status_center_open {
-                                    this.refresh_undo_availability();
+                                    this.refresh_undo_availability(cx);
                                 } else {
                                     this.undo_available.clear();
                                     this.undo_availability_checked_at = None;
