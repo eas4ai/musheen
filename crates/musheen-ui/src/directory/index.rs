@@ -4,7 +4,7 @@ use musheen_core::{DisplayPath, ItemId, ItemKind, StoreItem, StorePath};
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -229,6 +229,11 @@ pub(super) struct DiskDirectoryIndex {
     record_count: u64,
     order: Option<SortedOrder>,
     order_preferences: Option<ViewPreferences>,
+    /// The filter the visible order was built under.
+    order_filter: Option<DirectoryFilter>,
+    /// A merge failed after the orders stopped matching the records; the
+    /// next order change rebuilds instead of merging.
+    order_stale: bool,
     id_order: Option<SortedOrder>,
     /// Held for the life of the index; `lock` drops before `scratch` so the
     /// directory is removed after the lock is released.
@@ -381,10 +386,43 @@ impl IndexedSelection {
     }
 }
 
+#[derive(Clone)]
 struct SortEntry {
     item: StoreItem,
     arrival: u64,
     offset: u64,
+}
+
+/// One appended record a merge folds into the orders: an item's latest
+/// state with its arrival, or `None` for a tombstone.
+pub(super) struct IndexChange {
+    pub(super) id: ItemId,
+    pub(super) offset: u64,
+    pub(super) item: Option<(StoreItem, u64)>,
+}
+
+/// The edits one merge makes to an order file: old positions to drop and
+/// entries to insert before an old position (`len` appends).
+#[derive(Default)]
+struct OrderEdits {
+    removed: BTreeSet<usize>,
+    inserted: Vec<(usize, SortEntry)>,
+}
+
+impl OrderEdits {
+    fn remove(&mut self, position: usize) {
+        self.removed.insert(position);
+    }
+
+    fn insert(&mut self, slot: usize, entry: SortEntry) {
+        self.inserted.push((slot, entry));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OrderKind {
+    Identity,
+    Visible,
 }
 
 #[derive(Clone, Copy)]
@@ -427,6 +465,8 @@ impl DiskDirectoryIndex {
             record_count: 0,
             order: None,
             order_preferences: None,
+            order_filter: None,
+            order_stale: false,
             id_order: None,
             _lock: lock,
             scratch,
@@ -554,8 +594,196 @@ impl DiskDirectoryIndex {
         #[cfg(test)]
         ORDER_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.order_preferences = Some(preferences.clone());
+        self.order_filter = filter.cloned();
         self.id_order = Some(id_order);
+        self.order_stale = false;
         Ok(())
+    }
+
+    /// Folds appended records into the visible and identity orders in
+    /// place. Each id's old entry is found by binary search and both order
+    /// files are rewritten in one pass, so a batch costs its size times the
+    /// logarithm of the index, not the whole index. The orders are rebuilt
+    /// instead when they do not exist yet, were built under other
+    /// preferences or another filter, or an earlier merge failed part way.
+    pub(super) fn merge_changes(
+        &mut self,
+        changes: &[IndexChange],
+        preferences: &ViewPreferences,
+        filter: Option<&DirectoryFilter>,
+    ) -> io::Result<()> {
+        let mergeable = !self.order_stale
+            && self.order.is_some()
+            && self.id_order.is_some()
+            && self.order_preferences.as_ref() == Some(preferences)
+            && self.order_filter.as_ref() == filter;
+        if !mergeable {
+            return self.rebuild_order(preferences, filter);
+        }
+        // The latest record per id decides its final state.
+        let mut latest: BTreeMap<&ItemId, &IndexChange> = BTreeMap::new();
+        for change in changes {
+            latest.insert(&change.id, change);
+        }
+        let policy = OrderPolicy::Visible(preferences);
+        let mut id_edits = OrderEdits::default();
+        let mut visible_edits = OrderEdits::default();
+        for (id, change) in latest {
+            let old = self.id_order_position(id)?;
+            if let Some((position, entry)) = &old {
+                id_edits.remove(*position);
+                if let Some(visible_position) = self.visible_position_of(entry, policy)? {
+                    visible_edits.remove(visible_position);
+                }
+            }
+            if let Some((item, arrival)) = &change.item {
+                let entry = SortEntry {
+                    item: item.clone(),
+                    arrival: *arrival,
+                    offset: change.offset,
+                };
+                let id_slot = match &old {
+                    Some((position, _)) => *position,
+                    None => self.id_order_lower_bound(id)?,
+                };
+                if Self::is_visible(item, preferences, filter) {
+                    let slot = self.visible_lower_bound(&entry, policy)?;
+                    visible_edits.insert(slot, entry.clone());
+                }
+                id_edits.insert(id_slot, entry);
+            }
+        }
+        // Both orders change together; until they have, the records lead the
+        // orders and a failure leaves them for a rebuild.
+        self.order_stale = true;
+        let id_order = self.rewrite_order(OrderKind::Identity, id_edits, OrderPolicy::Identity)?;
+        let order = self.rewrite_order(OrderKind::Visible, visible_edits, policy)?;
+        self.id_order = Some(id_order);
+        self.order = Some(order);
+        #[cfg(test)]
+        ORDER_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.order_stale = false;
+        Ok(())
+    }
+
+    fn is_visible(
+        item: &StoreItem,
+        preferences: &ViewPreferences,
+        filter: Option<&DirectoryFilter>,
+    ) -> bool {
+        !((!preferences.show_hidden && item.display_name().as_str().starts_with('.'))
+            || filter.is_some_and(|filter| !filter.matches(item)))
+    }
+
+    /// Writes one order again with the edits applied, reading the old order
+    /// once from start to end and decoding no record.
+    fn rewrite_order(
+        &mut self,
+        kind: OrderKind,
+        mut edits: OrderEdits,
+        policy: OrderPolicy<'_>,
+    ) -> io::Result<SortedOrder> {
+        let order = match kind {
+            OrderKind::Identity => self.id_order.as_mut(),
+            OrderKind::Visible => self.order.as_mut(),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "directory order is not ready"))?;
+        edits.inserted.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| compare_entries(&left.1, &right.1, policy))
+        });
+        let old_len = order.len;
+        let mut output = NamedTempFile::new_in(self.scratch.path())?;
+        order.file.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(&mut order.file);
+        let mut inserts = edits.inserted.into_iter().peekable();
+        let mut len = 0usize;
+        for position in 0..old_len {
+            let offset = read_next_offset(&mut reader)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "directory order offset is missing",
+                )
+            })?;
+            while let Some((slot, _)) = inserts.peek()
+                && *slot == position
+            {
+                let (_, entry) = inserts.next().expect("the peeked insertion exists");
+                output.write_all(&entry.offset.to_le_bytes())?;
+                len += 1;
+            }
+            if edits.removed.contains(&position) {
+                continue;
+            }
+            output.write_all(&offset.to_le_bytes())?;
+            len += 1;
+        }
+        for (_, entry) in inserts {
+            output.write_all(&entry.offset.to_le_bytes())?;
+            len += 1;
+        }
+        output.flush()?;
+        let path = output.into_temp_path();
+        Ok(SortedOrder {
+            file: File::open(&path)?,
+            _path: path,
+            len,
+        })
+    }
+
+    /// The first position in the identity order whose id is not below `id`.
+    fn id_order_lower_bound(&mut self, id: &ItemId) -> io::Result<usize> {
+        let order = self.id_order.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "directory identity order is not ready",
+            )
+        })?;
+        lower_bound(order, &mut self.records, |candidate| {
+            candidate.item.id().cmp(id) == Ordering::Less
+        })
+    }
+
+    /// The position and entry of an id in the identity order.
+    fn id_order_position(&mut self, id: &ItemId) -> io::Result<Option<(usize, SortEntry)>> {
+        let position = self.id_order_lower_bound(id)?;
+        let order = self.id_order.as_mut().expect("the identity order exists");
+        if position == order.len {
+            return Ok(None);
+        }
+        let candidate = Self::order_entry_at(order, &mut self.records, position)?;
+        Ok((candidate.item.id() == id).then_some((position, candidate)))
+    }
+
+    /// The first position in the visible order that sorts at or after
+    /// `target`.
+    fn visible_lower_bound(
+        &mut self,
+        target: &SortEntry,
+        policy: OrderPolicy<'_>,
+    ) -> io::Result<usize> {
+        let order = self.order.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
+        })?;
+        lower_bound(order, &mut self.records, |candidate| {
+            compare_entries(candidate, target, policy) == Ordering::Less
+        })
+    }
+
+    /// The position of an entry in the visible order, when it is shown.
+    fn visible_position_of(
+        &mut self,
+        target: &SortEntry,
+        policy: OrderPolicy<'_>,
+    ) -> io::Result<Option<usize>> {
+        let position = self.visible_lower_bound(target, policy)?;
+        let order = self.order.as_mut().expect("the visible order exists");
+        if position == order.len {
+            return Ok(None);
+        }
+        let candidate = Self::order_entry_at(order, &mut self.records, position)?;
+        Ok((candidate.item.id() == target.item.id()).then_some(position))
     }
 
     fn deduplicate_id_order(&mut self, mut all_ids: SortedOrder) -> io::Result<SortedOrder> {
@@ -913,51 +1141,13 @@ impl DiskDirectoryIndex {
                 "directory order policy is not ready",
             )
         })?;
-        let order = self.order.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
-        })?;
-        let mut low = 0;
-        let mut high = order.len;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let candidate = Self::order_entry_at(order, &mut self.records, middle)?;
-            if compare_entries(&candidate, &target, OrderPolicy::Visible(preferences))
-                == Ordering::Less
-            {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        if low == order.len {
-            return Ok(None);
-        }
-        let candidate = Self::order_entry_at(order, &mut self.records, low)?;
-        Ok((candidate.item.id() == id).then_some(low))
+        let preferences = preferences.clone();
+        self.visible_position_of(&target, OrderPolicy::Visible(&preferences))
     }
 
     fn lookup_id_entry(&mut self, id: &ItemId) -> io::Result<Option<SortEntry>> {
-        let order = self.id_order.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "directory identity order is not ready",
-            )
-        })?;
-        let mut low = 0;
-        let mut high = order.len;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let candidate = Self::order_entry_at(order, &mut self.records, middle)?;
-            match candidate.item.id().cmp(id) {
-                Ordering::Less => low = middle + 1,
-                Ordering::Equal | Ordering::Greater => high = middle,
-            }
-        }
-        if low == order.len {
-            return Ok(None);
-        }
-        let candidate = Self::order_entry_at(order, &mut self.records, low)?;
-        Ok((candidate.item.id() == id).then_some(candidate))
+        self.id_order_position(id)
+            .map(|found| found.map(|(_, entry)| entry))
     }
 
     fn order_entry_at(
@@ -985,6 +1175,27 @@ impl DiskDirectoryIndex {
             offset,
         })
     }
+}
+
+/// The first position in `order` whose entry is not `less`; a binary search
+/// that decodes one record per step.
+fn lower_bound(
+    order: &mut SortedOrder,
+    records: &mut File,
+    less: impl Fn(&SortEntry) -> bool,
+) -> io::Result<usize> {
+    let mut low = 0;
+    let mut high = order.len;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let candidate = DiskDirectoryIndex::order_entry_at(order, records, middle)?;
+        if less(&candidate) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(low)
 }
 
 fn compare_entries(left: &SortEntry, right: &SortEntry, policy: OrderPolicy<'_>) -> Ordering {

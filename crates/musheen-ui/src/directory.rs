@@ -383,6 +383,7 @@ impl DirectoryIndexWatchWork {
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
         let mut removed = Vec::new();
         let mut selection_transitions = Vec::new();
+        let mut changes = Vec::with_capacity(self.events.len());
         for event in self.events {
             let arrival = index.record_count();
             let event_id = match &event {
@@ -401,11 +402,21 @@ impl DirectoryIndexWatchWork {
                 WatchEvent::Created(item)
                 | WatchEvent::Changed(item)
                 | WatchEvent::Renamed { item, .. } => {
-                    index.append(&item, arrival)?;
+                    let offset = index.append(&item, arrival)?;
+                    changes.push(index::IndexChange {
+                        id: item.id().clone(),
+                        offset,
+                        item: Some((item, arrival)),
+                    });
                     None
                 }
                 WatchEvent::Removed(id) => {
-                    index.append_tombstone(&id, arrival)?;
+                    let offset = index.append_tombstone(&id, arrival)?;
+                    changes.push(index::IndexChange {
+                        id: id.clone(),
+                        offset,
+                        item: None,
+                    });
                     Some(id)
                 }
                 WatchEvent::Invalidated { .. } => {
@@ -415,7 +426,6 @@ impl DirectoryIndexWatchWork {
                     ));
                 }
             };
-            index.rebuild_order(&self.preferences, self.filter.as_ref())?;
             if let Some(old) = previous_arrival {
                 selection_transitions.push((
                     old,
@@ -428,6 +438,8 @@ impl DirectoryIndexWatchWork {
             }
             removed.extend(removed_id);
         }
+        // One merge for the whole batch: the records lead, the orders follow.
+        index.merge_changes(&changes, &self.preferences, self.filter.as_ref())?;
         Ok(DirectoryIndexWatchResult {
             indexed_count: index.active_count().unwrap_or(0),
             visible_count: index.visible_count().unwrap_or(0),
@@ -1002,6 +1014,7 @@ impl DirectoryModel {
         }
         match result {
             Ok(result) => {
+                self.index_error = None;
                 if let Some(selection) = &mut self.indexed_selection {
                     for (old, new) in result.selection_transitions {
                         if let Err(error) = selection.carry_forward(old, new) {
