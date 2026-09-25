@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_to_local_move_refuses_source_without_conditional_delete() {
+    fn remote_to_local_move_refuses_source_without_conditional_delete_or_rename() {
         let settings = settings_with_remote_profile();
         let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         future::block_on(operator.write("download-move.txt", b"remote payload".to_vec())).unwrap();
@@ -1166,7 +1166,7 @@ mod tests {
             .unwrap()
             .execute_detailed()
             .unwrap_err();
-        assert!(failure.message().contains("conditional delete"));
+        assert!(failure.message().contains("guard removal"));
         assert!(!scratch.path().join("download-move.txt").exists());
         assert!(future::block_on(operator.exists("download-move.txt")).unwrap());
     }
@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn same_remote_move_refuses_source_without_conditional_delete() {
+    fn same_remote_move_refuses_source_without_conditional_delete_or_rename() {
         let settings = settings_with_remote_profile();
         let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
         future::block_on(operator.write("source.txt", b"keep source".to_vec())).unwrap();
@@ -1286,7 +1286,7 @@ mod tests {
             .execute_detailed()
             .unwrap_err();
 
-        assert!(failure.message().contains("conditional delete"));
+        assert!(failure.message().contains("guard removal"));
         assert_eq!(
             future::block_on(operator.read("source.txt"))
                 .unwrap()
@@ -1294,6 +1294,134 @@ mod tests {
             b"keep source"
         );
         assert!(!future::block_on(operator.exists("target/source.txt")).unwrap());
+    }
+
+    #[test]
+    fn live_sftp_to_local_move_waits_for_review_then_removes_source() {
+        if std::env::var_os("MUSHEEN_REMOTE_LIVE").is_none() {
+            return;
+        }
+
+        struct LiveCredentials;
+        impl musheen_desktop::remote::CredentialResolver for LiveCredentials {
+            fn resolve<'a>(
+                &'a self,
+                _reference: &'a musheen_desktop::CredentialReference,
+                _cancellation: CancellationToken,
+            ) -> musheen_core::BoxFuture<
+                'a,
+                Result<musheen_desktop::SecretBuffer, musheen_desktop::RemoteErrorCategory>,
+            > {
+                Box::pin(async { Ok(musheen_desktop::SecretBuffer::new(b"musheen-pass".to_vec())) })
+            }
+        }
+
+        let endpoint = std::env::var("MUSHEEN_LIVE_SFTP_ENDPOINT").unwrap();
+        let port = endpoint.rsplit_once(':').unwrap().1.parse().unwrap();
+        let pin = std::env::var("MUSHEEN_LIVE_SSH_SHA256").unwrap();
+        let mut fingerprint = [0_u8; 32];
+        for (index, pair) in pin.as_bytes().chunks_exact(2).enumerate() {
+            fingerprint[index] =
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        let id = ConnectionId::new("live-sftp-move").unwrap();
+        let profile = ConnectionProfile::new(
+            id.clone(),
+            "Live SFTP move",
+            RemoteProtocol::Sftp,
+            RemoteHost::new(RemoteProtocol::Sftp, "127.0.0.1").unwrap(),
+            Some(port),
+            "/srv/remote",
+            Some("musheen"),
+            Some(musheen_desktop::CredentialReference::persistent(id)),
+            SecurityPolicy::Ssh(musheen_desktop::HostKeyPolicy::PinnedSha256(fingerprint)),
+            None,
+        )
+        .unwrap();
+        let mut settings = SettingsDocument::default();
+        settings
+            .set_value(
+                "remote.connections",
+                &ConnectionProfiles::new(vec![profile]).export().unwrap(),
+            )
+            .unwrap();
+        let connector: RemoteStoreConnector = Arc::new(|provider, profile, cancellation| {
+            Box::pin(async move {
+                let store = musheen_desktop::sftp_store_from_profile(
+                    provider,
+                    &profile,
+                    &LiveCredentials,
+                    cancellation,
+                )
+                .await
+                .map_err(|error| StoreError::Backend(error.to_string().into()))?;
+                Ok(remote::RemoteStoreConnection::opendal(Arc::new(store)))
+            })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        let remote_root = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap()
+        .items()[0]
+            .path()
+            .clone();
+        future::block_on(runtime.store().read_directory(
+            &remote_root,
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let (provider, _) = remote_root.provider_key().unwrap();
+        let source =
+            StorePath::from_provider_key(provider.clone(), b"/fixtures/range.txt".to_vec())
+                .unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+        let job = queue
+            .submit_drop(
+                FileDragPayload::new(vec![source.clone()], DropAction::Move).unwrap(),
+                StorePath::from_unix_path(local.path()),
+            )
+            .unwrap()[0];
+        let outcome = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+        let LocalOperationOutcome::Transfer(musheen_local::TransferOutcome::MetadataReview {
+            review,
+            ..
+        }) = outcome
+        else {
+            panic!("SFTP move must request metadata review")
+        };
+        assert_eq!(
+            std::fs::read(local.path().join("range.txt")).unwrap(),
+            b"remote fixture payload\n"
+        );
+        assert!(runtime.store().resolve_item(&source).unwrap().is_some());
+        queue.finish_metadata_review(job, review).unwrap();
+        queue.confirm_metadata_loss(job).unwrap();
+        queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+        assert!(runtime.store().resolve_item(&source).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(local.path().join("range.txt")).unwrap(),
+            b"remote fixture payload\n"
+        );
     }
 
     #[test]

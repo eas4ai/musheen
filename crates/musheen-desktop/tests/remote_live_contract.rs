@@ -8,6 +8,7 @@ use musheen_desktop::remote::{
     sftp_store_from_profile, webdav_store_from_profile,
 };
 use musheen_desktop::{ConnectionId, CredentialReference, SecretBuffer};
+use musheen_ops::{EventGeneration, JobId, StagingPath};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -366,4 +367,168 @@ fn ftp_http_and_webdav_profiles_reach_live_services() {
         CancellationToken::new(),
     ))
     .expect("SFTP removes the replacement fixture");
+}
+
+#[test]
+fn reviewed_sftp_source_is_removed_after_quarantine_check() {
+    if !live_tests_enabled() {
+        return;
+    }
+
+    let profile = profile(
+        "sftp-cleanup",
+        RemoteProtocol::Sftp,
+        endpoint_port("MUSHEEN_LIVE_SFTP_ENDPOINT"),
+        "/srv/remote",
+        SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(decode_sha256(
+            "MUSHEEN_LIVE_SSH_SHA256",
+        ))),
+    );
+    let store = block_on(sftp_store_from_profile(
+        provider("sftp-cleanup"),
+        &profile,
+        &StaticCredentials,
+        CancellationToken::new(),
+    ))
+    .expect("the SFTP fixture connects");
+    assert!(store.supports_reviewed_source_removal());
+    let path = store
+        .path(&format!(
+            "/fixtures/reviewed-cleanup-{}",
+            std::process::id()
+        ))
+        .expect("the fixture path is valid");
+    let local = tempfile::tempdir().expect("the local fixture directory exists");
+    let payload = local.path().join("payload");
+    std::fs::write(&payload, FIXTURE_PREFIX).expect("the fixture payload is written");
+    let staging = StagingPath::for_slash_key_destination_with_nonce(
+        &path,
+        JobId::new(900).expect("the fixture job ID is valid"),
+        EventGeneration::new(0),
+        StagingPath::unique_nonce(),
+    )
+    .expect("the staging path is valid");
+    block_on(store.upload_staging_from_local(&payload, &staging, CancellationToken::new()))
+        .expect("the fixture payload is staged");
+    block_on(store.publish_staging_noreplace(&staging, &path, CancellationToken::new()))
+        .expect("the fixture source is published");
+    let identity = store
+        .resolve_item(&path)
+        .expect("the fixture resolves")
+        .expect("the fixture exists")
+        .id()
+        .clone();
+
+    block_on(store.delete_if_unchanged(&path, &identity, CancellationToken::new()))
+        .expect("the reviewed source is quarantined, checked, and removed");
+
+    assert!(
+        store
+            .resolve_item(&path)
+            .expect("the original path resolves")
+            .is_none()
+    );
+}
+
+#[test]
+fn reviewed_sftp_cleanup_keeps_source_on_identity_mismatch() {
+    if !live_tests_enabled() {
+        return;
+    }
+
+    let profile = profile(
+        "sftp-mismatch",
+        RemoteProtocol::Sftp,
+        endpoint_port("MUSHEEN_LIVE_SFTP_ENDPOINT"),
+        "/srv/remote",
+        SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(decode_sha256(
+            "MUSHEEN_LIVE_SSH_SHA256",
+        ))),
+    );
+    let store = block_on(sftp_store_from_profile(
+        provider("sftp-mismatch"),
+        &profile,
+        &StaticCredentials,
+        CancellationToken::new(),
+    ))
+    .expect("the SFTP fixture connects");
+    let source = store
+        .path(&format!("/fixtures/mismatch-{}", std::process::id()))
+        .expect("the source path is valid");
+    block_on(store.mutate(
+        MutationRequest::CreateFile {
+            path: source.clone(),
+        },
+        CancellationToken::new(),
+    ))
+    .expect("the source is created");
+    let unrelated = store
+        .resolve_item(&store.path(FIXTURE_PATH).expect("the fixture path is valid"))
+        .expect("the fixture resolves")
+        .expect("the fixture exists");
+
+    let error =
+        block_on(store.delete_if_unchanged(&source, unrelated.id(), CancellationToken::new()))
+            .expect_err("a different reviewed identity cannot be deleted");
+
+    assert_eq!(
+        error.category(),
+        musheen_desktop::remote::RemoteErrorCategory::Conflict
+    );
+    assert!(error.recovery_path().is_none());
+    assert!(
+        store
+            .resolve_item(&source)
+            .expect("the source resolves")
+            .is_some()
+    );
+}
+
+#[test]
+fn reviewed_webdav_source_is_removed_after_quarantine_check() {
+    if !live_tests_enabled() {
+        return;
+    }
+
+    let profile = profile(
+        "webdav-cleanup",
+        RemoteProtocol::WebDav,
+        endpoint_port("MUSHEEN_LIVE_WEBDAV_URL"),
+        "/",
+        SecurityPolicy::Tls(TlsPolicy::PinnedSha256(decode_sha256(
+            "MUSHEEN_LIVE_TLS_SHA256",
+        ))),
+    );
+    let store = block_on(webdav_store_from_profile(
+        provider("webdav-cleanup"),
+        &profile,
+        &StaticCredentials,
+        CancellationToken::new(),
+    ))
+    .expect("the WebDAV fixture connects");
+    assert!(store.supports_reviewed_source_removal());
+    let path = store
+        .path(&format!("/fixtures/webdav-cleanup-{}", std::process::id()))
+        .expect("the fixture path is valid");
+    block_on(store.mutate(
+        MutationRequest::CreateFile { path: path.clone() },
+        CancellationToken::new(),
+    ))
+    .expect("the fixture source is created");
+    let identity = store
+        .resolve_item(&path)
+        .expect("the fixture resolves")
+        .expect("the fixture exists")
+        .id()
+        .clone();
+
+    block_on(store.delete_if_unchanged(&path, &identity, CancellationToken::new()))
+        .expect("the WebDAV source is quarantined, checked, and removed");
+
+    assert!(
+        store
+            .resolve_item(&path)
+            .expect("the original path resolves")
+            .is_none()
+    );
 }

@@ -34,6 +34,7 @@ struct MetadataReviewStrings {
     to: SharedString,
     not_preserved: SharedString,
     question: SharedString,
+    non_atomic_source_removal: SharedString,
     keep_both: SharedString,
     remove_anyway: SharedString,
     keep_source: SharedString,
@@ -62,6 +63,7 @@ impl MetadataReviewStrings {
             to: message("metadata-review-to"),
             not_preserved: message("metadata-review-not-preserved"),
             question: message("metadata-review-question"),
+            non_atomic_source_removal: message("metadata-review-non-atomic-source-removal"),
             keep_both: message("metadata-review-keep-both"),
             remove_anyway: message("metadata-review-remove-anyway"),
             keep_source: message("metadata-review-keep-source"),
@@ -127,7 +129,7 @@ impl MetadataReviewDialogModel {
             })
             .collect::<Vec<_>>()
             .join(self.strings.list_separator);
-        format!(
+        let mut warning = format!(
             "{} {} {} {}, {}: {skipped}. {}",
             self.strings.copied.as_ref(),
             DisplayPath::from_store_path(&self.source).as_str(),
@@ -135,7 +137,12 @@ impl MetadataReviewDialogModel {
             DisplayPath::from_store_path(&self.destination).as_str(),
             self.strings.not_preserved.as_ref(),
             self.strings.question.as_ref(),
-        )
+        );
+        if self.source.provider_key().is_some() {
+            warning.push(' ');
+            warning.push_str(self.strings.non_atomic_source_removal.as_ref());
+        }
+        warning
     }
 }
 

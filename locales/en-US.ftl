@@ -685,6 +685,7 @@ metadata-review-copied = Musheen copied
 metadata-review-to = to
 metadata-review-not-preserved = but could not preserve
 metadata-review-question = Keep both copies, or remove the source anyway?
+metadata-review-non-atomic-source-removal = This service cannot guarantee an atomic source delete. Musheen checks a hidden recovery copy before removal, but another writer could race the final delete.
 metadata-review-keep-both = Keep both copies
 metadata-review-remove-anyway = Remove source anyway
 metadata-review-keep-source = Keep source

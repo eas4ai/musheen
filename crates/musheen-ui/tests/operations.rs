@@ -1,4 +1,4 @@
-use musheen_core::{ResourceLimits, StorePath};
+use musheen_core::{ProviderId, ResourceLimits, StorePath};
 use musheen_desktop::StatusStore;
 use musheen_ops::{
     ApplyScope, ConflictChoice, ConflictItemKind, ConflictRecord, EventGeneration, JobId,
@@ -142,6 +142,24 @@ fn metadata_review_defaults_to_keeping_the_source_and_names_every_loss() {
 
     model.select(MetadataReviewChoice::RemoveSource);
     assert_eq!(model.choice(), MetadataReviewChoice::RemoveSource);
+}
+
+#[test]
+fn metadata_review_warns_when_remote_cleanup_is_not_atomic() {
+    let provider = ProviderId::new("remote-test").unwrap();
+    let model = MetadataReviewDialogModel::new(
+        StorePath::from_provider_key(provider, b"/source".to_vec()).unwrap(),
+        StorePath::from_unix_path("/destination"),
+        MetadataReport::with_skipped([MetadataKind::Ownership]),
+        &musheen_ui::Catalog::load(musheen_ui::Locale::EnUs).unwrap(),
+    );
+
+    assert!(
+        model
+            .warning()
+            .contains("cannot guarantee an atomic source delete")
+    );
+    assert_eq!(model.choice(), MetadataReviewChoice::KeepSource);
 }
 
 #[test]

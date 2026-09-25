@@ -514,6 +514,7 @@ metadata-review-copied = نسخ موشين
 metadata-review-to = إلى
 metadata-review-not-preserved = لكن تعذّر الاحتفاظ بما يلي
 metadata-review-question = احتفظ بالنسختين أم أزل المصدر على أي حال؟
+metadata-review-non-atomic-source-removal = لا تضمن هذه الخدمة حذف المصدر ذريًا. يتحقق موشين من نسخة استرداد مخفية قبل إزالتها، لكن قد يغيّرها برنامج آخر أثناء الحذف الأخير.
 metadata-review-keep-both = الاحتفاظ بالنسختين
 metadata-review-remove-anyway = إزالة المصدر على أي حال
 metadata-review-keep-source = الاحتفاظ بالمصدر

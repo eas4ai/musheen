@@ -685,6 +685,7 @@ metadata-review-copied = ⟦Müšħëëñ çöþïëð··⟧
 metadata-review-to = ⟦ţö··⟧
 metadata-review-not-preserved = ⟦ɓüţ çöüŀð ñöţ þŕëšëŕṽë··⟧
 metadata-review-question = ⟦Ķëëþ ɓöţħ çöþïëš, öŕ ŕëɱöṽë ţħë šöüŕçë åñÿẅåÿ?··⟧
+metadata-review-non-atomic-source-removal = ⟦Ţħïš šëŕṽïçë çåññöţ ģüåŕåñţëë åñ åţöɱïç šöüŕçë ðëŀëţë. Müşħëëñ çħëçķš å ħïððëñ ŕëçöṽëŕÿ çöþÿ ɓëƒöŕë ŕëɱöṽåŀ, ɓüţ åñöţħëŕ ẅŕïţëŕ çöüŀð ŕåçë ţħë ƒïñåŀ ðëŀëţë.··⟧
 metadata-review-keep-both = ⟦Ķëëþ ɓöţħ çöþïëš··⟧
 metadata-review-remove-anyway = ⟦Ŕëɱöṽë šöüŕçë åñÿẅåÿ··⟧
 metadata-review-keep-source = ⟦Ķëëþ šöüŕçë··⟧

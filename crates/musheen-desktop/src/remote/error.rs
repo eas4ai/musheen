@@ -1,4 +1,5 @@
 use super::{RemoteHost, RemoteProtocol};
+use musheen_core::StorePath;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +30,7 @@ pub struct RemoteError {
     protocol: RemoteProtocol,
     category: RemoteErrorCategory,
     host: Option<RemoteHost>,
+    recovery_path: Option<StorePath>,
 }
 
 impl RemoteError {
@@ -42,7 +44,19 @@ impl RemoteError {
             protocol,
             category,
             host,
+            recovery_path: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_recovery_path(mut self, path: StorePath) -> Self {
+        self.recovery_path = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn recovery_path(&self) -> Option<&StorePath> {
+        self.recovery_path.as_ref()
     }
 
     #[must_use]
@@ -68,6 +82,7 @@ impl fmt::Debug for RemoteError {
             .field("protocol", &self.protocol)
             .field("category", &self.category)
             .field("host", &self.host)
+            .field("recovery_path_present", &self.recovery_path.is_some())
             .finish()
     }
 }

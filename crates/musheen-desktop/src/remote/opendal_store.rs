@@ -22,6 +22,7 @@ use musheen_ops::StagingPath;
 use opendal::{Entry, Error, ErrorKind, Lister, Metadata, Operator};
 use opendal::{HttpTransporter, OperationContext};
 use opendal_http_transport_reqwest::ReqwestTransport;
+use ring::rand::SecureRandom;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -346,8 +347,20 @@ impl OpendalStore {
             && self.operator.info().capability().delete_with_if_match
     }
 
-    /// Removes a source only if its current object identity still matches the
-    /// reviewed item. The final delete uses the server's atomic ETag condition.
+    #[must_use]
+    pub fn supports_reviewed_source_removal(&self) -> bool {
+        let native = self.operator.info().capability();
+        self.supports_conditional_delete()
+            || (self.mutation_policy == RemoteMutationPolicy::CapabilitiesVerified
+                && native.rename
+                && native.delete
+                && native.read
+                && native.stat)
+    }
+
+    /// Removes a reviewed source with an atomic ETag condition when available.
+    /// Otherwise, moves it to an app-owned sibling, checks its bytes, and only
+    /// then deletes that sibling. A failed cleanup reports its recovery path.
     pub fn delete_if_unchanged<'a>(
         &'a self,
         path: &'a StorePath,
@@ -355,7 +368,8 @@ impl OpendalStore {
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<(), RemoteError>> {
         let remote_path = self.remote_path(path);
-        let supported = self.supports_conditional_delete();
+        let conditional = self.supports_conditional_delete();
+        let supported = self.supports_reviewed_source_removal();
         let expected = expected.clone();
         let provider = self.provider.clone();
         let operator = self.operator.clone();
@@ -371,6 +385,18 @@ impl OpendalStore {
             }
             let remote_path =
                 remote_path.map_err(|category| RemoteError::new(protocol, category, None))?;
+            if !conditional {
+                return quarantine_delete_if_unchanged(
+                    operator,
+                    pool,
+                    provider,
+                    protocol,
+                    remote_path,
+                    expected,
+                    cancellation,
+                )
+                .await;
+            }
             run_pooled_stream(
                 operator,
                 pool,
@@ -1090,6 +1116,169 @@ where
         .await
         .map_err(|category| RemoteError::new(protocol, category, None))?
         .map_err(|category| RemoteError::new(protocol, category, None))
+}
+
+async fn quarantine_delete_if_unchanged(
+    operator: Operator,
+    pool: Option<ProviderPool<OperatorConnector>>,
+    provider: ProviderId,
+    protocol: RemoteProtocol,
+    remote_path: String,
+    expected: ItemId,
+    cancellation: CancellationToken,
+) -> Result<(), RemoteError> {
+    let (quarantine, recovery_path) = quarantine_sibling(&provider, protocol, &remote_path)?;
+    let preflight_path = remote_path.clone();
+    let preflight_provider = provider.clone();
+    let preflight_expected = expected.clone();
+    let (size, digest) = run_pooled_stream(
+        operator.clone(),
+        pool.clone(),
+        protocol,
+        cancellation.clone(),
+        move |operator| async move {
+            source_digest_if_unchanged(
+                &operator,
+                &preflight_provider,
+                &preflight_path,
+                &preflight_expected,
+            )
+            .await
+        },
+    )
+    .await?;
+    run_pooled_stream(
+        operator,
+        pool,
+        protocol,
+        cancellation,
+        move |operator| async move {
+            let current = remote_stat(&operator, &remote_path).await?;
+            let identity = remote_item_identity(&provider, &remote_path, &current)
+                .map_err(|_| RemoteErrorCategory::Permanent)?;
+            if identity != expected {
+                return Err(RemoteErrorCategory::Conflict);
+            }
+            ensure_remote_absent(&operator, &quarantine).await?;
+            tokio::time::timeout(
+                TRANSFER_IDLE_TIMEOUT,
+                operator.rename(&remote_path, &quarantine),
+            )
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+            verify_quarantine_and_delete(&operator, &quarantine, size, digest).await
+        },
+    )
+    .await
+    .map_err(|error| error.with_recovery_path(recovery_path))
+}
+
+fn quarantine_sibling(
+    provider: &ProviderId,
+    protocol: RemoteProtocol,
+    remote_path: &str,
+) -> Result<(String, StorePath), RemoteError> {
+    let mut nonce_bytes = [0_u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| RemoteError::new(protocol, RemoteErrorCategory::Unavailable, None))?;
+    let nonce = u128::from_be_bytes(nonce_bytes);
+    let name = format!(".musheen-quarantine-v1-{nonce:032x}");
+    let quarantine = remote_path
+        .rsplit_once('/')
+        .map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"));
+    let recovery_path =
+        StorePath::from_provider_key(provider.clone(), format!("/{quarantine}").into_bytes())
+            .map_err(|_| RemoteError::new(protocol, RemoteErrorCategory::Permanent, None))?;
+    Ok((quarantine, recovery_path))
+}
+
+async fn source_digest_if_unchanged(
+    operator: &Operator,
+    provider: &ProviderId,
+    path: &str,
+    expected: &ItemId,
+) -> Result<(u64, [u8; 32]), RemoteErrorCategory> {
+    let before = remote_stat(operator, path).await?;
+    if remote_item_identity(provider, path, &before).map_err(|_| RemoteErrorCategory::Permanent)?
+        != *expected
+    {
+        return Err(RemoteErrorCategory::Conflict);
+    }
+    let size = before.content_length();
+    let digest = remote_digest(operator, path, size).await?;
+    let after = remote_stat(operator, path).await?;
+    if remote_item_identity(provider, path, &after).map_err(|_| RemoteErrorCategory::Permanent)?
+        != *expected
+    {
+        return Err(RemoteErrorCategory::Conflict);
+    }
+    Ok((size, digest))
+}
+
+async fn ensure_remote_absent(operator: &Operator, path: &str) -> Result<(), RemoteErrorCategory> {
+    match tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(path)).await {
+        Ok(Ok(_)) => Err(RemoteErrorCategory::Conflict),
+        Ok(Err(error)) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(Err(error)) => Err(classify_opendal_error(&error, RemoteErrorContext::Read)),
+        Err(_) => Err(RemoteErrorCategory::Timeout),
+    }
+}
+
+async fn verify_quarantine_and_delete(
+    operator: &Operator,
+    quarantine: &str,
+    size: u64,
+    digest: [u8; 32],
+) -> Result<(), RemoteErrorCategory> {
+    let quarantined = remote_stat(operator, quarantine).await?;
+    if quarantined.content_length() != size
+        || remote_digest(operator, quarantine, size).await? != digest
+    {
+        return Err(RemoteErrorCategory::Conflict);
+    }
+    let unchanged = remote_stat(operator, quarantine).await?;
+    if unchanged.content_length() != size {
+        return Err(RemoteErrorCategory::Conflict);
+    }
+    tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.delete(quarantine))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))
+}
+
+async fn remote_stat(operator: &Operator, path: &str) -> Result<Metadata, RemoteErrorCategory> {
+    tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(path))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))
+}
+
+async fn remote_digest(
+    operator: &Operator,
+    path: &str,
+    size: u64,
+) -> Result<[u8; 32], RemoteErrorCategory> {
+    let reader = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.reader(path))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+    let mut digest = Sha256::new();
+    let mut offset = 0_u64;
+    while offset < size {
+        let end = offset.saturating_add(TRANSFER_CHUNK_BYTES as u64).min(size);
+        let chunk = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, reader.read(offset..end))
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+        if chunk.len() as u64 != end - offset {
+            return Err(RemoteErrorCategory::Protocol);
+        }
+        digest.update(chunk.to_vec());
+        offset = end;
+    }
+    Ok(digest.finalize().into())
 }
 
 async fn upload_staging(

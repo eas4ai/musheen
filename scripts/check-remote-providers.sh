@@ -65,17 +65,18 @@ ssh_sha256=$(
 )
 
 cd "$repository"
-MUSHEEN_LIVE_HTTP_URL=http://127.0.0.1:38080/ \
-MUSHEEN_LIVE_WEBDAV_URL=https://127.0.0.1:38443/ \
-MUSHEEN_LIVE_FTP_ENDPOINT=ftp://127.0.0.1:32121 \
-MUSHEEN_LIVE_FTPS_ENDPOINT=ftps://127.0.0.1:32990 \
-MUSHEEN_LIVE_SFTP_ENDPOINT=ssh://127.0.0.1:32222 \
-MUSHEEN_LIVE_USERNAME=musheen \
-MUSHEEN_LIVE_PASSWORD=musheen-pass \
-MUSHEEN_LIVE_TLS_SHA256="$tls_sha256" \
-MUSHEEN_LIVE_SSH_SHA256="$ssh_sha256" \
-MUSHEEN_REMOTE_CONTAINER="$container" \
-MUSHEEN_REMOTE_LIVE=1 \
-SSL_CERT_FILE="$certificate_file" \
-CARGO_BUILD_JOBS=1 \
+export MUSHEEN_LIVE_HTTP_URL=http://127.0.0.1:38080/
+export MUSHEEN_LIVE_WEBDAV_URL=https://127.0.0.1:38443/
+export MUSHEEN_LIVE_FTP_ENDPOINT=ftp://127.0.0.1:32121
+export MUSHEEN_LIVE_FTPS_ENDPOINT=ftps://127.0.0.1:32990
+export MUSHEEN_LIVE_SFTP_ENDPOINT=ssh://127.0.0.1:32222
+export MUSHEEN_LIVE_USERNAME=musheen
+export MUSHEEN_LIVE_PASSWORD=musheen-pass
+export MUSHEEN_LIVE_TLS_SHA256="$tls_sha256"
+export MUSHEEN_LIVE_SSH_SHA256="$ssh_sha256"
+export MUSHEEN_REMOTE_CONTAINER="$container"
+export MUSHEEN_REMOTE_LIVE=1
+export SSL_CERT_FILE="$certificate_file"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}"
 cargo test -p musheen-desktop --test remote_live_contract --locked -- --nocapture
+cargo test -p musheen-ui --lib live_sftp_to_local_move_waits_for_review_then_removes_source --locked -- --nocapture

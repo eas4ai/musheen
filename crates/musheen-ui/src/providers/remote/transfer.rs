@@ -394,9 +394,9 @@ impl RemoteDownloadRoute {
                 "remote download currently requires a regular file",
             ));
         }
-        if execution.action() == DropAction::Move && !remote.supports_conditional_delete() {
+        if execution.action() == DropAction::Move && !remote.supports_reviewed_source_removal() {
             return Err(LocalOperationFailure::failed(
-                "the remote service cannot conditional delete a reviewed source",
+                "the remote service cannot guard removal of a reviewed source",
             ));
         }
         if execution
@@ -594,12 +594,26 @@ impl RemoteDownloadRoute {
         remote
             .delete_if_unchanged(review.source(), source_identity, cancellation)
             .await
-            .map_err(|error| LocalOperationFailure::needs_attention(format!(
-                "the destination was published but remote source removal needs inspection: {error}"
-            )))?;
+            .map_err(source_cleanup_failure)?;
         CommandTargetRef::new(destination.id().clone(), destination.path().clone())
             .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))
     }
+}
+
+pub(super) fn source_cleanup_failure(error: musheen_desktop::RemoteError) -> LocalOperationFailure {
+    let recovery = error
+        .recovery_path()
+        .and_then(StorePath::provider_key)
+        .map(|(_, key)| {
+            format!(
+                "; inspect the source and quarantine at {}",
+                String::from_utf8_lossy(key)
+            )
+        })
+        .unwrap_or_default();
+    LocalOperationFailure::needs_attention(format!(
+        "the destination was published but remote source removal needs inspection: {error}{recovery}"
+    ))
 }
 
 impl fmt::Debug for RemoteDownloadRoute {
