@@ -17973,7 +17973,7 @@ mod tests {
                 .0
                 .borrow()
                 .base_handle
-                .set_offset(point(px(0.), -(pitch * 10.) - px(5.)));
+                .set_offset(point(px(0.), -(pitch * 10.) - pitch / 2.));
         });
         let (surface, row_12, row_13) = cx
             .update_window(browser, |_, window, cx| {
@@ -17986,9 +17986,12 @@ mod tests {
             })
             .unwrap();
         // Start in the margin left of the rows so no row consumes the press.
+        // Both edges sit just inside the top of their rows. The list is
+        // scrolled by half a row, so a mapping that drops the partial-row
+        // remainder would pick rows 11 and 12 instead.
         let margin = surface.left() + (row_12.left() - surface.left()) / 2.;
-        let start = point(margin, row_12.center().y);
-        let end = point(surface.left() + px(200.), row_13.center().y);
+        let start = point(margin, row_12.top() + px(2.));
+        let end = point(surface.left() + px(200.), row_13.top() + px(2.));
 
         let mut visual = VisualTestContext::from_window(browser, cx);
         visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
