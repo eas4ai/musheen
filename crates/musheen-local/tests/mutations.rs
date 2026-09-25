@@ -7,7 +7,7 @@ use musheen_ops::{
     MetadataPlan, MetadataScope, MutationError, MutationProvider, OperationKind,
     PermanentDeleteRequest, RenameMapping, RenameRequest, SymbolicLinkRequest, execute_create,
     execute_delete, execute_hard_link, execute_permanent_delete, execute_rename,
-    execute_symbolic_link,
+    execute_restore, execute_symbolic_link,
 };
 use posix_acl::{ACL_READ, PosixACL, Qualifier};
 use std::ffi::OsString;
@@ -595,4 +595,114 @@ fn parent_symlink_swap_cannot_redirect_a_rename_even_for_the_same_inode() {
     );
     assert!(first.exists());
     assert!(second.exists());
+}
+
+#[test]
+fn local_trash_restore_returns_a_link_to_a_directory() {
+    if std::env::var_os("MUSHEEN_TRASH_LINK_HELPER").is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());
+        let target = root.join("target-directory");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside"), b"stays").unwrap();
+        let link = root.join("trashed-link");
+        symlink(&target, &link).unwrap();
+        let link_path = StorePath::from_unix_path(link.clone().into_os_string());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &link_path)
+            .unwrap()
+            .unwrap();
+        let outcome = execute_delete(
+            &mut store,
+            vec![DeleteTarget::new(link_path, identity.to_vec())],
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        let receipt = &outcome.trashed()[0];
+
+        execute_restore(&mut store, receipt).expect("a trashed link to a directory restores");
+
+        let restored =
+            fs::symlink_metadata(&link).expect("the link is back at its original path");
+        assert!(
+            restored.file_type().is_symlink(),
+            "the restored entry is the link, not a directory"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read(target.join("inside")).unwrap(), b"stays");
+        assert!(
+            store
+                .list_trash()
+                .unwrap()
+                .iter()
+                .all(|item| item.receipt() != receipt)
+        );
+        return;
+    }
+
+    let root = tempdir().unwrap();
+    let xdg_data = root.path().join("xdg-data");
+    fs::create_dir(&xdg_data).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("local_trash_restore_returns_a_link_to_a_directory")
+        .arg("--nocapture")
+        .env("MUSHEEN_TRASH_LINK_HELPER", "1")
+        .env("MUSHEEN_TRASH_ROOT", root.path())
+        .env("XDG_DATA_HOME", xdg_data)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn local_trash_listing_survives_an_orphaned_info_file() {
+    if std::env::var_os("MUSHEEN_TRASH_ORPHAN_HELPER").is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());
+        let path = root.join("kept");
+        fs::write(&path, b"kept").unwrap();
+        let store_path = StorePath::from_unix_path(path.into_os_string());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &store_path)
+            .unwrap()
+            .unwrap();
+        let outcome = execute_delete(
+            &mut store,
+            vec![DeleteTarget::new(store_path, identity.to_vec())],
+        )
+        .unwrap();
+        let receipt = &outcome.trashed()[0];
+        let orphan = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
+            .join("Trash")
+            .join("info")
+            .join("orphan.trashinfo");
+        fs::write(
+            &orphan,
+            format!(
+                "[Trash Info]\nPath={}\nDeletionDate=2026-09-25T08:00:00\n",
+                root.join("orphan").display()
+            ),
+        )
+        .unwrap();
+
+        let listed = store
+            .list_trash()
+            .expect("one info file without a payload never hides the other entries");
+
+        assert!(listed.iter().any(|item| item.receipt() == receipt));
+        return;
+    }
+
+    let root = tempdir().unwrap();
+    let xdg_data = root.path().join("xdg-data");
+    fs::create_dir(&xdg_data).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("local_trash_listing_survives_an_orphaned_info_file")
+        .arg("--nocapture")
+        .env("MUSHEEN_TRASH_ORPHAN_HELPER", "1")
+        .env("MUSHEEN_TRASH_ROOT", root.path())
+        .env("XDG_DATA_HOME", xdg_data)
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
