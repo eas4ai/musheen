@@ -8994,22 +8994,8 @@ impl MusheenApp {
             }
             _ => unreachable!("the caller accepts only target-based commands"),
         };
-        if matches!(
-            action,
-            CommandAction::Open
-                | CommandAction::OpenInNewTab
-                | CommandAction::OpenInNewWindow
-                | CommandAction::OpenInOtherPane
-        ) && targets.len() == 1
-            && origin_tab
-                .and_then(|tab| self.directories.get(&tab))
-                .and_then(|directory| directory.view().item(targets[0].id()))
-                .is_some_and(|item| {
-                    item.path() == targets[0].path() && item.kind() == ItemKind::Directory
-                })
-        {
-            let location = targets[0].path().clone();
-            match action {
+        if let Some(location) = self.single_directory_target(origin_tab, targets) {
+            let handled = match action {
                 CommandAction::Open => {
                     if let Some(tab_id) = origin_tab
                         && self.navigation.focused_tab().id() != tab_id
@@ -9017,15 +9003,18 @@ impl MusheenApp {
                         self.activate_tab(tab_id, cx);
                     }
                     self.navigate(location, true, cx);
+                    true
                 }
                 CommandAction::OpenInNewTab => {
                     if let Ok(tab_id) = self.navigation.new_tab(location.clone()) {
                         self.start_load_for_tab(tab_id, location, cx);
                         self.schedule_session_save(cx);
                     }
+                    true
                 }
                 CommandAction::OpenInNewWindow => {
                     self.open_new_browser_window(location, cx);
+                    true
                 }
                 CommandAction::OpenInOtherPane => {
                     let current = self.navigation.focused_pane_id();
@@ -9040,10 +9029,13 @@ impl MusheenApp {
                         let _ = self.navigation.focus_pane(pane);
                         self.navigate(location, true, cx);
                     }
+                    true
                 }
-                _ => unreachable!(),
+                _ => false,
+            };
+            if handled {
+                return;
             }
-            return;
         }
         if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
             self.operation_error = Some(error);
@@ -9129,8 +9121,61 @@ impl MusheenApp {
                 );
                 cx.notify();
             }
-            _ => unreachable!("the caller pairs each local command with typed parameters"),
+            (
+                CommandAction::OpenInNewTab | CommandAction::OpenInOtherPane,
+                CommandParameters::Targets(_),
+            ) => {
+                // The target exists but is not a directory, so there is
+                // nothing to open a tab or pane on.
+                self.operation_error = Some(
+                    self.catalog
+                        .message("context.directory-only")
+                        .expect("directory-only refusal is localized")
+                        .into(),
+                );
+                cx.notify();
+            }
+            _ => {
+                // The caller pairs each local command with typed parameters.
+                // A mismatch is a programming error; refuse it visibly
+                // instead of aborting the application.
+                self.operation_error = Some(
+                    self.catalog
+                        .message("context.command-mismatch")
+                        .expect("command mismatch refusal is localized")
+                        .into(),
+                );
+                cx.notify();
+            }
         }
+    }
+
+    /// The one directory a single-target open command points at, whether it
+    /// is a resident item of the origin tab (a content row) or a location the
+    /// store resolves directly (a sidebar entry). The stable identity must
+    /// match in both cases.
+    fn single_directory_target(
+        &self,
+        origin_tab: Option<TabId>,
+        targets: &[CommandTargetRef],
+    ) -> Option<StorePath> {
+        let [target] = targets else {
+            return None;
+        };
+        let resident = origin_tab
+            .and_then(|tab| self.directories.get(&tab))
+            .and_then(|directory| directory.view().item(target.id()))
+            .map(|item| item.path() == target.path() && item.kind() == ItemKind::Directory);
+        let is_directory = match resident {
+            Some(resident) => resident,
+            None => self
+                .store
+                .resolve_item(target.path())
+                .ok()
+                .flatten()
+                .is_some_and(|item| item.id() == target.id() && item.kind() == ItemKind::Directory),
+        };
+        is_directory.then(|| target.path().clone())
     }
 
     fn launch_external_terminal(&mut self, location: StorePath, cx: &mut Context<Self>) {
