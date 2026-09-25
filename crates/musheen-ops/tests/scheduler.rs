@@ -387,3 +387,30 @@ fn pause_resume_cancel_retry_and_restart_states_are_explicit() {
     scheduler.retry(interrupted).unwrap();
     assert_eq!(scheduler.state(interrupted), Some(JobState::Queued));
 }
+
+#[test]
+fn scheduler_bound_caps_the_event_history_at_4096() {
+    let limits = ResourceLimits::default();
+    let scheduler = Scheduler::new(&limits);
+    let provider = provider("bounded", ProviderLimits::unbounded());
+    let total = 3_000;
+    for index in 0..total {
+        scheduler
+            .enqueue(plan(index, OperationKind::CreateFile, provider.clone()))
+            .unwrap();
+    }
+    let mut completed = 0;
+    while completed < total {
+        let started = scheduler.start_ready().unwrap();
+        assert!(!started.is_empty(), "queued jobs keep starting");
+        for job in started {
+            scheduler.complete(job.id()).unwrap();
+            completed += 1;
+        }
+    }
+    let events = scheduler.events().len();
+    assert!(
+        events <= 4_096,
+        "the scheduler holds {events} events after {total} finished jobs"
+    );
+}

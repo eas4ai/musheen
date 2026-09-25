@@ -993,3 +993,52 @@ fn parse_operation_kind(value: &str) -> Result<OperationKind, StatusCenterError>
         other => Err(StatusCenterError::UnknownOperationKind(other.into())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(number: u64) -> JobId {
+        JobId::new(number).unwrap()
+    }
+
+    #[test]
+    fn status_history_retains_at_most_500_finished_entries_and_every_unfinished_one() {
+        let mut model = StatusCenterModel::default();
+        for number in 1..=600 {
+            model
+                .register(
+                    job(number),
+                    EventGeneration::new(0),
+                    OperationKind::Copy,
+                    StorePath::from_unix_path(format!("/work/{number}")),
+                    Some(1),
+                )
+                .unwrap();
+            if number > 10 {
+                model.mark_running(job(number)).unwrap();
+                model.complete(job(number)).unwrap();
+            }
+        }
+
+        let finished = model
+            .history()
+            .iter()
+            .filter(|entry| entry.status() == OperationStatus::Completed)
+            .count();
+        assert!(finished <= 500, "{finished} finished entries are retained");
+        for number in 1..=10 {
+            assert_eq!(
+                model.entry(job(number)).map(OperationStatusEntry::status),
+                Some(OperationStatus::Pending),
+                "pending job {number} is kept"
+            );
+        }
+        let restored = StatusCenterModel::from_json(&model.to_json().unwrap()).unwrap();
+        assert!(
+            restored.history().len() <= 510,
+            "the persisted document holds {} entries",
+            restored.history().len()
+        );
+    }
+}

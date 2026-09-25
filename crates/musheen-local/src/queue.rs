@@ -1545,6 +1545,12 @@ impl LocalOperationQueue {
         self.scheduler.state(id)
     }
 
+    /// The jobs the scheduler still holds a record for.
+    #[must_use]
+    pub fn scheduler_record_count(&self) -> usize {
+        self.scheduler.record_count()
+    }
+
     #[must_use]
     pub fn job_count(&self) -> usize {
         self.operations
@@ -2959,5 +2965,71 @@ mod tests {
             Some((id, EventGeneration::new(0), plan))
         );
         assert!(!destination.as_unix_path().unwrap().exists());
+    }
+
+    #[test]
+    fn trash_undo_is_remembered_and_checked_without_listing_the_trash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original_path = temporary.path().join("discarded.txt");
+        fs::write(&original_path, b"recoverable contents").unwrap();
+        let original = StorePath::from_unix_path(original_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &original)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_trash(vec![DeleteTarget::new(original, identity.into_vec())])
+            .unwrap()[0];
+        let operation = queue.start_ready().unwrap().into_iter().next().unwrap();
+        let outcome = operation.execute_detailed().unwrap();
+
+        let before = crate::mutation::trash_listings();
+        queue.finish_with_outcome(job, outcome).unwrap();
+        assert_eq!(
+            crate::mutation::trash_listings(),
+            before,
+            "remembering the undo listed the trash"
+        );
+        assert!(queue.can_undo(job));
+        assert_eq!(
+            crate::mutation::trash_listings(),
+            before,
+            "checking the undo listed the trash"
+        );
+
+        // Restore the file, so nothing from this test stays in the trash.
+        let undo_job = queue.submit_undo(job).unwrap();
+        let _ = finish_one(&mut queue);
+        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(fs::read(&original_path).unwrap(), b"recoverable contents");
+    }
+
+    #[test]
+    fn scheduler_bound_finished_jobs_leave_no_scheduler_record() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::new();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        for number in 0..50 {
+            let original_path = temporary.path().join(format!("original-{number}"));
+            fs::write(&original_path, b"contents").unwrap();
+            let original = StorePath::from_unix_path(original_path.as_os_str());
+            let identity = MutationProvider::identity(&mut store, &original)
+                .unwrap()
+                .unwrap();
+            queue
+                .submit_rename(RenameRequest::new(
+                    original,
+                    format!("renamed-{number}").into(),
+                    identity.into_vec(),
+                ))
+                .unwrap();
+            assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
+        }
+        assert_eq!(
+            queue.scheduler_record_count(),
+            0,
+            "finished jobs keep no scheduler record"
+        );
     }
 }

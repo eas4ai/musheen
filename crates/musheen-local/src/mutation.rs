@@ -27,6 +27,16 @@ use walkdir::WalkDir;
 
 static TRASH_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_RESTORE_NAME: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static TRASH_LISTINGS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times this process has listed the trash. Tests use it to show
+/// that remembering and checking an undo never lists the trash.
+#[cfg(test)]
+pub(crate) fn trash_listings() -> u64 {
+    TRASH_LISTINGS.load(Ordering::Relaxed)
+}
+
 const REPLACE_BACKUP_PREFIX: &str = ".musheen-replace-backup-v1-";
 const REPLACE_JOURNAL_PREFIX: &str = ".musheen-replace-journal-v1-";
 const REPLACE_MERGING_PREFIX: &str = ".musheen-replace-merging-v1-";
@@ -254,6 +264,8 @@ impl LocalStore {
         let _guard = TRASH_LOCK
             .lock()
             .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
+        #[cfg(test)]
+        TRASH_LISTINGS.fetch_add(1, Ordering::Relaxed);
         let listed = trash::os_limited::list().map_err(map_trash_error)?;
         let listed_ids = listed
             .iter()

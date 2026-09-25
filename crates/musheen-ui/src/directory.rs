@@ -336,7 +336,9 @@ pub(crate) struct DirectoryIndexResult {
 
 pub(crate) struct DirectoryIndexWatchWork {
     index: SharedIndex,
-    event: WatchEvent,
+    /// The changes one merge applies; the changes that arrived while the
+    /// previous merge ran travel together.
+    events: Vec<WatchEvent>,
     preferences: ViewPreferences,
     filter: Option<DirectoryFilter>,
 }
@@ -344,8 +346,8 @@ pub(crate) struct DirectoryIndexWatchWork {
 pub(crate) struct DirectoryIndexWatchResult {
     indexed_count: usize,
     visible_count: usize,
-    removed: Option<musheen_core::ItemId>,
-    selection_transition: Option<(u64, Option<u64>)>,
+    removed: Vec<musheen_core::ItemId>,
+    selection_transitions: Vec<(u64, Option<u64>)>,
 }
 
 pub(crate) struct DirectoryIndexOrderWork {
@@ -379,52 +381,58 @@ impl DirectoryIndexWatchWork {
             .index
             .lock()
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
-        let arrival = index.record_count();
-        let event_id = match &self.event {
-            WatchEvent::Created(item)
-            | WatchEvent::Changed(item)
-            | WatchEvent::Renamed { item, .. } => Some(item.id()),
-            WatchEvent::Removed(id) => Some(id),
-            WatchEvent::Invalidated { .. } => None,
-        };
-        let previous_arrival = event_id
-            .map(|id| index.lookup_id_with_arrival(id))
-            .transpose()?
-            .flatten()
-            .map(|(_, arrival)| arrival);
-        let removed = match self.event {
-            WatchEvent::Created(item)
-            | WatchEvent::Changed(item)
-            | WatchEvent::Renamed { item, .. } => {
-                index.append(&item, arrival)?;
-                None
-            }
-            WatchEvent::Removed(id) => {
-                index.append_tombstone(&id, arrival)?;
-                Some(id)
-            }
-            WatchEvent::Invalidated { .. } => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "invalidated directory must be reloaded",
-                ));
-            }
-        };
-        index.rebuild_order(&self.preferences, self.filter.as_ref())?;
-        Ok(DirectoryIndexWatchResult {
-            indexed_count: index.active_count().unwrap_or(0),
-            visible_count: index.visible_count().unwrap_or(0),
-            selection_transition: previous_arrival.map(|old| {
-                (
+        let mut removed = Vec::new();
+        let mut selection_transitions = Vec::new();
+        for event in self.events {
+            let arrival = index.record_count();
+            let event_id = match &event {
+                WatchEvent::Created(item)
+                | WatchEvent::Changed(item)
+                | WatchEvent::Renamed { item, .. } => Some(item.id()),
+                WatchEvent::Removed(id) => Some(id),
+                WatchEvent::Invalidated { .. } => None,
+            };
+            let previous_arrival = event_id
+                .map(|id| index.lookup_id_with_arrival(id))
+                .transpose()?
+                .flatten()
+                .map(|(_, arrival)| arrival);
+            let removed_id = match event {
+                WatchEvent::Created(item)
+                | WatchEvent::Changed(item)
+                | WatchEvent::Renamed { item, .. } => {
+                    index.append(&item, arrival)?;
+                    None
+                }
+                WatchEvent::Removed(id) => {
+                    index.append_tombstone(&id, arrival)?;
+                    Some(id)
+                }
+                WatchEvent::Invalidated { .. } => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalidated directory must be reloaded",
+                    ));
+                }
+            };
+            index.rebuild_order(&self.preferences, self.filter.as_ref())?;
+            if let Some(old) = previous_arrival {
+                selection_transitions.push((
                     old,
-                    if removed.is_some() {
+                    if removed_id.is_some() {
                         None
                     } else {
                         Some(arrival)
                     },
-                )
-            }),
+                ));
+            }
+            removed.extend(removed_id);
+        }
+        Ok(DirectoryIndexWatchResult {
+            indexed_count: index.active_count().unwrap_or(0),
+            visible_count: index.visible_count().unwrap_or(0),
             removed,
+            selection_transitions,
         })
     }
 }
@@ -587,6 +595,12 @@ impl DirectoryModel {
     #[cfg(test)]
     pub(crate) fn set_index_root(&mut self, root: Option<PathBuf>) {
         self.index_root = root;
+    }
+
+    /// The load this folder's watch events belong to.
+    #[cfg(test)]
+    pub(crate) fn current_load(&self) -> Option<DirectoryLoad> {
+        self.active.clone()
     }
 
     /// The directory that holds this tab's index files while the folder is
@@ -949,12 +963,30 @@ impl DirectoryModel {
         event: WatchEvent,
         filter: Option<DirectoryFilter>,
     ) -> Option<DirectoryIndexWatchWork> {
-        if !self.is_current(load) || matches!(event, WatchEvent::Invalidated { .. }) {
+        self.prepare_index_watch_events(load, vec![event], filter)
+    }
+
+    /// The work that merges a batch of external changes into this folder's
+    /// index. `None` when the folder is not indexed, the load is stale, the
+    /// batch is empty, or a change invalidates the folder, which needs a
+    /// reload instead.
+    pub(crate) fn prepare_index_watch_events(
+        &self,
+        load: &DirectoryLoad,
+        events: Vec<WatchEvent>,
+        filter: Option<DirectoryFilter>,
+    ) -> Option<DirectoryIndexWatchWork> {
+        if !self.is_current(load)
+            || events.is_empty()
+            || events
+                .iter()
+                .any(|event| matches!(event, WatchEvent::Invalidated { .. }))
+        {
             return None;
         }
         Some(DirectoryIndexWatchWork {
             index: Arc::clone(self.index.as_ref()?),
-            event,
+            events,
             preferences: self.view.preferences().clone(),
             filter,
         })
@@ -970,19 +1002,20 @@ impl DirectoryModel {
         }
         match result {
             Ok(result) => {
-                if let (Some(selection), Some((old, new))) =
-                    (&mut self.indexed_selection, result.selection_transition)
-                    && let Err(error) = selection.carry_forward(old, new)
-                {
-                    self.state = DirectoryState::Error(
-                        format!("Directory selection failed: {error}").into(),
-                    );
-                    return true;
+                if let Some(selection) = &mut self.indexed_selection {
+                    for (old, new) in result.selection_transitions {
+                        if let Err(error) = selection.carry_forward(old, new) {
+                            self.state = DirectoryState::Error(
+                                format!("Directory selection failed: {error}").into(),
+                            );
+                            return true;
+                        }
+                    }
                 }
                 self.order_epoch = self.order_epoch.wrapping_add(1);
                 self.indexed_count = result.indexed_count;
                 self.indexed_visible_count = result.visible_count;
-                if let Some(id) = result.removed {
+                for id in result.removed {
                     self.view.apply_watch_event(WatchEvent::Removed(id));
                 }
                 self.state = if self.indexed_count == 0 {
@@ -1304,6 +1337,58 @@ mod indexed_watch_tests {
             "item-4599"
         );
     }
+
+    #[test]
+    fn indexed_folder_merge_failure_keeps_the_shown_items_and_reports_the_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let mut model = DirectoryModel::new(ResourceLimits::default())
+            .with_index_root(Some(root.path().to_path_buf()));
+        let load = model.begin_navigation(StorePath::from_unix_path("/many"));
+        for batch in 0..10 {
+            let request = PageRequest::first(&ResourceLimits::default());
+            let items = (batch * 512..(batch + 1) * 512)
+                .map(|number| item(number, &format!("item-{number:05}")))
+                .collect();
+            let page = Page::try_new(&request, items, None, TotalHint::Unknown).unwrap();
+            assert_eq!(model.apply_page(&load, page), ApplyPageResult::Applied);
+        }
+        assert!(model.is_indexed());
+        assert_eq!(model.indexed_count(), 5_120);
+        let scratch = model
+            .index
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .path()
+            .to_path_buf();
+
+        // The index directory stops accepting new files, so the merge cannot
+        // write the new order.
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let work = model
+            .prepare_index_watch_event(&load, WatchEvent::Created(item(9_000, "late")), None)
+            .unwrap();
+        let result = work.run();
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "the merge fails in a read-only index directory");
+
+        assert!(model.finish_index_watch_event(&load, result));
+        assert_eq!(
+            model.state(),
+            &DirectoryState::Ready,
+            "the items already shown stay on screen"
+        );
+        assert_eq!(model.indexed_count(), 5_120);
+        assert!(
+            model
+                .index_error()
+                .is_some_and(|error| error.contains("Directory index failed")),
+            "the failed merge is reported: {:?}",
+            model.index_error()
+        );
+    }
 }
 
 impl Default for DirectoryModel {
@@ -1406,4 +1491,5 @@ mod tests {
         assert_eq!(model.indexed_count(), 0);
         assert_eq!(model.location(), Some(next.location()));
     }
+
 }

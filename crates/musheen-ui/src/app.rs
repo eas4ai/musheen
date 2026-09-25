@@ -2830,19 +2830,30 @@ fn install_native_theme(cx: &mut App) {
         Err(error) => {
             eprintln!("Musheen could not read the system theme: {error}. Using Adwaita.");
             let preferences = native_theme::AccessibilityPreferences::from_system();
-            if let Ok((theme, resolved)) =
-                native_theme_gpui::from_preset("adwaita", true, &preferences)
-            {
-                native_theme_gpui::apply(theme, &resolved, &preferences, cx);
-            }
-            if let Ok((theme, resolved)) =
-                native_theme_gpui::from_preset("adwaita", false, &preferences)
-            {
-                native_theme_gpui::apply(theme, &resolved, &preferences, cx);
-            }
+            let prefers_dark = matches!(
+                cx.window_appearance(),
+                gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
+            );
+            install_fallback_theme(prefers_dark, &preferences, cx);
         }
     }
     crate::theme::runtime::install(cx);
+}
+
+/// Installs the Adwaita presets when the system theme cannot be read. The
+/// bridge keeps the variant applied last as the current mode.
+fn install_fallback_theme(
+    prefers_dark: bool,
+    preferences: &native_theme::AccessibilityPreferences,
+    cx: &mut App,
+) {
+    let _ = prefers_dark;
+    for is_dark in [true, false] {
+        if let Ok((theme, resolved)) = native_theme_gpui::from_preset("adwaita", is_dark, preferences)
+        {
+            native_theme_gpui::apply(theme, &resolved, preferences, cx);
+        }
+    }
 }
 
 fn preview_theme(value: &str) -> Option<(bool, bool)> {
@@ -28936,5 +28947,338 @@ mod tests {
                 && app.read(cx).file_clipboard.is_none()
         })
         .await;
+    }
+
+    /// A gate the test closes around a store's metadata calls. A call that
+    /// arrives while the gate is closed waits; after two seconds it panics,
+    /// so a UI thread that waits on the store fails the test instead of
+    /// hanging it.
+    #[derive(Default)]
+    struct StoreGate {
+        closed: Mutex<bool>,
+        opened: std::sync::Condvar,
+        passes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StoreGate {
+        fn close(&self) {
+            *self.closed.lock().unwrap() = true;
+        }
+
+        fn open(&self) {
+            *self.closed.lock().unwrap() = false;
+            self.opened.notify_all();
+        }
+
+        fn pass(&self) {
+            self.passes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut closed = self.closed.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while *closed {
+                let now = Instant::now();
+                assert!(
+                    now < deadline,
+                    "a store metadata call waited two seconds at the gate: the UI thread is waiting on the store"
+                );
+                closed = self.opened.wait_timeout(closed, deadline - now).unwrap().0;
+            }
+        }
+    }
+
+    /// The local store with its metadata calls behind a [`StoreGate`].
+    struct GatedStore {
+        inner: Arc<dyn Store>,
+        gate: Arc<StoreGate>,
+    }
+
+    impl Store for GatedStore {
+        fn provider_id(&self) -> &ProviderId {
+            self.inner.provider_id()
+        }
+
+        fn capabilities(&self, location: &StorePath) -> CapabilityMatrix {
+            self.gate.pass();
+            self.inner.capabilities(location)
+        }
+
+        fn resolve_item(&self, path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+            self.gate.pass();
+            self.inner.resolve_item(path)
+        }
+
+        fn resolve_link_target(&self, path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+            self.gate.pass();
+            self.inner.resolve_link_target(path)
+        }
+
+        fn location_writable(&self, path: &StorePath) -> Result<CapabilityState, StoreError> {
+            self.gate.pass();
+            self.inner.location_writable(path)
+        }
+
+        fn executable_state(&self, path: &StorePath) -> Result<CapabilityState, StoreError> {
+            self.gate.pass();
+            self.inner.executable_state(path)
+        }
+
+        fn search_capabilities(&self, location: &StorePath) -> SearchCapabilities {
+            self.inner.search_capabilities(location)
+        }
+
+        fn search<'a>(
+            &'a self,
+            scope: &'a StorePath,
+            query: musheen_core::SearchQuery,
+            cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Box<dyn musheen_core::SearchStream>, StoreError>>
+        {
+            self.inner.search(scope, query, cancellation)
+        }
+
+        fn read_directory<'a>(
+            &'a self,
+            location: &'a StorePath,
+            request: PageRequest,
+            cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Page<StoreItem>, StoreError>> {
+            self.inner.read_directory(location, request, cancellation)
+        }
+
+        fn watch_directory<'a>(
+            &'a self,
+            location: &'a StorePath,
+            cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<Box<dyn musheen_core::DirectoryWatch>, StoreError>>
+        {
+            self.inner.watch_directory(location, cancellation)
+        }
+
+        fn validate_mutation(&self, request: &MutationRequest) -> Result<(), StoreError> {
+            self.inner.validate_mutation(request)
+        }
+
+        fn mutate<'a>(
+            &'a self,
+            request: MutationRequest,
+            cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<(), StoreError>> {
+            self.inner.mutate(request, cancellation)
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn ui_thread_context_menu_opens_while_the_store_metadata_call_is_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"test").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_navigation(
+                    WindowSession::new(StorePath::from_unix_path(
+                        temporary.path().as_os_str().to_owned(),
+                    )),
+                    None,
+                    None,
+                    ResourceLimits::default(),
+                    false,
+                    cx,
+                )
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+
+        let gate = Arc::new(StoreGate::default());
+        gate.close();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.store = Arc::new(GatedStore {
+                    inner: Arc::clone(&state.store),
+                    gate: Arc::clone(&gate),
+                });
+                let tab = state.navigation.focused_tab().id();
+                let item = state.focused_directory().view().items()[0].id().clone();
+                // The store is blocked, and the menu still opens.
+                let menu = state.item_context_menu(tab, item, cx);
+                assert!(
+                    MusheenApp::menu_entry_by_id(&menu, "file.open_with").is_some(),
+                    "the menu opens for the file while the store is blocked"
+                );
+            });
+        })
+        .unwrap();
+
+        gate.open();
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            gate.passes.load(std::sync::atomic::Ordering::SeqCst) >= 1
+        })
+        .await;
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
+                let tab = state.navigation.focused_tab().id();
+                let selection = state
+                    .active_command_request(CommandAction::Open)
+                    .selection()
+                    .to_vec();
+                let menu = state.compose_context_menu(tab, MenuTarget::Item, selection);
+                assert!(MusheenApp::menu_entry_by_id(&menu, "file.open_with").is_some());
+            });
+        })
+        .unwrap();
+    }
+
+    /// A watcher whose next event never comes.
+    struct StalledWatch;
+
+    impl musheen_core::DirectoryWatch for StalledWatch {
+        fn semantics(&self) -> musheen_core::WatchSemantics {
+            musheen_core::WatchSemantics::Live
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+            _cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'a, Result<WatchEvent, StoreError>> {
+            Box::pin(async { Err(StoreError::Cancelled) })
+        }
+    }
+
+    #[gpui_kit::test]
+    async fn ui_thread_watch_event_applies_while_the_catalog_lock_is_held(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("watched");
+        filesystem::create_dir(&folder).unwrap();
+        let catalog_path = temporary.path().join("private/catalog.json");
+        let catalog_store = CatalogStore::at(&catalog_path);
+        catalog_store.save(&CatalogDocument::default()).unwrap();
+        let limits = ResourceLimits::default();
+        let providers = ProviderRuntime::for_current_user();
+        let navigation =
+            WindowSession::new(StorePath::from_unix_path(folder.as_os_str().to_owned()));
+        let coordinator = Arc::new(Mutex::new(SessionCoordinator::new(
+            SessionStore::at(temporary.path().join("session.json")),
+            ApplicationSession::new(vec![navigation.clone()]).unwrap(),
+        )));
+        let window_id = coordinator.lock().unwrap().entries()[0].0;
+        let binding = SessionBinding {
+            coordinator,
+            window_id,
+            operation_hub: OperationHub::new_with_provider_runtime(&limits, &providers),
+            volume_runtime: None,
+            catalog: CatalogBinding::persistent_with_xattr_opt_in(
+                catalog_store,
+                CatalogDocument::default(),
+                true,
+            ),
+            providers,
+        };
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_navigation(navigation, Some(binding), None, limits, false, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Empty
+        })
+        .await;
+
+        // Another process holds the catalog lock for the next two seconds.
+        let mut lock_path = catalog_path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_file = standard_library::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(2));
+            drop(lock_file);
+        });
+
+        let created = folder.join("new.txt");
+        filesystem::write(&created, b"new").unwrap();
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(created.as_os_str().to_owned()))
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                let load = state.focused_directory().current_load().unwrap();
+                state.handle_watch_event(
+                    tab,
+                    load,
+                    Box::new(StalledWatch),
+                    WatchEvent::Created(item.clone()),
+                    cx,
+                );
+                assert!(
+                    state.focused_directory().view().item(item.id()).is_some(),
+                    "the directory model shows the created item"
+                );
+            });
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "applying the watch event took {elapsed:?}: the UI thread waited on the catalog lock"
+        );
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
+                assert_eq!(state.operation_error, None);
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn theme_fallback_installs_the_preferred_variant_last(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let preferences = native_theme::AccessibilityPreferences::default();
+            install_fallback_theme(true, &preferences, cx);
+            assert!(
+                cx.theme().mode.is_dark(),
+                "a window that prefers dark gets the dark fallback"
+            );
+            install_fallback_theme(false, &preferences, cx);
+            assert!(
+                !cx.theme().mode.is_dark(),
+                "a window that prefers light gets the light fallback"
+            );
+        });
     }
 }
