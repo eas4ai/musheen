@@ -425,23 +425,62 @@ impl OpendalStore {
             }
             let remote_path =
                 remote_path.map_err(|category| RemoteError::new(protocol, category, None))?;
-            let lease = match pool {
-                Some(pool) => Some(
-                    pool.acquire(cancellation.clone())
-                        .await
-                        .map_err(|error| RemoteError::new(protocol, error.category(), None))?,
-                ),
-                None => None,
-            };
-            let operator = lease
-                .as_ref()
-                .map_or(operator, |lease| lease.connection().clone());
-            run_remote_streaming(cancellation, async move {
-                upload_staging(operator, &remote_path, &local).await
-            })
+            run_pooled_stream(
+                operator,
+                pool,
+                protocol,
+                cancellation,
+                move |operator| async move { upload_staging(operator, &remote_path, &local).await },
+            )
             .await
-            .map_err(|category| RemoteError::new(protocol, category, None))?
-            .map_err(|category| RemoteError::new(protocol, category, None))
+        })
+    }
+
+    /// Publishes an owned staging object only when the backend supports an
+    /// exclusive destination write. Staging remains available for recovery.
+    pub fn publish_staging_noreplace<'a>(
+        &'a self,
+        staging: &'a StagingPath,
+        destination: &'a StorePath,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<u64, RemoteError>> {
+        let staging_path = self.remote_path(staging.path());
+        let destination_path = self.remote_path(destination);
+        let writable = self.mutation_policy == RemoteMutationPolicy::CapabilitiesVerified
+            && self.operator.info().capability().write_with_if_not_exists;
+        let owned_sibling = staging.is_sibling_of(destination);
+        let operator = self.operator.clone();
+        let pool = self.pool.clone();
+        let protocol = self.protocol;
+        Box::pin(async move {
+            if !writable {
+                return Err(RemoteError::new(
+                    protocol,
+                    RemoteErrorCategory::Unsupported,
+                    None,
+                ));
+            }
+            if !owned_sibling {
+                return Err(RemoteError::new(
+                    protocol,
+                    RemoteErrorCategory::InvalidProfile,
+                    None,
+                ));
+            }
+            let staging_path =
+                staging_path.map_err(|category| RemoteError::new(protocol, category, None))?;
+            let destination_path =
+                destination_path.map_err(|category| RemoteError::new(protocol, category, None))?;
+            run_pooled_stream(
+                operator,
+                pool,
+                protocol,
+                cancellation,
+                move |operator| async move {
+                    publish_staging_new(operator, &staging_path, &destination_path).await
+                },
+            )
+            .await
         })
     }
 
@@ -462,23 +501,16 @@ impl OpendalStore {
         Box::pin(async move {
             let remote_path =
                 remote_path.map_err(|category| RemoteError::new(protocol, category, None))?;
-            let lease = match pool {
-                Some(pool) => Some(
-                    pool.acquire(cancellation.clone())
-                        .await
-                        .map_err(|error| RemoteError::new(protocol, error.category(), None))?,
-                ),
-                None => None,
-            };
-            let operator = lease
-                .as_ref()
-                .map_or(operator, |lease| lease.connection().clone());
-            run_remote_streaming(cancellation, async move {
-                download_new_local(operator, &remote_path, &local, max_bytes).await
-            })
+            run_pooled_stream(
+                operator,
+                pool,
+                protocol,
+                cancellation,
+                move |operator| async move {
+                    download_new_local(operator, &remote_path, &local, max_bytes).await
+                },
+            )
             .await
-            .map_err(|category| RemoteError::new(protocol, category, None))?
-            .map_err(|category| RemoteError::new(protocol, category, None))
         })
     }
 
@@ -907,6 +939,35 @@ where
     result
 }
 
+async fn run_pooled_stream<F, Fut, T>(
+    operator: Operator,
+    pool: Option<ProviderPool<OperatorConnector>>,
+    protocol: RemoteProtocol,
+    cancellation: CancellationToken,
+    operation: F,
+) -> Result<T, RemoteError>
+where
+    F: FnOnce(Operator) -> Fut + Send,
+    Fut: Future<Output = Result<T, RemoteErrorCategory>> + Send + 'static,
+    T: Send + 'static,
+{
+    let lease = match pool {
+        Some(pool) => Some(
+            pool.acquire(cancellation.clone())
+                .await
+                .map_err(|error| RemoteError::new(protocol, error.category(), None))?,
+        ),
+        None => None,
+    };
+    let operator = lease
+        .as_ref()
+        .map_or(operator, |lease| lease.connection().clone());
+    run_remote_streaming(cancellation, operation(operator))
+        .await
+        .map_err(|category| RemoteError::new(protocol, category, None))?
+        .map_err(|category| RemoteError::new(protocol, category, None))
+}
+
 async fn upload_staging(
     operator: Operator,
     remote_path: &str,
@@ -958,6 +1019,80 @@ async fn upload_staging(
             .map_err(|_| RemoteErrorCategory::Timeout)?
             .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
         Ok(written)
+    }
+    .await;
+    if transfer.is_err() {
+        let _ = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, writer.abort()).await;
+    }
+    transfer
+}
+
+async fn publish_staging_new(
+    operator: Operator,
+    staging: &str,
+    destination: &str,
+) -> Result<u64, RemoteErrorCategory> {
+    let metadata = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(staging))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+    if !metadata.is_file() {
+        return Err(RemoteErrorCategory::Unsupported);
+    }
+    match tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(destination)).await {
+        Ok(Ok(_)) => return Err(RemoteErrorCategory::Conflict),
+        Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {}
+        Ok(Err(error)) => {
+            return Err(classify_opendal_error(&error, RemoteErrorContext::Read));
+        }
+        Err(_) => return Err(RemoteErrorCategory::Timeout),
+    }
+    let reader = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.reader(staging))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+    let mut writer = tokio::time::timeout(
+        TRANSFER_IDLE_TIMEOUT,
+        operator.writer_with(destination).if_not_exists(true),
+    )
+    .await
+    .map_err(|_| RemoteErrorCategory::Timeout)?
+    .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+    let transfer = async {
+        let mut offset = 0_u64;
+        while offset < metadata.content_length() {
+            let end = offset
+                .saturating_add(TRANSFER_CHUNK_BYTES as u64)
+                .min(metadata.content_length());
+            let chunk = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, reader.read(offset..end))
+                .await
+                .map_err(|_| RemoteErrorCategory::Timeout)?
+                .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+            if chunk.len() as u64 != end - offset {
+                return Err(RemoteErrorCategory::Protocol);
+            }
+            tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, writer.write(chunk.to_vec()))
+                .await
+                .map_err(|_| RemoteErrorCategory::Timeout)?
+                .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+            offset = end;
+        }
+        let after = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(staging))
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+        if after.content_length() != metadata.content_length()
+            || after.etag() != metadata.etag()
+            || after.version() != metadata.version()
+            || after.last_modified() != metadata.last_modified()
+        {
+            return Err(RemoteErrorCategory::Conflict);
+        }
+        tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, writer.close())
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+        Ok(offset)
     }
     .await;
     if transfer.is_err() {

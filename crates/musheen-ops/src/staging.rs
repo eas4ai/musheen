@@ -129,21 +129,7 @@ impl StagingPath {
         generation: EventGeneration,
         nonce: [u8; 16],
     ) -> bool {
-        let same_parent = match (path.as_unix_path(), destination.as_unix_path()) {
-            (Some(path), Some(destination)) => path.parent() == destination.parent(),
-            _ => match (path.provider_key(), destination.provider_key()) {
-                (
-                    Some((path_provider, path_key)),
-                    Some((destination_provider, destination_key)),
-                ) => {
-                    path_provider == destination_provider
-                        && slash_key_parent(path_key) == slash_key_parent(destination_key)
-                        && slash_key_parent(path_key).is_some()
-                }
-                _ => false,
-            },
-        };
-        same_parent
+        same_staging_parent(path, destination)
             && Self::nonce(path) == Some(nonce)
             && path_name(path).is_some_and(|name| {
                 name.starts_with(
@@ -163,11 +149,30 @@ impl StagingPath {
     }
 
     #[must_use]
+    pub fn is_sibling_of(&self, destination: &StorePath) -> bool {
+        self.is_app_owned() && same_staging_parent(&self.path, destination)
+    }
+
+    #[must_use]
     pub fn is_owned_path(path: &StorePath) -> bool {
         let Some(name) = path_name(path) else {
             return false;
         };
         parse_staging_name(name).is_some()
+    }
+}
+
+fn same_staging_parent(path: &StorePath, destination: &StorePath) -> bool {
+    match (path.as_unix_path(), destination.as_unix_path()) {
+        (Some(path), Some(destination)) => path.parent() == destination.parent(),
+        _ => match (path.provider_key(), destination.provider_key()) {
+            (Some((path_provider, path_key)), Some((destination_provider, destination_key))) => {
+                path_provider == destination_provider
+                    && slash_key_parent(path_key) == slash_key_parent(destination_key)
+                    && slash_key_parent(path_key).is_some()
+            }
+            _ => false,
+        },
     }
 }
 

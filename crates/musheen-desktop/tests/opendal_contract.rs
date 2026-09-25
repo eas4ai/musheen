@@ -154,6 +154,54 @@ fn streaming_upload_writes_only_a_new_owned_staging_object() {
 }
 
 #[test]
+fn publication_keeps_existing_remote_destination_and_owned_staging() {
+    let operator = memory_operator();
+    let store = store(
+        operator.clone(),
+        RemoteProtocol::WebDav,
+        RemoteCasePolicy::Sensitive,
+        RemoteMutationPolicy::CapabilitiesVerified,
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let local = scratch.path().join("source.bin");
+    let payload = vec![0x37; 2 * 1024 * 1024 + 3];
+    std::fs::write(&local, &payload).unwrap();
+    let destination = store.path("/target.bin").unwrap();
+    let staging = StagingPath::for_slash_key_destination_with_nonce(
+        &destination,
+        JobId::new(8).unwrap(),
+        EventGeneration::new(0),
+        [0x47; 16],
+    )
+    .unwrap();
+    block_on(store.upload_staging_from_local(&local, &staging, CancellationToken::new())).unwrap();
+
+    assert_eq!(
+        block_on(
+            store.publish_staging_noreplace(&staging, &destination, CancellationToken::new(),)
+        )
+        .unwrap(),
+        payload.len() as u64
+    );
+    assert_eq!(
+        block_on(operator.read("target.bin")).unwrap().to_vec(),
+        payload
+    );
+
+    let error =
+        block_on(store.publish_staging_noreplace(&staging, &destination, CancellationToken::new()))
+            .unwrap_err();
+    assert_eq!(error.category(), RemoteErrorCategory::Conflict);
+    assert_eq!(
+        block_on(operator.read("target.bin")).unwrap().to_vec(),
+        payload
+    );
+    assert!(
+        block_on(operator.stat(".musheen-stage-v1-8-0-47474747474747474747474747474747")).is_ok()
+    );
+}
+
+#[test]
 fn upload_rejects_read_only_and_cancelled_connections_without_writing() {
     let operator = memory_operator();
     let store = store(

@@ -198,6 +198,16 @@ fn remote_staging_is_a_unique_sibling_and_owned_by_its_job() {
     let (_, key) = staging.path().provider_key().unwrap();
     assert!(key.starts_with(b"/projects/.musheen-stage-v1-19-2-"));
     assert!(staging.is_app_owned());
+    assert!(staging.is_sibling_of(&destination));
+    assert!(
+        !staging.is_sibling_of(
+            &musheen_core::StorePath::from_provider_key(
+                ProviderId::new("remote").unwrap(),
+                b"/other/report.txt".to_vec(),
+            )
+            .unwrap()
+        )
+    );
     assert!(StagingPath::is_for_destination(
         staging.path(),
         &destination,
