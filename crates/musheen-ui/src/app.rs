@@ -20426,13 +20426,13 @@ mod tests {
         fn execute_transfer(
             &self,
             execution: ProviderTransferExecution<'_>,
-        ) -> Result<CommandTargetRef, Box<str>> {
+        ) -> Result<musheen_local::TransferOutcome, musheen_local::LocalOperationFailure> {
             assert!(execution.id().get() > 0);
             assert_eq!(execution.generation().get(), 0);
             execution
                 .cancellation()
                 .check()
-                .map_err(|error| Box::<str>::from(error.to_string()))?;
+                .map_err(|error| musheen_local::LocalOperationFailure::failed(error.to_string()))?;
             assert_eq!(execution.action(), DropAction::Move);
             assert_eq!(execution.source(), self.expected_source.path());
             assert_eq!(execution.destination(), self.completed.path());
@@ -20440,7 +20440,9 @@ mod tests {
                 execution.expected_identity(),
                 Some(self.expected_source.id())
             );
-            Ok(self.completed.clone())
+            Ok(musheen_local::TransferOutcome::Completed(
+                self.completed.clone(),
+            ))
         }
     }
 

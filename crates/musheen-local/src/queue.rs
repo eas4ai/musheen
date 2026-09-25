@@ -507,7 +507,9 @@ impl<'a> ProviderTransferExecution<'a> {
 
 /// Executes transfers whose destination uses a provider-owned opaque path.
 /// Implementations must revalidate `expected_identity` immediately before
-/// mutating the source and must return the exact completed destination target.
+/// mutating the source. A move that loses metadata must return a review outcome
+/// before source removal; an uncertain publication must return an attention
+/// failure, never a plain retryable error.
 pub trait ProviderTransferRoute: fmt::Debug + Send + Sync {
     fn source_provider_id(&self) -> &musheen_core::ProviderId;
 
@@ -526,7 +528,7 @@ pub trait ProviderTransferRoute: fmt::Debug + Send + Sync {
     fn execute_transfer(
         &self,
         execution: ProviderTransferExecution<'_>,
-    ) -> Result<CommandTargetRef, Box<str>>;
+    ) -> Result<TransferOutcome, LocalOperationFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -559,7 +561,7 @@ impl LocalOperationFailure {
         self.recovery_staging.as_ref()
     }
 
-    fn failed(message: impl Into<Box<str>>) -> Self {
+    pub fn failed(message: impl Into<Box<str>>) -> Self {
         Self {
             message: message.into(),
             disposition: LocalFailureDisposition::Failed,
@@ -567,7 +569,7 @@ impl LocalOperationFailure {
         }
     }
 
-    fn from_transfer(error: OperationFailure) -> Self {
+    pub fn from_transfer(error: OperationFailure) -> Self {
         let disposition = if error.publication_state() == PublicationState::Unknown
             || error.source_state() == SourceState::Unknown
             || error.destination_published()
@@ -592,6 +594,15 @@ impl LocalOperationFailure {
             message: message.into(),
             disposition,
             recovery_staging,
+        }
+    }
+
+    #[must_use]
+    pub fn needs_attention(message: impl Into<Box<str>>) -> Self {
+        Self {
+            message: message.into(),
+            disposition: LocalFailureDisposition::NeedsAttention,
+            recovery_staging: None,
         }
     }
 
@@ -656,20 +667,16 @@ impl ReadyLocalOperation {
                     expected_destination_parent_identity.as_deref(),
                 )?;
                 if let Some(route) = provider_route {
-                    let target = route
-                        .execute_transfer(ProviderTransferExecution {
-                            id: self.id,
-                            generation: self.generation,
-                            action,
-                            source: &source,
-                            destination: &destination,
-                            expected_identity: expected_identity.as_ref(),
-                            cancellation: &self.cancellation,
-                        })
-                        .map_err(LocalOperationFailure::failed)?;
-                    return Ok(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
-                        target,
-                    )));
+                    let outcome = route.execute_transfer(ProviderTransferExecution {
+                        id: self.id,
+                        generation: self.generation,
+                        action,
+                        source: &source,
+                        destination: &destination,
+                        expected_identity: expected_identity.as_ref(),
+                        cancellation: &self.cancellation,
+                    })?;
+                    return Ok(LocalOperationOutcome::Transfer(outcome));
                 }
                 if let Some(expected_identity) = expected_identity {
                     let current = crate::metadata::item_from_path(
@@ -1957,6 +1964,44 @@ mod tests {
         execution: Mutex<Option<(JobId, EventGeneration, ArchiveOperationPlan)>>,
     }
 
+    #[derive(Debug)]
+    struct AttentionTransferRoute {
+        provider: musheen_core::ProviderId,
+    }
+
+    impl ProviderTransferRoute for AttentionTransferRoute {
+        fn source_provider_id(&self) -> &musheen_core::ProviderId {
+            &self.provider
+        }
+
+        fn destination_provider_id(&self) -> &musheen_core::ProviderId {
+            &self.provider
+        }
+
+        fn plan_destination(
+            &self,
+            _action: DropAction,
+            _source: &StorePath,
+            _target: &StorePath,
+            _expected_identity: Option<&ItemId>,
+        ) -> Result<StorePath, Box<str>> {
+            unreachable!("the ready operation already has a destination")
+        }
+
+        fn provider_snapshot(&self, _location: &StorePath) -> ProviderSnapshot {
+            unreachable!("the ready operation has already been planned")
+        }
+
+        fn execute_transfer(
+            &self,
+            _execution: ProviderTransferExecution<'_>,
+        ) -> Result<TransferOutcome, LocalOperationFailure> {
+            Err(LocalOperationFailure::needs_attention(
+                "destination may have been published; inspect before retrying",
+            ))
+        }
+    }
+
     impl ArchiveOperationRoute for RecordingArchiveRoute {
         fn execute_archive(
             &self,
@@ -2021,6 +2066,37 @@ mod tests {
             failure.message(),
             "the published destination needs inspection"
         );
+    }
+
+    #[test]
+    fn provider_transfer_attention_survives_ready_operation_execution() {
+        let provider = musheen_core::ProviderId::new("remote.test").unwrap();
+        let source =
+            StorePath::from_provider_key(provider.clone(), b"source.txt".to_vec()).unwrap();
+        let destination =
+            StorePath::from_provider_key(provider.clone(), b"target.txt".to_vec()).unwrap();
+        let operation = ReadyLocalOperation {
+            id: JobId::new(1).unwrap(),
+            generation: EventGeneration::new(0),
+            cancellation: musheen_core::CancellationToken::new(),
+            operation: LocalOperation::Transfer {
+                action: DropAction::Move,
+                source,
+                destination,
+                decision: None,
+                expected_identity: None,
+                expected_raw_identity: None,
+                expected_destination_parent_identity: None,
+                provider_route: Some(Arc::new(AttentionTransferRoute { provider })),
+            },
+        };
+
+        let failure = operation.execute_detailed().unwrap_err();
+        assert_eq!(
+            failure.disposition(),
+            LocalFailureDisposition::NeedsAttention
+        );
+        assert!(failure.message().contains("inspect before retrying"));
     }
 
     #[test]
