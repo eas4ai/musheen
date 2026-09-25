@@ -395,28 +395,34 @@ impl MusheenApp {
                 return;
             }
         };
-        if self
-            .revalidate_context_targets(origin_tab, &targets)
-            .is_err()
-        {
-            self.reject_custom_action(context, CustomActionError::SelectionMismatch, cx);
-            return;
-        }
-        let id = match self.operation_hub.submit_custom_action(context.clone()) {
-            Ok(id) => id,
-            Err(error) => {
-                self.reject_custom_action(context, error, cx);
-                return;
-            }
-        };
-        let work = CustomActionWork {
-            script_action: self.is_script_action(&action.id, cx),
-            action,
-            targets,
-            location,
-            confirmed,
-        };
-        self.spawn_custom_action(id, work, (origin_tab, context.location), cx);
+        // The store confirms the targets off the UI thread; the action is
+        // submitted once it has.
+        let rejection = context.clone();
+        self.with_revalidated_targets_or(
+            origin_tab,
+            targets.clone(),
+            cx,
+            move |this, _, cx| {
+                this.reject_custom_action(rejection, CustomActionError::SelectionMismatch, cx);
+            },
+            move |this, _, _, cx| {
+                let id = match this.operation_hub.submit_custom_action(context.clone()) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        this.reject_custom_action(context, error, cx);
+                        return;
+                    }
+                };
+                let work = CustomActionWork {
+                    script_action: this.is_script_action(&action.id, cx),
+                    action,
+                    targets,
+                    location,
+                    confirmed,
+                };
+                this.spawn_custom_action(id, work, (origin_tab, context.location), cx);
+            },
+        );
     }
 
     fn capture_custom_action_context(
