@@ -399,7 +399,7 @@ enum StoreProbeResult {
     },
     Location {
         location: StorePath,
-        facts: LocationFacts,
+        facts: Box<LocationFacts>,
     },
 }
 
@@ -2979,11 +2979,11 @@ fn run_store_probe(
             });
             StoreProbeResult::Location {
                 location,
-                facts: LocationFacts {
+                facts: Box::new(LocationFacts {
                     capabilities,
                     writable,
                     resolution,
-                },
+                }),
             }
         }
     }
@@ -7735,6 +7735,7 @@ impl MusheenApp {
                     self.executable_facts.insert(id, state);
                 }
                 StoreProbeResult::Location { location, facts } => {
+                    let facts = *facts;
                     if self.location_facts.len() >= LOCATION_FACTS_LIMIT {
                         self.location_facts.clear();
                     }
