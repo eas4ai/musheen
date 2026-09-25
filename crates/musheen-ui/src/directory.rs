@@ -122,6 +122,18 @@ impl DirectoryIndexReader {
             .map(Some)
     }
 
+    pub(crate) fn toggle_selection(
+        &self,
+        base: Option<IndexedSelection>,
+        base_ids: &[ItemId],
+        id: &ItemId,
+    ) -> std::io::Result<Option<IndexedSelection>> {
+        self.index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
+            .toggle_selection(base, base_ids, id)
+    }
+
     pub(crate) fn move_focus(
         &self,
         current: Option<&ItemId>,
@@ -445,6 +457,8 @@ pub struct DirectoryModel {
     view: DirectoryViewModel,
     index_root: PathBuf,
     index: Option<SharedIndex>,
+    /// Why the index stopped: the folder keeps what it already shows.
+    index_error: Option<Box<str>>,
     indexed_selection: Option<IndexedSelection>,
     indexed_selection_anchor: Option<ItemId>,
     indexed_selection_epoch: u64,
@@ -475,6 +489,7 @@ impl DirectoryModel {
             view: DirectoryViewModel::new(retention_limit.min(MAX_RESIDENT_ITEMS)),
             index_root: directory_index_root(),
             index: None,
+            index_error: None,
             indexed_selection: None,
             indexed_selection_anchor: None,
             indexed_selection_epoch: 0,
@@ -516,6 +531,7 @@ impl DirectoryModel {
         self.order_token.fetch_add(1, Ordering::AcqRel);
         self.view.reset_items();
         self.index = None;
+        self.index_error = None;
         self.indexed_selection = None;
         self.indexed_selection_anchor = None;
         self.indexed_selection_epoch = self.indexed_selection_epoch.wrapping_add(1);
@@ -614,8 +630,10 @@ impl DirectoryModel {
         DirectoryIndexWork {
             index: self.index.clone(),
             index_root: self.index_root.clone(),
+            // The resident items stay in the view until the index holds them,
+            // so a failed first spill leaves them on screen.
             prior_items: if self.index.is_none() {
-                self.view.take_items_for_index()
+                self.view.items().to_vec()
             } else {
                 Vec::new()
             },
@@ -637,14 +655,28 @@ impl DirectoryModel {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                self.state =
-                    DirectoryState::Error(format!("Directory index failed: {error}").into());
+                let message: Box<str> = format!("Directory index failed: {error}").into();
                 self.next_request = None;
                 self.page_loading = false;
+                let shown = if self.index.is_some() {
+                    self.indexed_count
+                } else {
+                    self.view.items().len()
+                };
+                if shown == 0 {
+                    self.state = DirectoryState::Error(message);
+                } else {
+                    // The items already shown stay; the rest of the folder is
+                    // not loaded and the count is reported as partial.
+                    self.view.set_complete(false);
+                    self.state = DirectoryState::Ready;
+                    self.index_error = Some(message);
+                }
                 return ApplyPageResult::Failed;
             }
         };
         self.index = Some(result.index);
+        self.view.take_items_for_index();
         if result.order_rebuilt {
             self.order_epoch = self.order_epoch.wrapping_add(1);
         }
@@ -659,6 +691,13 @@ impl DirectoryModel {
             DirectoryState::Ready
         };
         ApplyPageResult::Applied
+    }
+
+    /// The error that stopped indexing while the folder keeps showing what it
+    /// had loaded.
+    #[must_use]
+    pub fn index_error(&self) -> Option<&str> {
+        self.index_error.as_deref()
     }
 
     #[must_use]
@@ -938,6 +977,52 @@ mod indexed_watch_tests {
             ItemKind::RegularFile,
             Some(number),
         )
+    }
+
+    #[test]
+    fn indexed_folder_keeps_the_shown_items_when_the_index_cannot_be_written() {
+        let index_root = tempfile::tempdir().unwrap();
+        let blocked = index_root.path().join("blocked");
+        std::fs::write(&blocked, b"a file where the index root should be").unwrap();
+        let mut model = DirectoryModel::new(ResourceLimits::default()).with_index_root(blocked);
+        let load = model.begin_navigation(StorePath::from_unix_path("/many"));
+        let request = PageRequest::first(&ResourceLimits::default());
+
+        for first in (0..4_608).step_by(512) {
+            let items = (first..first + 512)
+                .map(|number| item(number, &format!("item-{number:05}")))
+                .collect();
+            let page = Page::try_new(&request, items, None, TotalHint::Unknown).unwrap();
+            let expected = if first < 4_096 {
+                ApplyPageResult::Applied
+            } else {
+                ApplyPageResult::Failed
+            };
+            assert_eq!(model.apply_page(&load, page), expected, "page at {first}");
+        }
+
+        assert_eq!(
+            model.view().items().len(),
+            4_096,
+            "the items already shown stay"
+        );
+        assert_eq!(model.state(), &DirectoryState::Ready);
+        assert!(!model.is_indexed());
+        assert!(
+            !model.view().is_complete(),
+            "the count is reported as partial"
+        );
+        assert!(
+            model
+                .index_error()
+                .is_some_and(|error| error.contains("index")),
+            "the error is available to show: {:?}",
+            model.index_error()
+        );
+        assert!(
+            model.begin_page().is_none(),
+            "no further page is requested after the index failed"
+        );
     }
 
     #[test]

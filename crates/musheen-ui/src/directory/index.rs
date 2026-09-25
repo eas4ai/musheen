@@ -280,6 +280,31 @@ impl IndexedSelection {
         Ok(())
     }
 
+    /// Removes one arrival; returns whether it was selected.
+    fn remove(&mut self, arrival: u64) -> bool {
+        let Some(ordinal) = usize::try_from(arrival).ok() else {
+            return false;
+        };
+        let Some(word) = self.bits.get_mut(ordinal / 64) else {
+            return false;
+        };
+        let mask = 1u64 << (ordinal % 64);
+        if *word & mask == 0 {
+            return false;
+        }
+        *word &= !mask;
+        self.count -= 1;
+        true
+    }
+
+    fn toggle(&mut self, arrival: u64) -> io::Result<()> {
+        if self.remove(arrival) {
+            Ok(())
+        } else {
+            self.insert(arrival)
+        }
+    }
+
     pub(crate) fn contains(&self, arrival: u64) -> bool {
         usize::try_from(arrival)
             .ok()
@@ -724,6 +749,33 @@ impl DiskDirectoryIndex {
             selection.insert(record.arrival)?;
         }
         Ok(selection)
+    }
+
+    /// Toggles `id` in a selection: the bitmap when one exists, else a bitmap
+    /// built from the in-memory `base_ids`. `None` when `id` is not indexed.
+    pub(super) fn toggle_selection(
+        &mut self,
+        base: Option<IndexedSelection>,
+        base_ids: &[ItemId],
+        id: &ItemId,
+    ) -> io::Result<Option<IndexedSelection>> {
+        let Some((_, arrival)) = self.lookup_id_with_arrival(id)? else {
+            return Ok(None);
+        };
+        let mut selection = match base {
+            Some(selection) => selection,
+            None => {
+                let mut selection = IndexedSelection::new(self.record_count)?;
+                for base_id in base_ids {
+                    if let Some((_, base_arrival)) = self.lookup_id_with_arrival(base_id)? {
+                        selection.insert(base_arrival)?;
+                    }
+                }
+                selection
+            }
+        };
+        selection.toggle(arrival)?;
+        Ok(Some(selection))
     }
 
     pub(super) fn resolve_bitmap(

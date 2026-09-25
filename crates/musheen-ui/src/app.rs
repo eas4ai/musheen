@@ -344,6 +344,7 @@ type IndexedLoadedRange = (std::ops::Range<usize>, Vec<(StoreItem, u64)>);
 enum IndexedSelectionRequest {
     All,
     Through(ItemId),
+    Toggle(ItemId),
 }
 
 struct DeferredIndexedContextMenu {
@@ -484,6 +485,18 @@ const RUBBER_BAND_GRID_ROW_HEIGHT: f32 = 116.0;
 
 /// Splits a vertical scroll distance into the first visible row and the
 /// offset of that row's top from the viewport top, which is zero or negative.
+/// The message to show when a page or index step failed: the index error
+/// when the folder keeps its rows, otherwise the folder's error state.
+fn directory_failure_message(directory: &DirectoryModel) -> Option<Box<str>> {
+    directory
+        .index_error()
+        .map(Box::from)
+        .or_else(|| match directory.state() {
+            DirectoryState::Error(message) => Some(message.clone()),
+            _ => None,
+        })
+}
+
 fn rubber_band_scroll_position(scrolled: Pixels, row_pitch: Pixels) -> (usize, Pixels) {
     if row_pitch <= px(0.) || scrolled <= px(0.) {
         return (0, px(0.));
@@ -4663,9 +4676,7 @@ impl MusheenApp {
                 match directory.apply_page(load, page) {
                     ApplyPageResult::Stale => return,
                     ApplyPageResult::Failed => {
-                        if let DirectoryState::Error(message) = directory.state() {
-                            self.operation_error = Some(message.clone());
-                        }
+                        self.operation_error = directory_failure_message(directory);
                         return;
                     }
                     ApplyPageResult::Applied => {}
@@ -4717,9 +4728,7 @@ impl MusheenApp {
                 self.finish_directory_page(tab_id, load, page_items, cx);
             }
             ApplyPageResult::Failed => {
-                if let DirectoryState::Error(message) = directory.state() {
-                    self.operation_error = Some(message.clone());
-                }
+                self.operation_error = directory_failure_message(directory);
             }
             ApplyPageResult::Stale => {}
         }
@@ -6095,6 +6104,7 @@ impl MusheenApp {
         let order_epoch = directory.order_epoch();
         let selection_epoch = directory.indexed_selection_epoch();
         let selected_ids = directory.view().selected_ids().to_vec();
+        let bitmap = directory.indexed_selection().cloned();
         let count = directory.visible_count();
         let anchor = directory
             .indexed_selection_anchor()
@@ -6105,12 +6115,17 @@ impl MusheenApp {
             IndexedSelectionRequest::Through(end) => {
                 Some(anchor.clone().unwrap_or_else(|| end.clone()))
             }
+            IndexedSelectionRequest::Toggle(id) => Some(id.clone()),
         };
+        let base_ids = selected_ids.clone();
         let work = cx.background_spawn(async move {
             match request {
                 IndexedSelectionRequest::All => reader.select_visible_range(0..count).map(Some),
                 IndexedSelectionRequest::Through(end) => {
                     reader.select_between_ids(anchor.as_ref(), &end)
+                }
+                IndexedSelectionRequest::Toggle(id) => {
+                    reader.toggle_selection(bitmap, &base_ids, &id)
                 }
             }
         });
@@ -6242,6 +6257,11 @@ impl MusheenApp {
                 IndexedSelectionRequest::Through(id.clone()),
                 cx,
             )
+        {
+            return;
+        }
+        if mode == SelectionMode::Toggle
+            && self.start_indexed_selection(tab_id, IndexedSelectionRequest::Toggle(id.clone()), cx)
         {
             return;
         }
@@ -18054,19 +18074,10 @@ mod tests {
 
     const INDEXED_FOLDER_ITEMS: usize = 8_192;
 
-    /// Opens the gallery fixture, then replaces its listing with 8,192
-    /// synthetic items so the tab spills into a disk index kept under a
-    /// temporary root. The root is returned so the test controls its life.
-    async fn open_synthetic_indexed_folder(
-        layout: Layout,
+    /// Opens the gallery fixture in a window and waits for its listing.
+    async fn open_gallery_window(
         cx: &mut TestAppContext,
-    ) -> (
-        Entity<MusheenApp>,
-        AnyWindowHandle,
-        TabId,
-        tempfile::TempDir,
-    ) {
-        let index_root = tempfile::tempdir().unwrap();
+    ) -> (Entity<MusheenApp>, AnyWindowHandle, TabId) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
@@ -18085,31 +18096,58 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
-        let tab_id = cx.update(|cx| {
+        let tab_id = cx.read(|cx| app.read(cx).navigation.focused_tab().id());
+        (app, browser, tab_id)
+    }
+
+    /// One provider page of synthetic files named `item-NNNNN`.
+    fn synthetic_page(range: std::ops::Range<usize>) -> Page<StoreItem> {
+        let provider = ProviderId::new("local").unwrap();
+        let items = range
+            .map(|number| {
+                StoreItem::new(
+                    ItemId::new(provider.clone(), number.to_be_bytes()).unwrap(),
+                    StorePath::from_unix_path(format!("/synthetic/{number}")),
+                    DisplayPath::new(format!("item-{number:05}")),
+                    ItemKind::RegularFile,
+                    None,
+                )
+            })
+            .collect();
+        Page::try_new(
+            &PageRequest::first(&ResourceLimits::default()),
+            items,
+            None,
+            musheen_core::TotalHint::Unknown,
+        )
+        .unwrap()
+    }
+
+    /// Opens the gallery fixture, then replaces its listing with 8,192
+    /// synthetic items so the tab spills into a disk index kept under a
+    /// temporary root. The root is returned so the test controls its life.
+    async fn open_synthetic_indexed_folder(
+        layout: Layout,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<MusheenApp>,
+        AnyWindowHandle,
+        TabId,
+        tempfile::TempDir,
+    ) {
+        let index_root = tempfile::tempdir().unwrap();
+        let (app, browser, tab_id) = open_gallery_window(cx).await;
+        cx.update(|cx| {
             app.update(cx, |state, cx| {
-                let tab_id = state.navigation.focused_tab().id();
                 let directory = state.directories.get_mut(&tab_id).unwrap();
                 directory.view_mut().preferences_mut().directories_first = false;
                 directory.set_index_root(index_root.path().to_path_buf());
                 let load = directory.begin_navigation(StorePath::from_unix_path("/synthetic"));
-                let request = PageRequest::first(&ResourceLimits::default());
-                let provider = ProviderId::new("local").unwrap();
                 for first in (0..INDEXED_FOLDER_ITEMS).step_by(512) {
-                    let items = (first..first + 512)
-                        .map(|number| {
-                            StoreItem::new(
-                                ItemId::new(provider.clone(), number.to_be_bytes()).unwrap(),
-                                StorePath::from_unix_path(format!("/synthetic/{number}")),
-                                DisplayPath::new(format!("item-{number:05}")),
-                                ItemKind::RegularFile,
-                                None,
-                            )
-                        })
-                        .collect();
-                    let page =
-                        Page::try_new(&request, items, None, musheen_core::TotalHint::Unknown)
-                            .unwrap();
-                    assert_eq!(directory.apply_page(&load, page), ApplyPageResult::Applied);
+                    assert_eq!(
+                        directory.apply_page(&load, synthetic_page(first..first + 512)),
+                        ApplyPageResult::Applied
+                    );
                 }
                 directory.view_mut().preferences_mut().layout = layout;
                 assert!(
@@ -18124,8 +18162,7 @@ mod tests {
                     .unwrap()
                     .set_view_preferences(preferences);
                 cx.notify();
-                tab_id
-            })
+            });
         });
         cx.wait_for(browser, Duration::from_secs(3), |window, cx| {
             window.render_frame(cx);
@@ -18139,6 +18176,75 @@ mod tests {
         })
         .await;
         (app, browser, tab_id, index_root)
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_index_failure_keeps_the_rows_and_shows_the_error(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, browser, tab_id) = open_gallery_window(cx).await;
+        let index_root = tempfile::tempdir().unwrap();
+        let blocked = index_root.path().join("blocked");
+        filesystem::write(&blocked, b"a file where the index root should be").unwrap();
+
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let directory = state.directories.get_mut(&tab_id).unwrap();
+                directory.view_mut().preferences_mut().directories_first = false;
+                directory.set_index_root(blocked);
+                let load = directory.begin_navigation(StorePath::from_unix_path("/synthetic"));
+                for first in (0..4_608).step_by(512) {
+                    let page = synthetic_page(first..first + 512);
+                    let page_items = page.items().to_vec();
+                    let directory = state.directories.get_mut(&tab_id).unwrap();
+                    if directory.needs_index(&page) {
+                        let work = directory.prepare_index_page(page);
+                        let result = work.run();
+                        state.finish_index_page_work(tab_id, &load, result, page_items, cx);
+                    } else {
+                        assert_eq!(directory.apply_page(&load, page), ApplyPageResult::Applied);
+                    }
+                }
+                let preferences = state.directories[&tab_id].view().preferences().clone();
+                state
+                    .navigation
+                    .tab_mut(tab_id)
+                    .unwrap()
+                    .set_view_preferences(preferences);
+                cx.notify();
+            });
+        });
+
+        let (shown, state_now, error) = cx.read(|cx| {
+            let state = app.read(cx);
+            let directory = state.focused_directory();
+            (
+                directory.view().items().len(),
+                directory.state().clone(),
+                state.operation_error.clone(),
+            )
+        });
+        assert_eq!(shown, 4_096, "the items already shown stay");
+        assert_eq!(state_now, DirectoryState::Ready);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("index")),
+            "the error is visible: {error:?}"
+        );
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.find("directory-item-0-0").visible(),
+                "the first row still renders"
+            );
+            let status = window.find("status-bar");
+            assert_eq!(
+                status.label().as_deref(),
+                Some("4096 items loaded — total unknown")
+            );
+        })
+        .unwrap();
     }
 
     fn index_entries(root: &Path) -> Vec<std::path::PathBuf> {
