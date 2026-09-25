@@ -2071,25 +2071,22 @@ impl ContextMenuDestinationResolver for ContextTransferDestinationResolver<'_> {
     }
 }
 
+/// The directory that holds every tab's index. `run` resolves it from the
+/// environment; tests point it at a temporary directory. `None` means no
+/// cache directory is available.
+#[derive(Clone, Debug)]
+pub(crate) struct DirectoryIndexRoot(pub(crate) Option<PathBuf>);
+
+impl Global for DirectoryIndexRoot {}
+
 pub fn run(initial_path: PathBuf) {
-    if let Err(error) = crate::directory::install_index_cleanup_on_termination() {
-        eprintln!("Musheen could not watch for termination signals: {error}");
-    }
-    match crate::directory::directory_index_root() {
-        Some(root) => {
-            if let Err(error) = crate::directory::sweep_stale_indexes(&root) {
-                eprintln!("Musheen could not remove stale directory indexes: {error}");
-            }
-        }
-        None => eprintln!(
-            "Musheen cannot locate the cache directory: {}; large folders will not be indexed",
-            crate::directory::missing_index_root_error()
-        ),
-    }
     gpui_kit::application()
         .with_assets(MusheenAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.set_global(DirectoryIndexRoot(
+                crate::directory::directory_index_root(),
+            ));
             install_navigation_key_bindings(cx);
             install_native_theme(cx);
             install_file_manager1(cx);
@@ -3375,9 +3372,9 @@ struct MusheenApp {
     column_scrolls: HashMap<(TabId, usize), UniformListScrollHandle>,
     /// Rows loaded for parent columns that show an indexed folder.
     column_viewports: HashMap<(TabId, usize), IndexedViewport>,
-    /// Where new tabs keep their disk index when a test moves it away from
-    /// the user's cache directory.
-    index_root_override: Option<PathBuf>,
+    /// Where every tab of this window keeps its index; `None` when no cache
+    /// directory is available.
+    index_root: Option<PathBuf>,
     column_horizontal_scrolls: HashMap<(TabId, usize), ScrollHandle>,
     column_reveal_counts: HashMap<(TabId, usize), usize>,
     startup_load_started: bool,
@@ -3906,8 +3903,10 @@ impl MusheenApp {
         let location = navigation.focused_tab().location().clone();
         let focused_tab = navigation.focused_tab().id();
         let (catalog_binding, pins, tag_names) = Self::catalog_models(session_binding.as_ref());
+        let index_root = Self::prepared_index_root(cx);
         let mut directories = HashMap::new();
-        let mut directory = DirectoryModel::new(limits.snapshot());
+        let mut directory =
+            DirectoryModel::new(limits.snapshot()).with_index_root(index_root.clone());
         *directory.view_mut().preferences_mut() =
             navigation.focused_tab().view_preferences().clone();
         directories.insert(focused_tab, directory);
@@ -4110,7 +4109,7 @@ impl MusheenApp {
             directory_scrolls: HashMap::new(),
             column_scrolls: HashMap::new(),
             column_viewports: HashMap::new(),
-            index_root_override: None,
+            index_root,
             column_horizontal_scrolls: HashMap::new(),
             column_reveal_counts: HashMap::new(),
             startup_load_started: false,
@@ -5331,21 +5330,34 @@ impl MusheenApp {
     }
 
     fn new_directory_model(&self) -> DirectoryModel {
-        let directory = DirectoryModel::new(self.limits.snapshot());
-        match &self.index_root_override {
-            Some(root) => directory.with_index_root(Some(root.clone())),
-            None => directory,
-        }
+        DirectoryModel::new(self.limits.snapshot()).with_index_root(self.index_root.clone())
     }
 
-    /// Keeps every tab's disk index under `root`, including the tabs that
-    /// already exist.
-    #[cfg(test)]
-    fn set_index_root_override(&mut self, root: PathBuf) {
-        for directory in self.directories.values_mut() {
-            directory.set_index_root(Some(root.clone()));
+    /// The index root this window's tabs use, prepared for the process: the
+    /// termination watcher is installed and the indexes an earlier process
+    /// left behind are removed. Without a cache directory the root is
+    /// `None`, and a folder that needs an index reports it.
+    fn prepared_index_root(cx: &App) -> Option<PathBuf> {
+        let root = cx
+            .try_global::<DirectoryIndexRoot>()
+            .map_or_else(crate::directory::directory_index_root, |root| {
+                root.0.clone()
+            });
+        match &root {
+            Some(root) => {
+                if let Err(error) = crate::directory::prepare_index_root(root) {
+                    eprintln!(
+                        "Musheen could not prepare the directory index root {}: {error}",
+                        root.display()
+                    );
+                }
+            }
+            None => eprintln!(
+                "Musheen cannot locate the cache directory: {}; large folders will not be indexed",
+                crate::directory::missing_index_root_error()
+            ),
         }
-        self.index_root_override = Some(root);
+        root
     }
 
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -18360,16 +18372,12 @@ mod tests {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
+            cx.set_global(DirectoryIndexRoot(Some(index_root.path().to_path_buf())));
         });
         let root = folder.to_path_buf();
-        let override_root = index_root.path().to_path_buf();
         let mut app = None;
         let handle = cx.open_window(size(px(1_480.), px(760.)), |window, cx| {
-            let view = cx.new(|cx| {
-                let mut app = MusheenApp::new_with_session_store(root, None, cx);
-                app.set_index_root_override(override_root);
-                app
-            });
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(root, None, cx));
             app = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -18473,6 +18481,50 @@ mod tests {
             let directory = app.read(cx).focused_directory();
             directory.indexed_selected_count() + directory.view().selected_ids().len()
         })
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_stale_indexes_are_removed_when_a_window_opens(
+        cx: &mut TestAppContext,
+    ) {
+        let index_root = tempfile::tempdir().unwrap();
+        // What a process that ended by SIGKILL leaves behind.
+        let stale = index_root.path().join("musheen-directory-stale");
+        filesystem::create_dir(&stale).unwrap();
+        filesystem::write(stale.join("lock"), b"").unwrap();
+        filesystem::write(stale.join("records"), b"leftover").unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+            cx.set_global(DirectoryIndexRoot(Some(index_root.path().to_path_buf())));
+        });
+        let root = folder.path().to_path_buf();
+        let mut app = None;
+
+        let handle = cx.open_window(size(px(1_480.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(root, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() != &DirectoryState::Loading
+        })
+        .await;
+        assert!(
+            !stale.exists(),
+            "the leftover index is removed when the window opens"
+        );
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).index_root.as_deref(),
+                Some(index_root.path()),
+                "the window's tabs index under the prepared root"
+            );
+        });
     }
 
     #[gpui_kit::test]

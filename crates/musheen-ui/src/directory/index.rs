@@ -1013,8 +1013,8 @@ fn read_next_offset(reader: &mut impl Read) -> io::Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiskDirectoryIndex, INDEX_DIRECTORY_PREFIX, INDEX_LOCK_NAME, directory_index_root_from,
-        lock_index_directory, sweep_stale_indexes,
+        DiskDirectoryIndex, INDEX_DIRECTORY_PREFIX, INDEX_LOCK_NAME, directory_index_root,
+        directory_index_root_from, lock_index_directory, sweep_stale_indexes,
     };
     use crate::search::DirectoryFilter;
     use crate::views::{SortDirection, SortKey, ViewPreferences};
@@ -1536,6 +1536,60 @@ mod tests {
             );
         }
         assert_eq!(directory_index_root_from(None, None), None);
+    }
+
+    const ROOT_PROBE: &str = "MUSHEEN_INDEX_ROOT_PROBE";
+
+    /// The root the process resolves from `XDG_CACHE_HOME` and `HOME`,
+    /// read in a child process so this one's environment stays untouched.
+    #[test]
+    fn indexed_folder_root_follows_the_environment() {
+        if let Some(output) = std::env::var_os(ROOT_PROBE) {
+            // The child: write the root this environment resolves to.
+            let root = directory_index_root().map_or_else(
+                || b"none".to_vec(),
+                |root| std::os::unix::ffi::OsStringExt::into_vec(root.into_os_string()),
+            );
+            std::fs::write(output, root).unwrap();
+            return;
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let probe = |number: usize, cache: Option<&str>, home: Option<&str>| {
+            let output = scratch.path().join(format!("probe-{number}"));
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "directory::index::tests::indexed_folder_root_follows_the_environment",
+                    "--nocapture",
+                ])
+                .env(ROOT_PROBE, &output)
+                .env_remove("XDG_CACHE_HOME")
+                .env_remove("HOME");
+            if let Some(cache) = cache {
+                command.env("XDG_CACHE_HOME", cache);
+            }
+            if let Some(home) = home {
+                command.env("HOME", home);
+            }
+            assert!(command.status().unwrap().success());
+            String::from_utf8(std::fs::read(&output).unwrap()).unwrap()
+        };
+
+        assert_eq!(
+            probe(1, Some("/var/cache/me"), Some("/home/me")),
+            "/var/cache/me/musheen/directory-index"
+        );
+        assert_eq!(
+            probe(2, Some("relative/cache"), Some("/home/me")),
+            "/home/me/.cache/musheen/directory-index"
+        );
+        assert_eq!(
+            probe(3, None, Some("/home/me")),
+            "/home/me/.cache/musheen/directory-index"
+        );
+        assert_eq!(probe(4, None, None), "none");
     }
 
     #[test]

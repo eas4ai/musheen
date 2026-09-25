@@ -13,10 +13,34 @@ mod index;
 mod termination;
 pub(crate) use index::IndexedSelection;
 use index::{DiskDirectoryIndex, ResolvedIndexedSelection};
-pub(crate) use index::{directory_index_root, missing_index_root_error, sweep_stale_indexes};
-pub(crate) use termination::install_index_cleanup_on_termination;
+pub(crate) use index::{directory_index_root, missing_index_root_error};
+use index::sweep_stale_indexes;
+use termination::install_index_cleanup_on_termination;
 
 const MAX_RESIDENT_ITEMS: usize = 4_096;
+
+/// Makes `root` ready to hold this process's indexes: the termination
+/// watcher is installed, and the indexes an earlier process left behind
+/// are removed. Each root is prepared once per process; the removed
+/// directories are returned. A window's model construction calls it, so no
+/// window can index a folder under a root that was not prepared.
+pub(crate) fn prepare_index_root(root: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+    static PREPARED: std::sync::OnceLock<Mutex<std::collections::BTreeSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    let watcher = install_index_cleanup_on_termination();
+    let first_time = PREPARED
+        .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(root.to_path_buf());
+    let swept = if first_time {
+        sweep_stale_indexes(root)
+    } else {
+        Ok(Vec::new())
+    };
+    watcher?;
+    swept
+}
 
 type SharedIndex = Arc<Mutex<DiskDirectoryIndex>>;
 

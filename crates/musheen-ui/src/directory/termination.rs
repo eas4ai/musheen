@@ -40,7 +40,7 @@ fn install() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::index::DiskDirectoryIndex;
-    use super::install_index_cleanup_on_termination;
+    use super::super::prepare_index_root;
     use rustix::process::{Pid, Signal, kill_process};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::ExitStatusExt;
@@ -56,7 +56,8 @@ mod tests {
             // The child: hold a live index, tell the parent where it is, and
             // wait for the signal.
             let root = PathBuf::from(root);
-            install_index_cleanup_on_termination().unwrap();
+            // The same preparation a window's models go through.
+            prepare_index_root(&root).unwrap();
             let index = DiskDirectoryIndex::new_in(&root).unwrap();
             std::fs::write(root.join("ready"), index.path().as_os_str().as_bytes()).unwrap();
             std::thread::sleep(Duration::from_secs(30));
