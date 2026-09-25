@@ -17839,6 +17839,73 @@ mod tests {
         assert_eq!(selected_item_count(&app, cx), 1);
     }
 
+    // BROWSE-023: after the list is scrolled, a rubber band selects the rows
+    // it visibly covers, not the rows at the same distance from the top of an
+    // unscrolled list.
+    #[gpui_kit::test]
+    async fn rubber_band_after_scrolling_selects_the_rows_it_covers(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        for index in 0..100 {
+            filesystem::write(
+                temporary.path().join(format!("item-{index:03}.txt")),
+                b"item",
+            )
+            .unwrap();
+        }
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let tab_id = cx.read(|cx| app.read(cx).navigation.focused_tab().id());
+        let pitch = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                window.find("directory-item-0-1").bounds().top()
+                    - window.find("directory-item-0-0").bounds().top()
+            })
+            .unwrap();
+        assert!(pitch > px(0.), "two rendered rows give the row pitch");
+        app.update(cx, |state, _| {
+            state
+                .directory_scrolls
+                .get(&(tab_id, 0))
+                .expect("directory scroll handle exists")
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(px(0.), -(pitch * 10.) - px(5.)));
+        });
+        let (surface, row_12, row_13) = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.find("directory-items").bounds(),
+                    window.find("directory-item-0-12").bounds(),
+                    window.find("directory-item-0-13").bounds(),
+                )
+            })
+            .unwrap();
+        // Start in the margin left of the rows so no row consumes the press.
+        let margin = surface.left() + (row_12.left() - surface.left()) / 2.;
+        let start = point(margin, row_12.center().y);
+        let end = point(surface.left() + px(200.), row_13.center().y);
+
+        let mut visual = VisualTestContext::from_window(browser, cx);
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        visual.run_until_parked();
+
+        let selected = cx.read(|cx| {
+            let state = app.read(cx);
+            let ids = state.focused_directory().view().selected_ids().to_vec();
+            state
+                .filtered_items(tab_id)
+                .into_iter()
+                .filter(|item| ids.contains(item.id()))
+                .map(|item| item.display_name().as_str().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(selected, ["item-012.txt", "item-013.txt"]);
+    }
+
     #[gpui_kit::test]
     async fn dragging_the_directory_scrollbar_preserves_the_selection(cx: &mut TestAppContext) {
         let temporary = tempfile::tempdir().unwrap();
@@ -23672,6 +23739,97 @@ mod tests {
                     .iter()
                     .all(|entry| entry.captured_targets().is_empty()),
                 "an unresolved provider target must never acquire a fabricated local identity"
+            );
+        });
+    }
+
+    async fn open_app_with_external_directory(
+        cx: &mut TestAppContext,
+    ) -> (Entity<MusheenApp>, AnyWindowHandle, tempfile::TempDir, StorePath) {
+        cx.update(gpui_kit::init);
+        let temporary = tempfile::tempdir().unwrap();
+        let current = temporary.path().join("current");
+        let external = temporary.path().join("external");
+        filesystem::create_dir(&current).unwrap();
+        filesystem::create_dir(&external).unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(current, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.expect("test window constructs the application view");
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Empty
+        })
+        .await;
+        let location = StorePath::from_unix_path(external.as_os_str());
+        (app, browser, temporary, location)
+    }
+
+    fn dispatch_sidebar_menu_command(
+        state: &mut MusheenApp,
+        location: &StorePath,
+        command_id: &str,
+        cx: &mut Context<MusheenApp>,
+    ) {
+        let tab = state.navigation.focused_tab().id();
+        let identity = state
+            .store
+            .resolve_item(location)
+            .unwrap()
+            .expect("the sidebar location exists")
+            .id()
+            .clone();
+        let menu = state.sidebar_entry_context_menu(
+            tab,
+            MenuTarget::SidebarLocation,
+            location.clone(),
+            Some(identity),
+        );
+        let entry = MusheenApp::menu_entry_by_id(&menu, command_id)
+            .unwrap_or_else(|| panic!("the sidebar menu offers {command_id}"))
+            .clone();
+        state.dispatch_context_entry(entry, cx);
+    }
+
+    // UXF-012: a sidebar location's "Open in new tab" opens that location
+    // in a new tab of the focused pane instead of reaching an unreachable arm.
+    #[gpui_kit::test]
+    async fn sidebar_open_in_new_tab_opens_the_location_in_a_new_tab(cx: &mut TestAppContext) {
+        let (app, _browser, _temporary, location) = open_app_with_external_directory(cx).await;
+
+        app.update(cx, |state, cx| {
+            dispatch_sidebar_menu_command(state, &location, "directory.open_new_tab", cx);
+            let tabs = state.navigation.focused_pane().tabs();
+            assert_eq!(tabs.len(), 2, "a second tab opens in the focused pane");
+            assert!(
+                tabs.iter().any(|tab| tab.location() == &location),
+                "one tab shows the sidebar location"
+            );
+            assert!(
+                state.operation_error.is_none(),
+                "no error is shown: {:?}",
+                state.operation_error
+            );
+        });
+    }
+
+    // UXF-012: "Open" on a sidebar directory navigates the focused tab; it
+    // never asks the desktop application service to launch a directory.
+    #[gpui_kit::test]
+    async fn sidebar_open_navigates_the_focused_tab_to_the_location(cx: &mut TestAppContext) {
+        let (app, _browser, _temporary, location) = open_app_with_external_directory(cx).await;
+
+        app.update(cx, |state, cx| {
+            dispatch_sidebar_menu_command(state, &location, "file.open", cx);
+            assert_eq!(state.navigation.focused_tab().location(), &location);
+            assert_eq!(state.navigation.focused_pane().tabs().len(), 1);
+            assert!(
+                state.operation_error.is_none(),
+                "no error is shown: {:?}",
+                state.operation_error
             );
         });
     }
