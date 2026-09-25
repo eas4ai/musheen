@@ -479,6 +479,13 @@ impl DiskDirectoryIndex {
         self.scratch.path()
     }
 
+    /// Changes the mode of the index directory, so a test can make it refuse
+    /// new files.
+    #[cfg(test)]
+    pub(super) fn set_directory_mode(&self, mode: u32) -> io::Result<()> {
+        fs::set_permissions(self.scratch.path(), Permissions::from_mode(mode))
+    }
+
     pub(super) fn append(&mut self, item: &StoreItem, arrival: u64) -> io::Result<u64> {
         self.append_record(IndexRecord::from_item(item, arrival))
     }

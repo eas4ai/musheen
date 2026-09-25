@@ -1209,12 +1209,12 @@ where
         hub.persist_status();
         let hub = hub.clone();
         let on_finish = on_finish.clone();
-        let work = cx.background_spawn(async move { operation.execute_detailed() });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let outcome = result.as_ref().ok().cloned();
-            let failure = result.as_ref().err().cloned();
-            let finish = hub
+        let queue_hub = hub.clone();
+        let work = cx.background_spawn(async move {
+            let result = operation.execute_detailed();
+            // The queue's bookkeeping, including the stats that remember an
+            // undo candidate, stays off the UI thread.
+            let finish = queue_hub
                 .queue
                 .lock()
                 .map_err(|_| OperationHubError::QueueLock)
@@ -1229,6 +1229,12 @@ where
                     };
                     Ok(Some(state))
                 });
+            (result, finish)
+        });
+        cx.spawn(async move |this, cx| {
+            let (result, finish) = work.await;
+            let outcome = result.as_ref().ok().cloned();
+            let failure = result.as_ref().err().cloned();
             let status_result = hub
                 .status
                 .lock()

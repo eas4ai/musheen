@@ -629,6 +629,28 @@ impl CatalogBinding {
         })
     }
 
+    /// Applies a batch of watch observations in one catalog update: the
+    /// catalog file is locked and rewritten once for the batch.
+    pub(super) fn observe_batch(
+        &self,
+        observations: Vec<super::CatalogObservation>,
+    ) -> Result<(), Box<str>> {
+        self.update(|document| {
+            for observation in observations {
+                match observation {
+                    super::CatalogObservation::Present(id, path) => {
+                        TagService::new(document.tags_mut(), self.xattr_opt_in)
+                            .observe_present(&id, path);
+                    }
+                    super::CatalogObservation::Missing(id) => {
+                        TagService::new(document.tags_mut(), self.xattr_opt_in)
+                            .observe_missing(&id);
+                    }
+                }
+            }
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn cleanup_reviewed_orphans<'a>(
         &self,

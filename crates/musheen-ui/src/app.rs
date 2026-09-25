@@ -379,7 +379,12 @@ struct LocationFacts {
 
 #[derive(Clone, Debug)]
 struct LocationResolution {
+    /// The sidebar menu the resolution was probed for; a later menu asks
+    /// again, so a place whose target went away is seen as it is now.
+    menu_generation: u64,
     item: Option<StoreItem>,
+    /// What a link at the location leads to; `None` for a dangling link.
+    link_target: Option<StoreItem>,
     /// The item is a link whose target is gone.
     dead_link: bool,
 }
@@ -399,7 +404,7 @@ enum StoreProbeResult {
     },
     Location {
         location: StorePath,
-        facts: LocationFacts,
+        facts: Box<LocationFacts>,
     },
 }
 
@@ -427,6 +432,43 @@ impl MenuRecompose {
             Self::Request { target, .. } | Self::Sidebar { target, .. } => *target,
         }
     }
+}
+
+/// A command target the store confirmed off the UI thread: the item at the
+/// path and, for a link, what it leads to.
+#[derive(Clone, Debug)]
+struct ResolvedTarget {
+    item: StoreItem,
+    link_target: Option<StoreItem>,
+}
+
+impl ResolvedTarget {
+    /// A directory, or a link that leads to one. Sidebar places such as
+    /// $HOME/Desktop are often links, and they get the directory commands.
+    fn opens_as_directory(&self) -> bool {
+        match self.item.kind() {
+            ItemKind::Directory => true,
+            ItemKind::SymbolicLink => self
+                .link_target
+                .as_ref()
+                .is_some_and(|target| target.kind() == ItemKind::Directory),
+            ItemKind::RegularFile | ItemKind::Other => false,
+        }
+    }
+}
+
+/// The one directory a target-based command acts on: a single target that
+/// opens as a directory.
+fn single_directory_target(
+    targets: &[CommandTargetRef],
+    resolved: &[ResolvedTarget],
+) -> Option<StorePath> {
+    let ([target], [resolved]) = (targets, resolved) else {
+        return None;
+    };
+    resolved
+        .opens_as_directory()
+        .then(|| target.path().clone())
 }
 
 /// The probes a menu composition queued, and how to compose it again.
@@ -2839,7 +2881,7 @@ fn activate_notification_action(action: musheen_desktop::NotificationAction, cx:
             .is_ok_and(|status| status.entry(action.job_id()).is_some())
         {
             state.status_center_open = true;
-            state.refresh_undo_availability();
+            state.refresh_undo_availability(cx);
             cx.notify();
         }
     });
@@ -2930,20 +2972,23 @@ fn resolve_targets(
     targets: &[CommandTargetRef],
     verification: &str,
     changed: &str,
-) -> Result<Vec<StoreItem>, Box<str>> {
-    let mut items = Vec::with_capacity(targets.len());
+) -> Result<Vec<ResolvedTarget>, Box<str>> {
+    let mut resolved = Vec::with_capacity(targets.len());
     for target in targets {
         let current = store
             .resolve_item(target.path())
             .map_err(|error| Box::<str>::from(format!("{verification}: {error}")))?;
         match current {
             Some(item) if item.id() == target.id() && item.path() == target.path() => {
-                items.push(item);
+                let link_target = (item.kind() == ItemKind::SymbolicLink)
+                    .then(|| store.resolve_link_target(item.path()).ok().flatten())
+                    .flatten();
+                resolved.push(ResolvedTarget { item, link_target });
             }
             _ => return Err(Box::<str>::from(changed)),
         }
     }
-    Ok(items)
+    Ok(resolved)
 }
 
 /// Asks the store one of a menu's questions. Runs on a background thread.
@@ -2967,23 +3012,27 @@ fn run_store_probe(
             });
             let resolution = resolve.then(|| {
                 let item = store.resolve_item(&location).ok().flatten();
-                let dead_link = item.as_ref().is_some_and(|item| {
-                    item.kind() == ItemKind::SymbolicLink
-                        && store
-                            .resolve_link_target(item.path())
-                            .ok()
-                            .flatten()
-                            .is_none()
-                });
-                LocationResolution { item, dead_link }
+                let is_link = item
+                    .as_ref()
+                    .is_some_and(|item| item.kind() == ItemKind::SymbolicLink);
+                let link_target = item
+                    .as_ref()
+                    .filter(|_| is_link)
+                    .and_then(|item| store.resolve_link_target(item.path()).ok().flatten());
+                LocationResolution {
+                    menu_generation: 0,
+                    item,
+                    dead_link: is_link && link_target.is_none(),
+                    link_target,
+                }
             });
             StoreProbeResult::Location {
                 location,
-                facts: LocationFacts {
+                facts: Box::new(LocationFacts {
                     capabilities,
                     writable,
                     resolution,
-                },
+                }),
             }
         }
     }
@@ -3546,6 +3595,17 @@ struct MusheenApp {
     pending_directory_restores: HashMap<TabId, PendingDirectoryRestore>,
     pending_context_menu: Option<ContextMenu>,
     pending_indexed_context_menu: Option<DeferredIndexedContextMenu>,
+    /// Tabs whose index is merging a batch of changes right now.
+    index_merges_running: std::collections::HashSet<TabId>,
+    /// Changes that arrived while a tab's index was merging; the next
+    /// merge takes them as one batch.
+    pending_index_events: HashMap<TabId, Vec<WatchEvent>>,
+    /// How many index merges this window started; tests count batches by it.
+    #[cfg(test)]
+    index_merges_started: usize,
+    /// Counts the sidebar menus opened; a place's resolution is probed once
+    /// per menu.
+    sidebar_menu_generation: u64,
     /// Executable states by item, answered by background probes.
     executable_facts: HashMap<ItemId, Option<CapabilityState>>,
     /// Location facts by location, answered by background probes.
@@ -4307,6 +4367,11 @@ impl MusheenApp {
             pending_directory_restores: HashMap::new(),
             pending_context_menu: None,
             pending_indexed_context_menu: None,
+            index_merges_running: std::collections::HashSet::new(),
+            pending_index_events: HashMap::new(),
+            #[cfg(test)]
+            index_merges_started: 0,
+            sidebar_menu_generation: 0,
             executable_facts: HashMap::new(),
             location_facts: HashMap::new(),
             composing_menu: std::cell::Cell::new(false),
@@ -4367,7 +4432,7 @@ impl MusheenApp {
                         state.operation_status_revision = revision;
                         state.sync_operation_persistence_error();
                         if state.status_center_open {
-                            state.refresh_undo_availability();
+                            state.refresh_undo_availability(cx);
                         }
                         changed = true;
                     }
@@ -4381,9 +4446,7 @@ impl MusheenApp {
                             checked.elapsed() >= UNDO_AVAILABILITY_REFRESH_INTERVAL
                         })
                     {
-                        let previous = std::mem::take(&mut state.undo_available);
-                        state.refresh_undo_availability();
-                        changed |= state.undo_available != previous;
+                        state.refresh_undo_availability(cx);
                     }
                     if changed {
                         cx.notify();
@@ -4450,6 +4513,8 @@ impl MusheenApp {
                 this.update(cx, |state, cx| {
                     if update.model().revision() != state.volume_revision {
                         state.volume_revision = update.model().revision();
+                        // A mount change can change what a location allows.
+                        state.location_facts.clear();
                         state.sync_volume_projection_from(update.model(), cx);
                         cx.notify();
                     }
@@ -4546,6 +4611,8 @@ impl MusheenApp {
     fn start_load_for_tab(&mut self, tab_id: TabId, location: StorePath, cx: &mut Context<Self>) {
         self.pending_directory_restores.remove(&tab_id);
         self.indexed_viewports.remove(&tab_id);
+        // A refresh or a navigation asks the store about the location again.
+        self.location_facts.remove(&location);
         if let Err(error) = self.validate_elevated_location(&location) {
             self.operation_error = Some(localized_privilege_error(&self.catalog, &error));
             cx.notify();
@@ -4754,6 +4821,15 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let observed = event.clone();
+        if let WatchEvent::Removed(id) = &event
+            && let Some(path) = self
+                .directories
+                .get(&tab_id)
+                .and_then(|directory| directory.view().item(id))
+                .map(|item| item.path().clone())
+        {
+            self.location_facts.remove(&path);
+        }
         self.forget_store_facts(&event);
         let applied = self
             .directories
@@ -4769,22 +4845,30 @@ impl MusheenApp {
     /// catalog update takes the catalog file's lock, which another process
     /// may hold.
     fn observe_watch_event(&mut self, event: WatchEvent, cx: &mut Context<Self>) {
-        let observation = match event {
-            WatchEvent::Created(item)
-            | WatchEvent::Changed(item)
-            | WatchEvent::Renamed { item, .. } => {
-                CatalogObservation::Present(item.id().clone(), item.path().clone())
-            }
-            WatchEvent::Removed(item) => CatalogObservation::Missing(item),
-            WatchEvent::Invalidated { .. } => return,
-        };
+        self.observe_watch_events(vec![event], cx);
+    }
+
+    /// As `observe_watch_event`, for a batch of events: the catalog is
+    /// locked and rewritten once for the whole batch.
+    fn observe_watch_events(&mut self, events: Vec<WatchEvent>, cx: &mut Context<Self>) {
+        let observations = events
+            .into_iter()
+            .filter_map(|event| match event {
+                WatchEvent::Created(item)
+                | WatchEvent::Changed(item)
+                | WatchEvent::Renamed { item, .. } => Some(CatalogObservation::Present(
+                    item.id().clone(),
+                    item.path().clone(),
+                )),
+                WatchEvent::Removed(item) => Some(CatalogObservation::Missing(item)),
+                WatchEvent::Invalidated { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if observations.is_empty() {
+            return;
+        }
         let binding = self.catalog_binding.clone();
-        let work = cx.background_spawn(async move {
-            match observation {
-                CatalogObservation::Present(id, path) => binding.observe_present(&id, path),
-                CatalogObservation::Missing(id) => binding.observe_missing(&id),
-            }
-        });
+        let work = cx.background_spawn(async move { binding.observe_batch(observations) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let Some(this) = this.upgrade() else {
@@ -4808,40 +4892,22 @@ impl MusheenApp {
         event: WatchEvent,
         cx: &mut Context<Self>,
     ) {
-        let filter = self
-            .filters
-            .get(&tab_id)
-            .and_then(|active| active.filter.clone());
-        if let Some(work) = self
+        let indexed = self
             .directories
             .get(&tab_id)
-            .and_then(|directory| directory.prepare_index_watch_event(&load, event.clone(), filter))
-        {
-            let task = cx.background_spawn(async move { work.run() });
-            cx.spawn(async move |this, cx| {
-                let result = task.await;
-                let succeeded = result.is_ok();
-                let Some(this) = this.upgrade() else {
-                    return;
-                };
-                this.update(cx, |state, cx| {
-                    let applied = state
-                        .directories
-                        .get_mut(&tab_id)
-                        .is_some_and(|directory| directory.finish_index_watch_event(&load, result));
-                    if !applied {
-                        return;
-                    }
-                    if succeeded {
-                        state.forget_store_facts(&event);
-                        state.observe_watch_event(event, cx);
-                        state.indexed_viewports.remove(&tab_id);
-                    }
-                    state.continue_watch(tab_id, load, watcher, cx);
-                    cx.notify();
-                });
-            })
-            .detach();
+            .is_some_and(|directory| directory.is_current(&load) && directory.is_indexed());
+        if indexed && !matches!(event, WatchEvent::Invalidated { .. }) {
+            if self.index_merges_running.contains(&tab_id) {
+                // A merge is running; this change joins the next batch.
+                self.pending_index_events
+                    .entry(tab_id)
+                    .or_default()
+                    .push(event);
+            } else {
+                self.start_index_merge(tab_id, load.clone(), vec![event], cx);
+            }
+            // The watcher keeps delivering while the merge runs.
+            self.continue_watch(tab_id, load, watcher, cx);
             return;
         }
         let invalidated = matches!(event, WatchEvent::Invalidated { .. });
@@ -4853,6 +4919,78 @@ impl MusheenApp {
             }
             cx.notify();
         }
+    }
+
+    /// Merges a batch of changes into the tab's index off the UI thread.
+    /// Changes that arrive while it runs wait and go into the next batch.
+    fn start_index_merge(
+        &mut self,
+        tab_id: TabId,
+        load: DirectoryLoad,
+        events: Vec<WatchEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let filter = self
+            .filters
+            .get(&tab_id)
+            .and_then(|active| active.filter.clone());
+        let Some(work) = self.directories.get(&tab_id).and_then(|directory| {
+            directory.prepare_index_watch_events(&load, events.clone(), filter)
+        }) else {
+            self.pending_index_events.remove(&tab_id);
+            return;
+        };
+        self.index_merges_running.insert(tab_id);
+        #[cfg(test)]
+        {
+            self.index_merges_started += 1;
+        }
+        let task = cx.background_spawn(async move { work.run() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let succeeded = result.is_ok();
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.index_merges_running.remove(&tab_id);
+                let applied = state
+                    .directories
+                    .get_mut(&tab_id)
+                    .is_some_and(|directory| directory.finish_index_watch_event(&load, result));
+                if !applied {
+                    // The folder was reloaded under the merge; the waiting
+                    // changes belong to the old load.
+                    state.pending_index_events.remove(&tab_id);
+                    return;
+                }
+                // A failed merge keeps the shown items; the error is shown.
+                let index_error = state
+                    .directories
+                    .get(&tab_id)
+                    .and_then(|directory| directory.index_error())
+                    .map(Box::<str>::from);
+                if let Some(error) = index_error {
+                    state.operation_error = Some(error);
+                }
+                if succeeded {
+                    for event in &events {
+                        state.forget_store_facts(event);
+                    }
+                    state.observe_watch_events(events, cx);
+                    state.indexed_viewports.remove(&tab_id);
+                }
+                cx.notify();
+                let pending = state
+                    .pending_index_events
+                    .remove(&tab_id)
+                    .unwrap_or_default();
+                if !pending.is_empty() {
+                    state.start_index_merge(tab_id, load, pending, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn schedule_index_order(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
@@ -5939,14 +6077,41 @@ impl MusheenApp {
         if targets.len() == 1 && self.open_volume_properties_target(&targets[0], cx) {
             return;
         }
+        // The capability probes run off the UI thread; the window opens when
+        // they answer.
+        let store = Arc::clone(&self.store);
+        let probed = targets.to_vec();
+        let work = cx.background_spawn(async move {
+            probed
+                .iter()
+                .map(|target| store.capabilities(target.path()))
+                .collect::<Vec<_>>()
+        });
+        let targets = targets.to_vec();
+        cx.spawn(async move |this, cx| {
+            let capabilities = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.open_properties_targets_with_capabilities(&targets, capabilities, page, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn open_properties_targets_with_capabilities(
+        &mut self,
+        targets: &[CommandTargetRef],
+        capabilities: Vec<musheen_core::CapabilityMatrix>,
+        page: PropertiesPage,
+        cx: &mut Context<Self>,
+    ) {
         let tag_targets = targets
             .iter()
-            .map(|target| {
-                (
-                    target.id().clone(),
-                    target.path().clone(),
-                    self.store.capabilities(target.path()),
-                )
+            .zip(capabilities)
+            .map(|(target, capabilities)| {
+                (target.id().clone(), target.path().clone(), capabilities)
             })
             .collect::<Vec<TagTarget>>();
         let provider_targets = targets
@@ -7561,6 +7726,7 @@ impl MusheenApp {
                 .location_facts
                 .get(&location)
                 .and_then(|facts| facts.resolution.as_ref())
+                .filter(|resolution| resolution.menu_generation == self.sidebar_menu_generation)
             {
                 Some(resolution) => (resolution.item.clone(), resolution.dead_link),
                 None => {
@@ -7610,6 +7776,43 @@ impl MusheenApp {
             identity,
         });
         self.compose_context_request(request)
+    }
+
+    /// Marks the start of a new sidebar menu: the place is resolved again
+    /// for it, so a link whose target went away offers nothing.
+    fn begin_sidebar_menu(&mut self) {
+        self.sidebar_menu_generation = self.sidebar_menu_generation.wrapping_add(1);
+    }
+
+    /// A directory, or a link the cached resolution says leads to one. A
+    /// link the store has not been asked about is probed and read as a file
+    /// until the answer arrives.
+    fn opens_as_directory_by_facts(&self, item: &StoreItem) -> bool {
+        match item.kind() {
+            ItemKind::Directory => true,
+            ItemKind::SymbolicLink => match self
+                .location_facts
+                .get(item.path())
+                .and_then(|facts| facts.resolution.as_ref())
+                .filter(|resolution| resolution.menu_generation == self.sidebar_menu_generation)
+            {
+                Some(resolution) => resolution
+                    .link_target
+                    .as_ref()
+                    .is_some_and(|target| target.kind() == ItemKind::Directory),
+                None => {
+                    self.queue_store_probe(
+                        StoreProbe::Location {
+                            location: item.path().clone(),
+                            resolve: true,
+                        },
+                        true,
+                    );
+                    false
+                }
+            },
+            ItemKind::RegularFile | ItemKind::Other => false,
+        }
     }
 
     /// The reason a menu shows for a fact the store has not answered yet.
@@ -7726,24 +7929,34 @@ impl MusheenApp {
     }
 
     fn apply_store_probe_results(&mut self, results: Vec<StoreProbeResult>) {
+        // A full cache starts over once, before the batch, so no answer in
+        // the batch is dropped by a later one.
+        if self.executable_facts.len() >= EXECUTABLE_FACTS_LIMIT {
+            self.executable_facts.clear();
+        }
+        if self.location_facts.len() >= LOCATION_FACTS_LIMIT {
+            self.location_facts.clear();
+        }
         for result in results {
             match result {
                 StoreProbeResult::Executable { id, state } => {
-                    if self.executable_facts.len() >= EXECUTABLE_FACTS_LIMIT {
-                        self.executable_facts.clear();
-                    }
                     self.executable_facts.insert(id, state);
                 }
                 StoreProbeResult::Location { location, facts } => {
-                    if self.location_facts.len() >= LOCATION_FACTS_LIMIT {
-                        self.location_facts.clear();
-                    }
-                    // A resolution the new facts lack is kept from the old.
-                    let resolution = facts.resolution.or_else(|| {
-                        self.location_facts
-                            .get(&location)
-                            .and_then(|old| old.resolution.clone())
-                    });
+                    let facts = *facts;
+                    // A resolution belongs to the menu that asked for it; one
+                    // the new facts lack is kept from the old.
+                    let resolution = facts
+                        .resolution
+                        .map(|mut resolution| {
+                            resolution.menu_generation = self.sidebar_menu_generation;
+                            resolution
+                        })
+                        .or_else(|| {
+                            self.location_facts
+                                .get(&location)
+                                .and_then(|old| old.resolution.clone())
+                        });
                     self.location_facts.insert(
                         location,
                         LocationFacts {
@@ -8360,7 +8573,7 @@ impl MusheenApp {
             CommandTarget::Mount
         } else if target == MenuTarget::SidebarLocation
             && (selected_is_pinned || selection.len() == 1)
-            && selected_item.is_none_or(|item| self.opens_as_directory(item))
+            && selected_item.is_none_or(|item| self.opens_as_directory_by_facts(item))
         {
             CommandTarget::Directory
         } else if target == MenuTarget::SidebarLocation && selected_item.is_none() {
@@ -9891,7 +10104,39 @@ impl MusheenApp {
             }
             _ => unreachable!("the caller accepts only target-based commands"),
         };
-        if let Some(location) = self.single_directory_target(origin_tab, targets) {
+        let action = *action;
+        let parameters = parameters.clone();
+        self.with_revalidated_targets(
+            origin_tab,
+            targets.clone(),
+            cx,
+            move |this, targets, resolved, cx| {
+                this.dispatch_local_target_command_revalidated(
+                    &action,
+                    &parameters,
+                    targets,
+                    &resolved,
+                    origin_tab,
+                    cx,
+                );
+            },
+        );
+    }
+
+    /// The rest of a local target command, once the store confirmed the
+    /// targets. A single directory target takes the directory commands
+    /// without asking the store again: the resolution carries what a link
+    /// leads to.
+    fn dispatch_local_target_command_revalidated(
+        &mut self,
+        action: &CommandAction,
+        parameters: &CommandParameters,
+        targets: &[CommandTargetRef],
+        resolved: &[ResolvedTarget],
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(location) = single_directory_target(targets, resolved) {
             let handled = match action {
                 CommandAction::Open => {
                     if let Some(tab_id) = origin_tab
@@ -9944,34 +10189,6 @@ impl MusheenApp {
                 return;
             }
         }
-        let action = *action;
-        let parameters = parameters.clone();
-        self.with_revalidated_targets(
-            origin_tab,
-            targets.clone(),
-            cx,
-            move |this, targets, _, cx| {
-                this.dispatch_local_target_command_revalidated(
-                    &action,
-                    &parameters,
-                    targets,
-                    origin_tab,
-                    cx,
-                );
-            },
-        );
-    }
-
-    /// The rest of a local target command, once the store confirmed the
-    /// targets.
-    fn dispatch_local_target_command_revalidated(
-        &mut self,
-        action: &CommandAction,
-        parameters: &CommandParameters,
-        targets: &[CommandTargetRef],
-        origin_tab: Option<TabId>,
-        cx: &mut Context<Self>,
-    ) {
         if matches!(
             action,
             CommandAction::Open
@@ -10084,46 +10301,6 @@ impl MusheenApp {
     /// is a resident item of the origin tab (a content row) or a location the
     /// store resolves directly (a sidebar entry). The stable identity must
     /// match in both cases.
-    fn single_directory_target(
-        &self,
-        origin_tab: Option<TabId>,
-        targets: &[CommandTargetRef],
-    ) -> Option<StorePath> {
-        let [target] = targets else {
-            return None;
-        };
-        let resident = origin_tab
-            .and_then(|tab| self.directories.get(&tab))
-            .and_then(|directory| directory.view().item(target.id()))
-            .map(|item| item.path() == target.path() && self.opens_as_directory(item));
-        let is_directory = match resident {
-            Some(resident) => resident,
-            None => self
-                .store
-                .resolve_item(target.path())
-                .ok()
-                .flatten()
-                .is_some_and(|item| item.id() == target.id() && self.opens_as_directory(&item)),
-        };
-        is_directory.then(|| target.path().clone())
-    }
-
-    /// A directory, or a symbolic link that leads to one. Sidebar places
-    /// such as $HOME/Desktop are often links, and the sidebar menu offers
-    /// them the directory commands.
-    fn opens_as_directory(&self, item: &StoreItem) -> bool {
-        match item.kind() {
-            ItemKind::Directory => true,
-            ItemKind::SymbolicLink => self
-                .store
-                .resolve_link_target(item.path())
-                .ok()
-                .flatten()
-                .is_some_and(|target| target.kind() == ItemKind::Directory),
-            ItemKind::RegularFile | ItemKind::Other => false,
-        }
-    }
-
     fn launch_external_terminal(&mut self, location: StorePath, cx: &mut Context<Self>) {
         if self.open_terminal_embedded {
             let next = location.as_unix_path().map(Path::to_path_buf);
@@ -11223,27 +11400,39 @@ impl MusheenApp {
         target: &CommandTargetRef,
         cx: &mut Context<Self>,
     ) {
-        let result = if action == CommandAction::Pin {
-            let item = target.id().clone();
-            let path = target.path().clone();
-            let label = DisplayPath::from_store_path(target.path())
-                .as_str()
-                .to_owned();
-            self.catalog_binding.update(|document| {
-                let _ = document.pins_mut().pin(item, path, label);
-            })
-        } else {
-            let item = target.id().clone();
-            self.catalog_binding.update(|document| {
-                document.pins_mut().unpin(&item);
-            })
-        };
-        if let Err(error) = result {
-            self.operation_error = Some(error);
-        } else {
-            self.sync_catalog_projection();
-        }
-        cx.notify();
+        // The catalog file is locked and rewritten off the UI thread.
+        let binding = self.catalog_binding.clone();
+        let item = target.id().clone();
+        let path = target.path().clone();
+        let label = DisplayPath::from_store_path(target.path())
+            .as_str()
+            .to_owned();
+        let work = cx.background_spawn(async move {
+            if action == CommandAction::Pin {
+                binding.update(|document| {
+                    let _ = document.pins_mut().pin(item, path, label);
+                })
+            } else {
+                binding.update(|document| {
+                    document.pins_mut().unpin(&item);
+                })
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    state.operation_error = Some(error);
+                } else {
+                    state.sync_catalog_projection();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn dispatch_manage_tags(
@@ -11263,7 +11452,7 @@ impl MusheenApp {
         &self,
         origin_tab: Option<TabId>,
         targets: &[CommandTargetRef],
-    ) -> Result<Vec<StoreItem>, Box<str>> {
+    ) -> Result<Vec<ResolvedTarget>, Box<str>> {
         self.check_cached_targets(origin_tab, targets)?;
         resolve_targets(
             &*self.store,
@@ -11310,15 +11499,15 @@ impl MusheenApp {
     }
 
     /// Checks the targets against the store off the UI thread, then runs
-    /// `then` with them and the items the store resolved. A target that is
-    /// gone or replaced is refused with the menu's own messages. Without an
-    /// origin tab there is nothing to compare, as before.
+    /// `then` with them and what the store resolved. A target that is gone
+    /// or replaced is refused with the menu's own messages.
     fn with_revalidated_targets(
         &mut self,
         origin_tab: Option<TabId>,
         targets: Vec<CommandTargetRef>,
         cx: &mut Context<Self>,
-        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<StoreItem>, &mut Context<Self>) + 'static,
+        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<ResolvedTarget>, &mut Context<Self>)
+        + 'static,
     ) {
         self.with_revalidated_targets_or(
             origin_tab,
@@ -11340,14 +11529,11 @@ impl MusheenApp {
         targets: Vec<CommandTargetRef>,
         cx: &mut Context<Self>,
         on_error: impl FnOnce(&mut Self, Box<str>, &mut Context<Self>) + 'static,
-        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<StoreItem>, &mut Context<Self>) + 'static,
+        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<ResolvedTarget>, &mut Context<Self>)
+        + 'static,
     ) {
         if let Err(error) = self.check_cached_targets(origin_tab, &targets) {
             on_error(self, error, cx);
-            return;
-        }
-        if origin_tab.is_none() {
-            then(self, &targets, Vec::new(), cx);
             return;
         }
         let store = Arc::clone(&self.store);
@@ -11416,7 +11602,7 @@ impl MusheenApp {
             targets.to_vec(),
             cx,
             move |this, _, items, cx| {
-                let Some(item) = items.into_iter().next() else {
+                let Some(item) = items.into_iter().next().map(|resolved| resolved.item) else {
                     return;
                 };
                 if item.kind() != ItemKind::RegularFile {
@@ -13952,6 +14138,7 @@ impl MusheenApp {
                                                 if !this.context_dialog_windows.is_empty() {
                                                     return;
                                                 }
+                                                this.begin_sidebar_menu();
                                                 let menu = this.sidebar_entry_context_menu(
                                                     sidebar_tab,
                                                     if kind == SidebarSectionKind::Tags {
@@ -16834,18 +17021,36 @@ impl MusheenApp {
             .unwrap_or_default()
     }
 
-    fn refresh_undo_availability(&mut self) {
-        self.undo_available = self
+    /// Recomputes which finished jobs can be undone, off the UI thread: the
+    /// checks stat the original locations and the trash records.
+    fn refresh_undo_availability(&mut self, cx: &mut Context<Self>) {
+        self.undo_availability_checked_at = Some(Instant::now());
+        let candidates = self
             .operation_status_entries()
             .into_iter()
-            .filter(|entry| {
-                entry.status() == OperationStatus::Completed
-                    && self.operation_hub.has_undo_candidate(entry.id())
-                    && self.operation_hub.can_undo(entry.id())
-            })
+            .filter(|entry| entry.status() == OperationStatus::Completed)
             .map(|entry| entry.id())
-            .collect();
-        self.undo_availability_checked_at = Some(Instant::now());
+            .collect::<Vec<_>>();
+        let hub = self.operation_hub.clone();
+        let work = cx.background_spawn(async move {
+            candidates
+                .into_iter()
+                .filter(|id| hub.has_undo_candidate(*id) && hub.can_undo(*id))
+                .collect::<HashSet<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let available = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if state.undo_available != available {
+                    state.undo_available = available;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn record_operation_control_error(
@@ -16894,7 +17099,7 @@ impl MusheenApp {
         if self.record_operation_control_error(result, cx) {
             self.pump_operation_queue(cx);
         }
-        self.refresh_undo_availability();
+        self.refresh_undo_availability(cx);
     }
 
     fn resume_recovery_operation(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
@@ -17454,7 +17659,7 @@ impl Render for MusheenApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.status_center_open = !this.status_center_open;
                                 if this.status_center_open {
-                                    this.refresh_undo_availability();
+                                    this.refresh_undo_availability(cx);
                                 } else {
                                     this.undo_available.clear();
                                     this.undo_availability_checked_at = None;
@@ -30182,6 +30387,183 @@ mod tests {
                 !cx.theme().mode.is_dark(),
                 "a window that prefers light gets the light fallback"
             );
+        });
+    }
+
+    /// The items a test adds to a folder after it is open, as the watcher
+    /// would report them.
+    fn late_items(folder: &Path, count: usize) -> Vec<StoreItem> {
+        (0..count)
+            .map(|number| {
+                let path = folder.join(format!("late-{number}.txt"));
+                filesystem::write(&path, b"late").unwrap();
+                LocalStore::new()
+                    .resolve_item(&StorePath::from_unix_path(path.as_os_str().to_owned()))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_merge_batches_the_changes_that_arrive_while_one_runs(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = write_large_folder(&[]);
+        let (app, browser, tab_id, _index_root) =
+            open_large_folder(temporary.path(), Layout::List, cx).await;
+        let items = late_items(temporary.path(), 3);
+        let before = cx.read(|cx| app.read(cx).focused_directory().indexed_count());
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.index_merges_started = 0;
+                let load = state.focused_directory().current_load().unwrap();
+                for item in &items {
+                    state.handle_watch_event(
+                        tab_id,
+                        load.clone(),
+                        Box::new(StalledWatch),
+                        WatchEvent::Created(item.clone()),
+                        cx,
+                    );
+                }
+                assert!(
+                    state.index_merges_running.contains(&tab_id),
+                    "the first change starts a merge"
+                );
+                assert_eq!(
+                    state.pending_index_events.get(&tab_id).map_or(0, Vec::len),
+                    2,
+                    "the changes that arrive while it runs wait for the next merge"
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
+                assert_eq!(
+                    state.index_merges_started, 2,
+                    "one merge for the first change and one for the two that waited"
+                );
+                assert_eq!(state.focused_directory().indexed_count(), before + 3);
+                assert!(!state.index_merges_running.contains(&tab_id));
+                assert!(
+                    state
+                        .pending_index_events
+                        .get(&tab_id)
+                        .is_none_or(Vec::is_empty)
+                );
+                assert_eq!(state.operation_error, None);
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_merge_failure_is_reported_by_the_window(cx: &mut TestAppContext) {
+        let temporary = write_large_folder(&[]);
+        let (app, browser, tab_id, _index_root) =
+            open_large_folder(temporary.path(), Layout::List, cx).await;
+        let item = late_items(temporary.path(), 1).remove(0);
+        let before = cx.read(|cx| app.read(cx).focused_directory().indexed_count());
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                // The index directory stops accepting new files, so the merge
+                // cannot write the new order.
+                state
+                    .focused_directory()
+                    .set_index_directory_mode(0o500)
+                    .unwrap();
+                let load = state.focused_directory().current_load().unwrap();
+                state.handle_watch_event(
+                    tab_id,
+                    load,
+                    Box::new(StalledWatch),
+                    WatchEvent::Created(item),
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
+                state
+                    .focused_directory()
+                    .set_index_directory_mode(0o700)
+                    .unwrap();
+                assert_eq!(
+                    state.focused_directory().state(),
+                    &DirectoryState::Ready,
+                    "the items already shown stay on screen"
+                );
+                assert_eq!(state.focused_directory().indexed_count(), before);
+                assert!(
+                    state
+                        .operation_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Directory index failed")),
+                    "the failed merge is reported to the window: {:?}",
+                    state.operation_error
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    // UXF-012 through the caches: a sidebar place is resolved again for each
+    // menu, so a link whose target went away after the first menu offers
+    // nothing on the next one.
+    #[gpui_kit::test]
+    async fn sidebar_place_that_becomes_a_dangling_link_offers_nothing_on_the_next_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, _browser, temporary, location) =
+            open_app_with_external_location(ExternalLocation::LinkToDirectory, cx).await;
+        let compose = |state: &mut MusheenApp| {
+            let tab = state.navigation.focused_tab().id();
+            state.sidebar_entry_context_menu(tab, MenuTarget::SidebarLocation, location.clone(), None)
+        };
+
+        app.update(cx, |state, cx| {
+            state.begin_sidebar_menu();
+            compose(state);
+            assert!(state.run_pending_menu_probes(cx));
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
+            let menu = compose(state);
+            assert!(
+                MusheenApp::menu_entry_by_id(&menu, "directory.open_new_tab")
+                    .is_some_and(|entry| entry.state().is_enabled()),
+                "a live link to a directory offers the directory commands"
+            );
+        });
+
+        filesystem::remove_dir(temporary.path().join("real-external")).unwrap();
+        app.update(cx, |state, cx| {
+            state.begin_sidebar_menu();
+            compose(state);
+            assert!(
+                state.run_pending_menu_probes(cx),
+                "the next menu asks the store about the place again"
+            );
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
+            let menu = compose(state);
+            for command in [
+                "file.open",
+                "directory.open_new_tab",
+                "directory.open_new_window",
+            ] {
+                let enabled = MusheenApp::menu_entry_by_id(&menu, command)
+                    .is_some_and(|entry| entry.state().is_enabled());
+                assert!(!enabled, "{command} must not be offered on a dangling link");
+            }
         });
     }
 }

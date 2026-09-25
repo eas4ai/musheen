@@ -244,7 +244,7 @@ impl TrashUndo {
     /// Remembers the undo from the job's own receipt. The receipt names the
     /// trash record, so one record is checked and the trash is never listed.
     fn from_completed(receipt: TrashReceipt) -> Option<Self> {
-        if !crate::mutation::trash_record_present(&receipt) {
+        if !crate::mutation::trash_record_matches(&receipt) {
             return None;
         }
         let mut store = LocalStore::new();
@@ -271,7 +271,7 @@ impl TrashUndo {
             MutationProvider::identity(&mut store, &self.original_parent),
             Ok(Some(identity)) if identity == self.expected_parent_identity
         ) && writable_directory(&self.original_parent).is_ok()
-            && crate::mutation::trash_record_present(&self.receipt)
+            && crate::mutation::trash_record_matches(&self.receipt)
     }
 }
 
@@ -2314,7 +2314,11 @@ mod tests {
 
         queue.keep_source_after_metadata_review(id).unwrap();
 
-        assert_eq!(queue.state(id), Some(JobState::Cancelled));
+        assert_eq!(
+            queue.state(id),
+            None,
+            "the cancelled job keeps no scheduler record"
+        );
         assert!(!queue.can_confirm_metadata_loss(id));
         assert!(queue.start_ready().unwrap().is_empty());
     }
@@ -3089,5 +3093,59 @@ mod tests {
             0,
             "finished jobs keep no scheduler record"
         );
+    }
+
+    #[test]
+    fn trash_undo_is_not_offered_for_a_record_reused_by_another_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let documents = temporary.path().join("documents");
+        let downloads = temporary.path().join("downloads");
+        fs::create_dir(&documents).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        let first_path = documents.join("notes.txt");
+        fs::write(&first_path, b"first").unwrap();
+        let first = StorePath::from_unix_path(first_path.as_os_str());
+        let mut store = LocalStore::new();
+        let identity = MutationProvider::identity(&mut store, &first)
+            .unwrap()
+            .unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let job = queue
+            .submit_trash(vec![DeleteTarget::new(first, identity.into_vec())])
+            .unwrap()[0];
+        let LocalOperationOutcome::Trash(receipt) = finish_one(&mut queue) else {
+            panic!("trash produces a receipt");
+        };
+        assert!(queue.can_undo(job));
+
+        // Empty Trash frees the record's name, and another file of the same
+        // name takes it.
+        store.purge_trash(std::slice::from_ref(&receipt)).unwrap();
+        let second_path = downloads.join("notes.txt");
+        fs::write(&second_path, b"second").unwrap();
+        let second = StorePath::from_unix_path(second_path.as_os_str());
+        let identity = MutationProvider::identity(&mut store, &second)
+            .unwrap()
+            .unwrap();
+        let second = execute_delete(
+            &mut store,
+            vec![DeleteTarget::new(second, identity.into_vec())],
+        )
+        .unwrap()
+        .trashed()[0]
+            .clone();
+        assert_eq!(
+            second.provider_reference(),
+            receipt.provider_reference(),
+            "the trash reuses the freed record name"
+        );
+
+        assert!(
+            !queue.can_undo(job),
+            "the first job's undo is not offered on another file's record"
+        );
+        assert!(queue.submit_undo(job).is_err());
+        assert!(!second_path.exists(), "the other file stays in the trash");
+        store.purge_trash(&[second]).unwrap();
     }
 }
