@@ -14496,16 +14496,11 @@ impl MusheenApp {
                 // A uniform list never records child bounds, so the scroll
                 // handle's logical top is always item zero. Derive the first
                 // visible row from the raw scroll offset and the row pitch.
-                let (first_visible_row, first_item_offset) = {
-                    let scrolled = -rubber_band_scroll.0.borrow().base_handle.offset().y;
-                    let row_pitch = match layout {
-                        Layout::Cards | Layout::Grid | Layout::Adaptive => {
-                            px(RUBBER_BAND_GRID_ROW_HEIGHT)
-                        }
-                        Layout::Details | Layout::List | Layout::Columns => list_row_height,
-                    };
-                    rubber_band_scroll_position(scrolled, row_pitch)
-                };
+                let (first_visible_row, first_item_offset) = rubber_band_scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .logical_scroll_top();
                 let first_item_index = match layout {
                     Layout::Cards | Layout::Grid | Layout::Adaptive => {
                         first_visible_row.saturating_mul(grid_columns)
@@ -17973,7 +17968,7 @@ mod tests {
                 .0
                 .borrow()
                 .base_handle
-                .set_offset(point(px(0.), -(pitch * 10.) - px(5.)));
+                .set_offset(point(px(0.), -(pitch * 10.) - pitch / 2.));
         });
         let (surface, row_12, row_13) = cx
             .update_window(browser, |_, window, cx| {
@@ -17986,9 +17981,12 @@ mod tests {
             })
             .unwrap();
         // Start in the margin left of the rows so no row consumes the press.
+        // Both edges sit just inside the top of their rows. The list is
+        // scrolled by half a row, so a mapping that drops the partial-row
+        // remainder would pick rows 11 and 12 instead.
         let margin = surface.left() + (row_12.left() - surface.left()) / 2.;
-        let start = point(margin, row_12.center().y);
-        let end = point(surface.left() + px(200.), row_13.center().y);
+        let start = point(margin, row_12.top() + px(2.));
+        let end = point(surface.left() + px(200.), row_13.top() + px(2.));
 
         let mut visual = VisualTestContext::from_window(browser, cx);
         visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
