@@ -618,6 +618,19 @@ impl DirectoryModel {
         self.active.clone()
     }
 
+    /// Changes the mode of this folder's index directory, so a test can make
+    /// a merge fail to write.
+    #[cfg(test)]
+    pub(crate) fn set_index_directory_mode(&self, mode: u32) -> std::io::Result<()> {
+        let index = self.index.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "the folder is not indexed")
+        })?;
+        let index = index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
+        index.set_directory_mode(mode)
+    }
+
     /// The directory that holds this tab's index files while the folder is
     /// indexed.
     #[cfg(test)]

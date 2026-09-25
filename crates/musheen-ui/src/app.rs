@@ -3546,6 +3546,14 @@ struct MusheenApp {
     pending_directory_restores: HashMap<TabId, PendingDirectoryRestore>,
     pending_context_menu: Option<ContextMenu>,
     pending_indexed_context_menu: Option<DeferredIndexedContextMenu>,
+    /// Tabs whose index is merging a batch of changes right now.
+    index_merges_running: std::collections::HashSet<TabId>,
+    /// Changes that arrived while a tab's index was merging; the next
+    /// merge takes them as one batch.
+    pending_index_events: HashMap<TabId, Vec<WatchEvent>>,
+    /// How many index merges this window started; tests count batches by it.
+    #[cfg(test)]
+    index_merges_started: usize,
     /// Executable states by item, answered by background probes.
     executable_facts: HashMap<ItemId, Option<CapabilityState>>,
     /// Location facts by location, answered by background probes.
@@ -4307,6 +4315,10 @@ impl MusheenApp {
             pending_directory_restores: HashMap::new(),
             pending_context_menu: None,
             pending_indexed_context_menu: None,
+            index_merges_running: std::collections::HashSet::new(),
+            pending_index_events: HashMap::new(),
+            #[cfg(test)]
+            index_merges_started: 0,
             executable_facts: HashMap::new(),
             location_facts: HashMap::new(),
             composing_menu: std::cell::Cell::new(false),
@@ -4816,40 +4828,22 @@ impl MusheenApp {
         event: WatchEvent,
         cx: &mut Context<Self>,
     ) {
-        let filter = self
-            .filters
-            .get(&tab_id)
-            .and_then(|active| active.filter.clone());
-        if let Some(work) = self
+        let indexed = self
             .directories
             .get(&tab_id)
-            .and_then(|directory| directory.prepare_index_watch_event(&load, event.clone(), filter))
-        {
-            let task = cx.background_spawn(async move { work.run() });
-            cx.spawn(async move |this, cx| {
-                let result = task.await;
-                let succeeded = result.is_ok();
-                let Some(this) = this.upgrade() else {
-                    return;
-                };
-                this.update(cx, |state, cx| {
-                    let applied = state
-                        .directories
-                        .get_mut(&tab_id)
-                        .is_some_and(|directory| directory.finish_index_watch_event(&load, result));
-                    if !applied {
-                        return;
-                    }
-                    if succeeded {
-                        state.forget_store_facts(&event);
-                        state.observe_watch_event(event, cx);
-                        state.indexed_viewports.remove(&tab_id);
-                    }
-                    state.continue_watch(tab_id, load, watcher, cx);
-                    cx.notify();
-                });
-            })
-            .detach();
+            .is_some_and(|directory| directory.is_current(&load) && directory.is_indexed());
+        if indexed && !matches!(event, WatchEvent::Invalidated { .. }) {
+            if self.index_merges_running.contains(&tab_id) {
+                // A merge is running; this change joins the next batch.
+                self.pending_index_events
+                    .entry(tab_id)
+                    .or_default()
+                    .push(event);
+            } else {
+                self.start_index_merge(tab_id, load.clone(), vec![event], cx);
+            }
+            // The watcher keeps delivering while the merge runs.
+            self.continue_watch(tab_id, load, watcher, cx);
             return;
         }
         let invalidated = matches!(event, WatchEvent::Invalidated { .. });
@@ -4861,6 +4855,78 @@ impl MusheenApp {
             }
             cx.notify();
         }
+    }
+
+    /// Merges a batch of changes into the tab's index off the UI thread.
+    /// Changes that arrive while it runs wait and go into the next batch.
+    fn start_index_merge(
+        &mut self,
+        tab_id: TabId,
+        load: DirectoryLoad,
+        events: Vec<WatchEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let filter = self
+            .filters
+            .get(&tab_id)
+            .and_then(|active| active.filter.clone());
+        let Some(work) = self.directories.get(&tab_id).and_then(|directory| {
+            directory.prepare_index_watch_events(&load, events.clone(), filter)
+        }) else {
+            self.pending_index_events.remove(&tab_id);
+            return;
+        };
+        self.index_merges_running.insert(tab_id);
+        #[cfg(test)]
+        {
+            self.index_merges_started += 1;
+        }
+        let task = cx.background_spawn(async move { work.run() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let succeeded = result.is_ok();
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.index_merges_running.remove(&tab_id);
+                let applied = state
+                    .directories
+                    .get_mut(&tab_id)
+                    .is_some_and(|directory| directory.finish_index_watch_event(&load, result));
+                if !applied {
+                    // The folder was reloaded under the merge; the waiting
+                    // changes belong to the old load.
+                    state.pending_index_events.remove(&tab_id);
+                    return;
+                }
+                // A failed merge keeps the shown items; the error is shown.
+                let index_error = state
+                    .directories
+                    .get(&tab_id)
+                    .and_then(|directory| directory.index_error())
+                    .map(Box::<str>::from);
+                if let Some(error) = index_error {
+                    state.operation_error = Some(error);
+                }
+                if succeeded {
+                    for event in &events {
+                        state.forget_store_facts(event);
+                    }
+                    state.observe_watch_events(events, cx);
+                    state.indexed_viewports.remove(&tab_id);
+                }
+                cx.notify();
+                let pending = state
+                    .pending_index_events
+                    .remove(&tab_id)
+                    .unwrap_or_default();
+                if !pending.is_empty() {
+                    state.start_index_merge(tab_id, load, pending, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn schedule_index_order(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
@@ -30192,5 +30258,129 @@ mod tests {
                 "a window that prefers light gets the light fallback"
             );
         });
+    }
+
+    /// The items a test adds to a folder after it is open, as the watcher
+    /// would report them.
+    fn late_items(folder: &Path, count: usize) -> Vec<StoreItem> {
+        (0..count)
+            .map(|number| {
+                let path = folder.join(format!("late-{number}.txt"));
+                filesystem::write(&path, b"late").unwrap();
+                LocalStore::new()
+                    .resolve_item(&StorePath::from_unix_path(path.as_os_str().to_owned()))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_merge_batches_the_changes_that_arrive_while_one_runs(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = write_large_folder(&[]);
+        let (app, browser, tab_id, _index_root) =
+            open_large_folder(temporary.path(), Layout::List, cx).await;
+        let items = late_items(temporary.path(), 3);
+        let before = cx.read(|cx| app.read(cx).focused_directory().indexed_count());
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.index_merges_started = 0;
+                let load = state.focused_directory().current_load().unwrap();
+                for item in &items {
+                    state.handle_watch_event(
+                        tab_id,
+                        load.clone(),
+                        Box::new(StalledWatch),
+                        WatchEvent::Created(item.clone()),
+                        cx,
+                    );
+                }
+                assert!(
+                    state.index_merges_running.contains(&tab_id),
+                    "the first change starts a merge"
+                );
+                assert_eq!(
+                    state.pending_index_events.get(&tab_id).map_or(0, Vec::len),
+                    2,
+                    "the changes that arrive while it runs wait for the next merge"
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
+                assert_eq!(
+                    state.index_merges_started, 2,
+                    "one merge for the first change and one for the two that waited"
+                );
+                assert_eq!(state.focused_directory().indexed_count(), before + 3);
+                assert!(!state.index_merges_running.contains(&tab_id));
+                assert!(
+                    state
+                        .pending_index_events
+                        .get(&tab_id)
+                        .is_none_or(Vec::is_empty)
+                );
+                assert_eq!(state.operation_error, None);
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_merge_failure_is_reported_by_the_window(cx: &mut TestAppContext) {
+        let temporary = write_large_folder(&[]);
+        let (app, browser, tab_id, _index_root) =
+            open_large_folder(temporary.path(), Layout::List, cx).await;
+        let item = late_items(temporary.path(), 1).remove(0);
+        let before = cx.read(|cx| app.read(cx).focused_directory().indexed_count());
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                // The index directory stops accepting new files, so the merge
+                // cannot write the new order.
+                state
+                    .focused_directory()
+                    .set_index_directory_mode(0o500)
+                    .unwrap();
+                let load = state.focused_directory().current_load().unwrap();
+                state.handle_watch_event(
+                    tab_id,
+                    load,
+                    Box::new(StalledWatch),
+                    WatchEvent::Created(item),
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
+                state
+                    .focused_directory()
+                    .set_index_directory_mode(0o700)
+                    .unwrap();
+                assert_eq!(
+                    state.focused_directory().state(),
+                    &DirectoryState::Ready,
+                    "the items already shown stay on screen"
+                );
+                assert_eq!(state.focused_directory().indexed_count(), before);
+                assert!(
+                    state
+                        .operation_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Directory index failed")),
+                    "the failed merge is reported to the window: {:?}",
+                    state.operation_error
+                );
+            });
+        })
+        .unwrap();
     }
 }
