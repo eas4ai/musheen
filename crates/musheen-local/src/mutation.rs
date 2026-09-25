@@ -739,6 +739,15 @@ fn make_tree_writable(root: &Path) -> Result<(), MutationError> {
     Ok(())
 }
 
+/// Whether the trash still holds the record and the payload a receipt
+/// names. One record is checked, never the whole listing.
+pub(crate) fn trash_record_present(receipt: &TrashReceipt) -> bool {
+    let info = PathBuf::from(OsString::from_vec(receipt.provider_reference().to_vec()));
+    fs::symlink_metadata(&info).is_ok()
+        && trash_payload_path_of_record(&info)
+            .is_ok_and(|payload| fs::symlink_metadata(payload).is_ok())
+}
+
 fn trash_payload_path_of_record(info: &Path) -> Result<PathBuf, MutationError> {
     let info_directory = info.parent().ok_or(MutationError::InvalidScope)?;
     if info_directory.file_name() != Some(OsStr::new("info")) {

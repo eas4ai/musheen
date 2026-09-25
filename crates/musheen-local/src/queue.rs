@@ -241,15 +241,13 @@ struct TrashUndo {
 }
 
 impl TrashUndo {
+    /// Remembers the undo from the job's own receipt. The receipt names the
+    /// trash record, so one record is checked and the trash is never listed.
     fn from_completed(receipt: TrashReceipt) -> Option<Self> {
+        if !crate::mutation::trash_record_present(&receipt) {
+            return None;
+        }
         let mut store = LocalStore::new();
-        let receipt = store
-            .list_trash()
-            .ok()?
-            .into_iter()
-            .find(|entry| entry.receipt().provider_reference() == receipt.provider_reference())?
-            .receipt()
-            .clone();
         let original_parent = StorePath::from_unix_path(
             clean_absolute_path(receipt.original_path())?
                 .parent()?
@@ -273,9 +271,7 @@ impl TrashUndo {
             MutationProvider::identity(&mut store, &self.original_parent),
             Ok(Some(identity)) if identity == self.expected_parent_identity
         ) && writable_directory(&self.original_parent).is_ok()
-            && store
-                .list_trash()
-                .is_ok_and(|entries| entries.iter().any(|entry| entry.receipt() == &self.receipt))
+            && crate::mutation::trash_record_present(&self.receipt)
     }
 }
 
