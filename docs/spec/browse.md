@@ -115,10 +115,11 @@ Mechanism: browse-019
 Rationale: docs/opus-audit-2.md 5.1 (A-F5, A-F6, A-F9, the index kept in a tmpfs temp dir, and index directories left behind on SIGTERM).
 Status: Agreed 2026-09-25
 
-[BROWSE-020] External create, remove, rename, and metadata changes reconcile into the open model without resetting unrelated selection, scroll, sort, or grouping.
-Falsifier: one external change reloads the view to its top or selects a different stable item.
-Mechanism: watcher and polling tests during selection and scrolling.
-Status: Draft
+[BROWSE-020] External create, remove, rename, and metadata changes reconcile into the open model without resetting unrelated selection, scroll, sort, or grouping. In an indexed directory a change merges into the on-disk order in place, reading only the records it is compared against; the changes that arrive while one merge runs are applied by the next merge as one batch; a merge that fails keeps the shown items and makes the error visible.
+Falsifier: one external change reloads the view to its top or selects a different stable item; in an indexed directory, one change decodes more than 100 records of a 100,000-record index, a batch of waiting changes costs one merge each, or a failed merge leaves the list silently stale.
+Mechanism: browse-020
+Rationale: 1.x mechanism: watcher and polling tests during selection and scrolling; docs/opus-audit-2.md A-F3: every watch event rebuilt the whole order in five to seven passes over all records under the index mutex, and a failed merge was never shown.
+Status: Agreed 2026-09-25
 
 [BROWSE-021] The browsing-session store is schema-versioned, writes through atomic replacement with a last-valid backup, and migrates supported older sessions before restoring windows and tabs.
 Falsifier: interrupted persistence destroys the last valid session or a supported old session is interpreted without migration.

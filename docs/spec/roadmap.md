@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: local-safety-index-2026-09-25
+Current: ui-thread-growth-2026-09-25
 
 ## 1. Foundation
 
@@ -78,3 +78,19 @@ and leaves the rubber band and the Columns layout inert (BROWSE-019,
 BROWSE-023). Done when each mechanism's test fails on the recorded violating
 example and passes on the fix, the workspace tests and clippy are clean, and
 the review and report are accepted.
+
+## ui-thread-growth-2026-09-25
+
+Requirements: UXF-023, BROWSE-020, UIV-014, OPS-013, LIMIT-010
+
+Fix the UI-thread and growth findings from docs/opus-audit-2.md sections
+5.1 and 5.2: catalog file I/O on every watch event and stat and statfs on
+every context menu and command target check (UXF-023), the whole-order
+rebuild on every watch event in an indexed directory and its silent
+failure (BROWSE-020), the fallback theme that always ends on light
+(UIV-014), the full trash listing on every finished trash job and undo
+check (OPS-013), and the scheduler records, status history and persisted
+status document that grow without bound (LIMIT-010). Done when each
+mechanism's test fails on the recorded violating example and passes on
+the fix, the workspace tests and clippy are clean, and every finding of
+the review and the report is resolved or declined.

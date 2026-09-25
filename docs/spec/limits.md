@@ -51,3 +51,9 @@ Status: Draft
 Falsifier: work starts beyond a default or provider concurrency ceiling.
 Mechanism: scheduler tests with recording providers in every work class.
 Status: Draft
+
+[LIMIT-010] The status center retains at most 500 finished operation entries, in memory and in the persisted status document, dropping the oldest finished entries first and never a pending, running, paused, or interrupted one. The scheduler drops a job's record once its terminal state has been reported and keeps at most 4,096 recent events.
+Falsifier: after more finished jobs than the bound, the status model, the persisted status document, or the scheduler holds more than its bound, or pruning drops an entry that is not finished.
+Mechanism: limit-010
+Rationale: docs/opus-audit-2.md B-M6: scheduler records and events, the status history, and the persisted status document grew without bound, and the whole model was rewritten on every state change.
+Status: Agreed 2026-09-25

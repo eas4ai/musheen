@@ -74,6 +74,12 @@ Falsifier: retry silently repeats items that already completed.
 Mechanism: partial-batch failure test with recorded mutation calls.
 Status: Draft
 
+[UXF-023] The UI thread never waits on storage. The metadata probes that decide a context menu's commands and check a command's targets, and the catalog updates that follow a watch event, run on background executors; a store that blocks leaves the window responsive and the directory model updating.
+Falsifier: a store whose metadata call is blocked, or a catalog whose lock another process holds, stops the window from opening a context menu or applying a watch event to the directory model.
+Mechanism: uxf-023
+Rationale: docs/opus-audit-2.md A-F4 and A-F7: catalog file I/O ran on the UI thread on every watch event, and stat and statfs ran on the UI thread for every context menu and command target check, so a hung mount froze the window.
+Status: Agreed 2026-09-25
+
 ## Direct manipulation
 
 [UXF-011] Drag feedback distinguishes copy, move, link, pin, tag, and rejected drops before release.

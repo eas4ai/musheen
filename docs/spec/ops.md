@@ -81,10 +81,11 @@ Falsifier: a conflict performs behavior other than its displayed choice or appli
 Mechanism: conflict matrix tests over files, directories, symlinks, and mixed batches.
 Status: Draft
 
-[OPS-013] The engine exposes undo only for an operation whose inverse remains safe and available on the active store.
-Falsifier: the UI offers undo for an irreversible or no-longer-valid inverse.
-Mechanism: inverse-capability tests after rename, move, trash, overwrite, and remote mutations.
-Status: Draft
+[OPS-013] The engine exposes undo only for an operation whose inverse remains safe and available on the active store. A trash undo is remembered from the job's own receipt, and its availability is checked against that one trash record and the original location, never by listing the trash.
+Falsifier: the UI offers undo for an irreversible or no-longer-valid inverse, or remembering or checking one trash undo lists the trash.
+Mechanism: ops-013
+Rationale: 1.x mechanism: inverse-capability tests after rename, move, trash, overwrite, and remote mutations; docs/opus-audit-2.md B-M5: each finished trash job and each undo check listed the whole trash, up to a hundred times a second while the status center was open.
+Status: Agreed 2026-09-25
 
 ## Archives
 

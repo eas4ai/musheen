@@ -103,10 +103,11 @@ Status: Draft
 
 ## Theme, motion, and content states
 
-[UIV-014] The theme layer derives every available system appearance input from the native-theme bridge and uses named fallback tokens for values it does not provide.
-Falsifier: a component copies a Files color or Windows material instead of using a theme token.
-Mechanism: theme source audit plus token-resolution tests with complete and partial native themes.
-Status: Draft
+[UIV-014] The theme layer derives every available system appearance input from the native-theme bridge and uses named fallback tokens for values it does not provide. When the bridge cannot read the system theme, the fallback preset follows the window's dark or light appearance.
+Falsifier: a component copies a Files color or Windows material instead of using a theme token, or the fallback installs a variant the window appearance did not request.
+Mechanism: uiv-014
+Rationale: 1.x mechanism: theme source audit plus token-resolution tests with complete and partial native themes; docs/opus-audit-2.md A-F8: the fallback applied Adwaita dark and then light, so light always won.
+Status: Agreed 2026-09-25
 
 [UIV-015] Text, icons, focus indicators, and essential boundaries meet WCAG AA contrast in light, dark, and high-contrast themes.
 Falsifier: any listed essential element falls below its applicable AA ratio.
