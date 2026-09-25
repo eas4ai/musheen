@@ -7533,8 +7533,11 @@ impl MusheenApp {
             && selected_item.is_none_or(|item| self.opens_as_directory(item))
         {
             CommandTarget::Directory
-        } else if target == MenuTarget::SidebarLocation {
+        } else if target == MenuTarget::SidebarLocation && selected_item.is_none() {
             CommandTarget::Sidebar
+        // A sidebar location resolved to something that does not open as a
+        // directory, such as a link to a file, takes that item's own target
+        // below, so the directory commands are not offered for it.
         } else if target == MenuTarget::Tag {
             CommandTarget::Tag
         } else if target == MenuTarget::TrashItem {
