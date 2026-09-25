@@ -1904,7 +1904,11 @@ mod tests {
 
     fn new_item(number: u64, name: &str) -> StoreItem {
         StoreItem::new(
-            ItemId::new(ProviderId::new("local").unwrap(), number.to_be_bytes().to_vec()).unwrap(),
+            ItemId::new(
+                ProviderId::new("local").unwrap(),
+                number.to_be_bytes().to_vec(),
+            )
+            .unwrap(),
             StorePath::from_unix_path(format!("/many/{name}")),
             DisplayPath::new(name),
             ItemKind::RegularFile,
@@ -1935,9 +1939,12 @@ mod tests {
         let changed = new_item(500, "item-0000500");
 
         super::RECORD_READS.store(0, Relaxed);
-        let result = watch_work(&index, vec![musheen_core::WatchEvent::Changed(changed.clone())])
-            .run()
-            .unwrap();
+        let result = watch_work(
+            &index,
+            vec![musheen_core::WatchEvent::Changed(changed.clone())],
+        )
+        .run()
+        .unwrap();
         let reads = super::RECORD_READS.load(Relaxed);
 
         assert_eq!(result.indexed_count, 100_000);

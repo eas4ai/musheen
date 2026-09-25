@@ -1192,10 +1192,7 @@ where
         .map(|mut pending| std::mem::take(&mut *pending))
         .unwrap_or_default();
     let ready = {
-        let mut queue = hub
-            .queue
-            .lock()
-            .map_err(|_| OperationHubError::QueueLock)?;
+        let mut queue = hub.queue.lock().map_err(|_| OperationHubError::QueueLock)?;
         for id in forgotten {
             queue.forget(id);
         }
@@ -1217,22 +1214,21 @@ where
             let result = work.await;
             let outcome = result.as_ref().ok().cloned();
             let failure = result.as_ref().err().cloned();
-            let finish =
-                hub.queue
-                    .lock()
-                    .map_err(|_| OperationHubError::QueueLock)
-                    .and_then(|mut queue| {
-                        let state = match result.as_ref() {
-                            Ok(LocalOperationOutcome::Transfer(
-                                TransferOutcome::MetadataReview { review, .. },
-                            )) => queue.finish_metadata_review(id, review.clone())?,
-                            Ok(outcome) => queue.finish_with_outcome(id, outcome.clone())?,
-                            Err(error) => {
-                                queue.finish(id, Err(error.message().to_owned().into()))?
-                            }
-                        };
-                        Ok(Some(state))
-                    });
+            let finish = hub
+                .queue
+                .lock()
+                .map_err(|_| OperationHubError::QueueLock)
+                .and_then(|mut queue| {
+                    let state = match result.as_ref() {
+                        Ok(LocalOperationOutcome::Transfer(TransferOutcome::MetadataReview {
+                            review,
+                            ..
+                        })) => queue.finish_metadata_review(id, review.clone())?,
+                        Ok(outcome) => queue.finish_with_outcome(id, outcome.clone())?,
+                        Err(error) => queue.finish(id, Err(error.message().to_owned().into()))?,
+                    };
+                    Ok(Some(state))
+                });
             let status_result = hub
                 .status
                 .lock()

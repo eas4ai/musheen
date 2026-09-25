@@ -756,7 +756,7 @@ mod tests {
             views[0].read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
-        cx.update_window(handles[0].into(), |_, window, cx| {
+        cx.update_window(handles[0].into(), |_, _, cx| {
             views[0].update(cx, |app, cx| {
                 let item = app
                     .focused_directory()
@@ -779,9 +779,16 @@ mod tests {
                     cx,
                 );
             });
-            window.remove_window();
         })
         .unwrap();
+        // The action starts once the store confirmed its targets off the UI
+        // thread; the window closes as soon as the hub has the action.
+        cx.wait_for(handles[0].into(), Duration::from_secs(3), |_, _| {
+            !hub.status().lock().unwrap().custom_actions().is_empty()
+        })
+        .await;
+        cx.update_window(handles[0].into(), |_, window, _| window.remove_window())
+            .unwrap();
         let origin = views.remove(0);
         let weak = origin.downgrade();
         drop(origin);
@@ -1031,12 +1038,13 @@ mod tests {
                     "typed dispatch cannot bypass confirmation"
                 );
                 app.confirm_context_review(invocation, Vec::new(), None, cx);
-                assert_eq!(app.running_custom_actions, 1);
             });
         })
         .unwrap();
+        // The action starts once the store confirmed its targets off the UI
+        // thread, and finishes in the background.
         cx.wait_for(handle.into(), Duration::from_secs(3), |_, cx| {
-            app.read(cx).running_custom_actions == 0
+            app.read(cx).running_custom_actions == 0 && output.exists()
         })
         .await;
         assert_eq!(filesystem::read(&output).unwrap(), b"original");

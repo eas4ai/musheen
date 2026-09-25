@@ -384,8 +384,8 @@ struct LocationResolution {
     dead_link: bool,
 }
 
-/// One question a menu could not answer from the caches.
-#[derive(Clone, Debug, PartialEq)]
+/// One question a menu or the toolbar could not answer from the caches.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum StoreProbe {
     Executable { id: ItemId, path: StorePath },
     Location { location: StorePath, resolve: bool },
@@ -430,9 +430,13 @@ impl MenuRecompose {
 }
 
 /// The probes a menu composition queued, and how to compose it again.
+/// `deferring` says whether a probe decides the menu's commands, so the
+/// popup waits for it; a probe that only adds a Send To destination lets
+/// the popup open at once and rebuilds it later.
 struct PendingMenuProbe {
     probes: Vec<StoreProbe>,
     recompose: MenuRecompose,
+    deferring: bool,
 }
 
 /// The most executable states and location facts the caches keep; both
@@ -2193,9 +2197,7 @@ pub fn run(initial_path: PathBuf) {
         .with_assets(MusheenAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            cx.set_global(DirectoryIndexRoot(
-                crate::directory::directory_index_root(),
-            ));
+            cx.set_global(DirectoryIndexRoot(crate::directory::directory_index_root()));
             install_navigation_key_bindings(cx);
             install_native_theme(cx);
             install_file_manager1(cx);
@@ -2996,7 +2998,8 @@ fn install_fallback_theme(
     cx: &mut App,
 ) {
     for is_dark in [!prefers_dark, prefers_dark] {
-        if let Ok((theme, resolved)) = native_theme_gpui::from_preset("adwaita", is_dark, preferences)
+        if let Ok((theme, resolved)) =
+            native_theme_gpui::from_preset("adwaita", is_dark, preferences)
         {
             native_theme_gpui::apply(theme, &resolved, preferences, cx);
         }
@@ -3547,8 +3550,18 @@ struct MusheenApp {
     executable_facts: HashMap<ItemId, Option<CapabilityState>>,
     /// Location facts by location, answered by background probes.
     location_facts: HashMap<StorePath, LocationFacts>,
-    /// The probes the last menu composition could not answer from the caches.
-    pending_store_probes: std::cell::RefCell<Vec<StoreProbe>>,
+    /// Set while a context menu is composed: the probes queued then belong
+    /// to that menu, whose popup may wait for them.
+    composing_menu: std::cell::Cell<bool>,
+    /// The probes the menu being composed could not answer from the
+    /// caches, each with whether the popup waits for it.
+    pending_store_probes: std::cell::RefCell<Vec<(StoreProbe, bool)>>,
+    /// Probes queued outside a menu, by toolbar and command state during
+    /// a frame; the next frame runs them and repaints when they answer.
+    render_probes: std::cell::RefCell<Vec<StoreProbe>>,
+    /// Render probes in flight, so a frame does not ask the same question
+    /// twice.
+    probes_in_flight: std::collections::HashSet<StoreProbe>,
     /// How to compose the last menu again once its probes answer.
     pending_menu_recompose: std::cell::RefCell<Option<MenuRecompose>>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
@@ -4296,7 +4309,10 @@ impl MusheenApp {
             pending_indexed_context_menu: None,
             executable_facts: HashMap::new(),
             location_facts: HashMap::new(),
+            composing_menu: std::cell::Cell::new(false),
             pending_store_probes: std::cell::RefCell::new(Vec::new()),
+            render_probes: std::cell::RefCell::new(Vec::new()),
+            probes_in_flight: std::collections::HashSet::new(),
             pending_menu_recompose: std::cell::RefCell::new(None),
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
@@ -7329,21 +7345,26 @@ impl MusheenApp {
                 state.refresh_application_snapshot(&targets, cx);
                 let send_to = state.send_to_destinations(tab_id);
                 let open_with = state.open_with_applications(&targets);
-                let menu = state.compose_context_request(
-                    state
-                        .context_menu_request_with_item(
-                            tab_id,
-                            MenuTarget::Item,
-                            location,
-                            targets,
-                            first_item.as_ref(),
-                        )
-                        .with_send_to(&send_to)
-                        .with_open_with(&open_with),
-                );
+                let menu = state.while_composing_menu(|state| {
+                    state.compose_context_request(
+                        state
+                            .context_menu_request_with_item(
+                                tab_id,
+                                MenuTarget::Item,
+                                location,
+                                targets,
+                                first_item.as_ref(),
+                            )
+                            .with_send_to(&send_to)
+                            .with_open_with(&open_with),
+                    )
+                });
                 if let Some(pending) = state.take_pending_menu_probe() {
-                    state.start_menu_probe(pending, popup, window, path, cx);
-                    return;
+                    let deferring = pending.deferring;
+                    state.start_menu_probe(pending, popup.clone(), window, path.clone(), cx);
+                    if deferring {
+                        return;
+                    }
                 }
                 let live = custom_actions::LiveActionPopup {
                     popup,
@@ -7443,13 +7464,17 @@ impl MusheenApp {
                 MenuTarget::Item
             };
             self.refresh_application_snapshot(prepared.selection(), cx);
-            let menu = self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec());
+            let menu =
+                self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec());
             probe = self.take_pending_menu_probe();
-            probe.is_none().then_some(menu)
+            let deferring = probe.as_ref().is_some_and(|pending| pending.deferring);
+            (!deferring).then_some(menu)
         } else {
             None
         };
-        let loading_label = (deferred.is_some() || probe.is_some()).then(|| {
+        let deferring =
+            deferred.is_some() || probe.as_ref().is_some_and(|pending| pending.deferring);
+        let loading_label = deferring.then(|| {
             self.catalog
                 .message("context-menu-loading")
                 .expect("selection loading status is localized")
@@ -7512,6 +7537,18 @@ impl MusheenApp {
         location: StorePath,
         identity: Option<ItemId>,
     ) -> ContextMenu {
+        self.while_composing_menu(|this| {
+            this.sidebar_entry_context_menu_inner(tab_id, target, location, identity)
+        })
+    }
+
+    fn sidebar_entry_context_menu_inner(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        identity: Option<ItemId>,
+    ) -> ContextMenu {
         // For a sidebar location the resolved item decides the command set:
         // a directory or a link to one gets the directory commands. A link
         // whose target is gone offers nothing to open, so the menu is
@@ -7527,10 +7564,13 @@ impl MusheenApp {
             {
                 Some(resolution) => (resolution.item.clone(), resolution.dead_link),
                 None => {
-                    self.queue_store_probe(StoreProbe::Location {
-                        location: location.clone(),
-                        resolve: true,
-                    });
+                    self.queue_store_probe(
+                        StoreProbe::Location {
+                            location: location.clone(),
+                            resolve: true,
+                        },
+                        true,
+                    );
                     (None, false)
                 }
             }
@@ -7582,22 +7622,88 @@ impl MusheenApp {
         .expect("the loading reason is visible")
     }
 
-    fn queue_store_probe(&self, probe: StoreProbe) {
-        let mut probes = self.pending_store_probes.borrow_mut();
-        if !probes.contains(&probe) {
-            probes.push(probe);
+    /// Queues a question for the store. `defers_menu` says the popup waits
+    /// for the answer because it decides which commands the menu offers.
+    fn queue_store_probe(&self, probe: StoreProbe, defers_menu: bool) {
+        if !self.composing_menu.get() {
+            let mut probes = self.render_probes.borrow_mut();
+            if !probes.contains(&probe) {
+                probes.push(probe);
+            }
+            return;
         }
+        let mut probes = self.pending_store_probes.borrow_mut();
+        match probes.iter_mut().find(|(queued, _)| *queued == probe) {
+            Some((_, defers)) => *defers |= defers_menu,
+            None => probes.push((probe, defers_menu)),
+        }
+    }
+
+    /// Runs `compose` as a menu composition: the probes it queues belong to
+    /// the menu and the recompose record is written for it.
+    fn while_composing_menu<R>(&self, compose: impl FnOnce(&Self) -> R) -> R {
+        let previous = self.composing_menu.replace(true);
+        let result = compose(self);
+        self.composing_menu.set(previous);
+        result
+    }
+
+    /// Hands the probes a menu composition left behind to the next frame,
+    /// so the caches still fill when no popup waits for them.
+    fn move_menu_probes_to_render(&self) {
+        let queued = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
+        self.pending_menu_recompose.borrow_mut().take();
+        let mut render = self.render_probes.borrow_mut();
+        for (probe, _) in queued {
+            if !render.contains(&probe) {
+                render.push(probe);
+            }
+        }
+    }
+
+    /// Runs the probes toolbar and command state queued during the last
+    /// frame, and repaints when they answer.
+    fn flush_render_probes(&mut self, cx: &mut Context<Self>) {
+        let queued = std::mem::take(&mut *self.render_probes.borrow_mut());
+        let probes = queued
+            .into_iter()
+            .filter(|probe| self.probes_in_flight.insert(probe.clone()))
+            .collect::<Vec<_>>();
+        if probes.is_empty() {
+            return;
+        }
+        let work = self.spawn_store_probes(probes.clone(), cx);
+        cx.spawn(async move |this, cx| {
+            let results = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                for probe in &probes {
+                    state.probes_in_flight.remove(probe);
+                }
+                state.apply_store_probe_results(results);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The probes the last composition queued, with how to compose it
     /// again, or `None` when the caches answered everything.
     fn take_pending_menu_probe(&mut self) -> Option<PendingMenuProbe> {
-        let probes = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
+        let queued = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
         let recompose = self.pending_menu_recompose.borrow_mut().take();
-        if probes.is_empty() {
+        if queued.is_empty() {
             return None;
         }
-        recompose.map(|recompose| PendingMenuProbe { probes, recompose })
+        let deferring = queued.iter().any(|(_, defers)| *defers);
+        let probes = queued.into_iter().map(|(probe, _)| probe).collect();
+        recompose.map(|recompose| PendingMenuProbe {
+            probes,
+            recompose,
+            deferring,
+        })
     }
 
     fn spawn_store_probes(
@@ -7694,10 +7800,17 @@ impl MusheenApp {
     /// no popup to rebuild. Returns whether there were any.
     #[cfg(test)]
     fn run_pending_menu_probes(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(pending) = self.take_pending_menu_probe() else {
+        let queued = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
+        self.pending_menu_recompose.borrow_mut().take();
+        let mut probes = queued
+            .into_iter()
+            .map(|(probe, _)| probe)
+            .collect::<Vec<_>>();
+        probes.extend(std::mem::take(&mut *self.render_probes.borrow_mut()));
+        if probes.is_empty() {
             return false;
-        };
-        let work = self.spawn_store_probes(pending.probes, cx);
+        }
+        let work = self.spawn_store_probes(probes, cx);
         cx.spawn(async move |this, cx| {
             let results = work.await;
             if let Some(this) = this.upgrade() {
@@ -7736,7 +7849,12 @@ impl MusheenApp {
                 target,
                 location,
                 identity,
-            } => self.sidebar_entry_context_menu(*tab_id, *target, location.clone(), identity.clone()),
+            } => self.sidebar_entry_context_menu(
+                *tab_id,
+                *target,
+                location.clone(),
+                identity.clone(),
+            ),
         }
     }
 
@@ -7763,8 +7881,9 @@ impl MusheenApp {
                     return;
                 }
                 let menu = state.compose_from_recompose(&recompose);
-                // The caches answer now; a probe queued again is not run.
-                let _ = state.take_pending_menu_probe();
+                // The caches answer the menu now; anything still queued is
+                // a Send To destination the next frame fills in.
+                state.move_menu_probes_to_render();
                 let live = custom_actions::LiveActionPopup {
                     popup,
                     window,
@@ -7836,13 +7955,15 @@ impl MusheenApp {
         } else {
             self.context_for_menu(tab_id, target, &location, &selection)
         };
-        *self.pending_menu_recompose.borrow_mut() = Some(MenuRecompose::Request {
-            tab_id,
-            target,
-            location: location.clone(),
-            selection: selection.clone(),
-            resolved_item: resolved_item.cloned(),
-        });
+        if self.composing_menu.get() {
+            *self.pending_menu_recompose.borrow_mut() = Some(MenuRecompose::Request {
+                tab_id,
+                target,
+                location: location.clone(),
+                selection: selection.clone(),
+                resolved_item: resolved_item.cloned(),
+            });
+        }
         let trash_contents = if target == MenuTarget::TrashBackground {
             selection.clone()
         } else {
@@ -8066,6 +8187,7 @@ impl MusheenApp {
         for (popup, menu) in refreshes {
             popup.rebuild(menu, cx);
         }
+        self.move_menu_probes_to_render();
     }
 
     fn send_to_destinations(&self, tab_id: TabId) -> Vec<crate::SendToDestination> {
@@ -8090,11 +8212,23 @@ impl MusheenApp {
                 {
                     continue;
                 }
+                // A destination the caches know nothing about is left out
+                // until the store answers off the UI thread; the popup opens
+                // without waiting and is rebuilt with it.
                 let writable = entry.is_available()
-                    && matches!(
-                        self.store.location_writable(entry.location()),
-                        Ok(CapabilityState::Supported)
-                    );
+                    && match self.location_facts.get(entry.location()) {
+                        Some(facts) => matches!(facts.writable, CapabilityState::Supported),
+                        None => {
+                            self.queue_store_probe(
+                                StoreProbe::Location {
+                                    location: entry.location().clone(),
+                                    resolve: false,
+                                },
+                                false,
+                            );
+                            false
+                        }
+                    };
                 let destination = match section.kind() {
                     SidebarSectionKind::Pinned => crate::SendToDestination::pinned(
                         entry.label(),
@@ -8126,13 +8260,15 @@ impl MusheenApp {
         location: StorePath,
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
-        let send_to = self.send_to_destinations(tab_id);
-        let open_with = self.open_with_applications(&selection);
-        let request = self
-            .context_menu_request(tab_id, target, location, selection)
-            .with_send_to(&send_to)
-            .with_open_with(&open_with);
-        self.compose_context_request(request)
+        self.while_composing_menu(|this| {
+            let send_to = this.send_to_destinations(tab_id);
+            let open_with = this.open_with_applications(&selection);
+            let request = this
+                .context_menu_request(tab_id, target, location, selection)
+                .with_send_to(&send_to)
+                .with_open_with(&open_with);
+            this.compose_context_request(request)
+        })
     }
 
     fn compose_context_request(&self, request: crate::ContextMenuRequest) -> ContextMenu {
@@ -8200,10 +8336,13 @@ impl MusheenApp {
             .and_then(|item| match self.executable_facts.get(item.id()) {
                 Some(state) => state.clone(),
                 None => {
-                    self.queue_store_probe(StoreProbe::Executable {
-                        id: item.id().clone(),
-                        path: item.path().clone(),
-                    });
+                    self.queue_store_probe(
+                        StoreProbe::Executable {
+                            id: item.id().clone(),
+                            path: item.path().clone(),
+                        },
+                        true,
+                    );
                     None
                 }
             });
@@ -8271,11 +8410,30 @@ impl MusheenApp {
         };
         let (capabilities, writable_state) = match self.location_facts.get(&command_location) {
             Some(facts) => (facts.capabilities.clone(), facts.writable.clone()),
+            // Trash commands take nothing from the store about their
+            // location; any other location is asked off the UI thread.
+            None if is_trash_location(&command_location) => {
+                let unknown = CapabilityReason::new(
+                    self.catalog
+                        .message("context.write-unknown")
+                        .expect("write refusal is localized"),
+                )
+                .expect("the write-unknown reason is visible");
+                (
+                    musheen_core::CapabilityMatrix::new(|_| {
+                        CapabilityState::Unknown(unknown.clone())
+                    }),
+                    CapabilityState::Unknown(unknown),
+                )
+            }
             None => {
-                self.queue_store_probe(StoreProbe::Location {
-                    location: command_location.clone(),
-                    resolve: false,
-                });
+                self.queue_store_probe(
+                    StoreProbe::Location {
+                        location: command_location.clone(),
+                        resolve: false,
+                    },
+                    true,
+                );
                 let checking = self.checking_store_reason();
                 (
                     musheen_core::CapabilityMatrix::new(|_| {
@@ -9531,9 +9689,14 @@ impl MusheenApp {
             cx.notify();
             return;
         }
-        self.with_revalidated_targets(origin_tab, targets.to_vec(), cx, move |this, targets, _, cx| {
-            this.dispatch_privilege_action_revalidated(action, targets, cx);
-        });
+        self.with_revalidated_targets(
+            origin_tab,
+            targets.to_vec(),
+            cx,
+            move |this, targets, _, cx| {
+                this.dispatch_privilege_action_revalidated(action, targets, cx);
+            },
+        );
     }
 
     fn dispatch_privilege_action_revalidated(
@@ -9783,15 +9946,20 @@ impl MusheenApp {
         }
         let action = *action;
         let parameters = parameters.clone();
-        self.with_revalidated_targets(origin_tab, targets.clone(), cx, move |this, targets, _, cx| {
-            this.dispatch_local_target_command_revalidated(
-                &action,
-                &parameters,
-                targets,
-                origin_tab,
-                cx,
-            );
-        });
+        self.with_revalidated_targets(
+            origin_tab,
+            targets.clone(),
+            cx,
+            move |this, targets, _, cx| {
+                this.dispatch_local_target_command_revalidated(
+                    &action,
+                    &parameters,
+                    targets,
+                    origin_tab,
+                    cx,
+                );
+            },
+        );
     }
 
     /// The rest of a local target command, once the store confirmed the
@@ -10838,10 +11006,7 @@ impl MusheenApp {
         };
         // The store is asked again by the dispatch that follows, off the UI
         // thread; here only the directory model is compared.
-        semantic_targets_match
-            && self
-                .check_cached_targets(Some(origin.tab), targets)
-                .is_ok()
+        semantic_targets_match && self.check_cached_targets(Some(origin.tab), targets).is_ok()
     }
 
     fn execute_open_with(
@@ -11231,8 +11396,7 @@ impl MusheenApp {
             cx.notify();
             return;
         };
-        if self.navigation.focused_tab().id() != tab_id || !self.directories.contains_key(&tab_id)
-        {
+        if self.navigation.focused_tab().id() != tab_id || !self.directories.contains_key(&tab_id) {
             self.operation_error = Some(
                 self.catalog
                     .message("context.origin-unavailable")
@@ -11247,26 +11411,31 @@ impl MusheenApp {
             cx.notify();
             return;
         }
-        self.with_revalidated_targets(Some(tab_id), targets.to_vec(), cx, move |this, _, items, cx| {
-            let Some(item) = items.into_iter().next() else {
-                return;
-            };
-            if item.kind() != ItemKind::RegularFile {
-                this.operation_error = Some(
-                    this.catalog
-                        .message("context.backend-unavailable")
-                        .expect("backend refusal is localized")
-                        .into(),
-                );
-                cx.notify();
-                return;
-            }
-            this.select_item(tab_id, item.id().clone(), cx);
-            if !this.shell.info_visible() {
-                this.shell.toggle_info();
-                cx.notify();
-            }
-        });
+        self.with_revalidated_targets(
+            Some(tab_id),
+            targets.to_vec(),
+            cx,
+            move |this, _, items, cx| {
+                let Some(item) = items.into_iter().next() else {
+                    return;
+                };
+                if item.kind() != ItemKind::RegularFile {
+                    this.operation_error = Some(
+                        this.catalog
+                            .message("context.backend-unavailable")
+                            .expect("backend refusal is localized")
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                this.select_item(tab_id, item.id().clone(), cx);
+                if !this.shell.info_visible() {
+                    this.shell.toggle_info();
+                    cx.notify();
+                }
+            },
+        );
     }
 
     fn dispatch_run_command(
@@ -13907,12 +14076,13 @@ impl MusheenApp {
                             .take()
                             .unwrap_or_else(|| this.sidebar_context_menu(sidebar_tab));
                         let probe = this.take_pending_menu_probe();
-                        let loading_label = probe.as_ref().map(|_| {
-                            this.catalog
-                                .message("context-menu-loading")
-                                .expect("selection loading status is localized")
-                                .to_owned()
-                        });
+                        let loading_label =
+                            probe.as_ref().filter(|pending| pending.deferring).map(|_| {
+                                this.catalog
+                                    .message("context-menu-loading")
+                                    .expect("selection loading status is localized")
+                                    .to_owned()
+                            });
                         Some((menu, probe, loading_label))
                     })
                     .ok()
@@ -13921,15 +14091,18 @@ impl MusheenApp {
                     return popup;
                 };
                 if let Some(pending) = probe {
+                    let deferring = pending.deferring;
                     let popup_ref = popup_cx.entity().downgrade();
                     let window_handle = window.window_handle();
                     let path = format!("sidebar-{sidebar_tab:?}");
                     let _ = context_menu_host.update(popup_cx, |this, cx| {
                         this.start_menu_probe(pending, popup_ref, window_handle, path, cx);
                     });
-                    return popup.item(PopupMenuItem::label(
-                        loading_label.expect("deferred menus have a loading label"),
-                    ));
+                    if deferring {
+                        return popup.item(PopupMenuItem::label(
+                            loading_label.expect("deferred menus have a loading label"),
+                        ));
+                    }
                 }
                 Self::populate_context_popup(
                     popup,
@@ -14097,7 +14270,9 @@ impl MusheenApp {
                         } else {
                             None
                         };
-                        let loading_label = (deferred.is_some() || probe.is_some()).then(|| {
+                        let deferring = deferred.is_some()
+                            || probe.as_ref().is_some_and(|pending| pending.deferring);
+                        let loading_label = deferring.then(|| {
                             this.catalog
                                 .message("context-menu-loading")
                                 .expect("selection loading status is localized")
@@ -14111,15 +14286,18 @@ impl MusheenApp {
                     return popup;
                 };
                 if let Some(pending) = probe {
+                    let deferring = pending.deferring;
                     let popup_ref = popup_cx.entity().downgrade();
                     let window_handle = window.window_handle();
                     let path = format!("pane-{tab_id:?}");
                     let _ = context_menu_host.update(popup_cx, |this, cx| {
                         this.start_menu_probe(pending, popup_ref, window_handle, path, cx);
                     });
-                    return popup.item(PopupMenuItem::label(
-                        loading_label.expect("deferred menus have a loading label"),
-                    ));
+                    if deferring {
+                        return popup.item(PopupMenuItem::label(
+                            loading_label.expect("deferred menus have a loading label"),
+                        ));
+                    }
                 }
                 if let Some(deferred) = deferred {
                     let popup_ref = popup_cx.entity().downgrade();
@@ -17030,6 +17208,7 @@ fn apply_directory_page_error(
 
 impl Render for MusheenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.flush_render_probes(cx);
         self.refresh_remote_connections(cx);
         self.refresh_custom_actions(cx);
         let request = self.active_command_request(CommandAction::CustomAction);
@@ -17934,7 +18113,12 @@ mod tests {
         let mut viewport = IndexedViewport::new(0, 300);
         let rows = |range: std::ops::Range<usize>| {
             range
-                .map(|number| (synthetic_page(number..number + 1).items()[0].clone(), number as u64))
+                .map(|number| {
+                    (
+                        synthetic_page(number..number + 1).items()[0].clone(),
+                        number as u64,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -17944,7 +18128,10 @@ mod tests {
         viewport.insert(300..450, rows(300..450));
 
         assert!(viewport.loaded_len() <= 300, "{}", viewport.loaded_len());
-        assert!(viewport.item(0).is_none(), "the oldest rows are dropped first");
+        assert!(
+            viewport.item(0).is_none(),
+            "the oldest rows are dropped first"
+        );
         assert!(viewport.item(160).is_some());
         assert!(viewport.item(449).is_some());
         assert_eq!(viewport.load_range(&(1_000..1_072), 5_000), 928..1_144);
@@ -19195,9 +19382,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn indexed_folder_stale_indexes_are_removed_when_a_window_opens(
-        cx: &mut TestAppContext,
-    ) {
+    async fn indexed_folder_stale_indexes_are_removed_when_a_window_opens(cx: &mut TestAppContext) {
         let index_root = tempfile::tempdir().unwrap();
         // What a process that ended by SIGKILL leaves behind.
         let stale = index_root.path().join("musheen-directory-stale");
@@ -19686,8 +19871,7 @@ mod tests {
                 "the main list's row cache follows the folder's bound"
             );
             assert!(
-                trail.resident_len() + directory.view().items().len() + cache.loaded_len()
-                    <= 4_096,
+                trail.resident_len() + directory.view().items().len() + cache.loaded_len() <= 4_096,
                 "the tab holds at most one folder's bound of item models"
             );
         });
@@ -20682,36 +20866,46 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
+        let (tab, target) = cx
+            .update_window(browser, |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    let tab = state.navigation.focused_tab().id();
+                    let item = state.focused_directory().view().items()[0].clone();
+                    let target =
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+                    state.select_item(tab, item.id().clone(), cx);
+                    let origin = state
+                        .pending_application_origin(Some(tab), std::slice::from_ref(&target))
+                        .unwrap();
+                    assert!(state.application_selection_is_still_active(
+                        Some(&origin),
+                        std::slice::from_ref(&target),
+                    ));
+                    state.focused_directory_mut().view_mut().clear_selection();
+                    assert!(!state.application_selection_is_still_active(
+                        Some(&origin),
+                        std::slice::from_ref(&target),
+                    ));
+
+                    state.select_item(tab, item.id().clone(), cx);
+                    state.desktop_paths = None;
+                    state.desktop_applications = DesktopApplicationService::default();
+                    state.dispatch_typed_context_command(
+                        CommandAction::Open,
+                        CommandParameters::targets(vec![target.clone()]),
+                        Some(tab),
+                        None,
+                        false,
+                        cx,
+                    );
+                    (tab, target)
+                })
+            })
+            .unwrap();
+        // The target is confirmed at the store off the UI thread first.
+        cx.run_until_parked();
         cx.update_window(browser, |_, _, cx| {
             app.update(cx, |state, cx| {
-                let tab = state.navigation.focused_tab().id();
-                let item = state.focused_directory().view().items()[0].clone();
-                let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
-                state.select_item(tab, item.id().clone(), cx);
-                let origin = state
-                    .pending_application_origin(Some(tab), std::slice::from_ref(&target))
-                    .unwrap();
-                assert!(state.application_selection_is_still_active(
-                    Some(&origin),
-                    std::slice::from_ref(&target),
-                ));
-                state.focused_directory_mut().view_mut().clear_selection();
-                assert!(!state.application_selection_is_still_active(
-                    Some(&origin),
-                    std::slice::from_ref(&target),
-                ));
-
-                state.select_item(tab, item.id().clone(), cx);
-                state.desktop_paths = None;
-                state.desktop_applications = DesktopApplicationService::default();
-                state.dispatch_typed_context_command(
-                    CommandAction::Open,
-                    CommandParameters::targets(vec![target.clone()]),
-                    Some(tab),
-                    None,
-                    false,
-                    cx,
-                );
                 assert!(state.pending_application_commands.is_empty());
                 assert_eq!(
                     state.operation_error.as_deref(),
@@ -20740,6 +20934,12 @@ mod tests {
                     false,
                     cx,
                 );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
                 assert_eq!(
                     state.pending_application_commands.len(),
                     MAX_DESKTOP_APPLICATION_SNAPSHOTS
@@ -21218,78 +21418,98 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
+        let (tab, item, second_item) = cx
+            .update_window(browser, |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    let tab = state.navigation.focused_tab().id();
+                    let item = state
+                        .focused_directory()
+                        .view()
+                        .items()
+                        .iter()
+                        .find(|item| item.path().as_unix_path() == Some(source.as_path()))
+                        .unwrap()
+                        .clone();
+                    let second_item = state
+                        .focused_directory()
+                        .view()
+                        .items()
+                        .iter()
+                        .find(|item| item.path().as_unix_path() == Some(second_source.as_path()))
+                        .unwrap()
+                        .clone();
+                    state.select_item(tab, item.id().clone(), cx);
+                    for section in [
+                        SidebarSectionKind::Pinned,
+                        SidebarSectionKind::Mounts,
+                        SidebarSectionKind::Remote,
+                    ] {
+                        state
+                            .sidebars
+                            .get_mut(&tab)
+                            .unwrap()
+                            .set_section_items(section, std::iter::empty::<SidebarEntry>());
+                    }
+                    let empty_menu = state.compose_context_request(
+                        state.active_command_request(CommandAction::SendTo),
+                    );
+                    assert!(
+                        MusheenApp::menu_entry_by_id(&empty_menu, "actions.custom").is_none(),
+                        "Actions must be omitted when no custom actions contribute children",
+                    );
+                    assert!(
+                        MusheenApp::menu_entry_by_id(&empty_menu, "clipboard.send_to").is_none(),
+                        "Send To must be omitted when the live sidebar has no destinations",
+                    );
+
+                    state.sidebars.get_mut(&tab).unwrap().set_section_items(
+                        SidebarSectionKind::Pinned,
+                        [SidebarEntry::unavailable(
+                            "Read-only archive",
+                            destination_path.clone(),
+                            "read-only fixture",
+                        )],
+                    );
+                    let read_only_menu = state.compose_context_request(
+                        state.active_command_request(CommandAction::SendTo),
+                    );
+                    let read_only_parent =
+                        MusheenApp::menu_entry_by_id(&read_only_menu, "clipboard.send_to")
+                            .expect("an unavailable destination remains visible with its refusal");
+                    assert!(!read_only_parent.state().is_enabled());
+                    assert!(
+                        read_only_parent
+                            .accessible_disabled_reason()
+                            .is_some_and(|reason| reason.contains("read-only")),
+                        "the parent exposes the destination refusal, not the source location state",
+                    );
+                    let read_only_child = read_only_parent
+                        .submenu()
+                        .and_then(|submenu| submenu.destination(destination.to_str().unwrap()))
+                        .expect("the unavailable destination remains inspectable");
+                    assert!(!read_only_child.state().is_enabled());
+
+                    state.sidebars.get_mut(&tab).unwrap().set_section_items(
+                        SidebarSectionKind::Pinned,
+                        [SidebarEntry::new("Archive", destination_path.clone())],
+                    );
+                    // The destination's writability comes from the store off the
+                    // UI thread: ask, then compose again.
+                    state.compose_context_menu(
+                        tab,
+                        MenuTarget::Item,
+                        vec![
+                            CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap(),
+                        ],
+                    );
+                    assert!(state.run_pending_menu_probes(cx));
+                    (tab, item, second_item)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
         cx.update_window(browser, |_, window, cx| {
             app.update(cx, |state, cx| {
-                let tab = state.navigation.focused_tab().id();
-                let item = state
-                    .focused_directory()
-                    .view()
-                    .items()
-                    .iter()
-                    .find(|item| item.path().as_unix_path() == Some(source.as_path()))
-                    .unwrap()
-                    .clone();
-                let second_item = state
-                    .focused_directory()
-                    .view()
-                    .items()
-                    .iter()
-                    .find(|item| item.path().as_unix_path() == Some(second_source.as_path()))
-                    .unwrap()
-                    .clone();
-                state.select_item(tab, item.id().clone(), cx);
-                for section in [
-                    SidebarSectionKind::Pinned,
-                    SidebarSectionKind::Mounts,
-                    SidebarSectionKind::Remote,
-                ] {
-                    state
-                        .sidebars
-                        .get_mut(&tab)
-                        .unwrap()
-                        .set_section_items(section, std::iter::empty::<SidebarEntry>());
-                }
-                let empty_menu = state
-                    .compose_context_request(state.active_command_request(CommandAction::SendTo));
-                assert!(
-                    MusheenApp::menu_entry_by_id(&empty_menu, "actions.custom").is_none(),
-                    "Actions must be omitted when no custom actions contribute children",
-                );
-                assert!(
-                    MusheenApp::menu_entry_by_id(&empty_menu, "clipboard.send_to").is_none(),
-                    "Send To must be omitted when the live sidebar has no destinations",
-                );
-
-                state.sidebars.get_mut(&tab).unwrap().set_section_items(
-                    SidebarSectionKind::Pinned,
-                    [SidebarEntry::unavailable(
-                        "Read-only archive",
-                        destination_path.clone(),
-                        "read-only fixture",
-                    )],
-                );
-                let read_only_menu = state
-                    .compose_context_request(state.active_command_request(CommandAction::SendTo));
-                let read_only_parent =
-                    MusheenApp::menu_entry_by_id(&read_only_menu, "clipboard.send_to")
-                        .expect("an unavailable destination remains visible with its refusal");
-                assert!(!read_only_parent.state().is_enabled());
-                assert!(
-                    read_only_parent
-                        .accessible_disabled_reason()
-                        .is_some_and(|reason| reason.contains("read-only")),
-                    "the parent exposes the destination refusal, not the source location state",
-                );
-                let read_only_child = read_only_parent
-                    .submenu()
-                    .and_then(|submenu| submenu.destination(destination.to_str().unwrap()))
-                    .expect("the unavailable destination remains inspectable");
-                assert!(!read_only_child.state().is_enabled());
-
-                state.sidebars.get_mut(&tab).unwrap().set_section_items(
-                    SidebarSectionKind::Pinned,
-                    [SidebarEntry::new("Archive", destination_path.clone())],
-                );
                 let menu = state.compose_context_menu(
                     tab,
                     MenuTarget::Item,
@@ -21491,13 +21711,11 @@ mod tests {
                     false,
                     cx,
                 );
-                assert_eq!(
-                    state.operation_error.as_deref(),
-                    Some(state.catalog.message("application-open-loading").unwrap())
-                );
             });
         })
         .unwrap();
+        // The target is confirmed at the store off the UI thread, then the
+        // command waits for the application scan and runs when it is done.
         cx.wait_for(browser, Duration::from_secs(2), |_, _| {
             !application_runner.0.lock().unwrap().is_empty()
         })
@@ -21561,6 +21779,14 @@ mod tests {
                     false,
                     cx,
                 );
+            });
+        })
+        .unwrap();
+        // The replaced target is refused once the store answered off the UI
+        // thread.
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
                 assert_eq!(
                     state.operation_error.as_deref(),
                     Some(state.catalog.message("context.target-changed").unwrap())
@@ -22963,6 +23189,11 @@ mod tests {
                 false,
                 cx,
             );
+        });
+        // The target is confirmed at the store off the UI thread first.
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
             assert!(state.shell.info_visible());
             assert_eq!(
                 state.directories[&tab].view().selected_ids(),
@@ -22986,7 +23217,7 @@ mod tests {
         filesystem::rename(&selected, temporary.path().join("old.txt")).unwrap();
         filesystem::write(&selected, b"replacement").unwrap();
 
-        app.update(cx, |state, cx| {
+        let previous_selection = app.update(cx, |state, cx| {
             let tab = state.navigation.focused_tab().id();
             let previous_selection = state.directories[&tab].view().selected_ids().to_vec();
             if state.shell.info_visible() {
@@ -23000,6 +23231,11 @@ mod tests {
                 false,
                 cx,
             );
+            previous_selection
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
             assert!(!state.shell.info_visible());
             assert_eq!(
                 state.directories[&tab].view().selected_ids(),
@@ -23033,6 +23269,9 @@ mod tests {
                 false,
                 cx,
             );
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             assert!(!state.shell.info_visible());
             assert_eq!(
                 state.operation_error.as_deref(),
@@ -23064,6 +23303,19 @@ mod tests {
         app.update(cx, |state, cx| {
             state.application_runner = runner.clone();
             state.executable_handling = ExecutableHandling::Ask;
+            let tab = state.navigation.focused_tab().id();
+            let location = state.navigation.focused_tab().location().clone();
+            // The executable state comes from the store off the UI thread.
+            state.context_for_menu(
+                tab,
+                MenuTarget::Item,
+                &location,
+                std::slice::from_ref(&target),
+            );
+            assert!(state.run_pending_menu_probes(cx));
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, cx| {
             let tab = state.navigation.focused_tab().id();
             let location = state.navigation.focused_tab().location().clone();
             let context = state.context_for_menu(
@@ -23156,6 +23408,9 @@ mod tests {
                 true,
                 cx,
             );
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             assert_eq!(
                 state.operation_error.as_deref(),
                 Some(state.catalog.message("context.target-changed").unwrap())
@@ -23242,6 +23497,11 @@ mod tests {
                     cx,
                 );
             });
+        })
+        .unwrap();
+        // The targets are confirmed at the store off the UI thread first.
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
             assert_eq!(
                 cx.read_from_clipboard().and_then(|item| item.text()),
                 Some(selected.to_string_lossy().into_owned())
@@ -23273,6 +23533,10 @@ mod tests {
                     cx,
                 );
             });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
             assert_eq!(
                 cx.read_from_clipboard().and_then(|item| item.text()),
                 Some(format!("file://{}/raw-%FF", temporary.path().display()))
@@ -23311,6 +23575,12 @@ mod tests {
                     false,
                     cx,
                 );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, _| {
                 assert_eq!(
                     state.operation_error.as_deref(),
                     Some(state.catalog.message("context.target-changed").unwrap())
@@ -24965,7 +25235,10 @@ mod tests {
 
         let item = trash_item_from_entry(&unrestorable);
 
-        assert!(!item.is_restorable(), "the store's verdict reaches the surface");
+        assert!(
+            !item.is_restorable(),
+            "the store's verdict reaches the surface"
+        );
         assert_eq!(item.receipt(), &receipt);
         assert_eq!(item.deleted_at_unix_seconds(), 1_726_742_400);
         assert_eq!(item.kind(), musheen_ops::ConflictItemKind::Directory);
@@ -25836,6 +26109,19 @@ mod tests {
         let (app, _browser, _temporary, location) =
             open_app_with_external_location(ExternalLocation::LinkToFile, cx).await;
 
+        // The place is resolved at the store off the UI thread: ask, then
+        // compose again.
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.sidebar_entry_context_menu(
+                tab,
+                MenuTarget::SidebarLocation,
+                location.clone(),
+                None,
+            );
+            assert!(state.run_pending_menu_probes(cx));
+        });
+        cx.run_until_parked();
         app.update(cx, |state, _| {
             let tab = state.navigation.focused_tab().id();
             let menu =
@@ -25860,6 +26146,17 @@ mod tests {
         let (app, _browser, _temporary, location) =
             open_app_with_external_location(ExternalLocation::DanglingLink, cx).await;
 
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.sidebar_entry_context_menu(
+                tab,
+                MenuTarget::SidebarLocation,
+                location.clone(),
+                None,
+            );
+            assert!(state.run_pending_menu_probes(cx));
+        });
+        cx.run_until_parked();
         app.update(cx, |state, _| {
             let tab = state.navigation.focused_tab().id();
             let menu =
@@ -25938,6 +26235,9 @@ mod tests {
                 .expect("the sidebar menu offers the command")
                 .clone();
             state.dispatch_context_entry(entry, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             let expected = state.catalog.message("context.target-changed").unwrap();
             assert_eq!(
                 state.navigation.focused_pane().tabs().len(),
@@ -25985,6 +26285,12 @@ mod tests {
             window.render_frame(cx);
             assert!(window.find("keyboard-context-menu").visible());
             assert!(window.find("popup-menu").visible());
+        })
+        .expect("test window remains open");
+        // The rows arrive once the store answered off the UI thread.
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
             let row_id = format!(
                 "context-menu-row-keyboard-{:?}-0",
                 app.read(cx).navigation.focused_tab().id()
@@ -28967,8 +29273,13 @@ mod tests {
             window.right_click(network_button, cx);
         })
         .unwrap();
-        cx.wait_for(browser, Duration::from_secs(2), |window, _| {
+        // The rows arrive once the store answered off the UI thread.
+        cx.wait_for(browser, Duration::from_secs(2), |window, cx| {
+            let tab = app.read(cx).navigation.focused_tab().id();
             window.find("popup-menu").visible()
+                && window
+                    .try_find(format!("context-menu-row-sidebar-{tab:?}-0"))
+                    .is_some()
         })
         .await;
         cx.update_window(browser, |_, window, cx| {
@@ -29751,9 +30062,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn ui_thread_watch_event_applies_while_the_catalog_lock_is_held(
-        cx: &mut TestAppContext,
-    ) {
+    async fn ui_thread_watch_event_applies_while_the_catalog_lock_is_held(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
