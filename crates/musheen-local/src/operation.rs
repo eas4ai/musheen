@@ -1203,13 +1203,14 @@ fn descriptor_identity(stat: &rustix::fs::Statx) -> Box<[u8]> {
     // Removing a directory's planned children necessarily changes its size,
     // mtime, and ctime. Its descriptor, inode, type, mode, and exact child-name
     // plan still prove that the entry is the directory we prepared. Non-directory
-    // entries retain content timestamps and size so a changed file is refused.
+    // entries keep their size and content timestamp so a changed file is refused.
+    // ctime is left out on purpose: unlinking one link of a hard-link pair
+    // updates the shared inode's ctime, so a pair inside one moved tree would
+    // refuse its second link and leave the source half removed.
     if !descriptor_is_directory(stat) {
         identity.extend_from_slice(&stat.stx_size.to_ne_bytes());
         identity.extend_from_slice(&stat.stx_mtime.tv_sec.to_ne_bytes());
         identity.extend_from_slice(&stat.stx_mtime.tv_nsec.to_ne_bytes());
-        identity.extend_from_slice(&stat.stx_ctime.tv_sec.to_ne_bytes());
-        identity.extend_from_slice(&stat.stx_ctime.tv_nsec.to_ne_bytes());
     }
     identity.into_boxed_slice()
 }
