@@ -2352,18 +2352,14 @@ fn spawn_file_manager1_service(
 
 fn register_file_manager_window(view: &Entity<MusheenApp>, window: &mut Window, cx: &mut App) {
     let window_id = window.window_handle().window_id();
+    let release_binding = view.read(cx).session_binding.clone();
     let release = cx.observe_release(view, move |_, cx| {
-        if cx.has_global::<FileManagerWindows>() {
-            cx.global_mut::<FileManagerWindows>()
-                .entries
-                .retain(|entry| entry.window_id != window_id);
-        }
+        retire_file_manager_window(window_id, release_binding.as_ref(), cx);
     });
+    let close_binding = view.read(cx).session_binding.clone();
     let close = cx.on_window_closed(move |cx, closed| {
-        if closed == window_id && cx.has_global::<FileManagerWindows>() {
-            cx.global_mut::<FileManagerWindows>()
-                .entries
-                .retain(|entry| entry.window_id != window_id);
+        if closed == window_id {
+            retire_file_manager_window(window_id, close_binding.as_ref(), cx);
         }
     });
     let windows = cx.global_mut::<FileManagerWindows>();
@@ -2377,6 +2373,29 @@ fn register_file_manager_window(view: &Entity<MusheenApp>, window: &mut Window, 
         _release: release,
         _close: close,
     });
+}
+
+fn retire_file_manager_window(window_id: WindowId, binding: Option<&SessionBinding>, cx: &mut App) {
+    if cx.has_global::<FileManagerWindows>() {
+        cx.global_mut::<FileManagerWindows>()
+            .entries
+            .retain(|entry| entry.window_id != window_id);
+    }
+    if let Some(binding) = binding {
+        match binding.prepare_remove_window() {
+            Ok(Some(prepared)) => {
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(error) = prepared.save_if_current() {
+                            eprintln!("Musheen could not save its browsing session: {error}");
+                        }
+                    })
+                    .detach();
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("Musheen could not update its browsing session: {error}"),
+        }
+    }
 }
 
 fn route_file_manager_request(envelope: musheen_desktop::FileManagerRequestEnvelope, cx: &mut App) {
@@ -2864,6 +2883,25 @@ impl SessionCoordinator {
         Ok(id)
     }
 
+    fn remove_window(&mut self, id: u64) -> Result<Option<(u64, Vec<u8>)>, NavigationError> {
+        if self.windows.len() <= 1 || !self.windows.iter().any(|(window_id, _)| *window_id == id) {
+            return Ok(None);
+        }
+        let remaining = self
+            .windows
+            .iter()
+            .filter(|(window_id, _)| *window_id != id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let document =
+            ApplicationSession::new(remaining.iter().map(|(_, window)| window.clone()).collect())?
+                .with_unknown_fields(self.unknown_fields.clone())
+                .to_json()?;
+        self.windows = remaining;
+        self.revision = self.revision.wrapping_add(1);
+        Ok(Some((self.revision, document)))
+    }
+
     fn prepare_save(
         &mut self,
         window_id: u64,
@@ -2922,6 +2960,19 @@ impl PreparedSessionSave {
 }
 
 impl SessionBinding {
+    fn prepare_remove_window(&self) -> Result<Option<PreparedSessionSave>, NavigationError> {
+        let removed = self
+            .coordinator
+            .lock()
+            .expect("session coordinator lock is not poisoned")
+            .remove_window(self.window_id)?;
+        Ok(removed.map(|(revision, document)| PreparedSessionSave {
+            binding: self.clone(),
+            revision,
+            document,
+        }))
+    }
+
     fn prepare_save(&self, window: WindowSession) -> Result<PreparedSessionSave, NavigationError> {
         let (revision, document) = self
             .coordinator
@@ -8414,6 +8465,7 @@ impl MusheenApp {
             (
                 action @ (CommandAction::Open
                 | CommandAction::OpenInNewTab
+                | CommandAction::OpenInNewWindow
                 | CommandAction::OpenInOtherPane
                 | CommandAction::OpenWith
                 | CommandAction::SetDefaultApplication
@@ -8819,7 +8871,10 @@ impl MusheenApp {
         };
         if matches!(
             action,
-            CommandAction::Open | CommandAction::OpenInNewTab | CommandAction::OpenInOtherPane
+            CommandAction::Open
+                | CommandAction::OpenInNewTab
+                | CommandAction::OpenInNewWindow
+                | CommandAction::OpenInOtherPane
         ) && targets.len() == 1
             && origin_tab
                 .and_then(|tab| self.directories.get(&tab))
@@ -8843,6 +8898,9 @@ impl MusheenApp {
                         self.start_load_for_tab(tab_id, location, cx);
                         self.schedule_session_save(cx);
                     }
+                }
+                CommandAction::OpenInNewWindow => {
+                    self.open_new_browser_window(location, cx);
                 }
                 CommandAction::OpenInOtherPane => {
                     let current = self.navigation.focused_pane_id();
@@ -8936,6 +8994,15 @@ impl MusheenApp {
             }
             (CommandAction::Permissions, CommandParameters::Targets(_)) => {
                 self.open_properties_targets(targets, PropertiesPage::Permissions, cx);
+            }
+            (CommandAction::OpenInNewWindow, CommandParameters::Targets(_)) => {
+                self.operation_error = Some(
+                    self.catalog
+                        .message("context.target-changed")
+                        .expect("target refusal is localized")
+                        .into(),
+                );
+                cx.notify();
             }
             _ => unreachable!("the caller pairs each local command with typed parameters"),
         }
@@ -10059,8 +10126,11 @@ impl MusheenApp {
                 | CommandAction::Pin
                 | CommandAction::Unpin
                 | CommandAction::ManageTags
+                | CommandAction::RenameTag
+                | CommandAction::DeleteTag
                 | CommandAction::Open
                 | CommandAction::OpenInNewTab
+                | CommandAction::OpenInNewWindow
                 | CommandAction::OpenInOtherPane
                 | CommandAction::OpenWith
                 | CommandAction::ChooseApplication
@@ -10106,6 +10176,21 @@ impl MusheenApp {
         target: CommandTarget,
         selection: &[CommandTargetRef],
     ) -> CapabilityState {
+        if action == CommandAction::OpenInNewWindow
+            && !self
+                .session_binding
+                .as_ref()
+                .is_some_and(SessionBinding::can_append_window)
+        {
+            return CapabilityState::Unsupported(
+                CapabilityReason::new(
+                    self.catalog
+                        .message("context.backend-unavailable")
+                        .expect("backend refusal is localized"),
+                )
+                .expect("backend refusal is nonempty"),
+            );
+        }
         if action == CommandAction::Duplicate
             && selection
                 .iter()
@@ -11165,6 +11250,30 @@ impl MusheenApp {
         }
     }
 
+    fn open_new_browser_window(&mut self, location: StorePath, cx: &mut Context<Self>) {
+        let Some(source_binding) = self.session_binding.clone() else {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.backend-unavailable")
+                    .expect("backend refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let navigation = WindowSession::new(location);
+        match source_binding.append_window(navigation.clone()) {
+            Ok(binding) => {
+                self.schedule_session_save(cx);
+                self.spawn_browser_window(navigation, binding, cx);
+            }
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+            }
+        }
+    }
+
     fn tear_out_active_tab(&mut self, cx: &mut Context<Self>) {
         let Some(source_binding) = self.session_binding.clone() else {
             return;
@@ -11182,12 +11291,21 @@ impl MusheenApp {
         self.navigation = retained;
         self.schedule_session_save(cx);
         self.load_focused_tab(cx);
+        self.spawn_browser_window(detached, binding, cx);
+    }
+
+    fn spawn_browser_window(
+        &self,
+        navigation: WindowSession,
+        binding: SessionBinding,
+        cx: &mut Context<Self>,
+    ) {
         let watch_directories = self.watch_directories;
         cx.spawn(async move |_, cx| {
             cx.open_window(detached_window_options(), move |window, cx| {
                 let view = cx.new(|cx| {
                     MusheenApp::new_with_navigation(
-                        detached,
+                        navigation,
                         Some(binding),
                         None,
                         ResourceLimits::default(),
@@ -16690,6 +16808,15 @@ mod tests {
         layout: Layout,
         cx: &mut TestAppContext,
     ) -> (Entity<MusheenApp>, AnyWindowHandle) {
+        open_selected_directory_with_store(path, layout, None, cx).await
+    }
+
+    async fn open_selected_directory_with_store(
+        path: &Path,
+        layout: Layout,
+        session_store: Option<SessionStore>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<MusheenApp>, AnyWindowHandle) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
@@ -16697,7 +16824,7 @@ mod tests {
         let root = path.to_path_buf();
         let mut app = None;
         let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
-            let view = cx.new(|cx| MusheenApp::new_with_session_store(root, None, cx));
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(root, session_store, cx));
             app = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -19948,6 +20075,8 @@ mod tests {
             CommandAction::Duplicate,
             CommandAction::Hide,
             CommandAction::Unhide,
+            CommandAction::RenameTag,
+            CommandAction::DeleteTag,
         ] {
             assert_eq!(
                 MusheenApp::backend_action_state(action),
@@ -20278,6 +20407,221 @@ mod tests {
             )
         });
         assert!(matches!(capability, CapabilityState::Unsupported(_)));
+    }
+
+    #[gpui_kit::test]
+    async fn open_in_new_window_keeps_the_source_tab_at_its_location(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_temporary = tempfile::tempdir().unwrap();
+        cx.update(|cx| cx.set_global(FileManagerWindows::default()));
+        let destination = temporary.path().join("destination");
+        filesystem::create_dir(&destination).unwrap();
+        let (app, browser) = open_selected_directory_with_store(
+            temporary.path(),
+            Layout::List,
+            Some(SessionStore::at(
+                session_temporary.path().join("session.json"),
+            )),
+            cx,
+        )
+        .await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(destination.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+        let original = StorePath::from_unix_path(temporary.path().as_os_str());
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            assert_eq!(
+                state.context_backend_action_state(
+                    CommandAction::OpenInNewWindow,
+                    tab,
+                    CommandTarget::Directory,
+                    std::slice::from_ref(&target),
+                ),
+                CapabilityState::Supported
+            );
+            state.dispatch_typed_context_command(
+                CommandAction::OpenInNewWindow,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+            assert_eq!(state.navigation.focused_tab().location(), &original);
+            let windows = state
+                .session_binding
+                .as_ref()
+                .unwrap()
+                .coordinator
+                .lock()
+                .unwrap()
+                .entries();
+            assert_eq!(windows.len(), 2);
+            assert_eq!(
+                windows[1].1.focused_tab().location(),
+                &StorePath::from_unix_path(destination.as_os_str())
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.global::<FileManagerWindows>().entries.len() == 1
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn open_in_new_window_is_disabled_at_the_window_limit(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        filesystem::create_dir(&destination).unwrap();
+        let (app, _) = open_selected_directory_with_store(
+            temporary.path(),
+            Layout::List,
+            Some(SessionStore::at(
+                session_temporary.path().join("session.json"),
+            )),
+            cx,
+        )
+        .await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(destination.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+
+        app.update(cx, |state, _| {
+            let binding = state.session_binding.as_ref().unwrap();
+            let mut coordinator = binding.coordinator.lock().unwrap();
+            for _ in 1..MAX_WINDOWS {
+                coordinator
+                    .append(WindowSession::new(target.path().clone()))
+                    .unwrap();
+            }
+            assert_eq!(coordinator.entries().len(), MAX_WINDOWS);
+        });
+        let capability = app.update(cx, |state, _| {
+            state.context_backend_action_state(
+                CommandAction::OpenInNewWindow,
+                state.navigation.focused_tab().id(),
+                CommandTarget::Directory,
+                &[target],
+            )
+        });
+        assert!(matches!(capability, CapabilityState::Unsupported(_)));
+    }
+
+    #[gpui_kit::test]
+    async fn closing_a_new_browser_window_frees_session_capacity(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_temporary = tempfile::tempdir().unwrap();
+        cx.update(|cx| cx.set_global(FileManagerWindows::default()));
+        let destination = temporary.path().join("destination");
+        filesystem::create_dir(&destination).unwrap();
+        let (app, browser) = open_selected_directory_with_store(
+            temporary.path(),
+            Layout::List,
+            Some(SessionStore::at(
+                session_temporary.path().join("session.json"),
+            )),
+            cx,
+        )
+        .await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(destination.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::OpenInNewWindow,
+                CommandParameters::targets(vec![target.clone()]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            cx.global::<FileManagerWindows>().entries.len() == 1
+        })
+        .await;
+        let new_window = cx.update(|cx| cx.global::<FileManagerWindows>().entries[0].handle);
+        app.update(cx, |state, _| {
+            let binding = state.session_binding.as_ref().unwrap();
+            let mut coordinator = binding.coordinator.lock().unwrap();
+            for _ in 2..MAX_WINDOWS {
+                coordinator
+                    .append(WindowSession::new(target.path().clone()))
+                    .unwrap();
+            }
+            assert!(!coordinator.can_append());
+        });
+
+        cx.update_window(new_window, |_, window, _| window.remove_window())
+            .unwrap();
+        let capability = app.update(cx, |state, _| {
+            state.context_backend_action_state(
+                CommandAction::OpenInNewWindow,
+                state.navigation.focused_tab().id(),
+                CommandTarget::Directory,
+                &[target],
+            )
+        });
+        assert_eq!(capability, CapabilityState::Supported);
+    }
+
+    #[gpui_kit::test]
+    async fn closing_a_new_browser_window_updates_the_saved_session(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_temporary = tempfile::tempdir().unwrap();
+        cx.update(|cx| cx.set_global(FileManagerWindows::default()));
+        let destination = temporary.path().join("destination");
+        filesystem::create_dir(&destination).unwrap();
+        let session_store = SessionStore::at(session_temporary.path().join("session.json"));
+        let (app, browser) = open_selected_directory_with_store(
+            temporary.path(),
+            Layout::List,
+            Some(session_store.clone()),
+            cx,
+        )
+        .await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(destination.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::OpenInNewWindow,
+                CommandParameters::targets(vec![target]),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |_, _| {
+            saved_window_count(&session_store) == Some(2)
+        })
+        .await;
+        let new_window = cx.update(|cx| cx.global::<FileManagerWindows>().entries[0].handle);
+        cx.update_window(new_window, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.wait_for(browser, Duration::from_secs(3), |_, _| {
+            saved_window_count(&session_store) == Some(1)
+        })
+        .await;
+    }
+
+    fn saved_window_count(store: &SessionStore) -> Option<usize> {
+        let bytes = store.load().ok()??;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        Some(value.get("windows")?.as_array()?.len())
     }
 
     #[gpui_kit::test]
