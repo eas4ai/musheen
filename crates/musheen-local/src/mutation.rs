@@ -739,13 +739,68 @@ fn make_tree_writable(root: &Path) -> Result<(), MutationError> {
     Ok(())
 }
 
-/// Whether the trash still holds the record and the payload a receipt
-/// names. One record is checked, never the whole listing.
-pub(crate) fn trash_record_present(receipt: &TrashReceipt) -> bool {
+/// Whether the trash still holds the record a receipt names, for the same
+/// original path, with its payload. One record is read, never the listing:
+/// a record name freed by Empty Trash can be taken by another file of the
+/// same name, and that file is not this receipt's.
+pub(crate) fn trash_record_matches(receipt: &TrashReceipt) -> bool {
     let info = PathBuf::from(OsString::from_vec(receipt.provider_reference().to_vec()));
-    fs::symlink_metadata(&info).is_ok()
+    let Some(recorded) = trash_record_original_path(&info) else {
+        return false;
+    };
+    receipt_original_forms(receipt)
+        .iter()
+        .any(|form| *form == recorded)
         && trash_payload_path_of_record(&info)
             .is_ok_and(|payload| fs::symlink_metadata(payload).is_ok())
+}
+
+/// The original path a trash record names, decoded from its `Path=` line
+/// as the trash crate wrote it: each name percent-encoded.
+fn trash_record_original_path(info: &Path) -> Option<PathBuf> {
+    let text = fs::read(info).ok()?;
+    let encoded = text
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"Path="))?;
+    Some(PathBuf::from(OsString::from_vec(percent_decode(encoded))))
+}
+
+fn percent_decode(text: &[u8]) -> Vec<u8> {
+    let hex = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    let mut decoded = Vec::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        if text[index] == b'%'
+            && index + 2 < text.len()
+            && let (Some(high), Some(low)) = (hex(text[index + 1]), hex(text[index + 2]))
+        {
+            decoded.push(high << 4 | low);
+            index += 3;
+        } else {
+            decoded.push(text[index]);
+            index += 1;
+        }
+    }
+    decoded
+}
+
+/// The forms a receipt's original path takes in its trash record: the path
+/// as requested, and the path with its parent's links resolved, which is
+/// what the trash holds for an item reached through a linked parent.
+fn receipt_original_forms(receipt: &TrashReceipt) -> Vec<PathBuf> {
+    let Some(original) = receipt.original_path().as_unix_path() else {
+        return Vec::new();
+    };
+    let mut forms = vec![original.to_path_buf()];
+    if let (Some(parent), Some(name)) = (original.parent(), original.file_name())
+        && let Ok(resolved) = fs::canonicalize(parent)
+    {
+        let resolved = resolved.join(name);
+        if resolved != forms[0] {
+            forms.push(resolved);
+        }
+    }
+    forms
 }
 
 fn trash_payload_path_of_record(info: &Path) -> Result<PathBuf, MutationError> {
@@ -1888,6 +1943,14 @@ fn restore_receipt_no_replace(receipt: &TrashReceipt) -> Result<(), MutationErro
         .into_iter()
         .find(|item| item.id == id)
         .ok_or(MutationError::Missing)?;
+    // The record must still be this receipt's: a freed record name can be
+    // taken by another file of the same name.
+    if !receipt_original_forms(receipt)
+        .iter()
+        .any(|form| *form == item.original_path())
+    {
+        return Err(MutationError::Missing);
+    }
     let payload = trash_payload_path(&item)?;
     if fs::symlink_metadata(&payload).is_err() {
         return Err(MutationError::Missing);
