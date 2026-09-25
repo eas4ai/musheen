@@ -476,6 +476,7 @@ impl StatusCenterModel {
             return Err(StatusCenterError::InvalidState(id));
         }
         entry.status = OperationStatus::Cancelled;
+        self.prune_finished();
         Ok(())
     }
 
@@ -512,6 +513,7 @@ impl StatusCenterModel {
         } else {
             OperationStatus::NeedsAttention
         };
+        self.prune_finished();
         Ok(())
     }
 
