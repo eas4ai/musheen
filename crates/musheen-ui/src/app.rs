@@ -7065,20 +7065,40 @@ impl MusheenApp {
         location: StorePath,
         identity: Option<ItemId>,
     ) -> ContextMenu {
-        let selection = identity
-            .and_then(|item| CommandTargetRef::new(item, location.clone()).ok())
-            .or_else(|| {
-                self.store
-                    .resolve_item(&location)
+        // The resolved item decides the command set: a directory or a link
+        // to one gets the directory commands. A link whose target is gone
+        // offers nothing to open, so the menu is composed without a
+        // selection and the open commands show disabled with their reason.
+        let resolved = self.store.resolve_item(&location).ok().flatten();
+        let reachable = resolved.as_ref().is_some_and(|item| {
+            item.kind() != ItemKind::SymbolicLink
+                || self
+                    .store
+                    .resolve_link_target(item.path())
                     .ok()
                     .flatten()
-                    .and_then(|item| {
+                    .is_some()
+        });
+        let selection = if reachable {
+            identity
+                .and_then(|item| CommandTargetRef::new(item, location.clone()).ok())
+                .or_else(|| {
+                    resolved.as_ref().and_then(|item| {
                         CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
                     })
-            })
-            .into_iter()
-            .collect();
-        self.compose_context_menu_at(tab_id, target, location, selection)
+                })
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let send_to = self.send_to_destinations(tab_id);
+        let open_with = self.open_with_applications(&selection);
+        let request = self
+            .context_menu_request_with_item(tab_id, target, location, selection, resolved.as_ref())
+            .with_send_to(&send_to)
+            .with_open_with(&open_with);
+        self.compose_context_request(request)
     }
 
     fn compose_context_menu(
@@ -7502,6 +7522,7 @@ impl MusheenApp {
             CommandTarget::Mount
         } else if target == MenuTarget::SidebarLocation
             && (selected_is_pinned || selection.len() == 1)
+            && selected_item.is_none_or(|item| self.opens_as_directory(item))
         {
             CommandTarget::Directory
         } else if target == MenuTarget::SidebarLocation {
@@ -23857,14 +23878,22 @@ mod tests {
         tempfile::TempDir,
         StorePath,
     ) {
-        open_app_with_external_location(false, cx).await
+        open_app_with_external_location(ExternalLocation::Directory, cx).await
+    }
+
+    /// The shape of the external sidebar location a test opens the app
+    /// next to. Sidebar places such as $HOME/Desktop are often links.
+    #[derive(Clone, Copy)]
+    enum ExternalLocation {
+        Directory,
+        LinkToDirectory,
+        LinkToFile,
+        DanglingLink,
     }
 
     /// Opens the app on an empty directory next to an external location.
-    /// With `linked`, the location is a symbolic link to a directory, as
-    /// sidebar places such as $HOME/Desktop often are.
     async fn open_app_with_external_location(
-        linked: bool,
+        shape: ExternalLocation,
         cx: &mut TestAppContext,
     ) -> (
         Entity<MusheenApp>,
@@ -23877,12 +23906,20 @@ mod tests {
         let current = temporary.path().join("current");
         let external = temporary.path().join("external");
         filesystem::create_dir(&current).unwrap();
-        if linked {
-            let real = temporary.path().join("real-external");
-            filesystem::create_dir(&real).unwrap();
-            standard_library::os::unix::fs::symlink(&real, &external).unwrap();
-        } else {
-            filesystem::create_dir(&external).unwrap();
+        let real = temporary.path().join("real-external");
+        match shape {
+            ExternalLocation::Directory => filesystem::create_dir(&external).unwrap(),
+            ExternalLocation::LinkToDirectory => {
+                filesystem::create_dir(&real).unwrap();
+                standard_library::os::unix::fs::symlink(&real, &external).unwrap();
+            }
+            ExternalLocation::LinkToFile => {
+                filesystem::write(&real, b"a file").unwrap();
+                standard_library::os::unix::fs::symlink(&real, &external).unwrap();
+            }
+            ExternalLocation::DanglingLink => {
+                standard_library::os::unix::fs::symlink(&real, &external).unwrap();
+            }
         }
         let mut app = None;
         let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
@@ -23970,7 +24007,8 @@ mod tests {
     // offers them the directory commands, so those commands run on them.
     #[gpui_kit::test]
     async fn sidebar_open_in_new_tab_opens_a_link_to_a_directory(cx: &mut TestAppContext) {
-        let (app, _browser, _temporary, location) = open_app_with_external_location(true, cx).await;
+        let (app, _browser, _temporary, location) =
+            open_app_with_external_location(ExternalLocation::LinkToDirectory, cx).await;
 
         app.update(cx, |state, cx| {
             dispatch_sidebar_menu_command(state, &location, "directory.open_new_tab", cx);
@@ -23990,7 +24028,8 @@ mod tests {
 
     #[gpui_kit::test]
     async fn sidebar_open_navigates_to_a_link_to_a_directory(cx: &mut TestAppContext) {
-        let (app, _browser, _temporary, location) = open_app_with_external_location(true, cx).await;
+        let (app, _browser, _temporary, location) =
+            open_app_with_external_location(ExternalLocation::LinkToDirectory, cx).await;
 
         app.update(cx, |state, cx| {
             dispatch_sidebar_menu_command(state, &location, "file.open", cx);
@@ -24005,6 +24044,54 @@ mod tests {
                 "no error is shown: {:?}",
                 state.operation_error
             );
+        });
+    }
+
+    // UXF-012: a sidebar location that links to a file is not a directory,
+    // so the directory commands are not offered while Open stays available
+    // for the file.
+    #[gpui_kit::test]
+    async fn sidebar_open_in_new_tab_is_disabled_for_a_link_to_a_file(cx: &mut TestAppContext) {
+        let (app, _browser, _temporary, location) =
+            open_app_with_external_location(ExternalLocation::LinkToFile, cx).await;
+
+        app.update(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
+            let menu =
+                state.sidebar_entry_context_menu(tab, MenuTarget::SidebarLocation, location, None);
+            for command in ["directory.open_new_tab", "directory.open_new_window"] {
+                let offered = MusheenApp::menu_entry_by_id(&menu, command)
+                    .is_some_and(|entry| entry.state().is_enabled());
+                assert!(!offered, "{command} is not offered on a link to a file");
+            }
+            let open = MusheenApp::menu_entry_by_id(&menu, "file.open").expect("Open is offered");
+            assert!(
+                open.state().is_enabled(),
+                "a linked file opens with its application"
+            );
+        });
+    }
+
+    // UXF-012: a sidebar location whose link target is gone offers nothing
+    // to open; no open command is enabled.
+    #[gpui_kit::test]
+    async fn sidebar_open_commands_are_disabled_for_a_dangling_link(cx: &mut TestAppContext) {
+        let (app, _browser, _temporary, location) =
+            open_app_with_external_location(ExternalLocation::DanglingLink, cx).await;
+
+        app.update(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
+            let menu =
+                state.sidebar_entry_context_menu(tab, MenuTarget::SidebarLocation, location, None);
+            for command in [
+                "file.open",
+                "directory.open_new_tab",
+                "directory.open_new_window",
+            ] {
+                let enabled = MusheenApp::menu_entry_by_id(&menu, command)
+                    .is_some_and(|entry| entry.state().is_enabled());
+                assert!(!enabled, "{command} must not be offered on a dangling link");
+            }
         });
     }
 
