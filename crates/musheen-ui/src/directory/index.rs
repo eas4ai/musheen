@@ -15,14 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use tempfile::{Builder, NamedTempFile, TempDir, TempPath};
 
-/// Records decoded from the index, counted so a test can show how much of the
-/// index one change reads.
 #[cfg(test)]
-pub(super) static RECORD_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Times the visible order was replaced, counted so a test can show how many
-/// passes a batch of changes costs.
-#[cfg(test)]
-pub(super) static ORDER_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// Records this thread decoded from an index, counted so a test can show
+    /// how much of the index one change reads. Per thread, so tests that run
+    /// at the same time count only their own index.
+    static RECORD_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Times this thread replaced a visible order, counted so a test can
+    /// show how many passes a batch of changes costs.
+    static ORDER_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 const MAGIC: &[u8; 8] = b"MSIDX001";
 /// Every index directory starts with this prefix; the startup sweep looks
@@ -561,7 +563,7 @@ impl DiskDirectoryIndex {
 
     fn read_index_record(records: &mut File, offset: u64) -> io::Result<IndexRecord> {
         #[cfg(test)]
-        RECORD_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        RECORD_READS.with(|reads| reads.set(reads.get() + 1));
         if offset < MAGIC.len() as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -599,7 +601,7 @@ impl DiskDirectoryIndex {
         )?;
         self.order = Some(order);
         #[cfg(test)]
-        ORDER_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ORDER_WRITES.with(|writes| writes.set(writes.get() + 1));
         self.order_preferences = Some(preferences.clone());
         self.order_filter = filter.cloned();
         self.id_order = Some(id_order);
@@ -668,7 +670,7 @@ impl DiskDirectoryIndex {
         self.id_order = Some(id_order);
         self.order = Some(order);
         #[cfg(test)]
-        ORDER_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ORDER_WRITES.with(|writes| writes.set(writes.get() + 1));
         self.order_stale = false;
         Ok(())
     }
@@ -1882,15 +1884,6 @@ mod tests {
         );
     }
 
-    /// The read and write counters are process-wide, so the tests that
-    /// assert on them run one at a time.
-    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
-        static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        COUNTERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     fn many_records(index: &mut DiskDirectoryIndex, count: u64) {
         let provider = ProviderId::new("local").unwrap();
         for number in (0..count).rev() {
@@ -1937,22 +1930,20 @@ mod tests {
 
     #[test]
     fn indexed_folder_merge_reads_a_bounded_number_of_records() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let _serialized = counter_guard();
         let root = tempfile::tempdir().unwrap();
         let mut index = DiskDirectoryIndex::new_in(root.path()).unwrap();
         many_records(&mut index, 100_000);
         let index = std::sync::Arc::new(std::sync::Mutex::new(index));
         let changed = new_item(500, "item-0000500");
 
-        super::RECORD_READS.store(0, Relaxed);
+        super::RECORD_READS.with(|reads| reads.set(0));
         let result = watch_work(
             &index,
             vec![musheen_core::WatchEvent::Changed(changed.clone())],
         )
         .run()
         .unwrap();
-        let reads = super::RECORD_READS.load(Relaxed);
+        let reads = super::RECORD_READS.with(std::cell::Cell::get);
 
         assert_eq!(result.indexed_count, 100_000);
         assert!(
@@ -1967,8 +1958,6 @@ mod tests {
 
     #[test]
     fn indexed_folder_merge_applies_waiting_changes_as_one_batch() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let _serialized = counter_guard();
         let root = tempfile::tempdir().unwrap();
         let mut index = DiskDirectoryIndex::new_in(root.path()).unwrap();
         many_records(&mut index, 5_000);
@@ -1982,9 +1971,9 @@ mod tests {
             })
             .collect();
 
-        super::ORDER_WRITES.store(0, Relaxed);
+        super::ORDER_WRITES.with(|writes| writes.set(0));
         let result = watch_work(&index, events).run().unwrap();
-        let writes = super::ORDER_WRITES.load(Relaxed);
+        let writes = super::ORDER_WRITES.with(std::cell::Cell::get);
 
         assert_eq!(result.indexed_count, 5_050);
         assert_eq!(result.visible_count, 5_050);
