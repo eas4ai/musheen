@@ -224,6 +224,8 @@ pub struct OperationHub {
     status_revision: Arc<AtomicU64>,
     reservations: Arc<Mutex<BTreeMap<u64, Vec<std::path::PathBuf>>>>,
     next_reservation: Arc<AtomicU64>,
+    /// Jobs the status center pruned, forgotten by the queue on its next run.
+    pending_forget: Arc<Mutex<Vec<JobId>>>,
 }
 
 impl OperationHub {
@@ -289,6 +291,7 @@ impl OperationHub {
             status_revision: Arc::new(AtomicU64::new(0)),
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
+            pending_forget: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -344,6 +347,7 @@ impl OperationHub {
             status_revision,
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
+            pending_forget: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -855,10 +859,9 @@ impl OperationHub {
                 .queue
                 .lock()
                 .map_err(|_| OperationHubError::QueueLock)?;
-            queue.cancel(id)?;
-            queue.state(id)
+            queue.cancel(id)?
         };
-        if state == Some(JobState::Cancelled) {
+        if state == JobState::Cancelled {
             self.status
                 .lock()
                 .map_err(|_| OperationHubError::StatusLock)?
@@ -945,17 +948,25 @@ impl OperationHub {
             .status_revision
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        let Some(persistence) = self.persistence.as_ref() else {
-            return;
-        };
-        let snapshot = match self.status.lock() {
-            Ok(status) => status.clone(),
+        let (snapshot, pruned) = match self.status.lock() {
+            Ok(mut status) => {
+                let pruned = status.take_pruned();
+                (self.persistence.as_ref().map(|_| status.clone()), pruned)
+            }
             Err(_) => {
                 if let Ok(mut error) = self.persistence_error.lock() {
                     *error = Some("the status center lock is poisoned".into());
                 }
                 return;
             }
+        };
+        if !pruned.is_empty()
+            && let Ok(mut pending) = self.pending_forget.lock()
+        {
+            pending.extend(pruned);
+        }
+        let (Some(persistence), Some(snapshot)) = (self.persistence.as_ref(), snapshot) else {
+            return;
         };
         if let Err(error) = persistence.persist(revision, snapshot)
             && let Ok(mut persistence_error) = self.persistence_error.lock()
@@ -1064,10 +1075,6 @@ impl OperationHub {
             return Err(OperationHubError::MountReserved);
         }
         transition().map_err(Into::into)
-    }
-
-    fn queue(&self) -> Arc<Mutex<LocalOperationQueue>> {
-        Arc::clone(&self.queue)
     }
 
     fn recovery_staging(&self, id: JobId) -> Result<StorePath, OperationHubError> {
@@ -1179,11 +1186,21 @@ pub(crate) fn spawn_ready_hub_operations<V>(
 where
     V: 'static,
 {
-    let ready = hub
-        .queue()
+    let forgotten = hub
+        .pending_forget
         .lock()
-        .map_err(|_| OperationHubError::QueueLock)?
-        .start_ready()?;
+        .map(|mut pending| std::mem::take(&mut *pending))
+        .unwrap_or_default();
+    let ready = {
+        let mut queue = hub
+            .queue
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?;
+        for id in forgotten {
+            queue.forget(id);
+        }
+        queue.start_ready()?
+    };
 
     for operation in ready {
         let id = operation.id();
@@ -1205,16 +1222,16 @@ where
                     .lock()
                     .map_err(|_| OperationHubError::QueueLock)
                     .and_then(|mut queue| {
-                        match result.as_ref() {
+                        let state = match result.as_ref() {
                             Ok(LocalOperationOutcome::Transfer(
                                 TransferOutcome::MetadataReview { review, .. },
                             )) => queue.finish_metadata_review(id, review.clone())?,
                             Ok(outcome) => queue.finish_with_outcome(id, outcome.clone())?,
                             Err(error) => {
-                                queue.finish(id, Err(error.message().to_owned().into()))?;
+                                queue.finish(id, Err(error.message().to_owned().into()))?
                             }
-                        }
-                        Ok(queue.state(id))
+                        };
+                        Ok(Some(state))
                     });
             let status_result = hub
                 .status

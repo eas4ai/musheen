@@ -93,7 +93,7 @@ struct SchedulerData<C> {
     queued: VecDeque<JobId>,
     running: BTreeSet<JobId>,
     jobs: BTreeMap<JobId, JobRecord>,
-    events: Vec<JobEvent>,
+    events: VecDeque<JobEvent>,
 }
 
 #[derive(Debug)]
@@ -152,7 +152,7 @@ impl<C: Clock> Scheduler<C> {
                 queued: VecDeque::new(),
                 running: BTreeSet::new(),
                 jobs: BTreeMap::new(),
-                events: Vec::new(),
+                events: VecDeque::new(),
             })),
         }
     }
@@ -380,15 +380,34 @@ impl<C: Clock> Scheduler<C> {
         &self.limits
     }
 
+    /// The most recent events, at most [`EVENT_HISTORY`] of them.
     #[must_use]
     pub fn events(&self) -> Vec<JobEvent> {
-        self.lock().events.clone()
+        self.lock().events.iter().cloned().collect()
     }
 
     /// The jobs the scheduler still holds a record for.
     #[must_use]
     pub fn record_count(&self) -> usize {
         self.lock().jobs.len()
+    }
+
+    /// Drops the record of a job whose terminal state has been reported.
+    /// The job must be completed, failed or cancelled; a failed job that
+    /// may still be retried keeps its record until its caller lets it go.
+    pub fn release(&self, id: JobId) -> Result<(), SchedulerError> {
+        let mut data = self.lock();
+        let record = data.jobs.get(&id).ok_or(SchedulerError::UnknownJob(id))?;
+        if !matches!(
+            record.state.state(),
+            JobState::Completed | JobState::Failed | JobState::Cancelled
+        ) {
+            return Err(SchedulerError::NotTerminal(id));
+        }
+        data.jobs.remove(&id);
+        data.queued.retain(|queued| *queued != id);
+        data.running.remove(&id);
+        Ok(())
     }
 
     /// Atomically admits a running job into its non-cancellable publication section.
@@ -429,7 +448,7 @@ impl<C: Clock> Scheduler<C> {
             record.state.apply(event.clone())?;
             event
         };
-        data.events.push(event);
+        record_event(&mut data, event);
         Ok(())
     }
 
@@ -510,14 +529,25 @@ fn transition_at<C: Clock>(
         record.state.apply(event.clone())?;
         event
     };
-    data.events.push(event);
+    record_event(data, event);
     Ok(())
+}
+
+/// The most recent events the scheduler keeps; older ones drop first.
+const EVENT_HISTORY: usize = 4_096;
+
+fn record_event<C>(data: &mut SchedulerData<C>, event: JobEvent) {
+    if data.events.len() == EVENT_HISTORY {
+        data.events.pop_front();
+    }
+    data.events.push_back(event);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulerError {
     UnknownJob(JobId),
     NotRunning(JobId),
+    NotTerminal(JobId),
     CommitInProgress(JobId),
     CommitAdmissionDenied(JobId),
     JobIdExhausted,
@@ -530,6 +560,7 @@ impl fmt::Display for SchedulerError {
         match self {
             Self::UnknownJob(id) => write!(formatter, "unknown job {}", id.get()),
             Self::NotRunning(id) => write!(formatter, "job {} is not running", id.get()),
+            Self::NotTerminal(id) => write!(formatter, "job {} has not finished", id.get()),
             Self::CommitInProgress(id) => {
                 write!(
                     formatter,
@@ -558,6 +589,7 @@ impl Error for SchedulerError {
             Self::InvalidPlan(error) => Some(error),
             Self::UnknownJob(_)
             | Self::NotRunning(_)
+            | Self::NotTerminal(_)
             | Self::CommitInProgress(_)
             | Self::CommitAdmissionDenied(_)
             | Self::JobIdExhausted => None,
