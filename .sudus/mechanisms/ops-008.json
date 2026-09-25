@@ -1,1 +1,0 @@
-{"definition":{"command":"cargo test -p musheen-local --lib --locked -- trash_is_refused_ trash_stays_supported_","cwd":null,"documents":[],"identity":{"env":[],"image":null,"tools":{}},"inputs":["Cargo.lock","crates/musheen-core/src","crates/musheen-local/src","crates/musheen-ops/src"],"requirements":["OPS-008"],"results":null},"review":{},"schema":1}
