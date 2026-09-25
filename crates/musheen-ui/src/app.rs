@@ -4769,22 +4769,30 @@ impl MusheenApp {
     /// catalog update takes the catalog file's lock, which another process
     /// may hold.
     fn observe_watch_event(&mut self, event: WatchEvent, cx: &mut Context<Self>) {
-        let observation = match event {
-            WatchEvent::Created(item)
-            | WatchEvent::Changed(item)
-            | WatchEvent::Renamed { item, .. } => {
-                CatalogObservation::Present(item.id().clone(), item.path().clone())
-            }
-            WatchEvent::Removed(item) => CatalogObservation::Missing(item),
-            WatchEvent::Invalidated { .. } => return,
-        };
+        self.observe_watch_events(vec![event], cx);
+    }
+
+    /// As `observe_watch_event`, for a batch of events: the catalog is
+    /// locked and rewritten once for the whole batch.
+    fn observe_watch_events(&mut self, events: Vec<WatchEvent>, cx: &mut Context<Self>) {
+        let observations = events
+            .into_iter()
+            .filter_map(|event| match event {
+                WatchEvent::Created(item)
+                | WatchEvent::Changed(item)
+                | WatchEvent::Renamed { item, .. } => Some(CatalogObservation::Present(
+                    item.id().clone(),
+                    item.path().clone(),
+                )),
+                WatchEvent::Removed(item) => Some(CatalogObservation::Missing(item)),
+                WatchEvent::Invalidated { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if observations.is_empty() {
+            return;
+        }
         let binding = self.catalog_binding.clone();
-        let work = cx.background_spawn(async move {
-            match observation {
-                CatalogObservation::Present(id, path) => binding.observe_present(&id, path),
-                CatalogObservation::Missing(id) => binding.observe_missing(&id),
-            }
-        });
+        let work = cx.background_spawn(async move { binding.observe_batch(observations) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let Some(this) = this.upgrade() else {
