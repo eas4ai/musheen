@@ -45,8 +45,9 @@ use crate::toolbar::{
     resolve_command_mode, static_shortcut_declarations,
 };
 use crate::views::{
-    AdaptiveLayout, COLUMN_RESIDENT_BUDGET, ColumnKey, ColumnPaneItems, ColumnTrail, GroupKey,
-    Layout, SelectionMode, SortDirection, SortKey, SortSpec, ViewPreferenceStore,
+    AdaptiveLayout, COLUMN_CACHE_ROWS, COLUMN_RESIDENT_BUDGET, ColumnKey, ColumnPaneItems,
+    ColumnTrail, GroupKey, Layout, SelectionMode, SortDirection, SortKey, SortSpec,
+    ViewPreferenceStore,
 };
 use crate::{
     ContextMenu, ContextMenuDestinationResolver, MenuEntry, MenuInvocation, MenuTarget,
@@ -333,8 +334,12 @@ impl DirectoryRowsSource {
     }
 }
 
+/// The rows of an indexed folder that are loaded for rendering. It never
+/// holds more than `capacity` rows: the folder's own resident bound for the
+/// main list, `COLUMN_CACHE_ROWS` for a parent column.
 struct IndexedViewport {
     generation: u64,
+    capacity: usize,
     loaded: VecDeque<IndexedLoadedRange>,
     pending: Option<std::ops::Range<usize>>,
 }
@@ -374,14 +379,37 @@ impl IndexedContextSource {
 
 impl IndexedViewport {
     const MAX_RANGES: usize = 16;
-    const MAX_ITEMS: usize = 4_096;
 
-    fn new(generation: u64) -> Self {
+    fn new(generation: u64, capacity: usize) -> Self {
         Self {
             generation,
+            capacity: capacity.max(1),
             loaded: VecDeque::new(),
             pending: None,
         }
+    }
+
+    /// The rows to load for `requested`: padded on both sides for scrolling
+    /// with what the capacity leaves, cut to `visible_count`, and never more
+    /// than the capacity. The requested rows are always inside the load.
+    fn load_range(
+        &self,
+        requested: &std::ops::Range<usize>,
+        visible_count: usize,
+    ) -> std::ops::Range<usize> {
+        let padding = (self.capacity.saturating_sub(requested.len()) / 2).min(requested.len());
+        let start = requested.start.saturating_sub(padding);
+        let end = requested
+            .end
+            .saturating_add(padding)
+            .min(visible_count)
+            .min(start.saturating_add(self.capacity));
+        start..end
+    }
+
+    #[cfg(test)]
+    fn loaded_len(&self) -> usize {
+        self.loaded.iter().map(|(_, items)| items.len()).sum()
     }
 
     fn covers(&self, range: &std::ops::Range<usize>) -> bool {
@@ -413,7 +441,7 @@ impl IndexedViewport {
                 .iter()
                 .map(|(_, items)| items.len())
                 .sum::<usize>()
-                > Self::MAX_ITEMS
+                > self.capacity
         {
             self.loaded.pop_front();
         }
@@ -5190,7 +5218,7 @@ impl MusheenApp {
         let reserved = if preserve_columns {
             self.column_trails
                 .get(&tab_id)
-                .map_or(0, ColumnTrail::resident_len)
+                .map_or(0, ColumnTrail::reserved_models)
         } else {
             0
         };
@@ -15441,27 +15469,24 @@ impl MusheenApp {
             return;
         }
         let visible_count = directory.visible_count();
+        let capacity = directory.resident_limit();
         let Some(reader) = directory.index_reader() else {
             return;
         };
         let viewport = self
             .indexed_viewports
             .entry(tab_id)
-            .or_insert_with(|| IndexedViewport::new(generation));
+            .or_insert_with(|| IndexedViewport::new(generation, capacity));
         if viewport.generation != generation {
-            *viewport = IndexedViewport::new(generation);
+            *viewport = IndexedViewport::new(generation, capacity);
         }
+        // A request wider than the cache would never be covered; the rows
+        // past the cache stay placeholders.
+        let requested = requested.start..requested.end.min(requested.start + viewport.capacity);
         if viewport.covers(&requested) || viewport.pending.is_some() {
             return;
         }
-        let padding = requested.len().min(1_024);
-        let start = requested.start.saturating_sub(padding);
-        let end = requested
-            .end
-            .saturating_add(padding)
-            .min(visible_count)
-            .min(start.saturating_add(4_096));
-        let range = start..end;
+        let range = viewport.load_range(&requested, visible_count);
         viewport.pending = Some(range.clone());
         let result_range = range.clone();
         let work = cx.background_spawn(async move { reader.read_range_with_arrivals(range) });
@@ -15514,18 +15539,12 @@ impl MusheenApp {
         let viewport = self
             .column_viewports
             .entry(key)
-            .or_insert_with(|| IndexedViewport::new(0));
+            .or_insert_with(|| IndexedViewport::new(0, COLUMN_CACHE_ROWS));
+        let requested = requested.start..requested.end.min(requested.start + viewport.capacity);
         if viewport.covers(&requested) || viewport.pending.is_some() {
             return;
         }
-        let padding = requested.len().min(1_024);
-        let start = requested.start.saturating_sub(padding);
-        let end = requested
-            .end
-            .saturating_add(padding)
-            .min(visible_count)
-            .min(start.saturating_add(4_096));
-        let range = start..end;
+        let range = viewport.load_range(&requested, visible_count);
         viewport.pending = Some(range.clone());
         let result_range = range.clone();
         let work = cx.background_spawn(async move { reader.read_range_with_arrivals(range) });
@@ -17315,8 +17334,34 @@ mod tests {
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
 
     #[test]
+    fn indexed_viewport_keeps_at_most_its_capacity() {
+        let mut viewport = IndexedViewport::new(0, 300);
+        let rows = |range: std::ops::Range<usize>| {
+            range
+                .map(|number| (synthetic_page(number..number + 1).items()[0].clone(), number as u64))
+                .collect::<Vec<_>>()
+        };
+
+        viewport.insert(0..150, rows(0..150));
+        viewport.insert(150..300, rows(150..300));
+        assert_eq!(viewport.loaded_len(), 300);
+        viewport.insert(300..450, rows(300..450));
+
+        assert!(viewport.loaded_len() <= 300, "{}", viewport.loaded_len());
+        assert!(viewport.item(0).is_none(), "the oldest rows are dropped first");
+        assert!(viewport.item(160).is_some());
+        assert!(viewport.item(449).is_some());
+        assert_eq!(viewport.load_range(&(1_000..1_072), 5_000), 928..1_144);
+        assert_eq!(
+            viewport.load_range(&(1_000..1_300), 5_000),
+            1_000..1_300,
+            "a load never exceeds the capacity"
+        );
+    }
+
+    #[test]
     fn indexed_viewport_rejects_stale_range_completions() {
-        let mut viewport = IndexedViewport::new(7);
+        let mut viewport = IndexedViewport::new(7, 4_096);
         viewport.pending = Some(100..120);
 
         assert!(!viewport.matches_pending(6, &(100..120)));
@@ -18950,8 +18995,8 @@ mod tests {
             assert_eq!(trail.resident_len(), 0);
             assert_eq!(
                 state.focused_directory().resident_limit(),
-                4_096,
-                "the current folder keeps its whole budget"
+                4_096 - COLUMN_CACHE_ROWS,
+                "the current folder gives up the column's row cache"
             );
         });
         assert_eq!(
@@ -18976,6 +19021,15 @@ mod tests {
             );
         })
         .unwrap();
+        cx.read(|cx| {
+            let cache = &app.read(cx).column_viewports[&(tab_id, 0)];
+            assert_eq!(cache.capacity, COLUMN_CACHE_ROWS);
+            assert!(
+                0 < cache.loaded_len() && cache.loaded_len() <= COLUMN_CACHE_ROWS,
+                "the column keeps at most its row cache: {}",
+                cache.loaded_len()
+            );
+        });
 
         // Back to the parent drops the column and its index.
         app.update(cx, |state, cx| {
@@ -19029,8 +19083,15 @@ mod tests {
                 "the child spills once its rows and the parent's would pass the bound"
             );
             assert_eq!(directory.indexed_count(), 4_000);
+            let cache = &state.indexed_viewports[&tab_id];
+            assert_eq!(
+                cache.capacity,
+                4_096 - 501,
+                "the main list's row cache follows the folder's bound"
+            );
             assert!(
-                trail.resident_len() + directory.view().items().len() <= 4_096,
+                trail.resident_len() + directory.view().items().len() + cache.loaded_len()
+                    <= 4_096,
                 "the tab holds at most one folder's bound of item models"
             );
         });
