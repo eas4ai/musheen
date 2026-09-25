@@ -385,6 +385,12 @@ impl<C: Clock> Scheduler<C> {
         self.lock().events.clone()
     }
 
+    /// The jobs the scheduler still holds a record for.
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        self.lock().jobs.len()
+    }
+
     /// Atomically admits a running job into its non-cancellable publication section.
     ///
     /// Once admitted, pause, cancellation, and interruption are rejected until the executor

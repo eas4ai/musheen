@@ -15,6 +15,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use tempfile::{Builder, NamedTempFile, TempDir, TempPath};
 
+/// Records decoded from the index, counted so a test can show how much of the
+/// index one change reads.
+#[cfg(test)]
+pub(super) static RECORD_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times the visible order was replaced, counted so a test can show how many
+/// passes a batch of changes costs.
+#[cfg(test)]
+pub(super) static ORDER_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const MAGIC: &[u8; 8] = b"MSIDX001";
 /// Every index directory starts with this prefix; the startup sweep looks
 /// only at such entries.
@@ -504,6 +513,8 @@ impl DiskDirectoryIndex {
     }
 
     fn read_index_record(records: &mut File, offset: u64) -> io::Result<IndexRecord> {
+        #[cfg(test)]
+        RECORD_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if offset < MAGIC.len() as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -540,6 +551,8 @@ impl DiskDirectoryIndex {
             id_order.len as u64,
         )?;
         self.order = Some(order);
+        #[cfg(test)]
+        ORDER_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.order_preferences = Some(preferences.clone());
         self.id_order = Some(id_order);
         Ok(())
@@ -1648,6 +1661,111 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "a missing root has nothing to sweep"
+        );
+    }
+
+    fn many_records(index: &mut DiskDirectoryIndex, count: u64) {
+        let provider = ProviderId::new("local").unwrap();
+        for number in (0..count).rev() {
+            let name = format!("item-{number:07}");
+            let item = StoreItem::new(
+                ItemId::new(provider.clone(), number.to_be_bytes().to_vec()).unwrap(),
+                StorePath::from_unix_path(format!("/many/{name}")),
+                DisplayPath::new(name),
+                ItemKind::RegularFile,
+                Some(number),
+            );
+            index.append(&item, count - 1 - number).unwrap();
+        }
+        index
+            .rebuild_order(&ViewPreferences::default(), None)
+            .unwrap();
+    }
+
+    fn new_item(number: u64, name: &str) -> StoreItem {
+        StoreItem::new(
+            ItemId::new(ProviderId::new("local").unwrap(), number.to_be_bytes().to_vec()).unwrap(),
+            StorePath::from_unix_path(format!("/many/{name}")),
+            DisplayPath::new(name),
+            ItemKind::RegularFile,
+            Some(number),
+        )
+    }
+
+    fn watch_work(
+        index: &std::sync::Arc<std::sync::Mutex<DiskDirectoryIndex>>,
+        events: Vec<musheen_core::WatchEvent>,
+    ) -> super::super::DirectoryIndexWatchWork {
+        super::super::DirectoryIndexWatchWork {
+            index: std::sync::Arc::clone(index),
+            events,
+            preferences: ViewPreferences::default(),
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn indexed_folder_merge_reads_a_bounded_number_of_records() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(root.path()).unwrap();
+        many_records(&mut index, 100_000);
+        let index = std::sync::Arc::new(std::sync::Mutex::new(index));
+        let changed = new_item(500, "item-0000500");
+
+        super::RECORD_READS.store(0, Relaxed);
+        let result = watch_work(&index, vec![musheen_core::WatchEvent::Changed(changed.clone())])
+            .run()
+            .unwrap();
+        let reads = super::RECORD_READS.load(Relaxed);
+
+        assert_eq!(result.indexed_count, 100_000);
+        assert!(
+            reads <= 100,
+            "one change read {reads} records of a 100,000-record index"
+        );
+        assert_eq!(
+            index.lock().unwrap().lookup_id(changed.id()).unwrap(),
+            Some(changed)
+        );
+    }
+
+    #[test]
+    fn indexed_folder_merge_applies_waiting_changes_as_one_batch() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(root.path()).unwrap();
+        many_records(&mut index, 5_000);
+        let index = std::sync::Arc::new(std::sync::Mutex::new(index));
+        let events = (0..50u64)
+            .map(|number| {
+                musheen_core::WatchEvent::Created(new_item(
+                    10_000 + number,
+                    &format!("new-{number:03}"),
+                ))
+            })
+            .collect();
+
+        super::ORDER_WRITES.store(0, Relaxed);
+        let result = watch_work(&index, events).run().unwrap();
+        let writes = super::ORDER_WRITES.load(Relaxed);
+
+        assert_eq!(result.indexed_count, 5_050);
+        assert_eq!(result.visible_count, 5_050);
+        assert_eq!(
+            writes, 1,
+            "50 waiting changes were merged in {writes} passes over the order"
+        );
+        let mut index = index.lock().unwrap();
+        assert_eq!(
+            index.read_range(0..1).unwrap()[0].display_name().as_str(),
+            "item-0000000"
+        );
+        assert_eq!(
+            index.read_range(5_000..5_001).unwrap()[0]
+                .display_name()
+                .as_str(),
+            "new-000"
         );
     }
 }
