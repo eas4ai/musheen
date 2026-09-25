@@ -239,20 +239,18 @@ impl LocalStore {
         let _guard = TRASH_LOCK
             .lock()
             .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
-        let mut entries = trash::os_limited::list()
-            .map_err(map_trash_error)?
+        let listed = trash::os_limited::list().map_err(map_trash_error)?;
+        let listed_ids = listed
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut entries = listed
             .into_iter()
             .map(|item| {
                 // An entry whose data is missing or unreadable stays in the
                 // listing as unrestorable; it never hides the other entries.
                 let (kind, restorable) = match fs::symlink_metadata(trash_payload_path(&item)?) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        (musheen_ops::ConflictItemKind::SymbolicLink, true)
-                    }
-                    Ok(metadata) if metadata.is_dir() => {
-                        (musheen_ops::ConflictItemKind::Directory, true)
-                    }
-                    Ok(_) => (musheen_ops::ConflictItemKind::File, true),
+                    Ok(metadata) => (trash_payload_kind(&metadata), true),
                     Err(_) => (musheen_ops::ConflictItemKind::File, false),
                 };
                 Ok(LocalTrashEntry {
@@ -266,6 +264,7 @@ impl LocalStore {
                 })
             })
             .collect::<Result<Vec<_>, MutationError>>()?;
+        entries.extend(unreadable_trash_entries(&listed_ids));
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.deleted_at_unix_seconds));
         Ok(entries)
     }
@@ -282,6 +281,10 @@ impl LocalStore {
             .into_iter()
             .map(|item| item.id)
             .collect::<std::collections::HashSet<_>>();
+        let unreadable_ids = unreadable_trash_entries(&listed_ids)
+            .into_iter()
+            .map(|entry| OsString::from_vec(entry.receipt.provider_reference().to_vec()))
+            .collect::<std::collections::HashSet<_>>();
         let mut requested = std::collections::HashSet::with_capacity(receipts.len());
         let mut info_files = Vec::with_capacity(receipts.len());
         for receipt in receipts {
@@ -289,7 +292,7 @@ impl LocalStore {
                 return Err(MutationError::BatchCollision);
             }
             let id = OsString::from_vec(receipt.provider_reference().to_vec());
-            if !listed_ids.contains(&id) {
+            if !listed_ids.contains(&id) && !unreadable_ids.contains(&id) {
                 return Err(MutationError::Missing);
             }
             info_files.push(PathBuf::from(id));
@@ -583,6 +586,64 @@ fn rollback_restore_merge_failure(
 
 fn trash_payload_path(item: &trash::TrashItem) -> Result<PathBuf, MutationError> {
     trash_payload_path_of_record(Path::new(&item.id))
+}
+
+/// The item kind of a trash payload from its own metadata.
+fn trash_payload_kind(metadata: &fs::Metadata) -> musheen_ops::ConflictItemKind {
+    if metadata.file_type().is_symlink() {
+        musheen_ops::ConflictItemKind::SymbolicLink
+    } else if metadata.is_dir() {
+        musheen_ops::ConflictItemKind::Directory
+    } else {
+        musheen_ops::ConflictItemKind::File
+    }
+}
+
+/// Entries whose `.trashinfo` record the trash crate could not read or
+/// parse. Each is listed as unrestorable so it can be purged. Its original
+/// location and deletion time are unknown, so the entry shows where its data
+/// sits in Trash and when its record was written.
+fn unreadable_trash_entries(listed_ids: &std::collections::HashSet<OsString>) -> Vec<LocalTrashEntry> {
+    let Ok(folders) = trash::os_limited::trash_folders() else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for folder in folders {
+        let Ok(records) = fs::read_dir(folder.join("info")) else {
+            continue;
+        };
+        for record in records.flatten() {
+            let info = record.path();
+            if listed_ids.contains(info.as_os_str())
+                || info.extension() != Some(OsStr::new("trashinfo"))
+                || !record.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                continue;
+            }
+            let Ok(payload) = trash_payload_path_of_record(&info) else {
+                continue;
+            };
+            let kind = fs::symlink_metadata(&payload)
+                .as_ref()
+                .map_or(musheen_ops::ConflictItemKind::File, trash_payload_kind);
+            let written = record
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since_epoch| i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX));
+            entries.push(LocalTrashEntry {
+                receipt: TrashReceipt::new(
+                    StorePath::from_unix_path(payload.into_os_string()),
+                    info.into_os_string().into_vec(),
+                ),
+                deleted_at_unix_seconds: written,
+                kind,
+                restorable: false,
+            });
+        }
+    }
+    entries
 }
 
 /// Purges every target, continuing past the ones that fail, and reports how

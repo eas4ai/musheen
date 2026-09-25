@@ -687,6 +687,100 @@ fn run_trash_helper(test_name: &str, helper_variable: &str) {
 }
 
 #[test]
+fn local_trash_listing_shows_an_unreadable_record_as_unrestorable_and_purgeable() {
+    if std::env::var_os("MUSHEEN_TRASH_RECORD_HELPER").is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());
+        let kept_path = root.join("kept");
+        fs::write(&kept_path, b"kept").unwrap();
+        let mut store = LocalStore::new();
+        let kept = trash_through_store(&mut store, &kept_path);
+        let trash = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
+            .join("Trash");
+        // A record nothing can parse, with its data still in Trash.
+        fs::write(trash.join("info").join("garbled.trashinfo"), b"not a trash record\n").unwrap();
+        fs::write(trash.join("files").join("garbled"), b"data").unwrap();
+        // A record the process may not read, with its data in a folder.
+        fs::write(
+            trash.join("info").join("sealed.trashinfo"),
+            format!(
+                "[Trash Info]\nPath={}\nDeletionDate=2026-09-25T08:00:00\n",
+                root.join("sealed").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(
+            trash.join("info").join("sealed.trashinfo"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        fs::create_dir(trash.join("files").join("sealed")).unwrap();
+
+        let listed = store
+            .list_trash()
+            .expect("unreadable records never hide the other entries");
+
+        assert!(
+            listed
+                .iter()
+                .any(|item| item.receipt() == &kept && item.restorable()),
+            "the readable entry is listed and restorable"
+        );
+        let garbled = listed
+            .iter()
+            .find(|item| item.receipt().provider_reference().ends_with(b"garbled.trashinfo"))
+            .expect("the garbled record is listed");
+        assert!(!garbled.restorable());
+        assert_eq!(garbled.kind(), ConflictItemKind::File);
+        assert_eq!(
+            garbled.receipt().original_path(),
+            &StorePath::from_unix_path(trash.join("files").join("garbled").into_os_string()),
+            "an entry whose original location is unknown shows where its data is"
+        );
+        let sealed = listed
+            .iter()
+            .find(|item| item.receipt().provider_reference().ends_with(b"sealed.trashinfo"))
+            .expect("the unreadable record is listed");
+        assert!(!sealed.restorable());
+        assert_eq!(sealed.kind(), ConflictItemKind::Directory);
+        assert!(
+            execute_restore(&mut store, garbled.receipt()).is_err(),
+            "an entry without a readable record does not restore"
+        );
+        assert_eq!(fs::read(trash.join("files").join("garbled")).unwrap(), b"data");
+
+        store
+            .purge_trash(&[garbled.receipt().clone(), sealed.receipt().clone()])
+            .expect("unreadable records can be purged");
+
+        // The listing also shows the trash folders of other mounts, so only
+        // the entries of the private trash count.
+        let own = store
+            .list_trash()
+            .unwrap()
+            .into_iter()
+            .filter(|item| {
+                std::path::PathBuf::from(OsString::from_vec(
+                    item.receipt().provider_reference().to_vec(),
+                ))
+                .starts_with(&trash)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert_eq!(own[0].receipt(), &kept);
+        assert!(!trash.join("files").join("garbled").exists());
+        assert!(!trash.join("files").join("sealed").exists());
+        assert!(!trash.join("info").join("garbled.trashinfo").exists());
+        assert!(!trash.join("info").join("sealed.trashinfo").exists());
+        return;
+    }
+
+    run_trash_helper(
+        "local_trash_listing_shows_an_unreadable_record_as_unrestorable_and_purgeable",
+        "MUSHEEN_TRASH_RECORD_HELPER",
+    );
+}
+
+#[test]
 fn local_trash_purge_removes_a_read_only_tree_and_the_other_entries() {
     if std::env::var_os("MUSHEEN_TRASH_LOCKED_HELPER").is_some() {
         let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());
