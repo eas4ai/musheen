@@ -42,8 +42,9 @@ Status: Draft
 
 [OPS-006] Move uses an atomic rename when the provider guarantees it. Otherwise it copies to staging, verifies final size and content digest against bytes read, publishes the destination, and deletes the source only after verification.
 Falsifier: a cross-store move deletes its source before the verified destination is published.
-Mechanism: same-store and cross-store tests with corruption and failure injected at every phase.
-Status: Draft
+Mechanism: ops-006
+Rationale: 1.x mechanism: same-store and cross-store tests with corruption and failure injected at every phase.
+Status: Agreed 2026-09-25
 
 [OPS-007] Link creation offers symbolic links, hard links, and desktop launchers only where the destination capability and source type support them. Hard links are limited to regular files in the same provider and filesystem.
 Falsifier: link creation starts where the capability matrix forbids the selected link kind.
@@ -54,8 +55,9 @@ Status: Draft
 
 [OPS-008] Normal delete moves items through the `trash` wrapper when the active location reports trash support. Otherwise it refuses and offers the separate permanent-delete command without choosing it automatically.
 Falsifier: normal delete permanently removes an item or silently changes commands on a no-trash provider.
-Mechanism: trash-capable and no-trash provider interaction tests.
-Status: Draft
+Mechanism: ops-008
+Rationale: 1.x mechanism: trash-capable and no-trash provider interaction tests.
+Status: Agreed 2026-09-25
 
 [OPS-009] Permanent delete uses the dedicated irreversible-delete boundary and requires confirmation naming the item count, location, and lack of recovery.
 Falsifier: a direct removal bypasses that boundary or runs without the confirmation.

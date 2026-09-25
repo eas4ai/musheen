@@ -38,6 +38,20 @@ pub struct LocalStore {
     operation_timestamps: Vec<(PathBuf, SourceMetadata)>,
     #[cfg(test)]
     source_removal_fault_after: Option<usize>,
+    /// Test-only replacement for the home trash, mount table, and user id
+    /// that trash support is decided from.
+    #[cfg(test)]
+    trash_environment: Option<TrashEnvironment>,
+}
+
+/// The facts trash support is decided from: where the home trash lives,
+/// the mount points sorted longest first, and the user whose per-volume
+/// trash directory would be used.
+#[derive(Clone, Debug)]
+pub(crate) struct TrashEnvironment {
+    pub(crate) home_trash: PathBuf,
+    pub(crate) mount_points: Vec<PathBuf>,
+    pub(crate) uid: u32,
 }
 
 impl LocalStore {
@@ -65,6 +79,8 @@ impl LocalStore {
             operation_timestamps: Vec::new(),
             #[cfg(test)]
             source_removal_fault_after: None,
+            #[cfg(test)]
+            trash_environment: None,
         }
     }
 

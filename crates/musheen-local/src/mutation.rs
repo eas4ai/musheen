@@ -2012,6 +2012,7 @@ fn map_errno(error: rustix::io::Errno) -> MutationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TrashEnvironment;
 
     fn request(source: &Path, destination: &Path) -> CopyRequest {
         CopyRequest::new(
@@ -2224,6 +2225,84 @@ mod tests {
                 .as_bytes()
                 .starts_with(REPLACE_BACKUP_PREFIX.as_bytes())
         }));
+    }
+
+    // OPS-006: a verified cross-device move removes the whole source tree,
+    // including a hard-link pair whose link count changes while the first
+    // link is removed.
+    #[test]
+    fn cross_device_move_removes_a_source_tree_holding_a_hard_link_pair() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let destination_root = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir_in("/dev/shm").unwrap();
+        if fs::metadata(destination_root.path()).unwrap().dev()
+            == fs::metadata(source_root.path()).unwrap().dev()
+        {
+            return;
+        }
+        let source = source_root.path().join("tree");
+        let destination = destination_root.path().join("tree");
+        fs::create_dir_all(source.join("sub")).unwrap();
+        fs::write(source.join("sub/a"), b"linked").unwrap();
+        fs::hard_link(source.join("sub/a"), source.join("sub/a-link")).unwrap();
+        fs::write(source.join("plain"), b"plain").unwrap();
+        let request = request(&source, &destination);
+
+        execute_move(&mut LocalStore::new(), &request, &CancellationToken::new()).unwrap();
+
+        assert!(!source.exists(), "the source tree is removed completely");
+        assert_eq!(fs::read(destination.join("sub/a")).unwrap(), b"linked");
+        assert_eq!(fs::read(destination.join("sub/a-link")).unwrap(), b"linked");
+        assert_eq!(fs::read(destination.join("plain")).unwrap(), b"plain");
+    }
+
+    // OPS-008: where the trash crate would copy an item to the home trash
+    // across devices, normal delete reports no trash support and refuses.
+    #[test]
+    fn trash_is_refused_where_the_trash_crate_would_copy_across_devices() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let volume = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let item = volume.path().join("writable").join("item.txt");
+        fs::create_dir(volume.path().join("writable")).unwrap();
+        fs::write(&item, b"item").unwrap();
+        fs::set_permissions(volume.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let mut store = LocalStore::new();
+        store.trash_environment = Some(TrashEnvironment {
+            home_trash: home.path().join("Trash"),
+            mount_points: vec![volume.path().to_path_buf(), PathBuf::from("/")],
+            uid: 1000,
+        });
+        let path = StorePath::from_unix_path(item.as_os_str());
+
+        let supported = DeleteProvider::supports_trash(&mut store, &path).unwrap();
+        let identity = DeleteProvider::identity(&mut store, &path).unwrap().unwrap();
+        let refusal = store.move_to_trash(&DeleteTarget::new(path, identity.to_vec()));
+
+        fs::set_permissions(volume.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!supported, "a volume whose root cannot hold a trash directory has no trash");
+        assert!(matches!(refusal, Err(MutationError::Unsupported)), "{refusal:?}");
+        assert_eq!(fs::read(&item).unwrap(), b"item", "the item stays in place");
+    }
+
+    // OPS-008: a volume that can hold its own trash directory keeps trash support.
+    #[test]
+    fn trash_stays_supported_where_the_volume_holds_its_own_trash_directory() {
+        let volume = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let item = volume.path().join("item.txt");
+        fs::write(&item, b"item").unwrap();
+        let mut store = LocalStore::new();
+        store.trash_environment = Some(TrashEnvironment {
+            home_trash: home.path().join("Trash"),
+            mount_points: vec![volume.path().to_path_buf(), PathBuf::from("/")],
+            uid: 1000,
+        });
+        let path = StorePath::from_unix_path(item.as_os_str());
+
+        assert!(DeleteProvider::supports_trash(&mut store, &path).unwrap());
     }
 
     #[test]

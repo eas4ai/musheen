@@ -128,3 +128,9 @@ Status: Draft
 Falsifier: changing column layout affects another directory with its own preference or missing metadata is displayed as a real value.
 Mechanism: column persistence and limited-provider model tests.
 Status: Draft
+
+[BROWSE-023] Rubber-band selection selects exactly the items whose rendered rows or cells intersect the dragged rectangle, in every layout and at every scroll position.
+Falsifier: after scrolling, a drag rectangle selects rows other than the ones it visibly covers.
+Mechanism: browse-023
+Rationale: Observed on 2026-09-25 in docs/opus-audit-2.md section 4.2; the developer authorized the audit items ("You audit items are all authorized").
+Status: Agreed 2026-09-25
