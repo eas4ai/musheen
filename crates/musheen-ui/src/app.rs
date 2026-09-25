@@ -14496,11 +14496,16 @@ impl MusheenApp {
                 // A uniform list never records child bounds, so the scroll
                 // handle's logical top is always item zero. Derive the first
                 // visible row from the raw scroll offset and the row pitch.
-                let (first_visible_row, first_item_offset) = rubber_band_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .logical_scroll_top();
+                let (first_visible_row, first_item_offset) = {
+                    let scrolled = -rubber_band_scroll.0.borrow().base_handle.offset().y;
+                    let row_pitch = match layout {
+                        Layout::Cards | Layout::Grid | Layout::Adaptive => {
+                            px(RUBBER_BAND_GRID_ROW_HEIGHT)
+                        }
+                        Layout::Details | Layout::List | Layout::Columns => list_row_height,
+                    };
+                    rubber_band_scroll_position(scrolled, row_pitch)
+                };
                 let first_item_index = match layout {
                     Layout::Cards | Layout::Grid | Layout::Adaptive => {
                         first_visible_row.saturating_mul(grid_columns)
