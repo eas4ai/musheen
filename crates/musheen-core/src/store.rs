@@ -267,6 +267,13 @@ pub trait Store: Send + Sync {
         ))
     }
 
+    /// The item a path leads to after following symbolic links, described at
+    /// the path itself. Providers without links answer as `resolve_item`
+    /// does. A dangling link resolves to `None`.
+    fn resolve_link_target(&self, path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+        self.resolve_item(path)
+    }
+
     /// Provider-supplied access fact for a concrete directory. This is kept
     /// separate from operation capabilities such as atomic rename.
     fn location_writable(&self, _path: &StorePath) -> Result<CapabilityState, StoreError> {

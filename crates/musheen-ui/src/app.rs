@@ -9023,11 +9023,21 @@ impl MusheenApp {
                         .panes()
                         .iter()
                         .find(|pane| pane.id() != current)
-                        .map(|pane| pane.id())
-                        .or_else(|| self.navigation.split_focused(location.clone()).ok());
-                    if let Some(pane) = other {
-                        let _ = self.navigation.focus_pane(pane);
-                        self.navigate(location, true, cx);
+                        .map(|pane| pane.id());
+                    match other {
+                        Some(pane) => {
+                            if self.navigation.focus_pane(pane).is_ok() {
+                                self.navigate(location, true, cx);
+                            }
+                        }
+                        // A new pane starts at the location. Finishing the
+                        // navigation change gives its tab a directory model
+                        // and loads it, as the split-pane command does.
+                        None => {
+                            if self.navigation.split_focused(location).is_ok() {
+                                self.finish_navigation_change(cx);
+                            }
+                        }
                     }
                     true
                 }
@@ -9165,7 +9175,7 @@ impl MusheenApp {
         let resident = origin_tab
             .and_then(|tab| self.directories.get(&tab))
             .and_then(|directory| directory.view().item(target.id()))
-            .map(|item| item.path() == target.path() && item.kind() == ItemKind::Directory);
+            .map(|item| item.path() == target.path() && self.opens_as_directory(item));
         let is_directory = match resident {
             Some(resident) => resident,
             None => self
@@ -9173,9 +9183,25 @@ impl MusheenApp {
                 .resolve_item(target.path())
                 .ok()
                 .flatten()
-                .is_some_and(|item| item.id() == target.id() && item.kind() == ItemKind::Directory),
+                .is_some_and(|item| item.id() == target.id() && self.opens_as_directory(&item)),
         };
         is_directory.then(|| target.path().clone())
+    }
+
+    /// A directory, or a symbolic link that leads to one. Sidebar places
+    /// such as $HOME/Desktop are often links, and the sidebar menu offers
+    /// them the directory commands.
+    fn opens_as_directory(&self, item: &StoreItem) -> bool {
+        match item.kind() {
+            ItemKind::Directory => true,
+            ItemKind::SymbolicLink => self
+                .store
+                .resolve_link_target(item.path())
+                .ok()
+                .flatten()
+                .is_some_and(|target| target.kind() == ItemKind::Directory),
+            ItemKind::RegularFile | ItemKind::Other => false,
+        }
     }
 
     fn launch_external_terminal(&mut self, location: StorePath, cx: &mut Context<Self>) {

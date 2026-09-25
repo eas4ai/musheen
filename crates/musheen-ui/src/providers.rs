@@ -436,6 +436,10 @@ impl Store for RoutingStore {
         self.provider_for_path(path)?.resolve_item(path)
     }
 
+    fn resolve_link_target(&self, path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+        self.provider_for_path(path)?.resolve_link_target(path)
+    }
+
     fn location_writable(&self, path: &StorePath) -> Result<CapabilityState, StoreError> {
         self.provider_for_path(path)?.location_writable(path)
     }

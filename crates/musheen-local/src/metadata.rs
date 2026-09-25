@@ -28,6 +28,18 @@ pub(crate) fn item_from_path(provider: &ProviderId, path: &Path) -> Result<Store
     item_from_path_with_metadata(provider, path, metadata)
 }
 
+/// The item a path leads to after following symbolic links, described at
+/// the path itself. A dangling link is a not-found error.
+pub(crate) fn link_target_from_path(
+    provider: &ProviderId,
+    path: &Path,
+) -> Result<StoreItem, StoreError> {
+    let store_path = StorePath::from_unix_path(path.as_os_str().to_os_string());
+    let metadata = fs::metadata(path)
+        .map_err(|error| io_error("read link target metadata", Some(store_path), error))?;
+    item_from_path_with_metadata(provider, path, metadata)
+}
+
 fn item_from_path_with_metadata(
     provider: &ProviderId,
     path: &Path,

@@ -119,6 +119,20 @@ impl Store for LocalStore {
         }
     }
 
+    fn resolve_link_target(&self, path: &StorePath) -> Result<Option<StoreItem>, StoreError> {
+        let Some(path) = path.as_unix_path() else {
+            return Ok(None);
+        };
+        match metadata::link_target_from_path(&self.provider, path) {
+            Ok(item) => Ok(Some(item)),
+            Err(StoreError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn location_writable(&self, path: &StorePath) -> Result<CapabilityState, StoreError> {
         let Some(path) = path.as_unix_path() else {
             return Ok(CapabilityState::Unknown(
