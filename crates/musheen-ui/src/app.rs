@@ -466,9 +466,7 @@ fn single_directory_target(
     let ([target], [resolved]) = (targets, resolved) else {
         return None;
     };
-    resolved
-        .opens_as_directory()
-        .then(|| target.path().clone())
+    resolved.opens_as_directory().then(|| target.path().clone())
 }
 
 /// The probes a menu composition queued, and how to compose it again.
@@ -2955,11 +2953,11 @@ fn install_native_theme(cx: &mut App) {
         Err(error) => {
             eprintln!("Musheen could not read the system theme: {error}. Using Adwaita.");
             let preferences = native_theme::AccessibilityPreferences::from_system();
-            let prefers_dark = matches!(
-                cx.window_appearance(),
-                gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
+            install_fallback_theme(
+                prefers_dark_appearance(cx.window_appearance()),
+                &preferences,
+                cx,
             );
-            install_fallback_theme(prefers_dark, &preferences, cx);
         }
     }
     crate::theme::runtime::install(cx);
@@ -3041,6 +3039,14 @@ fn run_store_probe(
 /// Installs both Adwaita presets when the system theme cannot be read. The
 /// bridge keeps the variant applied last as the current mode, so the
 /// variant the window prefers goes last.
+/// Whether a window appearance asks for the dark fallback theme.
+fn prefers_dark_appearance(appearance: gpui_kit::WindowAppearance) -> bool {
+    matches!(
+        appearance,
+        gpui_kit::WindowAppearance::Dark | gpui_kit::WindowAppearance::VibrantDark
+    )
+}
+
 fn install_fallback_theme(
     prefers_dark: bool,
     preferences: &native_theme::AccessibilityPreferences,
@@ -7993,20 +7999,12 @@ impl MusheenApp {
         if self.location_facts.contains_key(&location) {
             return;
         }
-        let work = self.spawn_store_probes(
-            vec![StoreProbe::Location {
-                location,
-                resolve: false,
-            }],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            let results = work.await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |state, _| state.apply_store_probe_results(results));
-            }
-        })
-        .detach();
+        // The render queue skips a probe that is already in flight.
+        self.render_probes.borrow_mut().push(StoreProbe::Location {
+            location,
+            resolve: false,
+        });
+        self.flush_render_probes(cx);
     }
 
     /// Runs the probes the last composition queued, for a caller that holds
@@ -11551,6 +11549,11 @@ impl MusheenApp {
         let work = cx.background_spawn(async move {
             resolve_targets(&*store, &checked, &verification, &changed)
         });
+        // A command with no origin tab has no menu to be stale against, so
+        // a target the store cannot resolve is not refused here: the
+        // command's own handling reports it, as it did before the check
+        // moved off the UI thread.
+        let refuse_unresolved = origin_tab.is_some();
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let Some(this) = this.upgrade() else {
@@ -11558,6 +11561,7 @@ impl MusheenApp {
             };
             this.update(cx, |state, cx| match result {
                 Ok(items) => then(state, &targets, items, cx),
+                Err(_) if !refuse_unresolved => then(state, &targets, Vec::new(), cx),
                 Err(error) => on_error(state, error, cx),
             });
         })
@@ -23198,6 +23202,9 @@ mod tests {
                 false,
                 cx,
             );
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             assert_eq!(state.navigation.focused_tab().location(), &original);
             let windows = state
                 .session_binding
@@ -23860,12 +23867,13 @@ mod tests {
                     cx,
                 );
             });
-            assert_eq!(
-                cx.read_from_clipboard().and_then(|item| item.text()),
-                Some("sftp://files.example.test/remote%20item.txt".into())
-            );
         })
         .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("sftp://files.example.test/remote%20item.txt".into())
+        );
     }
 
     #[gpui_kit::test]
@@ -26230,6 +26238,9 @@ mod tests {
 
         app.update(cx, |state, cx| {
             dispatch_sidebar_menu_command(state, &location, "directory.open_new_tab", cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             let tabs = state.navigation.focused_pane().tabs();
             assert_eq!(tabs.len(), 2, "a second tab opens in the focused pane");
             assert!(
@@ -26252,6 +26263,9 @@ mod tests {
 
         app.update(cx, |state, cx| {
             dispatch_sidebar_menu_command(state, &location, "file.open", cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             assert_eq!(state.navigation.focused_tab().location(), &location);
             assert_eq!(state.navigation.focused_pane().tabs().len(), 1);
             assert!(
@@ -26271,6 +26285,9 @@ mod tests {
 
         app.update(cx, |state, cx| {
             dispatch_sidebar_menu_command(state, &location, "directory.open_new_tab", cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             let tabs = state.navigation.focused_pane().tabs();
             assert_eq!(tabs.len(), 2, "a second tab opens in the focused pane");
             assert!(
@@ -26292,6 +26309,9 @@ mod tests {
 
         app.update(cx, |state, cx| {
             dispatch_sidebar_menu_command(state, &location, "file.open", cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             assert_eq!(state.navigation.focused_tab().location(), &location);
             assert_eq!(state.navigation.focused_pane().tabs().len(), 1);
             assert!(
@@ -26398,6 +26418,9 @@ mod tests {
                 false,
                 cx,
             );
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
             assert_eq!(state.navigation.panes().len(), 2, "a second pane opens");
             let focused = state.navigation.focused_tab();
             assert_eq!(focused.location(), &location);
@@ -26767,6 +26790,10 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click("operation-status-summary", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click(format!("operation-undo-{}", job.get()), cx);
         })
@@ -26921,6 +26948,10 @@ mod tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click("operation-status-summary", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(
                 window
@@ -28041,6 +28072,9 @@ mod tests {
             let unavailable_unpin = unavailable_menu.entry("directory.unpin").unwrap().clone();
             assert!(unavailable_unpin.state().is_enabled());
             state.dispatch_context_entry(unavailable_unpin, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, cx| {
             assert!(state.catalog_binding.snapshot().pins().entries().is_empty());
             state
                 .focused_directory_mut()
@@ -28255,6 +28289,7 @@ mod tests {
             window.click("home-orphan-cleanup-0", cx);
         })
         .unwrap();
+        cx.run_until_parked();
 
         assert!(catalog_store.load().unwrap().pins().entries().is_empty());
         assert!(
@@ -30390,6 +30425,20 @@ mod tests {
         });
     }
 
+    // UIV-014: the fallback follows the window appearance, dark or light,
+    // through the same mapping install_native_theme uses.
+    #[test]
+    fn theme_fallback_preference_follows_the_window_appearance() {
+        assert!(prefers_dark_appearance(gpui_kit::WindowAppearance::Dark));
+        assert!(prefers_dark_appearance(
+            gpui_kit::WindowAppearance::VibrantDark
+        ));
+        assert!(!prefers_dark_appearance(gpui_kit::WindowAppearance::Light));
+        assert!(!prefers_dark_appearance(
+            gpui_kit::WindowAppearance::VibrantLight
+        ));
+    }
+
     /// The items a test adds to a folder after it is open, as the watcher
     /// would report them.
     fn late_items(folder: &Path, count: usize) -> Vec<StoreItem> {
@@ -30525,7 +30574,12 @@ mod tests {
             open_app_with_external_location(ExternalLocation::LinkToDirectory, cx).await;
         let compose = |state: &mut MusheenApp| {
             let tab = state.navigation.focused_tab().id();
-            state.sidebar_entry_context_menu(tab, MenuTarget::SidebarLocation, location.clone(), None)
+            state.sidebar_entry_context_menu(
+                tab,
+                MenuTarget::SidebarLocation,
+                location.clone(),
+                None,
+            )
         };
 
         app.update(cx, |state, cx| {

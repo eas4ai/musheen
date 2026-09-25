@@ -623,6 +623,7 @@ impl CatalogBinding {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn observe_missing(&self, item: &ItemId) -> Result<(), Box<str>> {
         self.update(|document| {
             TagService::new(document.tags_mut(), self.xattr_opt_in).observe_missing(item);
