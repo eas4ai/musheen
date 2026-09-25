@@ -109,10 +109,11 @@ Falsifier: toggling hidden entries changes another tab or loses a selected hidde
 Mechanism: multi-tab interaction tests with hidden selections and active search.
 Status: Draft
 
-[BROWSE-019] Directory views virtualize rendered items and request provider pages ahead of the viewport, while preserving selection and focus by stable item identity. After 4,096 items, each tab uses a private temporary disk index for global sorting and back-scrolling. At most 4,096 item models remain in memory, including selected, focused, and edited items. The status bar marks counts partial until the provider's final page is indexed; then it shows the full count, including folders with at least one million entries. Closing or navigating away from a tab removes its temporary index.
-Falsifier: opening a million-item fixture creates one rendered component per item, loses selection as pages arrive, or cannot scroll back to an evicted row.
-Mechanism: viewport, memory, back-scroll, and selection tests with a paged provider.
-Status: Draft
+[BROWSE-019] Directory views virtualize rendered items and request provider pages ahead of the viewport, while preserving selection and focus by stable item identity. After 4,096 items, each tab uses a private disk index under the user's cache directory for global sorting and back-scrolling, and every layout and every selection command works over that index. At most 4,096 item models remain in memory, including selected, focused, and edited items; when the index cannot be written, the items already shown stay and the error is visible. The status bar marks counts partial until the provider's final page is indexed; then it shows the full count, including folders with at least one million entries. Closing or navigating away from a tab removes its index, termination by SIGTERM or SIGINT removes the live indexes, and indexes left behind by an earlier process are removed at startup.
+Falsifier: opening a million-item fixture creates one rendered component per item, loses selection as pages arrive, or cannot scroll back to an evicted row; the index is written outside the cache directory; a failed index write drops the items already shown; Ctrl-click after Select All collapses the selection; the rubber band or the Columns layout does nothing in an indexed folder; an index directory survives its tab, a SIGTERM, or the next start.
+Mechanism: browse-019
+Rationale: docs/opus-audit-2.md 5.1 (A-F5, A-F6, A-F9, the index kept in a tmpfs temp dir, and index directories left behind on SIGTERM).
+Status: Agreed 2026-09-25
 
 [BROWSE-020] External create, remove, rename, and metadata changes reconcile into the open model without resetting unrelated selection, scroll, sort, or grouping.
 Falsifier: one external change reloads the view to its top or selects a different stable item.

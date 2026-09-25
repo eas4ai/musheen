@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: defects-2026-09-25
+Current: local-safety-index-2026-09-25
 
 ## 1. Foundation
 
@@ -60,5 +60,21 @@ the sidebar "Open in new tab" crash and "Open" launching a directory
 cross-device move that leaves a hard-linked source half-removed (OPS-006),
 and the trash path that copies across devices without verification
 (OPS-008). Done when each mechanism's test fails on the recorded violating
+example and passes on the fix, the workspace tests and clippy are clean, and
+the review and report are accepted.
+
+## local-safety-index-2026-09-25
+
+Requirements: OPS-019, OPS-021, OPS-028, BROWSE-019, BROWSE-023
+
+Fix the local data-safety and large-folder findings from docs/opus-audit-2.md
+sections 5.1 and 5.2: the no-replace fallback that leaves a partial tree
+under the destination name (OPS-019), sparse files expanded silently inside
+copied or moved folders (OPS-021), Trash restore of a directory link and a
+listing that fails on one orphaned entry (OPS-028), and the directory index
+that lives in the temp dir, leaks on SIGTERM, drops the shown items when its
+first write fails, collapses the selection on Ctrl-click after Select All,
+and leaves the rubber band and the Columns layout inert (BROWSE-019,
+BROWSE-023). Done when each mechanism's test fails on the recorded violating
 example and passes on the fix, the workspace tests and clippy are clean, and
 the review and report are accepted.

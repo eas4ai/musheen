@@ -119,8 +119,9 @@ Status: Draft
 
 [OPS-019] Non-atomic writes use a sibling staging name that is never shown as the destination; publication uses the strongest atomic replacement the store declares, and failure leaves the previous destination intact.
 Falsifier: readers observe a partially written final item or replacement failure destroys the old destination.
-Mechanism: reader-race and injected-publish-failure tests per provider capability.
-Status: Draft
+Mechanism: ops-019
+Rationale: docs/opus-audit-2.md B-M1: on a store without RENAME_NOREPLACE the fallback builds the destination in place, and a mid-way error leaves a partial tree under the user-visible name.
+Status: Agreed 2026-09-25
 
 [OPS-020] On local durable stores, completion is reported only after file data and the containing directory have been synchronized for operations that claim crash durability.
 Falsifier: a crash-durable operation reports completion before its sync calls finish.
@@ -129,8 +130,9 @@ Status: Draft
 
 [OPS-021] Copy and move preserve timestamps, mode, ownership, extended attributes, ACLs, and sparse layout when both stores declare support; unsupported metadata is summarized before destructive source removal.
 Falsifier: supported metadata changes silently or unsupported metadata is lost during a move without warning.
-Mechanism: metadata matrix fixtures across local and limited providers.
-Status: Draft
+Mechanism: ops-021
+Rationale: docs/opus-audit-2.md B-M2: sparse files inside a copied or moved folder are fully expanded with no warning while single files keep their holes.
+Status: Agreed 2026-09-25
 
 [OPS-022] Operations treat a symlink as the selected item by default and follow its target only after an explicit follow-links choice; traversal still rejects loops.
 Falsifier: copying or deleting a symlink mutates its target without that choice.
@@ -162,10 +164,11 @@ Falsifier: recovery repeats a completed mutation or deletes user-owned data.
 Mechanism: restart recovery tests for copy, move, archive, and remote fixtures.
 Status: Draft
 
-[OPS-028] The Trash surface lists trashed items with original location and deletion time, restores selected items through conflict handling, and empties trash only after confirmation naming the item count.
-Falsifier: restore overwrites without conflict handling or empty-trash runs without confirmation.
-Mechanism: trash list, restore, conflict, and purge integration tests.
-Status: Draft
+[OPS-028] The Trash surface lists trashed items with original location and deletion time, restores selected items through conflict handling, and empties trash only after confirmation naming the item count. One unreadable trash entry is listed as unrestorable and purgeable; it never hides the others.
+Falsifier: restore overwrites without conflict handling, a restorable item fails to restore or leaves a stray entry at its original path, one entry whose payload is missing makes the listing fail, or empty-trash runs without confirmation.
+Mechanism: ops-028
+Rationale: docs/opus-audit-2.md B-M3 and B-M4: restoring a trashed link to a directory failed and left an empty directory, and one orphaned .trashinfo made the whole Trash view fail.
+Status: Agreed 2026-09-25
 
 [OPS-029] Archive browse and extraction enforce configurable limits for entry count, expanded bytes, compression ratio, nesting depth, path length, memory, and temporary-disk use before and during decoding.
 Falsifier: a crafted archive can exceed any configured budget without a bounded error and cleanup.
