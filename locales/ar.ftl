@@ -65,6 +65,7 @@ context-archive-unavailable = استخراج الأرشيف غير متاح لأ
 context-authorization-unavailable = صلاحيات المسؤول غير متاحة لأن خدمة التفويض غير مثبتة
 context-association-unavailable = اختيار التطبيق غير متاح لأن خدمة ربط التطبيقات غير مثبتة
 context-target-changed = تغير العنصر المحدد أو لم يعد موجودًا؛ افتح قائمة السياق مجددًا
+context-trash-unrestorable = بيانات هذا العنصر مفقودة من سلة المهملات؛ لا يمكن إلا حذفه نهائيًا
 context-directory-only = هذا الأمر يفتح المجلدات فقط
 context-command-mismatch = تعذر تنفيذ هذا الأمر بالمعاملات التي أُعطيت له
 context-menu-loading = جارٍ تحميل قائمة السياق…

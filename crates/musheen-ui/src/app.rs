@@ -4459,6 +4459,7 @@ impl MusheenApp {
                                 entry.deleted_at_unix_seconds(),
                                 entry.kind(),
                             )
+                            .with_restorable(entry.restorable())
                         })
                         .collect(),
                 )
@@ -10963,7 +10964,25 @@ impl MusheenApp {
             CommandAction::EmptyTrash => target == CommandTarget::TrashBackground,
             _ => return self.localized_backend_action_state(action),
         };
-        if target_matches && self.trash_items_for_targets(tab_id, selection).is_some() {
+        let items = target_matches
+            .then(|| self.trash_items_for_targets(tab_id, selection))
+            .flatten();
+        if action == CommandAction::Restore
+            && items
+                .as_ref()
+                .is_some_and(|items| items.iter().any(|item| !item.is_restorable()))
+        {
+            // The entry's data is gone from Trash: it can be purged, not restored.
+            return CapabilityState::Unsupported(
+                CapabilityReason::new(
+                    self.catalog
+                        .message("context.trash-unrestorable")
+                        .expect("unrestorable refusal is localized"),
+                )
+                .expect("unrestorable refusal is nonempty"),
+            );
+        }
+        if items.is_some() {
             self.localized_backend_action_state(action)
         } else {
             CapabilityState::Unsupported(
@@ -13471,6 +13490,13 @@ impl MusheenApp {
                     let original = DisplayPath::from_store_path(receipt.original_path())
                         .as_str()
                         .to_owned();
+                    let restorable = item.is_restorable();
+                    let unrestorable_note = (!restorable).then(|| {
+                        self.catalog
+                            .message("context.trash-unrestorable")
+                            .map(|note| note.to_string())
+                            .unwrap_or_else(|_| "this item cannot be restored".to_owned())
+                    });
                     div()
                         .id(SharedString::from(format!("trash-item-{index}")))
                         .test_support()
@@ -13551,12 +13577,27 @@ impl MusheenApp {
                                         "Deleted at Unix time {}",
                                         item.deleted_at_unix_seconds()
                                     ),
-                                )),
+                                ))
+                                .when_some(unrestorable_note, |details, note| {
+                                    details.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "trash-unrestorable-{index}"
+                                            )))
+                                            .test_support()
+                                            .role(Role::Status)
+                                            .aria_label(note.clone())
+                                            .text_xs()
+                                            .text_color(colors.muted_foreground)
+                                            .child(note),
+                                    )
+                                }),
                         )
                         .child(
                             Button::new(SharedString::from(format!("trash-restore-{index}")))
                                 .label("Restore")
                                 .small()
+                                .disabled(!restorable)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let menu = this.compose_context_menu(
                                         tab_id,
@@ -24004,6 +24045,98 @@ mod tests {
             }
             drop(subscription);
         }
+    }
+
+    #[gpui_kit::test]
+    async fn trash_surface_marks_an_unrestorable_entry_and_keeps_the_others(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, browser, tab_id) = open_gallery_window(cx).await;
+        let restorable = TrashItem::new(
+            musheen_ops::TrashReceipt::new(
+                StorePath::from_unix_path("/home/user/Documents/kept.txt"),
+                b"kept-id".to_vec(),
+            ),
+            1_726_742_500,
+        );
+        let orphan = TrashItem::new(
+            musheen_ops::TrashReceipt::new(
+                StorePath::from_unix_path("/home/user/Documents/orphan.txt"),
+                b"orphan-id".to_vec(),
+            ),
+            1_726_742_400,
+        )
+        .with_restorable(false);
+        let restorable_target = trash_command_target(&restorable);
+        let orphan_target = trash_command_target(&orphan);
+        app.update(cx, |state, cx| {
+            state.navigation.navigate_focused(trash_store_path());
+            state.trash_states.insert(
+                tab_id,
+                TrashState::Ready(TrashSurfaceModel::new(vec![restorable, orphan])),
+            );
+            cx.notify();
+        });
+
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("trash-item-0").visible());
+            assert!(window.find("trash-item-1").visible());
+            assert!(
+                window.try_find("trash-unrestorable-0").is_none(),
+                "the entry with its data carries no note"
+            );
+            assert!(window.find("trash-unrestorable-1").visible());
+        })
+        .unwrap();
+        app.update(cx, |state, _| {
+            let menu = state.compose_context_menu(
+                tab_id,
+                MenuTarget::TrashItem,
+                vec![restorable_target.clone()],
+            );
+            assert!(
+                MusheenApp::menu_entry_by_id(&menu, "trash.restore")
+                    .unwrap()
+                    .state()
+                    .is_enabled(),
+                "the entry with its data restores"
+            );
+            let menu = state.compose_context_menu(
+                tab_id,
+                MenuTarget::TrashItem,
+                vec![orphan_target.clone()],
+            );
+            let restore = MusheenApp::menu_entry_by_id(&menu, "trash.restore").unwrap();
+            assert!(
+                !restore.state().is_enabled(),
+                "an orphaned entry cannot be restored"
+            );
+            assert!(
+                restore
+                    .state()
+                    .disabled_reason()
+                    .is_some_and(|reason| reason.contains("missing from Trash")),
+                "the refusal names the missing data: {:?}",
+                restore.state()
+            );
+            let TrashState::Ready(surface) = &state.trash_states[&tab_id] else {
+                panic!("the trash surface is ready");
+            };
+            assert!(surface.restore_receipt(0).is_ok());
+            assert_eq!(
+                surface.restore_receipt(1),
+                Err(crate::status_center::StatusCenterError::UnrestorableTrashItem(1))
+            );
+            assert_eq!(
+                surface
+                    .empty_challenge()
+                    .confirm(2, true)
+                    .map(|c| c.item_count()),
+                Ok(2),
+                "an unrestorable entry still counts for Empty Trash"
+            );
+        });
     }
 
     #[gpui_kit::test]

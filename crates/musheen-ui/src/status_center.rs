@@ -772,6 +772,7 @@ pub struct TrashItem {
     receipt: TrashReceipt,
     deleted_at_unix_seconds: i64,
     kind: musheen_ops::ConflictItemKind,
+    restorable: bool,
 }
 
 impl TrashItem {
@@ -781,6 +782,7 @@ impl TrashItem {
             receipt,
             deleted_at_unix_seconds,
             kind: musheen_ops::ConflictItemKind::File,
+            restorable: true,
         }
     }
 
@@ -794,7 +796,21 @@ impl TrashItem {
             receipt,
             deleted_at_unix_seconds,
             kind,
+            restorable: true,
         }
+    }
+
+    /// Marks whether the entry's data is still in Trash. An entry whose data
+    /// is missing is listed so it can be purged, but it cannot be restored.
+    #[must_use]
+    pub const fn with_restorable(mut self, restorable: bool) -> Self {
+        self.restorable = restorable;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_restorable(&self) -> bool {
+        self.restorable
     }
 
     #[must_use]
@@ -831,10 +847,14 @@ impl TrashSurfaceModel {
     }
 
     pub fn restore_receipt(&self, index: usize) -> Result<&TrashReceipt, StatusCenterError> {
-        self.items
+        let item = self
+            .items
             .get(index)
-            .map(TrashItem::receipt)
-            .ok_or(StatusCenterError::UnknownTrashItem(index))
+            .ok_or(StatusCenterError::UnknownTrashItem(index))?;
+        if !item.is_restorable() {
+            return Err(StatusCenterError::UnrestorableTrashItem(index));
+        }
+        Ok(item.receipt())
     }
 
     #[must_use]
@@ -885,6 +905,8 @@ pub enum StatusCenterError {
     InvalidJobId,
     MissingRecoveryAction,
     UnknownTrashItem(usize),
+    /// The entry's data is missing from Trash; it can be purged, not restored.
+    UnrestorableTrashItem(usize),
     ConfirmationRequired,
     UnsupportedSchema(u32),
     UnknownOperationKind(Box<str>),
@@ -910,6 +932,9 @@ impl fmt::Display for StatusCenterError {
             Self::InvalidJobId => formatter.write_str("the status document has an invalid job ID"),
             Self::MissingRecoveryAction => formatter.write_str("a failure needs a recovery action"),
             Self::UnknownTrashItem(index) => write!(formatter, "trash item {index} does not exist"),
+            Self::UnrestorableTrashItem(index) => {
+                write!(formatter, "trash item {index} has no data left to restore")
+            }
             Self::ConfirmationRequired => {
                 formatter.write_str("the destructive scope was not confirmed")
             }
