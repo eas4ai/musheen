@@ -1357,7 +1357,6 @@ mod indexed_watch_tests {
 
     #[test]
     fn indexed_folder_merge_failure_keeps_the_shown_items_and_reports_the_error() {
-        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let mut model = DirectoryModel::new(ResourceLimits::default())
             .with_index_root(Some(root.path().to_path_buf()));
@@ -1372,23 +1371,16 @@ mod indexed_watch_tests {
         }
         assert!(model.is_indexed());
         assert_eq!(model.indexed_count(), 5_120);
-        let scratch = model
-            .index
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .path()
-            .to_path_buf();
+        let index = Arc::clone(model.index.as_ref().unwrap());
 
         // The index directory stops accepting new files, so the merge cannot
         // write the new order.
-        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o500)).unwrap();
+        index.lock().unwrap().set_directory_mode(0o500).unwrap();
         let work = model
             .prepare_index_watch_event(&load, WatchEvent::Created(item(9_000, "late")), None)
             .unwrap();
         let result = work.run();
-        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+        index.lock().unwrap().set_directory_mode(0o700).unwrap();
         assert!(
             result.is_err(),
             "the merge fails in a read-only index directory"
