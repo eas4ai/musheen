@@ -187,7 +187,8 @@ fn directory_model_has_loading_empty_ready_and_error_states() {
 #[test]
 fn directory_model_bounds_resident_items_and_renders_three_viewports() {
     let limits = ResourceLimits::default();
-    let mut model = DirectoryModel::new(limits);
+    let index_root = tempfile::tempdir().unwrap();
+    let mut model = DirectoryModel::new(limits).with_index_root(index_root.path().to_path_buf());
     let load = model.begin_navigation(StorePath::from_unix_path("/many"));
 
     for batch in 0..16 {
@@ -209,7 +210,9 @@ fn directory_model_bounds_resident_items_and_renders_three_viewports() {
 
 #[test]
 fn directory_rendered_range_reaches_entries_after_retention_window() {
-    let mut model = DirectoryModel::new(ResourceLimits::default());
+    let index_root = tempfile::tempdir().unwrap();
+    let mut model = DirectoryModel::new(ResourceLimits::default())
+        .with_index_root(index_root.path().to_path_buf());
     let load = model.begin_navigation(StorePath::from_unix_path("/many"));
 
     for batch in 0..16 {
@@ -230,7 +233,9 @@ fn directory_rendered_range_reaches_entries_after_retention_window() {
 #[ignore = "resource-intensive million-item provider pagination verification"]
 fn streaming_directory_model_pages_through_one_million_items() {
     let limits = ResourceLimits::default();
-    let mut model = DirectoryModel::new(limits.clone());
+    let index_root = tempfile::tempdir().unwrap();
+    let mut model =
+        DirectoryModel::new(limits.clone()).with_index_root(index_root.path().to_path_buf());
     let load = model.begin_navigation(StorePath::from_unix_path("/huge"));
     let mut offset = 0usize;
 

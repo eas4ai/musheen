@@ -2058,6 +2058,14 @@ impl ContextMenuDestinationResolver for ContextTransferDestinationResolver<'_> {
 }
 
 pub fn run(initial_path: PathBuf) {
+    if let Err(error) = crate::directory::install_index_cleanup_on_termination() {
+        eprintln!("Musheen could not watch for termination signals: {error}");
+    }
+    if let Err(error) =
+        crate::directory::sweep_stale_indexes(&crate::directory::directory_index_root())
+    {
+        eprintln!("Musheen could not remove stale directory indexes: {error}");
+    }
     gpui_kit::application()
         .with_assets(MusheenAssets)
         .run(move |cx| {
@@ -18042,6 +18050,261 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(selected, ["item-012.txt", "item-013.txt"]);
+    }
+
+    const INDEXED_FOLDER_ITEMS: usize = 8_192;
+
+    /// Opens the gallery fixture, then replaces its listing with 8,192
+    /// synthetic items so the tab spills into a disk index kept under a
+    /// temporary root. The root is returned so the test controls its life.
+    async fn open_synthetic_indexed_folder(
+        layout: Layout,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<MusheenApp>,
+        AnyWindowHandle,
+        TabId,
+        tempfile::TempDir,
+    ) {
+        let index_root = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../musheen-test-support/fixtures/shell-gallery");
+        let mut app = None;
+        let handle = cx.open_window(size(px(1_480.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| MusheenApp::new_with_session_store(fixture, None, cx));
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let tab_id = cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                let tab_id = state.navigation.focused_tab().id();
+                let directory = state.directories.get_mut(&tab_id).unwrap();
+                directory.view_mut().preferences_mut().directories_first = false;
+                directory.set_index_root(index_root.path().to_path_buf());
+                let load = directory.begin_navigation(StorePath::from_unix_path("/synthetic"));
+                let request = PageRequest::first(&ResourceLimits::default());
+                let provider = ProviderId::new("local").unwrap();
+                for first in (0..INDEXED_FOLDER_ITEMS).step_by(512) {
+                    let items = (first..first + 512)
+                        .map(|number| {
+                            StoreItem::new(
+                                ItemId::new(provider.clone(), number.to_be_bytes()).unwrap(),
+                                StorePath::from_unix_path(format!("/synthetic/{number}")),
+                                DisplayPath::new(format!("item-{number:05}")),
+                                ItemKind::RegularFile,
+                                None,
+                            )
+                        })
+                        .collect();
+                    let page =
+                        Page::try_new(&request, items, None, musheen_core::TotalHint::Unknown)
+                            .unwrap();
+                    assert_eq!(directory.apply_page(&load, page), ApplyPageResult::Applied);
+                }
+                directory.view_mut().preferences_mut().layout = layout;
+                assert!(
+                    directory.is_indexed(),
+                    "the folder is indexed after 4,096 items"
+                );
+                assert_eq!(directory.visible_count(), INDEXED_FOLDER_ITEMS);
+                let preferences = directory.view().preferences().clone();
+                state
+                    .navigation
+                    .tab_mut(tab_id)
+                    .unwrap()
+                    .set_view_preferences(preferences);
+                cx.notify();
+                tab_id
+            })
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |window, cx| {
+            window.render_frame(cx);
+            app.read(cx)
+                .indexed_viewports
+                .get(&tab_id)
+                .is_some_and(|viewport| !viewport.loaded.is_empty())
+                && window
+                    .try_find("directory-item-0-1")
+                    .is_some_and(|item| item.visible())
+        })
+        .await;
+        (app, browser, tab_id, index_root)
+    }
+
+    fn index_entries(root: &Path) -> Vec<std::path::PathBuf> {
+        filesystem::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_index_lives_under_the_cache_directory(cx: &mut TestAppContext) {
+        let (app, _browser, _tab_id, index_root) =
+            open_synthetic_indexed_folder(Layout::List, cx).await;
+
+        let index_directory = cx
+            .read(|cx| app.read(cx).focused_directory().index_directory())
+            .expect("the indexed folder has an index directory");
+
+        assert_eq!(
+            index_directory.parent(),
+            Some(index_root.path()),
+            "the index is kept under the configured cache root"
+        );
+        assert_eq!(index_entries(index_root.path()), vec![index_directory]);
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_index_is_removed_when_the_tab_navigates_away(cx: &mut TestAppContext) {
+        let (app, browser, _tab_id, index_root) =
+            open_synthetic_indexed_folder(Layout::List, cx).await;
+        assert_eq!(index_entries(index_root.path()).len(), 1);
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        app.update(cx, |state, cx| {
+            state.navigate(
+                StorePath::from_unix_path(elsewhere.path().as_os_str()),
+                true,
+                cx,
+            );
+        });
+
+        cx.wait_for(browser, Duration::from_secs(3), |_, _| {
+            index_entries(index_root.path()).is_empty()
+        })
+        .await;
+        assert!(
+            index_entries(index_root.path()).is_empty(),
+            "navigating away removes the tab's index"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_ctrl_click_after_select_all_keeps_the_rest_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, browser, tab_id, _index_root) =
+            open_synthetic_indexed_folder(Layout::List, cx).await;
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_selection_action(CommandAction::SelectAll, cx);
+            });
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |_, cx| {
+            app.read(cx).focused_directory().indexed_selected_count() == INDEXED_FOLDER_ITEMS
+        })
+        .await;
+        let first = ItemId::new(ProviderId::new("local").unwrap(), 0usize.to_be_bytes()).unwrap();
+
+        cx.update(|cx| {
+            app.update(cx, |state, cx| {
+                state.select_item_with_mode(tab_id, first, SelectionMode::Toggle, cx);
+            });
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |_, cx| {
+            let directory = app.read(cx).focused_directory();
+            directory.indexed_selected_count() + directory.view().selected_ids().len()
+                == INDEXED_FOLDER_ITEMS - 1
+        })
+        .await;
+
+        let selected = cx.read(|cx| {
+            let directory = app.read(cx).focused_directory();
+            directory.indexed_selected_count() + directory.view().selected_ids().len()
+        });
+        assert_eq!(
+            selected,
+            INDEXED_FOLDER_ITEMS - 1,
+            "ctrl-click removes one item from Select All"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_rubber_band_after_scrolling_selects_the_rows_it_covers(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, browser, tab_id, _index_root) =
+            open_synthetic_indexed_folder(Layout::List, cx).await;
+        let pitch = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                window.find("directory-item-0-1").bounds().top()
+                    - window.find("directory-item-0-0").bounds().top()
+            })
+            .unwrap();
+        assert!(pitch > px(0.), "two rendered rows give the row pitch");
+        app.update(cx, |state, _| {
+            state
+                .directory_scrolls
+                .get(&(tab_id, 0))
+                .expect("directory scroll handle exists")
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(px(0.), -(pitch * 10.) - pitch / 2.));
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find("directory-item-0-13")
+                .is_some_and(|item| item.visible())
+        })
+        .await;
+        let (surface, row_12, row_13) = cx
+            .update_window(browser, |_, window, cx| {
+                window.render_frame(cx);
+                (
+                    window.find("directory-items").bounds(),
+                    window.find("directory-item-0-12").bounds(),
+                    window.find("directory-item-0-13").bounds(),
+                )
+            })
+            .unwrap();
+        let margin = surface.left() + (row_12.left() - surface.left()) / 2.;
+        let start = point(margin, row_12.top() + px(2.));
+        let end = point(surface.left() + px(200.), row_13.top() + px(2.));
+
+        let mut visual = VisualTestContext::from_window(browser, cx);
+        visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        visual.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+        visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+        visual.run_until_parked();
+
+        let selected = cx.read(|cx| {
+            let directory = app.read(cx).focused_directory();
+            directory.indexed_selected_count() + directory.view().selected_ids().len()
+        });
+        assert_eq!(
+            selected, 2,
+            "the rubber band selects the two rows it covers in an indexed folder"
+        );
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            let status_bar = window.find("status-bar");
+            let label = status_bar.label();
+            assert!(
+                label
+                    .as_deref()
+                    .is_some_and(|label| label.starts_with("2 items selected")),
+                "status bar: {label:?}"
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

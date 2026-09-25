@@ -5,12 +5,16 @@ use musheen_core::{
     StoreError, StoreItem, StorePath, WatchEvent,
 };
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod index;
+mod termination;
 pub(crate) use index::IndexedSelection;
 use index::{DiskDirectoryIndex, ResolvedIndexedSelection};
+pub(crate) use index::{directory_index_root, sweep_stale_indexes};
+pub(crate) use termination::install_index_cleanup_on_termination;
 
 const MAX_RESIDENT_ITEMS: usize = 4_096;
 
@@ -237,6 +241,7 @@ impl DirectoryIndexReader {
 
 pub(crate) struct DirectoryIndexWork {
     index: Option<SharedIndex>,
+    index_root: PathBuf,
     prior_items: Vec<StoreItem>,
     page_items: Vec<StoreItem>,
     preferences: ViewPreferences,
@@ -356,7 +361,7 @@ impl DirectoryIndexWork {
     pub(crate) fn run(self) -> std::io::Result<DirectoryIndexResult> {
         let index = match self.index {
             Some(index) => index,
-            None => Arc::new(Mutex::new(DiskDirectoryIndex::new()?)),
+            None => Arc::new(Mutex::new(DiskDirectoryIndex::new_in(&self.index_root)?)),
         };
         let (indexed_count, visible_count, order_rebuilt) = {
             let mut index_guard = index.lock().map_err(|_| {
@@ -438,6 +443,7 @@ pub struct DirectoryModel {
     active: Option<DirectoryLoad>,
     state: DirectoryState,
     view: DirectoryViewModel,
+    index_root: PathBuf,
     index: Option<SharedIndex>,
     indexed_selection: Option<IndexedSelection>,
     indexed_selection_anchor: Option<ItemId>,
@@ -467,6 +473,7 @@ impl DirectoryModel {
             active: None,
             state: DirectoryState::Empty,
             view: DirectoryViewModel::new(retention_limit.min(MAX_RESIDENT_ITEMS)),
+            index_root: directory_index_root(),
             index: None,
             indexed_selection: None,
             indexed_selection_anchor: None,
@@ -476,6 +483,28 @@ impl DirectoryModel {
             next_request: None,
             page_loading: false,
         }
+    }
+
+    /// Keeps this tab's disk index under `root` instead of the user's cache
+    /// directory.
+    #[must_use]
+    pub fn with_index_root(mut self, root: PathBuf) -> Self {
+        self.index_root = root;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_index_root(&mut self, root: PathBuf) {
+        self.index_root = root;
+    }
+
+    /// The directory that holds this tab's index files while the folder is
+    /// indexed.
+    #[cfg(test)]
+    pub(crate) fn index_directory(&self) -> Option<PathBuf> {
+        self.index
+            .as_ref()
+            .and_then(|index| index.lock().ok().map(|index| index.path().to_path_buf()))
     }
 
     pub fn begin_navigation(&mut self, location: StorePath) -> DirectoryLoad {
@@ -584,6 +613,7 @@ impl DirectoryModel {
         }
         DirectoryIndexWork {
             index: self.index.clone(),
+            index_root: self.index_root.clone(),
             prior_items: if self.index.is_none() {
                 self.view.take_items_for_index()
             } else {
