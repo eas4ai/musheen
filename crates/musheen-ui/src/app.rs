@@ -1744,9 +1744,7 @@ fn submitted_rename_name(original_name: &OsStr, submitted: &str) -> OsString {
 }
 
 fn template_copy_payload(source: &Path) -> Result<FileDragPayload, &'static str> {
-    if !source.is_absolute()
-        || !std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_file())
-    {
+    if !source.is_absolute() {
         return Err("template-source-invalid");
     }
     let path = StorePath::from_unix_path(source.as_os_str());
