@@ -4450,19 +4450,7 @@ impl MusheenApp {
         let work = cx.background_spawn(async move {
             let mut store = LocalStore::new();
             store.list_trash().map(|entries| {
-                TrashSurfaceModel::new(
-                    entries
-                        .into_iter()
-                        .map(|entry| {
-                            TrashItem::with_kind(
-                                entry.receipt().clone(),
-                                entry.deleted_at_unix_seconds(),
-                                entry.kind(),
-                            )
-                            .with_restorable(entry.restorable())
-                        })
-                        .collect(),
-                )
+                TrashSurfaceModel::new(entries.iter().map(trash_item_from_entry).collect())
             })
         });
         cx.spawn(async move |this, cx| {
@@ -16659,6 +16647,17 @@ fn trash_store_path() -> StorePath {
     .expect("the built-in Trash path is valid")
 }
 
+/// The surface item for one entry of the local Trash. Whether the entry can
+/// be restored comes from the store; the surface never decides it.
+fn trash_item_from_entry(entry: &musheen_local::LocalTrashEntry) -> TrashItem {
+    TrashItem::with_kind(
+        entry.receipt().clone(),
+        entry.deleted_at_unix_seconds(),
+        entry.kind(),
+    )
+    .with_restorable(entry.restorable())
+}
+
 fn trash_command_target(item: &TrashItem) -> CommandTargetRef {
     let provider = ProviderId::new("musheen.trash").expect("Trash provider ID is valid");
     let key = item.receipt().provider_reference().to_vec();
@@ -24039,6 +24038,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn trash_surface_items_take_restorable_from_the_store_entry() {
+        let receipt = musheen_ops::TrashReceipt::new(
+            StorePath::from_unix_path("/home/user/Documents/orphan.txt"),
+            b"orphan-id".to_vec(),
+        );
+        let unrestorable = musheen_local::LocalTrashEntry::new(
+            receipt.clone(),
+            1_726_742_400,
+            musheen_ops::ConflictItemKind::Directory,
+            false,
+        );
+        let restorable = musheen_local::LocalTrashEntry::new(
+            receipt.clone(),
+            1_726_742_400,
+            musheen_ops::ConflictItemKind::File,
+            true,
+        );
+
+        let item = trash_item_from_entry(&unrestorable);
+
+        assert!(!item.is_restorable(), "the store's verdict reaches the surface");
+        assert_eq!(item.receipt(), &receipt);
+        assert_eq!(item.deleted_at_unix_seconds(), 1_726_742_400);
+        assert_eq!(item.kind(), musheen_ops::ConflictItemKind::Directory);
+        assert!(trash_item_from_entry(&restorable).is_restorable());
+    }
+
     #[gpui_kit::test]
     async fn trash_surface_marks_an_unrestorable_entry_and_keeps_the_others(
         cx: &mut TestAppContext,
@@ -24108,8 +24135,8 @@ mod tests {
                 restore
                     .state()
                     .disabled_reason()
-                    .is_some_and(|reason| reason.contains("missing from Trash")),
-                "the refusal names the missing data: {:?}",
+                    .is_some_and(|reason| reason.contains("cannot be restored")),
+                "the refusal says why the entry stays: {:?}",
                 restore.state()
             );
             let TrashState::Ready(surface) = &state.trash_states[&tab_id] else {

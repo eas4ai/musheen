@@ -687,6 +687,41 @@ fn run_trash_helper(test_name: &str, helper_variable: &str) {
 }
 
 #[test]
+fn local_trash_restore_refuses_an_occupied_path_at_the_provider() {
+    if std::env::var_os("MUSHEEN_TRASH_OCCUPIED_HELPER").is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());
+        let path = root.join("busy");
+        fs::write(&path, b"trashed").unwrap();
+        let mut store = LocalStore::new();
+        let receipt = trash_through_store(&mut store, &path);
+        // Something else takes the original path before the restore runs.
+        fs::write(&path, b"occupant").unwrap();
+
+        // The provider is asked directly, without the engine's own check.
+        let outcome = musheen_ops::DeleteProvider::restore_no_replace(&mut store, &receipt);
+
+        assert_eq!(outcome, Err(MutationError::Conflict));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"occupant",
+            "the provider never replaces what occupies the original path"
+        );
+        let listed = store.list_trash().unwrap();
+        let entry = listed
+            .iter()
+            .find(|item| item.receipt() == &receipt)
+            .expect("the entry stays in Trash");
+        assert!(entry.restorable());
+        return;
+    }
+
+    run_trash_helper(
+        "local_trash_restore_refuses_an_occupied_path_at_the_provider",
+        "MUSHEEN_TRASH_OCCUPIED_HELPER",
+    );
+}
+
+#[test]
 fn local_trash_listing_shows_an_unreadable_record_as_unrestorable_and_purgeable() {
     if std::env::var_os("MUSHEEN_TRASH_RECORD_HELPER").is_some() {
         let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());

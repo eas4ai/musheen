@@ -108,6 +108,21 @@ pub struct LocalTrashEntry {
 
 impl LocalTrashEntry {
     #[must_use]
+    pub const fn new(
+        receipt: TrashReceipt,
+        deleted_at_unix_seconds: i64,
+        kind: musheen_ops::ConflictItemKind,
+        restorable: bool,
+    ) -> Self {
+        Self {
+            receipt,
+            deleted_at_unix_seconds,
+            kind,
+            restorable,
+        }
+    }
+
+    #[must_use]
     pub const fn receipt(&self) -> &TrashReceipt {
         &self.receipt
     }
