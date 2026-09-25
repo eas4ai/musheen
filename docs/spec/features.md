@@ -1,4 +1,4 @@
-Status: Draft
+Prefix: FEAT
 
 # Validated feature catalog
 

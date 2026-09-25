@@ -1,4 +1,3 @@
-Status: Draft
 
 # Musheen — overview
 
@@ -44,6 +43,23 @@ mid-operation.
 - GPL-3.0-or-later, matching the dependency set.
 
 ## Spec map
+
+| File | Prefix |
+|---|---|
+| features.md | FEAT |
+| deps.md | DEP |
+| core.md | CORE |
+| browse.md | BROWSE |
+| ops.md | OPS |
+| search.md | SEARCH |
+| custom.md | CUSTOM |
+| system.md | SYS |
+| ux.md | UXF |
+| ui.md | UIV |
+| icons.md | ICON |
+| limits.md | LIMIT |
+
+### What each file covers
 
 - docs/spec/features.md — validated feature catalog (veracity and
   effort per feature; non-normative, feeds the specs below).
