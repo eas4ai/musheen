@@ -653,6 +653,84 @@ fn local_trash_restore_returns_a_link_to_a_directory() {
     assert!(status.success());
 }
 
+/// Trashes `path` through the store and returns its receipt.
+fn trash_through_store(store: &mut LocalStore, path: &std::path::Path) -> musheen_ops::TrashReceipt {
+    let store_path = StorePath::from_unix_path(path.to_path_buf().into_os_string());
+    let identity = MutationProvider::identity(store, &store_path)
+        .unwrap()
+        .unwrap();
+    let outcome = execute_delete(
+        store,
+        vec![DeleteTarget::new(store_path, identity.to_vec())],
+    )
+    .unwrap();
+    outcome.trashed()[0].clone()
+}
+
+/// Runs this test binary again with a private trash: `XDG_DATA_HOME` points
+/// into a fresh temporary directory and `MUSHEEN_TRASH_ROOT` at the folder
+/// the helper works in.
+fn run_trash_helper(test_name: &str, helper_variable: &str) {
+    let root = tempdir().unwrap();
+    let xdg_data = root.path().join("xdg-data");
+    fs::create_dir(&xdg_data).unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env(helper_variable, "1")
+        .env("MUSHEEN_TRASH_ROOT", root.path())
+        .env("XDG_DATA_HOME", xdg_data)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn local_trash_purge_removes_a_read_only_tree_and_the_other_entries() {
+    if std::env::var_os("MUSHEEN_TRASH_LOCKED_HELPER").is_some() {
+        let root = std::path::PathBuf::from(std::env::var_os("MUSHEEN_TRASH_ROOT").unwrap());
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        let inner = locked.join("inner");
+        fs::create_dir(&inner).unwrap();
+        fs::write(inner.join("file"), b"read-only").unwrap();
+        fs::set_permissions(inner.join("file"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
+        let kept_path = root.join("kept");
+        fs::write(&kept_path, b"kept").unwrap();
+        let mut store = LocalStore::new();
+        let locked_receipt = trash_through_store(&mut store, &locked);
+        let kept_receipt = trash_through_store(&mut store, &kept_path);
+
+        store
+            .purge_trash(&[locked_receipt, kept_receipt])
+            .expect("a tree with a read-only folder is purged with the rest");
+
+        let trash = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
+            .join("Trash");
+        // The listing also shows the trash folders of other mounts, so only
+        // the entries of the private trash count.
+        assert!(store.list_trash().unwrap().iter().all(|item| {
+            !std::path::PathBuf::from(OsString::from_vec(
+                item.receipt().provider_reference().to_vec(),
+            ))
+            .starts_with(&trash)
+        }));
+        assert_eq!(
+            fs::read_dir(trash.join("files")).unwrap().count(),
+            0,
+            "no data is left in Trash"
+        );
+        return;
+    }
+
+    run_trash_helper(
+        "local_trash_purge_removes_a_read_only_tree_and_the_other_entries",
+        "MUSHEEN_TRASH_LOCKED_HELPER",
+    );
+}
+
 #[test]
 fn local_trash_listing_survives_an_orphaned_info_file() {
     if std::env::var_os("MUSHEEN_TRASH_ORPHAN_HELPER").is_some() {
