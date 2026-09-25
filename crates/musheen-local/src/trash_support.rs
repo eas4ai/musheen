@@ -8,8 +8,9 @@
 //! exists, else `.Trash-$uid` on the item's mount root, which it creates
 //! when missing. When that per-volume step fails with permission denied,
 //! the crate moves the item to the home trash instead. Every move is a
-//! rename; a rename that crosses a mount fails with EXDEV and the crate
-//! falls back to copy and delete. That copy is unverified and loses hard
+//! rename; a rename that crosses a mount or a device (a nested btrfs
+//! subvolume) fails with EXDEV and the crate falls back to copy and
+//! delete. That copy is unverified and loses hard
 //! links, sparse layout, and timestamps, so Musheen reports no trash
 //! support for such items and OPS-008 offers permanent delete instead.
 
@@ -231,9 +232,9 @@ fn trash_folder_writable(folder: &Path) -> bool {
     })
 }
 
-/// Whether a rename of `item` into `target` stays on one mount. `target`
-/// may not exist yet; the crate creates it under its nearest existing
-/// ancestor. rename(2) fails with EXDEV across mounts even on one device.
+/// Whether a rename of `item` into `target` stays on one filesystem.
+/// `target` may not exist yet; the crate creates it under its nearest
+/// existing ancestor.
 fn same_mount(item: &Path, target: &Path) -> bool {
     let Some(existing) = target
         .ancestors()
@@ -242,21 +243,35 @@ fn same_mount(item: &Path, target: &Path) -> bool {
         return false;
     };
     match (
-        mount_identity(item, AtFlags::SYMLINK_NOFOLLOW),
-        mount_identity(existing, AtFlags::empty()),
+        filesystem_identity(item, AtFlags::SYMLINK_NOFOLLOW),
+        filesystem_identity(existing, AtFlags::empty()),
     ) {
-        (Some(item), Some(target)) => item == target,
+        (Some(item), Some(target)) => rename_stays_on_one_filesystem(&item, &target),
         _ => false,
     }
 }
 
-/// The mount id from statx, or the device on kernels without STATX_MNT_ID.
-fn mount_identity(path: &Path, flags: AtFlags) -> Option<u64> {
+/// What rename(2) needs to agree on. The mount: a rename across mounts
+/// fails with EXDEV even when both sides are one device (a bind mount).
+/// The device: a nested btrfs subvolume shares its parent's mount id but
+/// has its own device, and a rename across its boundary fails the same way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilesystemIdentity {
+    /// `None` on kernels without STATX_MNT_ID.
+    mount: Option<u64>,
+    device: (u32, u32),
+}
+
+fn rename_stays_on_one_filesystem(item: &FilesystemIdentity, target: &FilesystemIdentity) -> bool {
+    item.device == target.device && item.mount == target.mount
+}
+
+fn filesystem_identity(path: &Path, flags: AtFlags) -> Option<FilesystemIdentity> {
     let stat = statx(CWD, path, flags | AtFlags::NO_AUTOMOUNT, StatxFlags::MNT_ID).ok()?;
-    Some(if stat.stx_mask & StatxFlags::MNT_ID.bits() != 0 {
-        stat.stx_mnt_id
-    } else {
-        (u64::from(stat.stx_dev_major) << 32) | u64::from(stat.stx_dev_minor)
+    let mount = (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id);
+    Some(FilesystemIdentity {
+        mount,
+        device: (stat.stx_dev_major, stat.stx_dev_minor),
     })
 }
 
@@ -318,6 +333,28 @@ mod tests {
             canonicalize_or_parents(&temporary.path().join("missing/Trash")),
             canonical.join("missing/Trash")
         );
+    }
+
+    // OPS-008: a nested btrfs subvolume keeps its parent's mount id but has
+    // its own device; a bind mount keeps the device but not the mount id.
+    // rename(2) fails across either boundary, so the crate would copy.
+    #[test]
+    fn trash_is_refused_where_the_device_differs_under_one_mount_id() {
+        let parent = FilesystemIdentity {
+            mount: Some(40),
+            device: (0, 60),
+        };
+        let subvolume = FilesystemIdentity {
+            mount: Some(40),
+            device: (0, 61),
+        };
+        let bind_mount = FilesystemIdentity {
+            mount: Some(41),
+            device: (0, 60),
+        };
+        assert!(rename_stays_on_one_filesystem(&parent, &parent));
+        assert!(!rename_stays_on_one_filesystem(&parent, &subvolume));
+        assert!(!rename_stays_on_one_filesystem(&parent, &bind_mount));
     }
 
     #[test]
