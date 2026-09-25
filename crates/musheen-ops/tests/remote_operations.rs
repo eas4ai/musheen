@@ -2,13 +2,14 @@
 mod support;
 
 use musheen_core::{
-    CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState,
-    ProviderId,
+    CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, ItemId,
+    ProviderId, StorePath,
 };
 use musheen_ops::{
-    CopyRequest, CopySession, EventGeneration, JobId, OperationKind, ProviderLimits,
-    ProviderSnapshot, RemoteTransferCapabilities, RemoteTransferGap, RemoteTransferPlan,
-    RemoteTransferStrategy, ResumePolicy, StagingPath,
+    CopyRequest, CopySession, CopyStrategy, EntryKind, EntrySnapshot, EventGeneration, JobId,
+    MetadataReport, MoveMetadataReview, OperationKind, ProviderLimits, ProviderSnapshot,
+    RemoteTransferCapabilities, RemoteTransferGap, RemoteTransferPlan, RemoteTransferStrategy,
+    ResumePolicy, SourceRemovalToken, StagingPath,
 };
 use support::RecordingProvider;
 
@@ -24,6 +25,30 @@ fn snapshot(id: &str, supported: &[CapabilityKind]) -> ProviderSnapshot {
         }),
         ProviderLimits::unbounded(),
     )
+}
+
+#[test]
+fn remote_move_review_retains_the_published_destination_identity() {
+    let provider = ProviderId::new("remote").unwrap();
+    let source = StorePath::from_provider_key(provider.clone(), b"/source".to_vec()).unwrap();
+    let destination = StorePath::from_provider_key(provider.clone(), b"/target".to_vec()).unwrap();
+    let published = ItemId::new(provider, b"published-version".to_vec()).unwrap();
+    let snapshot = EntrySnapshot::new(b"source-version".to_vec(), EntryKind::RegularFile, 7, 7, 0);
+    let token = SourceRemovalToken::new(b"source-version".to_vec());
+
+    let review = MoveMetadataReview::new(
+        source,
+        destination,
+        snapshot.clone(),
+        token.clone(),
+        CopyStrategy::Streamed,
+        MetadataReport::default(),
+    )
+    .with_destination_identity(published.clone());
+
+    assert_eq!(review.destination_identity(), Some(&published));
+    assert_eq!(review.source_snapshot(), &snapshot);
+    assert_eq!(review.source_removal(), &token);
 }
 
 #[test]

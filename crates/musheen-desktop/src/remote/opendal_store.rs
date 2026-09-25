@@ -25,6 +25,7 @@ use opendal_http_transport_reqwest::ReqwestTransport;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Read;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -394,6 +395,50 @@ impl OpendalStore {
                     None,
                 )
             })
+        })
+    }
+
+    /// Compares a local regular file with a remote object without retaining
+    /// either entire file in memory. Local file access stays in the desktop
+    /// provider boundary, including the final verification before a move.
+    pub fn local_content_matches<'a>(
+        &'a self,
+        local: &'a Path,
+        remote: &'a StorePath,
+        size: u64,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<bool, RemoteError>> {
+        Box::pin(async move {
+            let mut file = std::fs::File::open(local).map_err(|_| {
+                RemoteError::new(self.protocol, RemoteErrorCategory::Permanent, None)
+            })?;
+            let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
+            let mut offset = 0_u64;
+            while offset < size {
+                if cancellation.is_cancelled() {
+                    return Err(RemoteError::new(
+                        self.protocol,
+                        RemoteErrorCategory::Cancelled,
+                        None,
+                    ));
+                }
+                let end = offset.saturating_add(TRANSFER_CHUNK_BYTES as u64).min(size);
+                let count = (end - offset) as usize;
+                file.read_exact(&mut buffer[..count]).map_err(|_| {
+                    RemoteError::new(self.protocol, RemoteErrorCategory::Permanent, None)
+                })?;
+                let published = self
+                    .read_range(remote, offset..end, cancellation.clone())
+                    .await?;
+                if published != buffer[..count] {
+                    return Ok(false);
+                }
+                offset = end;
+            }
+            let mut extra = [0_u8; 1];
+            Ok(file.read(&mut extra).map_err(|_| {
+                RemoteError::new(self.protocol, RemoteErrorCategory::Permanent, None)
+            })? == 0)
         })
     }
 

@@ -4,17 +4,16 @@ use musheen_local::{
     DropAction, LocalOperationFailure, ProviderTransferExecution, TransferOutcome,
 };
 use musheen_ops::{
-    CopyProvider, ProviderError, ProviderLimits, ProviderSnapshot, RemoteTransferCapabilities,
-    RemoteTransferPlan, StagingPath,
+    CopyProvider, CopyStrategy, MetadataKind, MetadataReport, MoveMetadataReview, ProviderError,
+    ProviderLimits, ProviderSnapshot, RemoteTransferCapabilities, RemoteTransferPlan, StagingPath,
+    source_unchanged,
 };
 use nix::sys::statvfs::statvfs;
 use std::ffi::OsStr;
 use std::fmt;
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-const VERIFY_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_STAGING_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 pub(crate) struct RemoteUploadRoute {
@@ -117,14 +116,23 @@ impl RemoteUploadRoute {
                 staging.path().clone(),
             ));
         }
-        verify_upload(
-            &remote,
-            source_path,
-            &staging,
-            source_size,
-            cancellation.clone(),
-        )
-        .await?;
+        let matches = remote
+            .local_content_matches(
+                source_path,
+                staging.path(),
+                source_size,
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| {
+                LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
+            })?;
+        if !matches {
+            return Err(LocalOperationFailure::recoverable(
+                "remote staging content failed verification",
+                staging.path().clone(),
+            ));
+        }
         let current = local.resolve_item(execution.source()).map_err(|error| {
             LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
         })?;
@@ -155,6 +163,87 @@ impl RemoteUploadRoute {
         )
         .await
     }
+
+    async fn finalize_reviewed_move(
+        &self,
+        review: &MoveMetadataReview,
+        cancellation: CancellationToken,
+    ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        let expected_destination = review.destination_identity().ok_or_else(|| {
+            LocalOperationFailure::needs_attention(
+                "the reviewed remote destination has no recorded identity",
+            )
+        })?;
+        let remote = self
+            .destination
+            .connect_transfer(cancellation.clone())
+            .await
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        let completed = remote
+            .resolve_item(review.destination())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .ok_or_else(|| {
+                LocalOperationFailure::needs_attention("the reviewed destination disappeared")
+            })?;
+        if completed.id() != expected_destination
+            || completed.size() != Some(review.source_snapshot().size())
+        {
+            return Err(LocalOperationFailure::needs_attention(
+                "the reviewed destination changed before source removal",
+            ));
+        }
+        let mut local = LocalStore::new();
+        let current = CopyProvider::inspect(&mut local, review.source(), false)
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        if !source_unchanged(review.source_snapshot(), &current) {
+            return Err(LocalOperationFailure::needs_attention(
+                "the local source changed after the remote copy",
+            ));
+        }
+        let source_path = review.source().as_unix_path().ok_or_else(|| {
+            LocalOperationFailure::needs_attention("the reviewed source is not local")
+        })?;
+        let matches = remote
+            .local_content_matches(
+                source_path,
+                review.destination(),
+                review.source_snapshot().size(),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        if !matches {
+            return Err(LocalOperationFailure::needs_attention(
+                "the published remote content no longer matches the source",
+            ));
+        }
+        cancellation
+            .check()
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        if remote
+            .resolve_item(review.destination())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .as_ref()
+            .is_none_or(|item| item.id() != expected_destination)
+        {
+            return Err(LocalOperationFailure::needs_attention(
+                "the reviewed destination changed during final verification",
+            ));
+        }
+        CopyProvider::remove_source(
+            &mut local,
+            review.source(),
+            review.source_snapshot(),
+            review.source_removal(),
+        )
+        .map_err(|error| {
+            LocalOperationFailure::needs_attention(format!(
+                "the destination was published but source removal needs inspection: {error}"
+            ))
+        })?;
+        CommandTargetRef::new(completed.id().clone(), completed.path().clone())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))
+    }
 }
 
 impl fmt::Debug for RemoteUploadRoute {
@@ -182,9 +271,7 @@ impl ProviderTransferRoute for RemoteUploadRoute {
         target: &StorePath,
         _expected_identity: Option<&ItemId>,
     ) -> Result<StorePath, Box<str>> {
-        if action != DropAction::Copy {
-            return Err("remote moves require metadata review and are not ready".into());
-        }
+        let _ = action;
         let source = source
             .as_unix_path()
             .ok_or("the upload source is not a local path")?;
@@ -222,16 +309,50 @@ impl ProviderTransferRoute for RemoteUploadRoute {
         &self,
         execution: ProviderTransferExecution<'_>,
     ) -> Result<TransferOutcome, LocalOperationFailure> {
-        if execution.action() != DropAction::Copy {
-            return Err(LocalOperationFailure::failed(
-                "remote moves require metadata review and are not ready",
-            ));
-        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
-        runtime.block_on(self.execute_copy(execution))
+        let outcome = runtime.block_on(self.execute_copy(execution))?;
+        if execution.action() == DropAction::Copy {
+            return Ok(outcome);
+        }
+        let TransferOutcome::Completed(target) = outcome else {
+            return Err(LocalOperationFailure::needs_attention(
+                "the remote move did not produce a completed destination",
+            ));
+        };
+        let mut local = LocalStore::new();
+        let snapshot = CopyProvider::inspect(&mut local, execution.source(), false)
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        let removal =
+            CopyProvider::prepare_source_removal(&mut local, execution.source(), &snapshot)
+                .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        let review = MoveMetadataReview::new(
+            execution.source().clone(),
+            execution.destination().clone(),
+            snapshot,
+            removal,
+            CopyStrategy::Streamed,
+            remote_move_metadata_loss(),
+        )
+        .with_destination_identity(target.id().clone());
+        Ok(TransferOutcome::MetadataReview {
+            target,
+            review: Box::new(review),
+        })
+    }
+
+    fn finalize_move(
+        &self,
+        review: &MoveMetadataReview,
+        cancellation: &CancellationToken,
+    ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        runtime.block_on(self.finalize_reviewed_move(review, cancellation.clone()))
     }
 }
 
@@ -337,7 +458,7 @@ impl RemoteDownloadRoute {
             .await
             .map_err(|error| {
                 let message = format!("remote download stopped: {error}");
-                if std::fs::symlink_metadata(staging_path).is_ok() {
+                if local.resolve_item(staging.path()).ok().flatten().is_some() {
                     LocalOperationFailure::recoverable(message, staging.path().clone())
                 } else {
                     LocalOperationFailure::failed(message)
@@ -469,44 +590,6 @@ impl ProviderTransferRoute for RemoteDownloadRoute {
     }
 }
 
-async fn verify_upload(
-    remote: &OpendalStore,
-    source: &Path,
-    staging: &StagingPath,
-    size: u64,
-    cancellation: CancellationToken,
-) -> Result<(), LocalOperationFailure> {
-    let mut source = std::fs::File::open(source).map_err(|error| {
-        LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
-    })?;
-    let mut local = vec![0; VERIFY_CHUNK_BYTES];
-    let mut offset = 0_u64;
-    while offset < size {
-        cancellation.check().map_err(|error| {
-            LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
-        })?;
-        let end = offset.saturating_add(VERIFY_CHUNK_BYTES as u64).min(size);
-        let count = (end - offset) as usize;
-        source.read_exact(&mut local[..count]).map_err(|error| {
-            LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
-        })?;
-        let copied = remote
-            .read_range(staging.path(), offset..end, cancellation.clone())
-            .await
-            .map_err(|error| {
-                LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
-            })?;
-        if copied != local[..count] {
-            return Err(LocalOperationFailure::recoverable(
-                "remote staging content failed verification",
-                staging.path().clone(),
-            ));
-        }
-        offset = end;
-    }
-    Ok(())
-}
-
 pub(super) fn local_staging_budget(parent: &Path) -> Result<u64, LocalOperationFailure> {
     let space =
         statvfs(parent).map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
@@ -569,4 +652,16 @@ pub(super) async fn publish_remote_verified(
     let target = CommandTargetRef::new(completed.id().clone(), completed.path().clone())
         .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
     Ok(TransferOutcome::Completed(target))
+}
+
+pub(super) fn remote_move_metadata_loss() -> MetadataReport {
+    MetadataReport::with_skipped([
+        MetadataKind::Timestamps,
+        MetadataKind::Mode,
+        MetadataKind::Ownership,
+        MetadataKind::ExtendedAttributes,
+        MetadataKind::AccessControlList,
+        MetadataKind::SparseLayout,
+        MetadataKind::HardLinkRelationship,
+    ])
 }

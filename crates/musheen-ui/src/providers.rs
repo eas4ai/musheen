@@ -640,7 +640,7 @@ mod tests {
         ConnectionProfile, ConnectionProfiles, OpendalStore, PasswordRequest, RemoteCasePolicy,
         RemoteHost, RemoteMutationPolicy, RemoteProtocol, SecurityPolicy, SettingsDocument,
     };
-    use musheen_local::{DropAction, FileDragPayload};
+    use musheen_local::{DropAction, FileDragPayload, LocalOperationOutcome};
     use std::fs::File;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -667,6 +667,25 @@ mod tests {
             )
             .unwrap();
         settings
+    }
+
+    fn memory_remote_connector(operator: opendal::Operator) -> RemoteStoreConnector {
+        Arc::new(move |provider, _, _| {
+            let operator = operator.clone();
+            Box::pin(async move {
+                let store = Arc::new(
+                    OpendalStore::from_operator(
+                        provider,
+                        RemoteProtocol::Ftp,
+                        operator,
+                        RemoteCasePolicy::Sensitive,
+                        RemoteMutationPolicy::CapabilitiesVerified,
+                    )
+                    .unwrap(),
+                );
+                Ok(remote::RemoteStoreConnection::opendal(store))
+            })
+        })
     }
 
     #[test]
@@ -793,6 +812,220 @@ mod tests {
                 .unwrap()
                 .to_vec(),
             b"remote copy payload"
+        );
+    }
+
+    #[test]
+    fn local_to_remote_move_waits_for_metadata_review_before_removing_source() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let runtime = ProviderRuntime::from_settings_with_connector(
+            &settings,
+            memory_remote_connector(operator.clone()),
+        )
+        .unwrap();
+        let roots = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let local = scratch.path().join("move.txt");
+        std::fs::write(&local, b"move payload").unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+        let id = queue
+            .submit_drop(
+                FileDragPayload::new(
+                    vec![StorePath::from_unix_path(local.clone())],
+                    DropAction::Move,
+                )
+                .unwrap(),
+                roots.items()[0].path().clone(),
+            )
+            .unwrap()[0];
+
+        let outcome = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+        let LocalOperationOutcome::Transfer(musheen_local::TransferOutcome::MetadataReview {
+            review,
+            ..
+        }) = outcome
+        else {
+            panic!("remote move must request metadata review")
+        };
+        assert!(local.exists());
+        assert_eq!(
+            future::block_on(operator.read("move.txt"))
+                .unwrap()
+                .to_vec(),
+            b"move payload"
+        );
+        queue.finish_metadata_review(id, review).unwrap();
+        assert!(queue.can_confirm_metadata_loss(id));
+        queue.confirm_metadata_loss(id).unwrap();
+        queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+        assert!(!local.exists());
+        assert_eq!(
+            future::block_on(operator.read("move.txt"))
+                .unwrap()
+                .to_vec(),
+            b"move payload"
+        );
+    }
+
+    #[test]
+    fn reviewed_remote_move_keeps_source_if_destination_was_replaced() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let runtime = ProviderRuntime::from_settings_with_connector(
+            &settings,
+            memory_remote_connector(operator.clone()),
+        )
+        .unwrap();
+        let roots = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let local = scratch.path().join("guard.txt");
+        std::fs::write(&local, b"original").unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+        let id = queue
+            .submit_drop(
+                FileDragPayload::new(
+                    vec![StorePath::from_unix_path(local.clone())],
+                    DropAction::Move,
+                )
+                .unwrap(),
+                roots.items()[0].path().clone(),
+            )
+            .unwrap()[0];
+        let outcome = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+        let LocalOperationOutcome::Transfer(musheen_local::TransferOutcome::MetadataReview {
+            review,
+            ..
+        }) = outcome
+        else {
+            panic!("remote move must request metadata review")
+        };
+        future::block_on(operator.write("guard.txt", b"interloper".to_vec())).unwrap();
+        queue.finish_metadata_review(id, review).unwrap();
+        queue.confirm_metadata_loss(id).unwrap();
+        let failure = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap_err();
+
+        assert_eq!(
+            failure.disposition(),
+            musheen_local::LocalFailureDisposition::NeedsAttention
+        );
+        assert_eq!(std::fs::read(local).unwrap(), b"original");
+        assert_eq!(
+            future::block_on(operator.read("guard.txt"))
+                .unwrap()
+                .to_vec(),
+            b"interloper"
+        );
+    }
+
+    #[test]
+    fn reviewed_remote_move_keeps_replaced_local_source() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let runtime = ProviderRuntime::from_settings_with_connector(
+            &settings,
+            memory_remote_connector(operator.clone()),
+        )
+        .unwrap();
+        let roots = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let local = scratch.path().join("replaced.txt");
+        std::fs::write(&local, b"original").unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+        let id = queue
+            .submit_drop(
+                FileDragPayload::new(
+                    vec![StorePath::from_unix_path(local.clone())],
+                    DropAction::Move,
+                )
+                .unwrap(),
+                roots.items()[0].path().clone(),
+            )
+            .unwrap()[0];
+        let outcome = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+        let LocalOperationOutcome::Transfer(musheen_local::TransferOutcome::MetadataReview {
+            review,
+            ..
+        }) = outcome
+        else {
+            panic!("remote move must request metadata review")
+        };
+        std::fs::remove_file(&local).unwrap();
+        std::fs::write(&local, b"replacement").unwrap();
+        queue.finish_metadata_review(id, review).unwrap();
+        queue.confirm_metadata_loss(id).unwrap();
+        let failure = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap_err();
+
+        assert_eq!(
+            failure.disposition(),
+            musheen_local::LocalFailureDisposition::NeedsAttention
+        );
+        assert_eq!(std::fs::read(local).unwrap(), b"replacement");
+        assert_eq!(
+            future::block_on(operator.read("replaced.txt"))
+                .unwrap()
+                .to_vec(),
+            b"original"
         );
     }
 

@@ -3,7 +3,7 @@ use crate::{
     CopyProvider, CopyRequest, CopySession, CopyStrategy, EntrySnapshot, FailureKind,
     MetadataReport, OperationFailure, SourceRemovalToken,
 };
-use musheen_core::{CancellationToken, StorePath};
+use musheen_core::{CancellationToken, ItemId, StorePath};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MoveStrategy {
@@ -25,6 +25,7 @@ pub struct MoveMetadataReview {
     destination: StorePath,
     source_snapshot: EntrySnapshot,
     source_removal: SourceRemovalToken,
+    destination_identity: Option<ItemId>,
     copy_strategy: CopyStrategy,
     metadata: MetadataReport,
 }
@@ -44,9 +45,16 @@ impl MoveMetadataReview {
             destination,
             source_snapshot,
             source_removal,
+            destination_identity: None,
             copy_strategy,
             metadata,
         }
+    }
+
+    #[must_use]
+    pub fn with_destination_identity(mut self, identity: ItemId) -> Self {
+        self.destination_identity = Some(identity);
+        self
     }
 
     #[must_use]
@@ -57,6 +65,21 @@ impl MoveMetadataReview {
     #[must_use]
     pub const fn destination(&self) -> &StorePath {
         &self.destination
+    }
+
+    #[must_use]
+    pub const fn destination_identity(&self) -> Option<&ItemId> {
+        self.destination_identity.as_ref()
+    }
+
+    #[must_use]
+    pub const fn source_snapshot(&self) -> &EntrySnapshot {
+        &self.source_snapshot
+    }
+
+    #[must_use]
+    pub const fn source_removal(&self) -> &SourceRemovalToken {
+        &self.source_removal
     }
 
     #[must_use]
