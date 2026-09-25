@@ -48,14 +48,13 @@ impl ContextMenuRequest {
             selection.clear();
         }
         if target == MenuTarget::SidebarLocation
-            && !(context.target == musheen_core::CommandTarget::Sidebar && selection.len() == 1)
+            && context.target == musheen_core::CommandTarget::Sidebar
         {
             // Sidebar locations are navigable directory references, not a
-            // separate filesystem object kind for registry evaluation. The
-            // one exception is a single location the application resolved
-            // to something that does not open as a directory, such as a
-            // link to a file: its target stays Sidebar so the directory
-            // commands are not offered.
+            // separate filesystem object kind for registry evaluation. A
+            // location the application resolved to a file keeps the file
+            // target it was given, so the directory commands are not
+            // offered for it.
             context.target = musheen_core::CommandTarget::Directory;
         }
         context.selection_count = selection.len();
