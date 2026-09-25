@@ -379,6 +379,9 @@ struct LocationFacts {
 
 #[derive(Clone, Debug)]
 struct LocationResolution {
+    /// The sidebar menu the resolution was probed for; a later menu asks
+    /// again, so a place whose target went away is seen as it is now.
+    menu_generation: u64,
     item: Option<StoreItem>,
     /// What a link at the location leads to; `None` for a dangling link.
     link_target: Option<StoreItem>,
@@ -3017,6 +3020,7 @@ fn run_store_probe(
                     .filter(|_| is_link)
                     .and_then(|item| store.resolve_link_target(item.path()).ok().flatten());
                 LocationResolution {
+                    menu_generation: 0,
                     item,
                     dead_link: is_link && link_target.is_none(),
                     link_target,
@@ -3599,6 +3603,9 @@ struct MusheenApp {
     /// How many index merges this window started; tests count batches by it.
     #[cfg(test)]
     index_merges_started: usize,
+    /// Counts the sidebar menus opened; a place's resolution is probed once
+    /// per menu.
+    sidebar_menu_generation: u64,
     /// Executable states by item, answered by background probes.
     executable_facts: HashMap<ItemId, Option<CapabilityState>>,
     /// Location facts by location, answered by background probes.
@@ -4364,6 +4371,7 @@ impl MusheenApp {
             pending_index_events: HashMap::new(),
             #[cfg(test)]
             index_merges_started: 0,
+            sidebar_menu_generation: 0,
             executable_facts: HashMap::new(),
             location_facts: HashMap::new(),
             composing_menu: std::cell::Cell::new(false),
@@ -4505,6 +4513,8 @@ impl MusheenApp {
                 this.update(cx, |state, cx| {
                     if update.model().revision() != state.volume_revision {
                         state.volume_revision = update.model().revision();
+                        // A mount change can change what a location allows.
+                        state.location_facts.clear();
                         state.sync_volume_projection_from(update.model(), cx);
                         cx.notify();
                     }
@@ -4601,6 +4611,8 @@ impl MusheenApp {
     fn start_load_for_tab(&mut self, tab_id: TabId, location: StorePath, cx: &mut Context<Self>) {
         self.pending_directory_restores.remove(&tab_id);
         self.indexed_viewports.remove(&tab_id);
+        // A refresh or a navigation asks the store about the location again.
+        self.location_facts.remove(&location);
         if let Err(error) = self.validate_elevated_location(&location) {
             self.operation_error = Some(localized_privilege_error(&self.catalog, &error));
             cx.notify();
@@ -4809,6 +4821,15 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) -> bool {
         let observed = event.clone();
+        if let WatchEvent::Removed(id) = &event
+            && let Some(path) = self
+                .directories
+                .get(&tab_id)
+                .and_then(|directory| directory.view().item(id))
+                .map(|item| item.path().clone())
+        {
+            self.location_facts.remove(&path);
+        }
         self.forget_store_facts(&event);
         let applied = self
             .directories
@@ -7705,6 +7726,7 @@ impl MusheenApp {
                 .location_facts
                 .get(&location)
                 .and_then(|facts| facts.resolution.as_ref())
+                .filter(|resolution| resolution.menu_generation == self.sidebar_menu_generation)
             {
                 Some(resolution) => (resolution.item.clone(), resolution.dead_link),
                 None => {
@@ -7756,6 +7778,12 @@ impl MusheenApp {
         self.compose_context_request(request)
     }
 
+    /// Marks the start of a new sidebar menu: the place is resolved again
+    /// for it, so a link whose target went away offers nothing.
+    fn begin_sidebar_menu(&mut self) {
+        self.sidebar_menu_generation = self.sidebar_menu_generation.wrapping_add(1);
+    }
+
     /// A directory, or a link the cached resolution says leads to one. A
     /// link the store has not been asked about is probed and read as a file
     /// until the answer arrives.
@@ -7766,6 +7794,7 @@ impl MusheenApp {
                 .location_facts
                 .get(item.path())
                 .and_then(|facts| facts.resolution.as_ref())
+                .filter(|resolution| resolution.menu_generation == self.sidebar_menu_generation)
             {
                 Some(resolution) => resolution
                     .link_target
@@ -7900,25 +7929,34 @@ impl MusheenApp {
     }
 
     fn apply_store_probe_results(&mut self, results: Vec<StoreProbeResult>) {
+        // A full cache starts over once, before the batch, so no answer in
+        // the batch is dropped by a later one.
+        if self.executable_facts.len() >= EXECUTABLE_FACTS_LIMIT {
+            self.executable_facts.clear();
+        }
+        if self.location_facts.len() >= LOCATION_FACTS_LIMIT {
+            self.location_facts.clear();
+        }
         for result in results {
             match result {
                 StoreProbeResult::Executable { id, state } => {
-                    if self.executable_facts.len() >= EXECUTABLE_FACTS_LIMIT {
-                        self.executable_facts.clear();
-                    }
                     self.executable_facts.insert(id, state);
                 }
                 StoreProbeResult::Location { location, facts } => {
                     let facts = *facts;
-                    if self.location_facts.len() >= LOCATION_FACTS_LIMIT {
-                        self.location_facts.clear();
-                    }
-                    // A resolution the new facts lack is kept from the old.
-                    let resolution = facts.resolution.or_else(|| {
-                        self.location_facts
-                            .get(&location)
-                            .and_then(|old| old.resolution.clone())
-                    });
+                    // A resolution belongs to the menu that asked for it; one
+                    // the new facts lack is kept from the old.
+                    let resolution = facts
+                        .resolution
+                        .map(|mut resolution| {
+                            resolution.menu_generation = self.sidebar_menu_generation;
+                            resolution
+                        })
+                        .or_else(|| {
+                            self.location_facts
+                                .get(&location)
+                                .and_then(|old| old.resolution.clone())
+                        });
                     self.location_facts.insert(
                         location,
                         LocationFacts {
@@ -14100,6 +14138,7 @@ impl MusheenApp {
                                                 if !this.context_dialog_windows.is_empty() {
                                                     return;
                                                 }
+                                                this.begin_sidebar_menu();
                                                 let menu = this.sidebar_entry_context_menu(
                                                     sidebar_tab,
                                                     if kind == SidebarSectionKind::Tags {
@@ -30473,5 +30512,58 @@ mod tests {
             });
         })
         .unwrap();
+    }
+
+    // UXF-012 through the caches: a sidebar place is resolved again for each
+    // menu, so a link whose target went away after the first menu offers
+    // nothing on the next one.
+    #[gpui_kit::test]
+    async fn sidebar_place_that_becomes_a_dangling_link_offers_nothing_on_the_next_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, _browser, temporary, location) =
+            open_app_with_external_location(ExternalLocation::LinkToDirectory, cx).await;
+        let compose = |state: &mut MusheenApp| {
+            let tab = state.navigation.focused_tab().id();
+            state.sidebar_entry_context_menu(tab, MenuTarget::SidebarLocation, location.clone(), None)
+        };
+
+        app.update(cx, |state, cx| {
+            state.begin_sidebar_menu();
+            compose(state);
+            assert!(state.run_pending_menu_probes(cx));
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
+            let menu = compose(state);
+            assert!(
+                MusheenApp::menu_entry_by_id(&menu, "directory.open_new_tab")
+                    .is_some_and(|entry| entry.state().is_enabled()),
+                "a live link to a directory offers the directory commands"
+            );
+        });
+
+        filesystem::remove_dir(temporary.path().join("real-external")).unwrap();
+        app.update(cx, |state, cx| {
+            state.begin_sidebar_menu();
+            compose(state);
+            assert!(
+                state.run_pending_menu_probes(cx),
+                "the next menu asks the store about the place again"
+            );
+        });
+        cx.run_until_parked();
+        app.update(cx, |state, _| {
+            let menu = compose(state);
+            for command in [
+                "file.open",
+                "directory.open_new_tab",
+                "directory.open_new_window",
+            ] {
+                let enabled = MusheenApp::menu_entry_by_id(&menu, command)
+                    .is_some_and(|entry| entry.state().is_enabled());
+                assert!(!enabled, "{command} must not be offered on a dangling link");
+            }
+        });
     }
 }
