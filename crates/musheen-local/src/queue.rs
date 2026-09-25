@@ -2314,7 +2314,11 @@ mod tests {
 
         queue.keep_source_after_metadata_review(id).unwrap();
 
-        assert_eq!(queue.state(id), Some(JobState::Cancelled));
+        assert_eq!(
+            queue.state(id),
+            None,
+            "the cancelled job keeps no scheduler record"
+        );
         assert!(!queue.can_confirm_metadata_loss(id));
         assert!(queue.start_ready().unwrap().is_empty());
     }
