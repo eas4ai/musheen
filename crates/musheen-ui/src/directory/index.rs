@@ -1,16 +1,129 @@
 use crate::search::DirectoryFilter;
-use crate::views::{DirectoryViewModel, ViewPreferences};
+use crate::views::{DirectoryViewModel, SelectionMode, ViewPreferences};
 use musheen_core::{DisplayPath, ItemId, ItemKind, StoreItem, StorePath};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::fs::{File, OpenOptions, Permissions};
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use tempfile::{Builder, NamedTempFile, TempDir, TempPath};
 
 const MAGIC: &[u8; 8] = b"MSIDX001";
+/// Every index directory starts with this prefix; the startup sweep looks
+/// only at such entries.
+const INDEX_DIRECTORY_PREFIX: &str = "musheen-directory-";
+/// The file inside an index directory that its owner keeps locked for as
+/// long as the index is in use.
+const INDEX_LOCK_NAME: &str = "lock";
+
+/// The directory that holds every tab's index: `$XDG_CACHE_HOME/musheen/directory-index`,
+/// or `~/.cache/musheen/directory-index` when `XDG_CACHE_HOME` is unset. Without a
+/// usable home the index falls back to the temporary directory.
+pub(crate) fn directory_index_root() -> PathBuf {
+    directory_index_root_from(
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .unwrap_or_else(|| std::env::temp_dir().join("musheen-directory-index"))
+}
+
+/// Resolves the index root from the cache and home variables, following the
+/// XDG base directory rule that a relative `XDG_CACHE_HOME` is ignored.
+pub(crate) fn directory_index_root_from(
+    xdg_cache_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let cache = xdg_cache_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })?;
+    Some(cache.join("musheen").join("directory-index"))
+}
+
+/// Index directories owned by this process, removed by the termination watcher.
+fn live_indexes() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static LIVE: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// Removes every index directory this process still owns. The termination
+/// watcher calls it before the process ends by signal; the owners' own
+/// cleanup never runs on that path.
+pub(crate) fn remove_live_indexes() -> usize {
+    let paths = live_indexes()
+        .lock()
+        .map(|mut live| std::mem::take(&mut *live))
+        .unwrap_or_else(|poisoned| std::mem::take(&mut *poisoned.into_inner()));
+    paths
+        .into_iter()
+        .filter(|path| fs::remove_dir_all(path).is_ok())
+        .count()
+}
+
+/// Removes index directories under `root` whose owner no longer holds the
+/// lock: leftovers of a process that ended without cleanup. An index whose
+/// lock is held stays; it belongs to a running process.
+pub(crate) fn sweep_stale_indexes(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_bytes()
+            .starts_with(INDEX_DIRECTORY_PREFIX.as_bytes())
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let path = entry.path();
+        let lock = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join(INDEX_LOCK_NAME))
+        {
+            Ok(file) => match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => Some(lock),
+                // The owner is alive and holds the lock.
+                Err((_, nix::errno::Errno::EWOULDBLOCK)) => continue,
+                Err((_, errno)) => return Err(io::Error::from(errno)),
+            },
+            // A directory without its lock file never finished being created.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        fs::remove_dir_all(&path)?;
+        drop(lock);
+        removed.push(path);
+    }
+    Ok(removed)
+}
+
+fn lock_index_directory(directory: &Path) -> io::Result<Flock<File>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(directory.join(INDEX_LOCK_NAME))?;
+    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, errno)| io::Error::from(errno))
+}
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const SORT_RUN_ITEMS: usize = 4_096;
 const MERGE_FAN_IN: usize = 32;
@@ -99,7 +212,19 @@ pub(super) struct DiskDirectoryIndex {
     order: Option<SortedOrder>,
     order_preferences: Option<ViewPreferences>,
     id_order: Option<SortedOrder>,
+    /// Held for the life of the index; `lock` drops before `scratch` so the
+    /// directory is removed after the lock is released.
+    _lock: Flock<File>,
     scratch: TempDir,
+}
+
+impl Drop for DiskDirectoryIndex {
+    fn drop(&mut self) {
+        live_indexes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(self.scratch.path());
+    }
 }
 
 #[derive(Debug)]
@@ -153,6 +278,31 @@ impl IndexedSelection {
             self.count += 1;
         }
         Ok(())
+    }
+
+    /// Removes one arrival; returns whether it was selected.
+    fn remove(&mut self, arrival: u64) -> bool {
+        let Some(ordinal) = usize::try_from(arrival).ok() else {
+            return false;
+        };
+        let Some(word) = self.bits.get_mut(ordinal / 64) else {
+            return false;
+        };
+        let mask = 1u64 << (ordinal % 64);
+        if *word & mask == 0 {
+            return false;
+        }
+        *word &= !mask;
+        self.count -= 1;
+        true
+    }
+
+    fn toggle(&mut self, arrival: u64) -> io::Result<()> {
+        if self.remove(arrival) {
+            Ok(())
+        } else {
+            self.insert(arrival)
+        }
     }
 
     pub(crate) fn contains(&self, arrival: u64) -> bool {
@@ -226,11 +376,16 @@ enum OrderPolicy<'a> {
 }
 
 impl DiskDirectoryIndex {
-    pub(super) fn new() -> io::Result<Self> {
+    /// Creates an index directory under `root`, creating `root` when needed.
+    /// The directory holds a lock file this process keeps locked, so a later
+    /// process can tell a live index from one left behind.
+    pub(super) fn new_in(root: &Path) -> io::Result<Self> {
+        DirBuilder::new().recursive(true).mode(0o700).create(root)?;
         let scratch = Builder::new()
-            .prefix("musheen-directory-")
+            .prefix(INDEX_DIRECTORY_PREFIX)
             .permissions(Permissions::from_mode(0o700))
-            .tempdir()?;
+            .tempdir_in(root)?;
+        let lock = lock_index_directory(scratch.path())?;
         let mut records = OpenOptions::new()
             .read(true)
             .write(true)
@@ -244,6 +399,10 @@ impl DiskDirectoryIndex {
             .create_new(true)
             .mode(0o600)
             .open(scratch.path().join("offsets"))?;
+        live_indexes()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(scratch.path().to_path_buf());
         Ok(Self {
             records,
             offsets,
@@ -251,8 +410,14 @@ impl DiskDirectoryIndex {
             order: None,
             order_preferences: None,
             id_order: None,
+            _lock: lock,
             scratch,
         })
+    }
+
+    /// The directory that holds this index's files.
+    pub(super) fn path(&self) -> &Path {
+        self.scratch.path()
     }
 
     pub(super) fn append(&mut self, item: &StoreItem, arrival: u64) -> io::Result<u64> {
@@ -586,6 +751,90 @@ impl DiskDirectoryIndex {
         Ok(selection)
     }
 
+    /// Toggles `id` in a selection: the bitmap when one exists, else a bitmap
+    /// built from the in-memory `base_ids`. `None` when `id` is not indexed.
+    pub(super) fn toggle_selection(
+        &mut self,
+        base: Option<IndexedSelection>,
+        base_ids: &[ItemId],
+        id: &ItemId,
+    ) -> io::Result<Option<IndexedSelection>> {
+        let Some((_, arrival)) = self.lookup_id_with_arrival(id)? else {
+            return Ok(None);
+        };
+        let mut selection = match base {
+            Some(selection) => selection,
+            None => {
+                let mut selection = IndexedSelection::new(self.record_count)?;
+                for base_id in base_ids {
+                    if let Some((_, base_arrival)) = self.lookup_id_with_arrival(base_id)? {
+                        selection.insert(base_arrival)?;
+                    }
+                }
+                selection
+            }
+        };
+        selection.toggle(arrival)?;
+        Ok(Some(selection))
+    }
+
+    /// The selection a rubber band over `positions` (rows of the visible
+    /// order) produces from the selection at the gesture start: replaced,
+    /// added to, or toggled, as `mode` says.
+    pub(super) fn rubber_band_selection(
+        &mut self,
+        base: Option<IndexedSelection>,
+        base_ids: &[ItemId],
+        positions: &[usize],
+        mode: SelectionMode,
+    ) -> io::Result<IndexedSelection> {
+        let covered = self.arrivals_at_positions(positions)?;
+        let mut selection = match (mode, base) {
+            (SelectionMode::Replace, _) => IndexedSelection::new(self.record_count)?,
+            (_, Some(base)) => base,
+            (_, None) => {
+                let mut selection = IndexedSelection::new(self.record_count)?;
+                for base_id in base_ids {
+                    if let Some((_, arrival)) = self.lookup_id_with_arrival(base_id)? {
+                        selection.insert(arrival)?;
+                    }
+                }
+                selection
+            }
+        };
+        for arrival in covered {
+            match mode {
+                SelectionMode::Replace | SelectionMode::Add => selection.insert(arrival)?,
+                SelectionMode::Toggle => selection.toggle(arrival)?,
+            }
+        }
+        Ok(selection)
+    }
+
+    fn arrivals_at_positions(&mut self, positions: &[usize]) -> io::Result<Vec<u64>> {
+        let order = self.order.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
+        })?;
+        let mut arrivals = Vec::with_capacity(positions.len());
+        for &position in positions {
+            if position >= order.len {
+                continue;
+            }
+            let byte_offset = u64::try_from(position)
+                .ok()
+                .and_then(|value| value.checked_mul(8))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "range offset overflow")
+                })?;
+            order.file.seek(SeekFrom::Start(byte_offset))?;
+            let offset = read_next_offset(&mut order.file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "directory order is truncated")
+            })?;
+            arrivals.push(Self::read_index_record(&mut self.records, offset)?.arrival);
+        }
+        Ok(arrivals)
+    }
+
     pub(super) fn resolve_bitmap(
         &mut self,
         selection: &IndexedSelection,
@@ -753,7 +1002,10 @@ fn read_next_offset(reader: &mut impl Read) -> io::Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::DiskDirectoryIndex;
+    use super::{
+        DiskDirectoryIndex, INDEX_DIRECTORY_PREFIX, INDEX_LOCK_NAME, directory_index_root_from,
+        lock_index_directory, sweep_stale_indexes,
+    };
     use crate::search::DirectoryFilter;
     use crate::views::{SortDirection, SortKey, ViewPreferences};
     use musheen_core::{DisplayPath, ItemId, ItemKind, ProviderId, StoreItem, StorePath};
@@ -774,7 +1026,8 @@ mod tests {
     #[test]
     fn record_round_trip_preserves_non_utf8_path() {
         let original = item(StorePath::from_unix_bytes(b"/tmp/name-\xff".to_vec()));
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
 
         let offset = index.append(&original, 7).unwrap();
         let (decoded, arrival) = index.read(offset).unwrap();
@@ -789,7 +1042,8 @@ mod tests {
         let provider = ProviderId::new("remote").unwrap();
         let path = StorePath::from_provider_key(provider, b"opaque-\xff".to_vec()).unwrap();
         let original = item(path);
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
 
         let offset = index.append(&original, 19).unwrap();
         let (decoded, arrival) = index.read(offset).unwrap();
@@ -800,7 +1054,8 @@ mod tests {
 
     #[test]
     fn truncated_record_is_rejected() {
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let offset = index
             .append(&item(StorePath::from_unix_path("/tmp/item")), 1)
             .unwrap();
@@ -811,7 +1066,8 @@ mod tests {
 
     #[test]
     fn failed_offset_write_rolls_back_record_append() {
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let original = item(StorePath::from_unix_path("/tmp/item"));
         index.append(&original, 0).unwrap();
         let records_len = index.records.metadata().unwrap().len();
@@ -832,7 +1088,8 @@ mod tests {
 
     #[test]
     fn failed_record_write_keeps_existing_index() {
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let original = item(StorePath::from_unix_path("/tmp/item"));
         index.append(&original, 0).unwrap();
         let records_len = index.records.metadata().unwrap().len();
@@ -855,7 +1112,8 @@ mod tests {
 
     #[test]
     fn full_device_append_preserves_last_published_order() {
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let original = item(StorePath::from_unix_path("/tmp/item"));
         index.append(&original, 0).unwrap();
         index
@@ -881,7 +1139,8 @@ mod tests {
 
     #[test]
     fn corrupt_new_record_cannot_replace_last_valid_order() {
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let original = item(StorePath::from_unix_path("/tmp/original"));
         index.append(&original, 0).unwrap();
         index
@@ -904,7 +1163,8 @@ mod tests {
 
     #[test]
     fn private_record_directory_is_removed_on_drop() {
-        let index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let path = index.scratch.path().to_path_buf();
         assert!(path.is_dir());
         for entry in [&path, &path.join("records"), &path.join("offsets")] {
@@ -924,7 +1184,8 @@ mod tests {
     #[test]
     fn external_order_supports_random_ranges() {
         let provider = ProviderId::new("local").unwrap();
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         for number in (0u64..8_200).rev() {
             let name = format!("item-{number}");
             let item = StoreItem::new(
@@ -962,7 +1223,8 @@ mod tests {
     #[test]
     fn identity_lookup_reaches_offscreen_records() {
         let provider = ProviderId::new("local").unwrap();
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         for number in 0u64..8_200 {
             let item = StoreItem::new(
                 ItemId::new(provider.clone(), number.to_be_bytes().to_vec()).unwrap(),
@@ -993,7 +1255,8 @@ mod tests {
     #[test]
     fn visible_range_selection_uses_arrival_bits_and_excludes_new_arrivals() {
         let provider = ProviderId::new("local").unwrap();
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         for (number, name) in [(0u64, "c"), (1, ".hidden"), (2, "a"), (3, "b")] {
             let entry = StoreItem::new(
                 ItemId::new(provider.clone(), number.to_be_bytes()).unwrap(),
@@ -1049,7 +1312,8 @@ mod tests {
 
     #[test]
     fn later_record_replaces_same_identity_in_visible_order_and_lookup() {
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let old = item(StorePath::from_unix_bytes(b"/many/old-\xff".to_vec()));
         let replacement = item(StorePath::from_unix_bytes(b"/many/new-\xff".to_vec()));
         index.append(&old, 0).unwrap();
@@ -1068,7 +1332,8 @@ mod tests {
 
     #[test]
     fn removal_tombstone_hides_identity_until_a_later_create() {
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         let original = item(StorePath::from_unix_path("/many/original"));
         let recreated = item(StorePath::from_unix_path("/many/recreated"));
         index.append(&original, 0).unwrap();
@@ -1090,7 +1355,8 @@ mod tests {
     #[test]
     fn external_order_matches_view_sort_hidden_and_filter_rules() {
         let provider = ProviderId::new("local").unwrap();
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         for (number, name, kind, size) in [
             (0, "item-10", ItemKind::RegularFile, Some(10)),
             (1, "item-2", ItemKind::RegularFile, Some(2)),
@@ -1198,7 +1464,8 @@ mod tests {
     #[ignore = "resource-intensive million-item index verification"]
     fn external_order_supports_one_million_records() {
         let provider = ProviderId::new("local").unwrap();
-        let mut index = DiskDirectoryIndex::new().unwrap();
+        let index_root = tempfile::tempdir().unwrap();
+        let mut index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
         for number in (0u64..1_000_000).rev() {
             let name = format!("item-{number}");
             let item = StoreItem::new(
@@ -1227,5 +1494,96 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn indexed_folder_root_prefers_xdg_cache_home() {
+        let root = directory_index_root_from(
+            Some(std::ffi::OsStr::new("/var/cache/me")),
+            Some(std::ffi::OsStr::new("/home/me")),
+        );
+        assert_eq!(
+            root.as_deref(),
+            Some(std::path::Path::new(
+                "/var/cache/me/musheen/directory-index"
+            ))
+        );
+    }
+
+    #[test]
+    fn indexed_folder_root_ignores_a_relative_or_empty_xdg_cache_home() {
+        for cache in ["relative/cache", ""] {
+            let root = directory_index_root_from(
+                Some(std::ffi::OsStr::new(cache)),
+                Some(std::ffi::OsStr::new("/home/me")),
+            );
+            assert_eq!(
+                root.as_deref(),
+                Some(std::path::Path::new(
+                    "/home/me/.cache/musheen/directory-index"
+                )),
+                "XDG_CACHE_HOME={cache:?} falls back to the home cache"
+            );
+        }
+        assert_eq!(directory_index_root_from(None, None), None);
+    }
+
+    #[test]
+    fn indexed_folder_index_lives_under_its_root_and_holds_the_lock() {
+        let index_root = tempfile::tempdir().unwrap();
+        let index = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
+
+        let path = index.path().to_path_buf();
+        assert_eq!(path.parent(), Some(index_root.path()));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(INDEX_DIRECTORY_PREFIX)
+        );
+        assert!(
+            lock_index_directory(&path).is_err(),
+            "a second lock on a live index is refused"
+        );
+        assert_eq!(
+            sweep_stale_indexes(index_root.path()).unwrap(),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert!(path.is_dir(), "the sweep keeps a live index");
+
+        drop(index);
+        assert!(!path.exists(), "dropping the index removes its directory");
+    }
+
+    #[test]
+    fn indexed_folder_stale_indexes_are_removed_at_startup() {
+        let index_root = tempfile::tempdir().unwrap();
+        let stale = index_root.path().join("musheen-directory-stale");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join(INDEX_LOCK_NAME), b"").unwrap();
+        std::fs::write(stale.join("records"), b"leftover").unwrap();
+        let unfinished = index_root.path().join("musheen-directory-unfinished");
+        std::fs::create_dir(&unfinished).unwrap();
+        let live = DiskDirectoryIndex::new_in(index_root.path()).unwrap();
+        let unrelated = index_root.path().join("other-cache-entry");
+        std::fs::create_dir(&unrelated).unwrap();
+
+        let mut removed = sweep_stale_indexes(index_root.path()).unwrap();
+        removed.sort();
+
+        assert_eq!(removed, vec![stale.clone(), unfinished.clone()]);
+        assert!(!stale.exists());
+        assert!(!unfinished.exists());
+        assert!(live.path().is_dir(), "the running process keeps its index");
+        assert!(
+            unrelated.is_dir(),
+            "entries without the index prefix are left alone"
+        );
+        assert!(
+            sweep_stale_indexes(&index_root.path().join("missing"))
+                .unwrap()
+                .is_empty(),
+            "a missing root has nothing to sweep"
+        );
     }
 }
