@@ -365,6 +365,87 @@ struct DeferredIndexedContextMenu {
     selection_epoch: u64,
 }
 
+/// What a context menu takes from the store about a location: what the
+/// filesystem can do, whether it is writable and, for a sidebar place, the
+/// item at the location. Probed off the UI thread and kept until the
+/// location changes.
+#[derive(Clone, Debug)]
+struct LocationFacts {
+    capabilities: musheen_core::CapabilityMatrix,
+    writable: CapabilityState,
+    /// The item at the location, once a sidebar menu asked for it.
+    resolution: Option<LocationResolution>,
+}
+
+#[derive(Clone, Debug)]
+struct LocationResolution {
+    item: Option<StoreItem>,
+    /// The item is a link whose target is gone.
+    dead_link: bool,
+}
+
+/// One question a menu could not answer from the caches.
+#[derive(Clone, Debug, PartialEq)]
+enum StoreProbe {
+    Executable { id: ItemId, path: StorePath },
+    Location { location: StorePath, resolve: bool },
+}
+
+/// The store's answer to a probe, applied to the caches on the UI thread.
+enum StoreProbeResult {
+    Executable {
+        id: ItemId,
+        state: Option<CapabilityState>,
+    },
+    Location {
+        location: StorePath,
+        facts: LocationFacts,
+    },
+}
+
+/// How to compose a menu again once its probes have answered.
+#[derive(Clone)]
+enum MenuRecompose {
+    Request {
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        selection: Vec<CommandTargetRef>,
+        resolved_item: Option<StoreItem>,
+    },
+    Sidebar {
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        identity: Option<ItemId>,
+    },
+}
+
+impl MenuRecompose {
+    fn target(&self) -> MenuTarget {
+        match self {
+            Self::Request { target, .. } | Self::Sidebar { target, .. } => *target,
+        }
+    }
+}
+
+/// The probes a menu composition queued, and how to compose it again.
+struct PendingMenuProbe {
+    probes: Vec<StoreProbe>,
+    recompose: MenuRecompose,
+}
+
+/// The most executable states and location facts the caches keep; both
+/// start over when full.
+const EXECUTABLE_FACTS_LIMIT: usize = 4_096;
+const LOCATION_FACTS_LIMIT: usize = 1_024;
+
+/// What a watch event tells the catalog about an item.
+enum CatalogObservation {
+    Present(ItemId, StorePath),
+    Missing(ItemId),
+}
+
 #[derive(Clone, Copy)]
 enum IndexedContextSource {
     Pointer,
@@ -2840,6 +2921,72 @@ fn install_native_theme(cx: &mut App) {
     crate::theme::runtime::install(cx);
 }
 
+/// Resolves every target at the store and refuses one that is gone or was
+/// replaced. Runs on a background thread.
+fn resolve_targets(
+    store: &dyn Store,
+    targets: &[CommandTargetRef],
+    verification: &str,
+    changed: &str,
+) -> Result<Vec<StoreItem>, Box<str>> {
+    let mut items = Vec::with_capacity(targets.len());
+    for target in targets {
+        let current = store
+            .resolve_item(target.path())
+            .map_err(|error| Box::<str>::from(format!("{verification}: {error}")))?;
+        match current {
+            Some(item) if item.id() == target.id() && item.path() == target.path() => {
+                items.push(item);
+            }
+            _ => return Err(Box::<str>::from(changed)),
+        }
+    }
+    Ok(items)
+}
+
+/// Asks the store one of a menu's questions. Runs on a background thread.
+fn run_store_probe(
+    store: &dyn Store,
+    probe: StoreProbe,
+    writable_failure_prefix: &str,
+) -> StoreProbeResult {
+    match probe {
+        StoreProbe::Executable { id, path } => StoreProbeResult::Executable {
+            id,
+            state: store.executable_state(&path).ok(),
+        },
+        StoreProbe::Location { location, resolve } => {
+            let capabilities = store.capabilities(&location);
+            let writable = store.location_writable(&location).unwrap_or_else(|error| {
+                CapabilityState::Unknown(
+                    CapabilityReason::new(format!("{writable_failure_prefix}: {error}"))
+                        .expect("the writable-location failure is visible"),
+                )
+            });
+            let resolution = resolve.then(|| {
+                let item = store.resolve_item(&location).ok().flatten();
+                let dead_link = item.as_ref().is_some_and(|item| {
+                    item.kind() == ItemKind::SymbolicLink
+                        && store
+                            .resolve_link_target(item.path())
+                            .ok()
+                            .flatten()
+                            .is_none()
+                });
+                LocationResolution { item, dead_link }
+            });
+            StoreProbeResult::Location {
+                location,
+                facts: LocationFacts {
+                    capabilities,
+                    writable,
+                    resolution,
+                },
+            }
+        }
+    }
+}
+
 /// Installs both Adwaita presets when the system theme cannot be read. The
 /// bridge keeps the variant applied last as the current mode, so the
 /// variant the window prefers goes last.
@@ -3396,6 +3543,14 @@ struct MusheenApp {
     pending_directory_restores: HashMap<TabId, PendingDirectoryRestore>,
     pending_context_menu: Option<ContextMenu>,
     pending_indexed_context_menu: Option<DeferredIndexedContextMenu>,
+    /// Executable states by item, answered by background probes.
+    executable_facts: HashMap<ItemId, Option<CapabilityState>>,
+    /// Location facts by location, answered by background probes.
+    location_facts: HashMap<StorePath, LocationFacts>,
+    /// The probes the last menu composition could not answer from the caches.
+    pending_store_probes: std::cell::RefCell<Vec<StoreProbe>>,
+    /// How to compose the last menu again once its probes answer.
+    pending_menu_recompose: std::cell::RefCell<Option<MenuRecompose>>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
     /// Dialog windows are tracked by their GPUI identity. The close observer
     /// clears only its own immutable pending workflow; opening a second review
@@ -4139,6 +4294,10 @@ impl MusheenApp {
             pending_directory_restores: HashMap::new(),
             pending_context_menu: None,
             pending_indexed_context_menu: None,
+            executable_facts: HashMap::new(),
+            location_facts: HashMap::new(),
+            pending_store_probes: std::cell::RefCell::new(Vec::new()),
+            pending_menu_recompose: std::cell::RefCell::new(None),
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
             context_dialog_close_subscription: None,
@@ -4576,31 +4735,53 @@ impl MusheenApp {
         tab_id: TabId,
         load: &DirectoryLoad,
         event: WatchEvent,
+        cx: &mut Context<Self>,
     ) -> bool {
         let observed = event.clone();
+        self.forget_store_facts(&event);
         let applied = self
             .directories
             .get_mut(&tab_id)
             .is_some_and(|directory| directory.apply_watch_event(load, event));
         if applied {
-            self.observe_watch_event(observed);
+            self.observe_watch_event(observed, cx);
         }
         applied
     }
 
-    fn observe_watch_event(&mut self, event: WatchEvent) {
-        let result = match event {
+    /// Tells the catalog what a watch event showed, off the UI thread: the
+    /// catalog update takes the catalog file's lock, which another process
+    /// may hold.
+    fn observe_watch_event(&mut self, event: WatchEvent, cx: &mut Context<Self>) {
+        let observation = match event {
             WatchEvent::Created(item)
             | WatchEvent::Changed(item)
-            | WatchEvent::Renamed { item, .. } => self
-                .catalog_binding
-                .observe_present(item.id(), item.path().clone()),
-            WatchEvent::Removed(item) => self.catalog_binding.observe_missing(&item),
-            WatchEvent::Invalidated { .. } => Ok(()),
+            | WatchEvent::Renamed { item, .. } => {
+                CatalogObservation::Present(item.id().clone(), item.path().clone())
+            }
+            WatchEvent::Removed(item) => CatalogObservation::Missing(item),
+            WatchEvent::Invalidated { .. } => return,
         };
-        if let Err(error) = result {
-            self.operation_error = Some(error);
-        }
+        let binding = self.catalog_binding.clone();
+        let work = cx.background_spawn(async move {
+            match observation {
+                CatalogObservation::Present(id, path) => binding.observe_present(&id, path),
+                CatalogObservation::Missing(id) => binding.observe_missing(&id),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            if let Err(error) = result {
+                this.update(cx, |state, cx| {
+                    state.operation_error = Some(error);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn handle_watch_event(
@@ -4636,7 +4817,8 @@ impl MusheenApp {
                         return;
                     }
                     if succeeded {
-                        state.observe_watch_event(event);
+                        state.forget_store_facts(&event);
+                        state.observe_watch_event(event, cx);
                         state.indexed_viewports.remove(&tab_id);
                     }
                     state.continue_watch(tab_id, load, watcher, cx);
@@ -4647,7 +4829,7 @@ impl MusheenApp {
             return;
         }
         let invalidated = matches!(event, WatchEvent::Invalidated { .. });
-        if self.apply_watch_event(tab_id, &load, event) {
+        if self.apply_watch_event(tab_id, &load, event, cx) {
             if invalidated {
                 self.start_load_for_tab(tab_id, load.location().clone(), cx);
             } else {
@@ -4821,6 +5003,7 @@ impl MusheenApp {
         } else {
             page_items
         };
+        self.prefetch_location_facts(load.location().clone(), cx);
         self.remember_folder_location(load.location());
         self.apply_pending_file_manager_selection(tab_id, cx);
         self.advance_directory_restore(tab_id, cx);
@@ -7158,6 +7341,10 @@ impl MusheenApp {
                         .with_send_to(&send_to)
                         .with_open_with(&open_with),
                 );
+                if let Some(pending) = state.take_pending_menu_probe() {
+                    state.start_menu_probe(pending, popup, window, path, cx);
+                    return;
+                }
                 let live = custom_actions::LiveActionPopup {
                     popup,
                     window,
@@ -7245,6 +7432,7 @@ impl MusheenApp {
                     })
             })
         };
+        let mut probe = None;
         let menu = if deferred.is_none() {
             let prepared = self.shell.context_menus().prepare_keyboard_target(focused);
             let menu_target = if prepared.selection().is_empty() {
@@ -7255,11 +7443,13 @@ impl MusheenApp {
                 MenuTarget::Item
             };
             self.refresh_application_snapshot(prepared.selection(), cx);
-            Some(self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec()))
+            let menu = self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec());
+            probe = self.take_pending_menu_probe();
+            probe.is_none().then_some(menu)
         } else {
             None
         };
-        let loading_label = deferred.as_ref().map(|_| {
+        let loading_label = (deferred.is_some() || probe.is_some()).then(|| {
             self.catalog
                 .message("context-menu-loading")
                 .expect("selection loading status is localized")
@@ -7285,6 +7475,14 @@ impl MusheenApp {
         if let Some(deferred) = deferred {
             self.start_indexed_context_menu(
                 deferred,
+                popup.downgrade(),
+                window.window_handle(),
+                format!("keyboard-{tab_id:?}"),
+                cx,
+            );
+        } else if let Some(pending) = probe {
+            self.start_menu_probe(
+                pending,
                 popup.downgrade(),
                 window.window_handle(),
                 format!("keyboard-{tab_id:?}"),
@@ -7319,32 +7517,36 @@ impl MusheenApp {
         // whose target is gone offers nothing to open, so the menu is
         // composed without a selection and no open command is enabled.
         // Tags, mounts and other entries keep their identity-based target.
-        let resolved = if target == MenuTarget::SidebarLocation {
-            self.store.resolve_item(&location).ok().flatten()
+        // The store answers off the UI thread; until it has, the place is
+        // composed from its identity alone and the menu is composed again.
+        let (resolved, dead_link) = if target == MenuTarget::SidebarLocation {
+            match self
+                .location_facts
+                .get(&location)
+                .and_then(|facts| facts.resolution.as_ref())
+            {
+                Some(resolution) => (resolution.item.clone(), resolution.dead_link),
+                None => {
+                    self.queue_store_probe(StoreProbe::Location {
+                        location: location.clone(),
+                        resolve: true,
+                    });
+                    (None, false)
+                }
+            }
         } else {
-            None
+            (None, false)
         };
-        let dead_link = resolved.as_ref().is_some_and(|item| {
-            item.kind() == ItemKind::SymbolicLink
-                && self
-                    .store
-                    .resolve_link_target(item.path())
-                    .ok()
-                    .flatten()
-                    .is_none()
-        });
         let selection = if dead_link {
             Vec::new()
         } else {
             identity
+                .clone()
                 .and_then(|item| CommandTargetRef::new(item, location.clone()).ok())
                 .or_else(|| {
-                    resolved
-                        .clone()
-                        .or_else(|| self.store.resolve_item(&location).ok().flatten())
-                        .and_then(|item| {
-                            CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
-                        })
+                    resolved.as_ref().and_then(|item| {
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                    })
                 })
                 .into_iter()
                 .collect()
@@ -7352,10 +7554,234 @@ impl MusheenApp {
         let send_to = self.send_to_destinations(tab_id);
         let open_with = self.open_with_applications(&selection);
         let request = self
-            .context_menu_request_with_item(tab_id, target, location, selection, resolved.as_ref())
+            .context_menu_request_with_item(
+                tab_id,
+                target,
+                location.clone(),
+                selection,
+                resolved.as_ref(),
+            )
             .with_send_to(&send_to)
             .with_open_with(&open_with);
+        *self.pending_menu_recompose.borrow_mut() = Some(MenuRecompose::Sidebar {
+            tab_id,
+            target,
+            location,
+            identity,
+        });
         self.compose_context_request(request)
+    }
+
+    /// The reason a menu shows for a fact the store has not answered yet.
+    fn checking_store_reason(&self) -> CapabilityReason {
+        CapabilityReason::new(
+            self.catalog
+                .message("context-menu-loading")
+                .expect("selection loading status is localized"),
+        )
+        .expect("the loading reason is visible")
+    }
+
+    fn queue_store_probe(&self, probe: StoreProbe) {
+        let mut probes = self.pending_store_probes.borrow_mut();
+        if !probes.contains(&probe) {
+            probes.push(probe);
+        }
+    }
+
+    /// The probes the last composition queued, with how to compose it
+    /// again, or `None` when the caches answered everything.
+    fn take_pending_menu_probe(&mut self) -> Option<PendingMenuProbe> {
+        let probes = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
+        let recompose = self.pending_menu_recompose.borrow_mut().take();
+        if probes.is_empty() {
+            return None;
+        }
+        recompose.map(|recompose| PendingMenuProbe { probes, recompose })
+    }
+
+    fn spawn_store_probes(
+        &self,
+        probes: Vec<StoreProbe>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Task<Vec<StoreProbeResult>> {
+        let store = Arc::clone(&self.store);
+        let failure_prefix = self
+            .catalog
+            .message("context.directory-verification")
+            .expect("directory refusal is localized")
+            .to_string();
+        cx.background_spawn(async move {
+            probes
+                .into_iter()
+                .map(|probe| run_store_probe(&*store, probe, &failure_prefix))
+                .collect()
+        })
+    }
+
+    fn apply_store_probe_results(&mut self, results: Vec<StoreProbeResult>) {
+        for result in results {
+            match result {
+                StoreProbeResult::Executable { id, state } => {
+                    if self.executable_facts.len() >= EXECUTABLE_FACTS_LIMIT {
+                        self.executable_facts.clear();
+                    }
+                    self.executable_facts.insert(id, state);
+                }
+                StoreProbeResult::Location { location, facts } => {
+                    if self.location_facts.len() >= LOCATION_FACTS_LIMIT {
+                        self.location_facts.clear();
+                    }
+                    // A resolution the new facts lack is kept from the old.
+                    let resolution = facts.resolution.or_else(|| {
+                        self.location_facts
+                            .get(&location)
+                            .and_then(|old| old.resolution.clone())
+                    });
+                    self.location_facts.insert(
+                        location,
+                        LocationFacts {
+                            resolution,
+                            ..facts
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drops the cached facts a watch event made stale.
+    fn forget_store_facts(&mut self, event: &WatchEvent) {
+        match event {
+            WatchEvent::Changed(item) | WatchEvent::Renamed { item, .. } => {
+                self.executable_facts.remove(item.id());
+                self.location_facts.remove(item.path());
+            }
+            WatchEvent::Removed(id) => {
+                self.executable_facts.remove(id);
+            }
+            WatchEvent::Created(_) => {}
+            WatchEvent::Invalidated { .. } => {
+                self.executable_facts.clear();
+                self.location_facts.clear();
+            }
+        }
+    }
+
+    /// Asks the store about a location before a menu needs it, so the first
+    /// menu in a folder composes from the caches.
+    fn prefetch_location_facts(&mut self, location: StorePath, cx: &mut Context<Self>) {
+        if self.location_facts.contains_key(&location) {
+            return;
+        }
+        let work = self.spawn_store_probes(
+            vec![StoreProbe::Location {
+                location,
+                resolve: false,
+            }],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let results = work.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |state, _| state.apply_store_probe_results(results));
+            }
+        })
+        .detach();
+    }
+
+    /// Runs the probes the last composition queued, for a caller that holds
+    /// no popup to rebuild. Returns whether there were any.
+    #[cfg(test)]
+    fn run_pending_menu_probes(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pending) = self.take_pending_menu_probe() else {
+            return false;
+        };
+        let work = self.spawn_store_probes(pending.probes, cx);
+        cx.spawn(async move |this, cx| {
+            let results = work.await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |state, _| state.apply_store_probe_results(results));
+            }
+        })
+        .detach();
+        true
+    }
+
+    fn compose_from_recompose(&self, recompose: &MenuRecompose) -> ContextMenu {
+        match recompose {
+            MenuRecompose::Request {
+                tab_id,
+                target,
+                location,
+                selection,
+                resolved_item,
+            } => {
+                let send_to = self.send_to_destinations(*tab_id);
+                let open_with = self.open_with_applications(selection);
+                let request = self
+                    .context_menu_request_with_item(
+                        *tab_id,
+                        *target,
+                        location.clone(),
+                        selection.clone(),
+                        resolved_item.as_ref(),
+                    )
+                    .with_send_to(&send_to)
+                    .with_open_with(&open_with);
+                self.compose_context_request(request)
+            }
+            MenuRecompose::Sidebar {
+                tab_id,
+                target,
+                location,
+                identity,
+            } => self.sidebar_entry_context_menu(*tab_id, *target, location.clone(), identity.clone()),
+        }
+    }
+
+    /// Answers a menu's probes off the UI thread, then composes the menu
+    /// again from the caches and rebuilds the popup with it.
+    fn start_menu_probe(
+        &mut self,
+        pending: PendingMenuProbe,
+        popup: WeakEntity<PopupMenu>,
+        window: AnyWindowHandle,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        let work = self.spawn_store_probes(pending.probes, cx);
+        let recompose = pending.recompose;
+        cx.spawn(async move |this, cx| {
+            let results = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.apply_store_probe_results(results);
+                if popup.upgrade().is_none() {
+                    return;
+                }
+                let menu = state.compose_from_recompose(&recompose);
+                // The caches answer now; a probe queued again is not run.
+                let _ = state.take_pending_menu_probe();
+                let live = custom_actions::LiveActionPopup {
+                    popup,
+                    window,
+                    menu: menu.clone(),
+                    path,
+                    projection: Vec::new(),
+                    target: recompose.target(),
+                };
+                state
+                    .live_application_popups
+                    .retain(|popup| popup.popup.upgrade().is_some());
+                state.live_application_popups.push(live.clone());
+                live.rebuild(menu, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn compose_context_menu(
@@ -7410,6 +7836,13 @@ impl MusheenApp {
         } else {
             self.context_for_menu(tab_id, target, &location, &selection)
         };
+        *self.pending_menu_recompose.borrow_mut() = Some(MenuRecompose::Request {
+            tab_id,
+            target,
+            location: location.clone(),
+            selection: selection.clone(),
+            resolved_item: resolved_item.cloned(),
+        });
         let trash_contents = if target == MenuTarget::TrashBackground {
             selection.clone()
         } else {
@@ -7760,11 +8193,20 @@ impl MusheenApp {
                     })
                 })
         });
-        let executable_state = selected_item.and_then(|item| {
-            (item.kind() == ItemKind::RegularFile)
-                .then(|| self.store.executable_state(item.path()).ok())
-                .flatten()
-        });
+        // The store is asked off the UI thread: a fact the caches hold is
+        // used at once; a missing one is probed and the menu composed again.
+        let executable_state = selected_item
+            .filter(|item| item.kind() == ItemKind::RegularFile)
+            .and_then(|item| match self.executable_facts.get(item.id()) {
+                Some(state) => state.clone(),
+                None => {
+                    self.queue_store_probe(StoreProbe::Executable {
+                        id: item.id().clone(),
+                        path: item.path().clone(),
+                    });
+                    None
+                }
+            });
         let selected_is_pinned = selection.first().is_some_and(|selected| {
             self.catalog_binding
                 .snapshot()
@@ -7827,22 +8269,23 @@ impl MusheenApp {
         } else {
             location.clone()
         };
-        let capabilities = self.store.capabilities(&command_location);
-        let is_local = command_location.as_unix_path().is_some();
-        let writable_state = self
-            .store
-            .location_writable(&command_location)
-            .unwrap_or_else(|error| {
-                CapabilityState::Unknown(
-                    CapabilityReason::new(format!(
-                        "{}: {error}",
-                        self.catalog
-                            .message("context.directory-verification")
-                            .expect("directory refusal is localized")
-                    ))
-                    .expect("the writable-location failure is visible"),
+        let (capabilities, writable_state) = match self.location_facts.get(&command_location) {
+            Some(facts) => (facts.capabilities.clone(), facts.writable.clone()),
+            None => {
+                self.queue_store_probe(StoreProbe::Location {
+                    location: command_location.clone(),
+                    resolve: false,
+                });
+                let checking = self.checking_store_reason();
+                (
+                    musheen_core::CapabilityMatrix::new(|_| {
+                        CapabilityState::Unknown(checking.clone())
+                    }),
+                    CapabilityState::Unknown(checking),
                 )
-            });
+            }
+        };
+        let is_local = command_location.as_unix_path().is_some();
         let writable = matches!(writable_state, CapabilityState::Supported);
         let writable_reason = writable_state.reason().unwrap_or(
             self.catalog
@@ -8683,24 +9126,28 @@ impl MusheenApp {
                 self.open_template_picker(destination.clone(), origin_tab, cx);
             }
             (CommandAction::CopyLocation, CommandParameters::Targets(targets)) => {
-                if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-                    self.operation_error = Some(error);
-                    cx.notify();
-                } else if let Some(text) = targets
-                    .first()
-                    .filter(|_| targets.len() == 1)
-                    .and_then(|target| self.copyable_location_text(target.path()))
-                {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                } else {
-                    self.operation_error = Some(
-                        self.catalog
-                            .message("context.backend-unavailable")
-                            .expect("backend refusal is localized")
-                            .into(),
-                    );
-                    cx.notify();
-                }
+                self.with_revalidated_targets(
+                    origin_tab,
+                    targets.clone(),
+                    cx,
+                    |this, targets, _, cx| {
+                        if let Some(text) = targets
+                            .first()
+                            .filter(|_| targets.len() == 1)
+                            .and_then(|target| this.copyable_location_text(target.path()))
+                        {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        } else {
+                            this.operation_error = Some(
+                                this.catalog
+                                    .message("context.backend-unavailable")
+                                    .expect("backend refusal is localized")
+                                    .into(),
+                            );
+                            cx.notify();
+                        }
+                    },
+                );
             }
             (CommandAction::Preview, CommandParameters::Targets(targets)) => {
                 self.dispatch_preview_command(targets, origin_tab, cx);
@@ -8911,26 +9358,26 @@ impl MusheenApp {
                 cx.notify();
             }
             (CommandAction::DirectoryProperties, CommandParameters::Location(location)) => {
-                if let Some(targets) = captured_targets
-                    && let Err(error) = self.revalidate_context_targets(origin_tab, targets)
-                {
-                    self.operation_error = Some(error);
-                    cx.notify();
-                    return;
+                let paths = location
+                    .as_unix_path()
+                    .map(Path::to_path_buf)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                match captured_targets {
+                    Some(targets) => self.with_revalidated_targets(
+                        origin_tab,
+                        targets.to_vec(),
+                        cx,
+                        move |this, targets, _, cx| {
+                            if targets.is_empty() {
+                                this.open_properties_paths(paths, PropertiesPage::General, cx);
+                            } else {
+                                this.open_properties_targets(targets, PropertiesPage::General, cx);
+                            }
+                        },
+                    ),
+                    None => self.open_properties_paths(paths, PropertiesPage::General, cx),
                 }
-                if let Some(targets) = captured_targets.filter(|targets| !targets.is_empty()) {
-                    self.open_properties_targets(targets, PropertiesPage::General, cx);
-                    return;
-                }
-                self.open_properties_paths(
-                    location
-                        .as_unix_path()
-                        .map(Path::to_path_buf)
-                        .into_iter()
-                        .collect(),
-                    PropertiesPage::General,
-                    cx,
-                );
             }
             (CommandAction::OpenTerminalHere, CommandParameters::Location(location)) => {
                 self.launch_external_terminal(location.clone(), cx);
@@ -9084,11 +9531,17 @@ impl MusheenApp {
             cx.notify();
             return;
         }
-        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-            self.operation_error = Some(error);
-            cx.notify();
-            return;
-        }
+        self.with_revalidated_targets(origin_tab, targets.to_vec(), cx, move |this, targets, _, cx| {
+            this.dispatch_privilege_action_revalidated(action, targets, cx);
+        });
+    }
+
+    fn dispatch_privilege_action_revalidated(
+        &mut self,
+        action: CommandAction,
+        targets: &[CommandTargetRef],
+        cx: &mut Context<Self>,
+    ) {
         let Some(path) = targets[0].path().as_unix_path().map(Path::to_path_buf) else {
             self.operation_error = Some(
                 self.catalog
@@ -9328,11 +9781,29 @@ impl MusheenApp {
                 return;
             }
         }
-        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-            self.operation_error = Some(error);
-            cx.notify();
-            return;
-        }
+        let action = *action;
+        let parameters = parameters.clone();
+        self.with_revalidated_targets(origin_tab, targets.clone(), cx, move |this, targets, _, cx| {
+            this.dispatch_local_target_command_revalidated(
+                &action,
+                &parameters,
+                targets,
+                origin_tab,
+                cx,
+            );
+        });
+    }
+
+    /// The rest of a local target command, once the store confirmed the
+    /// targets.
+    fn dispatch_local_target_command_revalidated(
+        &mut self,
+        action: &CommandAction,
+        parameters: &CommandParameters,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(
             action,
             CommandAction::Open
@@ -10334,7 +10805,7 @@ impl MusheenApp {
         targets: &[CommandTargetRef],
     ) -> bool {
         let Some(origin) = origin else {
-            return self.revalidate_context_targets(None, targets).is_ok();
+            return true;
         };
         let Some(directory) = self.directories.get(&origin.tab) else {
             return false;
@@ -10365,9 +10836,11 @@ impl MusheenApp {
                     .all(|target| origin.selected.contains(target.id()))
                 && targets.iter().all(|target| visible.contains(&target.id()))
         };
+        // The store is asked again by the dispatch that follows, off the UI
+        // thread; here only the directory model is compared.
         semantic_targets_match
             && self
-                .revalidate_context_targets(Some(origin.tab), targets)
+                .check_cached_targets(Some(origin.tab), targets)
                 .is_ok()
     }
 
@@ -10525,16 +10998,19 @@ impl MusheenApp {
         let targets = targets.to_vec();
         let subscription = cx.subscribe(&dialog, move |this, _, event, cx| match event {
             OpenWithDialogEvent::Chosen { desktop_id, intent } => {
-                if let Err(error) = this.revalidate_context_targets(origin_tab, &targets) {
-                    this.operation_error = Some(error);
-                    cx.notify();
-                    return;
-                }
                 let intent = match intent {
                     DialogOpenWithIntent::OpenOnce => CoreOpenWithIntent::OpenOnce,
                     DialogOpenWithIntent::SetAsDefault => CoreOpenWithIntent::SetAsDefault,
                 };
-                this.execute_open_with(&targets, desktop_id, intent, cx);
+                let desktop_id = desktop_id.to_string();
+                this.with_revalidated_targets(
+                    origin_tab,
+                    targets.clone(),
+                    cx,
+                    move |this, targets, _, cx| {
+                        this.execute_open_with(targets, &desktop_id, intent, cx);
+                    },
+                );
             }
             OpenWithDialogEvent::Cancelled => cx.notify(),
         });
@@ -10555,17 +11031,33 @@ impl MusheenApp {
             return;
         };
         if action == CommandAction::Pin {
-            if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-                self.operation_error = Some(error);
-                cx.notify();
-                return;
-            }
-        } else if !self.catalog_binding.snapshot().pins().contains(target.id()) {
+            self.with_revalidated_targets(
+                origin_tab,
+                targets.to_vec(),
+                cx,
+                |this, targets, _, cx| {
+                    if let Some(target) = targets.first() {
+                        this.apply_pin_command(CommandAction::Pin, target, cx);
+                    }
+                },
+            );
+            return;
+        }
+        if !self.catalog_binding.snapshot().pins().contains(target.id()) {
             self.operation_error =
                 Some("the pinned location no longer exists in the catalog".into());
             cx.notify();
             return;
         }
+        self.apply_pin_command(action, target, cx);
+    }
+
+    fn apply_pin_command(
+        &mut self,
+        action: CommandAction,
+        target: &CommandTargetRef,
+        cx: &mut Context<Self>,
+    ) {
         let result = if action == CommandAction::Pin {
             let item = target.id().clone();
             let path = target.path().clone();
@@ -10595,15 +11087,34 @@ impl MusheenApp {
         origin_tab: Option<TabId>,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
-            self.operation_error = Some(error);
-            cx.notify();
-            return;
-        }
-        self.open_properties_targets(targets, PropertiesPage::Tags, cx);
+        self.with_revalidated_targets(origin_tab, targets.to_vec(), cx, |this, targets, _, cx| {
+            this.open_properties_targets(targets, PropertiesPage::Tags, cx);
+        });
     }
 
-    fn revalidate_context_targets(
+    /// The whole target check at once, for tests that hold no executor.
+    #[cfg(test)]
+    fn revalidate_targets_now(
+        &self,
+        origin_tab: Option<TabId>,
+        targets: &[CommandTargetRef],
+    ) -> Result<Vec<StoreItem>, Box<str>> {
+        self.check_cached_targets(origin_tab, targets)?;
+        resolve_targets(
+            &*self.store,
+            targets,
+            self.catalog
+                .message("context.target-verification")
+                .expect("verification refusal is localized"),
+            self.catalog
+                .message("context.target-changed")
+                .expect("target refusal is localized"),
+        )
+    }
+
+    /// The part of target revalidation that reads only the directory model:
+    /// a row that moved since the menu opened is refused at once.
+    fn check_cached_targets(
         &self,
         origin_tab: Option<TabId>,
         targets: &[CommandTargetRef],
@@ -10618,32 +11129,88 @@ impl MusheenApp {
                 .expect("origin refusal is localized")
                 .into());
         };
-        targets.iter().try_for_each(|target| {
-            let cached = directory.view().item(target.id());
-            if cached.is_some_and(|item| item.path() != target.path()) {
-                return Err(self
-                    .catalog
-                    .message("context.target-changed")
-                    .expect("target refusal is localized")
-                    .into());
-            }
-            let current = self.store.resolve_item(target.path()).map_err(|error| {
-                Box::<str>::from(format!(
-                    "{}: {error}",
-                    self.catalog
-                        .message("context.target-verification")
-                        .expect("verification refusal is localized")
-                ))
-            })?;
-            match current {
-                Some(item) if item.id() == target.id() && item.path() == target.path() => Ok(()),
-                _ => Err(self
-                    .catalog
-                    .message("context.target-changed")
-                    .expect("target refusal is localized")
-                    .into()),
-            }
+        if targets.iter().any(|target| {
+            directory
+                .view()
+                .item(target.id())
+                .is_some_and(|item| item.path() != target.path())
+        }) {
+            return Err(self
+                .catalog
+                .message("context.target-changed")
+                .expect("target refusal is localized")
+                .into());
+        }
+        Ok(())
+    }
+
+    /// Checks the targets against the store off the UI thread, then runs
+    /// `then` with them and the items the store resolved. A target that is
+    /// gone or replaced is refused with the menu's own messages. Without an
+    /// origin tab there is nothing to compare, as before.
+    fn with_revalidated_targets(
+        &mut self,
+        origin_tab: Option<TabId>,
+        targets: Vec<CommandTargetRef>,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<StoreItem>, &mut Context<Self>) + 'static,
+    ) {
+        self.with_revalidated_targets_or(
+            origin_tab,
+            targets,
+            cx,
+            |this, error, cx| {
+                this.operation_error = Some(error);
+                cx.notify();
+            },
+            then,
+        );
+    }
+
+    /// As `with_revalidated_targets`, with the refusal handled by `on_error`
+    /// instead of the operation error line.
+    fn with_revalidated_targets_or(
+        &mut self,
+        origin_tab: Option<TabId>,
+        targets: Vec<CommandTargetRef>,
+        cx: &mut Context<Self>,
+        on_error: impl FnOnce(&mut Self, Box<str>, &mut Context<Self>) + 'static,
+        then: impl FnOnce(&mut Self, &[CommandTargetRef], Vec<StoreItem>, &mut Context<Self>) + 'static,
+    ) {
+        if let Err(error) = self.check_cached_targets(origin_tab, &targets) {
+            on_error(self, error, cx);
+            return;
+        }
+        if origin_tab.is_none() {
+            then(self, &targets, Vec::new(), cx);
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let verification = self
+            .catalog
+            .message("context.target-verification")
+            .expect("verification refusal is localized")
+            .to_string();
+        let changed = self
+            .catalog
+            .message("context.target-changed")
+            .expect("target refusal is localized")
+            .to_string();
+        let checked = targets.clone();
+        let work = cx.background_spawn(async move {
+            resolve_targets(&*store, &checked, &verification, &changed)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(items) => then(state, &targets, items, cx),
+                Err(error) => on_error(state, error, cx),
+            });
         })
+        .detach();
     }
 
     fn dispatch_preview_command(
@@ -10653,71 +11220,53 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         let tab_id = origin_tab.unwrap_or_else(|| self.navigation.focused_tab().id());
-        let result = (|| {
-            let [target] = targets else {
-                return Err(self
-                    .catalog
-                    .message("context.backend-unavailable")
-                    .expect("backend refusal is localized")
-                    .into());
-            };
-            if self.navigation.focused_tab().id() != tab_id
-                || !self.directories.contains_key(&tab_id)
-            {
-                return Err(self
-                    .catalog
+        let backend_unavailable = || -> Box<str> {
+            self.catalog
+                .message("context.backend-unavailable")
+                .expect("backend refusal is localized")
+                .into()
+        };
+        let [target] = targets else {
+            self.operation_error = Some(backend_unavailable());
+            cx.notify();
+            return;
+        };
+        if self.navigation.focused_tab().id() != tab_id || !self.directories.contains_key(&tab_id)
+        {
+            self.operation_error = Some(
+                self.catalog
                     .message("context.origin-unavailable")
                     .expect("origin refusal is localized")
-                    .into());
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        if target.path().as_unix_path().is_none() {
+            self.operation_error = Some(backend_unavailable());
+            cx.notify();
+            return;
+        }
+        self.with_revalidated_targets(Some(tab_id), targets.to_vec(), cx, move |this, _, items, cx| {
+            let Some(item) = items.into_iter().next() else {
+                return;
+            };
+            if item.kind() != ItemKind::RegularFile {
+                this.operation_error = Some(
+                    this.catalog
+                        .message("context.backend-unavailable")
+                        .expect("backend refusal is localized")
+                        .into(),
+                );
+                cx.notify();
+                return;
             }
-            self.revalidate_context_targets(Some(tab_id), targets)?;
-            if target.path().as_unix_path().is_none() {
-                return Err(self
-                    .catalog
-                    .message("context.backend-unavailable")
-                    .expect("backend refusal is localized")
-                    .into());
-            }
-            let item = self.store.resolve_item(target.path()).map_err(|error| {
-                Box::<str>::from(format!(
-                    "{}: {error}",
-                    self.catalog
-                        .message("context.target-verification")
-                        .expect("verification refusal is localized")
-                ))
-            })?;
-            if item
-                .as_ref()
-                .is_none_or(|item| item.id() != target.id() || item.path() != target.path())
-            {
-                return Err(self
-                    .catalog
-                    .message("context.target-changed")
-                    .expect("target refusal is localized")
-                    .into());
-            }
-            if item.is_none_or(|item| item.kind() != ItemKind::RegularFile) {
-                return Err(self
-                    .catalog
-                    .message("context.backend-unavailable")
-                    .expect("backend refusal is localized")
-                    .into());
-            }
-            Ok(target.id().clone())
-        })();
-        match result {
-            Ok(id) => {
-                self.select_item(tab_id, id, cx);
-                if !self.shell.info_visible() {
-                    self.shell.toggle_info();
-                    cx.notify();
-                }
-            }
-            Err(error) => {
-                self.operation_error = Some(error);
+            this.select_item(tab_id, item.id().clone(), cx);
+            if !this.shell.info_visible() {
+                this.shell.toggle_info();
                 cx.notify();
             }
-        }
+        });
     }
 
     fn dispatch_run_command(
@@ -10777,7 +11326,9 @@ impl MusheenApp {
             cx.notify();
             return;
         };
-        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+        // The background task below resolves the target and its executable
+        // state itself; only the directory model is checked here.
+        if let Err(error) = self.check_cached_targets(origin_tab, targets) {
             self.operation_error = Some(error);
             cx.notify();
             return;
@@ -13342,7 +13893,7 @@ impl MusheenApp {
             .border_color(boundary)
             .children(sections)
             .context_menu(move |popup, window, popup_cx| {
-                let Some(menu) = context_menu_host
+                let Some((menu, probe, loading_label)) = context_menu_host
                     .update(popup_cx, |this, cx| {
                         if this.browser_input_blocked() {
                             this.pending_context_menu = None;
@@ -13351,17 +13902,35 @@ impl MusheenApp {
                         }
                         this.remember_context_invocation_focus(window, cx);
                         this.pending_indexed_context_menu = None;
-                        Some(
-                            this.pending_context_menu
-                                .take()
-                                .unwrap_or_else(|| this.sidebar_context_menu(sidebar_tab)),
-                        )
+                        let menu = this
+                            .pending_context_menu
+                            .take()
+                            .unwrap_or_else(|| this.sidebar_context_menu(sidebar_tab));
+                        let probe = this.take_pending_menu_probe();
+                        let loading_label = probe.as_ref().map(|_| {
+                            this.catalog
+                                .message("context-menu-loading")
+                                .expect("selection loading status is localized")
+                                .to_owned()
+                        });
+                        Some((menu, probe, loading_label))
                     })
                     .ok()
                     .flatten()
                 else {
                     return popup;
                 };
+                if let Some(pending) = probe {
+                    let popup_ref = popup_cx.entity().downgrade();
+                    let window_handle = window.window_handle();
+                    let path = format!("sidebar-{sidebar_tab:?}");
+                    let _ = context_menu_host.update(popup_cx, |this, cx| {
+                        this.start_menu_probe(pending, popup_ref, window_handle, path, cx);
+                    });
+                    return popup.item(PopupMenuItem::label(
+                        loading_label.expect("deferred menus have a loading label"),
+                    ));
+                }
                 Self::populate_context_popup(
                     popup,
                     menu,
@@ -13511,7 +14080,7 @@ impl MusheenApp {
                 }),
             )
             .context_menu(move |popup, window, popup_cx| {
-                let Some((menu, deferred, loading_label)) = context_menu_host
+                let Some((menu, deferred, probe, loading_label)) = context_menu_host
                     .update(popup_cx, |this, cx| {
                         if this.browser_input_blocked() {
                             this.pending_context_menu = None;
@@ -13523,19 +14092,35 @@ impl MusheenApp {
                             this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new())
                         });
                         let deferred = this.pending_indexed_context_menu.take();
-                        let loading_label = deferred.as_ref().map(|_| {
+                        let probe = if deferred.is_none() {
+                            this.take_pending_menu_probe()
+                        } else {
+                            None
+                        };
+                        let loading_label = (deferred.is_some() || probe.is_some()).then(|| {
                             this.catalog
                                 .message("context-menu-loading")
                                 .expect("selection loading status is localized")
                                 .to_owned()
                         });
-                        Some((menu, deferred, loading_label))
+                        Some((menu, deferred, probe, loading_label))
                     })
                     .ok()
                     .flatten()
                 else {
                     return popup;
                 };
+                if let Some(pending) = probe {
+                    let popup_ref = popup_cx.entity().downgrade();
+                    let window_handle = window.window_handle();
+                    let path = format!("pane-{tab_id:?}");
+                    let _ = context_menu_host.update(popup_cx, |this, cx| {
+                        this.start_menu_probe(pending, popup_ref, window_handle, path, cx);
+                    });
+                    return popup.item(PopupMenuItem::label(
+                        loading_label.expect("deferred menus have a loading label"),
+                    ));
+                }
                 if let Some(deferred) = deferred {
                     let popup_ref = popup_cx.entity().downgrade();
                     let window_handle = window.window_handle();
@@ -25038,14 +25623,14 @@ mod tests {
                 assert_eq!(entry.captured_targets().len(), 1);
                 assert!(
                     state
-                        .revalidate_context_targets(Some(tab), entry.captured_targets())
+                        .revalidate_targets_now(Some(tab), entry.captured_targets())
                         .is_ok()
                 );
                 filesystem::rename(&external, temporary.path().join("old")).unwrap();
                 filesystem::create_dir(&external).unwrap();
                 assert!(
                     state
-                        .revalidate_context_targets(Some(tab), entry.captured_targets())
+                        .revalidate_targets_now(Some(tab), entry.captured_targets())
                         .is_err()
                 );
                 filesystem::remove_dir(temporary.path().join("old")).unwrap();
@@ -29122,6 +29707,15 @@ mod tests {
         .unwrap();
 
         gate.open();
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                assert!(
+                    state.run_pending_menu_probes(cx),
+                    "the menu queued the store questions it could not answer"
+                );
+            });
+        })
+        .unwrap();
         cx.wait_for(browser, Duration::from_secs(2), |_, _| {
             gate.passes.load(std::sync::atomic::Ordering::SeqCst) >= 1
         })

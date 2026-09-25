@@ -20,6 +20,9 @@ pub(super) struct CatalogBinding {
     document: Arc<Mutex<CatalogDocument>>,
     revision: Arc<AtomicU64>,
     observed_scopes: Arc<Mutex<ObservedScopes>>,
+    /// Serializes updates without making a reader of the in-memory copy
+    /// wait on the catalog file's lock.
+    update_lock: Arc<Mutex<()>>,
     xattr_opt_in: bool,
 }
 
@@ -57,6 +60,7 @@ impl CatalogBinding {
             document: Arc::new(Mutex::new(CatalogDocument::default())),
             revision: Arc::new(AtomicU64::new(0)),
             observed_scopes: Arc::new(Mutex::new(Vec::new())),
+            update_lock: Arc::new(Mutex::new(())),
             xattr_opt_in,
         }
     }
@@ -76,6 +80,7 @@ impl CatalogBinding {
             document: Arc::new(Mutex::new(document)),
             revision: Arc::new(AtomicU64::new(0)),
             observed_scopes: Arc::new(Mutex::new(Vec::new())),
+            update_lock: Arc::new(Mutex::new(())),
             xattr_opt_in,
         }
     }
@@ -146,9 +151,20 @@ impl CatalogBinding {
         &self,
         change: impl FnOnce(&mut CatalogDocument) -> Result<T, Box<str>>,
     ) -> Result<T, Box<str>> {
-        let mut document = self.document.lock().expect("catalog lock is not poisoned");
+        // Updates run one at a time. The in-memory copy is locked only to
+        // read or install a document, never while the catalog file's lock
+        // is awaited, so a reader on the UI thread does not wait on another
+        // process.
+        let _serial = self
+            .update_lock
+            .lock()
+            .expect("catalog update lock is not poisoned");
         if let Some(store) = &self.store {
-            let previous_visible = document.clone();
+            let previous_visible = self
+                .document
+                .lock()
+                .expect("catalog lock is not poisoned")
+                .clone();
             let update = store.update(|current| {
                 let changed = change(current)?;
                 Ok((changed, current.clone()))
@@ -159,10 +175,7 @@ impl CatalogBinding {
                     let current = store
                         .load()
                         .map_err(|error| Box::<str>::from(error.to_string()))?;
-                    if current != *document {
-                        *document = current;
-                        self.revision.fetch_add(1, Ordering::AcqRel);
-                    }
+                    self.install_document(current, &previous_visible);
                     return Err(Box::<str>::from(
                         musheen_desktop::CatalogError::UpdateConflict.to_string(),
                     ));
@@ -174,12 +187,10 @@ impl CatalogBinding {
                     });
                 }
             };
-            *document = current;
-            if *document != previous_visible {
-                self.revision.fetch_add(1, Ordering::AcqRel);
-            }
+            self.install_document(current, &previous_visible);
             return Ok(changed);
         }
+        let mut document = self.document.lock().expect("catalog lock is not poisoned");
         let previous = document.clone();
         let changed = match change(&mut document) {
             Ok(changed) => changed,
@@ -192,6 +203,16 @@ impl CatalogBinding {
             self.revision.fetch_add(1, Ordering::AcqRel);
         }
         Ok(changed)
+    }
+
+    /// Installs the document the store now holds and counts a revision when
+    /// it differs from what was visible before the update.
+    fn install_document(&self, current: CatalogDocument, previous_visible: &CatalogDocument) {
+        let mut document = self.document.lock().expect("catalog lock is not poisoned");
+        *document = current;
+        if *document != *previous_visible {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     #[cfg(test)]
