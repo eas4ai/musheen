@@ -19,7 +19,7 @@ use std::fmt;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,6 +107,21 @@ pub struct LocalTrashEntry {
 }
 
 impl LocalTrashEntry {
+    #[must_use]
+    pub const fn new(
+        receipt: TrashReceipt,
+        deleted_at_unix_seconds: i64,
+        kind: musheen_ops::ConflictItemKind,
+        restorable: bool,
+    ) -> Self {
+        Self {
+            receipt,
+            deleted_at_unix_seconds,
+            kind,
+            restorable,
+        }
+    }
+
     #[must_use]
     pub const fn receipt(&self) -> &TrashReceipt {
         &self.receipt
@@ -239,20 +254,18 @@ impl LocalStore {
         let _guard = TRASH_LOCK
             .lock()
             .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
-        let mut entries = trash::os_limited::list()
-            .map_err(map_trash_error)?
+        let listed = trash::os_limited::list().map_err(map_trash_error)?;
+        let listed_ids = listed
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut entries = listed
             .into_iter()
             .map(|item| {
                 // An entry whose data is missing or unreadable stays in the
                 // listing as unrestorable; it never hides the other entries.
                 let (kind, restorable) = match fs::symlink_metadata(trash_payload_path(&item)?) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        (musheen_ops::ConflictItemKind::SymbolicLink, true)
-                    }
-                    Ok(metadata) if metadata.is_dir() => {
-                        (musheen_ops::ConflictItemKind::Directory, true)
-                    }
-                    Ok(_) => (musheen_ops::ConflictItemKind::File, true),
+                    Ok(metadata) => (trash_payload_kind(&metadata), true),
                     Err(_) => (musheen_ops::ConflictItemKind::File, false),
                 };
                 Ok(LocalTrashEntry {
@@ -266,6 +279,7 @@ impl LocalStore {
                 })
             })
             .collect::<Result<Vec<_>, MutationError>>()?;
+        entries.extend(unreadable_trash_entries(&listed_ids));
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.deleted_at_unix_seconds));
         Ok(entries)
     }
@@ -277,34 +291,28 @@ impl LocalStore {
         let _guard = TRASH_LOCK
             .lock()
             .map_err(|_| MutationError::Provider("trash lock was poisoned".into()))?;
-        let mut available = trash::os_limited::list()
+        let listed_ids = trash::os_limited::list()
             .map_err(map_trash_error)?
             .into_iter()
-            .map(|item| (item.id.clone(), item))
-            .collect::<std::collections::HashMap<_, _>>();
+            .map(|item| item.id)
+            .collect::<std::collections::HashSet<_>>();
+        let unreadable_ids = unreadable_trash_entries(&listed_ids)
+            .into_iter()
+            .map(|entry| OsString::from_vec(entry.receipt.provider_reference().to_vec()))
+            .collect::<std::collections::HashSet<_>>();
         let mut requested = std::collections::HashSet::with_capacity(receipts.len());
-        let mut selected = Vec::with_capacity(receipts.len());
-        let mut orphaned = Vec::new();
+        let mut info_files = Vec::with_capacity(receipts.len());
         for receipt in receipts {
             if !requested.insert(receipt.provider_reference().to_vec()) {
                 return Err(MutationError::BatchCollision);
             }
             let id = OsString::from_vec(receipt.provider_reference().to_vec());
-            let item = available.remove(&id).ok_or(MutationError::Missing)?;
-            // The trash crate refuses to purge an entry whose data is gone;
-            // such an entry is only its info file, which is removed here.
-            match fs::symlink_metadata(trash_payload_path(&item)?) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => orphaned.push(item),
-                _ => selected.push(item),
+            if !listed_ids.contains(&id) && !unreadable_ids.contains(&id) {
+                return Err(MutationError::Missing);
             }
+            info_files.push(PathBuf::from(id));
         }
-        if !selected.is_empty() {
-            trash::os_limited::purge_all(selected).map_err(map_trash_error)?;
-        }
-        for item in orphaned {
-            fs::remove_file(Path::new(&item.id)).map_err(map_io_error)?;
-        }
-        Ok(())
+        purge_each(&info_files, |info| purge_trash_record(info))
     }
 
     pub fn resolve_restore_conflict(
@@ -592,7 +600,134 @@ fn rollback_restore_merge_failure(
 }
 
 fn trash_payload_path(item: &trash::TrashItem) -> Result<PathBuf, MutationError> {
-    let info = Path::new(&item.id);
+    trash_payload_path_of_record(Path::new(&item.id))
+}
+
+/// The item kind of a trash payload from its own metadata.
+fn trash_payload_kind(metadata: &fs::Metadata) -> musheen_ops::ConflictItemKind {
+    if metadata.file_type().is_symlink() {
+        musheen_ops::ConflictItemKind::SymbolicLink
+    } else if metadata.is_dir() {
+        musheen_ops::ConflictItemKind::Directory
+    } else {
+        musheen_ops::ConflictItemKind::File
+    }
+}
+
+/// Entries whose `.trashinfo` record the trash crate could not read or
+/// parse. Each is listed as unrestorable so it can be purged. Its original
+/// location and deletion time are unknown, so the entry shows where its data
+/// sits in Trash and when its record was written.
+fn unreadable_trash_entries(listed_ids: &std::collections::HashSet<OsString>) -> Vec<LocalTrashEntry> {
+    let Ok(folders) = trash::os_limited::trash_folders() else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for folder in folders {
+        let Ok(records) = fs::read_dir(folder.join("info")) else {
+            continue;
+        };
+        for record in records.flatten() {
+            let info = record.path();
+            if listed_ids.contains(info.as_os_str())
+                || info.extension() != Some(OsStr::new("trashinfo"))
+                || !record.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                continue;
+            }
+            let Ok(payload) = trash_payload_path_of_record(&info) else {
+                continue;
+            };
+            let kind = fs::symlink_metadata(&payload)
+                .as_ref()
+                .map_or(musheen_ops::ConflictItemKind::File, trash_payload_kind);
+            let written = record
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since_epoch| i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX));
+            entries.push(LocalTrashEntry {
+                receipt: TrashReceipt::new(
+                    StorePath::from_unix_path(payload.into_os_string()),
+                    info.into_os_string().into_vec(),
+                ),
+                deleted_at_unix_seconds: written,
+                kind,
+                restorable: false,
+            });
+        }
+    }
+    entries
+}
+
+/// Purges every target, continuing past the ones that fail, and reports how
+/// many failed. One entry that cannot be removed never keeps the others in
+/// Trash.
+fn purge_each<T>(
+    targets: &[T],
+    mut purge: impl FnMut(&T) -> Result<(), MutationError>,
+) -> Result<(), MutationError> {
+    let mut failures = Vec::new();
+    for target in targets {
+        if let Err(error) = purge(target) {
+            failures.push(error);
+        }
+    }
+    match failures.first() {
+        None => Ok(()),
+        Some(first) => Err(MutationError::Provider(
+            format!(
+                "{} of {} trash entries could not be purged; the first error: {first}",
+                failures.len(),
+                targets.len()
+            )
+            .into(),
+        )),
+    }
+}
+
+/// Removes one trash entry: its data under `files/`, then its record. Data
+/// that is already gone is not an error. A tree with read-only folders is
+/// made writable first, because the user asked for it to be gone.
+fn purge_trash_record(info: &Path) -> Result<(), MutationError> {
+    let payload = trash_payload_path_of_record(info)?;
+    match fs::symlink_metadata(&payload) {
+        Ok(metadata) if metadata.is_dir() => {
+            if let Err(error) = fs::remove_dir_all(&payload) {
+                if error.kind() != std::io::ErrorKind::PermissionDenied {
+                    return Err(map_io_error(error));
+                }
+                make_tree_writable(&payload)?;
+                fs::remove_dir_all(&payload).map_err(map_io_error)?;
+            }
+        }
+        Ok(_) => fs::remove_file(&payload).map_err(map_io_error)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(map_io_error(error)),
+    }
+    fs::remove_file(info).map_err(map_io_error)
+}
+
+/// Gives the owner full access to every folder below `root` so the tree
+/// can be removed. Links are not followed.
+fn make_tree_writable(root: &Path) -> Result<(), MutationError> {
+    let metadata = fs::symlink_metadata(root).map_err(map_io_error)?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let mut permissions = metadata.permissions();
+    if permissions.mode() & 0o700 != 0o700 {
+        permissions.set_mode(permissions.mode() | 0o700);
+        fs::set_permissions(root, permissions).map_err(map_io_error)?;
+    }
+    for entry in fs::read_dir(root).map_err(map_io_error)? {
+        make_tree_writable(&entry.map_err(map_io_error)?.path())?;
+    }
+    Ok(())
+}
+
+fn trash_payload_path_of_record(info: &Path) -> Result<PathBuf, MutationError> {
     let info_directory = info.parent().ok_or(MutationError::InvalidScope)?;
     if info_directory.file_name() != Some(OsStr::new("info")) {
         return Err(MutationError::InvalidScope);
@@ -2092,6 +2227,29 @@ fn map_errno(error: rustix::io::Errno) -> MutationError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn purge_each_continues_past_a_failure_and_reports_it() {
+        let mut attempted = Vec::new();
+        let outcome = super::purge_each(&["first", "locked", "last"], |name| {
+            attempted.push(*name);
+            if *name == "locked" {
+                Err(super::MutationError::PermissionDenied)
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(attempted, ["first", "locked", "last"]);
+        assert_eq!(
+            outcome,
+            Err(super::MutationError::Provider(
+                "1 of 3 trash entries could not be purged; the first error: permission denied"
+                    .into()
+            ))
+        );
+        assert_eq!(super::purge_each(&["one"], |_| Ok(())), Ok(()));
+    }
+
     use super::*;
     use crate::TrashEnvironment;
 

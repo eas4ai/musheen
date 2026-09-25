@@ -946,20 +946,21 @@ static PUBLISH_STAGING_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// Creates a fresh directory next to `destination` under a name that is
 /// never the destination's; the fallback publication builds the tree there.
+/// The name is built from the process id and a serial only, so it stays
+/// short when the destination name is close to the filesystem's limit.
 fn create_publish_staging(destination: &Path) -> Result<PathBuf, ProviderError> {
     let parent = destination.parent().ok_or_else(|| {
         ProviderError::Unsupported("destination has no containing directory".into())
     })?;
-    let name = destination
-        .file_name()
-        .ok_or_else(|| ProviderError::Unsupported("destination has no file name".into()))?;
+    if destination.file_name().is_none() {
+        return Err(ProviderError::Unsupported(
+            "destination has no file name".into(),
+        ));
+    }
     let process = std::process::id();
     for _ in 0..64 {
         let serial = PUBLISH_STAGING_SERIAL.fetch_add(1, Ordering::Relaxed);
-        let mut staging_name = OsString::from(".");
-        staging_name.push(name);
-        staging_name.push(format!(".musheen-publish-{process}-{serial}"));
-        let staging = parent.join(staging_name);
+        let staging = parent.join(format!(".musheen-publish-{process}-{serial}"));
         match fs::create_dir(&staging) {
             Ok(()) => return Ok(staging),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1661,6 +1662,95 @@ mod tests {
             fs::read_dir(root.path()).unwrap().count(),
             2,
             "only the source and the destination remain"
+        );
+    }
+
+    #[test]
+    fn fallback_publish_accepts_a_destination_name_near_the_length_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stage");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"complete").unwrap();
+        // 240 bytes: the store accepts the name, so the fallback must too.
+        let destination = root.path().join("n".repeat(240));
+        fs::create_dir(&destination).unwrap();
+        fs::remove_dir(&destination).unwrap();
+
+        let outcome = rename_without_replacement_with(&source, &destination, |_, _| {
+            Err(rustix::io::Errno::INVAL)
+        });
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(fs::read(destination.join("file")).unwrap(), b"complete");
+        assert!(!source.exists(), "the source is removed after publication");
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "only the destination remains"
+        );
+    }
+
+    /// Counts every entry below `root`, or `None` while the tree cannot be
+    /// read completely.
+    fn count_tree_entries(root: &Path) -> Option<usize> {
+        let mut count = 0;
+        for entry in fs::read_dir(root).ok()? {
+            let entry = entry.ok()?;
+            count += 1;
+            if entry.file_type().ok()?.is_dir() {
+                count += count_tree_entries(&entry.path())?;
+            }
+        }
+        Some(count)
+    }
+
+    #[test]
+    fn fallback_publish_never_shows_a_partial_tree_under_the_destination_name() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stage");
+        fs::create_dir(&source).unwrap();
+        for folder in 0..60 {
+            let folder = source.join(format!("folder-{folder}"));
+            fs::create_dir(&folder).unwrap();
+            for file in 0..100 {
+                fs::write(folder.join(format!("file-{file}")), b"x").unwrap();
+            }
+        }
+        let total = count_tree_entries(&source).unwrap();
+        let destination = root.path().join("published");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A reader keeps looking at the destination name while the fallback
+        // runs. It may see nothing, the empty claim, or the complete tree;
+        // a tree with some of the entries is the partial publication that
+        // OPS-019 forbids.
+        let reader = std::thread::spawn({
+            let stop = std::sync::Arc::clone(&stop);
+            let destination = destination.clone();
+            move || {
+                let mut partial = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(count) = count_tree_entries(&destination)
+                        && count > 0
+                        && count < total
+                    {
+                        partial.push(count);
+                    }
+                }
+                partial
+            }
+        });
+
+        let outcome = rename_without_replacement_with(&source, &destination, |_, _| {
+            Err(rustix::io::Errno::INVAL)
+        });
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let partial = reader.join().unwrap();
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(count_tree_entries(&destination), Some(total));
+        assert!(
+            partial.is_empty(),
+            "a reader saw a partial tree under the destination name: {partial:?}"
         );
     }
 
