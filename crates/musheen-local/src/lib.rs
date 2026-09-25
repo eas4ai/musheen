@@ -7,8 +7,11 @@ mod operation;
 mod probe;
 mod queue;
 mod search;
+mod trash_support;
 mod traverse;
 mod watch;
+
+pub(crate) use trash_support::{TrashDisposition, TrashEnvironment};
 
 use enumerate::EnumerationRegistry;
 use musheen_core::{
@@ -42,16 +45,6 @@ pub struct LocalStore {
     /// that trash support is decided from.
     #[cfg(test)]
     trash_environment: Option<TrashEnvironment>,
-}
-
-/// The facts trash support is decided from: where the home trash lives,
-/// the mount points sorted longest first, and the user whose per-volume
-/// trash directory would be used.
-#[derive(Clone, Debug)]
-pub(crate) struct TrashEnvironment {
-    pub(crate) home_trash: PathBuf,
-    pub(crate) mount_points: Vec<PathBuf>,
-    pub(crate) uid: u32,
 }
 
 impl LocalStore {
