@@ -9,6 +9,12 @@ use musheen_core::{ItemKind, StoreItem, StorePath};
 /// levels remain reachable through Back and the breadcrumb trail.
 const MAX_PARENT_LEVELS: usize = 3;
 
+/// How many item models the parent columns may hold in memory together. A
+/// parent whose rows would push the trail over it is index-backed instead,
+/// and the current folder gives up the rows the parents hold, so a tab never
+/// holds more models than one folder's own bound.
+pub(crate) const COLUMN_RESIDENT_BUDGET: usize = 1_024;
+
 /// Where a parent column takes its rows from: the items the folder held in
 /// memory, or the disk index of a folder too large to keep in memory. An
 /// indexed pane keeps the index alive for as long as the column shows it.
@@ -86,6 +92,15 @@ impl ColumnTrail {
 
     pub(crate) fn clear(&mut self) {
         self.parents.clear();
+    }
+
+    /// How many item models the parent columns hold in memory.
+    #[must_use]
+    pub(crate) fn resident_len(&self) -> usize {
+        self.parents
+            .iter()
+            .filter_map(|pane| pane.resident_items().map(|items| items.len()))
+            .sum()
     }
 
     /// Keep the current directory only when the destination is one of its

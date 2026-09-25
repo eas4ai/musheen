@@ -62,6 +62,28 @@ pub(crate) struct IndexedFocusMove {
 }
 
 impl DirectoryIndexReader {
+    /// An index that holds `items` in the order `preferences` gives, for a
+    /// column that must not keep them in memory. It is written on the
+    /// caller's thread; the items are at most one folder's resident bound.
+    pub(crate) fn from_items(
+        root: &std::path::Path,
+        items: &[StoreItem],
+        preferences: &ViewPreferences,
+    ) -> std::io::Result<(Self, usize)> {
+        let mut index = DiskDirectoryIndex::new_in(root)?;
+        for (arrival, item) in (0u64..).zip(items) {
+            index.append(item, arrival)?;
+        }
+        index.rebuild_order(preferences, None)?;
+        let visible_count = index.visible_count().unwrap_or(0);
+        Ok((
+            Self {
+                index: Arc::new(Mutex::new(index)),
+            },
+            visible_count,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn read_range(&self, range: Range<usize>) -> std::io::Result<Vec<StoreItem>> {
         self.index
@@ -501,6 +523,10 @@ pub struct DirectoryModel {
     active: Option<DirectoryLoad>,
     state: DirectoryState,
     view: DirectoryViewModel,
+    /// The most items this folder keeps in memory before it spills to its
+    /// index. The Columns layout lowers it by the rows its parent columns
+    /// hold, so a tab never holds more than `MAX_RESIDENT_ITEMS` models.
+    resident_limit: usize,
     /// Where this tab's index lives; `None` when no cache directory is
     /// available, so a folder that needs an index reports the error.
     index_root: Option<PathBuf>,
@@ -535,6 +561,7 @@ impl DirectoryModel {
             active: None,
             state: DirectoryState::Empty,
             view: DirectoryViewModel::new(retention_limit.min(MAX_RESIDENT_ITEMS)),
+            resident_limit: MAX_RESIDENT_ITEMS,
             index_root: directory_index_root(),
             index: None,
             index_error: None,
@@ -668,7 +695,21 @@ impl DirectoryModel {
 
     pub(crate) fn needs_index(&self, page: &Page<StoreItem>) -> bool {
         self.index.is_some()
-            || self.view.items().len().saturating_add(page.items().len()) > MAX_RESIDENT_ITEMS
+            || self.view.items().len().saturating_add(page.items().len()) > self.resident_limit
+    }
+
+    /// Gives up `reserved` of the tab's item budget to models held elsewhere,
+    /// the rows the Columns layout keeps for its parent columns, so this
+    /// folder spills to its index that much sooner. Applies to the pages that
+    /// arrive after the call.
+    pub(crate) fn reserve_resident_items(&mut self, reserved: usize) {
+        self.resident_limit = MAX_RESIDENT_ITEMS.saturating_sub(reserved).max(1);
+    }
+
+    /// The most items this folder keeps in memory before it spills.
+    #[cfg(test)]
+    pub(crate) fn resident_limit(&self) -> usize {
+        self.resident_limit
     }
 
     pub(crate) fn prepare_index_page(&mut self, page: Page<StoreItem>) -> DirectoryIndexWork {

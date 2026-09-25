@@ -45,8 +45,8 @@ use crate::toolbar::{
     resolve_command_mode, static_shortcut_declarations,
 };
 use crate::views::{
-    AdaptiveLayout, ColumnKey, ColumnPaneItems, ColumnTrail, GroupKey, Layout, SelectionMode,
-    SortDirection, SortKey, SortSpec, ViewPreferenceStore,
+    AdaptiveLayout, COLUMN_RESIDENT_BUDGET, ColumnKey, ColumnPaneItems, ColumnTrail, GroupKey,
+    Layout, SelectionMode, SortDirection, SortKey, SortSpec, ViewPreferenceStore,
 };
 use crate::{
     ContextMenu, ContextMenuDestinationResolver, MenuEntry, MenuInvocation, MenuTarget,
@@ -5093,6 +5093,7 @@ impl MusheenApp {
             if directory.view().preferences().layout == Layout::Columns {
                 if let Some(current) = directory.location().cloned() {
                     let complete = directory.view().is_complete();
+                    let column_preferences = directory.view().preferences().clone();
                     let indexed = directory
                         .index_reader()
                         .map(|reader| (reader, directory.visible_count()));
@@ -5113,14 +5114,33 @@ impl MusheenApp {
                             reader,
                             visible_count,
                         }),
-                        (true, None) => Some(ColumnPaneItems::InMemory(
-                            self.directories
+                        (true, None) => {
+                            let items: Arc<[StoreItem]> = self
+                                .directories
                                 .get_mut(&tab_id)
                                 .expect("the column directory exists")
                                 .view_mut()
                                 .take_visible_items()
-                                .into(),
-                        )),
+                                .into();
+                            let resident = self
+                                .column_trails
+                                .get(&tab_id)
+                                .map_or(0, ColumnTrail::resident_len);
+                            if resident.saturating_add(items.len()) > COLUMN_RESIDENT_BUDGET {
+                                // The parents' budget is used up: this column
+                                // reads its rows from a disk index instead.
+                                match self.spill_column_items(&items, &column_preferences) {
+                                    Ok(pane) => Some(pane),
+                                    Err(error) => {
+                                        self.operation_error =
+                                            Some(format!("Directory index failed: {error}").into());
+                                        None
+                                    }
+                                }
+                            } else {
+                                Some(ColumnPaneItems::InMemory(items))
+                            }
+                        }
                     };
                     self.column_viewports.retain(|(tab, _), _| *tab != tab_id);
                     self.column_trails
@@ -5164,6 +5184,18 @@ impl MusheenApp {
         if preserve_columns {
             preferences.layout = Layout::Columns;
         }
+        // The rows the parent columns keep in memory come out of the current
+        // folder's budget, so the tab never holds more than one folder's
+        // bound of item models.
+        let reserved = if preserve_columns {
+            self.column_trails
+                .get(&tab_id)
+                .map_or(0, ColumnTrail::resident_len)
+        } else {
+            0
+        };
+        self.focused_directory_mut()
+            .reserve_resident_items(reserved);
         *self.focused_directory_mut().view_mut().preferences_mut() = preferences.clone();
         self.navigation
             .focused_tab_mut()
@@ -5331,6 +5363,24 @@ impl MusheenApp {
 
     fn new_directory_model(&self) -> DirectoryModel {
         DirectoryModel::new(self.limits.snapshot()).with_index_root(self.index_root.clone())
+    }
+
+    /// Writes a parent column's rows to a disk index under the window's
+    /// index root, so the column holds no item models in memory.
+    fn spill_column_items(
+        &self,
+        items: &[StoreItem],
+        preferences: &crate::views::ViewPreferences,
+    ) -> std::io::Result<ColumnPaneItems> {
+        let root = self
+            .index_root
+            .as_deref()
+            .ok_or_else(crate::directory::missing_index_root_error)?;
+        let (reader, visible_count) = DirectoryIndexReader::from_items(root, items, preferences)?;
+        Ok(ColumnPaneItems::Indexed {
+            reader,
+            visible_count,
+        })
     }
 
     /// The index root this window's tabs use, prepared for the process: the
@@ -18341,17 +18391,18 @@ mod tests {
     /// folders, into a new temporary directory.
     fn write_large_folder(folders: &[&str]) -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();
-        for folder in folders {
-            filesystem::create_dir(temporary.path().join(folder)).unwrap();
-        }
-        for index in 0..LARGE_FOLDER_ITEMS {
-            filesystem::write(
-                temporary.path().join(format!("item-{index:05}.txt")),
-                b"item",
-            )
-            .unwrap();
-        }
+        write_files(temporary.path(), LARGE_FOLDER_ITEMS, folders);
         temporary
+    }
+
+    /// Writes `count` small files and the given folders into `folder`.
+    fn write_files(folder: &Path, count: usize, folders: &[&str]) {
+        for name in folders {
+            filesystem::create_dir(folder.join(name)).unwrap();
+        }
+        for index in 0..count {
+            filesystem::write(folder.join(format!("item-{index:05}.txt")), b"item").unwrap();
+        }
     }
 
     /// Opens a folder with more items than fit in memory, keeps the tab's
@@ -18361,6 +18412,23 @@ mod tests {
     async fn open_large_folder(
         folder: &Path,
         layout: Layout,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<MusheenApp>,
+        AnyWindowHandle,
+        TabId,
+        tempfile::TempDir,
+    ) {
+        open_folder_under_index_root(folder, layout, true, cx).await
+    }
+
+    /// Opens a folder with the tab's index root under a temporary directory
+    /// and waits until the folder is loaded, and indexed when `indexed` says
+    /// so, with its first rows on screen.
+    async fn open_folder_under_index_root(
+        folder: &Path,
+        layout: Layout,
+        indexed: bool,
         cx: &mut TestAppContext,
     ) -> (
         Entity<MusheenApp>,
@@ -18386,7 +18454,7 @@ mod tests {
         cx.wait_for(browser, Duration::from_secs(10), |_, cx| {
             let directory = app.read(cx).focused_directory();
             directory.state() == &DirectoryState::Ready
-                && directory.is_indexed()
+                && (!indexed || directory.is_indexed())
                 && directory.view().is_complete()
         })
         .await;
@@ -18404,10 +18472,12 @@ mod tests {
         });
         cx.wait_for(browser, Duration::from_secs(3), |window, cx| {
             window.render_frame(cx);
-            app.read(cx)
-                .indexed_viewports
-                .get(&tab_id)
-                .is_some_and(|viewport| !viewport.loaded.is_empty())
+            (!indexed
+                || app
+                    .read(cx)
+                    .indexed_viewports
+                    .get(&tab_id)
+                    .is_some_and(|viewport| !viewport.loaded.is_empty()))
                 && window
                     .try_find("directory-item-0-1")
                     .is_some_and(|item| item.visible())
@@ -18844,6 +18914,127 @@ mod tests {
             active_child, sibling,
             "a click in the indexed parent column selects that folder"
         );
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_columns_parent_over_the_budget_is_index_backed(
+        cx: &mut TestAppContext,
+    ) {
+        // More rows than the parent columns may keep in memory, but not
+        // enough for the folder itself to be indexed.
+        let folder = tempfile::tempdir().unwrap();
+        write_files(folder.path(), COLUMN_RESIDENT_BUDGET + 500, &["aaa-one"]);
+        let (app, browser, tab_id, index_root) =
+            open_folder_under_index_root(folder.path(), Layout::Columns, false, cx).await;
+        let parent = StorePath::from_unix_path(folder.path().as_os_str());
+        let child = StorePath::from_unix_path(folder.path().join("aaa-one").as_os_str());
+
+        app.update(cx, |state, cx| {
+            state.navigate_with_column_parent(child.clone(), true, None, cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |_, cx| {
+            let directory = app.read(cx).focused_directory();
+            directory.location() == Some(&child) && directory.state() != &DirectoryState::Loading
+        })
+        .await;
+
+        cx.read(|cx| {
+            let state = app.read(cx);
+            let trail = &state.column_trails[&tab_id];
+            let pane = &trail.parents()[0];
+            assert!(
+                pane.index_reader().is_some(),
+                "a parent over the budget reads its rows from an index"
+            );
+            assert_eq!(pane.len(), COLUMN_RESIDENT_BUDGET + 501);
+            assert_eq!(trail.resident_len(), 0);
+            assert_eq!(
+                state.focused_directory().resident_limit(),
+                4_096,
+                "the current folder keeps its whole budget"
+            );
+        });
+        assert_eq!(
+            index_entries(index_root.path()).len(),
+            1,
+            "the column's index lives under the cache root"
+        );
+        let first_row = format!("column-parent-item-{tab_id:?}-0-0");
+        cx.wait_for(browser, Duration::from_secs(3), |window, cx| {
+            window.render_frame(cx);
+            window
+                .try_find(SharedString::from(first_row.clone()))
+                .is_some_and(|row| row.visible())
+        })
+        .await;
+        cx.update_window(browser, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(SharedString::from(first_row.clone())).label(),
+                Some("aaa-one"),
+                "the rows come from the index in sorted order"
+            );
+        })
+        .unwrap();
+
+        // Back to the parent drops the column and its index.
+        app.update(cx, |state, cx| {
+            state.navigate_with_column_parent(parent.clone(), false, None, cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            let directory = app.read(cx).focused_directory();
+            directory.location() == Some(&parent)
+                && directory.state() != &DirectoryState::Loading
+                && index_entries(index_root.path()).is_empty()
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn indexed_folder_columns_child_spills_sooner_when_parents_hold_rows(
+        cx: &mut TestAppContext,
+    ) {
+        // The parent fits the parents' budget; the child alone fits the
+        // folder bound, but not the bound less the parent's rows.
+        let folder = tempfile::tempdir().unwrap();
+        write_files(folder.path(), 500, &["aaa-one"]);
+        write_files(&folder.path().join("aaa-one"), 4_000, &[]);
+        let (app, browser, tab_id, index_root) =
+            open_folder_under_index_root(folder.path(), Layout::Columns, false, cx).await;
+        let child = StorePath::from_unix_path(folder.path().join("aaa-one").as_os_str());
+
+        app.update(cx, |state, cx| {
+            state.navigate_with_column_parent(child.clone(), true, None, cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(10), |_, cx| {
+            let directory = app.read(cx).focused_directory();
+            directory.location() == Some(&child)
+                && directory.state() == &DirectoryState::Ready
+                && directory.view().is_complete()
+        })
+        .await;
+
+        cx.read(|cx| {
+            let state = app.read(cx);
+            let trail = &state.column_trails[&tab_id];
+            assert_eq!(
+                trail.resident_len(),
+                501,
+                "a parent within the budget keeps its rows in memory"
+            );
+            let directory = state.focused_directory();
+            assert_eq!(directory.resident_limit(), 4_096 - 501);
+            assert!(
+                directory.is_indexed(),
+                "the child spills once its rows and the parent's would pass the bound"
+            );
+            assert_eq!(directory.indexed_count(), 4_000);
+            assert!(
+                trail.resident_len() + directory.view().items().len() <= 4_096,
+                "the tab holds at most one folder's bound of item models"
+            );
+        });
+        assert_eq!(index_entries(index_root.path()).len(), 1);
     }
 
     #[gpui_kit::test]
