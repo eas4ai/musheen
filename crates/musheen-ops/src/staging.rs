@@ -73,9 +73,43 @@ impl StagingPath {
         })
     }
 
+    /// Use only for providers whose keys are absolute slash-separated paths.
+    /// Opaque provider keys have no portable parent or sibling relationship.
+    pub fn for_slash_key_destination_with_nonce(
+        destination: &StorePath,
+        job_id: JobId,
+        generation: EventGeneration,
+        nonce: [u8; 16],
+    ) -> Result<Self, StagingError> {
+        let (provider, key) = destination
+            .provider_key()
+            .ok_or(StagingError::UnsupportedProvider)?;
+        let parent = slash_key_parent(key).ok_or(StagingError::InvalidSlashKey)?;
+        let nonce = nonce
+            .iter()
+            .fold(String::with_capacity(32), |mut output, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(output, "{byte:02x}");
+                output
+            });
+        let name = format!(
+            "{STAGING_PREFIX}{}-{}-{nonce}",
+            job_id.get(),
+            generation.get()
+        );
+        let mut staging = parent.to_vec();
+        if staging != b"/" {
+            staging.push(b'/');
+        }
+        staging.extend_from_slice(name.as_bytes());
+        let path = StorePath::from_provider_key(provider.clone(), staging)
+            .map_err(|_| StagingError::InvalidSlashKey)?;
+        Ok(Self { path })
+    }
+
     #[must_use]
     pub fn nonce(path: &StorePath) -> Option<[u8; 16]> {
-        let name = path.as_unix_path()?.file_name()?.as_bytes();
+        let name = path_name(path)?;
         let (_, _, encoded) = parse_staging_name(name)?;
         let encoded = encoded?;
         let mut nonce = [0_u8; 16];
@@ -95,16 +129,24 @@ impl StagingPath {
         generation: EventGeneration,
         nonce: [u8; 16],
     ) -> bool {
-        let Some(path_value) = path.as_unix_path() else {
-            return false;
+        let same_parent = match (path.as_unix_path(), destination.as_unix_path()) {
+            (Some(path), Some(destination)) => path.parent() == destination.parent(),
+            _ => match (path.provider_key(), destination.provider_key()) {
+                (
+                    Some((path_provider, path_key)),
+                    Some((destination_provider, destination_key)),
+                ) => {
+                    path_provider == destination_provider
+                        && slash_key_parent(path_key) == slash_key_parent(destination_key)
+                        && slash_key_parent(path_key).is_some()
+                }
+                _ => false,
+            },
         };
-        let Some(destination_value) = destination.as_unix_path() else {
-            return false;
-        };
-        path_value.parent() == destination_value.parent()
+        same_parent
             && Self::nonce(path) == Some(nonce)
-            && path_value.file_name().is_some_and(|name| {
-                name.as_bytes().starts_with(
+            && path_name(path).is_some_and(|name| {
+                name.starts_with(
                     format!("{STAGING_PREFIX}{}-{}-", job_id.get(), generation.get()).as_bytes(),
                 )
             })
@@ -122,11 +164,38 @@ impl StagingPath {
 
     #[must_use]
     pub fn is_owned_path(path: &StorePath) -> bool {
-        let Some(name) = path.as_unix_path().and_then(std::path::Path::file_name) else {
+        let Some(name) = path_name(path) else {
             return false;
         };
-        parse_staging_name(name.as_bytes()).is_some()
+        parse_staging_name(name).is_some()
     }
+}
+
+fn path_name(path: &StorePath) -> Option<&[u8]> {
+    if let Some(path) = path.as_unix_path() {
+        return path.file_name().map(OsStrExt::as_bytes);
+    }
+    let (_, key) = path.provider_key()?;
+    slash_key_parent(key)?;
+    key.rsplit(|byte| *byte == b'/').next()
+}
+
+fn slash_key_parent(key: &[u8]) -> Option<&[u8]> {
+    if key.len() < 2 || key[0] != b'/' || key.last() == Some(&b'/') || key.contains(&0) {
+        return None;
+    }
+    if key[1..]
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment.is_empty() || segment == b"." || segment == b"..")
+    {
+        return None;
+    }
+    let separator = key.iter().rposition(|byte| *byte == b'/')?;
+    Some(if separator == 0 {
+        &key[..1]
+    } else {
+        &key[..separator]
+    })
 }
 
 fn parse_staging_name(name: &[u8]) -> Option<(u64, u64, Option<&[u8]>)> {
@@ -169,6 +238,7 @@ fn parse_decimal(bytes: &[u8]) -> Option<u64> {
 pub enum StagingError {
     UnsupportedProvider,
     MissingParent,
+    InvalidSlashKey,
 }
 
 impl fmt::Display for StagingError {
@@ -178,6 +248,7 @@ impl fmt::Display for StagingError {
                 formatter.write_str("provider does not expose sibling staging paths")
             }
             Self::MissingParent => formatter.write_str("destination has no parent for staging"),
+            Self::InvalidSlashKey => formatter.write_str("provider path is not a valid slash key"),
         }
     }
 }

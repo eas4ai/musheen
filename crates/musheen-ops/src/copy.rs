@@ -605,12 +605,21 @@ impl CopySession {
             ));
         }
 
-        let staging = StagingPath::for_destination_with_nonce(
-            request.destination(),
-            request.job_id,
-            request.generation,
-            request.staging_nonce,
-        )
+        let staging = if request.destination().as_unix_path().is_some() {
+            StagingPath::for_destination_with_nonce(
+                request.destination(),
+                request.job_id,
+                request.generation,
+                request.staging_nonce,
+            )
+        } else {
+            StagingPath::for_slash_key_destination_with_nonce(
+                request.destination(),
+                request.job_id,
+                request.generation,
+                request.staging_nonce,
+            )
+        }
         .map_err(|_| {
             OperationFailure::before_publish(FailureKind::StagingUnavailable, request.destination())
         })?
