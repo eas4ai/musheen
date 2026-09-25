@@ -1,5 +1,0 @@
-cairn: DEP-007: fail
-DEP-007: nix is not declared
-DEP-007: proc-mounts is not declared
-DEP-007: xattr is not declared
-DEP-007: reflink-copy is not declared

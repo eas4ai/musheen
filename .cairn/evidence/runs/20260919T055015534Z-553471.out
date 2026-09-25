@@ -1,7 +1,0 @@
-cairn: DEP-008: fail
-DEP-008: walkdir is not declared
-DEP-008: rustix is not declared
-DEP-008: open is not declared
-DEP-008: camino is not declared
-DEP-008: wax is not declared
-DEP-008: notify is not declared
