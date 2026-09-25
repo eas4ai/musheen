@@ -1278,12 +1278,16 @@ impl LocalOperationQueue {
             .collect()
     }
 
-    pub fn finish(&mut self, id: JobId, result: Result<(), Box<str>>) -> Result<(), DropError> {
+    /// Records how a running job ended and returns its terminal state. A
+    /// completed or cancelled job is reported here and its scheduler record
+    /// goes with it; a failed job keeps its record for retry.
+    pub fn finish(&mut self, id: JobId, result: Result<(), Box<str>>) -> Result<JobState, DropError> {
         if self.scheduler.state(id) == Some(JobState::Cancelling) {
             self.scheduler.finish_cancel(id)?;
             self.failures.remove(&id);
             self.operations.remove(&id);
-            return Ok(());
+            self.scheduler.release(id)?;
+            return Ok(JobState::Cancelled);
         }
         match result {
             Ok(()) => {
@@ -1308,20 +1312,22 @@ impl LocalOperationQueue {
                 if let Some(undo) = undo {
                     self.remember_undo(id, undo);
                 }
+                self.scheduler.release(id)?;
+                Ok(JobState::Completed)
             }
             Err(error) => {
                 self.scheduler.fail(id)?;
                 self.failures.insert(id, error);
+                Ok(JobState::Failed)
             }
         }
-        Ok(())
     }
 
     pub fn finish_with_outcome(
         &mut self,
         id: JobId,
         outcome: LocalOperationOutcome,
-    ) -> Result<(), DropError> {
+    ) -> Result<JobState, DropError> {
         let receipt = match &outcome {
             LocalOperationOutcome::Trash(receipt) => match self.operations.get(&id) {
                 Some(LocalOperation::Trash(target)) if target.path() == receipt.original_path() => {
@@ -1331,13 +1337,13 @@ impl LocalOperationQueue {
             },
             _ => None,
         };
-        self.finish(id, Ok(()))?;
-        if self.scheduler.state(id) == Some(JobState::Completed)
+        let state = self.finish(id, Ok(()))?;
+        if state == JobState::Completed
             && let Some(undo) = receipt.and_then(TrashUndo::from_completed)
         {
             self.remember_undo(id, UndoCandidate::Trash(undo));
         }
-        Ok(())
+        Ok(state)
     }
 
     fn remember_undo(&mut self, id: JobId, undo: UndoCandidate) {
@@ -1351,7 +1357,7 @@ impl LocalOperationQueue {
         &mut self,
         id: JobId,
         review: Box<MoveMetadataReview>,
-    ) -> Result<(), DropError> {
+    ) -> Result<JobState, DropError> {
         self.scheduler.fail(id)?;
         let operation = match self.operations.get(&id) {
             Some(LocalOperation::Transfer {
@@ -1366,7 +1372,7 @@ impl LocalOperationQueue {
         self.operations.insert(id, operation);
         self.failures
             .insert(id, "metadata loss requires confirmation".into());
-        Ok(())
+        Ok(JobState::Failed)
     }
 
     #[must_use]
@@ -1396,6 +1402,7 @@ impl LocalOperationQueue {
         self.scheduler.cancel(id)?;
         self.operations.remove(&id);
         self.failures.remove(&id);
+        self.scheduler.release(id)?;
         Ok(())
     }
 
@@ -1409,13 +1416,20 @@ impl LocalOperationQueue {
         Ok(())
     }
 
-    pub fn cancel(&mut self, id: JobId) -> Result<(), DropError> {
-        let queued = self.scheduler.state(id) == Some(JobState::Queued);
+    /// Cancels a job and returns its state: cancelled at once for a queued
+    /// job, whose record goes with the report, or cancelling for a running
+    /// one, which `finish` reports later.
+    pub fn cancel(&mut self, id: JobId) -> Result<JobState, DropError> {
         self.scheduler.cancel(id)?;
-        if queued {
+        let state = self
+            .scheduler
+            .state(id)
+            .ok_or(DropError::MissingOperation(id))?;
+        if state == JobState::Cancelled {
             self.operations.remove(&id);
+            self.scheduler.release(id)?;
         }
-        Ok(())
+        Ok(state)
     }
 
     pub fn retry(&mut self, id: JobId) -> Result<EventGeneration, DropError> {
@@ -1438,8 +1452,31 @@ impl LocalOperationQueue {
 
     #[must_use]
     pub fn has_undo_candidate(&self, id: JobId) -> bool {
-        self.scheduler.state(id) == Some(JobState::Completed)
-            && self.undo_candidates.contains_key(&id)
+        // A candidate is remembered only for a completed job.
+        self.undo_candidates.contains_key(&id)
+    }
+
+    /// Drops what the queue keeps for a job the status center no longer
+    /// shows: its failure, its operation, its undo candidate and, once the
+    /// job is terminal, the scheduler's record. A job that is still queued,
+    /// running, paused, cancelling or interrupted is kept.
+    pub fn forget(&mut self, id: JobId) {
+        if matches!(
+            self.scheduler.state(id),
+            Some(
+                JobState::Queued
+                    | JobState::Running
+                    | JobState::Paused
+                    | JobState::Cancelling
+                    | JobState::Interrupted
+            )
+        ) {
+            return;
+        }
+        self.failures.remove(&id);
+        self.operations.remove(&id);
+        self.undo_candidates.remove(&id);
+        let _ = self.scheduler.release(id);
     }
 
     #[must_use]

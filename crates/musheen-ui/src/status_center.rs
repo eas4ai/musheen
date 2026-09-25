@@ -8,6 +8,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+/// The most finished entries the status center keeps; the oldest drop first.
+const FINISHED_HISTORY: usize = 500;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStatus {
@@ -151,6 +154,8 @@ pub struct StatusCenterModel {
     custom_actions: Vec<CustomActionStatus>,
     entries: BTreeMap<JobId, OperationStatusEntry>,
     order: Vec<JobId>,
+    /// The jobs pruning dropped since the hub last took them.
+    pruned: Vec<JobId>,
 }
 
 impl StatusCenterModel {
@@ -231,6 +236,7 @@ impl StatusCenterModel {
             },
         );
         self.order.push(id);
+        self.prune_finished();
         Ok(())
     }
 
@@ -324,6 +330,7 @@ impl StatusCenterModel {
         } else {
             OperationStatus::Failed
         };
+        self.prune_finished();
         Ok(())
     }
 
@@ -347,7 +354,43 @@ impl StatusCenterModel {
 
     pub fn mark_cancelled(&mut self, id: JobId) -> Result<(), StatusCenterError> {
         self.entry_mut(id)?.status = OperationStatus::Cancelled;
+        self.prune_finished();
         Ok(())
+    }
+
+    /// Keeps at most [`FINISHED_HISTORY`] finished entries, dropping the
+    /// oldest first. An entry that is pending, running, paused, interrupted
+    /// or waiting on the user is never dropped.
+    fn prune_finished(&mut self) {
+        let entries = &self.entries;
+        let finished = self
+            .order
+            .iter()
+            .filter(|id| entries.get(id).is_some_and(Self::is_finished))
+            .count();
+        let mut excess = finished.saturating_sub(FINISHED_HISTORY);
+        if excess == 0 {
+            return;
+        }
+        let mut dropped = Vec::with_capacity(excess);
+        self.order.retain(|id| {
+            if excess > 0 && entries.get(id).is_some_and(Self::is_finished) {
+                excess -= 1;
+                dropped.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+        for id in &dropped {
+            self.entries.remove(id);
+        }
+        self.pruned.extend(dropped);
+    }
+
+    /// The jobs pruning dropped since the last call, for the hub to forget.
+    pub fn take_pruned(&mut self) -> Vec<JobId> {
+        std::mem::take(&mut self.pruned)
     }
 
     pub fn mark_interrupted(&mut self, id: JobId) -> Result<(), StatusCenterError> {
@@ -575,7 +618,21 @@ impl StatusCenterModel {
             }
             model.order.push(entry.id);
         }
+        // A document written before the bound existed may hold more; the
+        // queue has no records for a restored job, so nothing is forgotten.
+        model.prune_finished();
+        model.pruned.clear();
         Ok(model)
+    }
+
+    fn is_finished(entry: &OperationStatusEntry) -> bool {
+        matches!(
+            entry.status,
+            OperationStatus::Completed
+                | OperationStatus::Failed
+                | OperationStatus::Cancelled
+                | OperationStatus::PartialSuccess
+        )
     }
 
     fn entry_mut(&mut self, id: JobId) -> Result<&mut OperationStatusEntry, StatusCenterError> {
