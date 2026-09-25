@@ -2148,9 +2148,10 @@ mod tests {
             .expect("one operation is ready");
         let id = operation.id();
         let outcome = operation.execute_detailed().expect("operation succeeds");
-        queue
+        let state = queue
             .finish_with_outcome(id, outcome.clone())
             .expect("operation finishes");
+        assert_eq!(state, JobState::Completed, "the finished job completed");
         outcome
     }
 
@@ -2603,7 +2604,11 @@ mod tests {
         assert!(!queue.can_undo(job));
         assert!(!queue.has_undo_candidate(job));
         assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
-        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(
+            queue.state(undo_job),
+            None,
+            "a completed job keeps no scheduler record"
+        );
         assert_eq!(fs::read(&original_path).unwrap(), b"original contents");
         assert!(!renamed_path.exists());
     }
@@ -2670,7 +2675,11 @@ mod tests {
 
         let undo_job = queue.submit_undo(job).unwrap();
         finish_one(&mut queue);
-        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(
+            queue.state(undo_job),
+            None,
+            "a completed job keeps no scheduler record"
+        );
         assert_eq!(fs::read(&original_path).unwrap(), b"original contents");
         assert!(!moved_path.exists());
     }
@@ -2836,7 +2845,11 @@ mod tests {
 
         let undo_job = queue.submit_undo(job).unwrap();
         let _ = finish_one(&mut queue);
-        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(
+            queue.state(undo_job),
+            None,
+            "a completed job keeps no scheduler record"
+        );
         assert_eq!(fs::read(&original_path).unwrap(), b"recoverable contents");
     }
 
@@ -2935,7 +2948,11 @@ mod tests {
 
         let undo_job = queue.submit_undo(job).unwrap();
         let _ = finish_one(&mut queue);
-        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(
+            queue.state(undo_job),
+            None,
+            "a completed job keeps no scheduler record"
+        );
         assert_eq!(fs::read(&actual_path).unwrap(), b"recoverable contents");
     }
 
@@ -2992,7 +3009,11 @@ mod tests {
         let id = queue.submit_archive(plan.clone()).unwrap();
 
         assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Archive);
-        assert_eq!(queue.state(id), Some(JobState::Completed));
+        assert_eq!(
+            queue.state(id),
+            None,
+            "a completed job keeps no scheduler record"
+        );
         assert_eq!(
             *route.execution.lock().unwrap(),
             Some((id, EventGeneration::new(0), plan))
@@ -3034,7 +3055,11 @@ mod tests {
         // Restore the file, so nothing from this test stays in the trash.
         let undo_job = queue.submit_undo(job).unwrap();
         let _ = finish_one(&mut queue);
-        assert_eq!(queue.state(undo_job), Some(JobState::Completed));
+        assert_eq!(
+            queue.state(undo_job),
+            None,
+            "a completed job keeps no scheduler record"
+        );
         assert_eq!(fs::read(&original_path).unwrap(), b"recoverable contents");
     }
 
