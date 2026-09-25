@@ -20,6 +20,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
@@ -894,15 +895,27 @@ fn publish_without_rename_noreplace(
         }
     } else if metadata.is_dir() {
         let source_mount = mount_identity(source, &metadata)?;
-        match fs::create_dir(destination) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(destination_conflict());
-            }
-            Err(error) => return Err(map_io(error)),
+        // Build the tree under a sibling staging name, claim the destination
+        // name, then publish with one rename over the empty claim. A failure
+        // before the rename leaves nothing under the destination name.
+        let staging = create_publish_staging(destination)?;
+        if let Err(error) = publish_directory_without_rename(source, &staging, &metadata) {
+            let _ = remove_path(&staging);
+            return Err(error);
         }
-        publish_directory_without_rename(source, destination, &metadata)
-            .map_err(|_| ProviderError::PublishUnknown)?;
+        if let Err(error) = fs::create_dir(destination) {
+            let _ = remove_path(&staging);
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                destination_conflict()
+            } else {
+                map_io(error)
+            });
+        }
+        if let Err(error) = fs::rename(&staging, destination) {
+            let _ = remove_path(&staging);
+            let _ = fs::remove_dir(destination);
+            return Err(map_io(error));
+        }
         remove_tree_without_crossing(source, source_mount)
             .map_err(|_| ProviderError::PublishUnknown)
     } else {
@@ -910,6 +923,35 @@ fn publish_without_rename_noreplace(
             "safe publication fallback does not support this file type".into(),
         ))
     }
+}
+
+static PUBLISH_STAGING_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Creates a fresh directory next to `destination` under a name that is
+/// never the destination's; the fallback publication builds the tree there.
+fn create_publish_staging(destination: &Path) -> Result<PathBuf, ProviderError> {
+    let parent = destination.parent().ok_or_else(|| {
+        ProviderError::Unsupported("destination has no containing directory".into())
+    })?;
+    let name = destination
+        .file_name()
+        .ok_or_else(|| ProviderError::Unsupported("destination has no file name".into()))?;
+    let process = std::process::id();
+    for _ in 0..64 {
+        let serial = PUBLISH_STAGING_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let mut staging_name = OsString::from(".");
+        staging_name.push(name);
+        staging_name.push(format!(".musheen-publish-{process}-{serial}"));
+        let staging = parent.join(staging_name);
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(map_io(error)),
+        }
+    }
+    Err(ProviderError::Other(
+        "could not create a staging directory next to the destination".into(),
+    ))
 }
 
 fn publish_directory_without_rename(
@@ -1537,6 +1579,71 @@ mod tests {
         assert_eq!(
             fs::read_link(destination.join("link")).unwrap(),
             Path::new("file")
+        );
+    }
+
+    #[test]
+    fn fallback_publish_failure_leaves_no_partial_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stage");
+        let destination = root.path().join("published");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("first"), b"complete").unwrap();
+        let locked = source.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("inner"), b"hidden").unwrap();
+        // An unreadable child directory fails the publication half way.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let outcome = rename_without_replacement_with(&source, &destination, |_, _| {
+            Err(rustix::io::Errno::INVAL)
+        });
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(outcome.is_err(), "an unreadable child fails the fallback");
+        assert!(
+            !destination.exists(),
+            "a failed publication leaves nothing under the destination name"
+        );
+        assert_eq!(fs::read(source.join("first")).unwrap(), b"complete");
+        assert_eq!(fs::read(locked.join("inner")).unwrap(), b"hidden");
+        let leftovers = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "stage")
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "no staging directory is left: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_publish_refuses_an_existing_destination_and_leaves_it_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stage");
+        let destination = root.path().join("published");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"new").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("kept"), b"old").unwrap();
+
+        let outcome = rename_without_replacement_with(&source, &destination, |_, _| {
+            Err(rustix::io::Errno::INVAL)
+        });
+
+        assert!(
+            matches!(outcome, Err(ProviderError::Unsupported(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read(destination.join("kept")).unwrap(), b"old");
+        assert!(!destination.join("file").exists());
+        assert_eq!(fs::read(source.join("file")).unwrap(), b"new");
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            2,
+            "only the source and the destination remain"
         );
     }
 
