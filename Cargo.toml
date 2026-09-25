@@ -87,7 +87,7 @@ sha2 = "0.11"
 trybuild = "1"
 tempfile = "3"
 tar = "0.4"
-tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt-multi-thread", "sync", "time"] }
 tree_magic_mini = { version = "3.2", default-features = false }
 ureq = { version = "3.1.4", default-features = false, features = ["rustls"] }
 trash = "5"

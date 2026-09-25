@@ -18,6 +18,7 @@ use musheen_core::{
     CapabilityState, Continuation, DirectoryWatch, DisplayPath, ItemId, ItemKind, MutationRequest,
     Page, PageRequest, ProviderId, Store, StoreError, StoreItem, StorePath, TotalHint,
 };
+use musheen_ops::StagingPath;
 use opendal::{Entry, Error, ErrorKind, Lister, Metadata, Operator};
 use opendal::{HttpTransporter, OperationContext};
 use opendal_http_transport_reqwest::ReqwestTransport;
@@ -25,12 +26,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_LIST_SESSIONS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,6 +382,66 @@ impl OpendalStore {
                     None,
                 )
             })
+        })
+    }
+
+    /// Uploads to a job-owned sibling staging key. It never writes the final
+    /// destination and refuses an existing staging object.
+    pub fn upload_staging_from_local<'a>(
+        &'a self,
+        local: &'a Path,
+        staging: &'a StagingPath,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<u64, RemoteError>> {
+        let remote_path = self.remote_path(staging.path());
+        let owned = staging.is_app_owned();
+        let writable = self.mutation_policy == RemoteMutationPolicy::CapabilitiesVerified
+            && self.operator.info().capability().write;
+        let operator = self.operator.clone();
+        let pool = self.pool.clone();
+        let protocol = self.protocol;
+        let local = local.to_path_buf();
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(RemoteError::new(
+                    protocol,
+                    RemoteErrorCategory::Cancelled,
+                    None,
+                ));
+            }
+            if !writable {
+                return Err(RemoteError::new(
+                    protocol,
+                    RemoteErrorCategory::Unsupported,
+                    None,
+                ));
+            }
+            if !owned {
+                return Err(RemoteError::new(
+                    protocol,
+                    RemoteErrorCategory::InvalidProfile,
+                    None,
+                ));
+            }
+            let remote_path =
+                remote_path.map_err(|category| RemoteError::new(protocol, category, None))?;
+            let lease = match pool {
+                Some(pool) => Some(
+                    pool.acquire(cancellation.clone())
+                        .await
+                        .map_err(|error| RemoteError::new(protocol, error.category(), None))?,
+                ),
+                None => None,
+            };
+            let operator = lease
+                .as_ref()
+                .map_or(operator, |lease| lease.connection().clone());
+            run_remote_streaming(cancellation, async move {
+                upload_staging(operator, &remote_path, &local).await
+            })
+            .await
+            .map_err(|category| RemoteError::new(protocol, category, None))?
+            .map_err(|category| RemoteError::new(protocol, category, None))
         })
     }
 
@@ -762,33 +827,102 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    if cancellation.is_cancelled() {
-        return Err(RemoteErrorCategory::Cancelled);
-    }
-    let handle = runtime()?.spawn(async move {
+    run_remote_streaming(cancellation, async move {
         tokio::time::timeout(REQUEST_TIMEOUT, operation)
             .await
             .map_err(|_| RemoteErrorCategory::Timeout)
-    });
+    })
+    .await?
+}
+
+async fn run_remote_streaming<F, T>(
+    cancellation: CancellationToken,
+    operation: F,
+) -> Result<T, RemoteErrorCategory>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    if cancellation.is_cancelled() {
+        return Err(RemoteErrorCategory::Cancelled);
+    }
+    let handle = runtime()?.spawn(operation);
     let abort = handle.abort_handle();
-    let operation = async move { handle.await.map_err(|_| RemoteErrorCategory::Unavailable)? };
-    let cancelled = async move {
-        future::poll_fn(|context| {
-            if cancellation.is_cancelled() {
-                std::task::Poll::Ready(())
-            } else {
-                cancellation.register_waker(context.waker());
-                std::task::Poll::Pending
-            }
-        })
-        .await;
-        Err(RemoteErrorCategory::Cancelled)
-    };
-    let result = future::race(operation, cancelled).await;
-    if matches!(result.as_ref(), Err(RemoteErrorCategory::Cancelled)) {
+    let result = future::race(
+        async move { handle.await.map_err(|_| RemoteErrorCategory::Unavailable) },
+        async move {
+            future::poll_fn(|context| {
+                if cancellation.is_cancelled() {
+                    std::task::Poll::Ready(())
+                } else {
+                    cancellation.register_waker(context.waker());
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Err(RemoteErrorCategory::Cancelled)
+        },
+    )
+    .await;
+    if matches!(result, Err(RemoteErrorCategory::Cancelled)) {
         abort.abort();
     }
     result
+}
+
+async fn upload_staging(
+    operator: Operator,
+    remote_path: &str,
+    local: &Path,
+) -> Result<u64, RemoteErrorCategory> {
+    let mut file = tokio::fs::File::open(local)
+        .await
+        .map_err(|_| RemoteErrorCategory::Permanent)?;
+    match tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(remote_path)).await {
+        Ok(Ok(_)) => return Err(RemoteErrorCategory::Conflict),
+        Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {}
+        Ok(Err(error)) => {
+            return Err(classify_opendal_error(&error, RemoteErrorContext::Read));
+        }
+        Err(_) => return Err(RemoteErrorCategory::Timeout),
+    }
+    let mut writer = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.writer(remote_path))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+    let transfer = async {
+        let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
+        let mut written = 0_u64;
+        loop {
+            let count = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, file.read(&mut buffer))
+                .await
+                .map_err(|_| RemoteErrorCategory::Timeout)?
+                .map_err(|_| RemoteErrorCategory::Permanent)?;
+            if count == 0 {
+                break;
+            }
+            tokio::time::timeout(
+                TRANSFER_IDLE_TIMEOUT,
+                writer.write(buffer[..count].to_vec()),
+            )
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+            written = written
+                .checked_add(count as u64)
+                .ok_or(RemoteErrorCategory::Permanent)?;
+        }
+        tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, writer.close())
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+        Ok(written)
+    }
+    .await;
+    if transfer.is_err() {
+        let _ = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, writer.abort()).await;
+    }
+    transfer
 }
 
 fn block_on_remote<F, T>(operation: F) -> Result<T, StoreError>

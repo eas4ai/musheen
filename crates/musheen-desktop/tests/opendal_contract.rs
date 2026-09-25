@@ -10,6 +10,7 @@ use musheen_desktop::remote::{
     http_store_from_profile, sftp_store_from_profile, webdav_store_from_profile,
 };
 use musheen_desktop::{ConnectionId, CredentialReference, SecretBuffer};
+use musheen_ops::{EventGeneration, JobId, StagingPath};
 use opendal::{
     Error, ErrorKind, Operator,
     services::{Http, Memory},
@@ -102,6 +103,94 @@ fn store(
         mutation_policy,
     )
     .expect("the adapter accepts a valid OpenDAL operator")
+}
+
+#[test]
+fn streaming_upload_writes_only_a_new_owned_staging_object() {
+    let operator = memory_operator();
+    let store = store(
+        operator.clone(),
+        RemoteProtocol::WebDav,
+        RemoteCasePolicy::Sensitive,
+        RemoteMutationPolicy::CapabilitiesVerified,
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let local = scratch.path().join("source.bin");
+    let payload = vec![0x5a; 2 * 1024 * 1024 + 7];
+    std::fs::write(&local, &payload).unwrap();
+    let destination = store.path("/target.bin").unwrap();
+    let staging = StagingPath::for_slash_key_destination_with_nonce(
+        &destination,
+        JobId::new(5).unwrap(),
+        EventGeneration::new(0),
+        [0x31; 16],
+    )
+    .unwrap();
+
+    let written =
+        block_on(store.upload_staging_from_local(&local, &staging, CancellationToken::new()))
+            .unwrap();
+
+    assert_eq!(written, payload.len() as u64);
+    assert_eq!(
+        block_on(operator.read(".musheen-stage-v1-5-0-31313131313131313131313131313131"))
+            .unwrap()
+            .to_vec(),
+        payload
+    );
+    assert!(block_on(operator.stat("target.bin")).is_err());
+    assert_eq!(
+        block_on(store.upload_staging_from_local(&local, &staging, CancellationToken::new()))
+            .unwrap_err()
+            .category(),
+        RemoteErrorCategory::Conflict
+    );
+    assert_eq!(
+        block_on(operator.read(".musheen-stage-v1-5-0-31313131313131313131313131313131"))
+            .unwrap()
+            .to_vec(),
+        payload
+    );
+}
+
+#[test]
+fn upload_rejects_read_only_and_cancelled_connections_without_writing() {
+    let operator = memory_operator();
+    let store = store(
+        operator.clone(),
+        RemoteProtocol::Http,
+        RemoteCasePolicy::Unknown,
+        RemoteMutationPolicy::ReadOnly,
+    );
+    let scratch = tempfile::tempdir().unwrap();
+    let local = scratch.path().join("source.bin");
+    std::fs::write(&local, b"payload").unwrap();
+    let destination = store.path("/target.bin").unwrap();
+    let staging = StagingPath::for_slash_key_destination_with_nonce(
+        &destination,
+        JobId::new(6).unwrap(),
+        EventGeneration::new(0),
+        [0x42; 16],
+    )
+    .unwrap();
+
+    assert_eq!(
+        block_on(store.upload_staging_from_local(&local, &staging, CancellationToken::new()))
+            .unwrap_err()
+            .category(),
+        RemoteErrorCategory::Unsupported
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    assert_eq!(
+        block_on(store.upload_staging_from_local(&local, &staging, cancellation))
+            .unwrap_err()
+            .category(),
+        RemoteErrorCategory::Cancelled
+    );
+    assert!(
+        block_on(operator.stat(".musheen-stage-v1-6-0-42424242424242424242424242424242")).is_err()
+    );
 }
 
 #[test]
