@@ -18252,7 +18252,8 @@ mod tests {
         );
         cx.update_window(browser, |_, window, cx| {
             window.render_frame(cx);
-            let label = window.find("status-bar").label();
+            let status_bar = window.find("status-bar");
+            let label = status_bar.label();
             assert!(
                 label
                     .as_deref()
