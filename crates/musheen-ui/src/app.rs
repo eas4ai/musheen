@@ -18575,10 +18575,7 @@ mod tests {
                 "the first row still renders"
             );
             let status = window.find("status-bar");
-            assert_eq!(
-                status.label().as_deref(),
-                Some("4096 items loaded — total unknown")
-            );
+            assert_eq!(status.label(), Some("4096 items loaded — total unknown"));
         })
         .unwrap();
     }
@@ -18719,9 +18716,7 @@ mod tests {
             let status_bar = window.find("status-bar");
             let label = status_bar.label();
             assert!(
-                label
-                    .as_deref()
-                    .is_some_and(|label| label.starts_with("2 items selected")),
+                label.is_some_and(|label| label.starts_with("2 items selected")),
                 "status bar: {label:?}"
             );
         })
@@ -18775,10 +18770,7 @@ mod tests {
             window.render_frame(cx);
             assert!(window.find("column-parent-0-0").visible());
             assert_eq!(
-                window
-                    .find(SharedString::from(first_row.clone()))
-                    .label()
-                    .as_deref(),
+                window.find(SharedString::from(first_row.clone())).label(),
                 Some("aaa-one"),
                 "the rows come from the index in its sorted order"
             );

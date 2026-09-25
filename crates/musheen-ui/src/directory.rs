@@ -1000,10 +1000,10 @@ mod indexed_watch_tests {
 
     #[test]
     fn indexed_folder_keeps_the_shown_items_when_the_index_cannot_be_written() {
-        let index_root = tempfile::tempdir().unwrap();
-        let blocked = index_root.path().join("blocked");
-        std::fs::write(&blocked, b"a file where the index root should be").unwrap();
-        let mut model = DirectoryModel::new(ResourceLimits::default()).with_index_root(blocked);
+        // A file where the index root should be makes every index write fail.
+        let blocked = tempfile::NamedTempFile::new().unwrap();
+        let mut model = DirectoryModel::new(ResourceLimits::default())
+            .with_index_root(blocked.path().to_path_buf());
         let load = model.begin_navigation(StorePath::from_unix_path("/many"));
         let request = PageRequest::first(&ResourceLimits::default());
 
