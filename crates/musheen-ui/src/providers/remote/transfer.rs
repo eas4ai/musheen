@@ -169,6 +169,11 @@ impl RemoteUploadRoute {
         review: &MoveMetadataReview,
         cancellation: CancellationToken,
     ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        let (source_snapshot, source_removal) = review.local_source_proof().ok_or_else(|| {
+            LocalOperationFailure::needs_attention(
+                "the reviewed upload has no local source removal proof",
+            )
+        })?;
         let expected_destination = review.destination_identity().ok_or_else(|| {
             LocalOperationFailure::needs_attention(
                 "the reviewed remote destination has no recorded identity",
@@ -186,7 +191,7 @@ impl RemoteUploadRoute {
                 LocalOperationFailure::needs_attention("the reviewed destination disappeared")
             })?;
         if completed.id() != expected_destination
-            || completed.size() != Some(review.source_snapshot().size())
+            || completed.size() != Some(source_snapshot.size())
         {
             return Err(LocalOperationFailure::needs_attention(
                 "the reviewed destination changed before source removal",
@@ -195,7 +200,7 @@ impl RemoteUploadRoute {
         let mut local = LocalStore::new();
         let current = CopyProvider::inspect(&mut local, review.source(), false)
             .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
-        if !source_unchanged(review.source_snapshot(), &current) {
+        if !source_unchanged(source_snapshot, &current) {
             return Err(LocalOperationFailure::needs_attention(
                 "the local source changed after the remote copy",
             ));
@@ -207,7 +212,7 @@ impl RemoteUploadRoute {
             .local_content_matches(
                 source_path,
                 review.destination(),
-                review.source_snapshot().size(),
+                source_snapshot.size(),
                 cancellation.clone(),
             )
             .await
@@ -230,13 +235,8 @@ impl RemoteUploadRoute {
                 "the reviewed destination changed during final verification",
             ));
         }
-        CopyProvider::remove_source(
-            &mut local,
-            review.source(),
-            review.source_snapshot(),
-            review.source_removal(),
-        )
-        .map_err(|error| {
+        CopyProvider::remove_source(&mut local, review.source(), source_snapshot, source_removal)
+            .map_err(|error| {
             LocalOperationFailure::needs_attention(format!(
                 "the destination was published but source removal needs inspection: {error}"
             ))
@@ -372,7 +372,7 @@ impl RemoteDownloadRoute {
     async fn execute_copy(
         &self,
         execution: ProviderTransferExecution<'_>,
-    ) -> Result<TransferOutcome, LocalOperationFailure> {
+    ) -> Result<(TransferOutcome, StoreItem), LocalOperationFailure> {
         let destination = execution.destination().as_unix_path().ok_or_else(|| {
             LocalOperationFailure::failed("the download destination is not a local path")
         })?;
@@ -392,6 +392,11 @@ impl RemoteDownloadRoute {
         if source.kind() != ItemKind::RegularFile {
             return Err(LocalOperationFailure::failed(
                 "remote download currently requires a regular file",
+            ));
+        }
+        if execution.action() == DropAction::Move && !remote.supports_conditional_delete() {
+            return Err(LocalOperationFailure::failed(
+                "the remote service cannot conditional delete a reviewed source",
             ));
         }
         if execution
@@ -515,7 +520,85 @@ impl RemoteDownloadRoute {
             })?;
         let target = CommandTargetRef::new(completed.id().clone(), completed.path().clone())
             .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
-        Ok(TransferOutcome::Completed(target))
+        Ok((TransferOutcome::Completed(target), source))
+    }
+
+    async fn finalize_reviewed_move(
+        &self,
+        review: &MoveMetadataReview,
+        cancellation: CancellationToken,
+    ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        let (source_identity, source_size) = review.remote_source_proof().ok_or_else(|| {
+            LocalOperationFailure::needs_attention(
+                "the reviewed download has no remote source proof",
+            )
+        })?;
+        let destination_identity = review.destination_identity().ok_or_else(|| {
+            LocalOperationFailure::needs_attention("the reviewed local destination has no identity")
+        })?;
+        let remote = self
+            .source
+            .connect_transfer(cancellation.clone())
+            .await
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        let local = LocalStore::new();
+        let destination = local
+            .resolve_item(review.destination())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .ok_or_else(|| {
+                LocalOperationFailure::needs_attention("the reviewed destination disappeared")
+            })?;
+        if destination.id() != destination_identity || destination.size() != Some(source_size) {
+            return Err(LocalOperationFailure::needs_attention(
+                "the reviewed local destination changed before source removal",
+            ));
+        }
+        let source = remote
+            .resolve_item(review.source())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .ok_or_else(|| {
+                LocalOperationFailure::needs_attention("the reviewed remote source disappeared")
+            })?;
+        if source.id() != source_identity || source.size() != Some(source_size) {
+            return Err(LocalOperationFailure::needs_attention(
+                "the reviewed remote source changed before removal",
+            ));
+        }
+        let local_path = review.destination().as_unix_path().ok_or_else(|| {
+            LocalOperationFailure::needs_attention("the reviewed download destination is not local")
+        })?;
+        let matches = remote
+            .local_content_matches(
+                local_path,
+                review.source(),
+                source_size,
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        if !matches {
+            return Err(LocalOperationFailure::needs_attention(
+                "the local destination no longer matches the remote source",
+            ));
+        }
+        if local
+            .resolve_item(review.destination())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .as_ref()
+            .is_none_or(|item| item.id() != destination_identity)
+        {
+            return Err(LocalOperationFailure::needs_attention(
+                "the local destination changed during final verification",
+            ));
+        }
+        remote
+            .delete_if_unchanged(review.source(), source_identity, cancellation)
+            .await
+            .map_err(|error| LocalOperationFailure::needs_attention(format!(
+                "the destination was published but remote source removal needs inspection: {error}"
+            )))?;
+        CommandTargetRef::new(destination.id().clone(), destination.path().clone())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))
     }
 }
 
@@ -539,14 +622,11 @@ impl ProviderTransferRoute for RemoteDownloadRoute {
 
     fn plan_destination(
         &self,
-        action: DropAction,
+        _action: DropAction,
         source: &StorePath,
         target: &StorePath,
         _expected_identity: Option<&ItemId>,
     ) -> Result<StorePath, Box<str>> {
-        if action != DropAction::Copy {
-            return Err("remote moves require metadata review and are not ready".into());
-        }
         let (provider, key) = source
             .provider_key()
             .ok_or("the download source is not a remote path")?;
@@ -577,16 +657,47 @@ impl ProviderTransferRoute for RemoteDownloadRoute {
         &self,
         execution: ProviderTransferExecution<'_>,
     ) -> Result<TransferOutcome, LocalOperationFailure> {
-        if execution.action() != DropAction::Copy {
-            return Err(LocalOperationFailure::failed(
-                "remote moves require metadata review and are not ready",
-            ));
-        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
-        runtime.block_on(self.execute_copy(execution))
+        let (outcome, source) = runtime.block_on(self.execute_copy(execution))?;
+        if execution.action() == DropAction::Copy {
+            return Ok(outcome);
+        }
+        let TransferOutcome::Completed(target) = outcome else {
+            return Err(LocalOperationFailure::needs_attention(
+                "the remote move did not produce a completed destination",
+            ));
+        };
+        let source_size = source.size().ok_or_else(|| {
+            LocalOperationFailure::needs_attention("the reviewed remote source has no size")
+        })?;
+        let review = MoveMetadataReview::new_remote(
+            execution.source().clone(),
+            execution.destination().clone(),
+            source.id().clone(),
+            source_size,
+            CopyStrategy::Streamed,
+            remote_move_metadata_loss(),
+        )
+        .with_destination_identity(target.id().clone());
+        Ok(TransferOutcome::MetadataReview {
+            target,
+            review: Box::new(review),
+        })
+    }
+
+    fn finalize_move(
+        &self,
+        review: &MoveMetadataReview,
+        cancellation: &CancellationToken,
+    ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        runtime.block_on(self.finalize_reviewed_move(review, cancellation.clone()))
     }
 }
 

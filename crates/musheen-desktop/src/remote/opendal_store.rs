@@ -340,6 +340,69 @@ impl OpendalStore {
             && self.operator.info().capability().copy
     }
 
+    #[must_use]
+    pub fn supports_conditional_delete(&self) -> bool {
+        self.mutation_policy == RemoteMutationPolicy::CapabilitiesVerified
+            && self.operator.info().capability().delete_with_if_match
+    }
+
+    /// Removes a source only if its current object identity still matches the
+    /// reviewed item. The final delete uses the server's atomic ETag condition.
+    pub fn delete_if_unchanged<'a>(
+        &'a self,
+        path: &'a StorePath,
+        expected: &'a ItemId,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RemoteError>> {
+        let remote_path = self.remote_path(path);
+        let supported = self.supports_conditional_delete();
+        let expected = expected.clone();
+        let provider = self.provider.clone();
+        let operator = self.operator.clone();
+        let pool = self.pool.clone();
+        let protocol = self.protocol;
+        Box::pin(async move {
+            if !supported {
+                return Err(RemoteError::new(
+                    protocol,
+                    RemoteErrorCategory::Unsupported,
+                    None,
+                ));
+            }
+            let remote_path =
+                remote_path.map_err(|category| RemoteError::new(protocol, category, None))?;
+            run_pooled_stream(
+                operator,
+                pool,
+                protocol,
+                cancellation,
+                move |operator| async move {
+                    let metadata =
+                        tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(&remote_path))
+                            .await
+                            .map_err(|_| RemoteErrorCategory::Timeout)?
+                            .map_err(|error| {
+                                classify_opendal_error(&error, RemoteErrorContext::Read)
+                            })?;
+                    let current = remote_item_identity(&provider, &remote_path, &metadata)
+                        .map_err(|_| RemoteErrorCategory::Permanent)?;
+                    if current != expected {
+                        return Err(RemoteErrorCategory::Conflict);
+                    }
+                    let etag = metadata.etag().ok_or(RemoteErrorCategory::Unsupported)?;
+                    tokio::time::timeout(
+                        TRANSFER_IDLE_TIMEOUT,
+                        operator.delete_with(&remote_path).if_match(etag),
+                    )
+                    .await
+                    .map_err(|_| RemoteErrorCategory::Timeout)?
+                    .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))
+                },
+            )
+            .await
+        })
+    }
+
     pub fn read_range<'a>(
         &'a self,
         path: &'a StorePath,
@@ -583,28 +646,7 @@ impl OpendalStore {
 
     fn item(&self, path: String, metadata: &Metadata) -> Result<StoreItem, StoreError> {
         let store_path = self.path(&format!("/{path}"))?;
-        let mut identity = blake3::Hasher::new();
-        identity.update(b"musheen-opendal-item-v1\0");
-        identity.update(self.provider.as_str().as_bytes());
-        identity.update(b"\0");
-        identity.update(path.as_bytes());
-        identity.update(b"\0");
-        if let Some(version) = metadata.version() {
-            identity.update(version.as_bytes());
-        }
-        identity.update(b"\0");
-        if let Some(etag) = metadata.etag() {
-            identity.update(etag.as_bytes());
-        }
-        identity.update(&metadata.content_length().to_be_bytes());
-        if let Some(modified) = metadata.last_modified() {
-            identity.update(&modified.into_inner().as_nanosecond().to_be_bytes());
-        }
-        let id = ItemId::new(
-            self.provider.clone(),
-            identity.finalize().as_bytes().to_vec(),
-        )
-        .map_err(|_| StoreError::Backend("remote item identity is invalid".into()))?;
+        let id = remote_item_identity(&self.provider, &path, metadata)?;
         let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("/");
         let kind = if metadata.is_dir() {
             ItemKind::Directory
@@ -645,6 +687,32 @@ impl OpendalStore {
             _ => false,
         }
     }
+}
+
+fn remote_item_identity(
+    provider: &ProviderId,
+    path: &str,
+    metadata: &Metadata,
+) -> Result<ItemId, StoreError> {
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"musheen-opendal-item-v1\0");
+    identity.update(provider.as_str().as_bytes());
+    identity.update(b"\0");
+    identity.update(path.as_bytes());
+    identity.update(b"\0");
+    if let Some(version) = metadata.version() {
+        identity.update(version.as_bytes());
+    }
+    identity.update(b"\0");
+    if let Some(etag) = metadata.etag() {
+        identity.update(etag.as_bytes());
+    }
+    identity.update(&metadata.content_length().to_be_bytes());
+    if let Some(modified) = metadata.last_modified() {
+        identity.update(&modified.into_inner().as_nanosecond().to_be_bytes());
+    }
+    ItemId::new(provider.clone(), identity.finalize().as_bytes().to_vec())
+        .map_err(|_| StoreError::Backend("remote item identity is invalid".into()))
 }
 
 impl Store for OpendalStore {

@@ -47,8 +47,28 @@ fn remote_move_review_retains_the_published_destination_identity() {
     .with_destination_identity(published.clone());
 
     assert_eq!(review.destination_identity(), Some(&published));
-    assert_eq!(review.source_snapshot(), &snapshot);
-    assert_eq!(review.source_removal(), &token);
+    assert_eq!(review.local_source_proof(), Some((&snapshot, &token)));
+    assert!(review.remote_source_proof().is_none());
+}
+
+#[test]
+fn remote_move_review_retains_remote_source_identity_and_size() {
+    let provider = ProviderId::new("remote").unwrap();
+    let source = StorePath::from_provider_key(provider.clone(), b"/source".to_vec()).unwrap();
+    let destination = StorePath::from_unix_path("/tmp/target");
+    let source_id = ItemId::new(provider, b"source-version".to_vec()).unwrap();
+
+    let review = MoveMetadataReview::new_remote(
+        source,
+        destination,
+        source_id.clone(),
+        17,
+        CopyStrategy::Streamed,
+        MetadataReport::default(),
+    );
+
+    assert_eq!(review.remote_source_proof(), Some((&source_id, 17)));
+    assert!(review.local_source_proof().is_none());
 }
 
 #[test]

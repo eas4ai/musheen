@@ -1128,6 +1128,50 @@ mod tests {
     }
 
     #[test]
+    fn remote_to_local_move_refuses_source_without_conditional_delete() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        future::block_on(operator.write("download-move.txt", b"remote payload".to_vec())).unwrap();
+        let runtime = ProviderRuntime::from_settings_with_connector(
+            &settings,
+            memory_remote_connector(operator.clone()),
+        )
+        .unwrap();
+        let remote_root = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap()
+        .items()[0]
+            .path()
+            .clone();
+        let (provider, _) = remote_root.provider_key().unwrap();
+        let source =
+            StorePath::from_provider_key(provider.clone(), b"/download-move.txt".to_vec()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+        queue
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Move).unwrap(),
+                StorePath::from_unix_path(scratch.path()),
+            )
+            .unwrap();
+        let failure = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap_err();
+        assert!(failure.message().contains("conditional delete"));
+        assert!(!scratch.path().join("download-move.txt").exists());
+        assert!(future::block_on(operator.exists("download-move.txt")).unwrap());
+    }
+
+    #[test]
     fn same_remote_copy_publishes_a_verified_new_destination() {
         let settings = settings_with_remote_profile();
         let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
@@ -1202,6 +1246,54 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.path().contains(".musheen-stage"))
         );
+    }
+
+    #[test]
+    fn same_remote_move_refuses_source_without_conditional_delete() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        future::block_on(operator.write("source.txt", b"keep source".to_vec())).unwrap();
+        future::block_on(operator.create_dir("target/")).unwrap();
+        let runtime = ProviderRuntime::from_settings_with_connector(
+            &settings,
+            memory_remote_connector(operator.clone()),
+        )
+        .unwrap();
+        let roots = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let (provider, _) = roots.items()[0].path().provider_key().unwrap();
+        let source =
+            StorePath::from_provider_key(provider.clone(), b"/source.txt".to_vec()).unwrap();
+        let target = StorePath::from_provider_key(provider.clone(), b"/target".to_vec()).unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+        queue
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Move).unwrap(),
+                target,
+            )
+            .unwrap();
+        let failure = queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap_err();
+
+        assert!(failure.message().contains("conditional delete"));
+        assert_eq!(
+            future::block_on(operator.read("source.txt"))
+                .unwrap()
+                .to_vec(),
+            b"keep source"
+        );
+        assert!(!future::block_on(operator.exists("target/source.txt")).unwrap());
     }
 
     #[test]

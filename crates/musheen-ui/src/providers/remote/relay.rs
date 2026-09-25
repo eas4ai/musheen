@@ -1,11 +1,12 @@
 use super::transfer::{local_staging_budget, publish_remote_verified};
 use super::*;
+use musheen_core::CommandTargetRef;
 use musheen_local::{
     DropAction, LocalOperationFailure, ProviderTransferExecution, TransferOutcome,
 };
 use musheen_ops::{
-    ProviderLimits, ProviderSnapshot, RemoteTransferCapabilities, RemoteTransferPlan,
-    RemoteTransferStrategy, StagingPath,
+    CopyStrategy, MoveMetadataReview, ProviderLimits, ProviderSnapshot, RemoteTransferCapabilities,
+    RemoteTransferPlan, RemoteTransferStrategy, StagingPath,
 };
 use std::fmt;
 
@@ -30,7 +31,7 @@ impl RemoteRelayRoute {
     async fn execute_copy(
         &self,
         execution: ProviderTransferExecution<'_>,
-    ) -> Result<TransferOutcome, LocalOperationFailure> {
+    ) -> Result<(TransferOutcome, StoreItem), LocalOperationFailure> {
         let cancellation = execution.cancellation().clone();
         cancellation
             .check()
@@ -57,6 +58,11 @@ impl RemoteRelayRoute {
         if source.kind() != ItemKind::RegularFile {
             return Err(LocalOperationFailure::failed(
                 "remote relay currently requires a regular file",
+            ));
+        }
+        if execution.action() == DropAction::Move && !source_store.supports_conditional_delete() {
+            return Err(LocalOperationFailure::failed(
+                "the remote service cannot conditional delete a reviewed source",
             ));
         }
         if execution
@@ -148,15 +154,22 @@ impl RemoteRelayRoute {
                 staging.path().clone(),
             ));
         }
-        verify_remote_stage(
+        let matches = remote_contents_match(
             &source_store,
             execution.source(),
             &destination_store,
-            &staging,
+            staging.path(),
             size,
             cancellation.clone(),
         )
-        .await?;
+        .await
+        .map_err(|error| LocalOperationFailure::recoverable(error, staging.path().clone()))?;
+        if !matches {
+            return Err(LocalOperationFailure::recoverable(
+                "remote staging content failed verification",
+                staging.path().clone(),
+            ));
+        }
         let current = source_store
             .resolve_item(execution.source())
             .map_err(|error| {
@@ -180,14 +193,91 @@ impl RemoteRelayRoute {
                 staging.path().clone(),
             ));
         }
-        publish_remote_verified(
+        let outcome = publish_remote_verified(
             &destination_store,
             &staging,
             execution.destination(),
             size,
             cancellation,
         )
+        .await?;
+        Ok((outcome, source))
+    }
+
+    async fn finalize_reviewed_move(
+        &self,
+        review: &MoveMetadataReview,
+        cancellation: CancellationToken,
+    ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        let (source_identity, source_size) = review.remote_source_proof().ok_or_else(|| {
+            LocalOperationFailure::needs_attention("the reviewed relay has no remote source proof")
+        })?;
+        let destination_identity = review.destination_identity().ok_or_else(|| {
+            LocalOperationFailure::needs_attention("the reviewed relay has no destination identity")
+        })?;
+        let source_store = self
+            .source
+            .connect_transfer(cancellation.clone())
+            .await
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        let destination_store = self
+            .destination
+            .connect_transfer(cancellation.clone())
+            .await
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        let source = source_store
+            .resolve_item(review.source())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .ok_or_else(|| {
+                LocalOperationFailure::needs_attention("the reviewed source disappeared")
+            })?;
+        let destination = destination_store
+            .resolve_item(review.destination())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .ok_or_else(|| {
+                LocalOperationFailure::needs_attention("the reviewed destination disappeared")
+            })?;
+        if source.id() != source_identity || source.size() != Some(source_size) {
+            return Err(LocalOperationFailure::needs_attention(
+                "the reviewed remote source changed",
+            ));
+        }
+        if destination.id() != destination_identity || destination.size() != Some(source_size) {
+            return Err(LocalOperationFailure::needs_attention(
+                "the reviewed remote destination changed",
+            ));
+        }
+        let matches = remote_contents_match(
+            &source_store,
+            review.source(),
+            &destination_store,
+            review.destination(),
+            source_size,
+            cancellation.clone(),
+        )
         .await
+        .map_err(LocalOperationFailure::needs_attention)?;
+        if !matches {
+            return Err(LocalOperationFailure::needs_attention(
+                "the published remote destination no longer matches the source",
+            ));
+        }
+        if destination_store
+            .resolve_item(review.destination())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .as_ref()
+            .is_none_or(|item| item.id() != destination_identity)
+        {
+            return Err(LocalOperationFailure::needs_attention(
+                "the remote destination changed during final verification",
+            ));
+        }
+        source_store.delete_if_unchanged(review.source(), source_identity, cancellation).await
+            .map_err(|error| LocalOperationFailure::needs_attention(format!(
+                "the destination was published but remote source removal needs inspection: {error}"
+            )))?;
+        CommandTargetRef::new(destination.id().clone(), destination.path().clone())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))
     }
 }
 
@@ -212,14 +302,11 @@ impl ProviderTransferRoute for RemoteRelayRoute {
 
     fn plan_destination(
         &self,
-        action: DropAction,
+        _action: DropAction,
         source: &StorePath,
         target: &StorePath,
         _expected_identity: Option<&ItemId>,
     ) -> Result<StorePath, Box<str>> {
-        if action != DropAction::Copy {
-            return Err("remote moves require metadata review and are not ready".into());
-        }
         let (source_provider, source_key) = source
             .provider_key()
             .ok_or("the source is not a remote path")?;
@@ -265,16 +352,47 @@ impl ProviderTransferRoute for RemoteRelayRoute {
         &self,
         execution: ProviderTransferExecution<'_>,
     ) -> Result<TransferOutcome, LocalOperationFailure> {
-        if execution.action() != DropAction::Copy {
-            return Err(LocalOperationFailure::failed(
-                "remote moves require metadata review and are not ready",
-            ));
-        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
-        runtime.block_on(self.execute_copy(execution))
+        let (outcome, source) = runtime.block_on(self.execute_copy(execution))?;
+        if execution.action() == DropAction::Copy {
+            return Ok(outcome);
+        }
+        let TransferOutcome::Completed(target) = outcome else {
+            return Err(LocalOperationFailure::needs_attention(
+                "the remote move did not produce a completed destination",
+            ));
+        };
+        let source_size = source.size().ok_or_else(|| {
+            LocalOperationFailure::needs_attention("the reviewed remote source has no size")
+        })?;
+        let review = MoveMetadataReview::new_remote(
+            execution.source().clone(),
+            execution.destination().clone(),
+            source.id().clone(),
+            source_size,
+            CopyStrategy::Streamed,
+            super::transfer::remote_move_metadata_loss(),
+        )
+        .with_destination_identity(target.id().clone());
+        Ok(TransferOutcome::MetadataReview {
+            target,
+            review: Box::new(review),
+        })
+    }
+
+    fn finalize_move(
+        &self,
+        review: &MoveMetadataReview,
+        cancellation: &CancellationToken,
+    ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        runtime.block_on(self.finalize_reviewed_move(review, cancellation.clone()))
     }
 }
 
@@ -338,39 +456,32 @@ async fn stage_streamed_copy(
     Ok(())
 }
 
-async fn verify_remote_stage(
+async fn remote_contents_match(
     source: &OpendalStore,
     source_path: &StorePath,
     destination: &OpendalStore,
-    staging: &StagingPath,
+    destination_path: &StorePath,
     size: u64,
     cancellation: CancellationToken,
-) -> Result<(), LocalOperationFailure> {
+) -> Result<bool, Box<str>> {
     let mut offset = 0_u64;
     while offset < size {
-        cancellation.check().map_err(|error| {
-            LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
-        })?;
+        cancellation
+            .check()
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
         let end = offset.saturating_add(VERIFY_CHUNK_BYTES).min(size);
         let original = source
             .read_range(source_path, offset..end, cancellation.clone())
             .await
-            .map_err(|error| {
-                LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
-            })?;
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
         let copied = destination
-            .read_range(staging.path(), offset..end, cancellation.clone())
+            .read_range(destination_path, offset..end, cancellation.clone())
             .await
-            .map_err(|error| {
-                LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
-            })?;
+            .map_err(|error| Box::<str>::from(error.to_string()))?;
         if original.len() as u64 != end - offset || original != copied {
-            return Err(LocalOperationFailure::recoverable(
-                "remote staging content failed verification",
-                staging.path().clone(),
-            ));
+            return Ok(false);
         }
         offset = end;
     }
-    Ok(())
+    Ok(true)
 }

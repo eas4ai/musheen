@@ -23,11 +23,22 @@ pub struct MoveOutcome {
 pub struct MoveMetadataReview {
     source: StorePath,
     destination: StorePath,
-    source_snapshot: EntrySnapshot,
-    source_removal: SourceRemovalToken,
+    source_proof: MoveSourceProof,
     destination_identity: Option<ItemId>,
     copy_strategy: CopyStrategy,
     metadata: MetadataReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MoveSourceProof {
+    Local {
+        snapshot: EntrySnapshot,
+        removal: SourceRemovalToken,
+    },
+    Remote {
+        identity: ItemId,
+        size: u64,
+    },
 }
 
 impl MoveMetadataReview {
@@ -43,8 +54,32 @@ impl MoveMetadataReview {
         Self {
             source,
             destination,
-            source_snapshot,
-            source_removal,
+            source_proof: MoveSourceProof::Local {
+                snapshot: source_snapshot,
+                removal: source_removal,
+            },
+            destination_identity: None,
+            copy_strategy,
+            metadata,
+        }
+    }
+
+    #[must_use]
+    pub fn new_remote(
+        source: StorePath,
+        destination: StorePath,
+        source_identity: ItemId,
+        source_size: u64,
+        copy_strategy: CopyStrategy,
+        metadata: MetadataReport,
+    ) -> Self {
+        Self {
+            source,
+            destination,
+            source_proof: MoveSourceProof::Remote {
+                identity: source_identity,
+                size: source_size,
+            },
             destination_identity: None,
             copy_strategy,
             metadata,
@@ -73,13 +108,19 @@ impl MoveMetadataReview {
     }
 
     #[must_use]
-    pub const fn source_snapshot(&self) -> &EntrySnapshot {
-        &self.source_snapshot
+    pub const fn local_source_proof(&self) -> Option<(&EntrySnapshot, &SourceRemovalToken)> {
+        match &self.source_proof {
+            MoveSourceProof::Local { snapshot, removal } => Some((snapshot, removal)),
+            MoveSourceProof::Remote { .. } => None,
+        }
     }
 
     #[must_use]
-    pub const fn source_removal(&self) -> &SourceRemovalToken {
-        &self.source_removal
+    pub const fn remote_source_proof(&self) -> Option<(&ItemId, u64)> {
+        match &self.source_proof {
+            MoveSourceProof::Local { .. } => None,
+            MoveSourceProof::Remote { identity, size } => Some((identity, *size)),
+        }
     }
 
     #[must_use]
@@ -201,10 +242,13 @@ pub fn complete_move_after_metadata_review<P: CopyProvider>(
             review.destination(),
         ));
     }
+    let (source_snapshot, source_removal) = review.local_source_proof().ok_or_else(|| {
+        OperationFailure::after_publish(FailureKind::VerificationFailed, review.destination())
+    })?;
     let destination_is_still_verified = provider
         .verify(
             review.source(),
-            &review.source_snapshot,
+            source_snapshot,
             review.destination(),
             review.metadata(),
         )
@@ -227,8 +271,8 @@ pub fn complete_move_after_metadata_review<P: CopyProvider>(
         provider,
         review.source(),
         review.destination(),
-        &review.source_snapshot,
-        &review.source_removal,
+        source_snapshot,
+        source_removal,
     )?;
     Ok(MoveOutcome {
         strategy: MoveStrategy::VerifiedCopy,
