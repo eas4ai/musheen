@@ -90,6 +90,20 @@ fn arguments(launch: &PreparedLaunch) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn direct_executable_launch_keeps_a_hostile_name_as_one_program_without_a_shell() {
+    let fixture = Fixture::new();
+    let program = fixture.executable("run $(touch escaped); echo hi");
+    let launch = PreparedLaunch::for_executable_file(&program).unwrap();
+    assert_eq!(launch.program(), program.as_os_str());
+    assert!(launch.arguments().is_empty());
+    assert_eq!(launch.working_directory(), program.parent());
+    assert!(matches!(
+        PreparedLaunch::for_executable_file(Path::new("relative")),
+        Err(LaunchError::InvalidExecutable(_))
+    ));
+}
+
+#[test]
 fn file_placeholders_preserve_argument_boundaries_without_a_shell() {
     let fixture = Fixture::new();
     let application = fixture.application(

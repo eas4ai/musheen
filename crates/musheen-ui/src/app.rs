@@ -83,12 +83,12 @@ use musheen_desktop::{
     DesktopPaths, ElevatedRootReference, ExternalTerminalCommand, FolderIdentity,
     FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
     MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation, OperationUsage,
-    OperationUse, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent, SecretBuffer,
-    SessionStore, SystemClock, SystemFileClipboard, SystemProcessRunner, TagMoveOutcome,
-    TerminalCommand, TerminalError, TerminalModel, TerminalProfile, TerminalSession, TerminalSize,
-    ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode, ThumbnailRequest,
-    ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError, VolumeId,
-    VolumeRuntime,
+    OperationUse, PreparedLaunch, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent,
+    SecretBuffer, SessionStore, SystemClock, SystemFileClipboard, SystemProcessRunner,
+    TagMoveOutcome, TerminalCommand, TerminalError, TerminalModel, TerminalProfile,
+    TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
+    ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError,
+    VolumeId, VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -3195,6 +3195,19 @@ impl OperationUsage for HubVolumeUsage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutableHandling {
+    Ask,
+    Open,
+    Run,
+}
+
+enum ExecutableRunError {
+    TargetChanged,
+    NotExecutable,
+    Launch(LaunchError),
+}
+
 struct MusheenApp {
     directories: HashMap<TabId, DirectoryModel>,
     indexed_viewports: HashMap<TabId, IndexedViewport>,
@@ -3230,6 +3243,7 @@ struct MusheenApp {
     sidebar_visible: bool,
     customization_keys: Option<Subscription>,
     custom_actions: musheen_desktop::CustomActionDocument,
+    executable_handling: ExecutableHandling,
     custom_action_warning: Option<&'static str>,
     script_load_warning: Option<&'static str>,
     running_custom_actions: usize,
@@ -3911,6 +3925,15 @@ impl MusheenApp {
             });
         let mut this = Self {
             custom_actions: custom_actions::from_settings(settings.as_ref()),
+            executable_handling: match settings
+                .as_ref()
+                .and_then(|settings| settings.value("files.executable"))
+                .as_deref()
+            {
+                Some("open") => ExecutableHandling::Open,
+                Some("run") => ExecutableHandling::Run,
+                _ => ExecutableHandling::Ask,
+            },
             custom_action_warning: None,
             script_load_warning: None,
             running_custom_actions: 0,
@@ -7598,7 +7621,8 @@ impl MusheenApp {
             has_dot_name_semantics: is_local,
             target_is_hidden: selected_item.is_some_and(|item| is_hidden_path(item.path())),
             target_is_pinned: selected_is_pinned,
-            executable_run_enabled: matches!(executable_state, Some(CapabilityState::Supported)),
+            executable_run_enabled: self.executable_handling != ExecutableHandling::Open
+                && matches!(executable_state, Some(CapabilityState::Supported)),
             capabilities,
             provider_actions,
             show_hidden: self
@@ -8343,6 +8367,9 @@ impl MusheenApp {
             }
             (CommandAction::Preview, CommandParameters::Targets(targets)) => {
                 self.dispatch_preview_command(targets, origin_tab, cx);
+            }
+            (CommandAction::Run, CommandParameters::Targets(targets)) => {
+                self.dispatch_run_command(targets, origin_tab, confirmed, cx);
             }
             (
                 create_action @ (CommandAction::NewDirectory | CommandAction::NewEmptyFile),
@@ -10285,6 +10312,139 @@ impl MusheenApp {
         }
     }
 
+    fn dispatch_run_command(
+        &mut self,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !confirmed {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.run-review-required")
+                    .expect("run review refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        if self.executable_handling == ExecutableHandling::Open {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.backend-unavailable")
+                    .expect("backend refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(tab_id) = origin_tab else {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.origin-unavailable")
+                    .expect("origin refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if self.navigation.focused_tab().id() != tab_id || !self.directories.contains_key(&tab_id) {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.origin-unavailable")
+                    .expect("origin refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let [target] = targets else {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.backend-unavailable")
+                    .expect("backend refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+            self.operation_error = Some(error);
+            cx.notify();
+            return;
+        }
+        let Some(path) = target.path().as_unix_path().map(Path::to_path_buf) else {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.backend-unavailable")
+                    .expect("backend refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        let target = target.clone();
+        let store = Arc::clone(&self.store);
+        let runner = Arc::clone(&self.application_runner);
+        self.operation_error = None;
+        cx.notify();
+        let work = cx.background_spawn(async move {
+            let current = store
+                .resolve_item(target.path())
+                .map_err(|_| ExecutableRunError::TargetChanged)?;
+            if !current.is_some_and(|item| {
+                item.id() == target.id()
+                    && item.path() == target.path()
+                    && item.kind() == ItemKind::RegularFile
+            }) {
+                return Err(ExecutableRunError::TargetChanged);
+            }
+            if !matches!(
+                store.executable_state(target.path()),
+                Ok(CapabilityState::Supported)
+            ) {
+                return Err(ExecutableRunError::NotExecutable);
+            }
+            let launch =
+                PreparedLaunch::for_executable_file(&path).map_err(ExecutableRunError::Launch)?;
+            runner
+                .spawn(&launch)
+                .map_err(LaunchError::Spawn)
+                .map_err(ExecutableRunError::Launch)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.operation_error = result.err().map(|error| match error {
+                    ExecutableRunError::TargetChanged => state
+                        .catalog
+                        .message("context.target-changed")
+                        .expect("target refusal is localized")
+                        .into(),
+                    ExecutableRunError::NotExecutable => state
+                        .catalog
+                        .message("context.backend-unavailable")
+                        .expect("backend refusal is localized")
+                        .into(),
+                    ExecutableRunError::Launch(error) => format!(
+                        "{}: {error}",
+                        state
+                            .catalog
+                            .message("context.run-failed")
+                            .expect("run failure is localized")
+                    )
+                    .into_boxed_str(),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn copyable_location_text(&self, path: &StorePath) -> Option<String> {
         if let Some(local) = path.as_unix_path() {
             if !local.is_absolute() {
@@ -10373,6 +10533,7 @@ impl MusheenApp {
                 | CommandAction::Copy
                 | CommandAction::CopyLocation
                 | CommandAction::Preview
+                | CommandAction::Run
                 | CommandAction::Cut
                 | CommandAction::PasteInto
                 | CommandAction::MoveToTrash
@@ -20326,6 +20487,7 @@ mod tests {
             CommandAction::Duplicate,
             CommandAction::CopyLocation,
             CommandAction::Preview,
+            CommandAction::Run,
             CommandAction::NewFromTemplate,
             CommandAction::Hide,
             CommandAction::Unhide,
@@ -20982,6 +21144,173 @@ mod tests {
                 )
             );
         });
+    }
+
+    #[gpui_kit::test]
+    async fn run_context_action_needs_review_and_spawns_one_exact_local_program(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("run $(touch escaped); echo hi");
+        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        filesystem::set_permissions(&executable, filesystem::Permissions::from_mode(0o755))
+            .unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&executable);
+        let runner = Arc::new(RecordingApplicationRunner::default());
+
+        app.update(cx, |state, cx| {
+            state.application_runner = runner.clone();
+            state.executable_handling = ExecutableHandling::Ask;
+            let tab = state.navigation.focused_tab().id();
+            let location = state.navigation.focused_tab().location().clone();
+            let context = state.context_for_menu(
+                tab,
+                MenuTarget::Item,
+                &location,
+                std::slice::from_ref(&target),
+            );
+            assert_eq!(context.target, CommandTarget::ExecutableFile);
+            assert!(context.executable_run_enabled);
+            state.dispatch_typed_context_command(
+                CommandAction::Run,
+                CommandParameters::targets(vec![target.clone()]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        assert!(runner.0.lock().unwrap().is_empty());
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::Run,
+                CommandParameters::targets(vec![target]),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                true,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| {
+            runner.0.lock().unwrap().len() == 1
+        })
+        .await;
+        let launches = runner.0.lock().unwrap();
+        assert_eq!(launches[0].program(), executable.as_os_str());
+        assert!(launches[0].arguments().is_empty());
+        assert_eq!(launches[0].working_directory(), Some(temporary.path()));
+    }
+
+    #[gpui_kit::test]
+    async fn run_context_action_obeys_open_policy_and_refuses_a_replaced_target(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("tool");
+        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        filesystem::set_permissions(&executable, filesystem::Permissions::from_mode(0o755))
+            .unwrap();
+        let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&executable);
+        let runner = Arc::new(RecordingApplicationRunner::default());
+
+        app.update(cx, |state, cx| {
+            state.application_runner = runner.clone();
+            state.executable_handling = ExecutableHandling::Open;
+            let tab = state.navigation.focused_tab().id();
+            let location = state.navigation.focused_tab().location().clone();
+            let context = state.context_for_menu(
+                tab,
+                MenuTarget::Item,
+                &location,
+                std::slice::from_ref(&target),
+            );
+            assert!(!context.executable_run_enabled);
+            state.dispatch_typed_context_command(
+                CommandAction::Run,
+                CommandParameters::targets(vec![target.clone()]),
+                Some(tab),
+                None,
+                true,
+                cx,
+            );
+            assert!(state.operation_error.is_some());
+        });
+        assert!(runner.0.lock().unwrap().is_empty());
+
+        filesystem::rename(&executable, temporary.path().join("old-tool")).unwrap();
+        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        app.update(cx, |state, cx| {
+            state.executable_handling = ExecutableHandling::Run;
+            state.dispatch_typed_context_command(
+                CommandAction::Run,
+                CommandParameters::targets(vec![target]),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                true,
+                cx,
+            );
+            assert_eq!(
+                state.operation_error.as_deref(),
+                Some(state.catalog.message("context.target-changed").unwrap())
+            );
+        });
+        assert!(runner.0.lock().unwrap().is_empty());
+    }
+
+    #[gpui_kit::test]
+    async fn executable_handling_loads_the_saved_file_preference(cx: &mut TestAppContext) {
+        let mut settings = musheen_desktop::SettingsDocument::default();
+        settings.set_value("files.executable", "open").unwrap();
+        cx.update(|cx| cx.set_global(crate::settings::RuntimeSettings(settings)));
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("item.txt"), b"content").unwrap();
+        let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        assert_eq!(
+            cx.read(|cx| app.read(cx).executable_handling),
+            ExecutableHandling::Open
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn run_context_action_rechecks_executable_permission_before_spawn(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("tool");
+        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        filesystem::set_permissions(&executable, filesystem::Permissions::from_mode(0o755))
+            .unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&executable);
+        let runner = Arc::new(RecordingApplicationRunner::default());
+        app.update(cx, |state, _| state.application_runner = runner.clone());
+        filesystem::set_permissions(&executable, filesystem::Permissions::from_mode(0o644))
+            .unwrap();
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::Run,
+                CommandParameters::targets(vec![target]),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                true,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).operation_error.is_some()
+        })
+        .await;
+        assert!(runner.0.lock().unwrap().is_empty());
     }
 
     #[gpui_kit::test]

@@ -63,6 +63,22 @@ pub struct PreparedLaunch {
 }
 
 impl PreparedLaunch {
+    /// Execute one absolute local file directly, with no shell or implicit arguments.
+    pub fn for_executable_file(path: &Path) -> Result<Self, LaunchError> {
+        if !path.is_absolute() || !valid_os_argument(path.as_os_str()) {
+            return Err(LaunchError::InvalidExecutable(path.to_path_buf()));
+        }
+        let working_directory = path
+            .parent()
+            .ok_or_else(|| LaunchError::InvalidExecutable(path.to_path_buf()))?;
+        validate_working_directory(Some(working_directory))?;
+        Ok(Self {
+            program: path.as_os_str().to_os_string(),
+            arguments: Vec::new(),
+            working_directory: Some(working_directory.to_path_buf()),
+        })
+    }
+
     #[must_use]
     pub fn program(&self) -> &OsStr {
         &self.program
@@ -532,6 +548,7 @@ impl LaunchRefusal {
 pub enum LaunchError {
     InvalidUri,
     InvalidExec,
+    InvalidExecutable(PathBuf),
     InvalidFieldCode,
     InvalidTerminalCommand,
     InvalidWorkingDirectory(PathBuf),
@@ -546,6 +563,9 @@ impl std::fmt::Display for LaunchError {
         match self {
             Self::InvalidUri => formatter.write_str("invalid launch URI"),
             Self::InvalidExec => formatter.write_str("invalid desktop entry Exec value"),
+            Self::InvalidExecutable(path) => {
+                write!(formatter, "invalid executable file: {}", path.display())
+            }
             Self::InvalidFieldCode => formatter.write_str("invalid desktop entry field code"),
             Self::InvalidTerminalCommand => formatter.write_str("invalid terminal command"),
             Self::InvalidWorkingDirectory(path) => {
