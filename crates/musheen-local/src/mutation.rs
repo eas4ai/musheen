@@ -2050,6 +2050,46 @@ mod tests {
         )
     }
 
+    /// Two temporary directories on different mounts: the first on /dev/shm,
+    /// the second under the temp dir or next to the test binary, whichever
+    /// /dev/shm does not share a device with. The cross-mount tests need a
+    /// rename that fails with EXDEV; a runner without a second mount fails
+    /// here instead of passing without crossing anything.
+    fn two_mount_roots() -> (tempfile::TempDir, tempfile::TempDir) {
+        let shared_memory =
+            tempfile::tempdir_in("/dev/shm").expect("/dev/shm holds a temporary directory");
+        let shared_device = fs::metadata(shared_memory.path()).unwrap().dev();
+        let candidates = [
+            Some(std::env::temp_dir()),
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf)),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            let differs = fs::metadata(&candidate)
+                .map(|metadata| metadata.dev() != shared_device)
+                .unwrap_or(false);
+            if differs {
+                let other = tempfile::tempdir_in(&candidate).unwrap();
+                return (shared_memory, other);
+            }
+        }
+        panic!("this check needs a temporary directory on a mount other than /dev/shm");
+    }
+
+    /// The trash refusal tests need a directory the runner cannot write. A
+    /// privileged runner (root or CAP_DAC_OVERRIDE) writes anywhere, and the
+    /// trash crate would then create its directory there, so the check
+    /// cannot run as that user.
+    fn assert_unwritable(path: &Path) {
+        assert!(
+            rustix::fs::access(path, rustix::fs::Access::WRITE_OK).is_err(),
+            "this check needs an unprivileged runner: uid {} can write {}",
+            rustix::process::getuid().as_raw(),
+            path.display()
+        );
+    }
+
     #[test]
     fn moving_a_destination_aside_rolls_back_when_directory_sync_fails() {
         let temporary = tempfile::tempdir().expect("temporary directory is available");
@@ -2214,15 +2254,7 @@ mod tests {
 
     #[test]
     fn cross_device_replace_preserves_verified_destination_after_partial_removal() {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let destination_root = tempfile::tempdir().unwrap();
-        let source_root = tempfile::tempdir_in("/dev/shm").unwrap();
-        if fs::metadata(destination_root.path()).unwrap().dev()
-            == fs::metadata(source_root.path()).unwrap().dev()
-        {
-            return;
-        }
+        let (source_root, destination_root) = two_mount_roots();
         let source = source_root.path().join("tree");
         let destination = destination_root.path().join("tree");
         fs::create_dir(&source).unwrap();
@@ -2259,15 +2291,7 @@ mod tests {
     // link is removed.
     #[test]
     fn cross_device_move_removes_a_source_tree_holding_a_hard_link_pair() {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let destination_root = tempfile::tempdir().unwrap();
-        let source_root = tempfile::tempdir_in("/dev/shm").unwrap();
-        if fs::metadata(destination_root.path()).unwrap().dev()
-            == fs::metadata(source_root.path()).unwrap().dev()
-        {
-            return;
-        }
+        let (source_root, destination_root) = two_mount_roots();
         let source = source_root.path().join("tree");
         let destination = destination_root.path().join("tree");
         fs::create_dir_all(source.join("sub")).unwrap();
@@ -2290,12 +2314,12 @@ mod tests {
     fn trash_is_refused_where_the_trash_crate_would_copy_across_devices() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let volume = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let (home, volume) = two_mount_roots();
         let item = volume.path().join("writable").join("item.txt");
         fs::create_dir(volume.path().join("writable")).unwrap();
         fs::write(&item, b"item").unwrap();
         fs::set_permissions(volume.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        assert_unwritable(volume.path());
         let mut store = LocalStore::new();
         store.trash_environment = Some(TrashEnvironment {
             home_trash: home.path().join("Trash"),
@@ -2305,12 +2329,99 @@ mod tests {
         let path = StorePath::from_unix_path(item.as_os_str());
 
         let supported = DeleteProvider::supports_trash(&mut store, &path).unwrap();
-        let identity = DeleteProvider::identity(&mut store, &path).unwrap().unwrap();
+        let identity = DeleteProvider::identity(&mut store, &path)
+            .unwrap()
+            .unwrap();
         let refusal = store.move_to_trash(&DeleteTarget::new(path, identity.to_vec()));
 
         fs::set_permissions(volume.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(!supported, "a volume whose root cannot hold a trash directory has no trash");
-        assert!(matches!(refusal, Err(MutationError::Unsupported)), "{refusal:?}");
+        assert!(
+            !supported,
+            "a volume whose root cannot hold a trash directory has no trash"
+        );
+        assert!(
+            matches!(refusal, Err(MutationError::Unsupported)),
+            "{refusal:?}"
+        );
+        assert_eq!(fs::read(&item).unwrap(), b"item", "the item stays in place");
+    }
+
+    // OPS-008: a shared .Trash whose per-user directory exists but cannot be
+    // written sends the trash crate to the home trash on another mount, where
+    // it copies. Normal delete refuses instead.
+    #[test]
+    fn trash_is_refused_where_the_shared_trash_per_user_directory_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (home, volume) = two_mount_roots();
+        let item = volume.path().join("item.txt");
+        fs::write(&item, b"item").unwrap();
+        let shared = volume.path().join(".Trash");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        let mine = shared.join("1000");
+        fs::create_dir(&mine).unwrap();
+        fs::set_permissions(&mine, fs::Permissions::from_mode(0o555)).unwrap();
+        assert_unwritable(&mine);
+        let mut store = LocalStore::new();
+        store.trash_environment = Some(TrashEnvironment {
+            home_trash: home.path().join("Trash"),
+            mount_points: vec![fs::canonicalize(volume.path()).unwrap(), PathBuf::from("/")],
+            uid: 1000,
+        });
+        let path = StorePath::from_unix_path(item.as_os_str());
+
+        let supported = DeleteProvider::supports_trash(&mut store, &path).unwrap();
+        let identity = DeleteProvider::identity(&mut store, &path)
+            .unwrap()
+            .unwrap();
+        let refusal = store.move_to_trash(&DeleteTarget::new(path, identity.to_vec()));
+
+        fs::set_permissions(&mine, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !supported,
+            "an unwritable per-user directory in a shared .Trash has no trash"
+        );
+        assert!(
+            matches!(refusal, Err(MutationError::Unsupported)),
+            "{refusal:?}"
+        );
+        assert_eq!(fs::read(&item).unwrap(), b"item", "the item stays in place");
+    }
+
+    // OPS-008: a per-volume trash directory on another mount (a nested
+    // subvolume, or here a link across mounts, which the crate follows) makes
+    // the crate's rename fail with EXDEV and copy. Normal delete refuses.
+    #[test]
+    fn trash_is_refused_where_the_volume_trash_directory_is_on_another_mount() {
+        let (elsewhere, volume) = two_mount_roots();
+        let item = volume.path().join("item.txt");
+        fs::write(&item, b"item").unwrap();
+        let trash_target = elsewhere.path().join("volume-trash");
+        fs::create_dir(&trash_target).unwrap();
+        std::os::unix::fs::symlink(&trash_target, volume.path().join(".Trash-1000")).unwrap();
+        let mut store = LocalStore::new();
+        store.trash_environment = Some(TrashEnvironment {
+            home_trash: elsewhere.path().join("Trash"),
+            mount_points: vec![fs::canonicalize(volume.path()).unwrap(), PathBuf::from("/")],
+            uid: 1000,
+        });
+        let path = StorePath::from_unix_path(item.as_os_str());
+
+        let supported = DeleteProvider::supports_trash(&mut store, &path).unwrap();
+        let identity = DeleteProvider::identity(&mut store, &path)
+            .unwrap()
+            .unwrap();
+        let refusal = store.move_to_trash(&DeleteTarget::new(path, identity.to_vec()));
+
+        assert!(
+            !supported,
+            "a trash directory on another mount cannot receive a rename"
+        );
+        assert!(
+            matches!(refusal, Err(MutationError::Unsupported)),
+            "{refusal:?}"
+        );
         assert_eq!(fs::read(&item).unwrap(), b"item", "the item stays in place");
     }
 
@@ -2334,15 +2445,7 @@ mod tests {
 
     #[test]
     fn cross_device_replace_moves_a_nonempty_directory_completely() {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let destination_root = tempfile::tempdir().unwrap();
-        let source_root = tempfile::tempdir_in("/dev/shm").unwrap();
-        if fs::metadata(destination_root.path()).unwrap().dev()
-            == fs::metadata(source_root.path()).unwrap().dev()
-        {
-            return;
-        }
+        let (source_root, destination_root) = two_mount_roots();
         let source = source_root.path().join("tree");
         let destination = destination_root.path().join("tree");
         fs::create_dir_all(source.join("nested")).unwrap();
