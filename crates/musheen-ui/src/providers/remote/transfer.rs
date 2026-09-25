@@ -146,52 +146,14 @@ impl RemoteUploadRoute {
                 staging.path().clone(),
             ));
         }
-        remote
-            .publish_staging_noreplace(&staging, execution.destination(), cancellation.clone())
-            .await
-            .map_err(|error| {
-                LocalOperationFailure::needs_attention_with_staging(
-                    format!("remote publication may have completed: {error}"),
-                    staging.path().clone(),
-                )
-            })?;
-        let completed = remote
-            .resolve_item(execution.destination())
-            .map_err(|error| {
-                LocalOperationFailure::needs_attention_with_staging(
-                    format!("published remote destination could not be inspected: {error}"),
-                    staging.path().clone(),
-                )
-            })?
-            .ok_or_else(|| {
-                LocalOperationFailure::needs_attention_with_staging(
-                    "published remote destination is missing",
-                    staging.path().clone(),
-                )
-            })?;
-        if completed.size() != Some(source_size) {
-            return Err(LocalOperationFailure::needs_attention_with_staging(
-                "published remote destination has the wrong size",
-                staging.path().clone(),
-            ));
-        }
-        remote
-            .mutate(
-                MutationRequest::PermanentDelete {
-                    target: staging.path().clone(),
-                },
-                CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| {
-                LocalOperationFailure::needs_attention_with_staging(
-                    format!("remote copy finished but staging cleanup failed: {error}"),
-                    staging.path().clone(),
-                )
-            })?;
-        let target = CommandTargetRef::new(completed.id().clone(), completed.path().clone())
-            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
-        Ok(TransferOutcome::Completed(target))
+        publish_remote_verified(
+            &remote,
+            &staging,
+            execution.destination(),
+            source_size,
+            cancellation,
+        )
+        .await
     }
 }
 
@@ -349,12 +311,7 @@ impl RemoteDownloadRoute {
         let parent = destination.parent().ok_or_else(|| {
             LocalOperationFailure::failed("the download destination has no parent")
         })?;
-        let space =
-            statvfs(parent).map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
-        let available = space
-            .blocks_available()
-            .saturating_mul(space.fragment_size());
-        let budget = MAX_LOCAL_STAGING_BYTES.min(available / 2);
+        let budget = local_staging_budget(parent)?;
         if size > budget {
             return Err(LocalOperationFailure::failed(
                 "the remote file exceeds the available local staging budget",
@@ -548,4 +505,68 @@ async fn verify_upload(
         offset = end;
     }
     Ok(())
+}
+
+pub(super) fn local_staging_budget(parent: &Path) -> Result<u64, LocalOperationFailure> {
+    let space =
+        statvfs(parent).map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+    let available = space
+        .blocks_available()
+        .saturating_mul(space.fragment_size());
+    Ok(MAX_LOCAL_STAGING_BYTES.min(available / 2))
+}
+
+pub(super) async fn publish_remote_verified(
+    remote: &OpendalStore,
+    staging: &StagingPath,
+    destination: &StorePath,
+    expected_size: u64,
+    cancellation: CancellationToken,
+) -> Result<TransferOutcome, LocalOperationFailure> {
+    remote
+        .publish_staging_noreplace(staging, destination, cancellation)
+        .await
+        .map_err(|error| {
+            LocalOperationFailure::needs_attention_with_staging(
+                format!("remote publication may have completed: {error}"),
+                staging.path().clone(),
+            )
+        })?;
+    let completed = remote
+        .resolve_item(destination)
+        .map_err(|error| {
+            LocalOperationFailure::needs_attention_with_staging(
+                format!("published remote destination could not be inspected: {error}"),
+                staging.path().clone(),
+            )
+        })?
+        .ok_or_else(|| {
+            LocalOperationFailure::needs_attention_with_staging(
+                "published remote destination is missing",
+                staging.path().clone(),
+            )
+        })?;
+    if completed.size() != Some(expected_size) {
+        return Err(LocalOperationFailure::needs_attention_with_staging(
+            "published remote destination has the wrong size",
+            staging.path().clone(),
+        ));
+    }
+    remote
+        .mutate(
+            MutationRequest::PermanentDelete {
+                target: staging.path().clone(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| {
+            LocalOperationFailure::needs_attention_with_staging(
+                format!("remote copy finished but staging cleanup failed: {error}"),
+                staging.path().clone(),
+            )
+        })?;
+    let target = CommandTargetRef::new(completed.id().clone(), completed.path().clone())
+        .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+    Ok(TransferOutcome::Completed(target))
 }

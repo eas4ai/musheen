@@ -333,6 +333,12 @@ impl OpendalStore {
             && self.operator.info().capability().write_with_if_not_exists
     }
 
+    #[must_use]
+    pub fn supports_server_copy(&self) -> bool {
+        self.mutation_policy == RemoteMutationPolicy::CapabilitiesVerified
+            && self.operator.info().capability().copy
+    }
+
     pub fn read_range<'a>(
         &'a self,
         path: &'a StorePath,

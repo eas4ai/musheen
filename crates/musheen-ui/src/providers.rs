@@ -128,13 +128,26 @@ impl ProviderRuntime {
         if let Some(document) = settings.value("remote.connections") {
             let profiles = musheen_desktop::ConnectionProfiles::import(&document)
                 .map_err(|_| ProviderRuntimeError::InvalidConnectionProfiles)?;
-            for profile in profiles.profiles() {
-                let store = Arc::new(
+            let stores = profiles
+                .profiles()
+                .iter()
+                .map(|profile| {
                     RemoteProfileStore::new(profile.clone(), Arc::clone(&connector))
-                        .map_err(|_| ProviderRuntimeError::InvalidConnectionProfiles)?,
-                );
-                builder = builder
-                    .register_adapter(Arc::new(RemoteProfileAdapter::new(store, profile.name())))?;
+                        .map(Arc::new)
+                        .map(|store| (store, profile.name()))
+                        .map_err(|_| ProviderRuntimeError::InvalidConnectionProfiles)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let peers = stores
+                .iter()
+                .map(|(store, _)| Arc::clone(store))
+                .collect::<Vec<_>>();
+            for (store, name) in stores {
+                builder = builder.register_adapter(Arc::new(RemoteProfileAdapter::new(
+                    store,
+                    name,
+                    peers.clone(),
+                )))?;
             }
         }
         builder.build()
@@ -882,6 +895,231 @@ mod tests {
     }
 
     #[test]
+    fn same_remote_copy_publishes_a_verified_new_destination() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        future::block_on(operator.write("source.txt", b"server copy payload".to_vec())).unwrap();
+        future::block_on(operator.create_dir("target/")).unwrap();
+        let connected_operator = operator.clone();
+        let connector: RemoteStoreConnector = Arc::new(move |provider, _, _| {
+            let operator = connected_operator.clone();
+            Box::pin(async move {
+                let store = Arc::new(
+                    OpendalStore::from_operator(
+                        provider,
+                        RemoteProtocol::Ftp,
+                        operator,
+                        RemoteCasePolicy::Sensitive,
+                        RemoteMutationPolicy::CapabilitiesVerified,
+                    )
+                    .unwrap(),
+                );
+                Ok(remote::RemoteStoreConnection::opendal(store))
+            })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        let roots = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let (provider, _) = roots.items()[0].path().provider_key().unwrap();
+        let source =
+            StorePath::from_provider_key(provider.clone(), b"/source.txt".to_vec()).unwrap();
+        let target = StorePath::from_provider_key(provider.clone(), b"/target".to_vec()).unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+
+        queue
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Copy).unwrap(),
+                target,
+            )
+            .unwrap();
+        queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+
+        assert_eq!(
+            future::block_on(operator.read("target/source.txt"))
+                .unwrap()
+                .to_vec(),
+            b"server copy payload"
+        );
+        assert_eq!(
+            future::block_on(operator.read("source.txt"))
+                .unwrap()
+                .to_vec(),
+            b"server copy payload"
+        );
+        let listed = future::block_on(operator.list("target/")).unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.path() == "target/source.txt")
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|entry| !entry.path().contains(".musheen-stage"))
+        );
+    }
+
+    #[test]
+    fn cross_remote_copy_replays_through_bounded_local_staging() {
+        let mut settings = settings_with_remote_profile();
+        let document = settings.value("remote.connections").unwrap();
+        let mut profiles = ConnectionProfiles::import(&document)
+            .unwrap()
+            .profiles()
+            .to_vec();
+        profiles.push(
+            ConnectionProfile::new(
+                ConnectionId::new("backup").unwrap(),
+                "Backup",
+                RemoteProtocol::Ftp,
+                RemoteHost::new(RemoteProtocol::Ftp, "backup.example.test").unwrap(),
+                None,
+                "/",
+                None::<&str>,
+                None,
+                SecurityPolicy::PlaintextConfirmed,
+                None,
+            )
+            .unwrap(),
+        );
+        settings
+            .set_value(
+                "remote.connections",
+                &ConnectionProfiles::new(profiles).export().unwrap(),
+            )
+            .unwrap();
+        let source_operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let destination_operator =
+            opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        future::block_on(source_operator.write("source.txt", b"relay payload".to_vec())).unwrap();
+        let connected_source = source_operator.clone();
+        let connected_destination = destination_operator.clone();
+        let connector: RemoteStoreConnector = Arc::new(move |provider, profile, _| {
+            let operator = if profile.id().as_str() == "team-files" {
+                connected_source.clone()
+            } else {
+                connected_destination.clone()
+            };
+            Box::pin(async move {
+                let store = Arc::new(
+                    OpendalStore::from_operator(
+                        provider,
+                        RemoteProtocol::Ftp,
+                        operator,
+                        RemoteCasePolicy::Sensitive,
+                        RemoteMutationPolicy::CapabilitiesVerified,
+                    )
+                    .unwrap(),
+                );
+                Ok(remote::RemoteStoreConnection::opendal(store))
+            })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        let roots = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let source_root = roots
+            .items()
+            .iter()
+            .find(|item| item.display_name().as_str() == "Team Files")
+            .unwrap();
+        let destination_root = roots
+            .items()
+            .iter()
+            .find(|item| item.display_name().as_str() == "Backup")
+            .unwrap();
+        let (source_provider, _) = source_root.path().provider_key().unwrap();
+        let source =
+            StorePath::from_provider_key(source_provider.clone(), b"/source.txt".to_vec()).unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+
+        queue
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Copy).unwrap(),
+                destination_root.path().clone(),
+            )
+            .unwrap();
+        queue
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+
+        assert_eq!(
+            future::block_on(destination_operator.read("source.txt"))
+                .unwrap()
+                .to_vec(),
+            b"relay payload"
+        );
+        assert_eq!(
+            future::block_on(source_operator.read("source.txt"))
+                .unwrap()
+                .to_vec(),
+            b"relay payload"
+        );
+        let listed = future::block_on(destination_operator.list("/")).unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|entry| !entry.path().contains(".musheen-stage"))
+        );
+
+        future::block_on(source_operator.write("source.txt", b"changed payload".to_vec())).unwrap();
+        let mut retry = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut retry);
+        retry
+            .submit_drop(
+                FileDragPayload::new(
+                    vec![
+                        StorePath::from_provider_key(
+                            source_provider.clone(),
+                            b"/source.txt".to_vec(),
+                        )
+                        .unwrap(),
+                    ],
+                    DropAction::Copy,
+                )
+                .unwrap(),
+                destination_root.path().clone(),
+            )
+            .unwrap();
+        let failure = retry
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap_err();
+        assert!(failure.message().contains("already exists"));
+        assert_eq!(
+            future::block_on(destination_operator.read("source.txt"))
+                .unwrap()
+                .to_vec(),
+            b"relay payload"
+        );
+    }
+
+    #[test]
     fn saved_remote_profile_is_visible_without_opening_a_connection() {
         let settings = settings_with_remote_profile();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -891,7 +1129,7 @@ mod tests {
             Box::pin(async { Err(StoreError::Backend("unexpected connection".into())) })
         });
         let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
-        assert_eq!(runtime.routes.len(), 2);
+        assert_eq!(runtime.routes.len(), 3);
 
         let network = runtime.store();
         let page = future::block_on(network.read_directory(

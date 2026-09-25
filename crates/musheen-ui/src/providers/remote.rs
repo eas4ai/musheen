@@ -4,19 +4,27 @@ use musheen_desktop::{
 };
 use std::sync::RwLock;
 
+mod relay;
 mod transfer;
+pub(super) use relay::RemoteRelayRoute;
 pub(super) use transfer::{RemoteDownloadRoute, RemoteUploadRoute};
 
 pub(super) struct RemoteProfileAdapter {
     store: Arc<RemoteProfileStore>,
     name: Box<str>,
+    peers: Vec<Arc<RemoteProfileStore>>,
 }
 
 impl RemoteProfileAdapter {
-    pub(super) fn new(store: Arc<RemoteProfileStore>, name: &str) -> Self {
+    pub(super) fn new(
+        store: Arc<RemoteProfileStore>,
+        name: &str,
+        peers: Vec<Arc<RemoteProfileStore>>,
+    ) -> Self {
         Self {
             store,
             name: name.into(),
+            peers,
         }
     }
 }
@@ -31,10 +39,17 @@ impl ProviderAdapter for RemoteProfileAdapter {
     }
 
     fn transfer_routes(&self) -> Vec<Arc<dyn ProviderTransferRoute>> {
-        vec![
+        let mut routes: Vec<Arc<dyn ProviderTransferRoute>> = vec![
             Arc::new(RemoteUploadRoute::new(self.store.clone())),
             Arc::new(RemoteDownloadRoute::new(self.store.clone())),
-        ]
+        ];
+        routes.extend(self.peers.iter().map(|destination| {
+            Arc::new(RemoteRelayRoute::new(
+                self.store.clone(),
+                destination.clone(),
+            )) as Arc<dyn ProviderTransferRoute>
+        }));
+        routes
     }
 }
 
