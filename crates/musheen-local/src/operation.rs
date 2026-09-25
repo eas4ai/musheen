@@ -1690,6 +1690,70 @@ mod tests {
         );
     }
 
+    /// Counts every entry below `root`, or `None` while the tree cannot be
+    /// read completely.
+    fn count_tree_entries(root: &Path) -> Option<usize> {
+        let mut count = 0;
+        for entry in fs::read_dir(root).ok()? {
+            let entry = entry.ok()?;
+            count += 1;
+            if entry.file_type().ok()?.is_dir() {
+                count += count_tree_entries(&entry.path())?;
+            }
+        }
+        Some(count)
+    }
+
+    #[test]
+    fn fallback_publish_never_shows_a_partial_tree_under_the_destination_name() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stage");
+        fs::create_dir(&source).unwrap();
+        for folder in 0..60 {
+            let folder = source.join(format!("folder-{folder}"));
+            fs::create_dir(&folder).unwrap();
+            for file in 0..100 {
+                fs::write(folder.join(format!("file-{file}")), b"x").unwrap();
+            }
+        }
+        let total = count_tree_entries(&source).unwrap();
+        let destination = root.path().join("published");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A reader keeps looking at the destination name while the fallback
+        // runs. It may see nothing, the empty claim, or the complete tree;
+        // a tree with some of the entries is the partial publication that
+        // OPS-019 forbids.
+        let reader = std::thread::spawn({
+            let stop = std::sync::Arc::clone(&stop);
+            let destination = destination.clone();
+            move || {
+                let mut partial = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(count) = count_tree_entries(&destination)
+                        && count > 0
+                        && count < total
+                    {
+                        partial.push(count);
+                    }
+                }
+                partial
+            }
+        });
+
+        let outcome = rename_without_replacement_with(&source, &destination, |_, _| {
+            Err(rustix::io::Errno::INVAL)
+        });
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let partial = reader.join().unwrap();
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(count_tree_entries(&destination), Some(total));
+        assert!(
+            partial.is_empty(),
+            "a reader saw a partial tree under the destination name: {partial:?}"
+        );
+    }
+
     #[test]
     fn sparse_files_inside_a_copied_folder_keep_their_holes() {
         let root = tempfile::tempdir().unwrap();
