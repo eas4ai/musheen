@@ -103,6 +103,7 @@ pub struct LocalTrashEntry {
     receipt: TrashReceipt,
     deleted_at_unix_seconds: i64,
     kind: musheen_ops::ConflictItemKind,
+    restorable: bool,
 }
 
 impl LocalTrashEntry {
@@ -119,6 +120,14 @@ impl LocalTrashEntry {
     #[must_use]
     pub const fn kind(&self) -> musheen_ops::ConflictItemKind {
         self.kind
+    }
+
+    /// Whether the entry's data is still in Trash. An entry whose data is
+    /// missing or unreadable is listed so it can be purged, but it cannot be
+    /// restored.
+    #[must_use]
+    pub const fn restorable(&self) -> bool {
+        self.restorable
     }
 }
 
@@ -234,14 +243,17 @@ impl LocalStore {
             .map_err(map_trash_error)?
             .into_iter()
             .map(|item| {
-                let metadata =
-                    fs::symlink_metadata(trash_payload_path(&item)?).map_err(map_io_error)?;
-                let kind = if metadata.file_type().is_symlink() {
-                    musheen_ops::ConflictItemKind::SymbolicLink
-                } else if metadata.is_dir() {
-                    musheen_ops::ConflictItemKind::Directory
-                } else {
-                    musheen_ops::ConflictItemKind::File
+                // An entry whose data is missing or unreadable stays in the
+                // listing as unrestorable; it never hides the other entries.
+                let (kind, restorable) = match fs::symlink_metadata(trash_payload_path(&item)?) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        (musheen_ops::ConflictItemKind::SymbolicLink, true)
+                    }
+                    Ok(metadata) if metadata.is_dir() => {
+                        (musheen_ops::ConflictItemKind::Directory, true)
+                    }
+                    Ok(_) => (musheen_ops::ConflictItemKind::File, true),
+                    Err(_) => (musheen_ops::ConflictItemKind::File, false),
                 };
                 Ok(LocalTrashEntry {
                     receipt: TrashReceipt::new(
@@ -250,6 +262,7 @@ impl LocalStore {
                     ),
                     deleted_at_unix_seconds: item.time_deleted,
                     kind,
+                    restorable,
                 })
             })
             .collect::<Result<Vec<_>, MutationError>>()?;
@@ -271,14 +284,27 @@ impl LocalStore {
             .collect::<std::collections::HashMap<_, _>>();
         let mut requested = std::collections::HashSet::with_capacity(receipts.len());
         let mut selected = Vec::with_capacity(receipts.len());
+        let mut orphaned = Vec::new();
         for receipt in receipts {
             if !requested.insert(receipt.provider_reference().to_vec()) {
                 return Err(MutationError::BatchCollision);
             }
             let id = OsString::from_vec(receipt.provider_reference().to_vec());
-            selected.push(available.remove(&id).ok_or(MutationError::Missing)?);
+            let item = available.remove(&id).ok_or(MutationError::Missing)?;
+            // The trash crate refuses to purge an entry whose data is gone;
+            // such an entry is only its info file, which is removed here.
+            match fs::symlink_metadata(trash_payload_path(&item)?) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => orphaned.push(item),
+                _ => selected.push(item),
+            }
         }
-        trash::os_limited::purge_all(selected).map_err(map_trash_error)
+        if !selected.is_empty() {
+            trash::os_limited::purge_all(selected).map_err(map_trash_error)?;
+        }
+        for item in orphaned {
+            fs::remove_file(Path::new(&item.id)).map_err(map_io_error)?;
+        }
+        Ok(())
     }
 
     pub fn resolve_restore_conflict(
@@ -1695,6 +1721,10 @@ impl DeleteProvider for LocalStore {
     }
 }
 
+/// Restores one trashed entry to its original path with Musheen's own
+/// rename. The trash crate's restore treats a link to a directory as a
+/// directory and fails after creating an empty one; one rename moves any
+/// kind of entry and refuses an occupied destination.
 fn restore_receipt_no_replace(receipt: &TrashReceipt) -> Result<(), MutationError> {
     let id = OsString::from_vec(receipt.provider_reference().to_vec());
     let item = trash::os_limited::list()
@@ -1702,7 +1732,31 @@ fn restore_receipt_no_replace(receipt: &TrashReceipt) -> Result<(), MutationErro
         .into_iter()
         .find(|item| item.id == id)
         .ok_or(MutationError::Missing)?;
-    trash::os_limited::restore_all([item]).map_err(map_trash_error)
+    let payload = trash_payload_path(&item)?;
+    if fs::symlink_metadata(&payload).is_err() {
+        return Err(MutationError::Missing);
+    }
+    let destination = receipt
+        .original_path()
+        .as_unix_path()
+        .ok_or(MutationError::Unsupported)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(map_io_error)?;
+    }
+    match renameat_with(CWD, &payload, CWD, destination, RenameFlags::NOREPLACE) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => return Err(MutationError::Conflict),
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {
+            if fs::symlink_metadata(destination).is_ok() {
+                return Err(MutationError::Conflict);
+            }
+            fs::rename(&payload, destination).map_err(map_io_error)?;
+        }
+        Err(error) => return Err(map_errno(error)),
+    }
+    sync_parent(destination).map_err(map_io_error)?;
+    fs::remove_file(Path::new(&item.id)).map_err(map_io_error)?;
+    Ok(())
 }
 
 #[derive(Debug)]
