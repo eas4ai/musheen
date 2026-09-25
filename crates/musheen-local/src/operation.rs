@@ -1003,7 +1003,7 @@ impl DescriptorRemoval {
                 Mode::empty(),
             )
             .map_err(map_rustix)?;
-            if descriptor_fd_identity(&directory)? != root_identity {
+            if !descriptor_fd_identity_matches(&directory, &root_identity)? {
                 return Err(ProviderError::SourceChanged);
             }
             let children = plan_descriptor_removal(&directory, root_mount)?;
@@ -1077,7 +1077,7 @@ fn plan_descriptor_removal(
                 Mode::empty(),
             )
             .map_err(map_rustix)?;
-            if descriptor_fd_identity(&child)? != identity {
+            if !descriptor_fd_identity_matches(&child, &identity)? {
                 return Err(ProviderError::SourceChanged);
             }
             plan_descriptor_removal(&child, root_mount)?
@@ -1124,7 +1124,7 @@ fn execute_descriptor_removal(
                 Mode::empty(),
             )
             .map_err(map_rustix)?;
-            if descriptor_fd_identity(&child)? != node.identity {
+            if !descriptor_fd_identity_matches(&child, &node.identity)? {
                 return Err(ProviderError::SourceChanged);
             }
             execute_descriptor_removal(&child, &node.children, fault_after, removed)?;
@@ -1157,7 +1157,7 @@ fn revalidate_descriptor_entry(
     name: &OsStr,
     expected: &[u8],
 ) -> Result<(), ProviderError> {
-    if descriptor_identity(&descriptor_stat(parent, name)?).as_ref() == expected {
+    if descriptor_identity_matches(&descriptor_stat(parent, name)?, expected) {
         Ok(())
     } else {
         Err(ProviderError::SourceChanged)
@@ -1182,19 +1182,47 @@ fn descriptor_stat(parent: &OwnedFd, name: &OsStr) -> Result<rustix::fs::Statx, 
     .map_err(map_rustix)
 }
 
-fn descriptor_fd_identity(fd: &OwnedFd) -> Result<Box<[u8]>, ProviderError> {
+fn descriptor_fd_identity_matches(fd: &OwnedFd, expected: &[u8]) -> Result<bool, ProviderError> {
     statx(
         fd,
         "",
         AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
         StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
     )
-    .map(|stat| descriptor_identity(&stat))
+    .map(|stat| descriptor_identity_matches(&stat, expected))
     .map_err(map_rustix)
 }
 
+/// The first identity byte names the rule the identity was built under, so a
+/// later check compares the entry under the rule chosen when it was planned.
+/// A regular entry keeps size, mtime and ctime, which refuses a rewrite even
+/// when its length and mtime were restored. An entry whose inode had more
+/// than one link at planning time leaves ctime out: unlinking one link of a
+/// pair updates the shared inode's ctime, and the second link would otherwise
+/// fail revalidation and leave the source half removed. That link count may
+/// already be one when the second link is checked, which is why the rule
+/// travels with the identity instead of being read again.
+const IDENTITY_RULE_FULL: u8 = 0;
+const IDENTITY_RULE_SHARED_INODE: u8 = 1;
+
 fn descriptor_identity(stat: &rustix::fs::Statx) -> Box<[u8]> {
-    let mut identity = Vec::with_capacity(80);
+    let rule = if !descriptor_is_directory(stat) && stat.stx_nlink > 1 {
+        IDENTITY_RULE_SHARED_INODE
+    } else {
+        IDENTITY_RULE_FULL
+    };
+    descriptor_identity_under(stat, rule)
+}
+
+fn descriptor_identity_matches(stat: &rustix::fs::Statx, expected: &[u8]) -> bool {
+    expected
+        .first()
+        .is_some_and(|rule| descriptor_identity_under(stat, *rule).as_ref() == expected)
+}
+
+fn descriptor_identity_under(stat: &rustix::fs::Statx, rule: u8) -> Box<[u8]> {
+    let mut identity = Vec::with_capacity(96);
+    identity.push(rule);
     identity.extend_from_slice(&stat.stx_dev_major.to_ne_bytes());
     identity.extend_from_slice(&stat.stx_dev_minor.to_ne_bytes());
     identity.extend_from_slice(&stat.stx_mnt_id.to_ne_bytes());
@@ -1202,15 +1230,15 @@ fn descriptor_identity(stat: &rustix::fs::Statx) -> Box<[u8]> {
     identity.extend_from_slice(&stat.stx_mode.to_ne_bytes());
     // Removing a directory's planned children necessarily changes its size,
     // mtime, and ctime. Its descriptor, inode, type, mode, and exact child-name
-    // plan still prove that the entry is the directory we prepared. Non-directory
-    // entries keep their size and content timestamp so a changed file is refused.
-    // ctime is left out on purpose: unlinking one link of a hard-link pair
-    // updates the shared inode's ctime, so a pair inside one moved tree would
-    // refuse its second link and leave the source half removed.
+    // plan still prove that the entry is the directory we prepared.
     if !descriptor_is_directory(stat) {
         identity.extend_from_slice(&stat.stx_size.to_ne_bytes());
         identity.extend_from_slice(&stat.stx_mtime.tv_sec.to_ne_bytes());
         identity.extend_from_slice(&stat.stx_mtime.tv_nsec.to_ne_bytes());
+        if rule == IDENTITY_RULE_FULL {
+            identity.extend_from_slice(&stat.stx_ctime.tv_sec.to_ne_bytes());
+            identity.extend_from_slice(&stat.stx_ctime.tv_nsec.to_ne_bytes());
+        }
     }
     identity.into_boxed_slice()
 }
