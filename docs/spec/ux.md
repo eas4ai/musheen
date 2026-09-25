@@ -83,8 +83,9 @@ Status: Draft
 
 [UXF-012] Context menus show commands for the current target and preserve disabled commands when their unavailable state explains a capability limit.
 Falsifier: a menu offers an inapplicable command or hides a relevant capability limit.
-Mechanism: context-menu schema tests across files, directories, backgrounds, mounts, and tags.
-Status: Draft
+Mechanism: uxf-012
+Rationale: 1.x mechanism: context-menu schema tests across files, directories, backgrounds, mounts, and tags.
+Status: Agreed 2026-09-25
 
 [UXF-013] Inline rename, omnibar entry, and settings search each expose a consistent cancel action that restores the state present before entry.
 Falsifier: cancelling an edit commits text or loses prior navigation state.

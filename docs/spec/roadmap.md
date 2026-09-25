@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: foundation
+Current: defects-2026-09-25
 
 ## 1. Foundation
 
@@ -49,3 +49,16 @@ operation safety, and recovery contracts.
 Complete performance budgets, fault injection, visual and accessibility
 baselines, packaging, update verification, license audit, migration tests,
 and cross-desktop integration testing.
+
+## defects-2026-09-25
+
+Requirements: UXF-012, BROWSE-023, OPS-006, OPS-008
+
+Fix the four user-facing defects from docs/opus-audit-2.md section 4:
+the sidebar "Open in new tab" crash and "Open" launching a directory
+(UXF-012), rubber-band selection that ignores scroll (BROWSE-023), the
+cross-device move that leaves a hard-linked source half-removed (OPS-006),
+and the trash path that copies across devices without verification
+(OPS-008). Done when each mechanism's test fails on the recorded violating
+example and passes on the fix, the workspace tests and clippy are clean, and
+the review and report are accepted.

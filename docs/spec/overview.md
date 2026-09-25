@@ -34,7 +34,7 @@ mid-operation.
 
 ## Technology choices
 
-- Rust + GPUI Kit 0.6.2: production-proven in the developer's
+- Rust + GPUI Kit 0.6.4: production-proven in the developer's
   investment app; semver ranges with a committed lockfile, no exact
   pins.
 - Dependency set in docs/spec/deps.md: ecosystem crates per
