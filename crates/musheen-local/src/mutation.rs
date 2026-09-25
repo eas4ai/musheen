@@ -1,5 +1,5 @@
-use crate::LocalStore;
 use crate::operation::{remove_path, sync_parent};
+use crate::{LocalStore, TrashDisposition, TrashEnvironment};
 use musheen_core::{CancellationToken, CapabilityKind, CapabilityState, StorePath};
 use musheen_ops::{
     AclChange, AclEntry, AclQualifier, ConflictChoice, ConflictDecision, CopyRequest, CopySession,
@@ -1576,15 +1576,39 @@ fn open_metadata_target(
     }
 }
 
+impl LocalStore {
+    fn trash_environment(&self) -> Result<Option<TrashEnvironment>, MutationError> {
+        #[cfg(test)]
+        if let Some(environment) = &self.trash_environment {
+            return Ok(Some(environment.clone()));
+        }
+        TrashEnvironment::current().map_err(map_io_error)
+    }
+
+    /// Where the `trash` crate would put `path`. Only a rename into a trash
+    /// directory counts as trash support; a cross-device copy does not.
+    fn trash_disposition(&self, path: &StorePath) -> Result<TrashDisposition, MutationError> {
+        let Some(path) = path.as_unix_path() else {
+            return Ok(TrashDisposition::Unusable);
+        };
+        if !path.is_absolute() || path.parent().is_none() {
+            return Ok(TrashDisposition::Unusable);
+        }
+        Ok(self
+            .trash_environment()?
+            .map_or(TrashDisposition::Unusable, |environment| {
+                environment.disposition(path)
+            }))
+    }
+}
+
 impl DeleteProvider for LocalStore {
     fn identity(&mut self, path: &StorePath) -> Result<Option<Box<[u8]>>, MutationError> {
         MutationProvider::identity(self, path)
     }
 
     fn supports_trash(&mut self, path: &StorePath) -> Result<bool, MutationError> {
-        Ok(path
-            .as_unix_path()
-            .is_some_and(|path| path.is_absolute() && path.parent().is_some()))
+        Ok(self.trash_disposition(path)?.is_safe())
     }
 
     fn supports_permanent_delete(&mut self, path: &StorePath) -> Result<bool, MutationError> {
@@ -1598,6 +1622,9 @@ impl DeleteProvider for LocalStore {
         let entry = ParentEntry::open(target.path())?;
         if read_identity(&entry).map_err(map_errno)?.as_ref() != target.expected_identity() {
             return Err(MutationError::SourceChanged);
+        }
+        if !self.trash_disposition(target.path())?.is_safe() {
+            return Err(MutationError::Unsupported);
         }
         let before: std::collections::HashSet<_> = trash::os_limited::list()
             .map_err(map_trash_error)?
@@ -2272,7 +2299,7 @@ mod tests {
         let mut store = LocalStore::new();
         store.trash_environment = Some(TrashEnvironment {
             home_trash: home.path().join("Trash"),
-            mount_points: vec![volume.path().to_path_buf(), PathBuf::from("/")],
+            mount_points: vec![fs::canonicalize(volume.path()).unwrap(), PathBuf::from("/")],
             uid: 1000,
         });
         let path = StorePath::from_unix_path(item.as_os_str());
@@ -2297,7 +2324,7 @@ mod tests {
         let mut store = LocalStore::new();
         store.trash_environment = Some(TrashEnvironment {
             home_trash: home.path().join("Trash"),
-            mount_points: vec![volume.path().to_path_buf(), PathBuf::from("/")],
+            mount_points: vec![fs::canonicalize(volume.path()).unwrap(), PathBuf::from("/")],
             uid: 1000,
         });
         let path = StorePath::from_unix_path(item.as_os_str());
