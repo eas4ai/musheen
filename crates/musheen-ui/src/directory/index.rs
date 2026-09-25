@@ -416,6 +416,7 @@ impl DiskDirectoryIndex {
     }
 
     /// The directory that holds this index's files.
+    #[cfg(test)]
     pub(super) fn path(&self) -> &Path {
         self.scratch.path()
     }
