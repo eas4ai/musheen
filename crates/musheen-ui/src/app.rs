@@ -7065,32 +7065,40 @@ impl MusheenApp {
         location: StorePath,
         identity: Option<ItemId>,
     ) -> ContextMenu {
-        // The resolved item decides the command set: a directory or a link
-        // to one gets the directory commands. A link whose target is gone
-        // offers nothing to open, so the menu is composed without a
-        // selection and the open commands show disabled with their reason.
-        let resolved = self.store.resolve_item(&location).ok().flatten();
-        let reachable = resolved.as_ref().is_some_and(|item| {
-            item.kind() != ItemKind::SymbolicLink
-                || self
+        // For a sidebar location the resolved item decides the command set:
+        // a directory or a link to one gets the directory commands. A link
+        // whose target is gone offers nothing to open, so the menu is
+        // composed without a selection and no open command is enabled.
+        // Tags, mounts and other entries keep their identity-based target.
+        let resolved = if target == MenuTarget::SidebarLocation {
+            self.store.resolve_item(&location).ok().flatten()
+        } else {
+            None
+        };
+        let dead_link = resolved.as_ref().is_some_and(|item| {
+            item.kind() == ItemKind::SymbolicLink
+                && self
                     .store
                     .resolve_link_target(item.path())
                     .ok()
                     .flatten()
-                    .is_some()
+                    .is_none()
         });
-        let selection = if reachable {
+        let selection = if dead_link {
+            Vec::new()
+        } else {
             identity
                 .and_then(|item| CommandTargetRef::new(item, location.clone()).ok())
                 .or_else(|| {
-                    resolved.as_ref().and_then(|item| {
-                        CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
-                    })
+                    resolved
+                        .clone()
+                        .or_else(|| self.store.resolve_item(&location).ok().flatten())
+                        .and_then(|item| {
+                            CommandTargetRef::new(item.id().clone(), item.path().clone()).ok()
+                        })
                 })
                 .into_iter()
                 .collect()
-        } else {
-            Vec::new()
         };
         let send_to = self.send_to_destinations(tab_id);
         let open_with = self.open_with_applications(&selection);
