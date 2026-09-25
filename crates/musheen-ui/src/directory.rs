@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 mod index;
 mod termination;
 pub(crate) use index::IndexedSelection;
+use index::sweep_stale_indexes;
 use index::{DiskDirectoryIndex, ResolvedIndexedSelection};
 pub(crate) use index::{directory_index_root, missing_index_root_error};
-use index::sweep_stale_indexes;
 use termination::install_index_cleanup_on_termination;
 
 const MAX_RESIDENT_ITEMS: usize = 4_096;
@@ -383,6 +383,7 @@ impl DirectoryIndexWatchWork {
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?;
         let mut removed = Vec::new();
         let mut selection_transitions = Vec::new();
+        let mut changes = Vec::with_capacity(self.events.len());
         for event in self.events {
             let arrival = index.record_count();
             let event_id = match &event {
@@ -401,11 +402,21 @@ impl DirectoryIndexWatchWork {
                 WatchEvent::Created(item)
                 | WatchEvent::Changed(item)
                 | WatchEvent::Renamed { item, .. } => {
-                    index.append(&item, arrival)?;
+                    let offset = index.append(&item, arrival)?;
+                    changes.push(index::IndexChange {
+                        id: item.id().clone(),
+                        offset,
+                        item: Some((item, arrival)),
+                    });
                     None
                 }
                 WatchEvent::Removed(id) => {
-                    index.append_tombstone(&id, arrival)?;
+                    let offset = index.append_tombstone(&id, arrival)?;
+                    changes.push(index::IndexChange {
+                        id: id.clone(),
+                        offset,
+                        item: None,
+                    });
                     Some(id)
                 }
                 WatchEvent::Invalidated { .. } => {
@@ -415,7 +426,6 @@ impl DirectoryIndexWatchWork {
                     ));
                 }
             };
-            index.rebuild_order(&self.preferences, self.filter.as_ref())?;
             if let Some(old) = previous_arrival {
                 selection_transitions.push((
                     old,
@@ -428,6 +438,8 @@ impl DirectoryIndexWatchWork {
             }
             removed.extend(removed_id);
         }
+        // One merge for the whole batch: the records lead, the orders follow.
+        index.merge_changes(&changes, &self.preferences, self.filter.as_ref())?;
         Ok(DirectoryIndexWatchResult {
             indexed_count: index.active_count().unwrap_or(0),
             visible_count: index.visible_count().unwrap_or(0),
@@ -447,7 +459,10 @@ impl DirectoryIndexWork {
         let index = match self.index {
             Some(index) => index,
             None => {
-                let root = self.index_root.as_deref().ok_or_else(missing_index_root_error)?;
+                let root = self
+                    .index_root
+                    .as_deref()
+                    .ok_or_else(missing_index_root_error)?;
                 Arc::new(Mutex::new(DiskDirectoryIndex::new_in(root)?))
             }
         };
@@ -1002,6 +1017,7 @@ impl DirectoryModel {
         }
         match result {
             Ok(result) => {
+                self.index_error = None;
                 if let Some(selection) = &mut self.indexed_selection {
                     for (old, new) in result.selection_transitions {
                         if let Err(error) = selection.carry_forward(old, new) {
@@ -1025,8 +1041,9 @@ impl DirectoryModel {
                 };
             }
             Err(error) => {
-                self.state =
-                    DirectoryState::Error(format!("Directory index failed: {error}").into());
+                // The items already shown stay; the error is reported beside
+                // them, and the next merge rebuilds the orders.
+                self.index_error = Some(format!("Directory index failed: {error}").into());
             }
         }
         true
@@ -1372,7 +1389,10 @@ mod indexed_watch_tests {
             .unwrap();
         let result = work.run();
         std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.is_err(), "the merge fails in a read-only index directory");
+        assert!(
+            result.is_err(),
+            "the merge fails in a read-only index directory"
+        );
 
         assert!(model.finish_index_watch_event(&load, result));
         assert_eq!(
@@ -1491,5 +1511,4 @@ mod tests {
         assert_eq!(model.indexed_count(), 0);
         assert_eq!(model.location(), Some(next.location()));
     }
-
 }

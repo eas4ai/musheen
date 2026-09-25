@@ -634,7 +634,11 @@ fn operation_controls_preserve_retryable_work_and_distinguish_cancellation() {
     queue
         .finish(cancelled, Err("cancelled by user".into()))
         .unwrap();
-    assert_eq!(queue.state(cancelled), Some(JobState::Cancelled));
+    assert_eq!(
+        queue.state(cancelled),
+        None,
+        "a cancelled job keeps no scheduler record"
+    );
 
     let failed = queue
         .submit_drop(
