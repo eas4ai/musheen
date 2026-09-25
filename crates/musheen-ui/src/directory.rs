@@ -25,6 +25,12 @@ pub(crate) struct DirectoryIndexReader {
     index: SharedIndex,
 }
 
+impl std::fmt::Debug for DirectoryIndexReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DirectoryIndexReader")
+    }
+}
+
 pub(crate) struct IndexedFocusMove {
     pub(crate) id: ItemId,
     pub(crate) position: usize,
@@ -132,6 +138,19 @@ impl DirectoryIndexReader {
             .lock()
             .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
             .toggle_selection(base, base_ids, id)
+    }
+
+    pub(crate) fn rubber_band_selection(
+        &self,
+        base: Option<IndexedSelection>,
+        base_ids: &[ItemId],
+        positions: &[usize],
+        mode: crate::views::SelectionMode,
+    ) -> std::io::Result<IndexedSelection> {
+        self.index
+            .lock()
+            .map_err(|_| std::io::Error::other("directory index worker stopped unexpectedly"))?
+            .rubber_band_selection(base, base_ids, positions, mode)
     }
 
     pub(crate) fn move_focus(

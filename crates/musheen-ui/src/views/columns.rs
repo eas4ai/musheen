@@ -2,16 +2,29 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::directory::DirectoryIndexReader;
 use musheen_core::{ItemKind, StoreItem, StorePath};
 
 /// Retain only the levels that can fit beside the active directory. Older
 /// levels remain reachable through Back and the breadcrumb trail.
 const MAX_PARENT_LEVELS: usize = 3;
 
+/// Where a parent column takes its rows from: the items the folder held in
+/// memory, or the disk index of a folder too large to keep in memory. An
+/// indexed pane keeps the index alive for as long as the column shows it.
+#[derive(Clone, Debug)]
+pub(crate) enum ColumnPaneItems {
+    InMemory(Arc<[StoreItem]>),
+    Indexed {
+        reader: DirectoryIndexReader,
+        visible_count: usize,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ColumnPane {
     location: StorePath,
-    items: Arc<[StoreItem]>,
+    items: ColumnPaneItems,
     active_child: StorePath,
     complete: bool,
 }
@@ -22,9 +35,31 @@ impl ColumnPane {
         &self.location
     }
 
+    /// The number of rows the column shows.
     #[must_use]
-    pub(crate) fn items(&self) -> &Arc<[StoreItem]> {
-        &self.items
+    pub(crate) fn len(&self) -> usize {
+        match &self.items {
+            ColumnPaneItems::InMemory(items) => items.len(),
+            ColumnPaneItems::Indexed { visible_count, .. } => *visible_count,
+        }
+    }
+
+    /// The rows of a pane that holds its items in memory.
+    #[must_use]
+    pub(crate) fn resident_items(&self) -> Option<&Arc<[StoreItem]>> {
+        match &self.items {
+            ColumnPaneItems::InMemory(items) => Some(items),
+            ColumnPaneItems::Indexed { .. } => None,
+        }
+    }
+
+    /// The index reader of a pane that shows an indexed folder.
+    #[must_use]
+    pub(crate) fn index_reader(&self) -> Option<&DirectoryIndexReader> {
+        match &self.items {
+            ColumnPaneItems::InMemory(_) => None,
+            ColumnPaneItems::Indexed { reader, .. } => Some(reader),
+        }
     }
 
     #[must_use]
@@ -55,11 +90,13 @@ impl ColumnTrail {
 
     /// Keep the current directory only when the destination is one of its
     /// folders. Back navigation reuses the older levels without duplicating it.
+    /// `items` is `None` when the caller found that the destination is not a
+    /// folder of the current directory.
     pub(crate) fn navigate(
         &mut self,
         current: &StorePath,
         next: &StorePath,
-        visible_items: impl IntoIterator<Item = StoreItem>,
+        items: Option<ColumnPaneItems>,
         complete: bool,
     ) -> bool {
         if current == next {
@@ -69,17 +106,21 @@ impl ColumnTrail {
             self.parents.truncate(index);
             return true;
         }
-        let items = visible_items.into_iter().collect::<Vec<_>>();
-        if !items
-            .iter()
-            .any(|item| item.kind() == ItemKind::Directory && item.path() == next)
-        {
+        let descends = match &items {
+            Some(ColumnPaneItems::InMemory(items)) => items
+                .iter()
+                .any(|item| item.kind() == ItemKind::Directory && item.path() == next),
+            // The caller checked the destination against the indexed folder.
+            Some(ColumnPaneItems::Indexed { .. }) => true,
+            None => false,
+        };
+        let Some(items) = items.filter(|_| descends) else {
             self.clear();
             return false;
-        }
+        };
         self.parents.push(ColumnPane {
             location: current.clone(),
-            items: items.into(),
+            items,
             active_child: next.clone(),
             complete,
         });
@@ -95,11 +136,13 @@ impl ColumnTrail {
         let Some(pane) = self.parents.get(index) else {
             return false;
         };
-        if !pane
-            .items
-            .iter()
-            .any(|item| item.kind() == ItemKind::Directory && item.path() == next)
-        {
+        // A click in an indexed column comes from a rendered row of that
+        // folder; the resident check applies to in-memory panes only.
+        if pane.resident_items().is_some_and(|items| {
+            !items
+                .iter()
+                .any(|item| item.kind() == ItemKind::Directory && item.path() == next)
+        }) {
             return false;
         }
         self.parents.truncate(index + 1);
@@ -283,9 +326,15 @@ pub struct ColumnsPresentation;
 
 #[cfg(test)]
 mod tests {
-    use super::ColumnTrail;
+    use super::{ColumnPaneItems, ColumnTrail};
     use crate::views::DirectoryViewModel;
     use musheen_core::{DisplayPath, ItemId, ItemKind, ProviderId, StoreItem, StorePath};
+
+    fn resident(items: impl IntoIterator<Item = StoreItem>) -> Option<ColumnPaneItems> {
+        Some(ColumnPaneItems::InMemory(
+            items.into_iter().collect::<Vec<_>>().into(),
+        ))
+    }
 
     fn directory(index: u64, path: &str) -> StoreItem {
         let provider = ProviderId::new("local").unwrap();
@@ -306,13 +355,18 @@ mod tests {
         let leaf = StorePath::from_unix_path("/root/first/leaf");
         let mut trail = ColumnTrail::default();
 
-        trail.navigate(&root, &first, [directory(1, "/root/first")], true);
-        trail.navigate(&first, &leaf, [directory(2, "/root/first/leaf")], true);
+        trail.navigate(&root, &first, resident([directory(1, "/root/first")]), true);
+        trail.navigate(
+            &first,
+            &leaf,
+            resident([directory(2, "/root/first/leaf")]),
+            true,
+        );
         assert_eq!(trail.parents().len(), 2);
         assert_eq!(trail.parents()[0].active_child(), &first);
         assert_eq!(trail.parents()[1].active_child(), &leaf);
 
-        trail.navigate(&leaf, &root, [], true);
+        trail.navigate(&leaf, &root, resident([]), true);
         assert!(trail.parents().is_empty());
     }
 
@@ -326,10 +380,15 @@ mod tests {
         trail.navigate(
             &root,
             &first,
-            [directory(1, "/root/first"), directory(2, "/root/second")],
+            resident([directory(1, "/root/first"), directory(2, "/root/second")]),
             false,
         );
-        trail.navigate(&first, &leaf, [directory(3, "/root/first/leaf")], true);
+        trail.navigate(
+            &first,
+            &leaf,
+            resident([directory(3, "/root/first/leaf")]),
+            true,
+        );
 
         assert!(!trail.select_from_parent(0, &StorePath::from_unix_path("/unknown")));
         assert!(trail.select_from_parent(0, &second));
@@ -348,7 +407,7 @@ mod tests {
             trail.navigate(
                 &StorePath::from_unix_path(&current_path),
                 &next,
-                [directory(index + 1, &next_path)],
+                resident([directory(index + 1, &next_path)]),
                 true,
             );
             current_path = next_path;
@@ -357,7 +416,7 @@ mod tests {
         trail.navigate(
             &StorePath::from_unix_path(&current_path),
             &StorePath::from_unix_path("/elsewhere"),
-            [],
+            resident([]),
             true,
         );
         assert!(trail.parents().is_empty());

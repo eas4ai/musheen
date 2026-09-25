@@ -1,5 +1,5 @@
 use crate::search::DirectoryFilter;
-use crate::views::{DirectoryViewModel, ViewPreferences};
+use crate::views::{DirectoryViewModel, SelectionMode, ViewPreferences};
 use musheen_core::{DisplayPath, ItemId, ItemKind, StoreItem, StorePath};
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
@@ -776,6 +776,63 @@ impl DiskDirectoryIndex {
         };
         selection.toggle(arrival)?;
         Ok(Some(selection))
+    }
+
+    /// The selection a rubber band over `positions` (rows of the visible
+    /// order) produces from the selection at the gesture start: replaced,
+    /// added to, or toggled, as `mode` says.
+    pub(super) fn rubber_band_selection(
+        &mut self,
+        base: Option<IndexedSelection>,
+        base_ids: &[ItemId],
+        positions: &[usize],
+        mode: SelectionMode,
+    ) -> io::Result<IndexedSelection> {
+        let covered = self.arrivals_at_positions(positions)?;
+        let mut selection = match (mode, base) {
+            (SelectionMode::Replace, _) => IndexedSelection::new(self.record_count)?,
+            (_, Some(base)) => base,
+            (_, None) => {
+                let mut selection = IndexedSelection::new(self.record_count)?;
+                for base_id in base_ids {
+                    if let Some((_, arrival)) = self.lookup_id_with_arrival(base_id)? {
+                        selection.insert(arrival)?;
+                    }
+                }
+                selection
+            }
+        };
+        for arrival in covered {
+            match mode {
+                SelectionMode::Replace | SelectionMode::Add => selection.insert(arrival)?,
+                SelectionMode::Toggle => selection.toggle(arrival)?,
+            }
+        }
+        Ok(selection)
+    }
+
+    fn arrivals_at_positions(&mut self, positions: &[usize]) -> io::Result<Vec<u64>> {
+        let order = self.order.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "directory order is not ready")
+        })?;
+        let mut arrivals = Vec::with_capacity(positions.len());
+        for &position in positions {
+            if position >= order.len {
+                continue;
+            }
+            let byte_offset = u64::try_from(position)
+                .ok()
+                .and_then(|value| value.checked_mul(8))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "range offset overflow")
+                })?;
+            order.file.seek(SeekFrom::Start(byte_offset))?;
+            let offset = read_next_offset(&mut order.file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "directory order is truncated")
+            })?;
+            arrivals.push(Self::read_index_record(&mut self.records, offset)?.arrival);
+        }
+        Ok(arrivals)
     }
 
     pub(super) fn resolve_bitmap(

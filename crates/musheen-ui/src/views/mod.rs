@@ -8,8 +8,8 @@ mod selection;
 mod sort;
 
 pub use adaptive::AdaptiveLayout;
-pub(crate) use columns::ColumnTrail;
 pub use columns::{ColumnKey, ColumnLayout, ColumnLayoutError, ColumnsPresentation};
+pub(crate) use columns::{ColumnPaneItems, ColumnTrail};
 pub use details::DetailsPresentation;
 pub use grid::GridPresentation;
 pub use group::GroupKey;
