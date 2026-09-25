@@ -1,17 +1,19 @@
 //! Decides whether normal delete can trash an item without the `trash`
-//! crate copying it across devices.
+//! crate copying it across mounts.
 //!
 //! The crate (5.2.9, `freedesktop.rs`) picks a trash directory like this.
 //! An item on the same mount as the home trash is renamed into the home
-//! trash. Otherwise the item's mount must hold `.Trash/$uid` or
-//! `.Trash-$uid`; the crate creates `.Trash-$uid` when the mount root is
-//! writable. When that fails with permission denied, the crate copies the
-//! item to the home trash and deletes the original. That copy is
-//! unverified and loses hard links, sparse layout, and timestamps, so
-//! Musheen reports no trash support for such items and OPS-008 offers
-//! permanent delete instead.
+//! trash. Otherwise the crate uses `.Trash/$uid` inside a valid shared
+//! `.Trash` (a real directory with the sticky bit) when that directory
+//! exists, else `.Trash-$uid` on the item's mount root, which it creates
+//! when missing. When that per-volume step fails with permission denied,
+//! the crate moves the item to the home trash instead. Every move is a
+//! rename; a rename that crosses a mount fails with EXDEV and the crate
+//! falls back to copy and delete. That copy is unverified and loses hard
+//! links, sparse layout, and timestamps, so Musheen reports no trash
+//! support for such items and OPS-008 offers permanent delete instead.
 
-use rustix::fs::{Access, access};
+use rustix::fs::{Access, AtFlags, CWD, StatxFlags, access, statx};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -31,11 +33,11 @@ pub(crate) struct TrashEnvironment {
 /// Where the `trash` crate would put an item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrashDisposition {
-    /// Renamed into the home trash on the same device.
+    /// Renamed into the home trash on the same mount.
     HomeTrash,
     /// Renamed into a trash directory on the item's own mount.
     VolumeTrash,
-    /// Copied to the home trash across devices, then deleted.
+    /// Copied across mounts, then deleted.
     WouldCopy,
     /// The crate would fail before moving anything, or no home is known.
     Unusable,
@@ -66,40 +68,65 @@ impl TrashEnvironment {
 
     /// Where the crate would put `item`.
     pub(crate) fn disposition(&self, item: &Path) -> TrashDisposition {
-        let item = canonicalize_or_parents(item);
+        let item = canonical_item_path(item);
         let item_top = self.top_dir(&item);
         if item_top == self.top_dir(&self.home_trash) {
-            return if same_device(&item, &self.home_trash) {
-                TrashDisposition::HomeTrash
-            } else {
-                TrashDisposition::WouldCopy
-            };
+            return self.home_trash_disposition(&item);
         }
         let shared = item_top.join(".Trash");
         if is_valid_shared_trash(&shared) {
             let mine = shared.join(self.uid.to_string());
-            if mine.is_dir() && writable(&mine) {
-                return TrashDisposition::VolumeTrash;
+            if mine.is_dir() {
+                // The crate uses this directory and looks no further.
+                return self.volume_trash_disposition(&item, &mine);
             }
         }
         let mine = item_top.join(format!(".Trash-{}", self.uid));
         match fs::symlink_metadata(&mine) {
-            Ok(metadata) if metadata.is_dir() => {
-                if writable(&mine) {
-                    TrashDisposition::VolumeTrash
-                } else {
-                    TrashDisposition::WouldCopy
-                }
-            }
-            Ok(_) => TrashDisposition::Unusable,
+            // The crate follows a link here, so the target decides.
+            Ok(_) => match fs::metadata(&mine) {
+                Ok(metadata) if metadata.is_dir() => self.volume_trash_disposition(&item, &mine),
+                // A file or a dangling link: creating the directory fails
+                // with an error the crate reports instead of copying.
+                _ => TrashDisposition::Unusable,
+            },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if writable(item_top) {
-                    TrashDisposition::VolumeTrash
+                    // The crate creates the directory on the mount root.
+                    if same_mount(&item, item_top) {
+                        TrashDisposition::VolumeTrash
+                    } else {
+                        TrashDisposition::WouldCopy
+                    }
                 } else {
-                    TrashDisposition::WouldCopy
+                    self.home_trash_disposition(&item)
                 }
             }
             Err(_) => TrashDisposition::Unusable,
+        }
+    }
+
+    /// The crate renames the item into the home trash. Across mounts that
+    /// rename fails and the crate copies.
+    fn home_trash_disposition(&self, item: &Path) -> TrashDisposition {
+        if same_mount(item, &self.home_trash) {
+            TrashDisposition::HomeTrash
+        } else {
+            TrashDisposition::WouldCopy
+        }
+    }
+
+    /// The crate writes `files` and `info` under `folder` and renames the
+    /// item into `files`. A folder it cannot write fails with permission
+    /// denied, which sends the crate to the home trash instead.
+    fn volume_trash_disposition(&self, item: &Path, folder: &Path) -> TrashDisposition {
+        if !trash_folder_writable(folder) {
+            return self.home_trash_disposition(item);
+        }
+        if same_mount(item, &folder.join("files")) {
+            TrashDisposition::VolumeTrash
+        } else {
+            TrashDisposition::WouldCopy
         }
     }
 
@@ -157,6 +184,15 @@ fn decode_mount_escapes(field: &[u8]) -> Vec<u8> {
     decoded
 }
 
+/// The path the crate trashes: the canonical parent joined with the item's
+/// own name, so a symbolic link is trashed as itself and not as its target.
+fn canonical_item_path(item: &Path) -> PathBuf {
+    match (item.parent(), item.file_name()) {
+        (Some(parent), Some(name)) => canonicalize_or_parents(parent).join(name),
+        _ => canonicalize_or_parents(item),
+    }
+}
+
 /// Canonicalizes a path, resolving through the nearest existing ancestor
 /// when the path itself does not exist, as the `trash` crate does.
 fn canonicalize_or_parents(path: &Path) -> PathBuf {
@@ -181,18 +217,47 @@ fn canonicalize_or_parents(path: &Path) -> PathBuf {
     }
 }
 
-fn same_device(item: &Path, home_trash: &Path) -> bool {
-    let Ok(item) = fs::symlink_metadata(item) else {
-        return false;
-    };
-    let Some(existing) = nearest_existing(home_trash) else {
-        return false;
-    };
-    item.dev() == existing.dev()
+/// Whether the crate can write the `files` and `info` directories of a
+/// trash folder: an existing one must be writable, a missing one needs a
+/// writable folder to be created in.
+fn trash_folder_writable(folder: &Path) -> bool {
+    ["files", "info"].iter().all(|name| {
+        let child = folder.join(name);
+        if child.is_dir() {
+            writable(&child)
+        } else {
+            writable(folder)
+        }
+    })
 }
 
-fn nearest_existing(path: &Path) -> Option<fs::Metadata> {
-    path.ancestors().find_map(|ancestor| fs::metadata(ancestor).ok())
+/// Whether a rename of `item` into `target` stays on one mount. `target`
+/// may not exist yet; the crate creates it under its nearest existing
+/// ancestor. rename(2) fails with EXDEV across mounts even on one device.
+fn same_mount(item: &Path, target: &Path) -> bool {
+    let Some(existing) = target
+        .ancestors()
+        .find(|ancestor| fs::metadata(ancestor).is_ok())
+    else {
+        return false;
+    };
+    match (
+        mount_identity(item, AtFlags::SYMLINK_NOFOLLOW),
+        mount_identity(existing, AtFlags::empty()),
+    ) {
+        (Some(item), Some(target)) => item == target,
+        _ => false,
+    }
+}
+
+/// The mount id from statx, or the device on kernels without STATX_MNT_ID.
+fn mount_identity(path: &Path, flags: AtFlags) -> Option<u64> {
+    let stat = statx(CWD, path, flags | AtFlags::NO_AUTOMOUNT, StatxFlags::MNT_ID).ok()?;
+    Some(if stat.stx_mask & StatxFlags::MNT_ID.bits() != 0 {
+        stat.stx_mnt_id
+    } else {
+        (u64::from(stat.stx_dev_major) << 32) | u64::from(stat.stx_dev_minor)
+    })
 }
 
 /// A shared `.Trash` directory is usable only when it is a real directory
@@ -216,7 +281,10 @@ mod tests {
         let mounts = b"tmpfs /run/user/1000 tmpfs rw 0 0\nsda1 /media/disk\\040one ext4 rw 0 0\n";
         assert_eq!(
             parse_mount_points(mounts),
-            [PathBuf::from("/run/user/1000"), PathBuf::from("/media/disk one")]
+            [
+                PathBuf::from("/run/user/1000"),
+                PathBuf::from("/media/disk one")
+            ]
         );
     }
 
@@ -224,11 +292,21 @@ mod tests {
     fn the_longest_mount_point_wins() {
         let environment = TrashEnvironment {
             home_trash: PathBuf::from("/home/user/.local/share/Trash"),
-            mount_points: vec![PathBuf::from("/home/user/data"), PathBuf::from("/home"), PathBuf::from("/")],
+            mount_points: vec![
+                PathBuf::from("/home/user/data"),
+                PathBuf::from("/home"),
+                PathBuf::from("/"),
+            ],
             uid: 1000,
         };
-        assert_eq!(environment.top_dir(Path::new("/home/user/data/x")), Path::new("/home/user/data"));
-        assert_eq!(environment.top_dir(Path::new("/home/user/x")), Path::new("/home"));
+        assert_eq!(
+            environment.top_dir(Path::new("/home/user/data/x")),
+            Path::new("/home/user/data")
+        );
+        assert_eq!(
+            environment.top_dir(Path::new("/home/user/x")),
+            Path::new("/home")
+        );
         assert_eq!(environment.top_dir(Path::new("/srv/x")), Path::new("/"));
     }
 
@@ -239,6 +317,19 @@ mod tests {
         assert_eq!(
             canonicalize_or_parents(&temporary.path().join("missing/Trash")),
             canonical.join("missing/Trash")
+        );
+    }
+
+    #[test]
+    fn a_link_keeps_its_own_name_when_canonicalized() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = temporary.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            canonical_item_path(&link),
+            fs::canonicalize(temporary.path()).unwrap().join("link")
         );
     }
 }
