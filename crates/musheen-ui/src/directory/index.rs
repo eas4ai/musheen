@@ -1664,6 +1664,15 @@ mod tests {
         );
     }
 
+    /// The read and write counters are process-wide, so the tests that
+    /// assert on them run one at a time.
+    fn counter_guard() -> std::sync::MutexGuard<'static, ()> {
+        static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        COUNTERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn many_records(index: &mut DiskDirectoryIndex, count: u64) {
         let provider = ProviderId::new("local").unwrap();
         for number in (0..count).rev() {
@@ -1707,6 +1716,7 @@ mod tests {
     #[test]
     fn indexed_folder_merge_reads_a_bounded_number_of_records() {
         use std::sync::atomic::Ordering::Relaxed;
+        let _serialized = counter_guard();
         let root = tempfile::tempdir().unwrap();
         let mut index = DiskDirectoryIndex::new_in(root.path()).unwrap();
         many_records(&mut index, 100_000);
@@ -1733,6 +1743,7 @@ mod tests {
     #[test]
     fn indexed_folder_merge_applies_waiting_changes_as_one_batch() {
         use std::sync::atomic::Ordering::Relaxed;
+        let _serialized = counter_guard();
         let root = tempfile::tempdir().unwrap();
         let mut index = DiskDirectoryIndex::new_in(root.path()).unwrap();
         many_records(&mut index, 5_000);
