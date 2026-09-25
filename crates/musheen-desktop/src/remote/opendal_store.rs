@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -438,6 +438,43 @@ impl OpendalStore {
                 .map_or(operator, |lease| lease.connection().clone());
             run_remote_streaming(cancellation, async move {
                 upload_staging(operator, &remote_path, &local).await
+            })
+            .await
+            .map_err(|category| RemoteError::new(protocol, category, None))?
+            .map_err(|category| RemoteError::new(protocol, category, None))
+        })
+    }
+
+    /// Downloads a regular file to a new local staging path. The caller owns
+    /// cleanup of any partial file after an error or cancellation.
+    pub fn download_to_new_local<'a>(
+        &'a self,
+        source: &'a StorePath,
+        local: &'a Path,
+        max_bytes: u64,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<u64, RemoteError>> {
+        let remote_path = self.remote_path(source);
+        let operator = self.operator.clone();
+        let pool = self.pool.clone();
+        let protocol = self.protocol;
+        let local = local.to_path_buf();
+        Box::pin(async move {
+            let remote_path =
+                remote_path.map_err(|category| RemoteError::new(protocol, category, None))?;
+            let lease = match pool {
+                Some(pool) => Some(
+                    pool.acquire(cancellation.clone())
+                        .await
+                        .map_err(|error| RemoteError::new(protocol, error.category(), None))?,
+                ),
+                None => None,
+            };
+            let operator = lease
+                .as_ref()
+                .map_or(operator, |lease| lease.connection().clone());
+            run_remote_streaming(cancellation, async move {
+                download_new_local(operator, &remote_path, &local, max_bytes).await
             })
             .await
             .map_err(|category| RemoteError::new(protocol, category, None))?
@@ -886,10 +923,14 @@ async fn upload_staging(
         }
         Err(_) => return Err(RemoteErrorCategory::Timeout),
     }
-    let mut writer = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.writer(remote_path))
-        .await
-        .map_err(|_| RemoteErrorCategory::Timeout)?
-        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
+    let exclusive = operator.info().capability().write_with_if_not_exists;
+    let mut writer = tokio::time::timeout(
+        TRANSFER_IDLE_TIMEOUT,
+        operator.writer_with(remote_path).if_not_exists(exclusive),
+    )
+    .await
+    .map_err(|_| RemoteErrorCategory::Timeout)?
+    .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Mutation))?;
     let transfer = async {
         let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
         let mut written = 0_u64;
@@ -923,6 +964,74 @@ async fn upload_staging(
         let _ = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, writer.abort()).await;
     }
     transfer
+}
+
+async fn download_new_local(
+    operator: Operator,
+    remote_path: &str,
+    local: &Path,
+    max_bytes: u64,
+) -> Result<u64, RemoteErrorCategory> {
+    let metadata = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(remote_path))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+    if !metadata.is_file() {
+        return Err(RemoteErrorCategory::Unsupported);
+    }
+    let size = metadata.content_length();
+    if size > max_bytes {
+        return Err(RemoteErrorCategory::Quota);
+    }
+    let reader = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.reader(remote_path))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(local)
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                RemoteErrorCategory::Conflict
+            } else {
+                RemoteErrorCategory::Permanent
+            }
+        })?;
+    let mut offset = 0_u64;
+    while offset < size {
+        let end = offset.saturating_add(TRANSFER_CHUNK_BYTES as u64).min(size);
+        let chunk = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, reader.read(offset..end))
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+        let bytes = chunk.to_vec();
+        if bytes.len() as u64 != end - offset {
+            return Err(RemoteErrorCategory::Protocol);
+        }
+        tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, file.write_all(&bytes))
+            .await
+            .map_err(|_| RemoteErrorCategory::Timeout)?
+            .map_err(|_| RemoteErrorCategory::Permanent)?;
+        offset = end;
+    }
+    tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, file.sync_all())
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|_| RemoteErrorCategory::Permanent)?;
+    let after = tokio::time::timeout(TRANSFER_IDLE_TIMEOUT, operator.stat(remote_path))
+        .await
+        .map_err(|_| RemoteErrorCategory::Timeout)?
+        .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+    if after.content_length() != size
+        || after.etag() != metadata.etag()
+        || after.version() != metadata.version()
+        || after.last_modified() != metadata.last_modified()
+    {
+        return Err(RemoteErrorCategory::Conflict);
+    }
+    Ok(offset)
 }
 
 fn block_on_remote<F, T>(operation: F) -> Result<T, StoreError>

@@ -194,6 +194,58 @@ fn upload_rejects_read_only_and_cancelled_connections_without_writing() {
 }
 
 #[test]
+fn range_download_is_bounded_and_never_replaces_a_local_file() {
+    let operator = memory_operator();
+    let payload = vec![0x7f; 2 * 1024 * 1024 + 7];
+    block_on(operator.write("source.bin", payload.clone())).unwrap();
+    let store = store(
+        operator,
+        RemoteProtocol::WebDav,
+        RemoteCasePolicy::Sensitive,
+        RemoteMutationPolicy::ReadOnly,
+    );
+    let source = store.path("/source.bin").unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let local = scratch.path().join("download.bin");
+
+    assert_eq!(
+        block_on(store.download_to_new_local(
+            &source,
+            &local,
+            payload.len() as u64 - 1,
+            CancellationToken::new()
+        ))
+        .unwrap_err()
+        .category(),
+        RemoteErrorCategory::Quota
+    );
+    assert!(!local.exists());
+    assert_eq!(
+        block_on(store.download_to_new_local(
+            &source,
+            &local,
+            payload.len() as u64,
+            CancellationToken::new()
+        ))
+        .unwrap(),
+        payload.len() as u64
+    );
+    assert_eq!(std::fs::read(&local).unwrap(), payload);
+    assert_eq!(
+        block_on(store.download_to_new_local(
+            &source,
+            &local,
+            payload.len() as u64,
+            CancellationToken::new()
+        ))
+        .unwrap_err()
+        .category(),
+        RemoteErrorCategory::Conflict
+    );
+    assert_eq!(std::fs::read(&local).unwrap(), payload);
+}
+
+#[test]
 fn paged_enumeration_range_reads_and_replacement_identity_share_one_adapter() {
     let operator = memory_operator();
     block_on(async {
