@@ -272,3 +272,7 @@ fn controls_for(page: SettingsPage) -> Vec<&'static SettingSpec> {
 /// Saved preferences consumed when new browser windows are constructed.
 pub(crate) struct RuntimeSettings(pub SettingsDocument);
 impl gpui_kit::Global for RuntimeSettings {}
+
+/// Advances only when saved remote connections change.
+pub(crate) struct RemoteConnectionsRevision(pub u64);
+impl gpui_kit::Global for RemoteConnectionsRevision {}

@@ -12,6 +12,7 @@ portal-backend = ["musheen-desktop/portal-backend"]
 
 [dependencies]
 async-channel.workspace = true
+blake3.workspace = true
 futures-lite.workspace = true
 gpui-kit.workspace = true
 jiff.workspace = true
@@ -25,6 +26,7 @@ open.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

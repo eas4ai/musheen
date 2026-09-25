@@ -5405,6 +5405,7 @@ name = "musheen-ui"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "blake3",
  "futures-lite",
  "gpui-kit",
  "jiff",
@@ -5418,6 +5419,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "xattr",
 ]
 

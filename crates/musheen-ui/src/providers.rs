@@ -1,8 +1,8 @@
 use musheen_core::{
     BoxFuture, CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityReason,
-    CapabilityState, DirectoryWatch, DisplayPath, ItemId, ItemKind, MutationRequest, Page,
-    PageRequest, ProviderId, SearchCapabilities, SearchQuery, SearchStream, Store, StoreError,
-    StoreItem, StorePath, TotalHint,
+    CapabilityState, Continuation, DirectoryWatch, DisplayPath, ItemId, ItemKind, MutationRequest,
+    Page, PageRequest, ProviderId, SearchCapabilities, SearchQuery, SearchStream, Store,
+    StoreError, StoreItem, StorePath, TotalHint,
 };
 use musheen_desktop::{LaunchTarget, MimeDetector};
 use musheen_local::{LocalOperationQueue, LocalStore, ProviderTransferRoute};
@@ -13,8 +13,31 @@ use std::sync::Arc;
 const NETWORK_PROVIDER_ID: &str = "musheen.network";
 const NETWORK_ROOT_KEY: &[u8] = b"root";
 
+fn provider_root_item(
+    provider: &ProviderId,
+    root: &StorePath,
+    identity_key: &[u8],
+    name: &str,
+) -> StoreItem {
+    StoreItem::new(
+        ItemId::new(provider.clone(), identity_key.to_vec())
+            .expect("a built-in provider root identity is valid"),
+        root.clone(),
+        DisplayPath::new(name),
+        ItemKind::Directory,
+        None,
+    )
+}
+
+mod remote;
+use remote::{RemoteProfileStore, RemoteStoreConnector, default_remote_connector};
+
 pub(crate) trait ProviderAdapter: Send + Sync {
     fn store(&self) -> Arc<dyn Store>;
+
+    fn network_name(&self) -> Option<&str> {
+        None
+    }
 
     /// Converts an opaque provider key at the provider boundary. Callers must
     /// never guess that a provider key is a URI.
@@ -87,6 +110,32 @@ impl ProviderRuntime {
         Self::builder()
             .build()
             .expect("the built-in provider registrations are valid")
+    }
+
+    pub(crate) fn from_settings(
+        settings: &musheen_desktop::SettingsDocument,
+    ) -> Result<Self, ProviderRuntimeError> {
+        Self::from_settings_with_connector(settings, default_remote_connector())
+    }
+
+    fn from_settings_with_connector(
+        settings: &musheen_desktop::SettingsDocument,
+        connector: RemoteStoreConnector,
+    ) -> Result<Self, ProviderRuntimeError> {
+        let mut builder = Self::builder();
+        if let Some(document) = settings.value("remote.connections") {
+            let profiles = musheen_desktop::ConnectionProfiles::import(&document)
+                .map_err(|_| ProviderRuntimeError::InvalidConnectionProfiles)?;
+            for profile in profiles.profiles() {
+                let store = Arc::new(
+                    RemoteProfileStore::new(profile.clone(), Arc::clone(&connector))
+                        .map_err(|_| ProviderRuntimeError::InvalidConnectionProfiles)?,
+                );
+                builder = builder
+                    .register_adapter(Arc::new(StoreOnlyAdapter::network(store, profile.name())))?;
+            }
+        }
+        builder.build()
     }
 
     pub(crate) fn with_primary_store(store: Arc<dyn Store>) -> Result<Self, ProviderRuntimeError> {
@@ -204,8 +253,14 @@ impl ProviderRuntimeBuilder {
         let mut providers = HashMap::with_capacity(self.adapters.len());
         let mut routes = Vec::new();
         let mut route_pairs = HashMap::new();
+        let mut remote_entries = Vec::new();
         for (provider, adapter) in &self.adapters {
             providers.insert(provider.clone(), adapter.store());
+            if let Some(name) = adapter.network_name() {
+                let root = StorePath::from_provider_key(provider.clone(), b"/".to_vec())
+                    .expect("a registered remote provider has a valid root key");
+                remote_entries.push(provider_root_item(provider, &root, b"/", name));
+            }
             for route in adapter.transfer_routes() {
                 let pair = (
                     route.source_provider_id().clone(),
@@ -217,6 +272,21 @@ impl ProviderRuntimeBuilder {
                 routes.push(route);
             }
         }
+        remote_entries.sort_by(|left, right| {
+            left.display_name()
+                .as_str()
+                .cmp(right.display_name().as_str())
+                .then_with(|| {
+                    left.id()
+                        .provider()
+                        .as_str()
+                        .cmp(right.id().provider().as_str())
+                })
+        });
+        providers.insert(
+            ProviderId::new(NETWORK_PROVIDER_ID).expect("the network provider ID is valid"),
+            Arc::new(NetworkDiscoveryStore::with_entries(remote_entries)),
+        );
         Ok(ProviderRuntime {
             store: Arc::new(RoutingStore { primary, providers }),
             routes: routes.into(),
@@ -230,6 +300,7 @@ pub(crate) enum ProviderRuntimeError {
     DuplicateProvider(ProviderId),
     DuplicateTransferRoute((ProviderId, ProviderId)),
     MissingPrimaryProvider(ProviderId),
+    InvalidConnectionProfiles,
 }
 
 impl fmt::Display for ProviderRuntimeError {
@@ -253,6 +324,9 @@ impl fmt::Display for ProviderRuntimeError {
                 "primary provider {} is not registered",
                 provider.as_str()
             ),
+            Self::InvalidConnectionProfiles => {
+                formatter.write_str("saved remote connections are invalid")
+            }
         }
     }
 }
@@ -261,17 +335,32 @@ impl std::error::Error for ProviderRuntimeError {}
 
 struct StoreOnlyAdapter {
     store: Arc<dyn Store>,
+    network_name: Option<Box<str>>,
 }
 
 impl StoreOnlyAdapter {
     fn new(store: Arc<dyn Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            network_name: None,
+        }
+    }
+
+    fn network(store: Arc<dyn Store>, name: impl Into<Box<str>>) -> Self {
+        Self {
+            store,
+            network_name: Some(name.into()),
+        }
     }
 }
 
 impl ProviderAdapter for StoreOnlyAdapter {
     fn store(&self) -> Arc<dyn Store> {
         Arc::clone(&self.store)
+    }
+
+    fn network_name(&self) -> Option<&str> {
+        self.network_name.as_deref()
     }
 }
 
@@ -400,6 +489,7 @@ impl Store for RoutingStore {
 struct NetworkDiscoveryStore {
     provider: ProviderId,
     root: StorePath,
+    entries: Arc<[StoreItem]>,
 }
 
 impl NetworkDiscoveryStore {
@@ -408,18 +498,22 @@ impl NetworkDiscoveryStore {
             .expect("the built-in network provider ID is valid");
         let root = StorePath::from_provider_key(provider.clone(), NETWORK_ROOT_KEY.to_vec())
             .expect("the built-in network root key is valid");
-        Self { provider, root }
+        Self {
+            provider,
+            root,
+            entries: Arc::new([]),
+        }
+    }
+
+    fn with_entries(entries: Vec<StoreItem>) -> Self {
+        Self {
+            entries: entries.into(),
+            ..Self::new()
+        }
     }
 
     fn root_item(&self) -> StoreItem {
-        StoreItem::new(
-            ItemId::new(self.provider.clone(), NETWORK_ROOT_KEY.to_vec())
-                .expect("the built-in network root identity is valid"),
-            self.root.clone(),
-            DisplayPath::new("Network"),
-            ItemKind::Directory,
-            None,
-        )
+        provider_root_item(&self.provider, &self.root, NETWORK_ROOT_KEY, "Network")
     }
 }
 
@@ -456,6 +550,7 @@ impl Store for NetworkDiscoveryStore {
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<Page<StoreItem>, StoreError>> {
         let is_root = location == &self.root;
+        let entries = Arc::clone(&self.entries);
         Box::pin(async move {
             cancellation.check()?;
             if !is_root {
@@ -463,7 +558,20 @@ impl Store for NetworkDiscoveryStore {
                     "network location does not exist".into(),
                 ));
             }
-            Page::try_new(&request, Vec::new(), None, TotalHint::Exact(0))
+            let start = request
+                .continuation()
+                .map_or(Ok(0), Continuation::decode_usize)?;
+            if start > entries.len() {
+                return Err(StoreError::InvalidContinuation);
+            }
+            let end = start.saturating_add(request.page_size()).min(entries.len());
+            let next = (end < entries.len()).then(|| Continuation::from_usize(end));
+            Page::try_new(
+                &request,
+                entries[start..end].to_vec(),
+                next,
+                TotalHint::Exact(entries.len() as u64),
+            )
         })
     }
 
@@ -509,11 +617,234 @@ pub(crate) fn network_root_path() -> StorePath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::future;
     use musheen_desktop::{
-        ArchiveFormat, ArchiveLimits, ArchivePasswordProvider, ArchiveStore, PasswordRequest,
+        ArchiveFormat, ArchiveLimits, ArchivePasswordProvider, ArchiveStore, ConnectionId,
+        ConnectionProfile, ConnectionProfiles, PasswordRequest, RemoteHost, RemoteProtocol,
+        SecurityPolicy, SettingsDocument,
     };
     use std::fs::File;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn settings_with_remote_profile() -> SettingsDocument {
+        let profile = ConnectionProfile::new(
+            ConnectionId::new("team-files").unwrap(),
+            "Team Files",
+            RemoteProtocol::Ftp,
+            RemoteHost::new(RemoteProtocol::Ftp, "files.example.test").unwrap(),
+            None,
+            "/",
+            None::<&str>,
+            None,
+            SecurityPolicy::PlaintextConfirmed,
+            None,
+        )
+        .unwrap();
+        let mut settings = SettingsDocument::default();
+        settings
+            .set_value(
+                "remote.connections",
+                &ConnectionProfiles::new(vec![profile]).export().unwrap(),
+            )
+            .unwrap();
+        settings
+    }
+
+    #[test]
+    fn saved_remote_profile_is_visible_without_opening_a_connection() {
+        let settings = settings_with_remote_profile();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let connector: RemoteStoreConnector = Arc::new(move |_, _, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(StoreError::Backend("unexpected connection".into())) })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+
+        let network = runtime.store();
+        let page = future::block_on(network.read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].display_name().as_str(), "Team Files");
+        let location = page.items()[0].path();
+        assert!(
+            location
+                .provider_key()
+                .unwrap()
+                .0
+                .as_str()
+                .starts_with("musheen.remote.")
+        );
+        assert!(runtime.store().resolve_item(location).unwrap().is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn opening_saved_remote_profile_connects_once_for_repeated_reads() {
+        let settings = settings_with_remote_profile();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let connector: RemoteStoreConnector = Arc::new(move |provider, _, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let root = StorePath::from_provider_key(provider.clone(), b"/".to_vec()).unwrap();
+            Box::pin(async move {
+                Ok(Arc::new(NetworkDiscoveryStore {
+                    provider,
+                    root,
+                    ..NetworkDiscoveryStore::new()
+                }) as Arc<dyn Store>)
+            })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        let network = runtime.store();
+        let entries = future::block_on(network.read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let remote = entries.items()[0].path();
+        for _ in 0..2 {
+            let page = future::block_on(network.read_directory(
+                remote,
+                PageRequest::new(16, None).unwrap(),
+                CancellationToken::new(),
+            ))
+            .unwrap();
+            assert!(page.items().is_empty());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn offline_profile_stays_visible_and_retries_after_a_failed_connection() {
+        let settings = settings_with_remote_profile();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let connector: RemoteStoreConnector = Arc::new(move |provider, _, _| {
+            let attempt = counted.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if attempt == 0 {
+                    return Err(StoreError::Backend("remote service is offline".into()));
+                }
+                let root = StorePath::from_provider_key(provider.clone(), b"/".to_vec())
+                    .expect("the fixture root is valid");
+                Ok(Arc::new(NetworkDiscoveryStore {
+                    provider,
+                    root,
+                    ..NetworkDiscoveryStore::new()
+                }) as Arc<dyn Store>)
+            })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        let store = runtime.store();
+        let entries = future::block_on(store.read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let remote = entries.items()[0].path();
+
+        assert!(
+            future::block_on(store.read_directory(
+                remote,
+                PageRequest::new(16, None).unwrap(),
+                CancellationToken::new(),
+            ))
+            .is_err()
+        );
+        assert!(store.resolve_item(remote).unwrap().is_some());
+        assert!(
+            future::block_on(store.read_directory(
+                remote,
+                PageRequest::new(16, None).unwrap(),
+                CancellationToken::new(),
+            ))
+            .is_ok()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn network_root_lists_registered_remote_locations() {
+        let provider = ProviderId::new("musheen.remote.example").unwrap();
+        let remote_root = StorePath::from_provider_key(provider.clone(), b"/".to_vec()).unwrap();
+        let remote = NetworkDiscoveryStore {
+            provider,
+            root: remote_root.clone(),
+            ..NetworkDiscoveryStore::new()
+        };
+        let runtime = ProviderRuntime::builder()
+            .register_adapter(Arc::new(StoreOnlyAdapter::network(
+                Arc::new(remote),
+                "Example",
+            )))
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let page = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].path(), &remote_root);
+    }
+
+    #[test]
+    fn equally_named_network_locations_have_stable_paged_order() {
+        let mut builder = ProviderRuntime::builder();
+        for suffix in b'a'..=b'j' {
+            let provider = ProviderId::new(format!("musheen.remote.{}", suffix as char)).unwrap();
+            let root = StorePath::from_provider_key(provider.clone(), b"/".to_vec()).unwrap();
+            builder = builder
+                .register_adapter(Arc::new(StoreOnlyAdapter::network(
+                    Arc::new(NetworkDiscoveryStore {
+                        provider,
+                        root,
+                        ..NetworkDiscoveryStore::new()
+                    }),
+                    "Shared",
+                )))
+                .unwrap();
+        }
+        let runtime = builder.build().unwrap();
+        let store = runtime.store();
+        let mut request = PageRequest::new(3, None).unwrap();
+        let mut providers = Vec::new();
+        loop {
+            let page = future::block_on(store.read_directory(
+                &network_root_path(),
+                request,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+            providers.extend(
+                page.items()
+                    .iter()
+                    .map(|item| item.id().provider().as_str().to_owned()),
+            );
+            let Some(next) = page.next_request() else {
+                break;
+            };
+            request = next;
+        }
+        assert_eq!(
+            providers,
+            (b'a'..=b'j')
+                .map(|suffix| format!("musheen.remote.{}", suffix as char))
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn additional_store_routes_archive_paths_without_replacing_local_storage() {

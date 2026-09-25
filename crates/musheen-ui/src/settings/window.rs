@@ -22,6 +22,23 @@ use std::sync::Arc;
 pub(crate) type RecentHistoryClearer =
     Arc<dyn Fn(&mut App) -> Result<(), Box<str>> + Send + Sync + 'static>;
 
+fn publish_saved_settings(document: &SettingsDocument, cx: &mut App) {
+    let changed_remote_connections =
+        cx.try_global::<super::RuntimeSettings>()
+            .is_none_or(|current| {
+                current.0.value("remote.connections") != document.value("remote.connections")
+            });
+    cx.set_global(super::RuntimeSettings(document.clone()));
+    if changed_remote_connections {
+        let revision = cx
+            .try_global::<super::RemoteConnectionsRevision>()
+            .map_or(0, |revision| revision.0)
+            .wrapping_add(1);
+        cx.set_global(super::RemoteConnectionsRevision(revision));
+    }
+    cx.refresh_windows();
+}
+
 #[derive(Default)]
 struct SettingsWindowOwner {
     handle: Option<WindowHandle<Root>>,
@@ -350,8 +367,7 @@ impl SettingsWindow {
             let result = work.await;
             cx.update(|cx| {
                 if let Ok(document) = &result {
-                    cx.set_global(super::RuntimeSettings(document.clone()));
-                    cx.refresh_windows();
+                    publish_saved_settings(document, cx);
                 }
                 if let Some(this) = this.upgrade() {
                     this.update(cx, |this, cx| {
@@ -1566,6 +1582,91 @@ mod tests {
         .await;
         assert_eq!(store.load().unwrap().value("files.hidden").unwrap(), "true");
         cx.update(|cx| assert!(!view.read(cx).state.is_dirty()));
+        cx.update_window(handle.into(), |_, window, _| window.remove_window())
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn remote_revision_advances_only_for_saved_connection_changes(cx: &mut TestAppContext) {
+        init_settings_pointer_test(cx);
+        cx.update(|cx| {
+            cx.set_global(crate::settings::RuntimeSettings(SettingsDocument::default()));
+            cx.set_global(crate::settings::RemoteConnectionsRevision(0));
+        });
+        let root = tempfile::tempdir().unwrap();
+        let store = SettingsStore::from_config_home(root.path());
+        let mut view = None;
+        let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
+            let entity = cx.new(|cx| {
+                SettingsWindow::new(
+                    store.clone(),
+                    SettingsBackends::all(),
+                    Catalog::load(Locale::EnUs).unwrap(),
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |this, _| {
+                this.state.edit("files.hidden", "true").unwrap()
+            });
+            window.render_frame(cx);
+            window.click("settings-apply", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), std::time::Duration::from_secs(3), |_, cx| {
+            !view.read(cx).saving
+        })
+        .await;
+        cx.update(|cx| {
+            assert_eq!(
+                cx.global::<crate::settings::RemoteConnectionsRevision>().0,
+                0
+            )
+        });
+
+        let profile = musheen_desktop::ConnectionProfile::new(
+            musheen_desktop::ConnectionId::new("revision-test").unwrap(),
+            "Revision test",
+            musheen_desktop::RemoteProtocol::Ftp,
+            musheen_desktop::RemoteHost::new(
+                musheen_desktop::RemoteProtocol::Ftp,
+                "files.example.test",
+            )
+            .unwrap(),
+            None,
+            "/",
+            None::<&str>,
+            None,
+            musheen_desktop::SecurityPolicy::PlaintextConfirmed,
+            None,
+        )
+        .unwrap();
+        let encoded = musheen_desktop::ConnectionProfiles::new(vec![profile])
+            .export()
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |this, _| {
+                this.state.edit("remote.connections", &encoded).unwrap();
+            });
+            window.render_frame(cx);
+            window.click("settings-apply", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), std::time::Duration::from_secs(3), |_, cx| {
+            !view.read(cx).saving
+        })
+        .await;
+        cx.update(|cx| {
+            assert_eq!(
+                cx.global::<crate::settings::RemoteConnectionsRevision>().0,
+                1
+            )
+        });
         cx.update_window(handle.into(), |_, window, _| window.remove_window())
             .unwrap();
     }

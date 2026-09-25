@@ -2067,6 +2067,7 @@ pub fn run(initial_path: PathBuf) {
                 .resource_limits_snapshot()
                 .expect("loaded settings limits are validated");
             cx.set_global(crate::settings::RuntimeSettings(settings.clone()));
+            cx.set_global(crate::settings::RemoteConnectionsRevision(0));
             let width = preview_window_width(
                 std::env::var("MUSHEEN_PREVIEW_WINDOW_WIDTH")
                     .ok()
@@ -2079,7 +2080,10 @@ pub fn run(initial_path: PathBuf) {
             );
             let fallback = StorePath::from_unix_path(initial_path.into_os_string());
             let store = SessionStore::for_current_user();
-            let providers = ProviderRuntime::for_current_user();
+            let providers = ProviderRuntime::from_settings(&settings).unwrap_or_else(|error| {
+                eprintln!("Musheen could not load remote connections: {error}");
+                ProviderRuntime::for_current_user()
+            });
             let application = (settings.value("general.restore_session").as_deref()
                 != Some("false")
                 && settings.value("general.startup").as_deref() == Some("last-session"))
@@ -3221,6 +3225,7 @@ struct MusheenApp {
     limits: ResourceLimits,
     store: Arc<dyn Store>,
     providers: ProviderRuntime,
+    remote_connections_revision: u64,
     shell: crate::ShellModel,
     navigation: WindowSession,
     omnibar: OmnibarState,
@@ -3955,6 +3960,9 @@ impl MusheenApp {
             limits,
             store: providers.store(),
             providers,
+            remote_connections_revision: cx
+                .try_global::<crate::settings::RemoteConnectionsRevision>()
+                .map_or(0, |revision| revision.0),
             shell: crate::ShellModel::with_terminal(
                 settings.as_ref().is_some_and(|settings| {
                     settings.value("layout.info_pane").as_deref() == Some("true")
@@ -4225,6 +4233,41 @@ impl MusheenApp {
     fn start_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
         let tab_id = self.navigation.focused_tab().id();
         self.start_load_for_tab(tab_id, location, cx);
+    }
+
+    fn refresh_remote_connections(&mut self, cx: &mut Context<Self>) {
+        let Some(revision) = cx
+            .try_global::<crate::settings::RemoteConnectionsRevision>()
+            .map(|revision| revision.0)
+        else {
+            return;
+        };
+        if revision == self.remote_connections_revision {
+            return;
+        }
+        self.remote_connections_revision = revision;
+        let Some(settings) = cx
+            .try_global::<crate::settings::RuntimeSettings>()
+            .map(|settings| &settings.0)
+        else {
+            return;
+        };
+        let providers = match ProviderRuntime::from_settings(settings) {
+            Ok(providers) => providers,
+            Err(error) => {
+                eprintln!("Musheen could not refresh remote connections: {error}");
+                return;
+            }
+        };
+        self.store = providers.store();
+        self.providers = providers;
+        let location = self.navigation.focused_tab().location().clone();
+        if location.provider_key().is_some_and(|(provider, _)| {
+            provider.as_str() == "musheen.network"
+                || provider.as_str().starts_with("musheen.remote.")
+        }) {
+            self.start_load(location, cx);
+        }
     }
 
     fn start_initial_load(&mut self, location: StorePath, cx: &mut Context<Self>) {
@@ -15918,6 +15961,7 @@ fn apply_directory_page_error(
 
 impl Render for MusheenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_remote_connections(cx);
         self.refresh_custom_actions(cx);
         let request = self.active_command_request(CommandAction::CustomAction);
         self.preflight_custom_actions(request.selection(), request.location().clone(), cx);
@@ -18003,7 +18047,6 @@ mod tests {
             app.read(cx).focused_directory().state() == &DirectoryState::Ready
         })
         .await;
-
         app.update(cx, |state, _| {
             assert_eq!(state.focused_directory().generation(), 1);
             assert_eq!(state.focused_directory().items().len(), 1);
@@ -26516,6 +26559,89 @@ mod tests {
             .await
             .unwrap();
         assert!(page.items().is_empty());
+    }
+
+    #[gpui_kit::test]
+    async fn saved_remote_profile_becomes_visible_in_an_open_window(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+            cx.set_global(crate::settings::RuntimeSettings(
+                musheen_desktop::SettingsDocument::default(),
+            ));
+            cx.set_global(crate::settings::RemoteConnectionsRevision(0));
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("visible.txt"), b"fixture").unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_session_store(temporary.path().to_path_buf(), None, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            state.navigate(network_root_path(), true, cx)
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            app.read(cx).focused_directory().state() == &DirectoryState::Empty
+        })
+        .await;
+
+        let profile = musheen_desktop::ConnectionProfile::new(
+            musheen_desktop::ConnectionId::new("new-remote").unwrap(),
+            "New Remote",
+            musheen_desktop::RemoteProtocol::Ftp,
+            musheen_desktop::RemoteHost::new(
+                musheen_desktop::RemoteProtocol::Ftp,
+                "files.example.test",
+            )
+            .unwrap(),
+            None,
+            "/",
+            None::<&str>,
+            None,
+            musheen_desktop::SecurityPolicy::PlaintextConfirmed,
+            None,
+        )
+        .unwrap();
+        let mut settings = musheen_desktop::SettingsDocument::default();
+        settings
+            .set_value(
+                "remote.connections",
+                &musheen_desktop::ConnectionProfiles::new(vec![profile])
+                    .export()
+                    .unwrap(),
+            )
+            .unwrap();
+        cx.update(|cx| {
+            cx.set_global(crate::settings::RuntimeSettings(settings));
+            cx.set_global(crate::settings::RemoteConnectionsRevision(1));
+            cx.refresh_windows();
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
+            let state = app.read(cx);
+            state.remote_connections_revision == 1
+                && state.focused_directory().state() == &DirectoryState::Ready
+        })
+        .await;
+        let store = app.update(cx, |state, _| Arc::clone(&state.store));
+        let page = store
+            .read_directory(
+                &network_root_path(),
+                PageRequest::new(16, None).unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items().len(), 1);
+        assert_eq!(page.items()[0].display_name().as_str(), "New Remote");
     }
 
     #[gpui_kit::test]
