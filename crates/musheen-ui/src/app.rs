@@ -8341,6 +8341,9 @@ impl MusheenApp {
                     cx.notify();
                 }
             }
+            (CommandAction::Preview, CommandParameters::Targets(targets)) => {
+                self.dispatch_preview_command(targets, origin_tab, cx);
+            }
             (
                 create_action @ (CommandAction::NewDirectory | CommandAction::NewEmptyFile),
                 CommandParameters::Location(parent),
@@ -10208,6 +10211,80 @@ impl MusheenApp {
         })
     }
 
+    fn dispatch_preview_command(
+        &mut self,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = origin_tab.unwrap_or_else(|| self.navigation.focused_tab().id());
+        let result = (|| {
+            let [target] = targets else {
+                return Err(self
+                    .catalog
+                    .message("context.backend-unavailable")
+                    .expect("backend refusal is localized")
+                    .into());
+            };
+            if self.navigation.focused_tab().id() != tab_id
+                || !self.directories.contains_key(&tab_id)
+            {
+                return Err(self
+                    .catalog
+                    .message("context.origin-unavailable")
+                    .expect("origin refusal is localized")
+                    .into());
+            }
+            self.revalidate_context_targets(Some(tab_id), targets)?;
+            if target.path().as_unix_path().is_none() {
+                return Err(self
+                    .catalog
+                    .message("context.backend-unavailable")
+                    .expect("backend refusal is localized")
+                    .into());
+            }
+            let item = self.store.resolve_item(target.path()).map_err(|error| {
+                Box::<str>::from(format!(
+                    "{}: {error}",
+                    self.catalog
+                        .message("context.target-verification")
+                        .expect("verification refusal is localized")
+                ))
+            })?;
+            if item
+                .as_ref()
+                .is_none_or(|item| item.id() != target.id() || item.path() != target.path())
+            {
+                return Err(self
+                    .catalog
+                    .message("context.target-changed")
+                    .expect("target refusal is localized")
+                    .into());
+            }
+            if item.is_none_or(|item| item.kind() != ItemKind::RegularFile) {
+                return Err(self
+                    .catalog
+                    .message("context.backend-unavailable")
+                    .expect("backend refusal is localized")
+                    .into());
+            }
+            Ok(target.id().clone())
+        })();
+        match result {
+            Ok(id) => {
+                self.select_item(tab_id, id, cx);
+                if !self.shell.info_visible() {
+                    self.shell.toggle_info();
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.operation_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
     fn copyable_location_text(&self, path: &StorePath) -> Option<String> {
         if let Some(local) = path.as_unix_path() {
             if !local.is_absolute() {
@@ -10295,6 +10372,7 @@ impl MusheenApp {
                 | CommandAction::RunAsAdministrator
                 | CommandAction::Copy
                 | CommandAction::CopyLocation
+                | CommandAction::Preview
                 | CommandAction::Cut
                 | CommandAction::PasteInto
                 | CommandAction::MoveToTrash
@@ -10328,11 +10406,17 @@ impl MusheenApp {
         target: CommandTarget,
         selection: &[CommandTargetRef],
     ) -> CapabilityState {
-        if action == CommandAction::CopyLocation
+        if matches!(action, CommandAction::CopyLocation | CommandAction::Preview)
             && selection
                 .first()
                 .filter(|_| selection.len() == 1)
-                .is_none_or(|item| self.copyable_location_text(item.path()).is_none())
+                .is_none_or(|item| match action {
+                    CommandAction::CopyLocation => {
+                        self.copyable_location_text(item.path()).is_none()
+                    }
+                    CommandAction::Preview => item.path().as_unix_path().is_none(),
+                    _ => false,
+                })
         {
             return CapabilityState::Unsupported(
                 CapabilityReason::new(
@@ -20241,6 +20325,7 @@ mod tests {
             CommandAction::CreateHardLink,
             CommandAction::Duplicate,
             CommandAction::CopyLocation,
+            CommandAction::Preview,
             CommandAction::NewFromTemplate,
             CommandAction::Hide,
             CommandAction::Unhide,
@@ -20791,6 +20876,112 @@ mod tests {
         let bytes = store.load().ok()??;
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         Some(value.get("windows")?.as_array()?.len())
+    }
+
+    #[gpui_kit::test]
+    async fn preview_context_action_selects_its_file_and_reveals_info_pane(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected.txt");
+        filesystem::write(&selected, b"preview me").unwrap();
+        let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&selected);
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            if state.shell.info_visible() {
+                state.shell.toggle_info();
+            }
+            state.dispatch_typed_context_command(
+                CommandAction::Preview,
+                CommandParameters::targets(vec![target.clone()]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+            assert!(state.shell.info_visible());
+            assert_eq!(
+                state.directories[&tab].view().selected_ids(),
+                &[target.id().clone()]
+            );
+            assert!(matches!(
+                state.info_panes.get(&tab).map(InfoPaneModel::state),
+                Some(InfoPaneState::Loading { details, .. }
+                    | InfoPaneState::Ready { details, .. }) if details.name() == "selected.txt"
+            ));
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn preview_context_action_refuses_a_replaced_file(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected.txt");
+        filesystem::write(&selected, b"old").unwrap();
+        let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&selected);
+        filesystem::rename(&selected, temporary.path().join("old.txt")).unwrap();
+        filesystem::write(&selected, b"replacement").unwrap();
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let previous_selection = state.directories[&tab].view().selected_ids().to_vec();
+            if state.shell.info_visible() {
+                state.shell.toggle_info();
+            }
+            state.dispatch_typed_context_command(
+                CommandAction::Preview,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+            assert!(!state.shell.info_visible());
+            assert_eq!(
+                state.directories[&tab].view().selected_ids(),
+                previous_selection
+            );
+            assert_eq!(
+                state.operation_error.as_deref(),
+                Some(state.catalog.message("context.target-changed").unwrap())
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn preview_context_action_refuses_a_directory(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("child");
+        filesystem::create_dir(&directory).unwrap();
+        let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&directory);
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            if state.shell.info_visible() {
+                state.shell.toggle_info();
+            }
+            state.dispatch_typed_context_command(
+                CommandAction::Preview,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+            assert!(!state.shell.info_visible());
+            assert_eq!(
+                state.operation_error.as_deref(),
+                Some(
+                    state
+                        .catalog
+                        .message("context.backend-unavailable")
+                        .unwrap()
+                )
+            );
+        });
     }
 
     #[gpui_kit::test]
