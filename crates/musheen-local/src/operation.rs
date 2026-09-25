@@ -1622,4 +1622,58 @@ mod tests {
         assert!(source.exists());
         assert_eq!(fs::read_dir(source).unwrap().count(), 1);
     }
+
+    // OPS-006: the removal identity keeps ctime for an entry with one link, so
+    // a child rewritten in place after planning is refused at removal even
+    // when its length and mtime were restored.
+    #[test]
+    fn a_regular_entry_rewritten_with_a_restored_mtime_is_refused_at_removal() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("tree");
+        fs::create_dir(&source).unwrap();
+        let child = source.join("child");
+        fs::write(&child, b"original").unwrap();
+        let before = fs::metadata(&child).unwrap();
+        let path = store_path(&source);
+        let mut provider = LocalStore::new();
+        let expected = provider.inspect(&path, false).unwrap();
+        let token = provider.prepare_source_removal(&path, &expected).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&child)
+            .unwrap()
+            .write_all(b"REWRITE!")
+            .unwrap();
+        let restored = Timespec {
+            tv_sec: before.mtime(),
+            tv_nsec: before.mtime_nsec(),
+        };
+        utimensat(
+            CWD,
+            &child,
+            &Timestamps {
+                last_access: restored,
+                last_modification: restored,
+            },
+            AtFlags::empty(),
+        )
+        .unwrap();
+        let after = fs::metadata(&child).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.mtime_nsec(), before.mtime_nsec());
+
+        assert_eq!(
+            provider.remove_source(&path, &expected, &token),
+            Err(ProviderError::SourceChanged)
+        );
+        assert_eq!(
+            fs::read(&child).unwrap(),
+            b"REWRITE!",
+            "the changed child stays"
+        );
+    }
 }
