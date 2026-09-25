@@ -105,6 +105,10 @@ enum LocalOperation {
         provider_route: Option<Arc<dyn ProviderTransferRoute>>,
     },
     FinalizeMove(Box<MoveMetadataReview>),
+    FinalizeProviderMove {
+        review: Box<MoveMetadataReview>,
+        route: Arc<dyn ProviderTransferRoute>,
+    },
     Metadata(MetadataPlan),
     Create(CreateRequest),
     SymbolicLink {
@@ -315,7 +319,7 @@ impl LocalOperation {
     const fn kind(&self) -> OperationKind {
         match self {
             Self::Transfer { action, .. } => action.operation_kind(),
-            Self::FinalizeMove(_) => OperationKind::Move,
+            Self::FinalizeMove(_) | Self::FinalizeProviderMove { .. } => OperationKind::Move,
             Self::Metadata(plan) => {
                 if plan.requires_permissions() {
                     OperationKind::SetPermissions
@@ -341,6 +345,7 @@ impl LocalOperation {
         match self {
             Self::Transfer { source, .. } => source,
             Self::FinalizeMove(review) => review.source(),
+            Self::FinalizeProviderMove { review, .. } => review.source(),
             Self::Metadata(plan) => plan.root(),
             Self::Create(request) => request.parent(),
             Self::SymbolicLink { source, .. } => source.path(),
@@ -360,7 +365,7 @@ impl LocalOperation {
                 destination,
                 ..
             } => vec![source.clone(), destination.clone()],
-            Self::FinalizeMove(review) => {
+            Self::FinalizeMove(review) | Self::FinalizeProviderMove { review, .. } => {
                 vec![review.source().clone(), review.destination().clone()]
             }
             Self::Metadata(plan) => vec![plan.root().clone()],
@@ -529,6 +534,16 @@ pub trait ProviderTransferRoute: fmt::Debug + Send + Sync {
         &self,
         execution: ProviderTransferExecution<'_>,
     ) -> Result<TransferOutcome, LocalOperationFailure>;
+
+    fn finalize_move(
+        &self,
+        _review: &MoveMetadataReview,
+        _cancellation: &musheen_core::CancellationToken,
+    ) -> Result<CommandTargetRef, LocalOperationFailure> {
+        Err(LocalOperationFailure::failed(
+            "this provider route cannot finalize a reviewed move",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -754,6 +769,12 @@ impl ReadyLocalOperation {
                 complete_move_after_metadata_review(&mut store, *review, &self.cancellation)
                     .map_err(LocalOperationFailure::from_transfer)?;
                 transfer_completed(&store, destination, None)
+            }
+            LocalOperation::FinalizeProviderMove { review, route } => {
+                let target = route.finalize_move(&review, &self.cancellation)?;
+                Ok(LocalOperationOutcome::Transfer(TransferOutcome::Completed(
+                    target,
+                )))
             }
             LocalOperation::Metadata(plan) => plan
                 .execute_controlled(&mut store, &self.cancellation)
@@ -1336,8 +1357,17 @@ impl LocalOperationQueue {
         review: Box<MoveMetadataReview>,
     ) -> Result<(), DropError> {
         self.scheduler.fail(id)?;
-        self.operations
-            .insert(id, LocalOperation::FinalizeMove(review));
+        let operation = match self.operations.get(&id) {
+            Some(LocalOperation::Transfer {
+                provider_route: Some(route),
+                ..
+            }) => LocalOperation::FinalizeProviderMove {
+                review,
+                route: Arc::clone(route),
+            },
+            _ => LocalOperation::FinalizeMove(review),
+        };
+        self.operations.insert(id, operation);
         self.failures
             .insert(id, "metadata loss requires confirmation".into());
         Ok(())
@@ -1349,6 +1379,7 @@ impl LocalOperationQueue {
             && matches!(
                 self.operations.get(&id),
                 Some(LocalOperation::FinalizeMove(_))
+                    | Some(LocalOperation::FinalizeProviderMove { .. })
             )
     }
 
@@ -1968,6 +1999,7 @@ impl From<SchedulerError> for DropError {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct AcceptDecisions;
 
@@ -1985,6 +2017,7 @@ mod tests {
     #[derive(Debug)]
     struct AttentionTransferRoute {
         provider: musheen_core::ProviderId,
+        finalized: Arc<AtomicBool>,
     }
 
     impl ProviderTransferRoute for AttentionTransferRoute {
@@ -2017,6 +2050,19 @@ mod tests {
             Err(LocalOperationFailure::needs_attention(
                 "destination may have been published; inspect before retrying",
             ))
+        }
+
+        fn finalize_move(
+            &self,
+            review: &MoveMetadataReview,
+            _cancellation: &musheen_core::CancellationToken,
+        ) -> Result<CommandTargetRef, LocalOperationFailure> {
+            self.finalized.store(true, Ordering::SeqCst);
+            CommandTargetRef::new(
+                ItemId::new(self.provider.clone(), b"completed".to_vec()).unwrap(),
+                review.destination().clone(),
+            )
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))
         }
     }
 
@@ -2105,7 +2151,10 @@ mod tests {
                 expected_identity: None,
                 expected_raw_identity: None,
                 expected_destination_parent_identity: None,
-                provider_route: Some(Arc::new(AttentionTransferRoute { provider })),
+                provider_route: Some(Arc::new(AttentionTransferRoute {
+                    provider,
+                    finalized: Arc::new(AtomicBool::new(false)),
+                })),
             },
         };
 
@@ -2115,6 +2164,54 @@ mod tests {
             LocalFailureDisposition::NeedsAttention
         );
         assert!(failure.message().contains("inspect before retrying"));
+    }
+
+    #[test]
+    fn provider_metadata_review_resumes_through_its_provider_route() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        let destination_directory = temporary.path().join("destination");
+        fs::write(&source_path, b"contents").unwrap();
+        fs::create_dir(&destination_directory).unwrap();
+        let source = StorePath::from_unix_path(source_path);
+        let target = StorePath::from_unix_path(destination_directory);
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        let id = queue
+            .submit_drop(
+                FileDragPayload::new(vec![source.clone()], DropAction::Move).unwrap(),
+                target,
+            )
+            .unwrap()[0];
+        let destination = queue.operation_paths(id).unwrap()[1].clone();
+        let _running = queue.start_ready().unwrap();
+        let finalized = Arc::new(AtomicBool::new(false));
+        let route = Arc::new(AttentionTransferRoute {
+            provider: musheen_core::ProviderId::new("local").unwrap(),
+            finalized: finalized.clone(),
+        });
+        let Some(LocalOperation::Transfer { provider_route, .. }) = queue.operations.get_mut(&id)
+        else {
+            panic!("the queued move is a transfer")
+        };
+        *provider_route = Some(route);
+
+        queue
+            .finish_metadata_review(id, Box::new(metadata_review(source, destination)))
+            .unwrap();
+        assert!(matches!(
+            queue.operations.get(&id),
+            Some(LocalOperation::FinalizeProviderMove { .. })
+        ));
+        queue.confirm_metadata_loss(id).unwrap();
+        let ready = queue.start_ready().unwrap();
+        assert_eq!(ready.len(), 1);
+        ready
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+        assert!(finalized.load(Ordering::SeqCst));
     }
 
     #[test]
