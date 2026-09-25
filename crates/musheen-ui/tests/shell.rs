@@ -230,7 +230,6 @@ fn directory_rendered_range_reaches_entries_after_retention_window() {
 }
 
 #[test]
-#[ignore = "resource-intensive million-item provider pagination verification"]
 fn streaming_directory_model_pages_through_one_million_items() {
     let limits = ResourceLimits::default();
     let index_root = tempfile::tempdir().unwrap();
