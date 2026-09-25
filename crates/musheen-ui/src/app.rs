@@ -2840,15 +2840,15 @@ fn install_native_theme(cx: &mut App) {
     crate::theme::runtime::install(cx);
 }
 
-/// Installs the Adwaita presets when the system theme cannot be read. The
-/// bridge keeps the variant applied last as the current mode.
+/// Installs both Adwaita presets when the system theme cannot be read. The
+/// bridge keeps the variant applied last as the current mode, so the
+/// variant the window prefers goes last.
 fn install_fallback_theme(
     prefers_dark: bool,
     preferences: &native_theme::AccessibilityPreferences,
     cx: &mut App,
 ) {
-    let _ = prefers_dark;
-    for is_dark in [true, false] {
+    for is_dark in [!prefers_dark, prefers_dark] {
         if let Ok((theme, resolved)) = native_theme_gpui::from_preset("adwaita", is_dark, preferences)
         {
             native_theme_gpui::apply(theme, &resolved, preferences, cx);
