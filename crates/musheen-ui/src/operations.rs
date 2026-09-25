@@ -1186,13 +1186,15 @@ pub(crate) fn spawn_ready_hub_operations<V>(
 where
     V: 'static,
 {
-    let forgotten = hub
-        .pending_forget
-        .lock()
-        .map(|mut pending| std::mem::take(&mut *pending))
-        .unwrap_or_default();
     let ready = {
         let mut queue = hub.queue.lock().map_err(|_| OperationHubError::QueueLock)?;
+        // The forget list is taken only once the queue is held, so a queue
+        // lock failure leaves it for the next spawn.
+        let forgotten = hub
+            .pending_forget
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default();
         for id in forgotten {
             queue.forget(id);
         }

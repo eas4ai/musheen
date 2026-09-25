@@ -985,6 +985,7 @@ impl DirectoryModel {
             .map(Option::flatten)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_index_watch_event(
         &self,
         load: &DirectoryLoad,
