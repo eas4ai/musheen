@@ -221,6 +221,9 @@ Status: Draft
 The directory-background menu includes New Directory, New Empty File, New
 from Template, Paste, Select All, Open Terminal Here, Show Hidden, view,
 sort, group, and directory Properties commands when applicable.
+New from Template chooses one local regular file and copies it into the
+captured directory under its filename through the normal conflict workflow;
+cancellation is a no-op and a changed destination is refused.
 Falsifier: a background command acts on a stale selection or bypasses the
 active pane's location and capability state.
 Mechanism: background-menu schema and dispatch tests in both panes.

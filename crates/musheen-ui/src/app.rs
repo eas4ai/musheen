@@ -62,10 +62,10 @@ use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context,
     DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Global, ImageSource, IntoElement,
-    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    Role, ScrollHandle, SharedString, Subscription, TestSupportExt, TitlebarOptions,
-    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowId, WindowOptions, canvas,
-    div, fill, img, point, px, size, uniform_list,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, Render, Role, ScrollHandle, SharedString, Subscription, TestSupportExt,
+    TitlebarOptions, UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowId,
+    WindowOptions, canvas, div, fill, img, point, px, size, uniform_list,
 };
 use musheen_core::{
     ActiveLayout, CancellationToken, CapabilityKind, CapabilityReason, CapabilityState,
@@ -1741,6 +1741,24 @@ fn submitted_rename_name(original_name: &OsStr, submitted: &str) -> OsString {
     } else {
         submitted.into()
     }
+}
+
+fn template_copy_payload(source: &Path) -> Result<FileDragPayload, &'static str> {
+    if !source.is_absolute()
+        || !std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err("template-source-invalid");
+    }
+    let path = StorePath::from_unix_path(source.as_os_str());
+    let item = LocalStore::new()
+        .resolve_item(&path)
+        .map_err(|_| "template-source-invalid")?
+        .ok_or("template-source-invalid")?;
+    if item.kind() != ItemKind::RegularFile {
+        return Err("template-source-invalid");
+    }
+    FileDragPayload::with_expected_identities(vec![path], vec![item.id().clone()], DropAction::Copy)
+        .map_err(|_| "template-source-invalid")
 }
 
 fn visibility_rename_name(path: &StorePath, hide: bool) -> Result<OsString, Box<str>> {
@@ -8302,6 +8320,9 @@ impl MusheenApp {
             (CommandAction::Duplicate, CommandParameters::Targets(targets)) => {
                 self.submit_duplicate_targets(targets.clone(), cx);
             }
+            (CommandAction::NewFromTemplate, CommandParameters::Location(destination)) => {
+                self.open_template_picker(destination.clone(), origin_tab, cx);
+            }
             (CommandAction::CopyLocation, CommandParameters::Targets(targets)) => {
                 if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
                     self.operation_error = Some(error);
@@ -9565,6 +9586,97 @@ impl MusheenApp {
         .detach();
     }
 
+    fn open_template_picker(
+        &mut self,
+        destination: StorePath,
+        origin_tab: Option<TabId>,
+        cx: &mut Context<Self>,
+    ) {
+        let valid_origin = origin_tab.is_some_and(|tab| {
+            self.navigation.focused_tab().id() == tab
+                && self
+                    .navigation
+                    .tab(tab)
+                    .is_some_and(|state| state.location() == &destination)
+        });
+        if !valid_origin {
+            self.operation_error = Some(
+                self.catalog
+                    .message("context.target-changed")
+                    .expect("target refusal is localized")
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let tab_id = origin_tab.expect("the origin was checked above");
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(
+                self.catalog
+                    .message("command.new-from-template")
+                    .expect("the template command is localized")
+                    .into(),
+            ),
+        });
+        let work = cx.background_spawn(async move {
+            let paths = receiver
+                .await
+                .map_err(|_| "template-picker-failed")?
+                .map_err(|_| "template-picker-failed")?;
+            let Some(paths) = paths else {
+                return Ok(None);
+            };
+            let [source] = paths.try_into().map_err(|_| "template-source-invalid")?;
+            template_copy_payload(&source).map(Some)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let result = match result {
+                    Ok(None) => return,
+                    result => result,
+                };
+                if state.navigation.focused_tab().id() != tab_id
+                    || !state
+                        .navigation
+                        .tab(tab_id)
+                        .is_some_and(|tab| tab.location() == &destination)
+                {
+                    state.operation_error = Some(
+                        state
+                            .catalog
+                            .message("context.target-changed")
+                            .expect("target refusal is localized")
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(Some(payload)) => state.submit_reviewed_transfer(payload, destination, cx),
+                    Ok(None) => unreachable!("cancelled template selection returns early"),
+                    Err(key) => {
+                        state.operation_error = Some(
+                            state
+                                .catalog
+                                .message(key)
+                                .expect("template refusal is localized")
+                                .into(),
+                        );
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn open_volume_unlock(&mut self, id: VolumeId, cx: &mut Context<Self>) {
         let label: Option<Box<str>> = Some(self.volumes.snapshot()).and_then(|model| {
             model
@@ -10197,6 +10309,7 @@ impl MusheenApp {
                 | CommandAction::Unhide
                 | CommandAction::NewDirectory
                 | CommandAction::NewEmptyFile
+                | CommandAction::NewFromTemplate
                 | CommandAction::BrowseArchive
                 | CommandAction::Compress
                 | CommandAction::Extract
@@ -20130,6 +20243,7 @@ mod tests {
             CommandAction::CreateHardLink,
             CommandAction::Duplicate,
             CommandAction::CopyLocation,
+            CommandAction::NewFromTemplate,
             CommandAction::Hide,
             CommandAction::Unhide,
             CommandAction::RenameTag,
@@ -20859,6 +20973,194 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn new_from_template_copies_a_chosen_file_into_the_active_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        let templates = temporary.path().join("Templates");
+        filesystem::create_dir(&destination).unwrap();
+        filesystem::create_dir(&templates).unwrap();
+        filesystem::write(destination.join("existing.txt"), b"existing").unwrap();
+        let template = templates.join("Letter.txt");
+        filesystem::write(&template, b"Dear recipient,\n").unwrap();
+        let (app, browser) = open_selected_directory(&destination, Layout::List, cx).await;
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::NewFromTemplate,
+                CommandParameters::Location(StorePath::from_unix_path(destination.as_os_str())),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                false,
+                cx,
+            );
+        });
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.files);
+            assert!(!options.directories);
+            assert!(!options.multiple);
+            Some(vec![template.clone()])
+        });
+        cx.wait_for(browser, Duration::from_secs(4), |_, _| {
+            destination.join("Letter.txt").exists()
+        })
+        .await;
+        assert_eq!(
+            filesystem::read(destination.join("Letter.txt")).unwrap(),
+            b"Dear recipient,\n"
+        );
+    }
+
+    #[test]
+    fn template_source_must_be_a_regular_file_not_a_symlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let template = temporary.path().join("Letter.txt");
+        filesystem::write(&template, b"letter").unwrap();
+        let link = temporary.path().join("Letter link.txt");
+        std::os::unix::fs::symlink(&template, &link).unwrap();
+
+        assert!(template_copy_payload(&template).is_ok());
+        assert_eq!(
+            template_copy_payload(&link).unwrap_err(),
+            "template-source-invalid"
+        );
+        assert_eq!(
+            template_copy_payload(temporary.path()).unwrap_err(),
+            "template-source-invalid"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn new_from_template_cancel_does_not_create_a_file(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let template = temporary.path().join("Letter.txt");
+        filesystem::write(&template, b"letter").unwrap();
+        let destination = temporary.path().join("destination");
+        filesystem::create_dir(&destination).unwrap();
+        filesystem::write(destination.join("existing.txt"), b"existing").unwrap();
+        let (app, _) = open_selected_directory(&destination, Layout::List, cx).await;
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::NewFromTemplate,
+                CommandParameters::Location(StorePath::from_unix_path(destination.as_os_str())),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                false,
+                cx,
+            );
+        });
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert!(!destination.join("Letter.txt").exists());
+        assert!(cx.read(|cx| app.read(cx).operation_error.is_none()));
+    }
+
+    #[gpui_kit::test]
+    async fn new_from_template_refuses_a_destination_changed_while_choosing(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let template = temporary.path().join("Letter.txt");
+        filesystem::write(&template, b"letter").unwrap();
+        let destination = temporary.path().join("destination");
+        let elsewhere = temporary.path().join("elsewhere");
+        filesystem::create_dir(&destination).unwrap();
+        filesystem::create_dir(&elsewhere).unwrap();
+        filesystem::write(destination.join("existing.txt"), b"existing").unwrap();
+        let (app, browser) = open_selected_directory(&destination, Layout::List, cx).await;
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::NewFromTemplate,
+                CommandParameters::Location(StorePath::from_unix_path(destination.as_os_str())),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                false,
+                cx,
+            );
+            state.navigate(StorePath::from_unix_path(elsewhere.as_os_str()), true, cx);
+        });
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| Some(vec![template]));
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            app.read(cx).operation_error.as_deref()
+                == Some(
+                    app.read(cx)
+                        .catalog
+                        .message("context.target-changed")
+                        .unwrap(),
+                )
+        })
+        .await;
+        assert!(!destination.join("Letter.txt").exists());
+        assert!(!elsewhere.join("Letter.txt").exists());
+    }
+
+    #[gpui_kit::test]
+    async fn cancelled_template_picker_stays_silent_after_navigation(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        let elsewhere = temporary.path().join("elsewhere");
+        filesystem::create_dir(&destination).unwrap();
+        filesystem::create_dir(&elsewhere).unwrap();
+        filesystem::write(destination.join("existing.txt"), b"existing").unwrap();
+        let (app, _) = open_selected_directory(&destination, Layout::List, cx).await;
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::NewFromTemplate,
+                CommandParameters::Location(StorePath::from_unix_path(destination.as_os_str())),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                false,
+                cx,
+            );
+            state.navigate(StorePath::from_unix_path(elsewhere.as_os_str()), true, cx);
+        });
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert!(cx.read(|cx| app.read(cx).operation_error.is_none()));
+    }
+
+    #[gpui_kit::test]
+    async fn new_from_template_keeps_an_existing_file_until_conflict_review(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        let templates = temporary.path().join("Templates");
+        filesystem::create_dir(&destination).unwrap();
+        filesystem::create_dir(&templates).unwrap();
+        let template = templates.join("Letter.txt");
+        filesystem::write(&template, b"template").unwrap();
+        let existing = destination.join("Letter.txt");
+        filesystem::write(&existing, b"keep existing").unwrap();
+        let (app, browser) = open_selected_directory(&destination, Layout::List, cx).await;
+
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::NewFromTemplate,
+                CommandParameters::Location(StorePath::from_unix_path(destination.as_os_str())),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.simulate_path_prompt_response(|_| Some(vec![template]));
+        cx.wait_for(browser, Duration::from_secs(3), |_, cx| {
+            app.read(cx).pending_drop.is_some()
+        })
+        .await;
+        assert_eq!(filesystem::read(existing).unwrap(), b"keep existing");
     }
 
     #[gpui_kit::test]
