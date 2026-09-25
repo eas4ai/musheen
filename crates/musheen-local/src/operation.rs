@@ -486,6 +486,7 @@ fn copy_directory_tree(
                     &metadata,
                     cancellation,
                     &mut hard_links,
+                    metadata_skips,
                 )?);
             }
             special => {
@@ -540,6 +541,7 @@ fn copy_regular_tree_entry(
     metadata: &fs::Metadata,
     cancellation: &CancellationToken,
     hard_links: &mut BTreeMap<(u64, u64), PathBuf>,
+    metadata_skips: &mut Vec<MetadataKind>,
 ) -> Result<u64, ProviderError> {
     let identity = (metadata.dev(), metadata.ino());
     if metadata.nlink() > 1
@@ -548,7 +550,22 @@ fn copy_regular_tree_entry(
         fs::hard_link(existing, target).map_err(map_io)?;
         return Ok(0);
     }
-    let copied = streamed_copy(source, target, cancellation)?;
+    // A file with holes keeps them, as a single-file copy does; when the
+    // store cannot describe holes the copy is dense and the loss is reported.
+    let sparse_source = metadata.blocks().saturating_mul(512) < metadata.len();
+    let copied = match sparse_source
+        .then(|| sparse_copy(source, target, cancellation))
+        .transpose()?
+        .flatten()
+    {
+        Some(copied) => copied,
+        None => {
+            if sparse_source {
+                metadata_skips.push(MetadataKind::SparseLayout);
+            }
+            streamed_copy(source, target, cancellation)?
+        }
+    };
     if metadata.nlink() > 1 {
         hard_links.insert(identity, target.to_path_buf());
     }
@@ -1645,6 +1662,62 @@ mod tests {
             2,
             "only the source and the destination remain"
         );
+    }
+
+    #[test]
+    fn sparse_files_inside_a_copied_folder_keep_their_holes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("folder");
+        let destination = root.path().join("copied");
+        fs::create_dir(&source).unwrap();
+        let logical_size = 8 * 1024 * 1024;
+        let data_offset = 4 * 1024 * 1024;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(source.join("sparse"))
+            .unwrap();
+        file.set_len(logical_size).unwrap();
+        file.seek(SeekFrom::Start(data_offset)).unwrap();
+        file.write_all(b"island").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs::write(source.join("dense"), b"dense").unwrap();
+        let original = fs::metadata(source.join("sparse")).unwrap();
+        assert!(
+            original.blocks() * 512 < logical_size,
+            "the fixture holds a hole on this filesystem"
+        );
+        let mut metadata_skips = Vec::new();
+
+        copy_directory_tree(
+            &source,
+            &destination,
+            false,
+            &CancellationToken::new(),
+            &mut metadata_skips,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let copied = fs::metadata(destination.join("sparse")).unwrap();
+        assert_eq!(copied.len(), logical_size);
+        assert!(
+            copied.blocks() * 512 < logical_size,
+            "the copy inside the folder keeps the hole; it holds {} blocks",
+            copied.blocks()
+        );
+        assert!(
+            !metadata_skips.contains(&MetadataKind::SparseLayout),
+            "a kept layout is not reported as lost: {metadata_skips:?}"
+        );
+        let mut copied = File::open(destination.join("sparse")).unwrap();
+        copied.seek(SeekFrom::Start(data_offset)).unwrap();
+        let mut data = [0_u8; 6];
+        copied.read_exact(&mut data).unwrap();
+        assert_eq!(&data, b"island");
+        assert_eq!(fs::read(destination.join("dense")).unwrap(), b"dense");
     }
 
     #[test]
