@@ -479,6 +479,19 @@ fn is_rubber_band_start(
     x >= left && x < right && y >= top && y <= surface.bottom().as_f32()
 }
 
+/// Height of one grid row as `rubber_band_indices` lays it out.
+const RUBBER_BAND_GRID_ROW_HEIGHT: f32 = 116.0;
+
+/// Splits a vertical scroll distance into the first visible row and the
+/// offset of that row's top from the viewport top, which is zero or negative.
+fn rubber_band_scroll_position(scrolled: Pixels, row_pitch: Pixels) -> (usize, Pixels) {
+    if row_pitch <= px(0.) || scrolled <= px(0.) {
+        return (0, px(0.));
+    }
+    let row = (scrolled.as_f32() / row_pitch.as_f32()).floor();
+    (row as usize, -(scrolled - row_pitch * row))
+}
+
 fn rubber_band_indices(selection: Bounds<Pixels>, surface: RubberBandSurface) -> Vec<usize> {
     let RubberBandSurface {
         bounds,
@@ -530,7 +543,7 @@ fn rubber_band_indices(selection: Bounds<Pixels>, surface: RubberBandSurface) ->
                 .collect();
         }
         Layout::Cards | Layout::Grid | Layout::Adaptive => {
-            row_height = 116.0;
+            row_height = RUBBER_BAND_GRID_ROW_HEIGHT;
             first_row = ((selection_top - content_top) / row_height)
                 .floor()
                 .max(0.0) as usize;
@@ -14409,11 +14422,19 @@ impl MusheenApp {
                     }
                 });
                 let move_view = view.clone();
-                let (first_visible_row, first_item_offset) = rubber_band_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .logical_scroll_top();
+                // A uniform list never records child bounds, so the scroll
+                // handle's logical top is always item zero. Derive the first
+                // visible row from the raw scroll offset and the row pitch.
+                let (first_visible_row, first_item_offset) = {
+                    let scrolled = -rubber_band_scroll.0.borrow().base_handle.offset().y;
+                    let row_pitch = match layout {
+                        Layout::Cards | Layout::Grid | Layout::Adaptive => {
+                            px(RUBBER_BAND_GRID_ROW_HEIGHT)
+                        }
+                        Layout::Details | Layout::List | Layout::Columns => list_row_height,
+                    };
+                    rubber_band_scroll_position(scrolled, row_pitch)
+                };
                 let first_item_index = match layout {
                     Layout::Cards | Layout::Grid | Layout::Adaptive => {
                         first_visible_row.saturating_mul(grid_columns)
@@ -17179,6 +17200,14 @@ mod tests {
             ),
             vec![1]
         );
+    }
+
+    #[test]
+    fn rubber_band_scroll_position_splits_the_offset_into_row_and_remainder() {
+        assert_eq!(rubber_band_scroll_position(px(0.), px(24.)), (0, px(0.)));
+        assert_eq!(rubber_band_scroll_position(px(245.), px(24.)), (10, px(-5.)));
+        assert_eq!(rubber_band_scroll_position(px(48.), px(24.)), (2, px(0.)));
+        assert_eq!(rubber_band_scroll_position(px(30.), px(0.)), (0, px(0.)));
     }
 
     #[test]
