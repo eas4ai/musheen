@@ -5,7 +5,7 @@ use musheen_desktop::{
 use std::sync::RwLock;
 
 mod transfer;
-pub(super) use transfer::RemoteUploadRoute;
+pub(super) use transfer::{RemoteDownloadRoute, RemoteUploadRoute};
 
 pub(super) struct RemoteProfileAdapter {
     store: Arc<RemoteProfileStore>,
@@ -31,7 +31,10 @@ impl ProviderAdapter for RemoteProfileAdapter {
     }
 
     fn transfer_routes(&self) -> Vec<Arc<dyn ProviderTransferRoute>> {
-        vec![Arc::new(RemoteUploadRoute::new(self.store.clone()))]
+        vec![
+            Arc::new(RemoteUploadRoute::new(self.store.clone())),
+            Arc::new(RemoteDownloadRoute::new(self.store.clone())),
+        ]
     }
 }
 

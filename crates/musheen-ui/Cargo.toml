@@ -22,6 +22,7 @@ musheen-local = { path = "../musheen-local" }
 musheen-ops = { path = "../musheen-ops" }
 native-theme.workspace = true
 native-theme-gpui.workspace = true
+nix.workspace = true
 open.workspace = true
 serde.workspace = true
 serde_json.workspace = true

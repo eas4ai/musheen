@@ -5415,6 +5415,7 @@ dependencies = [
  "musheen-ops",
  "native-theme",
  "native-theme-gpui",
+ "nix 0.31.3",
  "open",
  "opendal",
  "serde",

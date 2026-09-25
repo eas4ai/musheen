@@ -784,6 +784,104 @@ mod tests {
     }
 
     #[test]
+    fn remote_file_copy_uses_local_staging_without_removing_the_source() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        future::block_on(operator.write("remote.txt", b"download payload".to_vec())).unwrap();
+        let connected_operator = operator.clone();
+        let connector: RemoteStoreConnector = Arc::new(move |provider, _, _| {
+            let operator = connected_operator.clone();
+            Box::pin(async move {
+                let store = Arc::new(
+                    OpendalStore::from_operator(
+                        provider,
+                        RemoteProtocol::Ftp,
+                        operator,
+                        RemoteCasePolicy::Sensitive,
+                        RemoteMutationPolicy::CapabilitiesVerified,
+                    )
+                    .unwrap(),
+                );
+                Ok(remote::RemoteStoreConnection::opendal(store))
+            })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        let remote_root = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap()
+        .items()[0]
+            .path()
+            .clone();
+        let (provider, _) = remote_root.provider_key().unwrap();
+        let source =
+            StorePath::from_provider_key(provider.clone(), b"/remote.txt".to_vec()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+
+        queue
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Copy).unwrap(),
+                StorePath::from_unix_path(scratch.path()),
+            )
+            .unwrap();
+        let ready = queue.start_ready().unwrap();
+        assert_eq!(ready.len(), 1);
+        ready
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(scratch.path().join("remote.txt")).unwrap(),
+            b"download payload"
+        );
+        assert_eq!(
+            future::block_on(operator.read("remote.txt"))
+                .unwrap()
+                .to_vec(),
+            b"download payload"
+        );
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+
+        future::block_on(operator.write("remote.txt", b"changed payload".to_vec())).unwrap();
+        let mut retry = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut retry);
+        retry
+            .submit_drop(
+                FileDragPayload::new(
+                    vec![
+                        StorePath::from_provider_key(provider.clone(), b"/remote.txt".to_vec())
+                            .unwrap(),
+                    ],
+                    DropAction::Copy,
+                )
+                .unwrap(),
+                StorePath::from_unix_path(scratch.path()),
+            )
+            .unwrap();
+        let failure = retry
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap_err();
+        assert!(failure.message().contains("already exists"));
+        assert_eq!(
+            std::fs::read(scratch.path().join("remote.txt")).unwrap(),
+            b"download payload"
+        );
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn saved_remote_profile_is_visible_without_opening_a_connection() {
         let settings = settings_with_remote_profile();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -793,7 +891,7 @@ mod tests {
             Box::pin(async { Err(StoreError::Backend("unexpected connection".into())) })
         });
         let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
-        assert_eq!(runtime.routes.len(), 1);
+        assert_eq!(runtime.routes.len(), 2);
 
         let network = runtime.store();
         let page = future::block_on(network.read_directory(

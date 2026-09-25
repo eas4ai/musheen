@@ -4,14 +4,18 @@ use musheen_local::{
     DropAction, LocalOperationFailure, ProviderTransferExecution, TransferOutcome,
 };
 use musheen_ops::{
-    ProviderLimits, ProviderSnapshot, RemoteTransferCapabilities, RemoteTransferPlan, StagingPath,
+    CopyProvider, ProviderError, ProviderLimits, ProviderSnapshot, RemoteTransferCapabilities,
+    RemoteTransferPlan, StagingPath,
 };
+use nix::sys::statvfs::statvfs;
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 const VERIFY_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_LOCAL_STAGING_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 pub(crate) struct RemoteUploadRoute {
     source_provider: ProviderId,
@@ -70,7 +74,7 @@ impl RemoteUploadRoute {
         }
         let source_snapshot = ProviderSnapshot::new(
             self.source_provider.clone(),
-            local.capabilities(execution.source()),
+            Store::capabilities(&local, execution.source()),
             ProviderLimits::default(),
         );
         let destination_snapshot = self.provider_snapshot(execution.destination());
@@ -248,6 +252,245 @@ impl ProviderTransferRoute for RemoteUploadRoute {
         ProviderSnapshot::new(
             self.destination.provider_id().clone(),
             self.destination.capabilities(location),
+            ProviderLimits::default(),
+        )
+    }
+
+    fn execute_transfer(
+        &self,
+        execution: ProviderTransferExecution<'_>,
+    ) -> Result<TransferOutcome, LocalOperationFailure> {
+        if execution.action() != DropAction::Copy {
+            return Err(LocalOperationFailure::failed(
+                "remote moves require metadata review and are not ready",
+            ));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        runtime.block_on(self.execute_copy(execution))
+    }
+}
+
+pub(crate) struct RemoteDownloadRoute {
+    source: Arc<RemoteProfileStore>,
+    destination_provider: ProviderId,
+}
+
+impl RemoteDownloadRoute {
+    pub(crate) fn new(source: Arc<RemoteProfileStore>) -> Self {
+        Self {
+            source,
+            destination_provider: ProviderId::new("local").expect("the local provider ID is valid"),
+        }
+    }
+
+    async fn execute_copy(
+        &self,
+        execution: ProviderTransferExecution<'_>,
+    ) -> Result<TransferOutcome, LocalOperationFailure> {
+        let destination = execution.destination().as_unix_path().ok_or_else(|| {
+            LocalOperationFailure::failed("the download destination is not a local path")
+        })?;
+        let cancellation = execution.cancellation().clone();
+        cancellation
+            .check()
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        let remote = self
+            .source
+            .connect_transfer(cancellation.clone())
+            .await
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        let source = remote
+            .resolve_item(execution.source())
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?
+            .ok_or_else(|| LocalOperationFailure::failed("the remote source disappeared"))?;
+        if source.kind() != ItemKind::RegularFile {
+            return Err(LocalOperationFailure::failed(
+                "remote download currently requires a regular file",
+            ));
+        }
+        if execution
+            .expected_identity()
+            .is_some_and(|expected| expected != source.id())
+        {
+            return Err(LocalOperationFailure::failed(
+                "the remote source changed before the transfer",
+            ));
+        }
+        let size = source
+            .size()
+            .ok_or_else(|| LocalOperationFailure::failed("the remote source size is unknown"))?;
+        let local = LocalStore::new();
+        let source_snapshot = ProviderSnapshot::new(
+            self.source.provider_id().clone(),
+            remote.capabilities(execution.source()),
+            ProviderLimits::default(),
+        );
+        let destination_snapshot = self.provider_snapshot(execution.destination());
+        let _plan = RemoteTransferPlan::new(
+            musheen_ops::OperationKind::Copy,
+            &source_snapshot,
+            &destination_snapshot,
+            RemoteTransferCapabilities::readable(),
+            RemoteTransferCapabilities::writable(),
+        )
+        .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        if local
+            .resolve_item(execution.destination())
+            .map_err(|error| LocalOperationFailure::failed(error.to_string()))?
+            .is_some()
+        {
+            return Err(LocalOperationFailure::failed(
+                "the local destination already exists",
+            ));
+        }
+        let parent = destination.parent().ok_or_else(|| {
+            LocalOperationFailure::failed("the download destination has no parent")
+        })?;
+        let space =
+            statvfs(parent).map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        let available = space
+            .blocks_available()
+            .saturating_mul(space.fragment_size());
+        let budget = MAX_LOCAL_STAGING_BYTES.min(available / 2);
+        if size > budget {
+            return Err(LocalOperationFailure::failed(
+                "the remote file exceeds the available local staging budget",
+            ));
+        }
+        let staging = StagingPath::for_destination_with_nonce(
+            execution.destination(),
+            execution.id(),
+            execution.generation(),
+            StagingPath::unique_nonce(),
+        )
+        .map_err(|error| LocalOperationFailure::failed(error.to_string()))?;
+        let staging_path = staging.path().as_unix_path().ok_or_else(|| {
+            LocalOperationFailure::failed("the download staging path is not local")
+        })?;
+        let downloaded = remote
+            .download_to_new_local(
+                execution.source(),
+                staging_path,
+                budget,
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| {
+                let message = format!("remote download stopped: {error}");
+                if std::fs::symlink_metadata(staging_path).is_ok() {
+                    LocalOperationFailure::recoverable(message, staging.path().clone())
+                } else {
+                    LocalOperationFailure::failed(message)
+                }
+            })?;
+        if downloaded != size {
+            return Err(LocalOperationFailure::recoverable(
+                "the downloaded size does not match the remote source",
+                staging.path().clone(),
+            ));
+        }
+        let current = remote.resolve_item(execution.source()).map_err(|error| {
+            LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
+        })?;
+        if current.as_ref().is_none_or(|item| item.id() != source.id()) {
+            return Err(LocalOperationFailure::recoverable(
+                "the remote source changed during the download",
+                staging.path().clone(),
+            ));
+        }
+        if local
+            .resolve_item(execution.destination())
+            .map_err(|error| {
+                LocalOperationFailure::recoverable(error.to_string(), staging.path().clone())
+            })?
+            .is_some()
+        {
+            return Err(LocalOperationFailure::recoverable(
+                "the local destination appeared during the download",
+                staging.path().clone(),
+            ));
+        }
+        let mut local = local;
+        CopyProvider::publish(
+            &mut local,
+            staging.path(),
+            execution.destination(),
+            &cancellation,
+        )
+        .map_err(|error| match error {
+            ProviderError::PublishUnknown => LocalOperationFailure::needs_attention(
+                "local publication may have completed; inspect the destination before retrying",
+            ),
+            _ => LocalOperationFailure::recoverable(
+                format!("local publication failed: {error}"),
+                staging.path().clone(),
+            ),
+        })?;
+        let completed = local
+            .resolve_item(execution.destination())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?
+            .ok_or_else(|| {
+                LocalOperationFailure::needs_attention("published local destination is missing")
+            })?;
+        let target = CommandTargetRef::new(completed.id().clone(), completed.path().clone())
+            .map_err(|error| LocalOperationFailure::needs_attention(error.to_string()))?;
+        Ok(TransferOutcome::Completed(target))
+    }
+}
+
+impl fmt::Debug for RemoteDownloadRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteDownloadRoute")
+            .field("source_provider", self.source.provider_id())
+            .finish()
+    }
+}
+
+impl ProviderTransferRoute for RemoteDownloadRoute {
+    fn source_provider_id(&self) -> &ProviderId {
+        self.source.provider_id()
+    }
+
+    fn destination_provider_id(&self) -> &ProviderId {
+        &self.destination_provider
+    }
+
+    fn plan_destination(
+        &self,
+        action: DropAction,
+        source: &StorePath,
+        target: &StorePath,
+        _expected_identity: Option<&ItemId>,
+    ) -> Result<StorePath, Box<str>> {
+        if action != DropAction::Copy {
+            return Err("remote moves require metadata review and are not ready".into());
+        }
+        let (provider, key) = source
+            .provider_key()
+            .ok_or("the download source is not a remote path")?;
+        if provider != self.source.provider_id() || !key.starts_with(b"/") {
+            return Err("the download source belongs to another provider".into());
+        }
+        let name = key.rsplit(|byte| *byte == b'/').next().unwrap_or_default();
+        if name.is_empty() || name == b"." || name == b".." {
+            return Err("the remote source has no safe file name".into());
+        }
+        let parent = target
+            .as_unix_path()
+            .ok_or("the download target is not a local directory")?;
+        Ok(StorePath::from_unix_path(
+            parent.join(OsStr::from_bytes(name)),
+        ))
+    }
+
+    fn provider_snapshot(&self, location: &StorePath) -> ProviderSnapshot {
+        ProviderSnapshot::new(
+            self.destination_provider.clone(),
+            Store::capabilities(&LocalStore::new(), location),
             ProviderLimits::default(),
         )
     }
