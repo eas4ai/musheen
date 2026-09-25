@@ -2228,7 +2228,7 @@ fn map_errno(error: rustix::io::Errno) -> MutationError {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn purge_each_continues_past_a_failure_and_reports_it() {
+    fn local_trash_purge_continues_past_a_failure_and_reports_it() {
         let mut attempted = Vec::new();
         let outcome = super::purge_each(&["first", "locked", "last"], |name| {
             attempted.push(*name);

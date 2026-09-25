@@ -706,8 +706,9 @@ impl DirectoryModel {
         self.resident_limit = MAX_RESIDENT_ITEMS.saturating_sub(reserved).max(1);
     }
 
-    /// The most items this folder keeps in memory before it spills.
-    #[cfg(test)]
+    /// The most items this folder keeps in memory before it spills, and the
+    /// most rows its viewport may hold once it is indexed.
+    #[must_use]
     pub(crate) fn resident_limit(&self) -> usize {
         self.resident_limit
     }

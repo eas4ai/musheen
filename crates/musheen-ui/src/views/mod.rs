@@ -9,7 +9,7 @@ mod sort;
 
 pub use adaptive::AdaptiveLayout;
 pub use columns::{ColumnKey, ColumnLayout, ColumnLayoutError, ColumnsPresentation};
-pub(crate) use columns::{COLUMN_RESIDENT_BUDGET, ColumnPaneItems, ColumnTrail};
+pub(crate) use columns::{COLUMN_CACHE_ROWS, COLUMN_RESIDENT_BUDGET, ColumnPaneItems, ColumnTrail};
 pub use details::DetailsPresentation;
 pub use grid::GridPresentation;
 pub use group::GroupKey;

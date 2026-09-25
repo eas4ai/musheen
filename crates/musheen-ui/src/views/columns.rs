@@ -15,6 +15,10 @@ const MAX_PARENT_LEVELS: usize = 3;
 /// holds more models than one folder's own bound.
 pub(crate) const COLUMN_RESIDENT_BUDGET: usize = 1_024;
 
+/// How many loaded rows an index-backed parent column keeps in memory. The
+/// current folder gives up this many models for each such column.
+pub(crate) const COLUMN_CACHE_ROWS: usize = 256;
+
 /// Where a parent column takes its rows from: the items the folder held in
 /// memory, or the disk index of a folder too large to keep in memory. An
 /// indexed pane keeps the index alive for as long as the column shows it.
@@ -101,6 +105,19 @@ impl ColumnTrail {
             .iter()
             .filter_map(|pane| pane.resident_items().map(|items| items.len()))
             .sum()
+    }
+
+    /// How many item models the parent columns may hold at most: the rows
+    /// kept in memory plus one row cache for each index-backed column. The
+    /// current folder gives up this many from its own bound.
+    #[must_use]
+    pub(crate) fn reserved_models(&self) -> usize {
+        let index_backed = self
+            .parents
+            .iter()
+            .filter(|pane| pane.index_reader().is_some())
+            .count();
+        self.resident_len() + index_backed * COLUMN_CACHE_ROWS
     }
 
     /// Keep the current directory only when the destination is one of its
