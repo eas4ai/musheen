@@ -17250,7 +17250,10 @@ mod tests {
     #[test]
     fn rubber_band_scroll_position_splits_the_offset_into_row_and_remainder() {
         assert_eq!(rubber_band_scroll_position(px(0.), px(24.)), (0, px(0.)));
-        assert_eq!(rubber_band_scroll_position(px(245.), px(24.)), (10, px(-5.)));
+        assert_eq!(
+            rubber_band_scroll_position(px(245.), px(24.)),
+            (10, px(-5.))
+        );
         assert_eq!(rubber_band_scroll_position(px(48.), px(24.)), (2, px(0.)));
         assert_eq!(rubber_band_scroll_position(px(30.), px(0.)), (0, px(0.)));
     }
@@ -23819,13 +23822,39 @@ mod tests {
 
     async fn open_app_with_external_directory(
         cx: &mut TestAppContext,
-    ) -> (Entity<MusheenApp>, AnyWindowHandle, tempfile::TempDir, StorePath) {
+    ) -> (
+        Entity<MusheenApp>,
+        AnyWindowHandle,
+        tempfile::TempDir,
+        StorePath,
+    ) {
+        open_app_with_external_location(false, cx).await
+    }
+
+    /// Opens the app on an empty directory next to an external location.
+    /// With `linked`, the location is a symbolic link to a directory, as
+    /// sidebar places such as $HOME/Desktop often are.
+    async fn open_app_with_external_location(
+        linked: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<MusheenApp>,
+        AnyWindowHandle,
+        tempfile::TempDir,
+        StorePath,
+    ) {
         cx.update(gpui_kit::init);
         let temporary = tempfile::tempdir().unwrap();
         let current = temporary.path().join("current");
         let external = temporary.path().join("external");
         filesystem::create_dir(&current).unwrap();
-        filesystem::create_dir(&external).unwrap();
+        if linked {
+            let real = temporary.path().join("real-external");
+            filesystem::create_dir(&real).unwrap();
+            standard_library::os::unix::fs::symlink(&real, &external).unwrap();
+        } else {
+            filesystem::create_dir(&external).unwrap();
+        }
         let mut app = None;
         let handle = cx.open_window(size(px(1_180.), px(760.)), |window, cx| {
             let view = cx.new(|cx| MusheenApp::new_with_session_store(current, None, cx));
@@ -23905,6 +23934,120 @@ mod tests {
                 "no error is shown: {:?}",
                 state.operation_error
             );
+        });
+    }
+
+    // UXF-012: sidebar places are often links to directories. The menu
+    // offers them the directory commands, so those commands run on them.
+    #[gpui_kit::test]
+    async fn sidebar_open_in_new_tab_opens_a_link_to_a_directory(cx: &mut TestAppContext) {
+        let (app, _browser, _temporary, location) = open_app_with_external_location(true, cx).await;
+
+        app.update(cx, |state, cx| {
+            dispatch_sidebar_menu_command(state, &location, "directory.open_new_tab", cx);
+            let tabs = state.navigation.focused_pane().tabs();
+            assert_eq!(tabs.len(), 2, "a second tab opens in the focused pane");
+            assert!(
+                tabs.iter().any(|tab| tab.location() == &location),
+                "one tab shows the linked location"
+            );
+            assert!(
+                state.operation_error.is_none(),
+                "no error is shown: {:?}",
+                state.operation_error
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn sidebar_open_navigates_to_a_link_to_a_directory(cx: &mut TestAppContext) {
+        let (app, _browser, _temporary, location) = open_app_with_external_location(true, cx).await;
+
+        app.update(cx, |state, cx| {
+            dispatch_sidebar_menu_command(state, &location, "file.open", cx);
+            assert_eq!(state.navigation.focused_tab().location(), &location);
+            assert_eq!(state.navigation.focused_pane().tabs().len(), 1);
+            assert!(
+                state.pending_application_commands.is_empty(),
+                "a directory is never handed to the application service"
+            );
+            assert!(
+                state.operation_error.is_none(),
+                "no error is shown: {:?}",
+                state.operation_error
+            );
+        });
+    }
+
+    // UXF-012: with one pane open, "Open in other pane" splits the pane and
+    // shows the location in the new one. Keyboard and D-Bus callers reach
+    // this arm with a target outside the focused directory.
+    #[gpui_kit::test]
+    async fn sidebar_open_in_other_pane_splits_the_pane_and_shows_the_location(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, _browser, _temporary, location) = open_app_with_external_directory(cx).await;
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let target = local_command_target(location.as_unix_path().unwrap());
+            state.dispatch_typed_context_command(
+                CommandAction::OpenInOtherPane,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+            assert_eq!(state.navigation.panes().len(), 2, "a second pane opens");
+            let focused = state.navigation.focused_tab();
+            assert_eq!(focused.location(), &location);
+            assert!(
+                state.directories.contains_key(&focused.id()),
+                "the new pane's tab owns a directory model"
+            );
+            assert!(
+                state.operation_error.is_none(),
+                "no error is shown: {:?}",
+                state.operation_error
+            );
+        });
+    }
+
+    // UXF-012: a target whose identity changed since the menu was built is
+    // refused as changed; nothing opens on the replacement.
+    #[gpui_kit::test]
+    async fn sidebar_open_in_new_tab_refuses_a_target_whose_identity_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, _browser, _temporary, location) = open_app_with_external_directory(cx).await;
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            let other = state
+                .store
+                .resolve_item(state.navigation.focused_tab().location())
+                .unwrap()
+                .expect("the current directory exists")
+                .id()
+                .clone();
+            let menu = state.sidebar_entry_context_menu(
+                tab,
+                MenuTarget::SidebarLocation,
+                location.clone(),
+                Some(other),
+            );
+            let entry = MusheenApp::menu_entry_by_id(&menu, "directory.open_new_tab")
+                .expect("the sidebar menu offers the command")
+                .clone();
+            state.dispatch_context_entry(entry, cx);
+            let expected = state.catalog.message("context.target-changed").unwrap();
+            assert_eq!(
+                state.navigation.focused_pane().tabs().len(),
+                1,
+                "no tab opens on a changed target"
+            );
+            assert_eq!(state.operation_error.as_deref(), Some(expected));
         });
     }
 
