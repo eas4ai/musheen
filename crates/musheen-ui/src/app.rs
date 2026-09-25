@@ -8248,6 +8248,9 @@ impl MusheenApp {
             (CommandAction::PasteInto, CommandParameters::Location(destination)) => {
                 self.paste_file_clipboard(destination.clone(), cx);
             }
+            (CommandAction::Duplicate, CommandParameters::Targets(targets)) => {
+                self.submit_duplicate_targets(targets.clone(), cx);
+            }
             (
                 create_action @ (CommandAction::NewDirectory | CommandAction::NewEmptyFile),
                 CommandParameters::Location(parent),
@@ -9436,6 +9439,45 @@ impl MusheenApp {
         .detach();
     }
 
+    fn submit_duplicate_targets(&mut self, targets: Vec<CommandTargetRef>, cx: &mut Context<Self>) {
+        let hub = self.operation_hub.clone();
+        let work = cx.background_spawn(async move {
+            targets
+                .into_iter()
+                .map(|target| {
+                    hub.submit_duplicate(target)
+                        .map_err(|error| Box::<str>::from(error.to_string()))
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let results = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let mut first_error = None;
+                let mut submitted = false;
+                for result in results {
+                    match result {
+                        Ok(_) => submitted = true,
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                state.operation_error =
+                    first_error.or_else(|| state.operation_hub.persistence_error());
+                if submitted {
+                    state.pump_operation_queue(cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn open_volume_unlock(&mut self, id: VolumeId, cx: &mut Context<Self>) {
         let label: Option<Box<str>> = Some(self.volumes.snapshot()).and_then(|model| {
             model
@@ -10037,6 +10079,7 @@ impl MusheenApp {
                 | CommandAction::MoveToTrash
                 | CommandAction::DeletePermanently
                 | CommandAction::Rename
+                | CommandAction::Duplicate
                 | CommandAction::CreateSymbolicLink
                 | CommandAction::CreateHardLink
                 | CommandAction::Hide
@@ -10063,6 +10106,20 @@ impl MusheenApp {
         target: CommandTarget,
         selection: &[CommandTargetRef],
     ) -> CapabilityState {
+        if action == CommandAction::Duplicate
+            && selection
+                .iter()
+                .any(|item| item.path().as_unix_path().is_none())
+        {
+            return CapabilityState::Unsupported(
+                CapabilityReason::new(
+                    self.catalog
+                        .message("context.backend-unavailable")
+                        .expect("backend refusal is localized"),
+                )
+                .expect("backend refusal is nonempty"),
+            );
+        }
         // Trash renders receipts in deletion order, independently of the
         // directory view. Do not advertise preferences it cannot render.
         if self
@@ -19888,6 +19945,7 @@ mod tests {
             CommandAction::ExtractHere,
             CommandAction::CreateSymbolicLink,
             CommandAction::CreateHardLink,
+            CommandAction::Duplicate,
             CommandAction::Hide,
             CommandAction::Unhide,
         ] {
@@ -20120,6 +20178,106 @@ mod tests {
             filesystem::metadata(link).unwrap().ino(),
             filesystem::metadata(source).unwrap().ino()
         );
+    }
+
+    #[gpui_kit::test]
+    async fn duplicate_context_action_copies_file_beside_source(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("original.txt");
+        let duplicate = temporary.path().join("original (copy).txt");
+        filesystem::write(&source, b"original").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(source.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::Duplicate,
+                CommandParameters::targets(vec![target]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(2), |_, _| duplicate.exists())
+            .await;
+        assert_eq!(filesystem::read(source).unwrap(), b"original");
+        assert_eq!(filesystem::read(duplicate).unwrap(), b"original");
+    }
+
+    #[gpui_kit::test]
+    async fn duplicate_context_action_copies_each_selected_item(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first.txt");
+        let second = temporary.path().join("second.txt");
+        filesystem::write(&first, b"first").unwrap();
+        filesystem::write(&second, b"second").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let store = LocalStore::new();
+        let targets = [&first, &second]
+            .into_iter()
+            .map(|path| {
+                let item = store
+                    .resolve_item(&StorePath::from_unix_path(path.as_os_str()))
+                    .unwrap()
+                    .unwrap();
+                CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap()
+            })
+            .collect();
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::Duplicate,
+                CommandParameters::targets(targets),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(3), |_, _| {
+            temporary.path().join("first (copy).txt").exists()
+                && temporary.path().join("second (copy).txt").exists()
+        })
+        .await;
+        assert_eq!(
+            filesystem::read(temporary.path().join("first (copy).txt")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            filesystem::read(temporary.path().join("second (copy).txt")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn duplicate_context_action_refuses_a_nonlocal_target(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("local.txt"), b"local").unwrap();
+        let (app, _) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let provider = ProviderId::new("test.remote").unwrap();
+        let key = b"remote-file".to_vec();
+        let target = CommandTargetRef::new(
+            ItemId::new(provider.clone(), key.clone()).unwrap(),
+            StorePath::from_provider_key(provider, key).unwrap(),
+        )
+        .unwrap();
+
+        let capability = app.update(cx, |state, _| {
+            state.context_backend_action_state(
+                CommandAction::Duplicate,
+                state.navigation.focused_tab().id(),
+                CommandTarget::File,
+                &[target],
+            )
+        });
+        assert!(matches!(capability, CapabilityState::Unsupported(_)));
     }
 
     #[gpui_kit::test]

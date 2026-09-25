@@ -587,6 +587,30 @@ impl OperationHub {
         Ok(id)
     }
 
+    pub fn submit_duplicate(&self, target: CommandTargetRef) -> Result<JobId, OperationHubError> {
+        let source = target.path().clone();
+        let (id, destination) = self.with_unreserved_queue([&source], |queue| {
+            let id = queue.submit_duplicate(target)?;
+            let destination = queue
+                .operation_paths(id)
+                .and_then(|paths| paths.into_iter().nth(1))
+                .ok_or(DropError::MissingOperation(id))?;
+            Ok((id, destination))
+        })?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                OperationKind::Copy,
+                destination,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(id)
+    }
+
     pub fn submit_hard_link(
         &self,
         request: HardLinkRequest,

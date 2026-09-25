@@ -17,6 +17,7 @@ use musheen_ops::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -1014,6 +1015,80 @@ impl LocalOperationQueue {
             .map(|mut ids| ids.remove(0))
     }
 
+    pub fn submit_duplicate(&mut self, target: CommandTargetRef) -> Result<JobId, DropError> {
+        let source = target.path().clone();
+        let source_path = clean_absolute_path(&source).ok_or_else(|| {
+            DropError::InvalidSource(source.clone(), "not an absolute local path".into())
+        })?;
+        let parent_path = source_path.parent().ok_or_else(|| {
+            DropError::InvalidSource(source.clone(), "the source has no parent".into())
+        })?;
+        let parent = StorePath::from_unix_path(parent_path.as_os_str());
+        writable_directory(&parent)?;
+        let metadata = fs::symlink_metadata(source_path)
+            .map_err(|error| DropError::InvalidSource(source.clone(), error.to_string().into()))?;
+        let kind = metadata.file_type();
+        if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
+            return Err(DropError::InvalidSource(
+                source.clone(),
+                "special files cannot be duplicated".into(),
+            ));
+        }
+        let store = LocalStore::new();
+        let current = crate::metadata::item_from_path(store.provider_id(), source_path)
+            .map_err(|error| DropError::InvalidSource(source.clone(), error.to_string().into()))?;
+        if current.id() != target.id() {
+            return Err(DropError::SourceIdentityChanged(source));
+        }
+        let queued_paths = self
+            .active_operation_paths()
+            .into_iter()
+            .flat_map(|operation| operation.paths)
+            .collect::<HashSet<_>>();
+        let mut destination = None;
+        for ordinal in 1..=10_000 {
+            let name = duplicate_name(source_path, kind.is_dir(), ordinal).ok_or_else(|| {
+                DropError::InvalidSource(source.clone(), "the source has no file name".into())
+            })?;
+            let candidate = parent_path.join(name);
+            let path = StorePath::from_unix_path(candidate.as_os_str());
+            if queued_paths.contains(&path) {
+                continue;
+            }
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    destination = Some(path);
+                    break;
+                }
+                Err(error) => return Err(DropError::Plan(error.to_string().into())),
+            }
+        }
+        let destination =
+            destination.ok_or_else(|| DropError::Plan("no available duplicate name".into()))?;
+        let plan = OperationPlan::new(
+            OperationKind::Copy,
+            provider_snapshot(&store, &parent),
+            Some(source.clone()),
+            destination.clone(),
+        )
+        .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(
+            plan,
+            LocalOperation::Transfer {
+                action: DropAction::Copy,
+                source,
+                destination,
+                decision: None,
+                expected_identity: Some(target.id().clone()),
+                expected_raw_identity: None,
+                expected_destination_parent_identity: None,
+                provider_route: None,
+            },
+        )])
+        .map(|mut ids| ids.remove(0))
+    }
+
     pub fn submit_symbolic_link(
         &mut self,
         request: SymbolicLinkRequest,
@@ -1740,6 +1815,27 @@ fn path_provider_id(path: &StorePath) -> musheen_core::ProviderId {
         .map_or_else(local_provider_id, |(provider, _)| provider.clone())
 }
 
+fn duplicate_name(source: &Path, directory: bool, ordinal: usize) -> Option<OsString> {
+    let name = source.file_name()?;
+    let (stem, extension) = if directory {
+        (name, None)
+    } else {
+        let filename = Path::new(name);
+        (filename.file_stem().unwrap_or(name), filename.extension())
+    };
+    let mut duplicate = stem.to_os_string();
+    if ordinal == 1 {
+        duplicate.push(" (copy)");
+    } else {
+        duplicate.push(format!(" (copy {ordinal})"));
+    }
+    if let Some(extension) = extension {
+        duplicate.push(".");
+        duplicate.push(extension);
+    }
+    Some(duplicate)
+}
+
 fn clean_absolute_path(path: &StorePath) -> Option<&Path> {
     let path = path.as_unix_path()?;
     if !path.is_absolute()
@@ -2043,6 +2139,116 @@ mod tests {
             .expect("delete is queued");
         assert_eq!(finish_one(&mut queue), LocalOperationOutcome::Mutation);
         assert!(!renamed_path.exists());
+    }
+
+    #[test]
+    fn duplicate_uses_unused_sibling_names_without_overwriting() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        let occupied_path = temporary.path().join("source (copy).txt");
+        fs::write(&source_path, b"source").unwrap();
+        fs::write(&occupied_path, b"occupied").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let item = LocalStore::new().resolve_item(&source).unwrap().unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), source).unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+
+        queue.submit_duplicate(target.clone()).unwrap();
+        queue.submit_duplicate(target).unwrap();
+        let mut completed = 0;
+        while completed < 2 {
+            let ready = queue.start_ready().unwrap();
+            assert!(!ready.is_empty());
+            for operation in ready {
+                let id = operation.id();
+                let outcome = operation.execute_detailed().unwrap();
+                assert!(matches!(
+                    outcome,
+                    LocalOperationOutcome::Transfer(TransferOutcome::Completed(_))
+                ));
+                queue.finish_with_outcome(id, outcome).unwrap();
+                completed += 1;
+            }
+        }
+        assert_eq!(fs::read(occupied_path).unwrap(), b"occupied");
+        assert_eq!(
+            fs::read(temporary.path().join("source (copy 2).txt")).unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            fs::read(temporary.path().join("source (copy 3).txt")).unwrap(),
+            b"source"
+        );
+    }
+
+    #[test]
+    fn duplicate_reserves_a_running_jobs_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        fs::write(&source_path, b"source").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let item = LocalStore::new().resolve_item(&source).unwrap().unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), source).unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+
+        let first = queue.submit_duplicate(target.clone()).unwrap();
+        let running = queue.start_ready().unwrap();
+        assert_eq!(running.len(), 1);
+        let second = queue.submit_duplicate(target).unwrap();
+        assert_eq!(
+            queue.operation_paths(first).unwrap()[1],
+            StorePath::from_unix_path(temporary.path().join("source (copy).txt").as_os_str())
+        );
+        assert_eq!(
+            queue.operation_paths(second).unwrap()[1],
+            StorePath::from_unix_path(temporary.path().join("source (copy 2).txt").as_os_str())
+        );
+    }
+
+    #[test]
+    fn duplicate_directory_keeps_the_full_name_and_contents() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("project.folder");
+        fs::create_dir(&source_path).unwrap();
+        fs::write(source_path.join("child.txt"), b"child").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let item = LocalStore::new().resolve_item(&source).unwrap().unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), source).unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+
+        queue.submit_duplicate(target).unwrap();
+        finish_one(&mut queue);
+        assert_eq!(
+            fs::read(temporary.path().join("project.folder (copy)/child.txt")).unwrap(),
+            b"child"
+        );
+    }
+
+    #[test]
+    fn duplicate_name_preserves_non_utf8_filename_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let source = std::path::PathBuf::from(OsString::from_vec(b"name\xff.txt".to_vec()));
+        let duplicate = duplicate_name(&source, false, 1).unwrap();
+        assert_eq!(duplicate.as_bytes(), b"name\xff (copy).txt");
+    }
+
+    #[test]
+    fn queued_duplicate_refuses_a_replaced_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("source.txt");
+        fs::write(&source_path, b"original").unwrap();
+        let source = StorePath::from_unix_path(source_path.as_os_str());
+        let item = LocalStore::new().resolve_item(&source).unwrap().unwrap();
+        let target = CommandTargetRef::new(item.id().clone(), source).unwrap();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        queue.submit_duplicate(target).unwrap();
+
+        fs::rename(&source_path, temporary.path().join("moved.txt")).unwrap();
+        fs::write(&source_path, b"replacement").unwrap();
+        let ready = queue.start_ready().unwrap().remove(0);
+        assert!(ready.execute_detailed().is_err());
+        assert!(!temporary.path().join("source (copy).txt").exists());
     }
 
     #[test]
