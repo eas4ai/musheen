@@ -327,6 +327,12 @@ impl OpendalStore {
             .map_err(|_| StoreError::Backend("remote path exceeds provider limits".into()))
     }
 
+    #[must_use]
+    pub fn supports_exclusive_publish(&self) -> bool {
+        self.mutation_policy == RemoteMutationPolicy::CapabilitiesVerified
+            && self.operator.info().capability().write_with_if_not_exists
+    }
+
     pub fn read_range<'a>(
         &'a self,
         path: &'a StorePath,
@@ -446,8 +452,7 @@ impl OpendalStore {
     ) -> BoxFuture<'a, Result<u64, RemoteError>> {
         let staging_path = self.remote_path(staging.path());
         let destination_path = self.remote_path(destination);
-        let writable = self.mutation_policy == RemoteMutationPolicy::CapabilitiesVerified
-            && self.operator.info().capability().write_with_if_not_exists;
+        let writable = self.supports_exclusive_publish();
         let owned_sibling = staging.is_sibling_of(destination);
         let operator = self.operator.clone();
         let pool = self.pool.clone();

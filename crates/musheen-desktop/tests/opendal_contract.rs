@@ -114,6 +114,7 @@ fn streaming_upload_writes_only_a_new_owned_staging_object() {
         RemoteCasePolicy::Sensitive,
         RemoteMutationPolicy::CapabilitiesVerified,
     );
+    assert!(store.supports_exclusive_publish());
     let scratch = tempfile::tempdir().unwrap();
     let local = scratch.path().join("source.bin");
     let payload = vec![0x5a; 2 * 1024 * 1024 + 7];
@@ -210,6 +211,7 @@ fn upload_rejects_read_only_and_cancelled_connections_without_writing() {
         RemoteCasePolicy::Unknown,
         RemoteMutationPolicy::ReadOnly,
     );
+    assert!(!store.supports_exclusive_publish());
     let scratch = tempfile::tempdir().unwrap();
     let local = scratch.path().join("source.bin");
     std::fs::write(&local, b"payload").unwrap();

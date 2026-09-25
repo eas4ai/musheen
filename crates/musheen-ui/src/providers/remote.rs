@@ -1,13 +1,69 @@
 use super::*;
-use musheen_desktop::{ConnectionProfile, RemoteProtocol, SecretServiceCredentialResolver};
+use musheen_desktop::{
+    ConnectionProfile, OpendalStore, RemoteProtocol, SecretServiceCredentialResolver,
+};
 use std::sync::RwLock;
+
+mod transfer;
+pub(super) use transfer::RemoteUploadRoute;
+
+pub(super) struct RemoteProfileAdapter {
+    store: Arc<RemoteProfileStore>,
+    name: Box<str>,
+}
+
+impl RemoteProfileAdapter {
+    pub(super) fn new(store: Arc<RemoteProfileStore>, name: &str) -> Self {
+        Self {
+            store,
+            name: name.into(),
+        }
+    }
+}
+
+impl ProviderAdapter for RemoteProfileAdapter {
+    fn store(&self) -> Arc<dyn Store> {
+        self.store.clone()
+    }
+
+    fn network_name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
+    fn transfer_routes(&self) -> Vec<Arc<dyn ProviderTransferRoute>> {
+        vec![Arc::new(RemoteUploadRoute::new(self.store.clone()))]
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RemoteStoreConnection {
+    store: Arc<dyn Store>,
+    transfer: Option<Arc<OpendalStore>>,
+}
+
+impl RemoteStoreConnection {
+    pub(super) fn opendal(store: Arc<OpendalStore>) -> Self {
+        Self {
+            store: store.clone(),
+            transfer: Some(store),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn browse_only(store: Arc<dyn Store>) -> Self {
+        Self {
+            store,
+            transfer: None,
+        }
+    }
+}
 
 pub(super) type RemoteStoreConnector = Arc<
     dyn Fn(
             ProviderId,
             ConnectionProfile,
             CancellationToken,
-        ) -> BoxFuture<'static, Result<Arc<dyn Store>, StoreError>>
+        ) -> BoxFuture<'static, Result<RemoteStoreConnection, StoreError>>
         + Send
         + Sync,
 >;
@@ -16,7 +72,7 @@ pub(super) fn default_remote_connector() -> RemoteStoreConnector {
     Arc::new(|provider, profile, cancellation| {
         Box::pin(async move {
             let credentials = SecretServiceCredentialResolver::default();
-            let store: Arc<dyn Store> = match profile.protocol() {
+            let store: Arc<OpendalStore> = match profile.protocol() {
                 RemoteProtocol::Ftp | RemoteProtocol::Ftps => Arc::new(
                     musheen_desktop::ftp_store_from_profile(
                         provider,
@@ -70,7 +126,7 @@ pub(super) fn default_remote_connector() -> RemoteStoreConnector {
                     ));
                 }
             };
-            Ok(store)
+            Ok(RemoteStoreConnection::opendal(store))
         })
     })
 }
@@ -84,7 +140,7 @@ pub(super) struct RemoteProfileStore {
     profile: ConnectionProfile,
     root: StorePath,
     connector: RemoteStoreConnector,
-    connection: RwLock<Option<Arc<dyn Store>>>,
+    connection: RwLock<Option<RemoteStoreConnection>>,
     connect_gate: tokio::sync::Mutex<()>,
 }
 
@@ -112,7 +168,8 @@ impl RemoteProfileStore {
         self.connection
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .as_ref()
+            .map(|connection| Arc::clone(&connection.store))
     }
 
     async fn connect(&self, cancellation: CancellationToken) -> Result<Arc<dyn Store>, StoreError> {
@@ -132,7 +189,7 @@ impl RemoteProfileStore {
         )
         .await?;
         cancellation.check()?;
-        if store.provider_id() != &self.provider {
+        if store.store.provider_id() != &self.provider {
             return Err(StoreError::Backend(
                 "remote connector returned a different provider".into(),
             ));
@@ -140,8 +197,23 @@ impl RemoteProfileStore {
         *self
             .connection
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&store));
-        Ok(store)
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store.clone());
+        Ok(store.store)
+    }
+
+    pub(super) async fn connect_transfer(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<Arc<OpendalStore>, StoreError> {
+        self.connect(cancellation).await?;
+        self.connection
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|connection| connection.transfer.clone())
+            .ok_or_else(|| {
+                StoreError::unsupported("transfer remote item", "connection has no transfer API")
+            })
     }
 
     fn root_item(&self) -> StoreItem {

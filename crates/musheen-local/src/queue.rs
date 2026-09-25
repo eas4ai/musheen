@@ -606,6 +606,24 @@ impl LocalOperationFailure {
         }
     }
 
+    #[must_use]
+    pub fn recoverable(message: impl Into<Box<str>>, staging: StorePath) -> Self {
+        Self {
+            message: message.into(),
+            disposition: LocalFailureDisposition::Recoverable,
+            recovery_staging: Some(staging),
+        }
+    }
+
+    #[must_use]
+    pub fn needs_attention_with_staging(message: impl Into<Box<str>>, staging: StorePath) -> Self {
+        Self {
+            message: message.into(),
+            disposition: LocalFailureDisposition::NeedsAttention,
+            recovery_staging: Some(staging),
+        }
+    }
+
     fn from_resolved(error: ResolvedTransferFailure) -> Self {
         match error {
             ResolvedTransferFailure::Transfer(error) => Self::from_transfer(error),

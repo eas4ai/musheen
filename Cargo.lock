@@ -5416,6 +5416,7 @@ dependencies = [
  "native-theme",
  "native-theme-gpui",
  "open",
+ "opendal",
  "serde",
  "serde_json",
  "tempfile",

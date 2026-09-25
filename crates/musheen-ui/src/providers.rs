@@ -30,7 +30,9 @@ fn provider_root_item(
 }
 
 mod remote;
-use remote::{RemoteProfileStore, RemoteStoreConnector, default_remote_connector};
+use remote::{
+    RemoteProfileAdapter, RemoteProfileStore, RemoteStoreConnector, default_remote_connector,
+};
 
 pub(crate) trait ProviderAdapter: Send + Sync {
     fn store(&self) -> Arc<dyn Store>;
@@ -132,7 +134,7 @@ impl ProviderRuntime {
                         .map_err(|_| ProviderRuntimeError::InvalidConnectionProfiles)?,
                 );
                 builder = builder
-                    .register_adapter(Arc::new(StoreOnlyAdapter::network(store, profile.name())))?;
+                    .register_adapter(Arc::new(RemoteProfileAdapter::new(store, profile.name())))?;
             }
         }
         builder.build()
@@ -346,6 +348,7 @@ impl StoreOnlyAdapter {
         }
     }
 
+    #[cfg(test)]
     fn network(store: Arc<dyn Store>, name: impl Into<Box<str>>) -> Self {
         Self {
             store,
@@ -618,11 +621,13 @@ pub(crate) fn network_root_path() -> StorePath {
 mod tests {
     use super::*;
     use futures_lite::future;
+    use musheen_core::ResourceLimits;
     use musheen_desktop::{
         ArchiveFormat, ArchiveLimits, ArchivePasswordProvider, ArchiveStore, ConnectionId,
-        ConnectionProfile, ConnectionProfiles, PasswordRequest, RemoteHost, RemoteProtocol,
-        SecurityPolicy, SettingsDocument,
+        ConnectionProfile, ConnectionProfiles, OpendalStore, PasswordRequest, RemoteCasePolicy,
+        RemoteHost, RemoteMutationPolicy, RemoteProtocol, SecurityPolicy, SettingsDocument,
     };
+    use musheen_local::{DropAction, FileDragPayload};
     use std::fs::File;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -652,6 +657,133 @@ mod tests {
     }
 
     #[test]
+    fn saved_profile_keeps_the_concrete_transfer_store_after_connect() {
+        let settings = settings_with_remote_profile();
+        let document = settings.value("remote.connections").unwrap();
+        let profiles = ConnectionProfiles::import(&document).unwrap();
+        let profile = profiles.profiles()[0].clone();
+        let connector: RemoteStoreConnector = Arc::new(|provider, _, _| {
+            Box::pin(async move {
+                let operator =
+                    opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+                let store = Arc::new(
+                    OpendalStore::from_operator(
+                        provider,
+                        RemoteProtocol::Ftp,
+                        operator,
+                        RemoteCasePolicy::Sensitive,
+                        RemoteMutationPolicy::CapabilitiesVerified,
+                    )
+                    .unwrap(),
+                );
+                Ok(remote::RemoteStoreConnection::opendal(store))
+            })
+        });
+        let saved = RemoteProfileStore::new(profile, connector).unwrap();
+
+        let transfer = future::block_on(saved.connect_transfer(CancellationToken::new())).unwrap();
+
+        assert_eq!(transfer.provider_id(), saved.provider_id());
+        assert_eq!(
+            transfer.root_path(),
+            StorePath::from_provider_key(saved.provider_id().clone(), b"/".to_vec()).unwrap()
+        );
+    }
+
+    #[test]
+    fn local_file_copy_uses_the_saved_remote_profile_route() {
+        let settings = settings_with_remote_profile();
+        let operator = opendal::Operator::new(opendal::services::Memory::default()).unwrap();
+        let connected_operator = operator.clone();
+        let connector: RemoteStoreConnector = Arc::new(move |provider, _, _| {
+            let operator = connected_operator.clone();
+            Box::pin(async move {
+                let store = Arc::new(
+                    OpendalStore::from_operator(
+                        provider,
+                        RemoteProtocol::Ftp,
+                        operator,
+                        RemoteCasePolicy::Sensitive,
+                        RemoteMutationPolicy::CapabilitiesVerified,
+                    )
+                    .unwrap(),
+                );
+                Ok(remote::RemoteStoreConnection::opendal(store))
+            })
+        });
+        let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        let network = runtime.store();
+        let entries = future::block_on(network.read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let source_path = scratch.path().join("report.txt");
+        std::fs::write(&source_path, b"remote copy payload").unwrap();
+        let source = StorePath::from_unix_path(source_path);
+        let target = entries.items()[0].path().clone();
+        let mut queue = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut queue);
+
+        let jobs = queue
+            .submit_drop(
+                FileDragPayload::new(vec![source], DropAction::Copy).unwrap(),
+                target,
+            )
+            .unwrap();
+        assert_eq!(jobs.len(), 1);
+        let ready = queue.start_ready().unwrap();
+        assert_eq!(ready.len(), 1);
+        ready
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap();
+
+        assert_eq!(
+            future::block_on(operator.read("report.txt"))
+                .unwrap()
+                .to_vec(),
+            b"remote copy payload"
+        );
+        let listed = future::block_on(operator.list("/")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path(), "report.txt");
+
+        std::fs::write(scratch.path().join("report.txt"), b"replacement payload").unwrap();
+        let mut retry = LocalOperationQueue::new(&ResourceLimits::default());
+        runtime.configure_queue(&mut retry);
+        retry
+            .submit_drop(
+                FileDragPayload::new(
+                    vec![StorePath::from_unix_path(scratch.path().join("report.txt"))],
+                    DropAction::Copy,
+                )
+                .unwrap(),
+                entries.items()[0].path().clone(),
+            )
+            .unwrap();
+        let failure = retry
+            .start_ready()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .execute_detailed()
+            .unwrap_err();
+        assert!(failure.message().contains("already exists"));
+        assert_eq!(
+            future::block_on(operator.read("report.txt"))
+                .unwrap()
+                .to_vec(),
+            b"remote copy payload"
+        );
+    }
+
+    #[test]
     fn saved_remote_profile_is_visible_without_opening_a_connection() {
         let settings = settings_with_remote_profile();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -661,6 +793,7 @@ mod tests {
             Box::pin(async { Err(StoreError::Backend("unexpected connection".into())) })
         });
         let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
+        assert_eq!(runtime.routes.len(), 1);
 
         let network = runtime.store();
         let page = future::block_on(network.read_directory(
@@ -693,11 +826,13 @@ mod tests {
             counted.fetch_add(1, Ordering::SeqCst);
             let root = StorePath::from_provider_key(provider.clone(), b"/".to_vec()).unwrap();
             Box::pin(async move {
-                Ok(Arc::new(NetworkDiscoveryStore {
-                    provider,
-                    root,
-                    ..NetworkDiscoveryStore::new()
-                }) as Arc<dyn Store>)
+                Ok(remote::RemoteStoreConnection::browse_only(
+                    Arc::new(NetworkDiscoveryStore {
+                        provider,
+                        root,
+                        ..NetworkDiscoveryStore::new()
+                    }) as Arc<dyn Store>,
+                ))
             })
         });
         let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
@@ -734,11 +869,13 @@ mod tests {
                 }
                 let root = StorePath::from_provider_key(provider.clone(), b"/".to_vec())
                     .expect("the fixture root is valid");
-                Ok(Arc::new(NetworkDiscoveryStore {
-                    provider,
-                    root,
-                    ..NetworkDiscoveryStore::new()
-                }) as Arc<dyn Store>)
+                Ok(remote::RemoteStoreConnection::browse_only(
+                    Arc::new(NetworkDiscoveryStore {
+                        provider,
+                        root,
+                        ..NetworkDiscoveryStore::new()
+                    }) as Arc<dyn Store>,
+                ))
             })
         });
         let runtime = ProviderRuntime::from_settings_with_connector(&settings, connector).unwrap();
