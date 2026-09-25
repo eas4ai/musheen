@@ -60,10 +60,10 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, Root, Selectable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, Context, DismissEvent,
-    Entity, EventEmitter, FocusHandle, Focusable, Global, ImageSource, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Role,
-    ScrollHandle, SharedString, Subscription, TestSupportExt, TitlebarOptions,
+    AnyElement, AnyWindowHandle, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context,
+    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Global, ImageSource, IntoElement,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    Role, ScrollHandle, SharedString, Subscription, TestSupportExt, TitlebarOptions,
     UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowId, WindowOptions, canvas,
     div, fill, img, point, px, size, uniform_list,
 };
@@ -8302,6 +8302,26 @@ impl MusheenApp {
             (CommandAction::Duplicate, CommandParameters::Targets(targets)) => {
                 self.submit_duplicate_targets(targets.clone(), cx);
             }
+            (CommandAction::CopyLocation, CommandParameters::Targets(targets)) => {
+                if let Err(error) = self.revalidate_context_targets(origin_tab, targets) {
+                    self.operation_error = Some(error);
+                    cx.notify();
+                } else if let Some(text) = targets
+                    .first()
+                    .filter(|_| targets.len() == 1)
+                    .and_then(|target| self.copyable_location_text(target.path()))
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                } else {
+                    self.operation_error = Some(
+                        self.catalog
+                            .message("context.backend-unavailable")
+                            .expect("backend refusal is localized")
+                            .into(),
+                    );
+                    cx.notify();
+                }
+            }
             (
                 create_action @ (CommandAction::NewDirectory | CommandAction::NewEmptyFile),
                 CommandParameters::Location(parent),
@@ -10078,6 +10098,26 @@ impl MusheenApp {
         })
     }
 
+    fn copyable_location_text(&self, path: &StorePath) -> Option<String> {
+        if let Some(local) = path.as_unix_path() {
+            if !local.is_absolute() {
+                return None;
+            }
+            if let Some(text) = local.to_str() {
+                return Some(text.to_owned());
+            }
+            let payload =
+                ClipboardPayload::new(ClipboardOperation::Copy, vec![path.clone()]).ok()?;
+            let uri = payload.format("text/uri-list")?.strip_suffix(b"\r\n")?;
+            return String::from_utf8(uri.to_vec()).ok();
+        }
+        let target = self.providers.application_target(path).ok()?;
+        match target.launch_target() {
+            LaunchTarget::Uri(uri) => Some(uri.to_string()),
+            LaunchTarget::Local(_) => None,
+        }
+    }
+
     fn backend_action_state(action: CommandAction) -> CapabilityState {
         if matches!(
             action,
@@ -10144,6 +10184,7 @@ impl MusheenApp {
                 | CommandAction::OpenAsAdministrator
                 | CommandAction::RunAsAdministrator
                 | CommandAction::Copy
+                | CommandAction::CopyLocation
                 | CommandAction::Cut
                 | CommandAction::PasteInto
                 | CommandAction::MoveToTrash
@@ -10176,6 +10217,21 @@ impl MusheenApp {
         target: CommandTarget,
         selection: &[CommandTargetRef],
     ) -> CapabilityState {
+        if action == CommandAction::CopyLocation
+            && selection
+                .first()
+                .filter(|_| selection.len() == 1)
+                .is_none_or(|item| self.copyable_location_text(item.path()).is_none())
+        {
+            return CapabilityState::Unsupported(
+                CapabilityReason::new(
+                    self.catalog
+                        .message("context.backend-unavailable")
+                        .expect("backend refusal is localized"),
+                )
+                .expect("backend refusal is nonempty"),
+            );
+        }
         if action == CommandAction::OpenInNewWindow
             && !self
                 .session_binding
@@ -20073,6 +20129,7 @@ mod tests {
             CommandAction::CreateSymbolicLink,
             CommandAction::CreateHardLink,
             CommandAction::Duplicate,
+            CommandAction::CopyLocation,
             CommandAction::Hide,
             CommandAction::Unhide,
             CommandAction::RenameTag,
@@ -20622,6 +20679,186 @@ mod tests {
         let bytes = store.load().ok()??;
         let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
         Some(value.get("windows")?.as_array()?.len())
+    }
+
+    #[gpui_kit::test]
+    async fn copy_location_writes_the_selected_path_as_text(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected.txt");
+        filesystem::write(&selected, b"file").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&selected);
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                assert_eq!(
+                    state.context_backend_action_state(
+                        CommandAction::CopyLocation,
+                        tab,
+                        CommandTarget::File,
+                        std::slice::from_ref(&target),
+                    ),
+                    CapabilityState::Supported
+                );
+                state.dispatch_typed_context_command(
+                    CommandAction::CopyLocation,
+                    CommandParameters::targets(vec![target]),
+                    Some(tab),
+                    None,
+                    false,
+                    cx,
+                );
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(selected.to_string_lossy().into_owned())
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn copy_location_keeps_non_utf8_path_bytes_in_a_file_uri(cx: &mut TestAppContext) {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary
+            .path()
+            .join(std::ffi::OsString::from_vec(b"raw-\xff".to_vec()));
+        filesystem::write(&selected, b"file").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&selected);
+
+        cx.update_window(browser, |_, _, cx| {
+            app.update(cx, |state, cx| {
+                state.dispatch_typed_context_command(
+                    CommandAction::CopyLocation,
+                    CommandParameters::targets(vec![target]),
+                    Some(state.navigation.focused_tab().id()),
+                    None,
+                    false,
+                    cx,
+                );
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(format!("file://{}/raw-%FF", temporary.path().display()))
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn copy_location_refuses_a_replaced_target_without_changing_clipboard(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let selected = temporary.path().join("selected.txt");
+        filesystem::write(&selected, b"file").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let original = local_command_target(&selected);
+        let stale = CommandTargetRef::new(
+            ItemId::new(
+                original.id().provider().clone(),
+                b"replaced-identity".to_vec(),
+            )
+            .unwrap(),
+            original.path().clone(),
+        )
+        .unwrap();
+
+        cx.update_window(browser, |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string("keep".to_owned()));
+            app.update(cx, |state, cx| {
+                state.dispatch_typed_context_command(
+                    CommandAction::CopyLocation,
+                    CommandParameters::targets(vec![stale]),
+                    Some(state.navigation.focused_tab().id()),
+                    None,
+                    false,
+                    cx,
+                );
+                assert_eq!(
+                    state.operation_error.as_deref(),
+                    Some(state.catalog.message("context.target-changed").unwrap())
+                );
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("keep".into())
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn copy_location_uses_the_provider_owned_uri(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let provider = ProviderId::new("remote.copy-location").unwrap();
+        let remote_path =
+            StorePath::from_provider_key(provider.clone(), b"opaque-not-a-uri".to_vec()).unwrap();
+        let remote_item = StoreItem::new(
+            ItemId::new(provider.clone(), b"remote-item".to_vec()).unwrap(),
+            remote_path,
+            DisplayPath::new("remote.txt"),
+            ItemKind::RegularFile,
+            Some(1),
+        );
+        let target =
+            CommandTargetRef::new(remote_item.id().clone(), remote_item.path().clone()).unwrap();
+        let adapter = UriApplicationAdapter {
+            store: Arc::new(FixtureProviderStore::new(provider, [remote_item])),
+            target: Arc::new(Mutex::new(ProviderApplicationTarget::new(
+                LaunchTarget::uri("sftp://files.example.test/remote%20item.txt").unwrap(),
+                "text/plain",
+            ))),
+        };
+        let providers = ProviderRuntime::builder()
+            .register_adapter(Arc::new(adapter))
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_provider_runtime(temporary.path().to_path_buf(), providers, cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        cx.update_window(handle.into(), |_, _, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                assert_eq!(
+                    state.context_backend_action_state(
+                        CommandAction::CopyLocation,
+                        tab,
+                        CommandTarget::File,
+                        std::slice::from_ref(&target),
+                    ),
+                    CapabilityState::Supported
+                );
+                state.dispatch_typed_context_command(
+                    CommandAction::CopyLocation,
+                    CommandParameters::targets(vec![target]),
+                    None,
+                    None,
+                    false,
+                    cx,
+                );
+            });
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sftp://files.example.test/remote%20item.txt".into())
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
