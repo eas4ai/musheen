@@ -1,0 +1,172 @@
+use crate::{
+    ContextMenuSurface,
+    toolbar::{FixedCommandSurface, fixed_surface_ids},
+};
+use musheen_core::CommandRegistry;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticRegion {
+    TabStrip,
+    NavigationToolbar,
+    Sidebar,
+    DirectoryContent,
+    Info,
+    Terminal,
+    StatusBar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FocusTarget {
+    Tabs,
+    Back,
+    Forward,
+    Parent,
+    Refresh,
+    Location,
+    Search,
+    ViewMode,
+    InfoToggle,
+    PaneSplit,
+    Settings,
+    Sidebar,
+    Directory,
+    Info,
+    Terminal,
+}
+
+const BASE_REGIONS: [SemanticRegion; 5] = [
+    SemanticRegion::TabStrip,
+    SemanticRegion::NavigationToolbar,
+    SemanticRegion::Sidebar,
+    SemanticRegion::DirectoryContent,
+    SemanticRegion::StatusBar,
+];
+
+const INFO_REGIONS: [SemanticRegion; 6] = [
+    SemanticRegion::TabStrip,
+    SemanticRegion::NavigationToolbar,
+    SemanticRegion::Sidebar,
+    SemanticRegion::DirectoryContent,
+    SemanticRegion::Info,
+    SemanticRegion::StatusBar,
+];
+
+const BASE_FOCUS: [FocusTarget; 13] = [
+    FocusTarget::Tabs,
+    FocusTarget::Back,
+    FocusTarget::Forward,
+    FocusTarget::Parent,
+    FocusTarget::Refresh,
+    FocusTarget::Location,
+    FocusTarget::Search,
+    FocusTarget::ViewMode,
+    FocusTarget::InfoToggle,
+    FocusTarget::PaneSplit,
+    FocusTarget::Settings,
+    FocusTarget::Sidebar,
+    FocusTarget::Directory,
+];
+
+const INFO_FOCUS: [FocusTarget; 14] = [
+    FocusTarget::Tabs,
+    FocusTarget::Back,
+    FocusTarget::Forward,
+    FocusTarget::Parent,
+    FocusTarget::Refresh,
+    FocusTarget::Location,
+    FocusTarget::Search,
+    FocusTarget::ViewMode,
+    FocusTarget::InfoToggle,
+    FocusTarget::PaneSplit,
+    FocusTarget::Settings,
+    FocusTarget::Sidebar,
+    FocusTarget::Directory,
+    FocusTarget::Info,
+];
+
+#[derive(Clone, Debug)]
+pub struct ShellModel {
+    commands: CommandRegistry,
+    context_menus: ContextMenuSurface,
+    info_visible: bool,
+    terminal_visible: bool,
+}
+
+impl ShellModel {
+    #[must_use]
+    pub fn new(info_visible: bool) -> Self {
+        Self::with_terminal(info_visible, false)
+    }
+
+    #[must_use]
+    pub fn with_terminal(info_visible: bool, terminal_visible: bool) -> Self {
+        let commands = CommandRegistry::built_in();
+        Self {
+            context_menus: ContextMenuSurface::new(commands.clone()),
+            commands,
+            info_visible,
+            terminal_visible,
+        }
+    }
+
+    #[must_use]
+    pub fn semantic_regions(&self) -> Vec<SemanticRegion> {
+        let mut regions = if self.info_visible {
+            INFO_REGIONS.to_vec()
+        } else {
+            BASE_REGIONS.to_vec()
+        };
+        if self.terminal_visible {
+            regions.insert(regions.len() - 1, SemanticRegion::Terminal);
+        }
+        regions
+    }
+
+    #[must_use]
+    pub fn focus_order(&self) -> Vec<FocusTarget> {
+        let mut focus = if self.info_visible {
+            INFO_FOCUS.to_vec()
+        } else {
+            BASE_FOCUS.to_vec()
+        };
+        if self.terminal_visible {
+            focus.push(FocusTarget::Terminal);
+        }
+        focus
+    }
+
+    #[must_use]
+    pub fn toolbar_command_ids(&self) -> Vec<&'static str> {
+        fixed_surface_ids(FixedCommandSurface::NavigationToolbar)
+    }
+
+    #[must_use]
+    pub fn commands(&self) -> &CommandRegistry {
+        &self.commands
+    }
+
+    /// The shell owns the same registry-backed surface rendered for every pane.
+    #[must_use]
+    pub const fn context_menus(&self) -> &ContextMenuSurface {
+        &self.context_menus
+    }
+
+    #[must_use]
+    pub const fn info_visible(&self) -> bool {
+        self.info_visible
+    }
+
+    pub fn toggle_info(&mut self) {
+        self.info_visible = !self.info_visible;
+    }
+
+    pub fn set_terminal_visible(&mut self, visible: bool) {
+        self.terminal_visible = visible;
+    }
+}
+
+impl Default for ShellModel {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
