@@ -2202,7 +2202,10 @@ pub(crate) fn deletion_path(path: &Path) -> Result<PathBuf, ArchiveOperationErro
     Ok(path.with_file_name(deletion_name))
 }
 
-fn remove_open_directory(directory: &File, depth: usize) -> Result<(), ArchiveOperationError> {
+pub(crate) fn remove_open_directory(
+    directory: &File,
+    depth: usize,
+) -> Result<(), ArchiveOperationError> {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
     const MAX_CLEANUP_DEPTH: usize = 4_096;
     if depth > MAX_CLEANUP_DEPTH {

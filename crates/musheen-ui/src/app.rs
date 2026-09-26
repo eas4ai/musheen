@@ -8,7 +8,8 @@ use catalog::{
 
 use crate::date_time::format_modified;
 use crate::dialogs::{
-    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, MetadataReviewChoice,
+    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, ExtractConflictChoice,
+    ExtractConflictDialog, ExtractConflictEvent, ExtractConflictStrings, MetadataReviewChoice,
     MetadataReviewDialog, MetadataReviewDialogEvent, MetadataReviewDialogModel, OpenWithDialog,
     OpenWithDialogEvent, OpenWithIntent as DialogOpenWithIntent, OpenWithModel,
     PropertiesFailureWindow, PropertiesPage, PropertiesWindow, PropertiesWindowData,
@@ -98,8 +99,8 @@ use musheen_local::LocalStore;
 use musheen_ops::{
     ApplyScope, ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, ConflictChoice,
     ConflictDecision, ConflictItemKind, ConflictPolicies, ConflictRecord, CreateRequest,
-    DeleteTarget, EventGeneration, HardLinkRequest, JobId, MutationError, MutationProvider,
-    OperationKind, PermanentDeleteRequest, RenameRequest, SymbolicLinkRequest,
+    DeleteTarget, EventGeneration, ExtractMerge, HardLinkRequest, JobId, MutationError,
+    MutationProvider, OperationKind, PermanentDeleteRequest, RenameRequest, SymbolicLinkRequest,
 };
 use native_theme::SystemTheme;
 use native_theme::icons::FreedesktopLoader;
@@ -984,6 +985,26 @@ enum TrashRestoreResult {
         conflict: ConflictRecord,
     },
     Failed(MutationError),
+}
+
+/// One question an extraction asks before it runs: an existing item, by its
+/// path relative to the destination folder, or the folder's own name when
+/// something other than a folder already has it.
+#[derive(Clone, Debug)]
+struct ExtractQuestion {
+    path: Vec<u8>,
+    whole_folder: bool,
+}
+
+/// An extraction waiting for the user's answers about its collisions.
+struct PendingExtract {
+    plan: ArchiveOperationPlan,
+    current: ExtractQuestion,
+    remaining: std::collections::VecDeque<ExtractQuestion>,
+    replace: std::collections::BTreeSet<Vec<u8>>,
+    window: Option<WindowId>,
+    // Keeps the dialog alive until its answer arrives.
+    dialog: Option<Entity<ExtractConflictDialog>>,
 }
 
 struct PendingDrop {
@@ -3800,6 +3821,7 @@ struct MusheenApp {
     pending_restores: HashMap<WindowId, PendingRestore>,
     pending_metadata_reviews: HashMap<WindowId, JobId>,
     pending_drop: Option<PendingDrop>,
+    pending_extract: Option<PendingExtract>,
     transfer_preflights: usize,
     file_clipboard: Option<FileClipboard>,
     system_file_clipboard: Option<Arc<SystemFileClipboard>>,
@@ -4582,6 +4604,7 @@ impl MusheenApp {
             pending_restores: HashMap::new(),
             pending_metadata_reviews: HashMap::new(),
             pending_drop: None,
+            pending_extract: None,
             transfer_preflights: 0,
             file_clipboard: None,
             system_file_clipboard: watch_directories.then(shared_system_file_clipboard),
@@ -9514,6 +9537,15 @@ impl MusheenApp {
         {
             self.pending_drop = None;
         }
+        // A collision question closed without an answer cancels its
+        // extraction.
+        if self
+            .pending_extract
+            .as_ref()
+            .is_some_and(|pending| pending.window == Some(closed))
+        {
+            self.pending_extract = None;
+        }
         // An unresolved window-manager close cancels only its own workflow.
         if self.context_dialog_windows.is_empty() {
             self.pending_content_focus = false;
@@ -9992,19 +10024,20 @@ impl MusheenApp {
             (CommandAction::BrowseArchive, CommandParameters::Targets(targets)) => {
                 self.open_archive_window(targets, cx);
             }
+            (CommandAction::Compress, CommandParameters::Targets(targets)) => {
+                self.submit_archive_plan(build_compress_plan(targets), cx);
+            }
             (
-                archive_action @ (CommandAction::Compress
-                | CommandAction::Extract
-                | CommandAction::ExtractHere),
+                CommandAction::Extract | CommandAction::ExtractHere,
                 CommandParameters::Targets(targets),
-            ) => self.submit_archive_plan(build_archive_plan(*archive_action, targets), cx),
+            ) => self.begin_extract(build_extract_plan(targets), cx),
             (
                 CommandAction::Extract,
                 CommandParameters::Destination {
                     targets,
                     destination,
                 },
-            ) => self.submit_archive_plan(build_extract_plan_into(targets, destination), cx),
+            ) => self.begin_extract(build_extract_plan_into(targets, destination), cx),
             (
                 delete_action @ (CommandAction::MoveToTrash | CommandAction::DeletePermanently),
                 CommandParameters::Targets(targets),
@@ -10221,6 +10254,213 @@ impl MusheenApp {
                 cx.notify();
             }
         }
+    }
+
+    /// Looks at the extraction's destination folder in the background, then
+    /// asks about each collision before the extraction is queued.
+    fn begin_extract(
+        &mut self,
+        plan: Result<ArchiveOperationPlan, Box<str>>,
+        cx: &mut Context<Self>,
+    ) {
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.operation_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let preflight = plan.clone();
+        let destination = cx.background_spawn(async move {
+            musheen_desktop::extract_destination(
+                &preflight,
+                &musheen_desktop::ArchiveOperationLimits::default(),
+                &NoArchivePasswords,
+                &CancellationToken::new(),
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let destination = destination.await;
+            let _ = this.update(cx, |state, cx| {
+                state.continue_extract(plan, destination, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn continue_extract(
+        &mut self,
+        plan: ArchiveOperationPlan,
+        destination: Result<
+            musheen_desktop::ExtractDestination,
+            musheen_desktop::ArchiveOperationError,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        let mut questions = match destination {
+            Err(error) => {
+                self.operation_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+            Ok(musheen_desktop::ExtractDestination::Absent) => {
+                self.submit_archive_plan(Ok(plan), cx);
+                return;
+            }
+            Ok(musheen_desktop::ExtractDestination::NotAFolder) => {
+                std::collections::VecDeque::from([ExtractQuestion {
+                    path: Vec::new(),
+                    whole_folder: true,
+                }])
+            }
+            Ok(musheen_desktop::ExtractDestination::Folder(collisions)) => collisions
+                .into_iter()
+                .map(|collision| ExtractQuestion {
+                    path: collision.path,
+                    whole_folder: false,
+                })
+                .collect(),
+        };
+        let Some(current) = questions.pop_front() else {
+            let merged = plan
+                .with_merge(ExtractMerge::default())
+                .map_err(|error| error.to_string().into());
+            self.submit_archive_plan(merged, cx);
+            return;
+        };
+        self.pending_extract = Some(PendingExtract {
+            plan,
+            current,
+            remaining: questions,
+            replace: std::collections::BTreeSet::new(),
+            window: None,
+            dialog: None,
+        });
+        self.ask_extract_question(cx);
+    }
+
+    /// Opens the dialog for the pending extraction's current question.
+    fn ask_extract_question(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = &self.pending_extract else {
+            return;
+        };
+        let message = |id| {
+            self.catalog
+                .message(id)
+                .expect("extract collision messages are localized")
+                .to_owned()
+        };
+        let destination = pending
+            .plan
+            .destination()
+            .as_unix_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let question = if pending.current.whole_folder {
+            format!(
+                "{} {}",
+                message("extract-conflict-not-a-folder"),
+                destination.display()
+            )
+        } else {
+            format!(
+                "{} {}",
+                message("extract-conflict-exists"),
+                destination
+                    .join(OsString::from_vec(pending.current.path.clone()))
+                    .display()
+            )
+        };
+        let strings = ExtractConflictStrings {
+            title: message("extract-conflict-title"),
+            replace: message("extract-conflict-replace"),
+            replace_all: message("extract-conflict-replace-all"),
+            skip: message("extract-conflict-skip"),
+            skip_all: message("extract-conflict-skip-all"),
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(520.), px(240.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from(strings.title.clone())),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(400.), px(200.))),
+            ..WindowOptions::default()
+        };
+        let mut dialog = None;
+        let opened = cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ExtractConflictDialog::new(question, strings, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        });
+        let (Ok(handle), Some(dialog)) = (opened, dialog) else {
+            self.pending_extract = None;
+            self.operation_error = Some("Musheen could not ask about the extraction".into());
+            cx.notify();
+            return;
+        };
+        let origin_tab = self.navigation.focused_tab().id();
+        self.track_context_dialog_window(handle.window_id(), Some(origin_tab), cx);
+        let subscription = cx.subscribe(&dialog, |this, _, event: &ExtractConflictEvent, cx| {
+            let ExtractConflictEvent::Chosen(choice) = *event;
+            this.answer_extract_question(choice, cx);
+        });
+        self.conflict_subscriptions.push(subscription);
+        if let Some(pending) = &mut self.pending_extract {
+            pending.window = Some(handle.window_id());
+            pending.dialog = Some(dialog);
+        }
+    }
+
+    /// Records the answer for the current collision, then asks the next one
+    /// or queues the extraction with every answer.
+    fn answer_extract_question(&mut self, choice: ExtractConflictChoice, cx: &mut Context<Self>) {
+        let Some(mut pending) = self.pending_extract.take() else {
+            return;
+        };
+        pending.window = None;
+        pending.dialog = None;
+        match choice {
+            ExtractConflictChoice::Replace => {
+                pending.replace.insert(pending.current.path.clone());
+            }
+            ExtractConflictChoice::Skip => {}
+            ExtractConflictChoice::ReplaceAll => {
+                pending.replace.insert(pending.current.path.clone());
+                pending
+                    .replace
+                    .extend(pending.remaining.drain(..).map(|question| question.path));
+            }
+            ExtractConflictChoice::SkipAll => pending.remaining.clear(),
+        }
+        if let Some(next) = pending.remaining.pop_front() {
+            pending.current = next;
+            self.pending_extract = Some(pending);
+            self.ask_extract_question(cx);
+            return;
+        }
+        if pending.current.whole_folder {
+            if pending.replace.contains(&pending.current.path) {
+                let plan = &pending.plan;
+                let replace = ArchiveOperationPlan::extract(
+                    plan.sources()[0].clone(),
+                    plan.destination().clone(),
+                    plan.codec(),
+                    ArchiveConflictPolicy::Replace,
+                    plan.encrypted(),
+                )
+                .map_err(|error| error.to_string().into());
+                self.submit_archive_plan(replace, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let merged = pending
+            .plan
+            .with_merge(ExtractMerge::new(pending.replace))
+            .map_err(|error| error.to_string().into());
+        self.submit_archive_plan(merged, cx);
     }
 
     fn open_archive_window(&mut self, targets: &[CommandTargetRef], cx: &mut Context<Self>) {
@@ -18473,17 +18713,6 @@ fn is_archive_path(path: &StorePath) -> bool {
         .is_some()
 }
 
-fn build_archive_plan(
-    action: CommandAction,
-    targets: &[CommandTargetRef],
-) -> Result<ArchiveOperationPlan, Box<str>> {
-    match action {
-        CommandAction::Compress => build_compress_plan(targets),
-        CommandAction::Extract | CommandAction::ExtractHere => build_extract_plan(action, targets),
-        _ => Err("the command is not an archive operation".into()),
-    }
-}
-
 fn build_compress_plan(targets: &[CommandTargetRef]) -> Result<ArchiveOperationPlan, Box<str>> {
     if targets.is_empty() {
         return Err("select at least one file or folder to compress".into());
@@ -18525,9 +18754,25 @@ fn build_compress_plan(targets: &[CommandTargetRef]) -> Result<ArchiveOperationP
     .map_err(|error| error.to_string().into())
 }
 
-fn build_extract_plan(
-    action: CommandAction,
+/// Extract Here: the archive's entries go into a folder named after it,
+/// beside it.
+fn build_extract_plan(targets: &[CommandTargetRef]) -> Result<ArchiveOperationPlan, Box<str>> {
+    let [target] = targets else {
+        return Err("select exactly one archive to extract".into());
+    };
+    let parent = target
+        .path()
+        .as_unix_path()
+        .and_then(Path::parent)
+        .ok_or_else(|| Box::<str>::from("the selected archive has no parent folder"))?;
+    build_extract_plan_into(targets, &StorePath::from_unix_path(parent))
+}
+
+/// Extract… into a picked folder: the archive's entries go into a folder
+/// named after the archive inside `parent`, under Extract Here's policy.
+fn build_extract_plan_into(
     targets: &[CommandTargetRef],
+    parent: &StorePath,
 ) -> Result<ArchiveOperationPlan, Box<str>> {
     let [target] = targets else {
         return Err("select exactly one archive to extract".into());
@@ -18536,54 +18781,22 @@ fn build_extract_plan(
         .path()
         .as_unix_path()
         .ok_or_else(|| Box::<str>::from("only local archives can be extracted"))?;
-    let parent = source
-        .parent()
-        .ok_or_else(|| Box::<str>::from("the selected archive has no parent folder"))?;
+    let parent = parent
+        .as_unix_path()
+        .ok_or_else(|| Box::<str>::from("archives are extracted only into local folders"))?;
     let (codec, suffix_length) = archive_codec_and_suffix(source)
         .ok_or_else(|| Box::<str>::from("the selected file is not a supported archive"))?;
-    let destination = if action == CommandAction::ExtractHere {
-        parent.to_path_buf()
-    } else {
-        let name = source
-            .file_name()
-            .ok_or_else(|| Box::<str>::from("the selected archive has no file name"))?;
-        let stem_length = name.as_bytes().len().saturating_sub(suffix_length);
-        if stem_length == 0 {
-            return Err("the selected archive has no usable output folder name".into());
-        }
-        parent.join(OsString::from_vec(name.as_bytes()[..stem_length].to_vec()))
-    };
+    let name = source
+        .file_name()
+        .ok_or_else(|| Box::<str>::from("the selected archive has no file name"))?;
+    let stem_length = name.as_bytes().len().saturating_sub(suffix_length);
+    if stem_length == 0 {
+        return Err("the selected archive has no usable output folder name".into());
+    }
+    let destination = parent.join(OsString::from_vec(name.as_bytes()[..stem_length].to_vec()));
     ArchiveOperationPlan::extract(
         target.path().clone(),
         StorePath::from_unix_path(destination),
-        codec,
-        ArchiveConflictPolicy::Fail,
-        false,
-    )
-    .map_err(|error| error.to_string().into())
-}
-
-/// Extract… into the folder the user picked: the archive's entries land in
-/// that folder itself, under Extract Here's conflict policy.
-fn build_extract_plan_into(
-    targets: &[CommandTargetRef],
-    destination: &StorePath,
-) -> Result<ArchiveOperationPlan, Box<str>> {
-    let [target] = targets else {
-        return Err("select exactly one archive to extract".into());
-    };
-    let source = target
-        .path()
-        .as_unix_path()
-        .ok_or_else(|| Box::<str>::from("only local archives can be extracted"))?;
-    if destination.as_unix_path().is_none() {
-        return Err("archives are extracted only into local folders".into());
-    }
-    let (codec, _) = archive_codec_and_suffix(source)
-        .ok_or_else(|| Box::<str>::from("the selected file is not a supported archive"))?;
-    ArchiveOperationPlan::extract(
-        target.path().clone(),
-        destination.clone(),
         codec,
         ArchiveConflictPolicy::Fail,
         false,
@@ -18883,7 +19096,7 @@ mod tests {
         let source = temporary.path().join("report.txt");
         std::fs::write(&source, b"contents").unwrap();
 
-        let plan = build_archive_plan(CommandAction::Compress, &[local_command_target(&source)])
+        let plan = build_compress_plan(&[local_command_target(&source)])
             .expect("compression plan is valid");
 
         assert_eq!(plan.kind(), OperationKind::Compress);
@@ -18902,17 +19115,23 @@ mod tests {
         std::fs::write(&source, b"fixture").unwrap();
         let target = local_command_target(&source);
 
-        let plan = build_archive_plan(CommandAction::Extract, std::slice::from_ref(&target))
-            .expect("extraction plan is valid");
-        let here = build_archive_plan(CommandAction::ExtractHere, &[target])
-            .expect("extract-here plan is valid");
+        let here =
+            build_extract_plan(std::slice::from_ref(&target)).expect("extract-here plan is valid");
+        let picked = temporary.path().join("picked");
+        let into = build_extract_plan_into(&[target], &StorePath::from_unix_path(&picked))
+            .expect("extract-to plan is valid");
 
-        assert_eq!(plan.codec(), ArchiveCodec::TarGzip);
+        assert_eq!(here.codec(), ArchiveCodec::TarGzip);
         assert_eq!(
-            plan.destination().as_unix_path(),
-            Some(temporary.path().join("backup").as_path())
+            here.destination().as_unix_path(),
+            Some(temporary.path().join("backup").as_path()),
+            "Extract Here names its folder after the archive, beside it"
         );
-        assert_eq!(here.destination().as_unix_path(), Some(temporary.path()));
+        assert_eq!(
+            into.destination().as_unix_path(),
+            Some(picked.join("backup").as_path()),
+            "Extract… names its folder after the archive, inside the picked folder"
+        );
     }
 
     #[test]
@@ -18926,19 +19145,10 @@ mod tests {
         }
 
         assert!(
-            build_archive_plan(
-                CommandAction::Extract,
-                &[local_command_target(&first), local_command_target(&second)]
-            )
-            .is_err()
+            build_extract_plan(&[local_command_target(&first), local_command_target(&second)])
+                .is_err()
         );
-        assert!(
-            build_archive_plan(
-                CommandAction::Extract,
-                &[local_command_target(&unsupported)]
-            )
-            .is_err()
-        );
+        assert!(build_extract_plan(&[local_command_target(&unsupported)]).is_err());
     }
 
     #[test]
@@ -23353,22 +23563,33 @@ mod tests {
         });
     }
 
-    /// Compresses `source` into `<name>.zip` beside it with the app's own
-    /// Compress command, and returns the archive once it is published.
+    /// Compresses `sources` with the app's own Compress command and returns
+    /// the archive once it is published: `<name>.zip` for one source,
+    /// `Archive.zip` for several.
     async fn compressed_fixture(
         app: &Entity<MusheenApp>,
         browser: AnyWindowHandle,
-        source: &Path,
+        sources: &[PathBuf],
         cx: &mut TestAppContext,
     ) -> PathBuf {
-        let mut name = source.file_name().unwrap().to_os_string();
-        name.push(".zip");
-        let archive = source.with_file_name(name);
+        let archive = match sources {
+            [source] => {
+                let mut name = source.file_name().unwrap().to_os_string();
+                name.push(".zip");
+                source.with_file_name(name)
+            }
+            _ => sources[0].with_file_name("Archive.zip"),
+        };
         app.update(cx, |state, cx| {
             let tab = state.navigation.focused_tab().id();
             state.dispatch_typed_context_command(
                 CommandAction::Compress,
-                CommandParameters::targets(vec![local_command_target(source)]),
+                CommandParameters::targets(
+                    sources
+                        .iter()
+                        .map(|source| local_command_target(source))
+                        .collect(),
+                ),
                 Some(tab),
                 None,
                 false,
@@ -23378,6 +23599,20 @@ mod tests {
         cx.wait_for(browser, Duration::from_secs(5), |_, _| archive.exists())
             .await;
         archive
+    }
+
+    /// Writes `a.txt` and `b.txt` in `directory` and compresses them into
+    /// `Archive.zip` there.
+    async fn two_entry_archive(
+        app: &Entity<MusheenApp>,
+        browser: AnyWindowHandle,
+        directory: &Path,
+        cx: &mut TestAppContext,
+    ) -> PathBuf {
+        let sources = [directory.join("a.txt"), directory.join("b.txt")];
+        filesystem::write(&sources[0], b"new a").unwrap();
+        filesystem::write(&sources[1], b"new b").unwrap();
+        compressed_fixture(app, browser, &sources, cx).await
     }
 
     /// Chooses Extract… on `archive` from its context menu and picks
@@ -23426,61 +23661,73 @@ mod tests {
         cx.run_until_parked();
     }
 
-    #[gpui_kit::test]
-    async fn extract_to_a_picked_folder_writes_the_archive_entries_there(cx: &mut TestAppContext) {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("notes.txt");
-        filesystem::write(&source, b"notes").unwrap();
-        let picked = temporary.path().join("picked");
-        filesystem::create_dir(&picked).unwrap();
-        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
-        let journal = tempfile::tempdir().unwrap();
-        run_archive_jobs(&app, journal.path(), cx);
-        let archive = compressed_fixture(&app, browser, &source, cx).await;
-
-        extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
-
-        cx.read(|cx| {
-            assert_eq!(
-                app.read(cx).operation_error,
-                None,
-                "Extract… queues an extraction into the picked folder"
-            )
-        });
-        let extracted = picked.join("notes.txt");
-        cx.wait_for(browser, Duration::from_secs(5), |_, _| extracted.exists())
-            .await;
-        assert_eq!(filesystem::read(&extracted).unwrap(), b"notes");
-        assert!(
-            !temporary.path().join("notes").exists(),
-            "nothing is extracted beside the archive"
-        );
-        assert!(
-            !picked.join("notes").exists(),
-            "the entries land in the picked folder itself, not in a subfolder"
-        );
+    /// Answers the extraction's collision question with `choice` once it
+    /// shows, in whichever window holds it. Returns the colliding item it
+    /// named, or `None` when no question came.
+    fn answer_extract_collision(choice: &str, cx: &mut TestAppContext) -> Option<String> {
+        for _ in 0..100 {
+            cx.run_until_parked();
+            for window in cx.windows() {
+                let answered = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        window.try_find(choice.to_owned())?;
+                        let item = window
+                            .try_find("extract-conflict-item")
+                            .and_then(|item| item.label().map(str::to_owned))
+                            .unwrap_or_default();
+                        window.click(choice.to_owned(), cx);
+                        Some(item)
+                    })
+                    .ok()
+                    .flatten();
+                if answered.is_some() {
+                    cx.run_until_parked();
+                    return answered;
+                }
+            }
+            cx.executor().advance_clock(Duration::from_millis(20));
+        }
+        None
     }
 
-    #[gpui_kit::test]
-    async fn extract_to_a_folder_that_holds_an_entry_keeps_that_item(cx: &mut TestAppContext) {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("notes.txt");
-        filesystem::write(&source, b"notes").unwrap();
-        let picked = temporary.path().join("picked");
-        filesystem::create_dir(&picked).unwrap();
-        filesystem::write(picked.join("notes.txt"), b"already here").unwrap();
-        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
-        let journal = tempfile::tempdir().unwrap();
-        run_archive_jobs(&app, journal.path(), cx);
-        let archive = compressed_fixture(&app, browser, &source, cx).await;
-        let before = cx.read(|cx| {
+    fn highest_job(app: &Entity<MusheenApp>, cx: &mut TestAppContext) -> Option<JobId> {
+        cx.read(|cx| {
             app.read(cx)
                 .operation_hub
                 .status()
                 .lock()
                 .unwrap()
                 .highest_job_id()
-        });
+        })
+    }
+
+    async fn wait_for_jobs_after(
+        app: &Entity<MusheenApp>,
+        browser: AnyWindowHandle,
+        before: Option<JobId>,
+        cx: &mut TestAppContext,
+    ) {
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            let status = app.read(cx).operation_hub.status();
+            let status = status.lock().unwrap();
+            status.highest_job_id() > before && status.active_count() == 0
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_a_picked_folder_creates_a_folder_named_after_the_archive(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let picked = temporary.path().join("picked");
+        filesystem::create_dir(&picked).unwrap();
+        filesystem::write(picked.join("keep.txt"), b"keep").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
 
         extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
 
@@ -23488,20 +23735,163 @@ mod tests {
             assert_eq!(
                 app.read(cx).operation_error,
                 None,
-                "Extract… queues an extraction into the picked folder"
+                "Extract… queues an extraction into a folder named after the archive"
             )
         });
-        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
-            let status = app.read(cx).operation_hub.status();
-            let status = status.lock().unwrap();
-            status.highest_job_id() > before && status.active_count() == 0
+        let folder = picked.join("Archive");
+        cx.wait_for(browser, Duration::from_secs(5), |_, _| {
+            folder.join("b.txt").exists()
         })
         .await;
-        assert_eq!(
-            filesystem::read(picked.join("notes.txt")).unwrap(),
-            b"already here",
-            "an extraction never replaces an item already in the picked folder"
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        assert_eq!(filesystem::read(picked.join("keep.txt")).unwrap(), b"keep");
+        assert!(
+            !picked.join("a.txt").exists(),
+            "the entries go into the folder named after the archive"
         );
+        assert!(
+            !temporary.path().join("Archive").exists(),
+            "nothing is extracted beside the archive"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_the_archive_folder_with_extract_here_creates_a_folder_named_after_it(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("readme.txt"), b"readme").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::ExtractHere,
+                CommandParameters::targets(vec![local_command_target(&archive)]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).operation_error,
+                None,
+                "Extract Here extracts into a folder named after the archive beside it"
+            )
+        });
+        let folder = temporary.path().join("Archive");
+        cx.wait_for(browser, Duration::from_secs(5), |_, _| {
+            folder.join("b.txt").exists()
+        })
+        .await;
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+    }
+
+    /// Picks a folder that already holds `Archive/a.txt`, `Archive/b.txt`
+    /// and `Archive/keep.txt`, and extracts `Archive.zip` into it.
+    async fn extract_into_an_existing_folder(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Entity<MusheenApp>,
+        AnyWindowHandle,
+        PathBuf,
+        Option<JobId>,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let picked = temporary.path().join("picked");
+        let folder = picked.join("Archive");
+        filesystem::create_dir_all(&folder).unwrap();
+        filesystem::write(folder.join("a.txt"), b"old a").unwrap();
+        filesystem::write(folder.join("b.txt"), b"old b").unwrap();
+        filesystem::write(folder.join("keep.txt"), b"keep").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+        let before = highest_job(&app, cx);
+        extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
+        (temporary, journal, app, browser, folder, before)
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_existing_folder_asks_for_each_collision_and_follows_the_choice(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temporary, _journal, app, browser, folder, before) =
+            extract_into_an_existing_folder(cx).await;
+
+        let replaced = answer_extract_collision("extract-conflict-replace", cx)
+            .expect("a colliding file asks Replace, Replace All, Skip or Skip All");
+        let skipped = answer_extract_collision("extract-conflict-skip", cx)
+            .expect("every colliding file is asked about");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        let (replaced, skipped) = if replaced.contains("a.txt") {
+            assert!(skipped.contains("b.txt"), "{skipped}");
+            ("a.txt", "b.txt")
+        } else {
+            assert!(replaced.contains("b.txt") && skipped.contains("a.txt"));
+            ("b.txt", "a.txt")
+        };
+        let expected = |name: &str, age: &str| format!("{age} {}", &name[..1]).into_bytes();
+        assert_eq!(
+            filesystem::read(folder.join(replaced)).unwrap(),
+            expected(replaced, "new"),
+            "Replace writes the archive's entry"
+        );
+        assert_eq!(
+            filesystem::read(folder.join(skipped)).unwrap(),
+            expected(skipped, "old"),
+            "Skip keeps the existing item"
+        );
+        assert_eq!(
+            filesystem::read(folder.join("keep.txt")).unwrap(),
+            b"keep",
+            "an item no entry collides with does not change"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_existing_folder_with_replace_all_answers_every_collision(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temporary, _journal, app, browser, folder, before) =
+            extract_into_an_existing_folder(cx).await;
+
+        answer_extract_collision("extract-conflict-replace-all", cx)
+            .expect("a colliding file asks Replace, Replace All, Skip or Skip All");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        assert_eq!(filesystem::read(folder.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_existing_folder_with_skip_all_keeps_every_colliding_item(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temporary, _journal, app, browser, folder, before) =
+            extract_into_an_existing_folder(cx).await;
+
+        answer_extract_collision("extract-conflict-skip-all", cx)
+            .expect("a colliding file asks Replace, Replace All, Skip or Skip All");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"old a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"old b");
+        assert_eq!(filesystem::read(folder.join("keep.txt")).unwrap(), b"keep");
     }
 
     #[gpui_kit::test]

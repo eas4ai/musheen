@@ -4,9 +4,9 @@ use super::budget::{
 };
 use super::create::{
     ArchiveCleanupIntent, ArchiveOperationOutcome, ArchivePublicationPaths, append_archive_phase,
-    cleanup_path, cleanup_phase, deletion_path, file_identity, local_path,
+    cleanup_path, cleanup_phase, deletion_path, file_identity, local_path, map_errno,
     path_identity_with_controls, publication_phase, publication_quarantine_path, publish_staging,
-    remove_owned_journaled, staging_path, sync_parent,
+    remove_open_directory, remove_owned_journaled, staging_path, sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
@@ -15,7 +15,8 @@ use super::{tar_codec, zip_codec};
 use musheen_core::{CancellationToken, ProviderId};
 use musheen_ops::{
     ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
-    ArchiveOperationPlan, EventGeneration, JobId, Journal, JournalPhase, JournalStorage,
+    ArchiveOperationPlan, EventGeneration, ExtractMerge, JobId, Journal, JournalPhase,
+    JournalStorage,
 };
 use nix::libc::O_NOFOLLOW;
 use std::ffi::OsString;
@@ -61,7 +62,13 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             .ok_or(ArchiveOperationError::InvalidArchive)?,
     )?;
     let destination = local_path(plan.destination())?;
-    if destination.exists() {
+    // A merge needs a real folder at the destination; anything else follows
+    // the plan's conflict policy for the destination as a whole.
+    let merge = match (plan.merge(), std::fs::symlink_metadata(&destination)) {
+        (Some(merge), Ok(metadata)) if metadata.is_dir() => Some(merge),
+        _ => None,
+    };
+    if merge.is_none() && destination.exists() {
         match plan.conflict_policy() {
             ArchiveConflictPolicy::Fail => return Err(ArchiveOperationError::Conflict),
             ArchiveConflictPolicy::Skip => return Ok(ArchiveOperationOutcome::Skipped),
@@ -251,6 +258,78 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                 .ok_or(ArchiveOperationError::Conflict)?;
         begin_commit()?;
         transaction_started = true;
+        if let Some(merge) = merge {
+            merge_staging(&staging, &destination, merge, cancellation)?;
+            published = true;
+            sync_parent(&destination)?;
+            let destination_after =
+                path_identity_with_controls(&destination, Some(&budget), Some(cancellation))?;
+            // What the merge skipped is still staged; remove it.
+            if let Some(leftover) =
+                path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
+            {
+                let owned = stage_root.is_some_and(|created| {
+                    created.device() == leftover.device() && created.inode() == leftover.inode()
+                });
+                if !owned {
+                    return Err(ArchiveOperationError::RecoveryRequired);
+                }
+                let stage_deletion = deletion_path(&staging)?;
+                let cleanup = ArchiveCleanupIntent::new(
+                    ArchiveCleanupKind::PrepublishStage,
+                    &staging,
+                    &stage_deletion,
+                    Some(leftover),
+                );
+                append_archive_phase(
+                    journal,
+                    job_id,
+                    generation,
+                    cleanup_phase(JournalPhase::PrepublishStageCleanupPlanned, cleanup),
+                    plan,
+                    &staging,
+                    destination_before,
+                    destination_after,
+                    Some(&budget),
+                )?;
+                let mut quarantined = || {
+                    append_archive_phase(
+                        journal,
+                        job_id,
+                        generation,
+                        cleanup_phase(JournalPhase::PrepublishStageCleanupQuarantined, cleanup),
+                        plan,
+                        &staging,
+                        destination_before,
+                        destination_after,
+                        Some(&budget),
+                    )
+                };
+                remove_owned_journaled(
+                    &staging,
+                    &stage_deletion,
+                    Some(leftover),
+                    &budget,
+                    cancellation,
+                    &mut quarantined,
+                )
+                .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
+            }
+            for phase in [JournalPhase::StagingCleaned, JournalPhase::Completed] {
+                append_archive_phase(
+                    journal,
+                    job_id,
+                    generation,
+                    phase,
+                    plan,
+                    &staging,
+                    destination_before,
+                    destination_after,
+                    Some(&budget),
+                )?;
+            }
+            return Ok(ArchiveOperationOutcome::Published);
+        }
         let outcome = {
             let rollback_quarantine = deletion_path(&rollback)?;
             let payload_quarantine = publication_quarantine_path(&staging)?;
@@ -514,6 +593,232 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         }
     }
     result
+}
+
+/// Moves staged entries into the existing destination folder. An entry the
+/// folder lacks moves in whole; folders on both sides merge entry by entry;
+/// any other collision is replaced only when `merge` names its path, and
+/// otherwise stays staged for cleanup. Every step works relative to opened
+/// folders, never follows a symlink in the destination, and never replaces
+/// an item that appeared after the user answered.
+fn merge_staging(
+    staging: &Path,
+    destination: &Path,
+    merge: &ExtractMerge,
+    cancellation: &CancellationToken,
+) -> Result<(), ArchiveOperationError> {
+    let staged = open_directory(staging)?;
+    let target = open_directory(destination)?;
+    merge_directory(&staged, &target, &mut Vec::new(), merge, cancellation, 0)
+}
+
+fn open_directory(path: &Path) -> Result<File, ArchiveOperationError> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(map_errno)
+}
+
+fn open_child_directory(
+    parent: &File,
+    name: &std::ffi::CStr,
+) -> Result<File, ArchiveOperationError> {
+    use rustix::fs::{Mode, OFlags, openat};
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(map_errno)
+}
+
+fn merge_directory(
+    staged: &File,
+    target: &File,
+    relative: &mut Vec<u8>,
+    merge: &ExtractMerge,
+    cancellation: &CancellationToken,
+    depth: usize,
+) -> Result<(), ArchiveOperationError> {
+    use rustix::fs::{AtFlags, Dir, FileType, RenameFlags, renameat_with, statat, unlinkat};
+    use rustix::io::Errno;
+    const MAX_MERGE_DEPTH: usize = 4_096;
+    if depth > MAX_MERGE_DEPTH {
+        return Err(ArchiveOperationError::UnsafePath(
+            "archive folders nest too deep",
+        ));
+    }
+    let mut names = Vec::new();
+    for entry in Dir::read_from(staged).map_err(map_errno)? {
+        let entry = entry.map_err(map_errno)?;
+        let name = entry.file_name();
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    let is_directory = |mode| FileType::from_raw_mode(mode) == FileType::Directory;
+    for name in names {
+        cancellation.wait_if_paused()?;
+        let mark = relative.len();
+        if !relative.is_empty() {
+            relative.push(b'/');
+        }
+        relative.extend_from_slice(name.to_bytes());
+        let staged_is_directory = is_directory(
+            statat(staged, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(map_errno)?
+                .st_mode,
+        );
+        let moved = match statat(target, &name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => {
+                renameat_with(staged, &name, target, &name, RenameFlags::NOREPLACE)
+            }
+            Err(error) => return Err(map_errno(error)),
+            Ok(existing) if is_directory(existing.st_mode) && staged_is_directory => {
+                let staged_child = open_child_directory(staged, &name)?;
+                let target_child = open_child_directory(target, &name)?;
+                merge_directory(
+                    &staged_child,
+                    &target_child,
+                    relative,
+                    merge,
+                    cancellation,
+                    depth.saturating_add(1),
+                )?;
+                Ok(())
+            }
+            Ok(_) if !merge.replaces(relative) => Ok(()),
+            Ok(existing) if is_directory(existing.st_mode) => {
+                let existing_child = open_child_directory(target, &name)?;
+                remove_open_directory(&existing_child, 0)?;
+                unlinkat(target, &name, AtFlags::REMOVEDIR).map_err(map_errno)?;
+                renameat_with(staged, &name, target, &name, RenameFlags::NOREPLACE)
+            }
+            Ok(_) if staged_is_directory => {
+                unlinkat(target, &name, AtFlags::empty()).map_err(map_errno)?;
+                renameat_with(staged, &name, target, &name, RenameFlags::NOREPLACE)
+            }
+            // A file over a file or a link: one rename replaces it in place.
+            Ok(_) => renameat_with(staged, &name, target, &name, RenameFlags::empty()),
+        };
+        match moved {
+            // An item that appeared after the question stays; the staged
+            // entry is cleaned up with the rest of the staging.
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(error) => return Err(map_errno(error)),
+        }
+        relative.truncate(mark);
+    }
+    target.sync_all().map_err(|error| map_io(&error))
+}
+
+/// What an extraction would meet at its destination folder.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtractDestination {
+    /// The folder does not exist; the extraction publishes it in one step.
+    Absent,
+    /// An item other than a folder has the folder's name.
+    NotAFolder,
+    /// The folder exists; the items that collide with archive entries.
+    Folder(Vec<ExtractCollision>),
+}
+
+/// An existing item an archive entry would replace, by its path relative to
+/// the destination folder with `/` between components.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractCollision {
+    pub path: Vec<u8>,
+    pub existing_is_folder: bool,
+}
+
+/// Lists the collisions an extraction would meet, reading the archive's
+/// entries as the extraction itself does and never following a symlink in
+/// the destination. A folder that meets a folder merges and is no collision;
+/// the entries under a colliding item follow that item's answer.
+pub fn extract_destination(
+    plan: &ArchiveOperationPlan,
+    limits: &ArchiveOperationLimits,
+    passwords: &dyn ArchivePasswordProvider,
+    cancellation: &CancellationToken,
+) -> Result<ExtractDestination, ArchiveOperationError> {
+    let destination = local_path(plan.destination())?;
+    match std::fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ExtractDestination::Absent);
+        }
+        Err(error) => return Err(map_io(&error)),
+        Ok(metadata) if !metadata.is_dir() => return Ok(ExtractDestination::NotAFolder),
+        Ok(_) => {}
+    }
+    let source = local_path(
+        plan.sources()
+            .first()
+            .ok_or(ArchiveOperationError::InvalidArchive)?,
+    )?;
+    let parent = destination
+        .parent()
+        .ok_or(ArchiveOperationError::UnsafePath(
+            "archive destination needs a parent",
+        ))?;
+    let operation_limits = limits.for_staging(parent)?;
+    let mut budget = ArchiveBudget::new(operation_limits.clone());
+    let counters = DecodeCounterState::with_memory_budget(budget.shared_memory());
+    let source_file = open_archive_source(&source)?;
+    let source_bytes = source_file
+        .metadata()
+        .map_err(|error| map_io(&error))?
+        .len();
+    let entries = collect_extract_entries(
+        &source_file,
+        source_bytes,
+        archive_format(plan.codec()),
+        &decode_limits(&operation_limits),
+        passwords,
+        cancellation,
+        &mut budget,
+        &counters,
+        parent,
+    )?;
+    let mut collisions: Vec<ExtractCollision> = Vec::new();
+    for entry in &entries {
+        let relative = ArchivePath::normalize_bytes(&entry.path, limits.max_path_bytes)?;
+        let components = relative.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        let mut prefix = Vec::new();
+        for (index, component) in components.iter().enumerate() {
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            prefix.extend_from_slice(component);
+            if collisions.iter().any(|collision| collision.path == prefix) {
+                break;
+            }
+            let entry_is_folder =
+                index + 1 < components.len() || matches!(entry.kind, ExtractEntryKind::Directory);
+            let existing = match std::fs::symlink_metadata(
+                destination.join(OsString::from_vec(prefix.clone())),
+            ) {
+                Ok(existing) => existing,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => return Err(map_io(&error)),
+            };
+            if existing.is_dir() && entry_is_folder {
+                continue;
+            }
+            collisions.push(ExtractCollision {
+                path: prefix.clone(),
+                existing_is_folder: existing.is_dir(),
+            });
+            break;
+        }
+    }
+    Ok(ExtractDestination::Folder(collisions))
 }
 
 fn copy_source_snapshot(

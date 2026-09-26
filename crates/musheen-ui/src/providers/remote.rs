@@ -1,7 +1,7 @@
 use super::*;
 use musheen_desktop::{
-    ConnectionProfile, CredentialResolver, OpendalStore, RemoteCredentials, RemoteError,
-    RemoteErrorCategory, RemoteProtocol, SshEnvironment,
+    ConnectionProfile, CredentialResolver, OpendalStore, RemoteError, RemoteErrorCategory,
+    RemoteProtocol, SshEnvironment,
 };
 use std::sync::RwLock;
 
@@ -87,9 +87,10 @@ pub(super) type RemoteStoreConnector = Arc<
         + Sync,
 >;
 
+#[cfg(test)]
 pub(super) fn default_remote_connector() -> RemoteStoreConnector {
     remote_connector(
-        Arc::new(RemoteCredentials::system()),
+        Arc::new(musheen_desktop::RemoteCredentials::system()),
         SshEnvironment::for_current_user(),
     )
 }
