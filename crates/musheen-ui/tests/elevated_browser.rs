@@ -380,7 +380,7 @@ fn elevated_session_lists_more_than_the_pipe_holds() {
         let store = open_window(&fake, &backend, root.path());
 
         let started = std::time::Instant::now();
-        let names = list_all(&store, root.path(), 5_000)
+        let names = list_all(&store, root.path(), 1_000)
             .unwrap_or_else(|error| panic!("{provider:?} lists 2,000 entries: {error}"));
         assert_eq!(names.len(), 2_000, "{provider:?}");
         assert!(
