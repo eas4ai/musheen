@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Musheen</title>
+  <desc id="desc">A gold directory with a blue machine gear</desc>
+  <rect x="28" y="28" width="456" height="456" rx="112" fill="#172033"/>
+  <rect x="40" y="40" width="432" height="432" rx="100" fill="none" stroke="#33415c" stroke-width="8"/>
+
+  <path d="M82 176c0-25 20-45 45-45h89c13 0 25 5 34 14l31 31h104c25 0 45 20 45 45v36H82z" fill="#d99a25"/>
+  <path d="M70 235c0-24 19-43 43-43h286c24 0 43 19 43 43v144c0 24-19 43-43 43H113c-24 0-43-19-43-43z" fill="#f5b942"/>
+  <path d="M91 244c0-17 14-31 31-31h268c17 0 31 14 31 31v19H91z" fill="#ffd36a"/>
+
+  <circle cx="355" cy="333" r="91" fill="#2563eb" stroke="#172033" stroke-width="12"/>
+  <g fill="#f8fafc">
+    <rect x="342" y="244" width="26" height="45" rx="8"/>
+    <rect x="342" y="377" width="26" height="45" rx="8"/>
+    <rect x="289" y="297" width="26" height="45" rx="8" transform="rotate(-90 302 319.5)"/>
+    <rect x="395" y="297" width="26" height="45" rx="8" transform="rotate(-90 408 319.5)"/>
+    <rect x="304" y="259" width="26" height="45" rx="8" transform="rotate(-45 317 281.5)"/>
+    <rect x="380" y="335" width="26" height="45" rx="8" transform="rotate(-45 393 357.5)"/>
+    <rect x="380" y="259" width="26" height="45" rx="8" transform="rotate(45 393 281.5)"/>
+    <rect x="304" y="335" width="26" height="45" rx="8" transform="rotate(45 317 357.5)"/>
+    <circle cx="355" cy="333" r="60"/>
+  </g>
+  <circle cx="355" cy="333" r="25" fill="#2563eb"/>
+</svg>
