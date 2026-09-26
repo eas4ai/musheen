@@ -35,6 +35,11 @@ pub(super) enum SecurityChoice {
 
 pub use musheen_desktop::ProfileConnectionTest as ConnectionTestService;
 
+/// The connection test a Settings window runs unless a test supplies its own.
+pub(crate) fn default_connection_tester() -> std::sync::Arc<dyn ConnectionTestService> {
+    std::sync::Arc::new(musheen_desktop::ProfileConnectionTester::default())
+}
+
 pub(super) fn controls() -> Vec<&'static SettingSpec> {
     super::controls_for(SettingsPage::Integrations)
         .into_iter()
@@ -933,3 +938,6 @@ pub(super) fn render_editor(
         ))
         .into_any_element()
 }
+
+#[cfg(test)]
+mod tests;

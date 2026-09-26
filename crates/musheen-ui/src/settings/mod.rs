@@ -19,6 +19,7 @@ use musheen_desktop::{
     SettingsPage, SettingsStore, settings_schema,
 };
 pub use remote::ConnectionTestService;
+pub(crate) use remote::default_connection_tester;
 use std::collections::BTreeSet;
 pub(crate) use window::{
     RecentHistoryClearer, accept_native_theme_change, apply_appearance,
@@ -276,3 +277,22 @@ impl gpui_kit::Global for RuntimeSettings {}
 /// Advances only when saved remote connections change.
 pub(crate) struct RemoteConnectionsRevision(pub u64);
 impl gpui_kit::Global for RemoteConnectionsRevision {}
+
+/// The remote-connection secrets every window shares: the desktop secret
+/// service and the secrets kept for this session only.
+#[derive(Clone)]
+pub(crate) struct RemoteCredentialStore(pub std::sync::Arc<musheen_desktop::RemoteCredentials>);
+impl gpui_kit::Global for RemoteCredentialStore {}
+
+/// The shared remote credentials, the desktop secret service unless a test
+/// installed its own.
+pub(crate) fn remote_credentials(
+    cx: &mut gpui_kit::App,
+) -> std::sync::Arc<musheen_desktop::RemoteCredentials> {
+    if !cx.has_global::<RemoteCredentialStore>() {
+        cx.set_global(RemoteCredentialStore(std::sync::Arc::new(
+            musheen_desktop::RemoteCredentials::system(),
+        )));
+    }
+    std::sync::Arc::clone(&cx.global::<RemoteCredentialStore>().0)
+}
