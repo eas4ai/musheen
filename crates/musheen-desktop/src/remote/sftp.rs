@@ -148,7 +148,7 @@ impl SshEnvironment {
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(RemoteErrorCategory::InvalidProfile),
+            Err(_) => return Err(RemoteErrorCategory::SshConfigUnreadable),
         };
         ssh2_config::SshConfig::default()
             .parse(
@@ -157,7 +157,7 @@ impl SshEnvironment {
                     | ssh2_config::ParseRule::ALLOW_UNSUPPORTED_FIELDS,
             )
             .map(Some)
-            .map_err(|_| RemoteErrorCategory::InvalidProfile)
+            .map_err(|_| RemoteErrorCategory::SshConfigUnreadable)
     }
 
     /// `path` with a leading `~/` read from this environment's home.
@@ -189,82 +189,233 @@ struct SshRoute {
 impl SshRoute {
     /// Applies the Host entry of the connection's host: its HostName and
     /// ProxyJump, and its User, Port and IdentityFile where the profile
-    /// leaves them empty. Each jump host is resolved through its own entry.
+    /// leaves them empty. Each jump host is resolved through its own entry,
+    /// and the first one is reached through its own ProxyJump, as ssh does.
     fn resolve(
         profile: &ConnectionProfile,
         environment: &SshEnvironment,
     ) -> Result<Self, RemoteErrorCategory> {
         let config = environment.ssh_config()?;
-        let entry = |host: &str| config.as_ref().map(|config| config.query(host));
-        let params = entry(profile.host().as_str());
+        let entry = |host: &str| host_entry(config.as_ref(), host);
+        let alias = profile.host().as_str();
+        let params = entry(alias)?;
         let user = profile
             .username()
             .map(str::to_owned)
             .or_else(|| params.as_ref().and_then(|params| params.user.clone()))
-            .or_else(|| std::env::var("USER").ok())
+            .or_else(local_user)
             .ok_or(RemoteErrorCategory::InvalidProfile)?;
-        let target = SshHop {
-            host: params
-                .as_ref()
-                .and_then(|params| params.host_name.clone())
-                .unwrap_or_else(|| profile.host().as_str().to_owned()),
-            port: profile
-                .port()
-                .or_else(|| params.as_ref().and_then(|params| params.port))
-                .unwrap_or(22),
-            identity_files: identity_files(params.as_ref(), environment),
-            user,
-        };
+        let port = profile
+            .port()
+            .or_else(|| params.as_ref().and_then(|params| params.port))
+            .unwrap_or(22);
+        let target = hop(params.as_ref(), alias, &user, port, environment);
         let jumps = params
             .as_ref()
             .and_then(|params| params.proxy_jump.clone())
-            .unwrap_or_default()
-            .iter()
-            .filter(|jump| !jump.eq_ignore_ascii_case("none"))
-            .map(|jump| {
-                let (user, address) = match jump.rsplit_once('@') {
-                    Some((user, address)) => (Some(user.to_owned()), address),
-                    None => (None, jump.as_str()),
-                };
-                let (name, port) = match address.rsplit_once(':') {
-                    Some((name, port)) => (
-                        name,
-                        Some(
-                            port.parse::<u16>()
-                                .map_err(|_| RemoteErrorCategory::InvalidProfile)?,
-                        ),
-                    ),
-                    None => (address, None),
-                };
-                let params = entry(name);
-                Ok(SshHop {
-                    host: params
-                        .as_ref()
-                        .and_then(|params| params.host_name.clone())
-                        .unwrap_or_else(|| name.to_owned()),
-                    port: port
-                        .or_else(|| params.as_ref().and_then(|params| params.port))
-                        .unwrap_or(22),
-                    user: user
-                        .or_else(|| params.as_ref().and_then(|params| params.user.clone()))
-                        .unwrap_or_else(|| target.user.clone()),
-                    identity_files: identity_files(params.as_ref(), environment),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|jumps| jump_hops(&jumps, &entry, &target.user, environment, 0))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self { jumps, target })
     }
+}
+
+/// How many jump hosts a route may pass through a chain of ProxyJump entries.
+const MAX_JUMP_DEPTH: usize = 8;
+
+/// The Host entry for `host`. ssh2-config 0.8 reads no Match block: it keeps
+/// the options under one as options of the Host entry before it, so an entry
+/// that took any is refused rather than used with the wrong values.
+fn host_entry(
+    config: Option<&ssh2_config::SshConfig>,
+    host: &str,
+) -> Result<Option<ssh2_config::HostParams>, RemoteErrorCategory> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let params = config.query(host);
+    if params
+        .ignored_fields
+        .keys()
+        .any(|field| field.eq_ignore_ascii_case("match"))
+    {
+        return Err(RemoteErrorCategory::SshConfigMatch);
+    }
+    Ok(Some(params))
+}
+
+/// One server on the route, from its Host entry and the values that take
+/// precedence over it.
+fn hop(
+    params: Option<&ssh2_config::HostParams>,
+    alias: &str,
+    user: &str,
+    port: u16,
+    environment: &SshEnvironment,
+) -> SshHop {
+    let local = local_user().unwrap_or_default();
+    let host = params
+        .and_then(|params| params.host_name.as_deref())
+        .map(|name| {
+            expand_tokens(
+                name,
+                &Tokens {
+                    host: alias,
+                    port,
+                    remote_user: user,
+                    local_user: &local,
+                    home: &environment.home,
+                },
+            )
+        })
+        .unwrap_or_else(|| alias.to_owned());
+    let tokens = Tokens {
+        host: &host,
+        port,
+        remote_user: user,
+        local_user: &local,
+        home: &environment.home,
+    };
+    SshHop {
+        identity_files: identity_files(params, environment, &tokens),
+        host,
+        port,
+        user: user.to_owned(),
+    }
+}
+
+/// The jump hosts a ProxyJump list names, in order. The first one is itself
+/// reached through its own entry's ProxyJump, up to `MAX_JUMP_DEPTH` hosts.
+fn jump_hops(
+    jumps: &[String],
+    entry: &dyn Fn(&str) -> Result<Option<ssh2_config::HostParams>, RemoteErrorCategory>,
+    default_user: &str,
+    environment: &SshEnvironment,
+    depth: usize,
+) -> Result<Vec<SshHop>, RemoteErrorCategory> {
+    let mut hops = Vec::new();
+    let named = jumps
+        .iter()
+        .filter(|jump| !jump.eq_ignore_ascii_case("none"));
+    for (index, jump) in named.enumerate() {
+        if depth + hops.len() >= MAX_JUMP_DEPTH {
+            return Err(RemoteErrorCategory::SshConfigUnreadable);
+        }
+        let (user, alias, port) = parse_jump(jump)?;
+        let params = entry(&alias)?;
+        if index == 0
+            && let Some(own) = params.as_ref().and_then(|params| params.proxy_jump.clone())
+        {
+            hops.extend(jump_hops(
+                &own,
+                entry,
+                default_user,
+                environment,
+                depth + 1,
+            )?);
+        }
+        let user = user
+            .or_else(|| params.as_ref().and_then(|params| params.user.clone()))
+            .unwrap_or_else(|| default_user.to_owned());
+        let port = port
+            .or_else(|| params.as_ref().and_then(|params| params.port))
+            .unwrap_or(22);
+        hops.push(hop(params.as_ref(), &alias, &user, port, environment));
+    }
+    Ok(hops)
+}
+
+/// Reads one ProxyJump host: `[user@]host[:port]` or
+/// `ssh://[user@]host[:port]`, with an IPv6 address in brackets, or bare
+/// when it has no port.
+fn parse_jump(value: &str) -> Result<(Option<String>, String, Option<u16>), RemoteErrorCategory> {
+    let unreadable = RemoteErrorCategory::SshConfigUnreadable;
+    let value = value.strip_prefix("ssh://").unwrap_or(value);
+    let value = value.strip_suffix('/').unwrap_or(value);
+    let (user, address) = match value.rsplit_once('@') {
+        Some((user, address)) if !user.is_empty() => (Some(user.to_owned()), address),
+        Some(_) => return Err(unreadable),
+        None => (None, value),
+    };
+    let port = |text: &str| {
+        text.parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or(unreadable)
+    };
+    let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+        let (host, after) = rest.split_once(']').ok_or(unreadable)?;
+        match after {
+            "" => (host, None),
+            _ => (
+                host,
+                Some(port(after.strip_prefix(':').ok_or(unreadable)?)?),
+            ),
+        }
+    } else {
+        match address.split_once(':') {
+            Some((host, text)) if !text.contains(':') => (host, Some(port(text)?)),
+            // No port, or an IPv6 address written without brackets.
+            _ => (address, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(unreadable);
+    }
+    Ok((user, host.to_owned(), port))
+}
+
+/// The values ssh_config's `%` tokens stand for.
+struct Tokens<'a> {
+    host: &'a str,
+    port: u16,
+    remote_user: &'a str,
+    local_user: &'a str,
+    home: &'a std::path::Path,
+}
+
+/// Expands the `%` tokens of a HostName or IdentityFile value: `%h` the
+/// host, `%p` the port, `%r` the remote user, `%u` the local user, `%d` the
+/// home folder and `%%` a percent sign. Another token stays as written.
+fn expand_tokens(value: &str, tokens: &Tokens<'_>) -> String {
+    let mut expanded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            expanded.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('%') => expanded.push('%'),
+            Some('h') => expanded.push_str(tokens.host),
+            Some('p') => expanded.push_str(&tokens.port.to_string()),
+            Some('r') => expanded.push_str(tokens.remote_user),
+            Some('u') => expanded.push_str(tokens.local_user),
+            Some('d') => expanded.push_str(&tokens.home.to_string_lossy()),
+            Some(other) => {
+                expanded.push('%');
+                expanded.push(other);
+            }
+            None => expanded.push('%'),
+        }
+    }
+    expanded
+}
+
+fn local_user() -> Option<String> {
+    std::env::var("USER").ok()
 }
 
 fn identity_files(
     params: Option<&ssh2_config::HostParams>,
     environment: &SshEnvironment,
+    tokens: &Tokens<'_>,
 ) -> Vec<PathBuf> {
     params
         .and_then(|params| params.identity_file.clone())
         .unwrap_or_default()
         .into_iter()
-        .map(|path| environment.expand(&path.to_string_lossy()))
+        .map(|path| environment.expand(&expand_tokens(&path.to_string_lossy(), tokens)))
         .collect()
 }
 
@@ -289,6 +440,11 @@ impl SshLoginMaterial {
                 .map(|text| Zeroizing::new(text.to_owned()))
                 .map_err(|_| RemoteErrorCategory::Authentication)
         };
+        let key_text = |bytes: &[u8]| {
+            std::str::from_utf8(bytes)
+                .map(|text| Zeroizing::new(text.to_owned()))
+                .map_err(|_| RemoteErrorCategory::KeyUndecodable)
+        };
         let passphrase = match profile.credential() {
             Some(reference) => Some(
                 credentials
@@ -300,17 +456,19 @@ impl SshLoginMaterial {
         };
         match profile.login() {
             SshLogin::Password => Ok(Self::Password(passphrase)),
-            SshLogin::Agent => Ok(Self::Agent),
+            SshLogin::Agent => match &environment.agent_socket {
+                Some(socket) if std::os::unix::net::UnixStream::connect(socket).is_ok() => {
+                    Ok(Self::Agent)
+                }
+                _ => Err(RemoteErrorCategory::NoAgent),
+            },
             SshLogin::KeyFile { path } => {
                 let path = path
                     .as_deref()
                     .map(|path| environment.expand(path))
                     .or_else(|| route.target.identity_files.first().cloned())
                     .ok_or(RemoteErrorCategory::InvalidProfile)?;
-                let text = Zeroizing::new(
-                    std::fs::read_to_string(&path)
-                        .map_err(|_| RemoteErrorCategory::Authentication)?,
-                );
+                let text = read_key_file(&path)?;
                 decode_login_key(&text, passphrase.as_deref().map(String::as_str)).map(Self::Key)
             }
             SshLogin::StoredKey => {
@@ -320,11 +478,30 @@ impl SshLoginMaterial {
                 let text = credentials
                     .resolve(&reference, cancellation)
                     .await?
-                    .expose_secret(secret_text)?;
+                    .expose_secret(key_text)?;
                 decode_login_key(&text, passphrase.as_deref().map(String::as_str)).map(Self::Key)
             }
         }
     }
+}
+
+/// The largest private key file Musheen reads; OpenSSH keys are a few
+/// kilobytes.
+const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
+
+/// Reads a private key file the user named, refusing one larger than any
+/// private key.
+fn read_key_file(path: &std::path::Path) -> Result<Zeroizing<String>, RemoteErrorCategory> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|_| RemoteErrorCategory::KeyUnreadable)?;
+    let mut text = Zeroizing::new(String::new());
+    file.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| RemoteErrorCategory::KeyUndecodable)?;
+    if text.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(RemoteErrorCategory::KeyUndecodable);
+    }
+    Ok(text)
 }
 
 /// Decodes a private key Musheen signs with itself: Ed25519 or ECDSA. An RSA
@@ -337,7 +514,7 @@ fn decode_login_key(
         return Err(RemoteErrorCategory::KeyNeedsAgent);
     }
     let key =
-        decode_secret_key(text, passphrase).map_err(|_| RemoteErrorCategory::Authentication)?;
+        decode_secret_key(text, passphrase).map_err(|_| RemoteErrorCategory::KeyUndecodable)?;
     if key.algorithm().is_rsa() {
         return Err(RemoteErrorCategory::KeyNeedsAgent);
     }
@@ -437,6 +614,8 @@ impl RusshSftpService {
         self.connection().await.map(|_| ()).map_err(|error| {
             if error.kind() == ErrorKind::PermissionDenied {
                 RemoteErrorCategory::Authentication
+            } else if error.kind() == ErrorKind::NotFound {
+                RemoteErrorCategory::UnknownHost
             } else if error.kind() == ErrorKind::ConditionNotMatch {
                 RemoteErrorCategory::HostKey
             } else if error.is_temporary() {
@@ -948,18 +1127,29 @@ impl client::Handler for SftpHostKeyVerifier {
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let public_key = server_public_key.public_key();
-        Ok(match &self.policy {
-            HostKeyPolicy::KnownHosts => russh::keys::check_known_hosts_path(
+        // `false` means known_hosts has no key for the host; a key that
+        // differs from the recorded or pinned one fails as a changed key.
+        match &self.policy {
+            HostKeyPolicy::KnownHosts => match russh::keys::check_known_hosts_path(
                 &self.host,
                 self.port,
                 &public_key,
                 &self.known_hosts,
-            )
-            .unwrap_or(false),
+            ) {
+                Ok(known) => Ok(known),
+                Err(russh::keys::Error::KeyChanged { line }) => {
+                    Err(russh::Error::KeyChanged { line })
+                }
+                Err(_) => Ok(false),
+            },
             HostKeyPolicy::PinnedSha256(expected) => {
-                Sha256::digest(public_key.public_key_bytes()).as_slice() == expected
+                if Sha256::digest(public_key.public_key_bytes()).as_slice() == expected {
+                    Ok(true)
+                } else {
+                    Err(russh::Error::KeyChanged { line: 0 })
+                }
             }
-        })
+        }
     }
 }
 
@@ -1126,10 +1316,13 @@ async fn login_with_agent(
         return false;
     };
     for identity in identities {
-        let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = identity else {
-            continue;
+        let rsa = match &identity {
+            russh::keys::agent::AgentIdentity::PublicKey { key, .. } => key.algorithm().is_rsa(),
+            russh::keys::agent::AgentIdentity::Certificate { certificate, .. } => {
+                certificate.algorithm().is_rsa()
+            }
         };
-        let hash = if key.algorithm().is_rsa() {
+        let hash = if rsa {
             Some(match ssh.best_supported_rsa_hash().await {
                 Ok(Some(Some(HashAlg::Sha512))) => HashAlg::Sha512,
                 _ => HashAlg::Sha256,
@@ -1137,11 +1330,17 @@ async fn login_with_agent(
         } else {
             None
         };
-        if ssh
-            .authenticate_publickey_with(user.to_owned(), key, hash, &mut agent)
-            .await
-            .is_ok_and(|result| result.success())
-        {
+        let accepted = match identity {
+            russh::keys::agent::AgentIdentity::PublicKey { key, .. } => ssh
+                .authenticate_publickey_with(user.to_owned(), key, hash, &mut agent)
+                .await
+                .is_ok_and(|result| result.success()),
+            russh::keys::agent::AgentIdentity::Certificate { certificate, .. } => ssh
+                .authenticate_certificate_with(user.to_owned(), certificate, hash, &mut agent)
+                .await
+                .is_ok_and(|result| result.success()),
+        };
+        if accepted {
             return true;
         }
     }
@@ -1263,7 +1462,10 @@ fn unexpected_disconnect(message: &str) -> bool {
 
 fn map_ssh_error(error: &russh::Error) -> Error {
     match error {
-        russh::Error::UnknownKey | russh::Error::KeyChanged { .. } => Error::new(
+        russh::Error::UnknownKey => {
+            Error::new(ErrorKind::NotFound, "SFTP host key is not in known_hosts")
+        }
+        russh::Error::KeyChanged { .. } => Error::new(
             ErrorKind::ConditionNotMatch,
             "SFTP host key verification failed",
         ),
@@ -1279,8 +1481,8 @@ fn temporary_sftp_error() -> Error {
 mod tests {
     use super::*;
     use crate::remote::sftp_test_server::{
-        Accepts, RecordingRsaAgent, TestAgent, TestSshServer, ed25519_key, fabricated_rsa_key,
-        host_key_pin, known_hosts_line, write_key_file,
+        Accepts, CertificateAgent, RecordingRsaAgent, TestAgent, TestSshServer, ed25519_key,
+        fabricated_rsa_key, host_key_pin, known_hosts_line, user_certificate, write_key_file,
     };
     use crate::{ConnectionId, CredentialReference, RemoteHost, SecretBuffer, SshLogin};
     use futures_lite::future::block_on;
@@ -1445,6 +1647,218 @@ mod tests {
 
         assert_eq!(lists_root(&store), ["hello.txt"]);
         assert_eq!(server.log().logins(), [key_login("alice", &client_key)]);
+    }
+
+    #[test]
+    fn sftp_login_with_the_agent_offers_its_certificates() {
+        let authority = ed25519_key(60);
+        let client_key = ed25519_key(61);
+        let certificate = user_certificate(&authority, &client_key, "alice");
+        let server = TestSshServer::start(
+            ed25519_key(62),
+            Accepts {
+                user: "alice".into(),
+                certificate_authority: Some(authority.public_key().clone()),
+                ..Accepts::default()
+            },
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let agent = CertificateAgent::start(scratch.path(), client_key, &certificate);
+        let mut environment = environment(scratch.path());
+        environment.agent_socket = Some(agent.socket().to_path_buf());
+        let profile = profile(
+            "127.0.0.1",
+            Some(server.port()),
+            Some("alice"),
+            server.host_key(),
+            false,
+            SshLogin::Agent,
+        );
+
+        let store = open(&profile, &Secrets::default(), &environment)
+            .expect("a certificate the agent holds logs in");
+
+        assert_eq!(lists_root(&store), ["hello.txt"]);
+        assert_eq!(server.log().logins(), ["alice certificate"]);
+    }
+
+    #[test]
+    fn sftp_login_names_the_local_cause_of_each_failure() {
+        let server = TestSshServer::start(ed25519_key(63), accepts("alice", &[]));
+        let scratch = tempfile::tempdir().unwrap();
+        let cause =
+            |profile: &ConnectionProfile, secrets: &Secrets, environment: &SshEnvironment| {
+                open(profile, secrets, environment)
+                    .err()
+                    .map(|error| error.category())
+            };
+        let login = |login: SshLogin, credential: bool| {
+            profile(
+                "127.0.0.1",
+                Some(server.port()),
+                Some("alice"),
+                server.host_key(),
+                credential,
+                login,
+            )
+        };
+
+        let mut no_agent = environment(scratch.path());
+        assert_eq!(
+            cause(
+                &login(SshLogin::Agent, false),
+                &Secrets::default(),
+                &no_agent
+            ),
+            Some(RemoteErrorCategory::NoAgent),
+            "agent login with no agent names the agent"
+        );
+        no_agent.agent_socket = Some(scratch.path().join("gone.sock"));
+        assert_eq!(
+            cause(
+                &login(SshLogin::Agent, false),
+                &Secrets::default(),
+                &no_agent
+            ),
+            Some(RemoteErrorCategory::NoAgent),
+            "an agent socket nothing answers names the agent"
+        );
+
+        let missing = SshLogin::KeyFile {
+            path: Some(scratch.path().join("missing").to_string_lossy().into()),
+        };
+        assert_eq!(
+            cause(
+                &login(missing, false),
+                &Secrets::default(),
+                &environment(scratch.path())
+            ),
+            Some(RemoteErrorCategory::KeyUnreadable)
+        );
+
+        let key_path = scratch.path().join("id_office");
+        write_key_file(&key_path, &ed25519_key(64), Some("right"));
+        let encrypted = SshLogin::KeyFile {
+            path: Some(key_path.to_string_lossy().into()),
+        };
+        assert_eq!(
+            cause(
+                &login(encrypted, true),
+                &Secrets::default().with("office", b"wrong"),
+                &environment(scratch.path())
+            ),
+            Some(RemoteErrorCategory::KeyUndecodable),
+            "a wrong passphrase names the key, not the server"
+        );
+
+        let config = scratch.path().join("config");
+        let mut with_config = environment(scratch.path());
+        with_config.config = Some(config.clone());
+        std::fs::write(&config, "Host 127.0.0.1\n  Port not-a-port\n").unwrap();
+        assert_eq!(
+            cause(
+                &login(SshLogin::Password, false),
+                &Secrets::default(),
+                &with_config
+            ),
+            Some(RemoteErrorCategory::SshConfigUnreadable)
+        );
+        std::fs::write(
+            &config,
+            "Host 127.0.0.1\n  User alice\nMatch host *.example.com\n  User bob\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cause(
+                &login(SshLogin::Password, false),
+                &Secrets::default(),
+                &with_config
+            ),
+            Some(RemoteErrorCategory::SshConfigMatch),
+            "options a Match block would put on the Host entry are refused, not used"
+        );
+
+        let unknown = ConnectionProfile::new(
+            ConnectionId::new("office").unwrap(),
+            "Office",
+            RemoteProtocol::Sftp,
+            RemoteHost::new(RemoteProtocol::Sftp, "127.0.0.1").unwrap(),
+            Some(server.port()),
+            "/",
+            Some("alice"),
+            None,
+            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cause(&unknown, &Secrets::default(), &environment(scratch.path())),
+            Some(RemoteErrorCategory::UnknownHost),
+            "a host missing from known_hosts is not a changed key"
+        );
+    }
+
+    #[test]
+    fn sftp_login_expands_tokens_and_reaches_the_first_jump_host_through_its_own_proxy_jump() {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = scratch.path().join("config");
+        std::fs::write(
+            &config,
+            "Host office\n  HostName %h.inside\n  User alice\n  IdentityFile %d/keys/%r@%h\n  ProxyJump gate,ssh://carol@[::1]:2203\nHost gate\n  HostName gate.example\n  Port 2201\n  ProxyJump bob@outer:2202\n",
+        )
+        .unwrap();
+        let mut environment = environment(scratch.path());
+        environment.config = Some(config);
+        let profile = profile(
+            "office",
+            None,
+            None,
+            &ed25519_key(65),
+            false,
+            SshLogin::Password,
+        );
+
+        let route = SshRoute::resolve(&profile, &environment).unwrap();
+
+        assert_eq!(route.target.host, "office.inside");
+        assert_eq!(
+            route.target.identity_files,
+            [scratch.path().join("keys/alice@office.inside")]
+        );
+        let hops = route
+            .jumps
+            .iter()
+            .map(|hop| (hop.user.as_str(), hop.host.as_str(), hop.port))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hops,
+            [
+                ("bob", "outer", 2202),
+                ("alice", "gate.example", 2201),
+                ("carol", "::1", 2203),
+            ]
+        );
+    }
+
+    #[test]
+    fn sftp_login_reads_proxy_jump_addresses() {
+        assert_eq!(
+            parse_jump("ssh://bob@host:2222"),
+            Ok((Some("bob".into()), "host".into(), Some(2222)))
+        );
+        assert_eq!(
+            parse_jump("[::1]:2200"),
+            Ok((None, "::1".into(), Some(2200)))
+        );
+        assert_eq!(parse_jump("fe80::1"), Ok((None, "fe80::1".into(), None)));
+        assert_eq!(
+            parse_jump("alice@[fe80::1]"),
+            Ok((Some("alice".into()), "fe80::1".into(), None))
+        );
+        assert_eq!(
+            parse_jump("host:0"),
+            Err(RemoteErrorCategory::SshConfigUnreadable)
+        );
     }
 
     #[test]

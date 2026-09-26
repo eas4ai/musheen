@@ -30,9 +30,9 @@ fn provider_root_item(
 }
 
 mod remote;
-pub(crate) use remote::BrowseConnectionTester;
 #[cfg(test)]
 use remote::default_remote_connector;
+pub(crate) use remote::{BrowseConnectionTester, ssh_environment};
 use remote::{RemoteProfileAdapter, RemoteProfileStore, RemoteStoreConnector, remote_connector};
 
 pub(crate) trait ProviderAdapter: Send + Sync {
@@ -132,10 +132,7 @@ impl ProviderRuntime {
     ) -> Result<Self, ProviderRuntimeError> {
         Self::from_settings_with_connector(
             settings,
-            remote_connector(
-                credentials,
-                musheen_desktop::SshEnvironment::for_current_user(),
-            ),
+            remote_connector(credentials, ssh_environment()),
         )
     }
 
@@ -1371,12 +1368,16 @@ mod tests {
                 &ConnectionProfiles::new(vec![profile]).export().unwrap(),
             )
             .unwrap();
-        let connector: RemoteStoreConnector = Arc::new(|provider, profile, cancellation| {
+        // The live server is pinned; nothing reads the developer's ~/.ssh.
+        let ssh = ssh_environment();
+        let connector: RemoteStoreConnector = Arc::new(move |provider, profile, cancellation| {
+            let ssh = ssh.clone();
             Box::pin(async move {
-                let store = musheen_desktop::sftp_store_from_profile(
+                let store = musheen_desktop::sftp_store_from_profile_in(
                     provider,
                     &profile,
                     &LiveCredentials,
+                    &ssh,
                     cancellation,
                 )
                 .await

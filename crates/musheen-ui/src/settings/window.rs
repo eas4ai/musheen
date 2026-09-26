@@ -22,6 +22,22 @@ use std::sync::Arc;
 pub(crate) type RecentHistoryClearer =
     Arc<dyn Fn(&mut App) -> Result<(), Box<str>> + Send + Sync + 'static>;
 
+/// Why an Apply stopped before it finished.
+#[derive(Debug)]
+enum ApplyFailure {
+    Secret(musheen_desktop::SecretError),
+    Settings(musheen_desktop::SettingsError),
+}
+
+impl std::fmt::Display for ApplyFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Secret(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Settings(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
 fn publish_saved_settings(document: &SettingsDocument, cx: &mut App) {
     let changed_remote_connections =
         cx.try_global::<super::RuntimeSettings>()
@@ -149,6 +165,11 @@ pub struct SettingsWindow {
     pub(super) remote_saving: bool,
     pub(super) remote_session_offer: Option<super::remote::PendingRemoteSave>,
     pub(super) remote_secret_error: Option<musheen_desktop::SecretError>,
+    /// Secrets saved with their connections, which the next Apply stores.
+    pub(super) remote_pending_secrets:
+        std::collections::BTreeMap<musheen_desktop::ConnectionId, super::remote::PendingSecret>,
+    /// Secrets an Apply could not delete, which the next Apply tries again.
+    pub(super) remote_retired_secrets: std::collections::BTreeSet<musheen_desktop::ConnectionId>,
     pub(super) remote_tester: Arc<dyn super::remote::ConnectionTestService>,
     pub(super) remote_testing: bool,
     pub(super) remote_test_generation: u64,
@@ -230,6 +251,8 @@ impl SettingsWindow {
             remote_saving: false,
             remote_session_offer: None,
             remote_secret_error: None,
+            remote_pending_secrets: std::collections::BTreeMap::new(),
+            remote_retired_secrets: std::collections::BTreeSet::new(),
             remote_tester,
             remote_testing: false,
             remote_test_generation: 0,
@@ -319,15 +342,19 @@ impl SettingsWindow {
                     cx.notify();
                 }
             }));
-        for input in this.remote_inputs.values() {
+        for (key, input) in &this.remote_inputs {
+            // A profile's fingerprint names its credential, not the secret, so
+            // a new password always needs a new test.
+            let secret = *key == super::remote::PROFILE_PASSWORD;
             this.subscriptions
-                .push(cx.subscribe(input, |this, _, event, cx| {
+                .push(cx.subscribe(input, move |this, _, event, cx| {
                     if matches!(event, InputEvent::Change) {
-                        if this.remote_testing
-                            || this.remote_test_report.as_ref().is_some_and(|report| {
-                                this.remote_profile(cx)
-                                    .is_ok_and(|profile| report.matches(&profile))
-                            })
+                        if !secret
+                            && (this.remote_testing
+                                || this.remote_test_report.as_ref().is_some_and(|report| {
+                                    this.remote_profile(cx)
+                                        .is_ok_and(|profile| report.matches(&profile))
+                                }))
                         {
                             return;
                         }
@@ -336,6 +363,13 @@ impl SettingsWindow {
                     }
                 }));
         }
+        this.subscriptions
+            .push(cx.subscribe(&this.remote_key_text, |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.invalidate_remote_test();
+                    cx.notify();
+                }
+            }));
         this.subscriptions.push(cx.on_release(|this, cx| {
             if let Some(cancellation) = this.remote_test_cancellation.take() {
                 cancellation.cancel();
@@ -365,40 +399,60 @@ impl SettingsWindow {
         apply_appearance(self.state.draft(), cx);
     }
 
+    /// Applies the draft: stores the secrets saved with their connections,
+    /// writes the settings file, then deletes the secrets no connection uses
+    /// any more. A secret that cannot be stored stops Apply before the file
+    /// is written; a secret that cannot be deleted is named and tried again
+    /// by the next Apply.
     fn save(&mut self, cx: &mut Context<Self>) {
-        if self.blocked() || !self.state.errors().is_empty() || !self.state.is_dirty() {
+        if self.blocked()
+            || !self.state.errors().is_empty()
+            || !(self.state.is_dirty() || self.has_remote_secret_work())
+        {
             return;
         }
         self.saving = true;
         let document = self.state.draft().clone();
         let store = self.store.clone();
-        let work = cx.background_spawn(async move { store.save(&document).map(|()| document) });
+        let secrets = self.remote_secret_work(&document);
+        let credentials = Arc::clone(&self.remote_credentials);
+        let work = cx.background_spawn(async move {
+            super::remote::store_secret_writes(&credentials, &secrets)
+                .await
+                .map_err(ApplyFailure::Secret)?;
+            store.save(&document).map_err(ApplyFailure::Settings)?;
+            let kept = super::remote::delete_retired_secrets(&credentials, &secrets).await;
+            Ok::<_, ApplyFailure>((document, kept))
+        });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             cx.update(|cx| {
-                if let Ok(document) = &result {
+                if let Ok((document, _)) = &result {
                     publish_saved_settings(document, cx);
                 }
                 if let Some(this) = this.upgrade() {
                     this.update(cx, |this, cx| {
                         this.saving = false;
                         match result {
-                            Ok(document) => {
-                                this.forget_unreferenced_secrets(
-                                    &this.state.committed,
-                                    &document,
-                                    cx,
-                                );
+                            Ok((document, kept)) => {
                                 this.state.committed = document;
-                                this.failure = None;
+                                this.remote_pending_secrets.clear();
+                                this.failure = (!kept.is_empty())
+                                    .then_some("settings-remote-keyring-delete-failed");
+                                this.remote_retired_secrets = kept.into_iter().collect();
                             }
-                            Err(_) => this.failure = Some("settings-save-error"),
+                            Err(ApplyFailure::Secret(error)) => {
+                                this.failure = Some(super::remote::secret_failure_key(error));
+                            }
+                            Err(ApplyFailure::Settings(_)) => {
+                                this.failure = Some("settings-save-error");
+                            }
                         }
                         cx.notify();
                     });
                 } else {
                     match result {
-                        Ok(document) => apply_appearance(&document, cx),
+                        Ok((document, _)) => apply_appearance(&document, cx),
                         Err(error) => eprintln!("Musheen could not save settings: {error}"),
                     }
                 }
@@ -828,7 +882,7 @@ impl Render for SettingsWindow {
                         .primary()
                         .disabled(
                             self.blocked()
-                                || !self.state.is_dirty()
+                                || !(self.state.is_dirty() || self.has_remote_secret_work())
                                 || !self.state.errors().is_empty(),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {

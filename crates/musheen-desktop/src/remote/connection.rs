@@ -719,8 +719,10 @@ struct ProfileWire {
     credential: Option<String>,
     security: SecurityPolicy,
     proxy: Option<ProxyWire>,
-    #[serde(default, skip_serializing_if = "SshLogin::is_password")]
-    login: SshLogin,
+    /// An SFTP profile always names its login. A profile an older build
+    /// saved has none; see `legacy_login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    login: Option<SshLogin>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -752,8 +754,19 @@ impl TryFrom<&ConnectionProfile> for ProfileWire {
                 .as_ref()
                 .map(|proxy| ProxyWire::from_settings(profile.protocol, proxy))
                 .transpose()?,
-            login: profile.login.clone(),
+            login: (profile.protocol == RemoteProtocol::Sftp).then(|| profile.login.clone()),
         })
+    }
+}
+
+/// How a profile saved before logins had a method logs in. Such an SFTP
+/// profile with no stored password logged in through the system ssh, with
+/// the user's agent; it now uses the agent (decision 01M3ERXQ9N6KQB97P48DRE4YDV).
+fn legacy_login(protocol: RemoteProtocol, credential: Option<&CredentialReference>) -> SshLogin {
+    if protocol == RemoteProtocol::Sftp && credential.is_none() {
+        SshLogin::Agent
+    } else {
+        SshLogin::Password
     }
 }
 
@@ -774,6 +787,9 @@ impl TryFrom<ProfileWire> for ConnectionProfile {
             .transpose()?;
         let id = ConnectionId::new(profile.id)
             .map_err(|_| invalid_profile(profile.protocol, Some(host.clone())))?;
+        let login = profile
+            .login
+            .unwrap_or_else(|| legacy_login(profile.protocol, credential.as_ref()));
         Self::new(
             id,
             profile.name,
@@ -786,7 +802,7 @@ impl TryFrom<ProfileWire> for ConnectionProfile {
             profile.security,
             proxy,
         )?
-        .with_login(profile.login)
+        .with_login(login)
     }
 }
 
@@ -839,4 +855,64 @@ fn invalid_document() -> RemoteError {
 
 fn invalid_profile(protocol: RemoteProtocol, host: Option<RemoteHost>) -> RemoteError {
     RemoteError::new(protocol, RemoteErrorCategory::InvalidProfile, host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sftp_profile(credential: bool) -> ConnectionProfile {
+        ConnectionProfile::new(
+            ConnectionId::new("office").unwrap(),
+            "Office",
+            RemoteProtocol::Sftp,
+            RemoteHost::new(RemoteProtocol::Sftp, "office").unwrap(),
+            None,
+            "/",
+            None::<&str>,
+            credential
+                .then(|| CredentialReference::persistent(ConnectionId::new("office").unwrap())),
+            SecurityPolicy::Ssh(HostKeyPolicy::KnownHosts),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The document an older build wrote for `profile`: no login field.
+    fn saved_before_login_methods(profile: ConnectionProfile) -> String {
+        let exported = ConnectionProfiles::new(vec![profile]).export().unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        document["profiles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("login");
+        document.to_string()
+    }
+
+    #[test]
+    fn sftp_login_of_a_profile_saved_before_login_methods_follows_its_credential() {
+        let agent =
+            ConnectionProfiles::import(&saved_before_login_methods(sftp_profile(false))).unwrap();
+        assert_eq!(
+            agent.profiles()[0].login(),
+            &SshLogin::Agent,
+            "with no stored password, it logs in through the agent as the system ssh did"
+        );
+        let password =
+            ConnectionProfiles::import(&saved_before_login_methods(sftp_profile(true))).unwrap();
+        assert_eq!(password.profiles()[0].login(), &SshLogin::Password);
+
+        let exported = ConnectionProfiles::new(vec![sftp_profile(false)])
+            .export()
+            .unwrap();
+        assert!(
+            exported.contains("\"login\""),
+            "an SFTP profile always names its login: {exported}"
+        );
+        assert_eq!(
+            ConnectionProfiles::import(&exported).unwrap().profiles()[0].login(),
+            &SshLogin::Password,
+            "a password login with no stored password stays one"
+        );
+    }
 }

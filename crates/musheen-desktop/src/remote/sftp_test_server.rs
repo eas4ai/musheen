@@ -113,6 +113,8 @@ pub(crate) struct Accepts {
     pub(crate) keys: Vec<PublicKey>,
     /// Lets clients open direct-tcpip channels, as a jump host does.
     pub(crate) forwarding: bool,
+    /// Accepts a user certificate this key signed that names the user.
+    pub(crate) certificate_authority: Option<PublicKey>,
 }
 
 /// An SSH server on 127.0.0.1 with a root that lists one file, `hello.txt`.
@@ -217,7 +219,35 @@ impl russh::server::Handler for TestSession {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
+        // A certificate's key is offered like any key; its login is judged by
+        // the certificate's authority in `auth_openssh_certificate`.
+        if user == self.accepts.user && self.accepts.certificate_authority.is_some() {
+            return Ok(Auth::Accept);
+        }
         Ok(self.accepts_key(user, public_key))
+    }
+
+    async fn auth_openssh_certificate(
+        &mut self,
+        user: &str,
+        certificate: &russh::keys::Certificate,
+    ) -> Result<Auth, Self::Error> {
+        let signed = self
+            .accepts
+            .certificate_authority
+            .as_ref()
+            .is_some_and(|authority| certificate.signature_key() == authority.key_data());
+        if user == self.accepts.user
+            && signed
+            && certificate
+                .valid_principals()
+                .iter()
+                .any(|principal| principal == user)
+        {
+            self.log.state().logins.push(format!("{user} certificate"));
+            return Ok(Auth::Accept);
+        }
+        Ok(Auth::reject())
     }
 
     async fn auth_publickey(
@@ -459,6 +489,108 @@ impl Drop for TestAgent {
         );
         runtime.shutdown_background();
     }
+}
+
+/// A user certificate for `key`, signed by `authority`, naming `user`.
+pub(crate) fn user_certificate(
+    authority: &PrivateKey,
+    key: &PrivateKey,
+    user: &str,
+) -> russh::keys::Certificate {
+    use russh::keys::ssh_key::certificate::{Builder, CertType};
+    let mut builder = Builder::new([7_u8; 16], key.public_key().key_data().clone(), 0, u64::MAX)
+        .expect("the certificate validity is ordered");
+    builder
+        .cert_type(CertType::User)
+        .expect("the certificate takes a type");
+    builder
+        .key_id("musheen-test")
+        .expect("the certificate takes an ID");
+    builder
+        .valid_principal(user)
+        .expect("the certificate takes its user");
+    builder.sign(authority).expect("the authority signs")
+}
+
+/// An agent that holds one key with its certificate and offers only the
+/// certificate, as an agent loaded for an SSH certificate authority does.
+pub(crate) struct CertificateAgent {
+    socket: std::path::PathBuf,
+}
+
+impl CertificateAgent {
+    pub(crate) fn start(
+        directory: &Path,
+        key: PrivateKey,
+        certificate: &russh::keys::Certificate,
+    ) -> Self {
+        use russh::keys::signature::Signer;
+        use russh::keys::ssh_encoding::Encode;
+        use std::io::{Read, Write};
+        let socket = directory.join("certificate-agent.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket).expect("the certificate agent binds");
+        let blob = certificate.to_bytes().expect("the certificate encodes");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                loop {
+                    let mut length = [0; 4];
+                    if stream.read_exact(&mut length).is_err() {
+                        break;
+                    }
+                    let mut message = vec![0; u32::from_be_bytes(length) as usize];
+                    if stream.read_exact(&mut message).is_err() {
+                        break;
+                    }
+                    let reply = match message.first() {
+                        // SSH_AGENTC_REQUEST_IDENTITIES
+                        Some(11) => {
+                            let mut body = vec![12];
+                            body.extend_from_slice(&1u32.to_be_bytes());
+                            body.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+                            body.extend_from_slice(&blob);
+                            body.extend_from_slice(&0u32.to_be_bytes());
+                            body
+                        }
+                        // SSH_AGENTC_SIGN_REQUEST: key, data, flags
+                        Some(13) => sign_request_data(&message[1..])
+                            .and_then(|data| key.try_sign(data).ok())
+                            .and_then(|signature| {
+                                let mut encoded = Vec::new();
+                                signature.encode(&mut encoded).ok()?;
+                                let mut body = vec![14];
+                                body.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+                                body.extend_from_slice(&encoded);
+                                Some(body)
+                            })
+                            .unwrap_or_else(|| vec![5]),
+                        _ => vec![5],
+                    };
+                    let mut framed = (reply.len() as u32).to_be_bytes().to_vec();
+                    framed.extend_from_slice(&reply);
+                    if stream.write_all(&framed).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Self { socket }
+    }
+
+    pub(crate) fn socket(&self) -> &Path {
+        &self.socket
+    }
+}
+
+/// The data a signature request asks to sign.
+fn sign_request_data(body: &[u8]) -> Option<&[u8]> {
+    let length = |bytes: &[u8]| -> Option<usize> {
+        Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize)
+    };
+    let key = 4 + length(body)?;
+    let data = length(body.get(key..)?)?;
+    body.get(key + 4..key + 4 + data)
 }
 
 /// An agent that offers one RSA public key and records the flags of every

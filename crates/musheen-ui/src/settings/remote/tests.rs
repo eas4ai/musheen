@@ -154,6 +154,36 @@ impl Editor {
         let view = self.view.clone();
         settle(cx, |cx| !view.read(cx).remote_testing);
     }
+
+    /// Saves the connection in the editor and waits until it is in the draft.
+    fn save_connection(&self, cx: &mut TestAppContext, id: &str) {
+        self.click(cx, "settings-remote-save");
+        let view = self.view.clone();
+        let id = format!("\"{id}\"");
+        assert!(
+            settle(cx, |cx| {
+                !view.read(cx).remote_saving
+                    && view
+                        .read(cx)
+                        .state
+                        .draft()
+                        .value("remote.connections")
+                        .is_some_and(|saved| saved.contains(&id))
+            }),
+            "the connection is saved"
+        );
+    }
+
+    /// Applies the draft and waits until Apply ends.
+    fn apply(&self, cx: &mut TestAppContext) {
+        self.click(cx, "settings-apply");
+        let view = self.view.clone();
+        assert!(settle(cx, |cx| !view.read(cx).saving));
+    }
+
+    fn failure(&self, cx: &mut TestAppContext) -> Option<&'static str> {
+        cx.read(|cx| self.view.read(cx).failure)
+    }
 }
 
 /// Runs the app until `ready` holds, waiting in real time for the fake
@@ -403,14 +433,11 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
         "Test connection sends the password typed in the editor"
     );
 
-    editor.click(cx, "settings-remote-save");
+    editor.save_connection(cx, "team-ftp");
+    cx.run_until_parked();
     assert!(
-        settle(cx, |_| keyring.secret("team-ftp").is_some()),
-        "saving stores the password in the secret service"
-    );
-    assert_eq!(
-        keyring.secret("team-ftp").as_deref(),
-        Some(b"hunter2".as_slice())
+        keyring.ids().is_empty(),
+        "Save keeps the password for Apply, so Cancel leaves the keyring as it was"
     );
     let saved = editor.saved_connections(cx);
     assert!(saved.contains("secret-service:team-ftp"), "{saved}");
@@ -421,6 +448,12 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
     let profile = ConnectionProfiles::import(&saved).unwrap().profiles()[0].clone();
     assert!(!format!("{profile:?}").contains("hunter2"));
 
+    editor.apply(cx);
+    assert_eq!(
+        keyring.secret("team-ftp").as_deref(),
+        Some(b"hunter2".as_slice()),
+        "Apply stores the password in the secret service under the connection's ID"
+    );
     assert_eq!(
         browse_saved_connection(&saved, cx).unwrap(),
         ["hello.txt"],
@@ -433,20 +466,13 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
 
     editor.fill(cx, &[("remote-profile-name", " renamed")]);
     editor.test_connection(cx);
-    editor.click(cx, "settings-remote-save");
-    assert!(settle(cx, |cx| {
-        editor.view.read(cx).remote_save_requirement.is_none()
-            && !editor.view.read(cx).remote_testing
-    }));
+    editor.save_connection(cx, "team-ftp");
+    editor.apply(cx);
     assert_eq!(
         keyring.secret("team-ftp").as_deref(),
         Some(b"hunter2".as_slice()),
         "saving with the password field empty keeps the stored password"
     );
-
-    editor.click(cx, "settings-apply");
-    let view = editor.view.clone();
-    assert!(settle(cx, |cx| !view.read(cx).saving));
     let file = std::fs::read_to_string(editor.store.path()).unwrap();
     assert!(
         !file.contains("hunter2"),
@@ -461,10 +487,156 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
         Some(b"hunter2".as_slice()),
         "a removal not yet applied keeps the password, so Cancel keeps a working connection"
     );
-    editor.click(cx, "settings-apply");
+    editor.apply(cx);
     assert!(
-        settle(cx, |_| keyring.secret("team-ftp").is_none()),
+        keyring.secret("team-ftp").is_none(),
         "applying the removal deletes the connection's password"
+    );
+}
+
+#[gpui_kit::test]
+async fn remote_password_of_a_connection_removed_before_apply_never_reaches_the_keyring(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let keyring = MemoryKeyring::default();
+    let server = FakeFtp::start(FtpServerOptions {
+        password: Some("hunter2"),
+        lists_root: true,
+    });
+    let editor = open_editor(cx, Some(keyring.clone()), None);
+    fill_ftp_connection(&editor, cx, server.port());
+    editor.type_password(cx, "hunter2");
+    editor.test_connection(cx);
+    editor.save_connection(cx, "team-ftp");
+
+    editor.click(cx, "settings-remote-remove");
+    editor.apply(cx);
+
+    assert!(
+        keyring.ids().is_empty(),
+        "a connection removed before Apply leaves no password behind"
+    );
+}
+
+#[gpui_kit::test]
+async fn remote_password_a_deletion_the_keyring_refuses_is_named_and_tried_again(
+    cx: &mut TestAppContext,
+) {
+    cx.executor().allow_parking();
+    let keyring = MemoryKeyring::default();
+    let server = FakeFtp::start(FtpServerOptions {
+        password: Some("hunter2"),
+        lists_root: true,
+    });
+    let editor = open_editor(cx, Some(keyring.clone()), None);
+    fill_ftp_connection(&editor, cx, server.port());
+    editor.type_password(cx, "hunter2");
+    editor.test_connection(cx);
+    editor.save_connection(cx, "team-ftp");
+    editor.apply(cx);
+    assert!(keyring.secret("team-ftp").is_some());
+
+    keyring.set_locked(true);
+    editor.click(cx, "settings-remote-remove");
+    editor.apply(cx);
+    assert_eq!(
+        editor.failure(cx),
+        Some("settings-remote-keyring-delete-failed"),
+        "a password the keyring would not delete is named"
+    );
+    assert!(keyring.secret("team-ftp").is_some());
+
+    keyring.set_locked(false);
+    editor.apply(cx);
+    assert!(
+        keyring.secret("team-ftp").is_none(),
+        "the next Apply deletes it"
+    );
+    assert_eq!(editor.failure(cx), None);
+}
+
+#[gpui_kit::test]
+async fn remote_password_stored_under_another_id_is_kept_and_used(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let keyring = MemoryKeyring::default();
+    keyring.put("shared", b"hunter2");
+    let server = FakeFtp::start(FtpServerOptions {
+        password: Some("hunter2"),
+        lists_root: true,
+    });
+    let editor = open_editor(cx, Some(keyring.clone()), None);
+    // A connection an older build saved with the global credential.
+    let profile = ConnectionProfile::new(
+        ConnectionId::new("team-ftp").unwrap(),
+        "Team FTP",
+        RemoteProtocol::Ftp,
+        RemoteHost::new(RemoteProtocol::Ftp, "127.0.0.1").unwrap(),
+        Some(server.port()),
+        "/",
+        Some("alice"),
+        Some(CredentialReference::persistent(
+            ConnectionId::new("shared").unwrap(),
+        )),
+        SecurityPolicy::PlaintextConfirmed,
+        None,
+    )
+    .unwrap();
+    let encoded = ConnectionProfiles::new(vec![profile]).export().unwrap();
+    editor.view.update(cx, |view, cx| {
+        view.state.edit("remote.connections", &encoded).unwrap();
+        view.remote_editor_open = false;
+        cx.notify();
+    });
+    editor.click(cx, "settings-remote-edit-team-ftp");
+
+    editor.test_connection(cx);
+    assert_eq!(
+        server.passwords(),
+        ["hunter2"],
+        "Test connection uses the stored password the connection names"
+    );
+    editor.save_connection(cx, "team-ftp");
+    assert!(
+        editor
+            .saved_connections(cx)
+            .contains("secret-service:shared"),
+        "saving with the password field empty keeps that reference"
+    );
+    editor.apply(cx);
+    assert!(keyring.secret("shared").is_some());
+}
+
+#[gpui_kit::test]
+async fn remote_parity_a_changed_password_or_key_needs_a_new_test(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let keyring = MemoryKeyring::default();
+    let server = FakeFtp::start(FtpServerOptions {
+        password: Some("hunter2"),
+        lists_root: true,
+    });
+    let editor = open_editor(cx, Some(keyring.clone()), None);
+    fill_ftp_connection(&editor, cx, server.port());
+    editor.type_password(cx, "hunter2");
+    editor.test_connection(cx);
+    assert!(cx.read(|cx| editor.view.read(cx).remote_test_report.is_some()));
+
+    editor.fill(cx, &[("remote-profile-password", "x")]);
+    assert!(
+        cx.read(|cx| editor.view.read(cx).remote_test_report.is_none()),
+        "a password typed after the test needs a new test"
+    );
+
+    editor.click(cx, "settings-remote-protocol-sftp");
+    editor.click(cx, "settings-remote-login-stored-key");
+    editor.fill(cx, &[("remote-profile-host", "office")]);
+    editor.view.update(cx, |view, cx| {
+        view.remote_test_report = Some(TestReport::passed(&view.remote_profile(cx).unwrap()));
+    });
+    editor.fill(cx, &[("remote-login-key-text", "k")]);
+    assert!(
+        cx.read(|cx| editor.view.read(cx).remote_test_report.is_none()),
+        "a key pasted after the test needs a new test"
     );
 }
 
@@ -508,6 +680,9 @@ async fn remote_session_password_a_locked_keyring_offers_session_only_use(cx: &m
     let saved = editor.saved_connections(cx);
     assert!(saved.contains("secret-service:team-ftp"), "{saved}");
     assert!(!saved.contains("hunter2"));
+
+    editor.apply(cx);
+    assert_eq!(editor.failure(cx), None);
     assert!(
         keyring.ids().is_empty(),
         "nothing reaches the locked keyring"
@@ -521,10 +696,6 @@ async fn remote_session_password_a_locked_keyring_offers_session_only_use(cx: &m
         server.passwords().last().map(String::as_str),
         Some("hunter2")
     );
-
-    editor.click(cx, "settings-apply");
-    let view = editor.view.clone();
-    assert!(settle(cx, |cx| !view.read(cx).saving));
     let file = std::fs::read_to_string(editor.store.path()).unwrap();
     assert!(
         !file.contains("hunter2"),
@@ -599,9 +770,9 @@ async fn sftp_login_the_editor_offers_each_login_method_and_saves_it(cx: &mut Te
     editor.fill(cx, &[("remote-login-key-text", key_text)]);
     editor.type_password(cx, "key passphrase");
     editor.test_connection(cx);
-    editor.click(cx, "settings-remote-save");
-    assert!(settle(cx, |_| keyring.secret("office.key").is_some()));
+    editor.save_connection(cx, "office");
     assert_eq!(saved_login(&editor, cx), SshLogin::StoredKey);
+    editor.apply(cx);
     assert_eq!(
         keyring.secret("office.key").as_deref(),
         Some(key_text.as_bytes()),
@@ -615,21 +786,89 @@ async fn sftp_login_the_editor_offers_each_login_method_and_saves_it(cx: &mut Te
     let saved = editor.saved_connections(cx);
     assert!(!saved.contains("stored-key-body") && !saved.contains("key passphrase"));
 
-    editor.click(cx, "settings-apply");
-    let view = editor.view.clone();
-    assert!(settle(cx, |cx| !view.read(cx).saving));
     editor.click(cx, "settings-remote-login-agent");
     editor.test_connection(cx);
-    editor.click(cx, "settings-remote-save");
+    editor.save_connection(cx, "office");
     cx.run_until_parked();
     assert!(
         keyring.secret("office.key").is_some(),
         "a login change not yet applied keeps the stored key"
     );
-    editor.click(cx, "settings-apply");
+    editor.apply(cx);
     assert!(
-        settle(cx, |_| keyring.secret("office.key").is_none()
-            && keyring.secret("office").is_none()),
+        keyring.secret("office.key").is_none() && keyring.secret("office").is_none(),
         "applying a switch to agent login deletes the stored key and its passphrase"
+    );
+}
+
+/// The cause a failed test shows.
+fn shown_cause(editor: &Editor, cx: &mut TestAppContext) -> Option<String> {
+    cx.update_window(editor.handle, |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .try_find("settings-remote-test-cause")
+            .and_then(|cause| cause.label().map(str::to_owned))
+    })
+    .unwrap()
+}
+
+fn message(key: &str) -> String {
+    Catalog::load(Locale::EnUs)
+        .unwrap()
+        .message(key)
+        .unwrap()
+        .to_owned()
+}
+
+#[gpui_kit::test]
+async fn remote_parity_a_failed_ftps_test_on_port_990_names_implicit_tls(cx: &mut TestAppContext) {
+    let editor = open_editor(
+        cx,
+        Some(MemoryKeyring::default()),
+        Some(Arc::new(FailingTester(RemoteErrorCategory::Timeout))),
+    );
+    fill_ftp_connection(&editor, cx, 990);
+    editor.click(cx, "settings-remote-protocol-ftps");
+
+    editor.test_connection(cx);
+
+    assert_eq!(
+        shown_cause(&editor, cx),
+        Some(message("settings-remote-cause-implicit-tls")),
+        "an FTPS server that does not answer on 990 most likely wants implicit TLS"
+    );
+}
+
+#[gpui_kit::test]
+async fn sftp_login_with_the_agent_and_no_agent_running_names_the_agent(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let editor = open_editor(cx, Some(MemoryKeyring::default()), None);
+    fill_sftp_connection(&editor, cx);
+    editor.click(cx, "settings-remote-login-agent");
+
+    editor.test_connection(cx);
+
+    assert_eq!(
+        shown_cause(&editor, cx),
+        Some(message("settings-remote-cause-no-agent")),
+        "the test that browsing runs names the missing agent, not the server"
+    );
+}
+
+#[gpui_kit::test]
+async fn sftp_login_a_connection_id_ending_in_key_is_refused(cx: &mut TestAppContext) {
+    let editor = open_editor(
+        cx,
+        Some(MemoryKeyring::default()),
+        Some(Arc::new(PassingTester)),
+    );
+    fill_sftp_connection(&editor, cx);
+    editor.fill(cx, &[("remote-profile-id", ".key")]);
+
+    editor.test_connection(cx);
+
+    assert!(
+        cx.read(|cx| editor.view.read(cx).remote_validation_failed),
+        "office.key would share the secret ID of office's stored key"
     );
 }

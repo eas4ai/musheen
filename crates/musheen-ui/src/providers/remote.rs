@@ -91,8 +91,26 @@ pub(super) type RemoteStoreConnector = Arc<
 pub(super) fn default_remote_connector() -> RemoteStoreConnector {
     remote_connector(
         Arc::new(musheen_desktop::RemoteCredentials::system()),
-        SshEnvironment::for_current_user(),
+        ssh_environment(),
     )
+}
+
+/// The SSH files and agent remote connections use. A test build gets an
+/// empty SSH folder and no agent, so no test reads the user's ~/.ssh or
+/// talks to their agent.
+pub(crate) fn ssh_environment() -> SshEnvironment {
+    #[cfg(test)]
+    {
+        let home = std::env::temp_dir().join("musheen-tests-have-no-ssh-home");
+        SshEnvironment {
+            known_hosts: home.join("known_hosts"),
+            home,
+            config: None,
+            agent_socket: None,
+        }
+    }
+    #[cfg(not(test))]
+    SshEnvironment::for_current_user()
 }
 
 /// Opens saved connections with `credentials` and the SSH files `ssh` names.
