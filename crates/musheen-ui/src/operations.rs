@@ -14,8 +14,9 @@ use musheen_desktop::{
 };
 use musheen_ops::{
     ArchiveOperationPlan, ConflictDecision, ConflictRecord, CreateRequest, DeleteTarget,
-    HardLinkRequest, JobId, JobState, Journal, MetadataChange, MetadataScope, OperationKind,
-    PermanentDeleteConfirmation, PermanentDeleteRequest, RenameRequest, SymbolicLinkRequest,
+    Durability, HardLinkRequest, JobId, JobState, Journal, JournalPhase, MetadataChange,
+    MetadataScope, OperationKind, PermanentDeleteConfirmation, PermanentDeleteRequest,
+    RenameRequest, SymbolicLinkRequest,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -59,6 +60,59 @@ impl DesktopArchiveRoute {
             journal: Mutex::new(journal),
             limits: ArchiveOperationLimits::default(),
         })
+    }
+
+    /// The plans of the archive jobs the journal left unfinished: the jobs
+    /// that stopped with the app.
+    fn unfinished_plans(&self) -> BTreeMap<JobId, ArchiveOperationPlan> {
+        let Ok(journal) = self.journal.lock() else {
+            return BTreeMap::new();
+        };
+        let mut latest = BTreeMap::new();
+        for record in journal.records() {
+            if let Some(checkpoint) = record.archive_checkpoint() {
+                latest.insert(record.job_id(), (record.phase(), checkpoint.plan().clone()));
+            }
+        }
+        latest
+            .into_iter()
+            .filter(|(_, (phase, _))| {
+                !matches!(phase, JournalPhase::Completed | JournalPhase::RolledBack)
+            })
+            .map(|(id, (_, plan))| (id, plan))
+            .collect()
+    }
+
+    /// Records that an unfinished job ran again as a new job, so the journal
+    /// no longer lists it as unfinished.
+    fn retire_unfinished(&self, id: JobId) -> Result<(), Box<str>> {
+        let mut journal = self
+            .journal
+            .lock()
+            .map_err(|_| Box::<str>::from("archive journal lock is unavailable"))?;
+        let Some((generation, checkpoint)) = journal
+            .records()
+            .iter()
+            .rev()
+            .filter(|record| record.job_id() == id)
+            .find_map(|record| {
+                record
+                    .archive_checkpoint()
+                    .map(|checkpoint| (record.generation(), checkpoint.clone()))
+            })
+        else {
+            return Ok(());
+        };
+        journal
+            .append_archive(
+                id,
+                generation,
+                JournalPhase::RolledBack,
+                Durability::CrashDurable,
+                checkpoint,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string().into())
     }
 }
 
@@ -231,6 +285,10 @@ pub struct OperationHub {
     next_reservation: Arc<AtomicU64>,
     /// Jobs the status center pruned, forgotten by the queue on its next run.
     pending_forget: Arc<Mutex<Vec<JobId>>>,
+    /// The route archive jobs run through, once one is attached.
+    archive_route: Arc<Mutex<Option<Arc<DesktopArchiveRoute>>>>,
+    /// Interrupted archive jobs that can run again, with their plans.
+    interrupted_archives: Arc<Mutex<BTreeMap<JobId, ArchiveOperationPlan>>>,
 }
 
 impl OperationHub {
@@ -297,6 +355,8 @@ impl OperationHub {
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
             pending_forget: Arc::new(Mutex::new(Vec::new())),
+            archive_route: Arc::new(Mutex::new(None)),
+            interrupted_archives: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -353,6 +413,8 @@ impl OperationHub {
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
             next_reservation: Arc::new(AtomicU64::new(1)),
             pending_forget: Arc::new(Mutex::new(Vec::new())),
+            archive_route: Arc::new(Mutex::new(None)),
+            interrupted_archives: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -380,11 +442,7 @@ impl OperationHub {
             }
         };
         match DesktopArchiveRoute::for_current_user() {
-            Ok(route) => {
-                if let Ok(mut queue) = hub.queue.lock() {
-                    queue.register_archive_route(Arc::new(route));
-                }
-            }
+            Ok(route) => hub.attach_archive_route(route),
             Err(error) => {
                 if let Ok(mut archive_route_error) = hub.archive_route_error.lock() {
                     *archive_route_error = Some(error);
@@ -401,11 +459,77 @@ impl OperationHub {
         let storage = FileJournalStorage::at(directory).expect("the test archive journal opens");
         let route =
             DesktopArchiveRoute::with_storage(storage).expect("the test archive route opens");
-        self.queue
-            .lock()
-            .expect("the operation queue lock is available")
-            .register_archive_route(Arc::new(route));
+        self.attach_archive_route(route);
         self
+    }
+
+    /// Runs archive jobs through `route`, and offers Run again for each
+    /// interrupted archive job its journal left unfinished.
+    fn attach_archive_route(&self, route: DesktopArchiveRoute) {
+        let route = Arc::new(route);
+        let unfinished = route.unfinished_plans();
+        if let (Ok(status), Ok(mut interrupted)) =
+            (self.status.lock(), self.interrupted_archives.lock())
+        {
+            *interrupted = unfinished
+                .into_iter()
+                .filter(|(id, _)| {
+                    status
+                        .entry(*id)
+                        .is_some_and(|entry| entry.status() == crate::OperationStatus::Interrupted)
+                })
+                .collect();
+        }
+        if let Ok(mut attached) = self.archive_route.lock() {
+            *attached = Some(Arc::clone(&route));
+        }
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.register_archive_route(route);
+        }
+    }
+
+    /// Whether `id` is an interrupted archive job that can run again.
+    #[must_use]
+    pub fn can_run_again(&self, id: JobId) -> bool {
+        self.interrupted_archives
+            .lock()
+            .is_ok_and(|interrupted| interrupted.contains_key(&id))
+    }
+
+    /// Runs an interrupted archive job again as a new job with the same plan,
+    /// including the answers an extraction was given, and retires the old
+    /// one. Rerunning an interrupted merge finishes it: entries it already
+    /// placed collide with items that are no longer the ones answered about,
+    /// so they are skipped.
+    pub fn run_again(&self, id: JobId) -> Result<JobId, OperationHubError> {
+        let plan = self
+            .interrupted_archives
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| OperationHubError::Storage("this operation cannot run again".into()))?;
+        let rerun = self.submit_archive(plan)?;
+        self.interrupted_archives
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .remove(&id);
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .dismiss(id)?;
+        self.persist_status();
+        let route = self
+            .archive_route
+            .lock()
+            .map_err(|_| OperationHubError::QueueLock)?
+            .clone();
+        if let Some(route) = route {
+            route
+                .retire_unfinished(id)
+                .map_err(OperationHubError::Storage)?;
+        }
+        Ok(rerun)
     }
 
     #[must_use]

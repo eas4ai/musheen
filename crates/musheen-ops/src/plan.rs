@@ -57,27 +57,93 @@ pub enum ArchiveConflictPolicy {
     Replace,
 }
 
+/// An existing item the user answered about, as it was when they answered:
+/// its device, inode and kind. An answer holds only while the item at its
+/// path is still this one.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnsweredItem {
+    pub device: u64,
+    pub inode: u64,
+    pub folder: bool,
+}
+
+impl AnsweredItem {
+    /// Whether the item with this device and inode is the one answered about.
+    #[must_use]
+    pub const fn is(&self, device: u64, inode: u64) -> bool {
+        self.device == device && self.inode == inode
+    }
+}
+
 /// How an extraction merges into a destination folder that already exists.
-/// It names, relative to that folder, each colliding entry the user chose to
-/// replace; every other collision is skipped, including one that appeared
-/// after the user answered.
+/// It names, relative to that folder, each colliding item the user chose to
+/// replace, as it was when they answered; every other collision is skipped,
+/// including one that appeared or changed after the user answered. When
+/// something other than a folder has the destination's name, `whole` names
+/// the item the user chose to replace, and only that item is replaced.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExtractMerge {
-    replace: std::collections::BTreeSet<Vec<u8>>,
+    #[serde(with = "answer_list")]
+    replace: std::collections::BTreeMap<Vec<u8>, AnsweredItem>,
+    whole: Option<AnsweredItem>,
+}
+
+/// Writes the answers as a list of path and item pairs: a JSON map key must
+/// be a string, and an entry path is bytes.
+mod answer_list {
+    use super::AnsweredItem;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::BTreeMap;
+
+    pub(super) fn serialize<S: Serializer>(
+        answers: &BTreeMap<Vec<u8>, AnsweredItem>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(answers)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<Vec<u8>, AnsweredItem>, D::Error> {
+        Ok(Vec::<(Vec<u8>, AnsweredItem)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
 }
 
 impl ExtractMerge {
-    /// `replace` holds entry paths relative to the destination folder, with
-    /// `/` between components.
-    pub fn new(replace: impl IntoIterator<Item = Vec<u8>>) -> Self {
+    /// `replace` maps entry paths relative to the destination folder, with
+    /// `/` between components, to the items the user chose to replace.
+    pub fn new(replace: impl IntoIterator<Item = (Vec<u8>, AnsweredItem)>) -> Self {
         Self {
             replace: replace.into_iter().collect(),
+            whole: None,
         }
     }
 
+    /// Replaces the item that has the destination folder's name, while it is
+    /// still `item`.
     #[must_use]
-    pub fn replaces(&self, relative: &[u8]) -> bool {
-        self.replace.contains(relative)
+    pub fn replacing_destination(item: AnsweredItem) -> Self {
+        Self {
+            replace: std::collections::BTreeMap::new(),
+            whole: Some(item),
+        }
+    }
+
+    /// Whether the user chose to replace the item at `relative`, and it is
+    /// still the item with this device and inode.
+    #[must_use]
+    pub fn replaces(&self, relative: &[u8], device: u64, inode: u64) -> bool {
+        self.replace
+            .get(relative)
+            .is_some_and(|item| item.is(device, inode))
+    }
+
+    /// The item with the destination folder's name the user chose to replace.
+    #[must_use]
+    pub const fn whole(&self) -> Option<&AnsweredItem> {
+        self.whole.as_ref()
     }
 }
 
@@ -565,3 +631,30 @@ impl fmt::Display for PlanError {
 }
 
 impl Error for PlanError {}
+
+#[cfg(test)]
+mod extract_merge_tests {
+    use super::*;
+
+    #[test]
+    fn extract_merge_answers_round_trip_through_the_journal_format() {
+        let merge = ExtractMerge::new([(
+            b"docs/a.txt".to_vec(),
+            AnsweredItem {
+                device: 1,
+                inode: 2,
+                folder: false,
+            },
+        )]);
+        let text = serde_json::to_string(&merge).expect("a merge serializes as JSON");
+        assert_eq!(
+            serde_json::from_str::<ExtractMerge>(&text).expect("the JSON reads back"),
+            merge
+        );
+        assert!(merge.replaces(b"docs/a.txt", 1, 2));
+        assert!(
+            !merge.replaces(b"docs/a.txt", 1, 3),
+            "another item at the path"
+        );
+    }
+}
