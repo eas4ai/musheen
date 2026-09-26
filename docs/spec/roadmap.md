@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: xattr-io-outside-catalog-queue
+Current: remote-usable
 
 ## 1. Foundation
 
@@ -179,3 +179,29 @@ something else lands, the tags reach the file once it is unblocked, the
 UXF-024 and UXF-023 checks pass, the workspace tests, cargo fmt --check
 and clippy with warnings denied are clean, and every finding of the
 review and the report is resolved or declined.
+
+## remote-usable
+
+Requirements: SYS-024, SYS-026, SYS-031, SYS-032, OPS-033, DEP-022
+
+Make saved remote connections and Extract… usable (docs/opus-audit-2.md
+4.5). The connection editor takes a password and, for SFTP, a login
+method: password, SSH agent, key file, or a key stored in the secret
+service. Passwords, passphrases and stored keys go to the secret service,
+or stay in memory for the session when it is locked or missing, and a
+Remove button deletes a connection with its secrets. Test connection opens
+the connection through the code browsing uses and lists its root, and a
+failed test names its cause. FTPS uses explicit TLS on port 21 unless the
+connection names another port; the editor stops offering SMB, NFS,
+proxies and the FTPS certificate pin, and Network hides saved connections
+that use them. SFTP runs on russh only, uses RSA keys only through the SSH agent
+with SHA-2 signatures, reads
+~/.ssh/config through ssh2-config (Host, HostName, User, Port,
+IdentityFile, ProxyJump, Include) and checks each jump host against
+known_hosts. Extract… extracts into the picked folder. Done when each
+mechanism's test fails on its recorded violating example and passes on
+the final tree; the SFTP tests log in against an in-process SSH server,
+agent and jump host with throwaway keys, and no test reads the user's
+keyring or ~/.ssh; the workspace tests, cargo fmt --check and clippy with
+warnings denied are clean; and every finding of the review and the report
+is resolved or declined.

@@ -70,11 +70,11 @@ Mechanism: dep-011
 Rationale: 1.x mechanism: dependency check on Cargo.toml plus round-trip fixture tests per format including encrypted variants. Validation: xz2 is dormant since 2022, so the xz backend choice falls to liblzma unless re-checked at integration time, and compress-tools with libarchive stays feature-gated for RAR and ISO only.
 Status: Agreed 2026-09-18
 
-[DEP-012] The workspace declares OpenDAL 0.59.x as the unified remote backend for FTP, FTPS, SFTP, WebDAV, and HTTP, declares pavao 0.3.x wrapped in spawn_blocking for SMB, serves NFS from kernel mounts with no userspace client, and keeps russh with russh-sftp as the fallback only if OpenDAL SFTP blocks.
+[DEP-012] The workspace declares OpenDAL 0.59.x as the unified remote backend for FTP, FTPS, SFTP, WebDAV, and HTTP, declares pavao 0.3.x wrapped in spawn_blocking for SMB, serves NFS from kernel mounts with no userspace client, and runs SFTP on russh with russh-sftp behind an OpenDAL operator, because OpenDAL's own SFTP service cannot log in with a password, a chosen key, or a pinned host key.
 Falsifier: a second remote framework is introduced for a protocol OpenDAL already covers, or SMB calls run on an async executor thread instead of spawn_blocking.
 Mechanism: dep-012
 Rationale: 1.x mechanism: dependency check on Cargo.toml plus review of the SMB call sites.
-Status: Agreed 2026-09-18
+Status: Agreed 2026-09-26
 
 [DEP-013] The implementation does not implement AFP and documents SMB as its substitute.
 Falsifier: AFP wire-protocol code or an AFP dependency exists in the tree.
@@ -123,3 +123,9 @@ Status: Draft
 Falsifier: a command icon comes from another family or native builds embed the complete catalog without a measured need.
 Mechanism: dependency, asset-registration, and icon-registry checks.
 Status: Draft
+
+[DEP-022] The workspace declares `ssh2-config` 0.8.x to read ~/.ssh/config for SFTP connections and has no ssh_config parser of its own.
+Falsifier: musheen-desktop does not depend on `ssh2-config` 0.8.x, or app code parses ssh_config text itself.
+Mechanism: dep-022
+Rationale: `russh-config`, from the russh repository, does not follow Include and trails russh by five minor versions.
+Status: Agreed 2026-09-26
