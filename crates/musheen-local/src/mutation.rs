@@ -748,9 +748,7 @@ pub(crate) fn trash_record_matches(receipt: &TrashReceipt) -> bool {
     let Some(recorded) = trash_record_original_path(&info) else {
         return false;
     };
-    receipt_original_forms(receipt)
-        .iter()
-        .any(|form| *form == recorded)
+    receipt_original_forms(receipt).contains(&recorded)
         && trash_payload_path_of_record(&info)
             .is_ok_and(|payload| fs::symlink_metadata(payload).is_ok())
 }
