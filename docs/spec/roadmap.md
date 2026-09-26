@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: ui-thread-growth-2026-09-25
+Current: catalog-writes-off-ui-thread
 
 ## 1. Foundation
 
@@ -94,3 +94,26 @@ status document that grow without bound (LIMIT-010). Done when each
 mechanism's test fails on the recorded violating example and passes on
 the fix, the workspace tests and clippy are clean, and every finding of
 the review and the report is resolved or declined.
+
+## catalog-writes-off-ui-thread
+
+Requirements: UXF-023
+
+Take the remaining catalog file I/O and the store calls that come with it
+off the UI thread (backlog item catalog-writes-off-ui-thread, escalation
+54ca2f0b). The item names Properties tag edits and per-directory view
+preferences; the same wait is also in navigation, which resolves the
+folder identity and records recents and the remembered location on every
+load; in sidebar tag rename and delete, which ask each tagged path's
+capabilities; in the catalog projection sync, which resolves every pin
+and rewrites the catalog on each catalog change; in Home orphan cleanup;
+and in the move and rename completion, which asks statfs and rewrites
+the catalog. The resolutions of review 75af775d finding 1 and report
+9fa1a7b3 finding 5 said a09935f moved the move completion off the UI
+thread; it did not, and this commitment does. The initial catalog read
+when a window is built stays where it is. Done when a test for each of
+these paths holds the catalog lock from another open file or blocks the
+store and the window still repaints and takes input, the paths still
+apply their change once the lock or the store is released, the workspace
+tests and clippy are clean, and every finding of the review and the
+report is resolved or declined.
