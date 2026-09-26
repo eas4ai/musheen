@@ -115,6 +115,12 @@ Mechanism: ops-033
 Rationale: docs/opus-audit-2.md 4.5 and escalation 407ae943: Extract… was refused after its destination picker, the extract engine refused any existing destination so Extract Here always failed, and the developer asked for a folder named after the archive with a Replace, Replace All, Skip, or Skip All question for each colliding item.
 Status: Agreed 2026-09-26
 
+[OPS-034] The extract operation reads the archive where it is and never copies it. It lists and checks every entry in one pass over the archive, then decodes each file once, in archive order, into its staging folder, so it reads the archive's bytes at most twice. It writes nothing but the files it extracts and its own records, and it publishes nothing when the archive changed during the run. When the destination folder exists, the collision check before the questions lists the entries in one pass and writes nothing. An archive inside the archive is extracted as a file and never opened, so no nesting limit applies to it. Extraction has no time limit: the entry, expanded-size, compression-ratio, path, memory, and temporary-space limits bound it, and Cancel stops it.
+Falsifier: beyond 1 MiB for the journal and file system records, the extract operation reads more than twice the archive's bytes or writes more than its files' bytes, or the collision check reads more than the archive's bytes or writes anything; either one opens an archive inside the archive; the operation publishes after the archive changed during the run; or it stops because of the time it took.
+Mechanism: ops-034
+Rationale: docs/opus-audit-2.md C-N3: extraction copied the archive beside the destination, hashed it four times, decoded every file twice to look for nested archives, decoded tar and 7z entries from the start of the archive for each entry, and stopped after 30 seconds of decoding, a limit no requirement names; the developer agreed this text on 2026-09-26.
+Status: Agreed 2026-09-26
+
 ## Creation
 
 [OPS-018] The create action supports empty files and directories through one queued operation after validating the proposed name against the destination store.
@@ -177,7 +183,7 @@ Mechanism: ops-028
 Rationale: docs/opus-audit-2.md B-M3 and B-M4: restoring a trashed link to a directory failed and left an empty directory, and one orphaned .trashinfo made the whole Trash view fail.
 Status: Agreed 2026-09-25
 
-[OPS-029] Archive browse and extraction enforce configurable limits for entry count, expanded bytes, compression ratio, nesting depth, path length, memory, and temporary-disk use before and during decoding.
+[OPS-029] Archive browse and extraction enforce configurable limits for entry count, expanded bytes, compression ratio, path length, memory, and temporary-disk use before and during decoding; browsing also limits nesting depth.
 Falsifier: a crafted archive can exceed any configured budget without a bounded error and cleanup.
 Mechanism: archive-bomb fixtures for each independent limit.
 Status: Draft

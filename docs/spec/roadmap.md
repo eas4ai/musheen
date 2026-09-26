@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: retire-global-remote-credential
+Current: extraction-cost
 
 ## 1. Foundation
 
@@ -246,3 +246,20 @@ its reference and logs in with it. Done when the sys-033 check passes on
 the final tree, the workspace tests, cargo fmt --check and clippy with
 warnings denied are clean, and every finding of the review and the report
 is resolved or declined.
+
+## extraction-cost
+
+Requirements: OPS-034, OPS-033
+
+Make extraction cost what it needs (docs/opus-audit-2.md C-N3). The
+extract operation reads the archive where it is instead of copying and
+hashing it, lists and checks its entries in one pass, and decodes each
+file once in archive order, so tar and 7z no longer decode from the
+start of the archive for each entry. It checks that the archive did not
+change before it publishes. An archive inside the archive is written as
+a file and never opened, and the 30-second decoding limit goes. The
+collision check before a merge lists the entries in one pass. Extract…
+and Extract Here keep working as OPS-033 says. Done when the ops-034 and
+ops-033 checks pass on the final tree, the workspace tests, cargo fmt
+--check and clippy with warnings denied are clean, and every finding of
+the review and the report is resolved or declined.

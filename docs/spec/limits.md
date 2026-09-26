@@ -32,7 +32,7 @@ Falsifier: a malformed or oversized image exceeds a default without a fail recor
 Mechanism: oversized-header, decompression, slow-decoder, memory, and worker-count tests.
 Status: Draft
 
-[LIMIT-006] Archive browsing or extraction defaults to 100,000 entries, 20 GiB expanded bytes, 1,000:1 compression ratio, eight nested archives, 4,096 path bytes, 512 MiB memory, and the smaller of 10 GiB or half of currently free temporary space.
+[LIMIT-006] Archive browsing or extraction defaults to 100,000 entries, 20 GiB expanded bytes, 1,000:1 compression ratio, 4,096 path bytes, 512 MiB memory, and the smaller of 10 GiB or half of currently free temporary space. Browsing opens at most eight nested archives.
 Falsifier: one archive exceeds any default without stopping and cleaning staging data.
 Mechanism: independent and combined archive-bomb fixtures for every budget.
 Status: Draft
