@@ -634,19 +634,27 @@ impl ProcessBrokerTransport {
         }
         let deadline = Instant::now() + self.timeout;
         let encoded = encode_broker_request(request)?;
+        // A socket pair, not pipes: another process of the same user can
+        // reopen a pipe through /proc/<pid>/fd and write into the session,
+        // but it cannot reopen a socket (SYS-034).
+        let (input, broker_side) =
+            std::os::unix::net::UnixStream::pair().map_err(|_| BrokerError::BrokerCrashed)?;
+        let output = input.try_clone().map_err(|_| BrokerError::BrokerCrashed)?;
+        let broker_output = broker_side
+            .try_clone()
+            .map_err(|_| BrokerError::BrokerCrashed)?;
+        // The command, and with it Musheen's copy of the broker's side, drops
+        // at the end of this statement, so the broker alone holds that side.
         let mut child = std::process::Command::new(self.launch.program())
             .args(self.launch.arguments_for(request))
             .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(broker_side)))
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(broker_output)))
             .stderr(Stdio::null())
             .process_group(0)
             .spawn()
             .map_err(|_| BrokerError::BrokerCrashed)?;
-        let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
-            kill_and_reap_process_group(&mut child);
-            return Err(BrokerError::BrokerCrashed);
-        };
+        let input = SocketInput(input);
         let chunks = match spawn_output_reader(output, 64 * 1024) {
             Ok(chunks) => chunks,
             Err(error) => {
@@ -700,6 +708,27 @@ impl BrokerTransport for ProcessBrokerTransport {
         }
         let (output, channel) = self.start(request, cancellation)?;
         session_from(request, output, channel, self.timeout)
+    }
+}
+
+/// Musheen's side of a pkexec-started broker's socket. Dropping it ends the
+/// broker's input, as closing a pipe would; the output reader keeps its own
+/// handle to the socket.
+struct SocketInput(std::os::unix::net::UnixStream);
+
+impl std::io::Write for SocketInput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Drop for SocketInput {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Write);
     }
 }
 
@@ -786,6 +815,7 @@ impl SudoPtyBrokerTransport {
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize::default())
             .map_err(|_| BrokerError::AuthorizationUnavailable)?;
+        make_terminal_exclusive(pty.master.tty_name())?;
         let mut command = portable_pty::CommandBuilder::new(self.launch.program());
         command.args(self.launch.arguments_for(request));
         command.env_clear();
@@ -923,6 +953,22 @@ impl BrokerTransport for SudoPtyBrokerTransport {
         let (output, channel) = self.start(request, cancellation, authentication)?;
         session_from(request, output, channel, self.timeout)
     }
+}
+
+/// Makes the pseudoterminal `name` refuse any further open by an
+/// unprivileged process, before sudo starts on it. Another process of the
+/// same user could otherwise open it and read the password or write into
+/// the session (SYS-034). sudo and the broker run as root and may still open
+/// it.
+fn make_terminal_exclusive(name: Option<PathBuf>) -> Result<(), BrokerError> {
+    let name = name.ok_or(BrokerError::AuthorizationUnavailable)?;
+    let terminal = open(
+        name.as_path(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| BrokerError::AuthorizationUnavailable)?;
+    rustix::termios::ioctl_tiocexcl(&terminal).map_err(|_| BrokerError::AuthorizationUnavailable)
 }
 
 /// A sudo-started broker and its process group. It ends when the session's

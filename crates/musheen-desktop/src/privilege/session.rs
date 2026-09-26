@@ -149,7 +149,10 @@ pub fn serve_session<A, R, S, C>(
 
 /// Makes the sudo broker's terminal pass bytes through unchanged: no echo,
 /// no line editing and no 4,095-byte line limit, so a long request arrives
-/// whole and is not echoed back.
+/// whole and is not echoed back. It also makes the terminal refuse any
+/// further open by an unprivileged process, so no other process of the user
+/// can write into the session. This matters when sudo gives the broker a
+/// terminal of its own (`use_pty`).
 pub fn prepare_sudo_terminal() -> Result<(), BrokerError> {
     let input = std::io::stdin();
     if !rustix::termios::isatty(&input) {
@@ -159,7 +162,8 @@ pub fn prepare_sudo_terminal() -> Result<(), BrokerError> {
         rustix::termios::tcgetattr(&input).map_err(|_| BrokerError::BrokerCrashed)?;
     terminal.make_raw();
     rustix::termios::tcsetattr(&input, rustix::termios::OptionalActions::Now, &terminal)
-        .map_err(|_| BrokerError::BrokerCrashed)
+        .map_err(|_| BrokerError::BrokerCrashed)?;
+    rustix::termios::ioctl_tiocexcl(&input).map_err(|_| BrokerError::BrokerCrashed)
 }
 
 /// Why a broker's output produced no response line.
