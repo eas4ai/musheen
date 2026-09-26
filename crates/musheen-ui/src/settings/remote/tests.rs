@@ -5,7 +5,7 @@ use crate::test_fixtures::{FakeFtp, FtpServerOptions, MemoryKeyring};
 use crate::{Catalog, Locale};
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AnyWindowHandle, TestAppContext, px, size};
+use gpui_kit::{AnyWindowHandle, ScrollDelta, TestAppContext, point, px, size};
 use musheen_core::{BoxFuture, CancellationToken, PageRequest, StoreError};
 use musheen_desktop::{
     RemoteCredentials, RemoteErrorCategory, SettingsDocument, SettingsStore, SshLogin,
@@ -71,11 +71,33 @@ fn open_editor(
     }
 }
 
+/// Scrolls the Settings controls until `id` is on screen, from the top down.
+fn reveal(window: &mut gpui_kit::Window, id: &str, cx: &mut gpui_kit::App) {
+    window.render_frame(cx);
+    if window
+        .try_find(id.to_owned())
+        .is_some_and(|found| found.visible())
+    {
+        return;
+    }
+    window.scroll("settings-controls", ScrollDelta::Lines(point(0., 400.)), cx);
+    for _ in 0..40 {
+        window.render_frame(cx);
+        if window
+            .try_find(id.to_owned())
+            .is_some_and(|found| found.visible())
+        {
+            return;
+        }
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -5.)), cx);
+    }
+}
+
 impl Editor {
     fn fill(&self, cx: &mut TestAppContext, fields: &[(&str, &str)]) {
         cx.update_window(self.handle, |_, window, cx| {
-            window.render_frame(cx);
             for (id, value) in fields {
+                reveal(window, id, cx);
                 window.click(id.to_string(), cx);
                 window.input(value, cx);
             }
@@ -87,7 +109,7 @@ impl Editor {
     fn click(&self, cx: &mut TestAppContext, id: &str) {
         let id = id.to_owned();
         cx.update_window(self.handle, |_, window, cx| {
-            window.render_frame(cx);
+            reveal(window, &id, cx);
             window.click(id, cx);
             window.render_frame(cx);
         })
@@ -193,15 +215,22 @@ fn browse_saved_connection(
 async fn remote_parity_the_editor_offers_no_choice_browsing_refuses(cx: &mut TestAppContext) {
     let editor = open_editor(cx, Some(MemoryKeyring::default()), None);
 
-    for refused in ["settings-remote-protocol-smb", "settings-remote-protocol-nfs"] {
+    for refused in [
+        "settings-remote-protocol-smb",
+        "settings-remote-protocol-nfs",
+        "settings-remote-protocol-http",
+    ] {
         assert!(
             !editor.shows(cx, refused),
             "the editor offers no protocol browsing refuses: {refused}"
         );
     }
-    for protocol in ["ftp", "ftps", "sftp", "webdav", "http"] {
+    for protocol in ["ftp", "ftps", "sftp", "webdav"] {
         editor.click(cx, &format!("settings-remote-protocol-{protocol}"));
-        for proxy in ["settings-remote-proxy-socks5", "settings-remote-proxy-http-connect"] {
+        for proxy in [
+            "settings-remote-proxy-socks5",
+            "settings-remote-proxy-http-connect",
+        ] {
             assert!(
                 !editor.shows(cx, proxy),
                 "{protocol} offers no proxy, which browsing refuses: {proxy}"
@@ -308,7 +337,7 @@ fn remote_parity_every_offered_choice_reaches_the_server() {
 
 struct FailingTester(RemoteErrorCategory);
 
-impl ConnectionTestService for FailingTester {
+impl musheen_desktop::ProfileConnectionTest for FailingTester {
     fn test<'a>(
         &'a self,
         profile: &'a ConnectionProfile,
@@ -374,10 +403,16 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
         settle(cx, |_| keyring.secret("team-ftp").is_some()),
         "saving stores the password in the secret service"
     );
-    assert_eq!(keyring.secret("team-ftp").as_deref(), Some(b"hunter2".as_slice()));
+    assert_eq!(
+        keyring.secret("team-ftp").as_deref(),
+        Some(b"hunter2".as_slice())
+    );
     let saved = editor.saved_connections(cx);
     assert!(saved.contains("secret-service:team-ftp"), "{saved}");
-    assert!(!saved.contains("hunter2"), "settings keep only the reference");
+    assert!(
+        !saved.contains("hunter2"),
+        "settings keep only the reference"
+    );
     let profile = ConnectionProfiles::import(&saved).unwrap().profiles()[0].clone();
     assert!(!format!("{profile:?}").contains("hunter2"));
 
@@ -386,7 +421,10 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
         ["hello.txt"],
         "browsing the saved connection logs in with the stored password"
     );
-    assert_eq!(server.passwords().last().map(String::as_str), Some("hunter2"));
+    assert_eq!(
+        server.passwords().last().map(String::as_str),
+        Some("hunter2")
+    );
 
     editor.fill(cx, &[("remote-profile-name", " renamed")]);
     editor.test_connection(cx);
@@ -405,7 +443,10 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
     let view = editor.view.clone();
     assert!(settle(cx, |cx| !view.read(cx).saving));
     let file = std::fs::read_to_string(editor.store.path()).unwrap();
-    assert!(!file.contains("hunter2"), "the settings file never holds it");
+    assert!(
+        !file.contains("hunter2"),
+        "the settings file never holds it"
+    );
 
     editor.click(cx, "settings-remote-remove");
     assert!(
@@ -416,9 +457,7 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
 }
 
 #[gpui_kit::test]
-async fn remote_session_password_a_locked_keyring_offers_session_only_use(
-    cx: &mut TestAppContext,
-) {
+async fn remote_session_password_a_locked_keyring_offers_session_only_use(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     let keyring = MemoryKeyring::locked();
     let server = FakeFtp::start(FtpServerOptions {
@@ -440,7 +479,10 @@ async fn remote_session_password_a_locked_keyring_offers_session_only_use(
             })
             .unwrap_or(false)
     });
-    assert!(offered, "a locked keyring leaves the user a session-only choice");
+    assert!(
+        offered,
+        "a locked keyring leaves the user a session-only choice"
+    );
 
     editor.click(cx, "settings-remote-session-only");
     let view = editor.view.clone();
@@ -454,24 +496,33 @@ async fn remote_session_password_a_locked_keyring_offers_session_only_use(
     let saved = editor.saved_connections(cx);
     assert!(saved.contains("secret-service:team-ftp"), "{saved}");
     assert!(!saved.contains("hunter2"));
-    assert!(keyring.ids().is_empty(), "nothing reaches the locked keyring");
+    assert!(
+        keyring.ids().is_empty(),
+        "nothing reaches the locked keyring"
+    );
     assert_eq!(
         browse_saved_connection(&saved, cx).unwrap(),
         ["hello.txt"],
         "the session-only password logs the saved connection in"
     );
-    assert_eq!(server.passwords().last().map(String::as_str), Some("hunter2"));
+    assert_eq!(
+        server.passwords().last().map(String::as_str),
+        Some("hunter2")
+    );
 
     editor.click(cx, "settings-apply");
     let view = editor.view.clone();
     assert!(settle(cx, |cx| !view.read(cx).saving));
     let file = std::fs::read_to_string(editor.store.path()).unwrap();
-    assert!(!file.contains("hunter2"), "a session-only password is never written");
+    assert!(
+        !file.contains("hunter2"),
+        "a session-only password is never written"
+    );
 }
 
 struct PassingTester;
 
-impl ConnectionTestService for PassingTester {
+impl musheen_desktop::ProfileConnectionTest for PassingTester {
     fn test<'a>(
         &'a self,
         _profile: &'a ConnectionProfile,
@@ -530,7 +581,8 @@ async fn sftp_login_the_editor_offers_each_login_method_and_saves_it(cx: &mut Te
         }
     );
 
-    let key_text = "-----BEGIN OPENSSH PRIVATE KEY-----\nstored-key-body\n-----END OPENSSH PRIVATE KEY-----\n";
+    let key_text =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nstored-key-body\n-----END OPENSSH PRIVATE KEY-----\n";
     editor.click(cx, "settings-remote-login-stored-key");
     editor.fill(cx, &[("remote-login-key-text", key_text)]);
     editor.type_password(cx, "key passphrase");

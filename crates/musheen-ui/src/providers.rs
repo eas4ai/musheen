@@ -30,8 +30,10 @@ fn provider_root_item(
 }
 
 mod remote;
+pub(crate) use remote::BrowseConnectionTester;
 use remote::{
     RemoteProfileAdapter, RemoteProfileStore, RemoteStoreConnector, default_remote_connector,
+    remote_connector,
 };
 
 pub(crate) trait ProviderAdapter: Send + Sync {
@@ -124,9 +126,15 @@ impl ProviderRuntime {
     /// `credentials`.
     pub(crate) fn from_settings_with_credentials(
         settings: &musheen_desktop::SettingsDocument,
-        _credentials: Arc<musheen_desktop::RemoteCredentials>,
+        credentials: Arc<musheen_desktop::RemoteCredentials>,
     ) -> Result<Self, ProviderRuntimeError> {
-        Self::from_settings(settings)
+        Self::from_settings_with_connector(
+            settings,
+            remote_connector(
+                credentials,
+                musheen_desktop::SshEnvironment::for_current_user(),
+            ),
+        )
     }
 
     fn from_settings_with_connector(
@@ -137,9 +145,12 @@ impl ProviderRuntime {
         if let Some(document) = settings.value("remote.connections") {
             let profiles = musheen_desktop::ConnectionProfiles::import(&document)
                 .map_err(|_| ProviderRuntimeError::InvalidConnectionProfiles)?;
+            // A connection browsing cannot open stays in Settings with its
+            // reason; Network does not list it.
             let stores = profiles
                 .profiles()
                 .iter()
+                .filter(|profile| profile.browse_refusal().is_none())
                 .map(|profile| {
                     RemoteProfileStore::new(profile.clone(), Arc::clone(&connector))
                         .map(Arc::new)
@@ -1855,8 +1866,8 @@ mod tests {
     /// Opens `profile` the way browsing does and lists its root.
     fn browse_root(profile: ConnectionProfile) -> Result<Vec<String>, StoreError> {
         let saved = RemoteProfileStore::new(profile, default_remote_connector()).unwrap();
-        let root = StorePath::from_provider_key(saved.provider_id().clone(), b"/".to_vec())
-            .unwrap();
+        let root =
+            StorePath::from_provider_key(saved.provider_id().clone(), b"/".to_vec()).unwrap();
         future::block_on(saved.read_directory(
             &root,
             PageRequest::new(16, None).unwrap(),
@@ -1873,9 +1884,14 @@ mod tests {
     fn run_connection_test(
         profile: &ConnectionProfile,
     ) -> Result<(), musheen_desktop::RemoteError> {
-        future::block_on(
-            crate::settings::default_connection_tester().test(profile, CancellationToken::new()),
-        )
+        let credentials = Arc::new(musheen_desktop::RemoteCredentials::new(Arc::new(
+            crate::test_fixtures::MemoryKeyring::default(),
+        )));
+        future::block_on(crate::settings::default_connection_tester().test(
+            profile,
+            credentials,
+            CancellationToken::new(),
+        ))
     }
 
     #[test]
@@ -1887,7 +1903,10 @@ mod tests {
             SecurityPolicy::Tls(musheen_desktop::TlsPolicy::SystemRoots),
         );
 
-        assert!(browse_root(profile.clone()).is_err(), "the server offers no TLS");
+        assert!(
+            browse_root(profile.clone()).is_err(),
+            "the server offers no TLS"
+        );
         let browsed = server.first_commands();
         assert!(
             !browsed.is_empty() && browsed.iter().all(|command| command == "AUTH TLS"),
@@ -2001,6 +2020,13 @@ mod tests {
                 RemoteProtocol::Ftp,
                 SecurityPolicy::PlaintextConfirmed,
                 Some(socks),
+            ),
+            named(
+                "web-files",
+                "Web files",
+                RemoteProtocol::Http,
+                SecurityPolicy::Tls(musheen_desktop::TlsPolicy::SystemRoots),
+                None,
             ),
         ]);
 

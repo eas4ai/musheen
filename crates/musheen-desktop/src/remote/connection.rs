@@ -141,6 +141,18 @@ impl SshLogin {
     }
 }
 
+/// Why browsing cannot open a saved connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowseRefusal {
+    /// SMB and NFS have no browse store in this build, and OpenDAL's HTTP
+    /// service reads files but cannot list a folder.
+    Protocol,
+    /// No browse store connects through a proxy.
+    Proxy,
+    /// FTPS browsing cannot verify against a pinned certificate.
+    CertificatePin,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct ProxySettings {
     kind: ProxyKind,
@@ -326,6 +338,30 @@ impl ConnectionProfile {
         }
         self.login = login;
         Ok(self)
+    }
+
+    /// Why browsing cannot open this connection in this build, if it cannot.
+    /// Network lists no such connection, and the connection editor offers no
+    /// choice that leads to one.
+    #[must_use]
+    pub fn browse_refusal(&self) -> Option<BrowseRefusal> {
+        if matches!(
+            self.protocol,
+            RemoteProtocol::Http | RemoteProtocol::Smb | RemoteProtocol::Nfs
+        ) {
+            Some(BrowseRefusal::Protocol)
+        } else if self.proxy.is_some() {
+            Some(BrowseRefusal::Proxy)
+        } else if self.protocol == RemoteProtocol::Ftps
+            && matches!(
+                self.security,
+                SecurityPolicy::Tls(TlsPolicy::PinnedSha256(_))
+            )
+        {
+            Some(BrowseRefusal::CertificatePin)
+        } else {
+            None
+        }
     }
 
     #[must_use]

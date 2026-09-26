@@ -323,6 +323,27 @@ impl OpendalStore {
         self.root.clone()
     }
 
+    /// Reads the first entry of the connection's root, as browsing does when
+    /// it opens the connection, and names the cause when it cannot.
+    pub async fn check_root(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<(), RemoteErrorCategory> {
+        let root = directory_path(&self.remote_path(&self.root)?);
+        let operator = self.operator.clone();
+        run_remote(cancellation, async move {
+            let mut lister = operator
+                .lister(&root)
+                .await
+                .map_err(|error| classify_opendal_error(&error, RemoteErrorContext::Read))?;
+            match lister.next().await {
+                Some(Err(error)) => Err(classify_opendal_error(&error, RemoteErrorContext::Read)),
+                _ => Ok(()),
+            }
+        })
+        .await?
+    }
+
     pub fn path(&self, path: &str) -> Result<StorePath, StoreError> {
         let normalized = normalize_store_path(path)?;
         StorePath::from_provider_key(self.provider.clone(), normalized.into_bytes())

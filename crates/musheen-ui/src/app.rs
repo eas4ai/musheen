@@ -2319,6 +2319,30 @@ impl Render for VolumeUnlockDialog {
 /// The menu layer asks this adapter for a provider-backed destination result;
 /// it deliberately delegates the decision to the operation queue instead of
 /// accepting a UI-provided writable flag.
+/// Accepts a local folder as an Extract… destination without touching
+/// storage; the extract operation reports a folder it cannot write.
+struct ContextExtractDestinationResolver<'a> {
+    catalog: &'a Catalog,
+}
+
+impl ContextMenuDestinationResolver for ContextExtractDestinationResolver<'_> {
+    fn resolve_context_menu_destination(
+        &self,
+        destination: &StorePath,
+    ) -> musheen_core::ResolvedDestination {
+        if destination.as_unix_path().is_some() {
+            musheen_core::ResolvedDestination::writable(destination.clone())
+        } else {
+            musheen_core::ResolvedDestination::read_only(
+                destination.clone(),
+                self.catalog
+                    .message("context.destination-refused")
+                    .expect("destination refusal is localized"),
+            )
+        }
+    }
+}
+
 struct ContextTransferDestinationResolver<'a> {
     operation_hub: &'a OperationHub,
     payload: &'a FileDragPayload,
@@ -2391,7 +2415,11 @@ pub fn run(initial_path: PathBuf) {
             );
             let fallback = StorePath::from_unix_path(initial_path.into_os_string());
             let store = SessionStore::for_current_user();
-            let providers = ProviderRuntime::from_settings(&settings).unwrap_or_else(|error| {
+            let providers = ProviderRuntime::from_settings_with_credentials(
+                &settings,
+                crate::settings::remote_credentials(cx),
+            )
+            .unwrap_or_else(|error| {
                 eprintln!("Musheen could not load remote connections: {error}");
                 ProviderRuntime::for_current_user()
             });
@@ -4784,17 +4812,19 @@ impl MusheenApp {
         self.remote_connections_revision = revision;
         let Some(settings) = cx
             .try_global::<crate::settings::RuntimeSettings>()
-            .map(|settings| &settings.0)
+            .map(|settings| settings.0.clone())
         else {
             return;
         };
-        let providers = match ProviderRuntime::from_settings(settings) {
-            Ok(providers) => providers,
-            Err(error) => {
-                eprintln!("Musheen could not refresh remote connections: {error}");
-                return;
-            }
-        };
+        let credentials = crate::settings::remote_credentials(cx);
+        let providers =
+            match ProviderRuntime::from_settings_with_credentials(&settings, credentials) {
+                Ok(providers) => providers,
+                Err(error) => {
+                    eprintln!("Musheen could not refresh remote connections: {error}");
+                    return;
+                }
+            };
         self.store = providers.store();
         self.providers = providers;
         let location = self.navigation.focused_tab().location().clone();
@@ -9284,6 +9314,25 @@ impl MusheenApp {
         let action = match pending.command_id() {
             "clipboard.copy_to" => DropAction::Copy,
             "clipboard.move_to" => DropAction::Move,
+            "archive.extract" => {
+                let resolver = ContextExtractDestinationResolver {
+                    catalog: &self.catalog,
+                };
+                let surface = self.shell.context_menus().clone();
+                let mut dispatcher = AppMenuDispatcher::default();
+                let origin_tab = pending.origin_tab();
+                let captured_targets = pending.selection().to_vec();
+                let invocation =
+                    surface.resolve_destination(pending, destination, &resolver, &mut dispatcher);
+                self.finish_context_destination(
+                    invocation,
+                    dispatcher,
+                    origin_tab,
+                    &captured_targets,
+                    cx,
+                );
+                return;
+            }
             unsupported => {
                 self.operation_error = Some(
                     format!(
@@ -9320,14 +9369,29 @@ impl MusheenApp {
         let mut dispatcher = AppMenuDispatcher::default();
         let origin_tab = pending.origin_tab();
         let captured_targets = pending.selection().to_vec();
-        match surface.resolve_destination(pending, destination, &resolver, &mut dispatcher) {
+        let invocation =
+            surface.resolve_destination(pending, destination, &resolver, &mut dispatcher);
+        self.finish_context_destination(invocation, dispatcher, origin_tab, &captured_targets, cx);
+    }
+
+    /// Runs, reviews or refuses a destination workflow once its destination
+    /// is resolved.
+    fn finish_context_destination(
+        &mut self,
+        invocation: MenuInvocation,
+        dispatcher: AppMenuDispatcher,
+        origin_tab: Option<TabId>,
+        captured_targets: &[CommandTargetRef],
+        cx: &mut Context<Self>,
+    ) {
+        match invocation {
             MenuInvocation::Dispatched => {
                 if let Some((action, parameters)) = dispatcher.dispatched {
                     self.dispatch_typed_context_command(
                         action,
                         parameters,
                         origin_tab,
-                        Some(&captured_targets),
+                        Some(captured_targets),
                         false,
                         cx,
                     );
@@ -9933,7 +9997,14 @@ impl MusheenApp {
                 | CommandAction::Extract
                 | CommandAction::ExtractHere),
                 CommandParameters::Targets(targets),
-            ) => self.submit_archive_command(*archive_action, targets, cx),
+            ) => self.submit_archive_plan(build_archive_plan(*archive_action, targets), cx),
+            (
+                CommandAction::Extract,
+                CommandParameters::Destination {
+                    targets,
+                    destination,
+                },
+            ) => self.submit_archive_plan(build_extract_plan_into(targets, destination), cx),
             (
                 delete_action @ (CommandAction::MoveToTrash | CommandAction::DeletePermanently),
                 CommandParameters::Targets(targets),
@@ -10131,13 +10202,11 @@ impl MusheenApp {
         }
     }
 
-    fn submit_archive_command(
+    fn submit_archive_plan(
         &mut self,
-        action: CommandAction,
-        targets: &[CommandTargetRef],
+        plan: Result<ArchiveOperationPlan, Box<str>>,
         cx: &mut Context<Self>,
     ) {
-        let plan = build_archive_plan(action, targets);
         match plan.and_then(|plan| {
             self.operation_hub
                 .submit_archive(plan)
@@ -18494,6 +18563,34 @@ fn build_extract_plan(
     .map_err(|error| error.to_string().into())
 }
 
+/// Extract… into the folder the user picked: the archive's entries land in
+/// that folder itself, under Extract Here's conflict policy.
+fn build_extract_plan_into(
+    targets: &[CommandTargetRef],
+    destination: &StorePath,
+) -> Result<ArchiveOperationPlan, Box<str>> {
+    let [target] = targets else {
+        return Err("select exactly one archive to extract".into());
+    };
+    let source = target
+        .path()
+        .as_unix_path()
+        .ok_or_else(|| Box::<str>::from("only local archives can be extracted"))?;
+    if destination.as_unix_path().is_none() {
+        return Err("archives are extracted only into local folders".into());
+    }
+    let (codec, _) = archive_codec_and_suffix(source)
+        .ok_or_else(|| Box::<str>::from("the selected file is not a supported archive"))?;
+    ArchiveOperationPlan::extract(
+        target.path().clone(),
+        destination.clone(),
+        codec,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .map_err(|error| error.to_string().into())
+}
+
 fn archive_codec_and_suffix(path: &Path) -> Option<(ArchiveCodec, usize)> {
     let name = path.file_name()?.as_bytes();
     [
@@ -23248,9 +23345,11 @@ mod tests {
     /// journal in `journal` rather than the user's configuration directory.
     fn run_archive_jobs(app: &Entity<MusheenApp>, journal: &Path, cx: &mut TestAppContext) {
         app.update(cx, |state, _| {
-            state.operation_hub =
-                OperationHub::new_with_provider_runtime(&ResourceLimits::default(), &state.providers)
-                    .with_archive_journal_at(journal);
+            state.operation_hub = OperationHub::new_with_provider_runtime(
+                &ResourceLimits::default(),
+                &state.providers,
+            )
+            .with_archive_journal_at(journal);
         });
     }
 
@@ -23328,9 +23427,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn extract_to_a_picked_folder_writes_the_archive_entries_there(
-        cx: &mut TestAppContext,
-    ) {
+    async fn extract_to_a_picked_folder_writes_the_archive_entries_there(cx: &mut TestAppContext) {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("notes.txt");
         filesystem::write(&source, b"notes").unwrap();

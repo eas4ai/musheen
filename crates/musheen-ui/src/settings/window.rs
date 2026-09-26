@@ -141,7 +141,16 @@ pub struct SettingsWindow {
     pub(super) remote_protocol: RemoteProtocol,
     pub(super) remote_security: SecurityPolicy,
     pub(super) remote_proxy: Option<ProxyKind>,
+    /// The credential the connection being edited already stores.
     pub(super) remote_credential: Option<CredentialReference>,
+    /// Whether the connection being edited already stores a private key.
+    pub(super) remote_stored_key: bool,
+    pub(super) remote_login: musheen_desktop::SshLogin,
+    pub(super) remote_key_text: Entity<gpui_kit::component::input::TextareaState>,
+    pub(super) remote_credentials: Arc<musheen_desktop::RemoteCredentials>,
+    pub(super) remote_saving: bool,
+    pub(super) remote_session_offer: Option<super::remote::PendingRemoteSave>,
+    pub(super) remote_secret_error: Option<musheen_desktop::SecretError>,
     pub(super) remote_tester: Arc<dyn super::remote::ConnectionTestService>,
     pub(super) remote_testing: bool,
     pub(super) remote_test_generation: u64,
@@ -206,10 +215,7 @@ impl SettingsWindow {
                     .expect("theme schema key"),
             )
         });
-        let remote_credential = document
-            .value("remote.credential")
-            .filter(|value| !value.is_empty())
-            .and_then(|value| CredentialReference::from_setting_value(&value).ok());
+        let remote_credentials = super::remote_credentials(cx);
         let mut this = Self {
             action_inputs: super::custom_actions::inputs(window, cx),
             action_shell: false,
@@ -219,7 +225,14 @@ impl SettingsWindow {
             remote_protocol: RemoteProtocol::Sftp,
             remote_security: super::remote::default_security(RemoteProtocol::Sftp),
             remote_proxy: None,
-            remote_credential,
+            remote_credential: None,
+            remote_stored_key: false,
+            remote_login: musheen_desktop::SshLogin::Password,
+            remote_key_text: super::remote::key_text_input(window, cx),
+            remote_credentials,
+            remote_saving: false,
+            remote_session_offer: None,
+            remote_secret_error: None,
             remote_tester,
             remote_testing: false,
             remote_test_generation: 0,

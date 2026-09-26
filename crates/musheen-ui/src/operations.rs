@@ -399,7 +399,8 @@ impl OperationHub {
     #[cfg(test)]
     pub(crate) fn with_archive_journal_at(self, directory: &std::path::Path) -> Self {
         let storage = FileJournalStorage::at(directory).expect("the test archive journal opens");
-        let route = DesktopArchiveRoute::with_storage(storage).expect("the test archive route opens");
+        let route =
+            DesktopArchiveRoute::with_storage(storage).expect("the test archive route opens");
         self.queue
             .lock()
             .expect("the operation queue lock is available")

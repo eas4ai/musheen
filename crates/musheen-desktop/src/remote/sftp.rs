@@ -1,6 +1,7 @@
 use super::{
     ConnectionProfile, CredentialResolver, HostKeyPolicy, OpendalStore, RemoteCasePolicy,
     RemoteError, RemoteErrorCategory, RemoteMutationPolicy, RemoteProtocol, SecurityPolicy,
+    SshLogin,
 };
 use musheen_core::{BoxFuture, CancellationToken, ProviderId};
 use opendal::raw::{
@@ -9,26 +10,25 @@ use opendal::raw::{
 };
 use opendal::{
     Buffer, Builder, BytesRange, Capability, Error, ErrorKind, Metadata, MetadataBuilder,
-    OperationContext, Operator, Result as OpendalResult, services::Sftp,
+    OperationContext, Operator, Result as OpendalResult,
 };
 use russh::client;
 use russh::keys::{
-    PrivateKeyWithHashAlg, PublicKeyBase64, PublicKeyOrCertificate, decode_secret_key,
+    HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyBase64, PublicKeyOrCertificate,
+    decode_secret_key,
 };
 use russh_sftp::client::{RawSftpSession, error::Error as SftpError};
 use russh_sftp::protocol::{File, FileAttributes, OpenFlags, StatusCode};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
-use super::opendal_store::{
-    RemoteErrorContext, classify_opendal_error, profile_endpoint, profile_error, profile_password,
-    run_remote,
-};
+use super::opendal_store::{RemoteErrorContext, classify_opendal_error, profile_error, run_remote};
 
 const SFTP_CHUNK_SIZE: usize = 32 * 1024;
 
@@ -81,8 +81,7 @@ pub fn sftp_store_from_profile<'a, R: CredentialResolver>(
 ) -> BoxFuture<'a, Result<OpendalStore, RemoteError>> {
     Box::pin(async move {
         let environment = SshEnvironment::for_current_user();
-        sftp_store_from_profile_in(provider, profile, credentials, &environment, cancellation)
-            .await
+        sftp_store_from_profile_in(provider, profile, credentials, &environment, cancellation).await
     })
 }
 
@@ -90,7 +89,7 @@ pub fn sftp_store_from_profile_in<'a, R: CredentialResolver>(
     provider: ProviderId,
     profile: &'a ConnectionProfile,
     credentials: &'a R,
-    _environment: &'a SshEnvironment,
+    environment: &'a SshEnvironment,
     cancellation: CancellationToken,
 ) -> BoxFuture<'a, Result<OpendalStore, RemoteError>> {
     Box::pin(async move {
@@ -104,53 +103,32 @@ pub fn sftp_store_from_profile_in<'a, R: CredentialResolver>(
             SecurityPolicy::Ssh(policy) => policy.clone(),
             _ => return Err(profile_error(profile, RemoteErrorCategory::InvalidProfile)),
         };
-
-        if profile.credential().is_none() && host_key == HostKeyPolicy::KnownHosts {
-            let mut builder = Sftp::default()
-                .endpoint(&profile_endpoint(profile, "ssh", 22))
-                .root(profile.path())
-                .known_hosts_strategy("Strict");
-            if let Some(username) = profile.username() {
-                builder = builder.user(username);
-            }
-            let operator = Operator::new(builder).map_err(|error| {
-                profile_error(
-                    profile,
-                    classify_opendal_error(&error, RemoteErrorContext::Connect),
-                )
-            })?;
-            return OpendalStore::from_profile_operator(
-                provider,
-                profile,
-                operator,
-                RemoteCasePolicy::Unknown,
-                RemoteMutationPolicy::CapabilitiesVerified,
-            );
-        }
-
-        let secret = profile_password(profile, credentials, cancellation.clone()).await?;
-        let username = profile
-            .username()
-            .ok_or_else(|| profile_error(profile, RemoteErrorCategory::InvalidProfile))?;
+        let fail = |category| profile_error(profile, category);
+        let route = SshRoute::resolve(profile, environment).map_err(fail)?;
+        let login = SshLoginMaterial::load(
+            profile,
+            credentials,
+            environment,
+            &route,
+            cancellation.clone(),
+        )
+        .await
+        .map_err(fail)?;
         let service = RusshSftpService::new(RusshSftpConfig {
-            host: profile.host().as_str().to_owned(),
-            port: profile.port().unwrap_or(22),
-            username: username.to_owned(),
+            route,
             root: profile.path().to_owned(),
-            secret,
+            login,
             host_key,
+            known_hosts: environment.known_hosts.clone(),
+            agent_socket: environment.agent_socket.clone(),
         });
         let warm_service = service.clone();
         run_remote(cancellation, async move { warm_service.warm_up().await })
             .await
-            .map_err(|category| profile_error(profile, category))?
-            .map_err(|category| profile_error(profile, category))?;
-        let operator = Operator::new(RusshSftpBuilder::new(service)).map_err(|error| {
-            profile_error(
-                profile,
-                classify_opendal_error(&error, RemoteErrorContext::Connect),
-            )
-        })?;
+            .map_err(fail)?
+            .map_err(fail)?;
+        let operator = Operator::new(RusshSftpBuilder::new(service))
+            .map_err(|error| fail(classify_opendal_error(&error, RemoteErrorContext::Connect)))?;
         OpendalStore::from_profile_operator(
             provider,
             profile,
@@ -161,23 +139,228 @@ pub fn sftp_store_from_profile_in<'a, R: CredentialResolver>(
     })
 }
 
-struct RusshSftpConfig {
+impl SshEnvironment {
+    /// The parsed ~/.ssh/config, or `None` when there is none.
+    fn ssh_config(&self) -> Result<Option<ssh2_config::SshConfig>, RemoteErrorCategory> {
+        let Some(path) = &self.config else {
+            return Ok(None);
+        };
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(RemoteErrorCategory::InvalidProfile),
+        };
+        ssh2_config::SshConfig::default()
+            .parse(
+                &mut std::io::BufReader::new(file),
+                ssh2_config::ParseRule::ALLOW_UNKNOWN_FIELDS
+                    | ssh2_config::ParseRule::ALLOW_UNSUPPORTED_FIELDS,
+            )
+            .map(Some)
+            .map_err(|_| RemoteErrorCategory::InvalidProfile)
+    }
+
+    /// `path` with a leading `~/` read from this environment's home.
+    fn expand(&self, path: &str) -> PathBuf {
+        match path.strip_prefix("~/") {
+            Some(rest) => self.home.join(rest),
+            None => PathBuf::from(path),
+        }
+    }
+}
+
+/// One SSH server on the way, as ~/.ssh/config resolves it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SshHop {
     host: String,
     port: u16,
-    username: String,
+    user: String,
+    identity_files: Vec<PathBuf>,
+}
+
+/// The servers a login passes: the ProxyJump hosts in order, then the
+/// connection's server.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SshRoute {
+    jumps: Vec<SshHop>,
+    target: SshHop,
+}
+
+impl SshRoute {
+    /// Applies the Host entry of the connection's host: its HostName and
+    /// ProxyJump, and its User, Port and IdentityFile where the profile
+    /// leaves them empty. Each jump host is resolved through its own entry.
+    fn resolve(
+        profile: &ConnectionProfile,
+        environment: &SshEnvironment,
+    ) -> Result<Self, RemoteErrorCategory> {
+        let config = environment.ssh_config()?;
+        let entry = |host: &str| config.as_ref().map(|config| config.query(host));
+        let params = entry(profile.host().as_str());
+        let user = profile
+            .username()
+            .map(str::to_owned)
+            .or_else(|| params.as_ref().and_then(|params| params.user.clone()))
+            .or_else(|| std::env::var("USER").ok())
+            .ok_or(RemoteErrorCategory::InvalidProfile)?;
+        let target = SshHop {
+            host: params
+                .as_ref()
+                .and_then(|params| params.host_name.clone())
+                .unwrap_or_else(|| profile.host().as_str().to_owned()),
+            port: profile
+                .port()
+                .or_else(|| params.as_ref().and_then(|params| params.port))
+                .unwrap_or(22),
+            identity_files: identity_files(params.as_ref(), environment),
+            user,
+        };
+        let jumps = params
+            .as_ref()
+            .and_then(|params| params.proxy_jump.clone())
+            .unwrap_or_default()
+            .iter()
+            .filter(|jump| !jump.eq_ignore_ascii_case("none"))
+            .map(|jump| {
+                let (user, address) = match jump.rsplit_once('@') {
+                    Some((user, address)) => (Some(user.to_owned()), address),
+                    None => (None, jump.as_str()),
+                };
+                let (name, port) = match address.rsplit_once(':') {
+                    Some((name, port)) => (
+                        name,
+                        Some(
+                            port.parse::<u16>()
+                                .map_err(|_| RemoteErrorCategory::InvalidProfile)?,
+                        ),
+                    ),
+                    None => (address, None),
+                };
+                let params = entry(name);
+                Ok(SshHop {
+                    host: params
+                        .as_ref()
+                        .and_then(|params| params.host_name.clone())
+                        .unwrap_or_else(|| name.to_owned()),
+                    port: port
+                        .or_else(|| params.as_ref().and_then(|params| params.port))
+                        .unwrap_or(22),
+                    user: user
+                        .or_else(|| params.as_ref().and_then(|params| params.user.clone()))
+                        .unwrap_or_else(|| target.user.clone()),
+                    identity_files: identity_files(params.as_ref(), environment),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { jumps, target })
+    }
+}
+
+fn identity_files(
+    params: Option<&ssh2_config::HostParams>,
+    environment: &SshEnvironment,
+) -> Vec<PathBuf> {
+    params
+        .and_then(|params| params.identity_file.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| environment.expand(&path.to_string_lossy()))
+        .collect()
+}
+
+/// What a login offers the connection's server, loaded before any network
+/// I/O so a refused key fails before a server is contacted.
+enum SshLoginMaterial {
+    Password(Option<Zeroizing<String>>),
+    Agent,
+    Key(Arc<PrivateKey>),
+}
+
+impl SshLoginMaterial {
+    async fn load<R: CredentialResolver>(
+        profile: &ConnectionProfile,
+        credentials: &R,
+        environment: &SshEnvironment,
+        route: &SshRoute,
+        cancellation: CancellationToken,
+    ) -> Result<Self, RemoteErrorCategory> {
+        let secret_text = |bytes: &[u8]| {
+            std::str::from_utf8(bytes)
+                .map(|text| Zeroizing::new(text.to_owned()))
+                .map_err(|_| RemoteErrorCategory::Authentication)
+        };
+        let passphrase = match profile.credential() {
+            Some(reference) => Some(
+                credentials
+                    .resolve(reference, cancellation.clone())
+                    .await?
+                    .expose_secret(secret_text)?,
+            ),
+            None => None,
+        };
+        match profile.login() {
+            SshLogin::Password => Ok(Self::Password(passphrase)),
+            SshLogin::Agent => Ok(Self::Agent),
+            SshLogin::KeyFile { path } => {
+                let path = path
+                    .as_deref()
+                    .map(|path| environment.expand(path))
+                    .or_else(|| route.target.identity_files.first().cloned())
+                    .ok_or(RemoteErrorCategory::InvalidProfile)?;
+                let text = Zeroizing::new(
+                    std::fs::read_to_string(&path)
+                        .map_err(|_| RemoteErrorCategory::Authentication)?,
+                );
+                decode_login_key(&text, passphrase.as_deref().map(String::as_str)).map(Self::Key)
+            }
+            SshLogin::StoredKey => {
+                let reference = profile
+                    .stored_key_reference()
+                    .ok_or(RemoteErrorCategory::InvalidProfile)?;
+                let text = credentials
+                    .resolve(&reference, cancellation)
+                    .await?
+                    .expose_secret(secret_text)?;
+                decode_login_key(&text, passphrase.as_deref().map(String::as_str)).map(Self::Key)
+            }
+        }
+    }
+}
+
+/// Decodes a private key Musheen signs with itself: Ed25519 or ECDSA. An RSA
+/// key is refused; it signs through the SSH agent only.
+fn decode_login_key(
+    text: &str,
+    passphrase: Option<&str>,
+) -> Result<Arc<PrivateKey>, RemoteErrorCategory> {
+    if PrivateKey::from_openssh(text).is_ok_and(|key| key.algorithm().is_rsa()) {
+        return Err(RemoteErrorCategory::KeyNeedsAgent);
+    }
+    let key =
+        decode_secret_key(text, passphrase).map_err(|_| RemoteErrorCategory::Authentication)?;
+    if key.algorithm().is_rsa() {
+        return Err(RemoteErrorCategory::KeyNeedsAgent);
+    }
+    Ok(Arc::new(key))
+}
+
+struct RusshSftpConfig {
+    route: SshRoute,
     root: String,
-    secret: Option<Zeroizing<String>>,
+    login: SshLoginMaterial,
     host_key: HostKeyPolicy,
+    known_hosts: PathBuf,
+    agent_socket: Option<PathBuf>,
 }
 
 impl fmt::Debug for RusshSftpConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RusshSftpConfig")
-            .field("host", &self.host)
-            .field("port", &self.port)
+            .field("host", &self.route.target.host)
+            .field("port", &self.route.target.port)
+            .field("jumps", &self.route.jumps.len())
             .field("root", &self.root)
-            .field("has_secret", &self.secret.is_some())
             .field("host_key", &self.host_key)
             .finish_non_exhaustive()
     }
@@ -210,7 +393,8 @@ impl Builder for RusshSftpBuilder {
 }
 
 struct RusshConnection {
-    _ssh: client::Handle<SftpHostKeyVerifier>,
+    /// Every session on the way; the jump hosts carry the last one.
+    _ssh: Vec<client::Handle<SftpHostKeyVerifier>>,
     sftp: Arc<RawSftpSession>,
 }
 
@@ -335,7 +519,11 @@ impl Service for RusshSftpService {
     type Composer = ();
 
     fn info(&self) -> ServiceInfo {
-        ServiceInfo::new("sftp", &self.inner.config.root, &self.inner.config.host)
+        ServiceInfo::new(
+            "sftp",
+            &self.inner.config.root,
+            &self.inner.config.route.target.host,
+        )
     }
 
     fn capability(&self) -> Capability {
@@ -749,6 +937,7 @@ struct SftpHostKeyVerifier {
     host: String,
     port: u16,
     policy: HostKeyPolicy,
+    known_hosts: PathBuf,
 }
 
 impl client::Handler for SftpHostKeyVerifier {
@@ -760,9 +949,13 @@ impl client::Handler for SftpHostKeyVerifier {
     ) -> Result<bool, Self::Error> {
         let public_key = server_public_key.public_key();
         Ok(match &self.policy {
-            HostKeyPolicy::KnownHosts => {
-                russh::keys::check_known_hosts(&self.host, self.port, &public_key).unwrap_or(false)
-            }
+            HostKeyPolicy::KnownHosts => russh::keys::check_known_hosts_path(
+                &self.host,
+                self.port,
+                &public_key,
+                &self.known_hosts,
+            )
+            .unwrap_or(false),
             HostKeyPolicy::PinnedSha256(expected) => {
                 Sha256::digest(public_key.public_key_bytes()).as_slice() == expected
             }
@@ -771,46 +964,71 @@ impl client::Handler for SftpHostKeyVerifier {
 }
 
 async fn connect_sftp(config: &RusshSftpConfig) -> OpendalResult<RusshConnection> {
-    let verifier = SftpHostKeyVerifier {
-        host: config.host.clone(),
-        port: config.port,
-        policy: config.host_key.clone(),
-    };
-    let mut ssh = tokio::time::timeout(
-        Duration::from_secs(10),
-        client::connect(
-            Arc::new(client::Config::default()),
-            (config.host.as_str(), config.port),
-            verifier,
-        ),
-    )
-    .await
-    .map_err(|_| temporary_sftp_error())?
-    .map_err(|error| map_ssh_error(&error))?;
-    let authenticated = match config.secret.as_deref() {
-        Some(secret) if secret.trim_start().starts_with("-----BEGIN") => {
-            let key = decode_secret_key(secret, None).map_err(|_| {
-                Error::new(ErrorKind::PermissionDenied, "SFTP private key is invalid")
-            })?;
-            ssh.authenticate_publickey(
-                config.username.clone(),
-                PrivateKeyWithHashAlg::new(Arc::new(key), None),
-            )
+    let client_config = Arc::new(client::Config::default());
+    let mut sessions: Vec<client::Handle<SftpHostKeyVerifier>> = Vec::new();
+    let last = config.route.jumps.len();
+    let hops = config
+        .route
+        .jumps
+        .iter()
+        .chain(std::iter::once(&config.route.target));
+    for (index, hop) in hops.enumerate() {
+        let target = index == last;
+        let verifier = SftpHostKeyVerifier {
+            host: hop.host.clone(),
+            port: hop.port,
+            // A jump host must match known_hosts; only the connection's own
+            // server may be pinned.
+            policy: if target {
+                config.host_key.clone()
+            } else {
+                HostKeyPolicy::KnownHosts
+            },
+            known_hosts: config.known_hosts.clone(),
+        };
+        let connect = async {
+            match sessions.last() {
+                None => {
+                    client::connect(
+                        Arc::clone(&client_config),
+                        (hop.host.as_str(), hop.port),
+                        verifier,
+                    )
+                    .await
+                }
+                Some(previous) => {
+                    let channel = previous
+                        .channel_open_direct_tcpip(
+                            hop.host.clone(),
+                            u32::from(hop.port),
+                            "127.0.0.1",
+                            0,
+                        )
+                        .await?;
+                    client::connect_stream(
+                        Arc::clone(&client_config),
+                        channel.into_stream(),
+                        verifier,
+                    )
+                    .await
+                }
+            }
+        };
+        let mut ssh = tokio::time::timeout(Duration::from_secs(10), connect)
             .await
+            .map_err(|_| temporary_sftp_error())?
+            .map_err(|error| map_ssh_error(&error))?;
+        if !authenticate(&mut ssh, hop, target, config).await? {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "SFTP authentication failed",
+            ));
         }
-        Some(secret) => {
-            ssh.authenticate_password(config.username.clone(), secret.to_owned())
-                .await
-        }
-        None => ssh.authenticate_none(config.username.clone()).await,
+        sessions.push(ssh);
     }
-    .map_err(|_| Error::new(ErrorKind::PermissionDenied, "SFTP authentication failed"))?;
-    if !authenticated.success() {
-        return Err(Error::new(
-            ErrorKind::PermissionDenied,
-            "SFTP authentication failed",
-        ));
-    }
+    let ssh = sessions
+        .last()
+        .ok_or_else(|| Error::new(ErrorKind::Unexpected, "SFTP route has no server"))?;
     let channel = ssh
         .channel_open_session()
         .await
@@ -822,9 +1040,112 @@ async fn connect_sftp(config: &RusshSftpConfig) -> OpendalResult<RusshConnection
     let raw = Arc::new(RawSftpSession::new(channel.into_stream()));
     raw.init().await.map_err(map_sftp_error)?;
     Ok(RusshConnection {
-        _ssh: ssh,
+        _ssh: sessions,
         sftp: raw,
     })
+}
+
+/// Logs in to one hop. The connection's server takes the profile's login; a
+/// jump host takes the agent's keys, the connection's own key, and the keys
+/// its Host entry names.
+async fn authenticate(
+    ssh: &mut client::Handle<SftpHostKeyVerifier>,
+    hop: &SshHop,
+    target: bool,
+    config: &RusshSftpConfig,
+) -> OpendalResult<bool> {
+    let denied = |_| Error::new(ErrorKind::PermissionDenied, "SFTP authentication failed");
+    if (!target || matches!(config.login, SshLoginMaterial::Agent))
+        && let Some(socket) = &config.agent_socket
+        && login_with_agent(ssh, &hop.user, socket).await
+    {
+        return Ok(true);
+    }
+    match (&config.login, target) {
+        (SshLoginMaterial::Password(Some(secret)), true) => {
+            return ssh
+                .authenticate_password(hop.user.clone(), secret.to_string())
+                .await
+                .map(|result| result.success())
+                .map_err(denied);
+        }
+        (SshLoginMaterial::Password(None), true) => {
+            return ssh
+                .authenticate_none(hop.user.clone())
+                .await
+                .map(|result| result.success())
+                .map_err(denied);
+        }
+        (SshLoginMaterial::Key(key), _) => {
+            let key = PrivateKeyWithHashAlg::new(Arc::clone(key), None);
+            if ssh
+                .authenticate_publickey(hop.user.clone(), key)
+                .await
+                .map_err(denied)?
+                .success()
+            {
+                return Ok(true);
+            }
+        }
+        _ => {}
+    }
+    if !target {
+        for path in &hop.identity_files {
+            let Ok(key) = russh::keys::load_secret_key(path, None) else {
+                continue;
+            };
+            if key.algorithm().is_rsa() {
+                continue;
+            }
+            let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+            if ssh
+                .authenticate_publickey(hop.user.clone(), key)
+                .await
+                .map_err(denied)?
+                .success()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Offers each key the agent at `socket` holds. The agent signs an RSA key
+/// with SHA-2, never SHA-1.
+async fn login_with_agent(
+    ssh: &mut client::Handle<SftpHostKeyVerifier>,
+    user: &str,
+    socket: &std::path::Path,
+) -> bool {
+    let Ok(stream) = tokio::net::UnixStream::connect(socket).await else {
+        return false;
+    };
+    let mut agent = russh::keys::agent::client::AgentClient::connect(stream);
+    let Ok(identities) = agent.request_identities().await else {
+        return false;
+    };
+    for identity in identities {
+        let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = identity else {
+            continue;
+        };
+        let hash = if key.algorithm().is_rsa() {
+            Some(match ssh.best_supported_rsa_hash().await {
+                Ok(Some(Some(HashAlg::Sha512))) => HashAlg::Sha512,
+                _ => HashAlg::Sha256,
+            })
+        } else {
+            None
+        };
+        if ssh
+            .authenticate_publickey_with(user.to_owned(), key, hash, &mut agent)
+            .await
+            .is_ok_and(|result| result.success())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn read_range(
@@ -1022,7 +1343,8 @@ mod tests {
             port,
             "/",
             user,
-            credential.then(|| CredentialReference::persistent(ConnectionId::new("office").unwrap())),
+            credential
+                .then(|| CredentialReference::persistent(ConnectionId::new("office").unwrap())),
             SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(host_key_pin(host_key))),
             None,
         )
@@ -1175,10 +1497,7 @@ mod tests {
         let key_reference = profile.stored_key_reference().unwrap();
         let secrets = Secrets::default()
             .with("office", b"stored passphrase")
-            .with(
-                key_reference.connection_id().as_str(),
-                encrypted.as_bytes(),
-            );
+            .with(key_reference.connection_id().as_str(), encrypted.as_bytes());
 
         let store = open(&profile, &secrets, &environment(scratch.path()))
             .expect("a stored key and its passphrase log in");
@@ -1213,7 +1532,14 @@ mod tests {
 
     #[test]
     fn sftp_login_asks_the_agent_for_a_sha2_rsa_signature() {
-        let server = TestSshServer::start(ed25519_key(6), accepts("alice", &[]));
+        let server = TestSshServer::start(
+            ed25519_key(6),
+            Accepts {
+                user: "alice".into(),
+                keys: vec![RecordingRsaAgent::public_key()],
+                ..Accepts::default()
+            },
+        );
         let scratch = tempfile::tempdir().unwrap();
         let agent = RecordingRsaAgent::start(scratch.path());
         let mut environment = environment(scratch.path());
