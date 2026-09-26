@@ -1182,9 +1182,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn localized_numeric_edits_round_trip(
-        cx: &mut TestAppContext,
-    ) {
+    async fn localized_numeric_edits_round_trip(cx: &mut TestAppContext) {
         init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         let mut view = None;

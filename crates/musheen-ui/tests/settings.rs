@@ -2,9 +2,9 @@ use gpui_kit::test::TestWindowExt;
 use musheen_core::{BoxFuture, CancellationToken, ItemId, ProviderId, StorePath};
 use musheen_desktop::{
     CatalogDocument, CatalogStore, ConnectionProbe, ConnectionProfile, ConnectionProfiles,
-    FolderIdentity, ProfileConnectionTest,
-    ProfileConnectionTester, RemoteError, RemoteErrorCategory, RemoteProtocol, SecurityPolicy,
-    SettingsDocument, SettingsPage, SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
+    FolderIdentity, ProfileConnectionTest, ProfileConnectionTester, RemoteError,
+    RemoteErrorCategory, RemoteProtocol, SecurityPolicy, SettingsDocument, SettingsPage,
+    SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
 };
 use musheen_ui::settings::{SettingsBackends, SettingsState, clear_recent_locations};
 use musheen_ui::{AppearanceMode, Catalog, Locale, ThemeProfile};
@@ -202,7 +202,7 @@ fn prior_schema_fixture_migrates_preserving_unknown_fields() {
 }
 
 #[test]
-fn malformed_neighbors_recover_and_secret_references_are_validated() {
+fn malformed_neighbors_recover() {
     let root = tempfile::tempdir().unwrap();
     let store = SettingsStore::from_config_home(root.path());
     store.save(&SettingsDocument::default()).unwrap();
