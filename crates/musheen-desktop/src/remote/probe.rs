@@ -280,10 +280,13 @@ async fn probe_ftp<R: CredentialResolver, T: RootCertificateProvider>(
     cancellation: CancellationToken,
 ) -> Result<(), RemoteErrorCategory> {
     let mut stream = connect_transport(profile, credentials, cancellation.clone()).await?;
+    expect_ftp(&mut stream, 220).await?;
+    // FTPS is explicit TLS (RFC 4217), as browsing through OpenDAL opens it.
     if profile.protocol() == RemoteProtocol::Ftps {
+        send_ftp(&mut stream, b"AUTH TLS", b"").await?;
+        expect_ftp(&mut stream, 234).await?;
         stream = connect_tls(stream, profile, roots).await?;
     }
-    expect_ftp(&mut stream, 220).await?;
     let username = profile.username().unwrap_or("anonymous");
     send_ftp(&mut stream, b"USER ", username.as_bytes()).await?;
     match read_ftp_status(&mut stream).await? {
@@ -685,7 +688,7 @@ fn authority(host: &str, port: Option<u16>) -> String {
 fn default_port(profile: &ConnectionProfile) -> u16 {
     match profile.protocol() {
         RemoteProtocol::Ftp => 21,
-        RemoteProtocol::Ftps => 990,
+        RemoteProtocol::Ftps => 21,
         RemoteProtocol::Sftp => 22,
         RemoteProtocol::WebDav | RemoteProtocol::Http => {
             if matches!(profile.security(), SecurityPolicy::PlaintextConfirmed) {

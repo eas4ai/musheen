@@ -5,7 +5,9 @@ use russh::keys::ssh_key::{LineEnding, private::Ed25519Keypair};
 use russh::keys::{PrivateKey, PublicKey, PublicKeyBase64};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
-use russh_sftp::protocol::{Attrs, File, FileAttributes, Handle, Name, Status, StatusCode, Version};
+use russh_sftp::protocol::{
+    Attrs, File, FileAttributes, Handle, Name, Status, StatusCode, Version,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
@@ -185,7 +187,9 @@ impl Drop for TestSshServer {
     fn drop(&mut self) {
         let runtime = std::mem::replace(
             &mut self.runtime,
-            tokio::runtime::Builder::new_current_thread().build().unwrap(),
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
         );
         runtime.shutdown_background();
     }
@@ -449,7 +453,9 @@ impl Drop for TestAgent {
     fn drop(&mut self) {
         let runtime = std::mem::replace(
             &mut self.runtime,
-            tokio::runtime::Builder::new_current_thread().build().unwrap(),
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
         );
         runtime.shutdown_background();
     }
@@ -519,6 +525,12 @@ impl RecordingRsaAgent {
 
     pub(crate) fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// The RSA public key the agent offers. A server that accepts it answers
+    /// the client's probe, so the client goes on to ask for a signature.
+    pub(crate) fn public_key() -> PublicKey {
+        PublicKey::from_bytes(&rsa_public_key_blob()).expect("the test RSA public key parses")
     }
 
     /// The flags of each signature request; 2 asks for rsa-sha2-256, 4 for

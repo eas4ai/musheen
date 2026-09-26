@@ -1,15 +1,18 @@
 use gpui_kit::component::Disableable;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, AppContext, Context, Entity, Role, TestSupportExt, Window, div};
+use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::{
-    ConnectionId, ConnectionProfile, ConnectionProfiles, CredentialReference, HostKeyPolicy,
-    ProxyKind, ProxySettings, RemoteError, RemoteErrorCategory, RemoteHost, RemoteProtocol,
-    SaveConfirmation, SaveRequirement, SecurityPolicy, SettingSpec, SettingsPage, TLS_PIN_BYTES,
-    TestReport, TlsPolicy, settings_schema,
+    BrowseRefusal, ConnectionId, ConnectionProfile, ConnectionProfiles, CredentialReference,
+    HostKeyPolicy, ProxyKind, ProxySettings, RemoteError, RemoteErrorCategory, RemoteHost,
+    RemoteProtocol, SaveConfirmation, SaveRequirement, SecurityPolicy, SettingSpec, SettingsPage,
+    TLS_PIN_BYTES, TestReport, TlsPolicy, settings_schema,
 };
+use musheen_desktop::{CredentialResolver, SecretBuffer, SshLogin};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const PROFILE_ID: &str = "remote-profile-id";
 pub const PROFILE_NAME: &str = "remote-profile-name";
@@ -17,6 +20,9 @@ pub const PROFILE_HOST: &str = "remote-profile-host";
 pub const PROFILE_PORT: &str = "remote-profile-port";
 pub const PROFILE_PATH: &str = "remote-profile-path";
 pub const PROFILE_USERNAME: &str = "remote-profile-username";
+pub const PROFILE_PASSWORD: &str = "remote-profile-password";
+pub const LOGIN_KEY_PATH: &str = "remote-login-key-path";
+pub const LOGIN_KEY_TEXT: &str = "remote-login-key-text";
 pub const SECURITY_PIN: &str = "remote-security-pin";
 pub const PROXY_HOST: &str = "remote-proxy-host";
 pub const PROXY_PORT: &str = "remote-proxy-port";
@@ -33,11 +39,35 @@ pub(super) enum SecurityChoice {
     SystemManaged,
 }
 
-pub use musheen_desktop::ProfileConnectionTest as ConnectionTestService;
+/// Tests a connection before it is saved. `credentials` answers with the
+/// secrets typed in the editor ahead of the stored ones.
+pub trait ConnectionTestService: Send + Sync + 'static {
+    fn test<'a>(
+        &'a self,
+        profile: &'a ConnectionProfile,
+        credentials: Arc<dyn CredentialResolver>,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RemoteError>>;
+}
 
-/// The connection test a Settings window runs unless a test supplies its own.
-pub(crate) fn default_connection_tester() -> std::sync::Arc<dyn ConnectionTestService> {
-    std::sync::Arc::new(musheen_desktop::ProfileConnectionTester::default())
+/// A tester that brings its own credentials, such as a protocol probe.
+impl<T: musheen_desktop::ProfileConnectionTest> ConnectionTestService for T {
+    fn test<'a>(
+        &'a self,
+        profile: &'a ConnectionProfile,
+        _credentials: Arc<dyn CredentialResolver>,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RemoteError>> {
+        musheen_desktop::ProfileConnectionTest::test(self, profile, cancellation)
+    }
+}
+
+/// The connection test a Settings window runs unless a test supplies its
+/// own: it opens the connection the way browsing does and reads its root.
+pub(crate) fn default_connection_tester() -> Arc<dyn ConnectionTestService> {
+    Arc::new(crate::providers::BrowseConnectionTester::new(
+        musheen_desktop::SshEnvironment::for_current_user(),
+    ))
 }
 
 pub(super) fn controls() -> Vec<&'static SettingSpec> {
@@ -58,6 +88,8 @@ pub(super) fn inputs(
         (PROFILE_PORT, ""),
         (PROFILE_PATH, "/"),
         (PROFILE_USERNAME, ""),
+        (PROFILE_PASSWORD, ""),
+        (LOGIN_KEY_PATH, ""),
         (SECURITY_PIN, ""),
         (PROXY_HOST, ""),
         (PROXY_PORT, ""),
@@ -66,12 +98,25 @@ pub(super) fn inputs(
     ]
     .into_iter()
     .map(|(id, value)| {
+        let masked = id == PROFILE_PASSWORD;
         (
             id,
-            cx.new(|cx| InputState::new(window, cx).default_value(value)),
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(value)
+                    .masked(masked)
+            }),
         )
     })
     .collect()
+}
+
+/// The box a private key is pasted into, for a stored-key SFTP login.
+pub(super) fn key_text_input(
+    window: &mut Window,
+    cx: &mut Context<super::SettingsWindow>,
+) -> Entity<TextareaState> {
+    cx.new(|cx| TextareaState::new(window, cx))
 }
 
 pub(super) fn build_profile(
@@ -204,7 +249,9 @@ pub(super) const fn security_choices(protocol: RemoteProtocol) -> &'static [Secu
     };
     match protocol {
         RemoteProtocol::Ftp => &[Plaintext],
-        RemoteProtocol::Ftps => &[TlsSystemRoots, TlsPinned],
+        // OpenDAL's FTP service has no certificate hook, so browsing cannot
+        // check a pinned FTPS certificate (SYS-031).
+        RemoteProtocol::Ftps => &[TlsSystemRoots],
         RemoteProtocol::Sftp => &[SshKnownHosts, SshPinned],
         RemoteProtocol::WebDav | RemoteProtocol::Http => &[TlsSystemRoots, TlsPinned, Plaintext],
         RemoteProtocol::Smb | RemoteProtocol::Nfs => &[SystemManaged],
@@ -274,9 +321,11 @@ pub(super) const fn security_selected(policy: &SecurityPolicy, choice: SecurityC
     )
 }
 
+/// No browse store connects through a proxy yet, so the editor offers none
+/// (SYS-031); the proxy fields return when one does.
 #[must_use]
-pub(super) const fn supports_proxy(protocol: RemoteProtocol) -> bool {
-    !matches!(protocol, RemoteProtocol::Smb | RemoteProtocol::Nfs)
+pub(super) const fn supports_proxy(_protocol: RemoteProtocol) -> bool {
+    false
 }
 
 #[must_use]
@@ -292,27 +341,121 @@ pub(super) const fn protocol_id(protocol: RemoteProtocol) -> &'static str {
     }
 }
 
-pub(super) const PROTOCOLS: [RemoteProtocol; 7] = [
+/// The protocols browsing can open (SYS-031). SMB and NFS return when they
+/// have a browse store; HTTP when its store can list a folder.
+pub(super) const PROTOCOLS: [RemoteProtocol; 4] = [
     RemoteProtocol::Ftp,
     RemoteProtocol::Ftps,
     RemoteProtocol::Sftp,
     RemoteProtocol::WebDav,
-    RemoteProtocol::Http,
-    RemoteProtocol::Smb,
-    RemoteProtocol::Nfs,
 ];
 
+/// A connection whose secrets wait for the user to accept session-only use,
+/// because the secret service is locked or missing.
+pub(super) struct PendingRemoteSave {
+    profile: ConnectionProfile,
+    secrets: Vec<(ConnectionId, SecretBuffer)>,
+    state: musheen_desktop::SecretServiceState,
+}
+
+/// Answers with the secrets typed in the editor ahead of the stored ones, so
+/// Test connection uses what the user just typed.
+struct EditorCredentials {
+    typed: BTreeMap<ConnectionId, SecretBuffer>,
+    stored: Arc<musheen_desktop::RemoteCredentials>,
+}
+
+impl CredentialResolver for EditorCredentials {
+    fn resolve<'a>(
+        &'a self,
+        reference: &'a CredentialReference,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<SecretBuffer, musheen_desktop::RemoteErrorCategory>> {
+        match self.typed.get(reference.connection_id()) {
+            Some(secret) => {
+                let secret = SecretBuffer::new(secret.expose_secret(<[u8]>::to_vec));
+                Box::pin(async move { Ok(secret) })
+            }
+            None => self.stored.resolve(reference, cancellation),
+        }
+    }
+}
+
 impl super::SettingsWindow {
+    /// The login the editor shows: an SFTP connection's chosen method, with
+    /// its key file path; every other protocol logs in with a password.
+    fn remote_login(&self, cx: &App) -> SshLogin {
+        if self.remote_protocol != RemoteProtocol::Sftp {
+            return SshLogin::Password;
+        }
+        match &self.remote_login {
+            SshLogin::KeyFile { .. } => {
+                let path = self.remote_inputs[LOGIN_KEY_PATH]
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .to_owned();
+                SshLogin::KeyFile {
+                    path: (!path.is_empty()).then(|| path.into()),
+                }
+            }
+            login => login.clone(),
+        }
+    }
+
+    fn typed_password(&self, cx: &App) -> Option<SecretBuffer> {
+        let value = self.remote_inputs[PROFILE_PASSWORD].read(cx).value();
+        (!value.is_empty() && self.remote_login(cx) != SshLogin::Agent)
+            .then(|| SecretBuffer::new(value.as_bytes().to_vec()))
+    }
+
+    fn typed_key(&self, cx: &App) -> Option<SecretBuffer> {
+        let value = self.remote_key_text.read(cx).value();
+        (!value.trim().is_empty() && self.remote_login(cx) == SshLogin::StoredKey)
+            .then(|| SecretBuffer::new(value.as_bytes().to_vec()))
+    }
+
     pub(super) fn remote_profile(&self, cx: &App) -> Result<ConnectionProfile, ()> {
+        let id = ConnectionId::new(self.remote_inputs[PROFILE_ID].read(cx).value().trim())
+            .map_err(|_| ())?;
+        let login = self.remote_login(cx);
+        // A typed password is stored under the connection's ID; an empty field
+        // keeps what the connection already stored; agent login keeps none.
+        let credential = if login == SshLogin::Agent {
+            None
+        } else if self.typed_password(cx).is_some() {
+            Some(CredentialReference::persistent(id.clone()))
+        } else {
+            self.remote_credential
+                .clone()
+                .filter(|reference| reference.connection_id() == &id)
+        };
         build_profile(
             &self.remote_inputs,
             self.remote_protocol,
             self.remote_security.clone(),
             self.remote_proxy,
-            self.remote_credential.clone(),
+            credential,
             cx,
         )
+        .and_then(|profile| profile.with_login(login))
         .map_err(|_| ())
+    }
+
+    /// The secrets typed for `profile`, each under the ID it is stored as.
+    fn typed_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        cx: &App,
+    ) -> Vec<(ConnectionId, SecretBuffer)> {
+        let mut secrets = Vec::new();
+        if let Some(password) = self.typed_password(cx) {
+            secrets.push((profile.id().clone(), password));
+        }
+        if let (Some(key), Some(reference)) = (self.typed_key(cx), profile.stored_key_reference()) {
+            secrets.push((reference.connection_id().clone(), key));
+        }
+        secrets
     }
 
     pub(super) fn invalidate_remote_test(&mut self) {
@@ -324,6 +467,8 @@ impl super::SettingsWindow {
         self.remote_test_report = None;
         self.remote_save_requirement = None;
         self.remote_validation_failed = false;
+        self.remote_session_offer = None;
+        self.remote_secret_error = None;
     }
 
     fn test_remote_connection(&mut self, cx: &mut Context<Self>) {
@@ -339,6 +484,10 @@ impl super::SettingsWindow {
         if let Some(cancellation) = self.remote_test_cancellation.take() {
             cancellation.cancel();
         }
+        let credentials: Arc<dyn CredentialResolver> = Arc::new(EditorCredentials {
+            typed: self.typed_secrets(&profile, cx).into_iter().collect(),
+            stored: Arc::clone(&self.remote_credentials),
+        });
         let cancellation = musheen_core::CancellationToken::new();
         self.remote_test_cancellation = Some(cancellation.clone());
         self.remote_testing = true;
@@ -349,7 +498,7 @@ impl super::SettingsWindow {
         let generation = self.remote_test_generation;
         let tester = self.remote_tester.clone();
         let work = cx.background_spawn(async move {
-            let result = tester.test(&profile, cancellation).await;
+            let result = tester.test(&profile, credentials, cancellation).await;
             (profile, result)
         });
         cx.spawn(async move |this, cx| {
@@ -375,19 +524,22 @@ impl super::SettingsWindow {
         cx.notify();
     }
 
-    fn stage_remote_connection(&mut self, confirmed: bool, cx: &mut Context<Self>) {
+    fn stage_remote_connection(
+        &mut self,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_saving {
+            return;
+        }
         let Ok(profile) = self.remote_profile(cx) else {
             self.remote_validation_failed = true;
             self.remote_save_requirement = None;
             cx.notify();
             return;
         };
-        let Some(document) = self.state.draft().value("remote.connections") else {
-            self.remote_validation_failed = true;
-            cx.notify();
-            return;
-        };
-        let Ok(saved) = ConnectionProfiles::import(&document) else {
+        let Some(saved) = self.saved_remote_profiles() else {
             self.remote_validation_failed = true;
             cx.notify();
             return;
@@ -411,12 +563,112 @@ impl super::SettingsWindow {
             cx.notify();
             return;
         }
+        let secrets = self.typed_secrets(&profile, cx);
+        if secrets.is_empty() {
+            self.commit_remote_profile(profile, window, cx);
+            return;
+        }
+        self.store_remote_secrets(
+            profile,
+            secrets,
+            musheen_desktop::SecretStorage::Persistent,
+            window,
+            cx,
+        );
+    }
 
+    /// Stores the typed secrets in the background, then saves the profile.
+    /// A locked or missing secret service leaves the profile waiting for the
+    /// user to accept session-only use.
+    fn store_remote_secrets(
+        &mut self,
+        profile: ConnectionProfile,
+        secrets: Vec<(ConnectionId, SecretBuffer)>,
+        storage: musheen_desktop::SecretStorage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_saving = true;
+        self.remote_session_offer = None;
+        self.remote_secret_error = None;
+        let credentials = Arc::clone(&self.remote_credentials);
+        let label = format!("Musheen: {}", profile.name());
+        let work = cx.background_spawn(async move {
+            for (id, secret) in &secrets {
+                if let Err(error) = credentials
+                    .store(id, &label, secret, storage, CancellationToken::new())
+                    .await
+                {
+                    return (secrets, Err(error));
+                }
+            }
+            (secrets, Ok(()))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (secrets, result) = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.remote_saving = false;
+                match result {
+                    Ok(()) => this.commit_remote_profile(profile, window, cx),
+                    Err(musheen_desktop::SecretError::SessionOnlyAvailable(state)) => {
+                        this.remote_session_offer = Some(PendingRemoteSave {
+                            profile,
+                            secrets,
+                            state,
+                        });
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        this.remote_secret_error = Some(error);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Keeps the waiting secrets in memory until Musheen exits, then saves
+    /// the profile.
+    fn accept_session_only(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.remote_session_offer.take() else {
+            return;
+        };
+        self.store_remote_secrets(
+            pending.profile,
+            pending.secrets,
+            musheen_desktop::SecretStorage::SessionOnlyConfirmed,
+            window,
+            cx,
+        );
+    }
+
+    fn saved_remote_profiles(&self) -> Option<ConnectionProfiles> {
+        self.state
+            .draft()
+            .value("remote.connections")
+            .and_then(|document| ConnectionProfiles::import(&document).ok())
+    }
+
+    /// Writes `profile` to the draft settings, replacing a saved connection
+    /// with its ID, and forgets the typed secrets.
+    fn commit_remote_profile(
+        &mut self,
+        profile: ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(saved) = self.saved_remote_profiles() else {
+            self.remote_validation_failed = true;
+            cx.notify();
+            return;
+        };
         let mut profiles = saved.profiles().to_vec();
         if let Some(index) = profiles.iter().position(|saved| saved.id() == profile.id()) {
-            profiles[index] = profile;
+            profiles[index] = profile.clone();
         } else {
-            profiles.push(profile);
+            profiles.push(profile.clone());
         }
         let encoded = ConnectionProfiles::new(profiles)
             .export()
@@ -424,9 +676,100 @@ impl super::SettingsWindow {
         if self.state.edit("remote.connections", &encoded).is_ok() {
             self.remote_save_requirement = None;
             self.remote_validation_failed = false;
+            self.forget_retired_secrets(&profile, cx);
+            self.remote_credential = profile.credential().cloned();
+            self.remote_stored_key = profile.stored_key_reference().is_some();
+            self.remote_inputs[PROFILE_PASSWORD]
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.remote_key_text
+                .update(cx, |input, cx| input.set_value("", window, cx));
         } else {
             self.remote_validation_failed = true;
         }
+        cx.notify();
+    }
+
+    /// Removes secrets the connection kept before this save and no longer
+    /// uses, such as a password after a switch to agent login.
+    fn forget_retired_secrets(&self, profile: &ConnectionProfile, cx: &mut Context<Self>) {
+        let mut retired = Vec::new();
+        if profile.credential().is_none()
+            && let Some(previous) = &self.remote_credential
+            && previous.connection_id() == profile.id()
+        {
+            retired.push(previous.connection_id().clone());
+        }
+        if self.remote_stored_key
+            && profile.stored_key_reference().is_none()
+            && let Ok(key) = ConnectionId::new(format!("{}.key", profile.id().as_str()))
+        {
+            retired.push(key);
+        }
+        self.forget_secrets(retired, cx);
+    }
+
+    fn forget_secrets(&self, ids: Vec<ConnectionId>, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        let credentials = Arc::clone(&self.remote_credentials);
+        cx.background_spawn(async move {
+            for id in ids {
+                // A secret the service cannot delete now stays unused; nothing
+                // refers to it any more.
+                let _ = credentials.remove(&id, CancellationToken::new()).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Removes the connection being edited from the draft settings and its
+    /// password and stored key from the secret service.
+    fn remove_remote_connection(&mut self, cx: &mut Context<Self>) {
+        let Ok(id) = ConnectionId::new(self.remote_inputs[PROFILE_ID].read(cx).value().trim())
+        else {
+            return;
+        };
+        let Some(saved) = self.saved_remote_profiles() else {
+            return;
+        };
+        let profiles = saved
+            .profiles()
+            .iter()
+            .filter(|profile| profile.id() != &id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let encoded = ConnectionProfiles::new(profiles)
+            .export()
+            .expect("validated connection profiles serialize");
+        if self.state.edit("remote.connections", &encoded).is_err() {
+            self.remote_validation_failed = true;
+            cx.notify();
+            return;
+        }
+        let mut ids = vec![id.clone()];
+        ids.extend(ConnectionId::new(format!("{}.key", id.as_str())));
+        self.forget_secrets(ids, cx);
+        self.remote_credential = None;
+        self.remote_stored_key = false;
+        self.remote_editor_open = false;
+        self.invalidate_remote_test();
+        cx.notify();
+    }
+
+    fn editing_saved_connection(&self, cx: &App) -> bool {
+        let id = self.remote_inputs[PROFILE_ID].read(cx).value();
+        self.saved_remote_profiles().is_some_and(|saved| {
+            saved
+                .profiles()
+                .iter()
+                .any(|profile| profile.id().as_str() == id.trim())
+        })
+    }
+
+    fn select_remote_login(&mut self, login: SshLogin, cx: &mut Context<Self>) {
+        self.remote_login = login;
+        self.invalidate_remote_test();
         cx.notify();
     }
 
@@ -459,12 +802,11 @@ impl super::SettingsWindow {
         self.remote_protocol = RemoteProtocol::Sftp;
         self.remote_security = default_security(RemoteProtocol::Sftp);
         self.remote_proxy = None;
-        self.remote_credential = self
-            .state
-            .draft()
-            .value("remote.credential")
-            .filter(|value| !value.is_empty())
-            .and_then(|value| CredentialReference::from_setting_value(&value).ok());
+        self.remote_credential = None;
+        self.remote_stored_key = false;
+        self.remote_login = SshLogin::Password;
+        self.remote_key_text
+            .update(cx, |input, cx| input.set_value("", window, cx));
         for (key, value) in [
             (PROFILE_ID, ""),
             (PROFILE_NAME, ""),
@@ -472,6 +814,8 @@ impl super::SettingsWindow {
             (PROFILE_PORT, ""),
             (PROFILE_PATH, "/"),
             (PROFILE_USERNAME, ""),
+            (PROFILE_PASSWORD, ""),
+            (LOGIN_KEY_PATH, ""),
             (SECURITY_PIN, ""),
             (PROXY_HOST, ""),
             (PROXY_PORT, ""),
@@ -495,6 +839,14 @@ impl super::SettingsWindow {
         self.remote_security = profile.security().clone();
         self.remote_proxy = profile.proxy().map(ProxySettings::kind);
         self.remote_credential = profile.credential().cloned();
+        self.remote_stored_key = profile.stored_key_reference().is_some();
+        self.remote_login = profile.login().clone();
+        self.remote_key_text
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let key_path = match profile.login() {
+            SshLogin::KeyFile { path } => path.as_deref().unwrap_or_default().to_owned(),
+            _ => String::new(),
+        };
         let security_pin = match profile.security() {
             SecurityPolicy::Tls(TlsPolicy::PinnedSha256(pin))
             | SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(pin)) => hex_pin(pin),
@@ -516,6 +868,8 @@ impl super::SettingsWindow {
                 PROFILE_USERNAME,
                 profile.username().unwrap_or_default().to_owned(),
             ),
+            (PROFILE_PASSWORD, String::new()),
+            (LOGIN_KEY_PATH, key_path),
             (SECURITY_PIN, security_pin),
             (
                 PROXY_HOST,
@@ -592,16 +946,28 @@ impl super::SettingsWindow {
             let profile = profile.clone();
             let id = format!("settings-remote-edit-{}", profile.id().as_str());
             let label = format!("{}: {}", self.label("settings-remote-edit"), profile.name());
-            summary = summary.child(super::window::native_button(id, label, cx).on_click(
-                cx.listener(move |settings, _, window, cx| {
-                    settings.load_remote_profile(profile.clone(), window, cx);
-                }),
-            ));
+            let refusal = profile.browse_refusal();
+            let refused_id = format!("settings-remote-refused-{}", profile.id().as_str());
+            summary = summary
+                .child(
+                    super::window::native_button(id, label, cx).on_click(cx.listener(
+                        move |settings, _, window, cx| {
+                            settings.load_remote_profile(profile.clone(), window, cx);
+                        },
+                    )),
+                )
+                .when_some(refusal, |summary, refusal| {
+                    summary.child(super::window::status_label(
+                        refused_id,
+                        self.label(refusal_key(refusal)),
+                        Role::Status,
+                    ))
+                });
         }
         summary.into_any_element()
     }
 
-    fn render_remote_profile_fields(&self) -> AnyElement {
+    fn render_remote_profile_fields(&self, cx: &App) -> AnyElement {
         let mut fields = div()
             .id("settings-remote-profile-list")
             .test_support()
@@ -631,7 +997,117 @@ impl super::SettingsWindow {
                         .aria_label(self.label(label)),
                 );
         }
+        let password_label = match self.remote_login(cx) {
+            SshLogin::Agent => None,
+            SshLogin::Password => Some("settings-remote-password"),
+            SshLogin::KeyFile { .. } | SshLogin::StoredKey => Some("settings-remote-passphrase"),
+        };
+        if let Some(label) = password_label {
+            fields = fields
+                .child(super::window::observed_label(
+                    format!("label-{PROFILE_PASSWORD}"),
+                    self.label(label),
+                ))
+                .child(
+                    Input::new(&self.remote_inputs[PROFILE_PASSWORD])
+                        .id(PROFILE_PASSWORD)
+                        .mask_toggle()
+                        .disabled(self.blocked() || self.remote_testing || self.remote_saving)
+                        .accessibility_id(PROFILE_PASSWORD)
+                        .aria_label(self.label(label)),
+                );
+        }
         fields.into_any_element()
+    }
+
+    /// The sign-in methods of an SFTP connection, with the key file path or
+    /// the pasted key the chosen method needs.
+    fn render_remote_login(&self, cx: &Context<Self>) -> AnyElement {
+        let mut methods = div()
+            .id("settings-remote-login-options")
+            .test_support()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .role(Role::Group)
+            .aria_label(self.label("settings-remote-login"));
+        for (id, label, login) in [
+            (
+                "settings-remote-login-password",
+                "settings-remote-login-password",
+                SshLogin::Password,
+            ),
+            (
+                "settings-remote-login-agent",
+                "settings-remote-login-agent",
+                SshLogin::Agent,
+            ),
+            (
+                "settings-remote-login-key-file",
+                "settings-remote-login-key-file",
+                SshLogin::KeyFile { path: None },
+            ),
+            (
+                "settings-remote-login-stored-key",
+                "settings-remote-login-stored-key",
+                SshLogin::StoredKey,
+            ),
+        ] {
+            let selected =
+                std::mem::discriminant(&self.remote_login) == std::mem::discriminant(&login);
+            methods = methods.child(
+                super::window::native_button(id, self.label(label), cx)
+                    .selected(selected)
+                    .disabled(self.blocked() || self.remote_testing || self.remote_saving)
+                    .on_click(cx.listener(move |settings, _, _, cx| {
+                        settings.select_remote_login(login.clone(), cx);
+                    })),
+            );
+        }
+        let mut login = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(super::window::observed_label(
+                "settings-remote-login-label",
+                self.label("settings-remote-login"),
+            ))
+            .child(methods);
+        match self.remote_login {
+            SshLogin::KeyFile { .. } => {
+                login = login
+                    .child(super::window::observed_label(
+                        format!("label-{LOGIN_KEY_PATH}"),
+                        self.label("settings-remote-key-path"),
+                    ))
+                    .child(
+                        Input::new(&self.remote_inputs[LOGIN_KEY_PATH])
+                            .id(LOGIN_KEY_PATH)
+                            .disabled(self.blocked() || self.remote_testing)
+                            .accessibility_id(LOGIN_KEY_PATH)
+                            .aria_label(self.label("settings-remote-key-path")),
+                    );
+            }
+            SshLogin::StoredKey => {
+                login = login
+                    .child(super::window::observed_label(
+                        format!("label-{LOGIN_KEY_TEXT}"),
+                        self.label("settings-remote-key-text"),
+                    ))
+                    .child(
+                        div().id(LOGIN_KEY_TEXT).test_support().child(
+                            Textarea::new(&self.remote_key_text)
+                                .disabled(
+                                    self.blocked() || self.remote_testing || self.remote_saving,
+                                )
+                                .accessibility_id(LOGIN_KEY_TEXT)
+                                .aria_label(self.label("settings-remote-key-text")),
+                        ),
+                    );
+            }
+            SshLogin::Password | SshLogin::Agent => {}
+        }
+        login.into_any_element()
     }
 
     fn render_remote_protocols(&self, cx: &Context<Self>) -> AnyElement {
@@ -791,7 +1267,7 @@ impl super::SettingsWindow {
             .into_any_element()
     }
 
-    fn render_remote_feedback(&self) -> AnyElement {
+    fn render_remote_feedback(&self, cx: &Context<Self>) -> AnyElement {
         let mut feedback = div().flex().flex_col().gap_1();
         if self.remote_testing {
             feedback = feedback.child(super::window::status_label(
@@ -814,6 +1290,58 @@ impl super::SettingsWindow {
                 )
             };
             feedback = feedback.child(super::window::status_label(id, self.label(label), role));
+            if let Some(error) = report.error() {
+                feedback = feedback.child(super::window::status_label(
+                    "settings-remote-test-cause",
+                    self.label(cause_key(error.category())),
+                    Role::Alert,
+                ));
+            }
+        }
+        if self.remote_saving {
+            feedback = feedback.child(super::window::status_label(
+                "settings-remote-saving",
+                self.label("settings-remote-saving"),
+                Role::Status,
+            ));
+        }
+        if let Some(offer) = &self.remote_session_offer {
+            let reason = if offer.state == musheen_desktop::SecretServiceState::Locked {
+                "settings-remote-keyring-locked"
+            } else {
+                "settings-remote-keyring-unavailable"
+            };
+            feedback = feedback
+                .child(super::window::status_label(
+                    "settings-remote-keyring-refused",
+                    self.label(reason),
+                    Role::Alert,
+                ))
+                .child(
+                    Button::new("settings-remote-session-only")
+                        .label(self.label("settings-remote-session-only"))
+                        .on_click(cx.listener(|settings, _, window, cx| {
+                            settings.accept_session_only(window, cx);
+                        })),
+                );
+        }
+        if self.remote_secret_error.is_some() {
+            feedback = feedback.child(super::window::status_label(
+                "settings-remote-keyring-failed",
+                self.label("settings-remote-keyring-failed"),
+                Role::Alert,
+            ));
+        }
+        if let Some(refusal) = self
+            .remote_profile(cx)
+            .ok()
+            .and_then(|profile| profile.browse_refusal())
+        {
+            feedback = feedback.child(super::window::status_label(
+                "settings-remote-refused",
+                self.label(refusal_key(refusal)),
+                Role::Alert,
+            ));
         }
         if self.remote_validation_failed
             || self.remote_save_requirement == Some(SaveRequirement::TestRequired)
@@ -829,6 +1357,39 @@ impl super::SettingsWindow {
             ));
         }
         feedback.into_any_element()
+    }
+}
+
+/// The message that names the cause of a failed connection test.
+const fn cause_key(category: RemoteErrorCategory) -> &'static str {
+    match category {
+        RemoteErrorCategory::InvalidProfile => "settings-remote-cause-invalid-profile",
+        RemoteErrorCategory::Authentication => "settings-remote-cause-authentication",
+        RemoteErrorCategory::HostKey => "settings-remote-cause-host-key",
+        RemoteErrorCategory::Tls => "settings-remote-cause-tls",
+        RemoteErrorCategory::Network => "settings-remote-cause-network",
+        RemoteErrorCategory::Protocol => "settings-remote-cause-protocol",
+        RemoteErrorCategory::Redirect => "settings-remote-cause-redirect",
+        RemoteErrorCategory::Timeout => "settings-remote-cause-timeout",
+        RemoteErrorCategory::Cancelled => "settings-remote-cause-cancelled",
+        RemoteErrorCategory::Saturated => "settings-remote-cause-saturated",
+        RemoteErrorCategory::Unavailable => "settings-remote-cause-unavailable",
+        RemoteErrorCategory::Retryable => "settings-remote-cause-retryable",
+        RemoteErrorCategory::Conflict => "settings-remote-cause-conflict",
+        RemoteErrorCategory::Quota => "settings-remote-cause-quota",
+        RemoteErrorCategory::Permission => "settings-remote-cause-permission",
+        RemoteErrorCategory::Unsupported => "settings-remote-cause-unsupported",
+        RemoteErrorCategory::Permanent => "settings-remote-cause-permanent",
+        RemoteErrorCategory::KeyNeedsAgent => "settings-remote-cause-key-needs-agent",
+    }
+}
+
+/// The message that says why browsing cannot open a saved connection.
+const fn refusal_key(refusal: BrowseRefusal) -> &'static str {
+    match refusal {
+        BrowseRefusal::Protocol => "settings-remote-refused-protocol",
+        BrowseRefusal::Proxy => "settings-remote-refused-proxy",
+        BrowseRefusal::CertificatePin => "settings-remote-refused-pin",
     }
 }
 
@@ -850,15 +1411,11 @@ pub(super) fn render_editor(
                 | musheen_desktop::SaveRequirement::TestRequired
         )
     });
-    let credential = settings
-        .state
-        .draft()
-        .value("remote.credential")
-        .filter(|value| !value.is_empty())
-        .map_or(
-            "settings-value-none",
-            |_| "settings-value-credential-stored",
-        );
+    let credential = if settings.remote_credential.is_some() {
+        "settings-value-credential-stored"
+    } else {
+        "settings-value-none"
+    };
     div()
         .id("remote.connections")
         .test_support()
@@ -889,8 +1446,8 @@ pub(super) fn render_editor(
                 .child(
                     Button::new("settings-remote-confirm-save")
                         .label(settings.label("settings-remote-confirm-save"))
-                        .on_click(cx.listener(|settings, _, _, cx| {
-                            settings.stage_remote_connection(true, cx);
+                        .on_click(cx.listener(|settings, _, window, cx| {
+                            settings.stage_remote_connection(true, window, cx);
                         })),
                 )
         })
@@ -914,20 +1471,38 @@ pub(super) fn render_editor(
                     Button::new("settings-remote-save")
                         .label(settings.label("settings-remote-save"))
                         .primary()
-                        .disabled(settings.blocked() || settings.remote_testing)
-                        .on_click(cx.listener(|settings, _, _, cx| {
-                            settings.stage_remote_connection(false, cx);
+                        .disabled(
+                            settings.blocked() || settings.remote_testing || settings.remote_saving,
+                        )
+                        .on_click(cx.listener(|settings, _, window, cx| {
+                            settings.stage_remote_connection(false, window, cx);
                         })),
-                ),
+                )
+                .when(settings.editing_saved_connection(cx), |buttons| {
+                    buttons.child(
+                        super::window::native_button(
+                            "settings-remote-remove",
+                            settings.label("settings-remote-remove"),
+                            cx,
+                        )
+                        .disabled(settings.blocked() || settings.remote_saving)
+                        .on_click(cx.listener(|settings, _, _, cx| {
+                            settings.remove_remote_connection(cx);
+                        })),
+                    )
+                }),
         )
-        .child(settings.render_remote_feedback())
-        .child(settings.render_remote_profile_fields())
+        .child(settings.render_remote_feedback(cx))
+        .child(settings.render_remote_profile_fields(cx))
         .child(super::window::observed_label(
             "settings-remote-protocol-label",
             settings.label("settings-remote-protocol"),
         ))
         .child(settings.render_remote_protocols(cx))
         .child(settings.render_remote_security(cx))
+        .when(settings.remote_protocol == RemoteProtocol::Sftp, |editor| {
+            editor.child(settings.render_remote_login(cx))
+        })
         .when(supports_proxy(settings.remote_protocol), |editor| {
             editor.child(settings.render_remote_proxy(cx))
         })

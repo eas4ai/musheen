@@ -1,6 +1,7 @@
 use super::*;
 use musheen_desktop::{
-    ConnectionProfile, OpendalStore, RemoteProtocol, SecretServiceCredentialResolver,
+    ConnectionProfile, CredentialResolver, OpendalStore, RemoteCredentials, RemoteError,
+    RemoteErrorCategory, RemoteProtocol, SshEnvironment,
 };
 use std::sync::RwLock;
 
@@ -87,66 +88,114 @@ pub(super) type RemoteStoreConnector = Arc<
 >;
 
 pub(super) fn default_remote_connector() -> RemoteStoreConnector {
-    Arc::new(|provider, profile, cancellation| {
+    remote_connector(
+        Arc::new(RemoteCredentials::system()),
+        SshEnvironment::for_current_user(),
+    )
+}
+
+/// Opens saved connections with `credentials` and the SSH files `ssh` names.
+pub(super) fn remote_connector(
+    credentials: Arc<dyn CredentialResolver>,
+    ssh: SshEnvironment,
+) -> RemoteStoreConnector {
+    Arc::new(move |provider, profile, cancellation| {
+        let credentials = Arc::clone(&credentials);
+        let ssh = ssh.clone();
         Box::pin(async move {
-            let credentials = SecretServiceCredentialResolver::default();
-            let store: Arc<OpendalStore> = match profile.protocol() {
-                RemoteProtocol::Ftp | RemoteProtocol::Ftps => Arc::new(
-                    musheen_desktop::ftp_store_from_profile(
-                        provider,
-                        &profile,
-                        &credentials,
-                        cancellation,
-                    )
-                    .await
-                    .map_err(remote_error)?,
-                ),
-                RemoteProtocol::Sftp => Arc::new(
-                    musheen_desktop::sftp_store_from_profile(
-                        provider,
-                        &profile,
-                        &credentials,
-                        cancellation,
-                    )
-                    .await
-                    .map_err(remote_error)?,
-                ),
-                RemoteProtocol::WebDav => Arc::new(
-                    musheen_desktop::webdav_store_from_profile(
-                        provider,
-                        &profile,
-                        &credentials,
-                        cancellation,
-                    )
-                    .await
-                    .map_err(remote_error)?,
-                ),
-                RemoteProtocol::Http => Arc::new(
-                    musheen_desktop::http_store_from_profile(
-                        provider,
-                        &profile,
-                        &credentials,
-                        cancellation,
-                    )
-                    .await
-                    .map_err(remote_error)?,
-                ),
-                RemoteProtocol::Smb => {
-                    return Err(StoreError::unsupported(
-                        "open SMB connection",
-                        "SMB profile connection is not yet available in this build",
-                    ));
-                }
-                RemoteProtocol::Nfs => {
-                    return Err(StoreError::unsupported(
-                        "open NFS connection",
-                        "NFS locations must be mounted by the system first",
-                    ));
-                }
-            };
-            Ok(RemoteStoreConnection::opendal(store))
+            open_remote_store(provider, &profile, &credentials, &ssh, cancellation)
+                .await
+                .map(RemoteStoreConnection::opendal)
+                .map_err(remote_error)
         })
     })
+}
+
+/// Opens `profile` the way browsing does. A connection browsing cannot open
+/// in this build is refused before any network I/O.
+async fn open_remote_store(
+    provider: ProviderId,
+    profile: &ConnectionProfile,
+    credentials: &Arc<dyn CredentialResolver>,
+    ssh: &SshEnvironment,
+    cancellation: CancellationToken,
+) -> Result<Arc<OpendalStore>, RemoteError> {
+    if profile.browse_refusal().is_some() {
+        return Err(RemoteError::new(
+            profile.protocol(),
+            RemoteErrorCategory::Unsupported,
+            Some(profile.host().clone()),
+        ));
+    }
+    let store = match profile.protocol() {
+        RemoteProtocol::Ftp | RemoteProtocol::Ftps => {
+            musheen_desktop::ftp_store_from_profile(provider, profile, credentials, cancellation)
+                .await?
+        }
+        RemoteProtocol::Sftp => {
+            musheen_desktop::sftp_store_from_profile_in(
+                provider,
+                profile,
+                credentials,
+                ssh,
+                cancellation,
+            )
+            .await?
+        }
+        RemoteProtocol::WebDav => {
+            musheen_desktop::webdav_store_from_profile(provider, profile, credentials, cancellation)
+                .await?
+        }
+        RemoteProtocol::Http => {
+            musheen_desktop::http_store_from_profile(provider, profile, credentials, cancellation)
+                .await?
+        }
+        RemoteProtocol::Smb | RemoteProtocol::Nfs => {
+            return Err(RemoteError::new(
+                profile.protocol(),
+                RemoteErrorCategory::Unsupported,
+                Some(profile.host().clone()),
+            ));
+        }
+    };
+    Ok(Arc::new(store))
+}
+
+/// Tests a connection by opening it the way browsing does and reading its
+/// root, so a connection passes only when browsing can open it.
+pub(crate) struct BrowseConnectionTester {
+    ssh: SshEnvironment,
+}
+
+impl BrowseConnectionTester {
+    pub(crate) fn new(ssh: SshEnvironment) -> Self {
+        Self { ssh }
+    }
+}
+
+impl crate::settings::ConnectionTestService for BrowseConnectionTester {
+    fn test<'a>(
+        &'a self,
+        profile: &'a ConnectionProfile,
+        credentials: Arc<dyn CredentialResolver>,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), RemoteError>> {
+        Box::pin(async move {
+            let provider = ProviderId::new("musheen.remote.connection-test")
+                .expect("the connection test provider ID is valid");
+            let store = open_remote_store(
+                provider,
+                profile,
+                &credentials,
+                &self.ssh,
+                cancellation.clone(),
+            )
+            .await?;
+            store.check_root(cancellation).await.map_err(|category| {
+                RemoteError::new(profile.protocol(), category, Some(profile.host().clone()))
+            })
+        })
+    }
 }
 
 fn remote_error(error: musheen_desktop::RemoteError) -> StoreError {

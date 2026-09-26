@@ -59,7 +59,9 @@ pub fn ftp_store_from_profile<'a, R: CredentialResolver>(
         }
         let (scheme, port) = match (profile.protocol(), profile.security()) {
             (RemoteProtocol::Ftp, SecurityPolicy::PlaintextConfirmed) => ("ftp", 21),
-            (RemoteProtocol::Ftps, SecurityPolicy::Tls(TlsPolicy::SystemRoots)) => ("ftps", 990),
+            // OpenDAL's FTPS is explicit TLS (AUTH TLS), whose standard port
+            // is FTP's own.
+            (RemoteProtocol::Ftps, SecurityPolicy::Tls(TlsPolicy::SystemRoots)) => ("ftps", 21),
             (RemoteProtocol::Ftps, SecurityPolicy::Tls(TlsPolicy::PinnedSha256(_))) => {
                 // OpenDAL's FTP service hard-wires native roots and exposes no
                 // certificate verifier hook. Never silently weaken the pin.

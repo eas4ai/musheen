@@ -133,9 +133,8 @@ fn serve_ftp(stream: TcpStream, options: FtpServerOptions, log: &Mutex<FtpLog>) 
                         return;
                     }
                     if let Ok((mut connection, _)) = listener.accept() {
-                        let _ = connection.write_all(
-                            b"-rw-r--r-- 1 owner group 5 Jan 01 00:00 hello.txt\r\n",
-                        );
+                        let _ = connection
+                            .write_all(b"-rw-r--r-- 1 owner group 5 Jan 01 00:00 hello.txt\r\n");
                     }
                     "226 done\r\n".to_owned()
                 }
