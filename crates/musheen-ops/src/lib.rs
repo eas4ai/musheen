@@ -49,7 +49,7 @@ pub use r#move::{
 };
 pub use mutation::{MutationError, MutationProvider};
 pub use plan::{
-    ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, ExtractMerge, InverseTemplate,
+    AnsweredItem, ArchiveCodec, ArchiveConflictPolicy, ArchiveOperationPlan, ExtractMerge, InverseTemplate,
     OperationKind, OperationPlan, PlanError, ProviderLimits, ProviderSnapshot, WorkClass,
 };
 pub use recovery::{RecoveryContext, RecoveryDecision, decide_recovery};

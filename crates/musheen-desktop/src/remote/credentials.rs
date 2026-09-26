@@ -1,7 +1,7 @@
 use super::{CredentialResolver, RemoteErrorCategory};
 use crate::{
     ConnectionId, CredentialReference, CredentialVault, LinuxSecretService, SecretBuffer,
-    SecretError, SecretServiceBackend, SecretStorage,
+    SecretError, SecretServiceBackend, SecretServiceState, SecretStorage,
 };
 use musheen_core::{BoxFuture, CancellationToken};
 use std::collections::BTreeMap;
@@ -32,6 +32,23 @@ impl RemoteCredentials {
     #[must_use]
     pub fn system() -> Self {
         Self::new(Arc::new(LinuxSecretService::default()))
+    }
+
+    /// Whether the secret service can store a secret now, without storing
+    /// one. A locked or missing service fails with
+    /// `SecretError::SessionOnlyAvailable`, as `store` would.
+    pub async fn availability(&self, cancellation: CancellationToken) -> Result<(), SecretError> {
+        match self.vault.state(cancellation).await {
+            Ok(SecretServiceState::Available) => Ok(()),
+            Ok(state) => Err(SecretError::SessionOnlyAvailable(state)),
+            Err(SecretError::Locked) => Err(SecretError::SessionOnlyAvailable(
+                SecretServiceState::Locked,
+            )),
+            Err(SecretError::Unavailable | SecretError::Disconnected | SecretError::Timeout) => Err(
+                SecretError::SessionOnlyAvailable(SecretServiceState::Unavailable),
+            ),
+            Err(error) => Err(error),
+        }
     }
 
     /// Stores `secret` under `id`, in the secret service or, when `storage`

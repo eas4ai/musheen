@@ -173,6 +173,16 @@ impl MemoryKeyring {
         keyring
     }
 
+    /// Locks or unlocks the keyring, as the user does on the desktop.
+    pub(crate) fn set_locked(&self, locked: bool) {
+        self.state().locked = locked;
+    }
+
+    /// Stores `secret` under `id`, as another tool or an older build did.
+    pub(crate) fn put(&self, id: &str, secret: &[u8]) {
+        self.state().secrets.insert(id.to_owned(), secret.to_vec());
+    }
+
     /// The secret stored under a connection ID.
     pub(crate) fn secret(&self, id: &str) -> Option<Vec<u8>> {
         self.state().secrets.get(id).cloned()

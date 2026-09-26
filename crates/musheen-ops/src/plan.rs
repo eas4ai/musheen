@@ -57,27 +57,69 @@ pub enum ArchiveConflictPolicy {
     Replace,
 }
 
+/// An existing item the user answered about, as it was when they answered:
+/// its device, inode and kind. An answer holds only while the item at its
+/// path is still this one.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnsweredItem {
+    pub device: u64,
+    pub inode: u64,
+    pub folder: bool,
+}
+
+impl AnsweredItem {
+    /// Whether the item with this device and inode is the one answered about.
+    #[must_use]
+    pub const fn is(&self, device: u64, inode: u64) -> bool {
+        self.device == device && self.inode == inode
+    }
+}
+
 /// How an extraction merges into a destination folder that already exists.
-/// It names, relative to that folder, each colliding entry the user chose to
-/// replace; every other collision is skipped, including one that appeared
-/// after the user answered.
+/// It names, relative to that folder, each colliding item the user chose to
+/// replace, as it was when they answered; every other collision is skipped,
+/// including one that appeared or changed after the user answered. When
+/// something other than a folder has the destination's name, `whole` names
+/// the item the user chose to replace, and only that item is replaced.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExtractMerge {
-    replace: std::collections::BTreeSet<Vec<u8>>,
+    replace: std::collections::BTreeMap<Vec<u8>, AnsweredItem>,
+    whole: Option<AnsweredItem>,
 }
 
 impl ExtractMerge {
-    /// `replace` holds entry paths relative to the destination folder, with
-    /// `/` between components.
-    pub fn new(replace: impl IntoIterator<Item = Vec<u8>>) -> Self {
+    /// `replace` maps entry paths relative to the destination folder, with
+    /// `/` between components, to the items the user chose to replace.
+    pub fn new(replace: impl IntoIterator<Item = (Vec<u8>, AnsweredItem)>) -> Self {
         Self {
             replace: replace.into_iter().collect(),
+            whole: None,
         }
     }
 
+    /// Replaces the item that has the destination folder's name, while it is
+    /// still `item`.
     #[must_use]
-    pub fn replaces(&self, relative: &[u8]) -> bool {
-        self.replace.contains(relative)
+    pub fn replacing_destination(item: AnsweredItem) -> Self {
+        Self {
+            replace: std::collections::BTreeMap::new(),
+            whole: Some(item),
+        }
+    }
+
+    /// Whether the user chose to replace the item at `relative`, and it is
+    /// still the item with this device and inode.
+    #[must_use]
+    pub fn replaces(&self, relative: &[u8], device: u64, inode: u64) -> bool {
+        self.replace
+            .get(relative)
+            .is_some_and(|item| item.is(device, inode))
+    }
+
+    /// The item with the destination folder's name the user chose to replace.
+    #[must_use]
+    pub const fn whole(&self) -> Option<&AnsweredItem> {
+        self.whole.as_ref()
     }
 }
 

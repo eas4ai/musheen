@@ -989,11 +989,13 @@ enum TrashRestoreResult {
 
 /// One question an extraction asks before it runs: an existing item, by its
 /// path relative to the destination folder, or the folder's own name when
-/// something other than a folder already has it.
+/// something other than a folder already has it, with the item as it was
+/// when the question was asked.
 #[derive(Clone, Debug)]
 struct ExtractQuestion {
     path: Vec<u8>,
     whole_folder: bool,
+    item: musheen_ops::AnsweredItem,
 }
 
 /// An extraction waiting for the user's answers about its collisions.
@@ -1001,7 +1003,7 @@ struct PendingExtract {
     plan: ArchiveOperationPlan,
     current: ExtractQuestion,
     remaining: std::collections::VecDeque<ExtractQuestion>,
-    replace: std::collections::BTreeSet<Vec<u8>>,
+    replace: std::collections::BTreeMap<Vec<u8>, musheen_ops::AnsweredItem>,
     window: Option<WindowId>,
     // Keeps the dialog alive until its answer arrives.
     dialog: Option<Entity<ExtractConflictDialog>>,
@@ -3822,6 +3824,9 @@ struct MusheenApp {
     pending_metadata_reviews: HashMap<WindowId, JobId>,
     pending_drop: Option<PendingDrop>,
     pending_extract: Option<PendingExtract>,
+    /// Extractions that reached their questions while another one waited
+    /// for answers; each looks at its destination again when its turn comes.
+    waiting_extracts: std::collections::VecDeque<ArchiveOperationPlan>,
     transfer_preflights: usize,
     file_clipboard: Option<FileClipboard>,
     system_file_clipboard: Option<Arc<SystemFileClipboard>>,
@@ -4605,6 +4610,7 @@ impl MusheenApp {
             pending_metadata_reviews: HashMap::new(),
             pending_drop: None,
             pending_extract: None,
+            waiting_extracts: std::collections::VecDeque::new(),
             transfer_preflights: 0,
             file_clipboard: None,
             system_file_clipboard: watch_directories.then(shared_system_file_clipboard),
@@ -9538,13 +9544,14 @@ impl MusheenApp {
             self.pending_drop = None;
         }
         // A collision question closed without an answer cancels its
-        // extraction.
+        // extraction; the next waiting one asks its questions.
         if self
             .pending_extract
             .as_ref()
             .is_some_and(|pending| pending.window == Some(closed))
         {
             self.pending_extract = None;
+            self.begin_waiting_extract(cx);
         }
         // An unresolved window-manager close cancels only its own workflow.
         if self.context_dialog_windows.is_empty() {
@@ -10308,10 +10315,11 @@ impl MusheenApp {
                 self.submit_archive_plan(Ok(plan), cx);
                 return;
             }
-            Ok(musheen_desktop::ExtractDestination::NotAFolder) => {
+            Ok(musheen_desktop::ExtractDestination::NotAFolder(item)) => {
                 std::collections::VecDeque::from([ExtractQuestion {
                     path: Vec::new(),
                     whole_folder: true,
+                    item,
                 }])
             }
             Ok(musheen_desktop::ExtractDestination::Folder(collisions)) => collisions
@@ -10319,6 +10327,7 @@ impl MusheenApp {
                 .map(|collision| ExtractQuestion {
                     path: collision.path,
                     whole_folder: false,
+                    item: collision.item,
                 })
                 .collect(),
         };
@@ -10330,10 +10339,9 @@ impl MusheenApp {
             return;
         };
         // One extraction asks at a time, so every answer reaches the
-        // extraction its dialog names.
+        // extraction its dialog names; the others wait their turn.
         if self.pending_extract.is_some() {
-            self.operation_error = Some("another extraction is awaiting a decision".into());
-            cx.notify();
+            self.waiting_extracts.push_back(plan);
             return;
         }
         self.pending_extract = Some(PendingExtract {
@@ -10373,7 +10381,11 @@ impl MusheenApp {
         } else {
             format!(
                 "{} {}",
-                message("extract-conflict-exists"),
+                message(if pending.current.item.folder {
+                    "extract-conflict-folder-exists"
+                } else {
+                    "extract-conflict-file-exists"
+                }),
                 destination
                     .join(OsString::from_vec(pending.current.path.clone()))
                     .display()
@@ -10404,6 +10416,7 @@ impl MusheenApp {
         let (Ok(handle), Some(dialog)) = (opened, dialog) else {
             self.pending_extract = None;
             self.operation_error = Some("Musheen could not ask about the extraction".into());
+            self.begin_waiting_extract(cx);
             cx.notify();
             return;
         };
@@ -10430,14 +10443,21 @@ impl MusheenApp {
         pending.dialog = None;
         match choice {
             ExtractConflictChoice::Replace => {
-                pending.replace.insert(pending.current.path.clone());
+                pending
+                    .replace
+                    .insert(pending.current.path.clone(), pending.current.item);
             }
             ExtractConflictChoice::Skip => {}
             ExtractConflictChoice::ReplaceAll => {
-                pending.replace.insert(pending.current.path.clone());
                 pending
                     .replace
-                    .extend(pending.remaining.drain(..).map(|question| question.path));
+                    .insert(pending.current.path.clone(), pending.current.item);
+                pending.replace.extend(
+                    pending
+                        .remaining
+                        .drain(..)
+                        .map(|question| (question.path, question.item)),
+                );
             }
             ExtractConflictChoice::SkipAll => pending.remaining.clear(),
         }
@@ -10447,9 +10467,11 @@ impl MusheenApp {
             self.ask_extract_question(cx);
             return;
         }
+        let plan = pending.plan;
         if pending.current.whole_folder {
-            if pending.replace.contains(&pending.current.path) {
-                let plan = &pending.plan;
+            if pending.replace.contains_key(&pending.current.path) {
+                // Replaces the item the question named, and only while it is
+                // still that item.
                 let replace = ArchiveOperationPlan::extract(
                     plan.sources()[0].clone(),
                     plan.destination().clone(),
@@ -10457,17 +10479,30 @@ impl MusheenApp {
                     ArchiveConflictPolicy::Replace,
                     plan.encrypted(),
                 )
+                .and_then(|replace| {
+                    replace.with_merge(ExtractMerge::replacing_destination(pending.current.item))
+                })
                 .map_err(|error| error.to_string().into());
                 self.submit_archive_plan(replace, cx);
             }
-            cx.notify();
-            return;
+        } else {
+            let merged = plan
+                .with_merge(ExtractMerge::new(pending.replace))
+                .map_err(|error| error.to_string().into());
+            self.submit_archive_plan(merged, cx);
         }
-        let merged = pending
-            .plan
-            .with_merge(ExtractMerge::new(pending.replace))
-            .map_err(|error| error.to_string().into());
-        self.submit_archive_plan(merged, cx);
+        self.begin_waiting_extract(cx);
+        cx.notify();
+    }
+
+    /// Starts the next extraction that waited while another one asked its
+    /// questions.
+    fn begin_waiting_extract(&mut self, cx: &mut Context<Self>) {
+        if self.pending_extract.is_none()
+            && let Some(plan) = self.waiting_extracts.pop_front()
+        {
+            self.begin_extract(Ok(plan), cx);
+        }
     }
 
     fn open_archive_window(&mut self, targets: &[CommandTargetRef], cx: &mut Context<Self>) {
@@ -17824,6 +17859,13 @@ impl MusheenApp {
         self.record_operation_control_error(result, cx);
     }
 
+    fn run_operation_again(&mut self, id: musheen_ops::JobId, cx: &mut Context<Self>) {
+        let result = self.operation_hub.run_again(id).map(|_| ());
+        if self.record_operation_control_error(result, cx) {
+            self.pump_operation_queue(cx);
+        }
+    }
+
     fn view_operation_location(&mut self, location: StorePath, cx: &mut Context<Self>) {
         self.status_center_open = false;
         self.undo_available.clear();
@@ -17852,6 +17894,7 @@ impl MusheenApp {
             let has_undo_candidate = self.undo_available.contains(&id);
             let can_resume_recovery = self.operation_hub.can_resume_recovery(id);
             let can_discard_recovery = self.operation_hub.can_discard_recovery(id);
+            let can_run_again = self.operation_hub.can_run_again(id);
             let has_failures = !entry.failures().is_empty();
             let browser_location = operation_browser_location(entry.location());
             let location = DisplayPath::from_store_path(entry.location())
@@ -17985,6 +18028,17 @@ impl MusheenApp {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.discard_recovery_operation(id, cx);
                         })),
+                    )
+                })
+                .when(can_run_again, |row| {
+                    row.child(
+                        Button::new(SharedString::from(format!("operation-run-again-{id_value}")))
+                            .label("Run again")
+                            .tooltip("Run the same operation again, with the answers it was given")
+                            .small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.run_operation_again(id, cx);
+                            })),
                     )
                 })
                 .when(has_failures, |row| {
@@ -23804,7 +23858,8 @@ mod tests {
     }
 
     /// Picks a folder that already holds `Archive/a.txt`, `Archive/b.txt`
-    /// and `Archive/keep.txt`, and extracts `Archive.zip` into it.
+    /// and `Archive/keep.txt`, with a symlink and a socket beside them, and
+    /// extracts `Archive.zip` into it.
     async fn extract_into_an_existing_folder(
         cx: &mut TestAppContext,
     ) -> (
@@ -23822,6 +23877,8 @@ mod tests {
         filesystem::write(folder.join("a.txt"), b"old a").unwrap();
         filesystem::write(folder.join("b.txt"), b"old b").unwrap();
         filesystem::write(folder.join("keep.txt"), b"keep").unwrap();
+        std::os::unix::fs::symlink("keep.txt", folder.join("link")).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(folder.join("socket")).unwrap());
         let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
         let journal = tempfile::tempdir().unwrap();
         run_archive_jobs(&app, journal.path(), cx);
@@ -23829,6 +23886,32 @@ mod tests {
         let before = highest_job(&app, cx);
         extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
         (temporary, journal, app, browser, folder, before)
+    }
+
+    /// The staging folders an extraction left beside `destination`.
+    fn staging_left_beside(destination: &Path) -> Vec<String> {
+        filesystem::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".musheen-stage"))
+            .collect()
+    }
+
+    /// Runs the app until an extraction's question is open.
+    fn wait_for_extract_question(app: &Entity<MusheenApp>, cx: &mut TestAppContext) {
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if cx.read(|cx| {
+                app.read(cx)
+                    .pending_extract
+                    .as_ref()
+                    .is_some_and(|pending| pending.window.is_some())
+            }) {
+                return;
+            }
+            cx.executor().advance_clock(Duration::from_millis(20));
+        }
+        panic!("the extraction asks its question");
     }
 
     #[gpui_kit::test]
@@ -23867,6 +23950,13 @@ mod tests {
             b"keep",
             "an item no entry collides with does not change"
         );
+        assert_eq!(
+            filesystem::read_link(folder.join("link")).unwrap(),
+            Path::new("keep.txt"),
+            "a symlink in the folder neither stops the merge nor changes"
+        );
+        assert!(folder.join("socket").exists());
+        assert!(staging_left_beside(&folder).is_empty());
     }
 
     #[gpui_kit::test]
@@ -23902,7 +23992,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn extract_to_a_second_extraction_is_refused_while_one_awaits_answers(
+    async fn extract_to_a_second_extraction_asks_after_the_first_is_answered(
         cx: &mut TestAppContext,
     ) {
         let temporary = tempfile::tempdir().unwrap();
@@ -23931,33 +24021,210 @@ mod tests {
                 );
             }
         });
-        for _ in 0..100 {
-            cx.run_until_parked();
-            if cx.read(|cx| app.read(cx).operation_error.is_some()) {
-                break;
-            }
-            cx.executor().advance_clock(Duration::from_millis(20));
-        }
-        cx.read(|cx| {
-            assert_eq!(
-                app.read(cx).operation_error.as_deref(),
-                Some("another extraction is awaiting a decision"),
-                "a second extraction does not take over the open question"
-            )
-        });
 
         answer_extract_collision("extract-conflict-replace-all", cx)
-            .expect("the first extraction's question is open");
+            .expect("the first extraction asks about its collisions");
         wait_for_jobs_after(&app, browser, before, cx).await;
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        let first = highest_job(&app, cx);
+
+        answer_extract_collision("extract-conflict-skip-all", cx)
+            .expect("the second extraction asks its own questions afterwards");
+        wait_for_jobs_after(&app, browser, first, cx).await;
+        cx.read(|cx| assert_eq!(app.read(cx).operation_error, None));
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_existing_folder_replaces_an_item_of_the_other_kind_in_one_step(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let picked = temporary.path().join("picked");
+        let folder = picked.join("Archive");
+        filesystem::create_dir_all(folder.join("a.txt")).unwrap();
+        filesystem::write(folder.join("a.txt").join("inside.txt"), b"inside").unwrap();
+        filesystem::write(folder.join("b.txt"), b"old b").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+        let before = highest_job(&app, cx);
+        extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
+
+        let asked = answer_extract_collision("extract-conflict-replace-all", cx)
+            .expect("a folder where the archive has a file asks first");
+        assert!(
+            asked.contains("This folder already exists")
+                && asked.contains("everything in it permanently"),
+            "the question names the folder and what Replace does: {asked}"
+        );
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        assert!(
+            staging_left_beside(&folder).is_empty(),
+            "the replaced folder leaves with the staging"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_item_that_changed_after_its_question_is_kept(cx: &mut TestAppContext) {
+        let (_temporary, _journal, app, browser, folder, before) =
+            extract_into_an_existing_folder(cx).await;
+        wait_for_extract_question(&app, cx);
+        // Another item takes a.txt's place after the question was asked.
+        filesystem::write(folder.join("a.new"), b"changed a").unwrap();
+        filesystem::rename(folder.join("a.new"), folder.join("a.txt")).unwrap();
+
+        answer_extract_collision("extract-conflict-replace-all", cx)
+            .expect("a colliding file asks Replace, Replace All, Skip or Skip All");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        assert_eq!(
+            filesystem::read(folder.join("a.txt")).unwrap(),
+            b"changed a",
+            "Replace holds only for the item the question named"
+        );
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_a_merge_that_fails_part_way_removes_its_staging(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("Archive");
+        filesystem::create_dir(&folder).unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+        let before = highest_job(&app, cx);
+        // Nothing collides, but no entry can be moved into the folder.
+        filesystem::set_permissions(&folder, filesystem::Permissions::from_mode(0o555)).unwrap();
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::ExtractHere,
+                CommandParameters::targets(vec![local_command_target(&archive)]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        wait_for_jobs_after(&app, browser, before, cx).await;
+        filesystem::set_permissions(&folder, filesystem::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            staging_left_beside(&folder).is_empty(),
+            "a failed merge removes what it staged"
+        );
+        assert_eq!(filesystem::read_dir(&folder).unwrap().count(), 0);
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_interrupted_merge_runs_again_with_its_answers(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("Archive");
+        filesystem::create_dir(&folder).unwrap();
+        filesystem::write(folder.join("a.txt"), b"old a").unwrap();
+        filesystem::write(folder.join("keep.txt"), b"keep").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+
+        // The app stopped while it merged Archive.zip into the folder, with
+        // Replace chosen for a.txt: the status file still says running, and
+        // the journal holds the job unfinished.
+        let store_path = |path: &Path| StorePath::from_unix_path(path.as_os_str());
+        let a = filesystem::symlink_metadata(folder.join("a.txt")).unwrap();
+        let plan = ArchiveOperationPlan::extract(
+            store_path(&archive),
+            store_path(&folder),
+            musheen_ops::ArchiveCodec::Zip,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .and_then(|plan| {
+            plan.with_merge(ExtractMerge::new([(
+                b"a.txt".to_vec(),
+                musheen_ops::AnsweredItem {
+                    device: a.dev(),
+                    inode: a.ino(),
+                    folder: false,
+                },
+            )]))
+        })
+        .unwrap();
+        let interrupted = JobId::new(40).unwrap();
+        let restart_journal = tempfile::tempdir().unwrap();
+        musheen_ops::Journal::open(
+            musheen_desktop::FileJournalStorage::at(restart_journal.path()).unwrap(),
+        )
+        .unwrap()
+        .append_archive(
+            interrupted,
+            musheen_ops::EventGeneration::new(0),
+            musheen_ops::JournalPhase::MetadataApplied,
+            musheen_ops::Durability::CrashDurable,
+            musheen_ops::ArchiveCheckpoint::new(
+                plan,
+                store_path(&temporary.path().join(".musheen-stage-v1-40-0")),
+                None,
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        let status_file = tempfile::tempdir().unwrap();
+        let store = musheen_desktop::StatusStore::at(status_file.path().join("status.json"));
+        let mut status = crate::StatusCenterModel::default();
+        status
+            .register(
+                interrupted,
+                musheen_ops::EventGeneration::new(0),
+                musheen_ops::OperationKind::Extract,
+                store_path(&folder),
+                Some(1),
+            )
+            .unwrap();
+        status.mark_running(interrupted).unwrap();
+        store.save(&status.to_json().unwrap()).unwrap();
+
+        // The next start offers to run it again.
+        app.update(cx, |state, _| {
+            state.operation_hub = OperationHub::with_status_store_and_provider_runtime(
+                &ResourceLimits::default(),
+                store,
+                &state.providers,
+            )
+            .unwrap()
+            .with_archive_journal_at(restart_journal.path());
+        });
+        assert!(cx.read(|cx| app.read(cx).operation_hub.can_run_again(interrupted)));
+        let before = highest_job(&app, cx);
+        app.update(cx, |state, cx| state.run_operation_again(interrupted, cx));
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
         assert_eq!(
             filesystem::read(folder.join("a.txt")).unwrap(),
             b"new a",
-            "the answer reaches the extraction its dialog names"
+            "the answer given before the stop holds"
         );
         assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        assert_eq!(filesystem::read(folder.join("keep.txt")).unwrap(), b"keep");
         assert!(
-            answer_extract_collision("extract-conflict-skip", cx).is_none(),
-            "the refused extraction asks nothing"
+            !cx.read(|cx| app.read(cx).operation_hub.can_run_again(interrupted)),
+            "an interrupted job runs again once"
         );
     }
 

@@ -6,7 +6,7 @@ use super::create::{
     ArchiveCleanupIntent, ArchiveOperationOutcome, ArchivePublicationPaths, append_archive_phase,
     cleanup_path, cleanup_phase, deletion_path, file_identity, local_path, map_errno,
     path_identity_with_controls, publication_phase, publication_quarantine_path, publish_staging,
-    remove_open_directory, remove_owned_journaled, staging_path, sync_parent,
+    remove_owned_journaled, remove_owned_journaled_by_identity, staging_path, sync_parent,
 };
 use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
@@ -14,9 +14,9 @@ use super::{ArchiveFormat, ArchivePath};
 use super::{tar_codec, zip_codec};
 use musheen_core::{CancellationToken, ProviderId};
 use musheen_ops::{
-    ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
-    ArchiveOperationPlan, EventGeneration, ExtractMerge, JobId, Journal, JournalPhase,
-    JournalStorage,
+    AnsweredItem, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
+    ArchiveOperationPlan, ArchivePathIdentity, EventGeneration, ExtractMerge, JobId, Journal,
+    JournalPhase, JournalStorage,
 };
 use nix::libc::O_NOFOLLOW;
 use std::ffi::OsString;
@@ -62,10 +62,21 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             .ok_or(ArchiveOperationError::InvalidArchive)?,
     )?;
     let destination = local_path(plan.destination())?;
-    // A merge needs a real folder at the destination; anything else follows
-    // the plan's conflict policy for the destination as a whole.
+    // A merge needs a real folder at the destination. Anything else follows
+    // the plan's conflict policy for the destination as a whole, and a merge
+    // plan replaces such an item only while it is the one the user answered
+    // about.
     let merge = match (plan.merge(), std::fs::symlink_metadata(&destination)) {
         (Some(merge), Ok(metadata)) if metadata.is_dir() => Some(merge),
+        (Some(merge), Ok(metadata)) => {
+            if !merge
+                .whole()
+                .is_some_and(|item| item.is(metadata.dev(), metadata.ino()))
+            {
+                return Err(ArchiveOperationError::Conflict);
+            }
+            None
+        }
         _ => None,
     };
     if merge.is_none() && destination.exists() {
@@ -139,8 +150,11 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     )?;
     let staging = staging_path(plan, job_id, generation)?;
     let rollback = cleanup_path(&staging)?;
-    let destination_before =
-        path_identity_with_controls(&destination, Some(&budget), Some(cancellation))?;
+    let destination_before = if merge.is_some() {
+        folder_identity(&destination)?
+    } else {
+        path_identity_with_controls(&destination, Some(&budget), Some(cancellation))?
+    };
     append_archive_phase(
         journal,
         job_id,
@@ -259,21 +273,25 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         begin_commit()?;
         transaction_started = true;
         if let Some(merge) = merge {
-            merge_staging(&staging, &destination, merge, cancellation)?;
-            published = true;
+            // The merge moves staged entries into the folder one by one. What
+            // it does not move, including the items it replaced, stays staged
+            // and is removed whether or not the merge finished; a merge error
+            // is returned after that.
+            let merged = merge_staging(&staging, &destination, merge, cancellation);
+            published = merged.is_ok();
             sync_parent(&destination)?;
-            let destination_after =
-                path_identity_with_controls(&destination, Some(&budget), Some(cancellation))?;
-            // What the merge skipped is still staged; remove it.
-            if let Some(leftover) =
-                path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
-            {
+            let destination_after = folder_identity(&destination)?;
+            if let Some(leftover) = folder_identity(&staging)? {
                 let owned = stage_root.is_some_and(|created| {
                     created.device() == leftover.device() && created.inode() == leftover.inode()
                 });
                 if !owned {
                     return Err(ArchiveOperationError::RecoveryRequired);
                 }
+                let cleanup_cancellation = CancellationToken::new();
+                let cleanup_budget = budget
+                    .next_phase()
+                    .with_identity_cancellation(cleanup_cancellation.clone());
                 let stage_deletion = deletion_path(&staging)?;
                 let cleanup = ArchiveCleanupIntent::new(
                     ArchiveCleanupKind::PrepublishStage,
@@ -290,7 +308,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                     &staging,
                     destination_before,
                     destination_after,
-                    Some(&budget),
+                    Some(&cleanup_budget),
                 )?;
                 let mut quarantined = || {
                     append_archive_phase(
@@ -302,25 +320,30 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                         &staging,
                         destination_before,
                         destination_after,
-                        Some(&budget),
+                        Some(&cleanup_budget),
                     )
                 };
-                remove_owned_journaled(
+                remove_owned_journaled_by_identity(
                     &staging,
                     &stage_deletion,
-                    Some(leftover),
-                    &budget,
-                    cancellation,
+                    leftover,
+                    &cleanup_budget,
+                    &cleanup_cancellation,
                     &mut quarantined,
                 )
                 .map_err(|_| ArchiveOperationError::RecoveryRequired)?;
             }
-            for phase in [JournalPhase::StagingCleaned, JournalPhase::Completed] {
+            let phases: &[JournalPhase] = if merged.is_ok() {
+                &[JournalPhase::StagingCleaned, JournalPhase::Completed]
+            } else {
+                &[JournalPhase::RolledBack]
+            };
+            for phase in phases {
                 append_archive_phase(
                     journal,
                     job_id,
                     generation,
-                    phase,
+                    *phase,
                     plan,
                     &staging,
                     destination_before,
@@ -328,6 +351,7 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                     Some(&budget),
                 )?;
             }
+            merged?;
             return Ok(ArchiveOperationOutcome::Published);
         }
         let outcome = {
@@ -597,10 +621,12 @@ pub(crate) fn execute_extract<S: JournalStorage>(
 
 /// Moves staged entries into the existing destination folder. An entry the
 /// folder lacks moves in whole; folders on both sides merge entry by entry;
-/// any other collision is replaced only when `merge` names its path, and
-/// otherwise stays staged for cleanup. Every step works relative to opened
-/// folders, never follows a symlink in the destination, and never replaces
-/// an item that appeared after the user answered.
+/// any other collision is replaced only when `merge` names its path and the
+/// item there is still the one the user answered about, and otherwise stays
+/// staged for cleanup. A replaced item leaves the folder in the same step
+/// that the entry arrives, and waits in the staging folder for its cleanup.
+/// Every step works relative to opened folders and never follows a symlink
+/// in the destination.
 fn merge_staging(
     staging: &Path,
     destination: &Path,
@@ -646,7 +672,7 @@ fn merge_directory(
     cancellation: &CancellationToken,
     depth: usize,
 ) -> Result<(), ArchiveOperationError> {
-    use rustix::fs::{AtFlags, Dir, FileType, RenameFlags, renameat_with, statat, unlinkat};
+    use rustix::fs::{AtFlags, Dir, FileType, RenameFlags, renameat_with, statat};
     use rustix::io::Errno;
     const MAX_MERGE_DEPTH: usize = 4_096;
     if depth > MAX_MERGE_DEPTH {
@@ -694,16 +720,10 @@ fn merge_directory(
                 )?;
                 Ok(())
             }
-            Ok(_) if !merge.replaces(relative) => Ok(()),
-            Ok(existing) if is_directory(existing.st_mode) => {
-                let existing_child = open_child_directory(target, &name)?;
-                remove_open_directory(&existing_child, 0)?;
-                unlinkat(target, &name, AtFlags::REMOVEDIR).map_err(map_errno)?;
-                renameat_with(staged, &name, target, &name, RenameFlags::NOREPLACE)
-            }
-            Ok(_) if staged_is_directory => {
-                unlinkat(target, &name, AtFlags::empty()).map_err(map_errno)?;
-                renameat_with(staged, &name, target, &name, RenameFlags::NOREPLACE)
+            Ok(existing) if !merge.replaces(relative, existing.st_dev, existing.st_ino) => Ok(()),
+            // An item of the other kind trades places with the entry.
+            Ok(existing) if is_directory(existing.st_mode) || staged_is_directory => {
+                exchange_entry(staged, target, &name)
             }
             // A file over a file or a link: one rename replaces it in place.
             Ok(_) => renameat_with(staged, &name, target, &name, RenameFlags::empty()),
@@ -719,23 +739,75 @@ fn merge_directory(
     target.sync_all().map_err(|error| map_io(&error))
 }
 
+/// Puts the staged entry `name` in place of the existing item of the other
+/// kind, leaving that item in the staging folder for cleanup. One exchange
+/// does it where the filesystem allows; elsewhere the item first moves
+/// aside into the staging folder, and moves back if the entry cannot take
+/// its place.
+fn exchange_entry(
+    staged: &File,
+    target: &File,
+    name: &std::ffi::CStr,
+) -> Result<(), rustix::io::Errno> {
+    use rustix::fs::{RenameFlags, renameat_with};
+    use rustix::io::Errno;
+    match renameat_with(staged, name, target, name, RenameFlags::EXCHANGE) {
+        Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+        other => return other,
+    }
+    let aside = (0_u32..)
+        .map(|attempt| {
+            std::ffi::CString::new(format!(".musheen-replaced-{attempt}"))
+                .expect("the aside name has no NUL byte")
+        })
+        .find_map(|aside| {
+            match renameat_with(target, name, staged, &aside, RenameFlags::NOREPLACE) {
+                Err(Errno::EXIST) => None,
+                moved => Some(moved.map(|()| aside)),
+            }
+        })
+        .expect("an unused aside name exists")?;
+    renameat_with(staged, name, target, name, RenameFlags::NOREPLACE).inspect_err(|_| {
+        let _ = renameat_with(staged, &aside, target, name, RenameFlags::NOREPLACE);
+    })
+}
+
+/// A folder's device, inode and kind, without reading what it holds. A merge
+/// enters a folder the user keeps, which may hold links, devices, unreadable
+/// files or more data than an identity digest may read.
+fn folder_identity(path: &Path) -> Result<Option<ArchivePathIdentity>, ArchiveOperationError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(ArchivePathIdentity::new(
+            metadata.dev(),
+            metadata.ino(),
+            0,
+            0,
+            0,
+            metadata.is_dir(),
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(map_io(&error)),
+    }
+}
+
 /// What an extraction would meet at its destination folder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtractDestination {
     /// The folder does not exist; the extraction publishes it in one step.
     Absent,
     /// An item other than a folder has the folder's name.
-    NotAFolder,
+    NotAFolder(AnsweredItem),
     /// The folder exists; the items that collide with archive entries.
     Folder(Vec<ExtractCollision>),
 }
 
 /// An existing item an archive entry would replace, by its path relative to
-/// the destination folder with `/` between components.
+/// the destination folder with `/` between components, and the item as it is
+/// now.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractCollision {
     pub path: Vec<u8>,
-    pub existing_is_folder: bool,
+    pub item: AnsweredItem,
 }
 
 /// Lists the collisions an extraction would meet, reading the archive's
@@ -754,7 +826,13 @@ pub fn extract_destination(
             return Ok(ExtractDestination::Absent);
         }
         Err(error) => return Err(map_io(&error)),
-        Ok(metadata) if !metadata.is_dir() => return Ok(ExtractDestination::NotAFolder),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Ok(ExtractDestination::NotAFolder(AnsweredItem {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                folder: false,
+            }));
+        }
         Ok(_) => {}
     }
     let source = local_path(
@@ -815,7 +893,11 @@ pub fn extract_destination(
             collided.insert(prefix.clone());
             collisions.push(ExtractCollision {
                 path: prefix.clone(),
-                existing_is_folder: existing.is_dir(),
+                item: AnsweredItem {
+                    device: existing.dev(),
+                    inode: existing.ino(),
+                    folder: existing.is_dir(),
+                },
             });
             break;
         }

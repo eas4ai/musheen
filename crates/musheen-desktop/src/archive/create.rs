@@ -2066,6 +2066,28 @@ pub(crate) fn remove_owned_journaled(
     )
 }
 
+/// Removes an owned staging folder that may hold items the archive did not
+/// write, such as the items a merge replaced. Ownership is proven by device
+/// and inode; what the folder holds is not read first.
+pub(crate) fn remove_owned_journaled_by_identity(
+    path: &Path,
+    quarantine: &Path,
+    expected: ArchivePathIdentity,
+    budget: &ArchiveBudget,
+    cancellation: &CancellationToken,
+    after_quarantine: &mut dyn FnMut() -> Result<(), ArchiveOperationError>,
+) -> Result<(), ArchiveOperationError> {
+    remove_owned_with_identity(
+        path,
+        Some(quarantine),
+        Some(expected),
+        false,
+        Some(budget),
+        Some(cancellation),
+        Some(after_quarantine),
+    )
+}
+
 fn remove_owned_with_identity(
     path: &Path,
     quarantine: Option<&Path>,
@@ -2202,6 +2224,8 @@ pub(crate) fn deletion_path(path: &Path) -> Result<PathBuf, ArchiveOperationErro
     Ok(path.with_file_name(deletion_name))
 }
 
+/// Removes everything inside `directory`, never entering another
+/// filesystem: a folder mounted inside it stops the removal.
 pub(crate) fn remove_open_directory(
     directory: &File,
     depth: usize,
@@ -2211,6 +2235,10 @@ pub(crate) fn remove_open_directory(
     if depth > MAX_CLEANUP_DEPTH {
         return Err(ArchiveOperationError::RecoveryRequired);
     }
+    let device = directory
+        .metadata()
+        .map_err(|error| map_io(&error))?
+        .dev();
     let proc_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     let entries = std::fs::read_dir(&proc_path)
         .map_err(|error| map_io(&error))?
@@ -2235,6 +2263,11 @@ pub(crate) fn remove_open_directory(
             let opened = child.metadata().map_err(|error| map_io(&error))?;
             if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
                 return Err(ArchiveOperationError::RecoveryRequired);
+            }
+            if opened.dev() != device {
+                return Err(ArchiveOperationError::UnsafePath(
+                    "a folder to remove holds a mounted filesystem",
+                ));
             }
             remove_open_directory(&child, depth.saturating_add(1))?;
             let current = std::fs::symlink_metadata(&anchored).map_err(|error| map_io(&error))?;

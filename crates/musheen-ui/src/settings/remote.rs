@@ -358,6 +358,73 @@ pub(super) struct PendingRemoteSave {
     state: musheen_desktop::SecretServiceState,
 }
 
+/// A secret saved with its connection in the editor, which Apply stores where
+/// the user chose before it writes the settings file.
+pub(super) struct PendingSecret {
+    secret: SecretBuffer,
+    label: String,
+    storage: musheen_desktop::SecretStorage,
+}
+
+/// The secret service work of one Apply: the saved secrets the new settings
+/// use, and the stored secrets the old settings used and the new ones do not.
+pub(super) struct SecretWork {
+    writes: Vec<(ConnectionId, PendingSecret)>,
+    retired: Vec<ConnectionId>,
+}
+
+/// Stores each saved secret, in order; the first failure stops Apply before
+/// it writes the settings file.
+pub(super) async fn store_secret_writes(
+    credentials: &musheen_desktop::RemoteCredentials,
+    work: &SecretWork,
+) -> Result<(), musheen_desktop::SecretError> {
+    for (id, pending) in &work.writes {
+        credentials
+            .store(
+                id,
+                &pending.label,
+                &pending.secret,
+                pending.storage,
+                CancellationToken::new(),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Deletes the secrets the settings no longer use, and returns those the
+/// secret service could not delete, for the next Apply to try again.
+pub(super) async fn delete_retired_secrets(
+    credentials: &musheen_desktop::RemoteCredentials,
+    work: &SecretWork,
+) -> Vec<ConnectionId> {
+    let mut kept = Vec::new();
+    for id in &work.retired {
+        if credentials
+            .remove(id, CancellationToken::new())
+            .await
+            .is_err()
+        {
+            kept.push(id.clone());
+        }
+    }
+    kept
+}
+
+/// The Settings failure message for a secret Apply could not store.
+pub(super) const fn secret_failure_key(error: musheen_desktop::SecretError) -> &'static str {
+    match error {
+        musheen_desktop::SecretError::SessionOnlyAvailable(
+            musheen_desktop::SecretServiceState::Locked,
+        ) => "settings-remote-keyring-locked",
+        musheen_desktop::SecretError::SessionOnlyAvailable(_) => {
+            "settings-remote-keyring-unavailable"
+        }
+        _ => "settings-remote-keyring-failed",
+    }
+}
+
 /// Answers with the secrets typed in the editor ahead of the stored ones, so
 /// Test connection uses what the user just typed.
 struct EditorCredentials {
@@ -450,9 +517,7 @@ impl super::SettingsWindow {
         } else if self.typed_password(cx).is_some() {
             Some(CredentialReference::persistent(id.clone()))
         } else {
-            self.remote_credential
-                .clone()
-                .filter(|reference| reference.connection_id() == &id)
+            self.remote_credential.clone()
         };
         build_profile(
             &self.remote_inputs,
@@ -508,8 +573,17 @@ impl super::SettingsWindow {
         if let Some(cancellation) = self.remote_test_cancellation.take() {
             cancellation.cancel();
         }
+        let mut typed = self
+            .remote_pending_secrets
+            .iter()
+            .map(|(id, pending)| {
+                let secret = SecretBuffer::new(pending.secret.expose_secret(<[u8]>::to_vec));
+                (id.clone(), secret)
+            })
+            .collect::<BTreeMap<_, _>>();
+        typed.extend(self.typed_secrets(&profile, cx));
         let credentials: Arc<dyn CredentialResolver> = Arc::new(EditorCredentials {
-            typed: self.typed_secrets(&profile, cx).into_iter().collect(),
+            typed,
             stored: Arc::clone(&self.remote_credentials),
         });
         let cancellation = musheen_core::CancellationToken::new();
@@ -589,26 +663,25 @@ impl super::SettingsWindow {
         }
         let secrets = self.typed_secrets(&profile, cx);
         if secrets.is_empty() {
-            self.commit_remote_profile(profile, window, cx);
+            self.commit_remote_profile(
+                profile,
+                secrets,
+                musheen_desktop::SecretStorage::Persistent,
+                window,
+                cx,
+            );
             return;
         }
-        self.store_remote_secrets(
-            profile,
-            secrets,
-            musheen_desktop::SecretStorage::Persistent,
-            window,
-            cx,
-        );
+        self.save_remote_with_secrets(profile, secrets, window, cx);
     }
 
-    /// Stores the typed secrets in the background, then saves the profile.
-    /// A locked or missing secret service leaves the profile waiting for the
-    /// user to accept session-only use.
-    fn store_remote_secrets(
+    /// Saves the profile with the secrets typed for it, which Apply stores.
+    /// A locked or missing secret service offers session-only use first;
+    /// nothing reaches the secret service before Apply.
+    fn save_remote_with_secrets(
         &mut self,
         profile: ConnectionProfile,
         secrets: Vec<(ConnectionId, SecretBuffer)>,
-        storage: musheen_desktop::SecretStorage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -616,24 +689,21 @@ impl super::SettingsWindow {
         self.remote_session_offer = None;
         self.remote_secret_error = None;
         let credentials = Arc::clone(&self.remote_credentials);
-        let label = format!("Musheen: {}", profile.name());
         let work = cx.background_spawn(async move {
-            for (id, secret) in &secrets {
-                if let Err(error) = credentials
-                    .store(id, &label, secret, storage, CancellationToken::new())
-                    .await
-                {
-                    return (secrets, Err(error));
-                }
-            }
-            (secrets, Ok(()))
+            credentials.availability(CancellationToken::new()).await
         });
         cx.spawn_in(window, async move |this, cx| {
-            let (secrets, result) = work.await;
+            let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.remote_saving = false;
                 match result {
-                    Ok(()) => this.commit_remote_profile(profile, window, cx),
+                    Ok(()) => this.commit_remote_profile(
+                        profile,
+                        secrets,
+                        musheen_desktop::SecretStorage::Persistent,
+                        window,
+                        cx,
+                    ),
                     Err(musheen_desktop::SecretError::SessionOnlyAvailable(state)) => {
                         this.remote_session_offer = Some(PendingRemoteSave {
                             profile,
@@ -653,13 +723,13 @@ impl super::SettingsWindow {
         cx.notify();
     }
 
-    /// Keeps the waiting secrets in memory until Musheen exits, then saves
-    /// the profile.
+    /// Saves the waiting profile with its secrets marked for this session
+    /// only: Apply keeps them in memory until Musheen exits.
     fn accept_session_only(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.remote_session_offer.take() else {
             return;
         };
-        self.store_remote_secrets(
+        self.commit_remote_profile(
             pending.profile,
             pending.secrets,
             musheen_desktop::SecretStorage::SessionOnlyConfirmed,
@@ -676,10 +746,13 @@ impl super::SettingsWindow {
     }
 
     /// Writes `profile` to the draft settings, replacing a saved connection
-    /// with its ID, and forgets the typed secrets.
+    /// with its ID, and keeps its typed secrets for Apply to store as
+    /// `storage` says.
     fn commit_remote_profile(
         &mut self,
         profile: ConnectionProfile,
+        secrets: Vec<(ConnectionId, SecretBuffer)>,
+        storage: musheen_desktop::SecretStorage,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -698,6 +771,17 @@ impl super::SettingsWindow {
             .export()
             .expect("validated connection profiles serialize");
         if self.state.edit("remote.connections", &encoded).is_ok() {
+            let label = format!("Musheen: {}", profile.name());
+            for (id, secret) in secrets {
+                self.remote_pending_secrets.insert(
+                    id,
+                    PendingSecret {
+                        secret,
+                        label: label.clone(),
+                        storage,
+                    },
+                );
+            }
             self.remote_save_requirement = None;
             self.remote_validation_failed = false;
             self.remote_credential = profile.credential().cloned();
@@ -711,41 +795,49 @@ impl super::SettingsWindow {
         cx.notify();
     }
 
-    /// Deletes the secrets the saved connections used before an apply and no
-    /// longer use after it: the password or stored key of a removed
-    /// connection, or of one whose login changed. Runs only once the apply
-    /// is saved, so a cancelled edit keeps every secret.
-    pub(super) fn forget_unreferenced_secrets(
-        &self,
-        before: &SettingsDocument,
-        after: &SettingsDocument,
-        cx: &mut Context<Self>,
-    ) {
-        let (Some(before), Some(after)) = (referenced_secrets(before), referenced_secrets(after))
-        else {
-            return;
+    /// Whether Apply has secret service work even when the settings are
+    /// unchanged: a saved secret to store, or a deletion to try again.
+    pub(super) fn has_remote_secret_work(&self) -> bool {
+        !self.remote_pending_secrets.is_empty() || !self.remote_retired_secrets.is_empty()
+    }
+
+    /// The secret service work for applying `after` over the committed
+    /// settings: the saved secrets `after` uses, and the secrets the committed
+    /// connections used that `after` does not, with the deletions an earlier
+    /// Apply could not finish. Nothing is deleted when either side's
+    /// connections cannot be read.
+    pub(super) fn remote_secret_work(&self, after: &SettingsDocument) -> SecretWork {
+        let used = referenced_secrets(after);
+        let writes = self
+            .remote_pending_secrets
+            .iter()
+            .filter(|(id, _)| used.as_ref().is_some_and(|used| used.contains(*id)))
+            .map(|(id, pending)| {
+                let secret = SecretBuffer::new(pending.secret.expose_secret(<[u8]>::to_vec));
+                (
+                    id.clone(),
+                    PendingSecret {
+                        secret,
+                        label: pending.label.clone(),
+                        storage: pending.storage,
+                    },
+                )
+            })
+            .collect();
+        let retired = match (referenced_secrets(&self.state.committed), used) {
+            (Some(before), Some(after)) => before
+                .union(&self.remote_retired_secrets)
+                .filter(|id| !after.contains(*id))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
         };
-        self.forget_secrets(before.difference(&after).cloned().collect(), cx);
+        SecretWork { writes, retired }
     }
 
-    fn forget_secrets(&self, ids: Vec<ConnectionId>, cx: &mut Context<Self>) {
-        if ids.is_empty() {
-            return;
-        }
-        let credentials = Arc::clone(&self.remote_credentials);
-        cx.background_spawn(async move {
-            for id in ids {
-                // A secret the service cannot delete now stays unused; nothing
-                // refers to it any more.
-                let _ = credentials.remove(&id, CancellationToken::new()).await;
-            }
-        })
-        .detach();
-    }
-
-    /// Removes the connection being edited from the draft settings. Its
-    /// password and stored key leave the secret service when the removal is
-    /// applied.
+    /// Removes the connection being edited from the draft settings, with any
+    /// secret saved for it and not yet applied. Its stored password and key
+    /// leave the secret service when the removal is applied.
     fn remove_remote_connection(&mut self, cx: &mut Context<Self>) {
         let Ok(id) = ConnectionId::new(self.remote_inputs[PROFILE_ID].read(cx).value().trim())
         else {
@@ -767,6 +859,10 @@ impl super::SettingsWindow {
             self.remote_validation_failed = true;
             cx.notify();
             return;
+        }
+        self.remote_pending_secrets.remove(&id);
+        if let Ok(key) = ConnectionId::new(format!("{}.key", id.as_str())) {
+            self.remote_pending_secrets.remove(&key);
         }
         self.remote_credential = None;
         self.remote_editor_open = false;
