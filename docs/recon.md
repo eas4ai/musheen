@@ -144,3 +144,37 @@ mechanism definitions are kept here so they can be declared again with
 | dep-008 | DEP-008 | `node scripts/check-dep-008.mjs` | `:(glob)**/Cargo.toml`, `Cargo.lock`, `:(glob)**/*.rs`, `scripts/check-dep-008.mjs` |
 | dep-014 | DEP-014 | `node scripts/check-dep-014.mjs` | `:(glob)**/Cargo.toml`, `Cargo.lock`, `deny.toml`, `scripts/check-dep-014.mjs`, `vendor/native-theme-gpui/README.md`, `vendor/native-theme-gpui/LICENSE-0BSD`, `vendor/native-theme-gpui/LICENSE-APACHE`, `vendor/native-theme-gpui/LICENSE-MIT` |
 | dep-015 | DEP-015 | `node scripts/check-dep-015.mjs` | `:(glob)**/Cargo.toml`, `Cargo.lock`, `:(top)*[Cc]argo*`, `:(top)[rs]*`, `:(glob)**/*.rs`, `ci/dep-015.Dockerfile`, `vendor/native-theme-gpui`, `scripts/check-dep-015.mjs` |
+
+## Recon 2026-09-26: remote-usable superseded by remote-usable-extract
+
+Scope: every commit since the newest Agreed date (2026-09-26), `dba48a3`
+through `9070753`. The commits before `0c979d6` belong to finished
+commitments (menu-composition-state, fallback-theme-follows-appearance-changes,
+xattr-io-outside-catalog-queue), each with a done record. The radius is
+archive extraction (OPS-033) and the remote requirements the successor
+carries (SYS-024, SYS-026, SYS-031, SYS-032, DEP-022).
+
+| Claim | Status | Citation |
+|---|---|---|
+| The extract engine publishes one new folder and refuses an existing destination: `Fail` returns `Conflict`, `Skip` skips the whole archive, `Replace` goes on. | Exists | `crates/musheen-desktop/src/archive/extract.rs:64-68` |
+| Extract Here targets the archive's own folder, which always exists, so it always fails with "the archive destination already exists". No test ran Extract Here end to end before this commitment. | Exists (defect) | `crates/musheen-ui/src/app.rs` `build_extract_plan` (ExtractHere uses the parent); extract_to_ run of 2026-09-26 05:20 |
+| "Extract here and Compress work." | Contradicted for Extract Here | `docs/opus-audit-2.md` 4.5 |
+| Extract… reaches the destination chooser and, since `f83dfeb`, resolves a picked local folder without storage I/O and queues an extraction into that folder itself. | Exists | `ContextExtractDestinationResolver`, `build_extract_plan_into` in `crates/musheen-ui/src/app.rs` |
+| The copy and move conflict dialog offers a per-conflict choice with an "apply to compatible remaining conflicts" switch. | Exists | `crates/musheen-ui/src/dialogs/conflict.rs:14-99` |
+| An archive's entries can be listed without extracting it, which a collision preflight can use. | Exists | `crates/musheen-desktop/src/archive/store.rs:718` (OPS-015) |
+| OPS-033 revised by the developer's ruling: a folder named after the archive, published in one step when absent and merged into when present, with Replace, Replace All, Skip or Skip All for each colliding item. | Documented | `docs/spec/ops.md` OPS-033; escalation `407ae943`, answer `3d44c334`; supersede `0e4e7cbc` |
+| SYS-024, SYS-026, SYS-031 and SYS-032 are implemented in `f83dfeb`: shared `RemoteCredentials`, password field, session-only offer, Remove, browse-based Test connection with a named cause, SFTP on russh with agent, key file, stored key and `~/.ssh/config`. | Exists | `crates/musheen-desktop/src/remote/{credentials,sftp,connection}.rs`, `crates/musheen-ui/src/settings/remote.rs`, `crates/musheen-ui/src/providers/remote.rs` |
+| The SFTP login tests pass except the RSA-agent one (8 of 9); the settings and parity tests pass except the offered-choice, SFTP editor and two Extract… tests (23 of 27). The fixes after that run are not yet built. | Unverified | run of 2026-09-26 05:20 |
+| OpenDAL's HTTP service reads files but cannot list a folder, so browsing refuses HTTP connections (`BrowseRefusal::Protocol`). | Exists | `opendal-service-http-0.59.3/src/backend.rs:131` (no `list` capability); `ConnectionProfile::browse_refusal` |
+| DEP-022 holds: musheen-desktop depends on ssh2-config 0.8.0. | Exists | `Cargo.lock`; receipt `196c5641` (pass) |
+
+Path B verdicts inside the radius:
+
+- OPS-033: Drifted from the engine it relies on; the developer ruled for the
+  spec, revised before the successor start.
+- OPS-015 (archive browsing without extraction): Holds for the collision
+  preflight's needs; not otherwise verified here.
+- OPS-016 and OPS-029 (path checks and archive limits): Still Observed; the
+  merge keeps the engine's per-entry path checks and limits.
+- SYS-024, SYS-026, SYS-031, SYS-032, DEP-022: Hold as agreed; carried
+  unchanged into the successor.
