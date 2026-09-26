@@ -23551,6 +23551,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("readme.txt"), b"readme").unwrap();
         let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
         let journal = tempfile::tempdir().unwrap();
         run_archive_jobs(&app, journal.path(), cx);
