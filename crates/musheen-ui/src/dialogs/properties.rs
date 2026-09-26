@@ -509,10 +509,17 @@ impl PropertiesDialogModel {
         !self.added_tags.is_empty() || !self.removed_tags.is_empty()
     }
 
-    pub fn accept_tags(&mut self) {
-        self.original_tags = self.tags.clone();
-        self.added_tags.clear();
-        self.removed_tags.clear();
+    /// Marks the tags one write stored as saved. Edits made while the
+    /// write ran stay unsaved.
+    pub(crate) fn accept_written_tags(&mut self, written: &TagDelta) {
+        for tag in &written.added {
+            self.original_tags.insert(tag.clone());
+            self.added_tags.remove(tag);
+        }
+        for tag in &written.removed {
+            self.original_tags.remove(tag);
+            self.removed_tags.remove(tag);
+        }
     }
 
     pub fn apply_visible(&self) -> bool {
@@ -703,10 +710,17 @@ impl ProviderPropertiesDialogModel {
         changed
     }
 
-    fn accept_tags(&mut self) {
-        self.original_tags = self.tags.clone();
-        self.added_tags.clear();
-        self.removed_tags.clear();
+    /// Marks the tags one write stored as saved. Edits made while the
+    /// write ran stay unsaved.
+    fn accept_written_tags(&mut self, written: &TagDelta) {
+        for tag in &written.added {
+            self.original_tags.insert(tag.clone());
+            self.added_tags.remove(tag);
+        }
+        for tag in &written.removed {
+            self.original_tags.remove(tag);
+            self.removed_tags.remove(tag);
+        }
     }
 }
 
@@ -748,6 +762,8 @@ impl ProviderPropertiesWindowData {
 pub(crate) struct ProviderPropertiesWindow {
     model: ProviderPropertiesDialogModel,
     tag_writer: Option<TagWriter>,
+    /// A tag write runs; Apply waits for it.
+    tag_write_pending: bool,
     tag_input: Entity<InputState>,
     tag_error: Option<Box<str>>,
     page_notice: Option<Box<str>>,
@@ -774,6 +790,7 @@ impl ProviderPropertiesWindow {
         Self {
             model,
             tag_writer: data.tag_writer,
+            tag_write_pending: false,
             tag_input: cx.new(|cx| InputState::new(window, cx).placeholder(tag_name)),
             tag_error: None,
             page_notice,
@@ -806,18 +823,35 @@ impl ProviderPropertiesWindow {
             cx.notify();
             return;
         };
+        if self.tag_write_pending {
+            return;
+        }
+        let writer = Arc::clone(writer);
         let delta = TagDelta {
             added: self.model.added_tags.clone(),
             removed: self.model.removed_tags.clone(),
         };
+        self.tag_write_pending = true;
+        let window = cx.entity().downgrade();
+        let written = delta.clone();
         // Provider and local windows use the same app-owned writer policy.
-        match writer(&delta, cx) {
-            Ok(()) => {
-                self.model.accept_tags();
-                self.tag_error = None;
-            }
-            Err(error) => self.tag_error = Some(error),
-        }
+        writer(
+            &delta,
+            cx,
+            Box::new(move |result, cx| {
+                let _ = window.update(cx, |this, cx| {
+                    this.tag_write_pending = false;
+                    match result {
+                        Ok(()) => {
+                            this.model.accept_written_tags(&written);
+                            this.tag_error = None;
+                        }
+                        Err(error) => this.tag_error = Some(error),
+                    }
+                    cx.notify();
+                });
+            }),
+        );
         cx.notify();
     }
 
@@ -947,6 +981,7 @@ impl ProviderPropertiesWindow {
                             .message("provider-properties-apply")
                             .expect("the apply catalog message exists"),
                     )
+                    .disabled(self.tag_write_pending)
                     .on_click(cx.listener(|this, _, _, cx| this.apply_tags(cx))),
             )
             .into_any_element()
@@ -1108,8 +1143,12 @@ pub struct PropertiesWindowData {
     catalog: Catalog,
 }
 
-pub(crate) type TagWriter =
-    Arc<dyn Fn(&TagDelta, &mut App) -> Result<(), Box<str>> + Send + Sync + 'static>;
+/// Hears the result of one tag write once the catalog took it.
+pub(crate) type TagWriteDone = Box<dyn FnOnce(Result<(), Box<str>>, &mut App) + 'static>;
+
+/// Saves a Properties window's tag edits. The write runs off the UI thread;
+/// the writer returns at once and calls `done` with the result.
+pub(crate) type TagWriter = Arc<dyn Fn(&TagDelta, &mut App, TagWriteDone) + Send + Sync + 'static>;
 
 impl PropertiesWindowData {
     pub fn load(paths: &[PathBuf]) -> Result<Self, PropertyError> {
@@ -1375,6 +1414,8 @@ pub(crate) struct PropertiesWindow {
     permission_batch: PermissionBatchState,
     tag_input: Entity<InputState>,
     tag_writer: Option<TagWriter>,
+    /// A tag write runs; Apply waits for it.
+    tag_write_pending: bool,
     tag_error: Option<Box<str>>,
     catalog: Catalog,
 }
@@ -1454,6 +1495,7 @@ impl PropertiesWindow {
             permission_batch: PermissionBatchState::default(),
             tag_input,
             tag_writer: data.tag_writer,
+            tag_write_pending: false,
             tag_error: None,
             catalog: data.catalog,
         };
@@ -2449,17 +2491,34 @@ impl PropertiesWindow {
             cx.notify();
             return;
         };
+        if self.tag_write_pending {
+            return;
+        }
+        let writer = Arc::clone(writer);
         let delta = TagDelta {
             added: self.model.added_tags.clone(),
             removed: self.model.removed_tags.clone(),
         };
-        match writer(&delta, cx) {
-            Ok(()) => {
-                self.model.accept_tags();
-                self.tag_error = None;
-            }
-            Err(error) => self.tag_error = Some(error),
-        }
+        self.tag_write_pending = true;
+        let window = cx.entity().downgrade();
+        let written = delta.clone();
+        writer(
+            &delta,
+            cx,
+            Box::new(move |result, cx| {
+                let _ = window.update(cx, |this, cx| {
+                    this.tag_write_pending = false;
+                    match result {
+                        Ok(()) => {
+                            this.model.accept_written_tags(&written);
+                            this.tag_error = None;
+                        }
+                        Err(error) => this.tag_error = Some(error),
+                    }
+                    cx.notify();
+                });
+            }),
+        );
         cx.notify();
     }
 
@@ -2483,6 +2542,7 @@ impl PropertiesWindow {
         if self.model.page() == PropertiesPage::Tags
             && self.model.tags_dirty()
             && self.tag_writer.is_some()
+            && !self.tag_write_pending
         {
             actions = actions.child(
                 Button::new("properties-tags-apply")

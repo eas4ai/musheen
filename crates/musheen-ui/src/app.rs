@@ -1,7 +1,7 @@
 mod catalog;
 mod custom_actions;
 
-use catalog::{CatalogBinding, DirectoryObservation, TagTarget};
+use catalog::{CatalogBinding, DirectoryObservation, TagStates, TagTarget};
 
 use crate::date_time::format_modified;
 use crate::dialogs::{
@@ -9,7 +9,7 @@ use crate::dialogs::{
     MetadataReviewDialog, MetadataReviewDialogEvent, MetadataReviewDialogModel, OpenWithDialog,
     OpenWithDialogEvent, OpenWithIntent as DialogOpenWithIntent, OpenWithModel,
     PropertiesFailureWindow, PropertiesPage, PropertiesWindow, PropertiesWindowData,
-    ProviderPropertiesWindow, ProviderPropertiesWindowData, TagDelta, TagWriter,
+    ProviderPropertiesWindow, ProviderPropertiesWindowData, TagDelta, TagWriteDone, TagWriter,
     VolumePropertiesModel, VolumePropertiesWindow, conflict_window_options,
     install_open_with_key_bindings, install_properties_key_bindings,
     metadata_review_window_options, open_with_window_options, properties_window_options,
@@ -3628,6 +3628,16 @@ struct MusheenApp {
     /// Render probes in flight, so a frame does not ask the same question
     /// twice.
     probes_in_flight: std::collections::HashSet<StoreProbe>,
+    /// Folder identities the store resolved, by location; `None` is a
+    /// location the store did not find. The UI thread reads only this and
+    /// the catalog; the store answers on a background executor.
+    folder_identities: HashMap<StorePath, Option<FolderIdentity>>,
+    /// Locations whose identity a background task is resolving.
+    folder_identities_in_flight: std::collections::HashSet<StorePath>,
+    /// A pin reconciliation runs; `pins_reconcile_again` asks for one more
+    /// when it ends.
+    pins_reconciling: bool,
+    pins_reconcile_again: bool,
     /// How to compose the last menu again once its probes answer.
     pending_menu_recompose: std::cell::RefCell<Option<MenuRecompose>>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
@@ -4155,7 +4165,7 @@ impl MusheenApp {
             Self::new_with_navigation(WindowSession::new(initial), None, None, limits, false, cx);
         let document = catalog_store.load().unwrap_or_default();
         app.catalog_binding = CatalogBinding::persistent(catalog_store, document);
-        app.sync_catalog_projection();
+        app.project_catalog();
         app
     }
 
@@ -4384,6 +4394,10 @@ impl MusheenApp {
             pending_store_probes: std::cell::RefCell::new(Vec::new()),
             render_probes: std::cell::RefCell::new(Vec::new()),
             probes_in_flight: std::collections::HashSet::new(),
+            folder_identities: HashMap::new(),
+            folder_identities_in_flight: std::collections::HashSet::new(),
+            pins_reconciling: false,
+            pins_reconcile_again: false,
             pending_menu_recompose: std::cell::RefCell::new(None),
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
@@ -4400,13 +4414,16 @@ impl MusheenApp {
             startup_load_started: false,
         };
         this.install_volume_properties_cleanup(cx);
-        this.sync_catalog_projection();
+        this.project_catalog();
         // Construction runs before the GPUI entity can be upgraded by an
         // async completion. Defer the first load until the entity is live so
         // fast filesystems cannot finish and drop the initial result.
         let startup_owner = cx.entity().downgrade();
         cx.defer(move |cx| {
-            let _ = startup_owner.update(cx, |this, cx| this.start_initial_load(location, cx));
+            let _ = startup_owner.update(cx, |this, cx| {
+                this.reconcile_pins(cx);
+                this.start_initial_load(location, cx);
+            });
         });
         this.start_operation_status_refresh(cx);
         this.start_pending_xattr_reconciliation(cx);
@@ -4444,7 +4461,7 @@ impl MusheenApp {
                     }
                     let revision = state.catalog_binding.revision();
                     if revision != state.catalog_projection_revision {
-                        state.sync_catalog_projection();
+                        state.sync_catalog_projection(cx);
                         changed = true;
                     }
                     if state.status_center_open
@@ -4619,6 +4636,7 @@ impl MusheenApp {
         self.indexed_viewports.remove(&tab_id);
         // A refresh or a navigation asks the store about the location again.
         self.location_facts.remove(&location);
+        self.folder_identities.remove(&location);
         if let Err(error) = self.validate_elevated_location(&location) {
             self.operation_error = Some(localized_privilege_error(&self.catalog, &error));
             cx.notify();
@@ -5164,7 +5182,7 @@ impl MusheenApp {
             page_items
         };
         self.prefetch_location_facts(load.location().clone(), cx);
-        self.remember_folder_location(load.location());
+        self.remember_folder_location(load.location().clone(), None, cx);
         self.apply_pending_file_manager_selection(tab_id, cx);
         self.advance_directory_restore(tab_id, cx);
 
@@ -5557,7 +5575,9 @@ impl MusheenApp {
             self.schedule_session_save(cx);
         }
         self.sync_terminal_location(&location, cx);
-        self.remember_folder_location(&location);
+        let recent_label =
+            remember.then(|| DisplayPath::from_store_path(&location).as_str().to_owned());
+        self.remember_folder_location(location.clone(), recent_label, cx);
         let mut preferences = self.preferences_with_catalog(
             &location,
             self.navigation.preferences_for(&location).clone(),
@@ -5590,17 +5610,6 @@ impl MusheenApp {
         );
         self.pending_content_focus = true;
         self.start_load(location, cx);
-        if remember {
-            let location = self.navigation.focused_tab().location().clone();
-            if let Some(identity) = self.folder_identity(&location) {
-                let label = DisplayPath::from_store_path(&location).as_str().to_owned();
-                if let Err(error) = self.catalog_binding.update(|document| {
-                    document.recents_mut().record(identity, location, label);
-                }) {
-                    self.operation_error = Some(error);
-                }
-            }
-        }
         cx.notify();
     }
 
@@ -6083,77 +6092,78 @@ impl MusheenApp {
         if targets.len() == 1 && self.open_volume_properties_target(&targets[0], cx) {
             return;
         }
-        // The capability probes run off the UI thread; the window opens when
-        // they answer.
+        // The capability probes and the catalog's tag states, which read the
+        // catalog file and the items' tag attributes, run off the UI thread;
+        // the window opens when they answer.
         let store = Arc::clone(&self.store);
+        let binding = self.catalog_binding.clone();
         let probed = targets.to_vec();
         let work = cx.background_spawn(async move {
-            probed
+            let tag_targets = probed
                 .iter()
-                .map(|target| store.capabilities(target.path()))
-                .collect::<Vec<_>>()
+                .map(|target| {
+                    (
+                        target.id().clone(),
+                        target.path().clone(),
+                        store.capabilities(target.path()),
+                    )
+                })
+                .collect::<Vec<TagTarget>>();
+            let tags_supported = tag_targets.iter().all(|(_, _, capabilities)| {
+                matches!(
+                    capabilities.get(CapabilityKind::Tags),
+                    CapabilityState::Supported
+                )
+            });
+            let tag_states = tags_supported.then(|| binding.tag_states(&tag_targets));
+            (tag_targets, tag_states)
         });
         let targets = targets.to_vec();
         cx.spawn(async move |this, cx| {
-            let capabilities = work.await;
+            let (tag_targets, tag_states) = work.await;
             let Some(this) = this.upgrade() else {
                 return;
             };
             this.update(cx, |state, cx| {
-                state.open_properties_targets_with_capabilities(&targets, capabilities, page, cx);
+                state.open_properties_targets_with_tags(
+                    &targets,
+                    tag_targets,
+                    tag_states,
+                    page,
+                    cx,
+                );
             });
         })
         .detach();
     }
 
-    fn open_properties_targets_with_capabilities(
+    /// Opens Properties once the background probe answered: the targets'
+    /// capabilities, and their tag states when every target supports tags.
+    fn open_properties_targets_with_tags(
         &mut self,
         targets: &[CommandTargetRef],
-        capabilities: Vec<musheen_core::CapabilityMatrix>,
+        tag_targets: Vec<TagTarget>,
+        tag_states: Option<Result<TagStates, Box<str>>>,
         page: PropertiesPage,
         cx: &mut Context<Self>,
     ) {
-        let tag_targets = targets
-            .iter()
-            .zip(capabilities)
-            .map(|(target, capabilities)| {
-                (target.id().clone(), target.path().clone(), capabilities)
-            })
-            .collect::<Vec<TagTarget>>();
         let provider_targets = targets
             .iter()
             .zip(tag_targets.iter())
             .map(|(target, (_, _, capabilities))| (target.clone(), capabilities.clone()))
             .collect::<Vec<_>>();
-        let tags_supported = tag_targets.iter().all(|(_, _, capabilities)| {
-            matches!(
-                capabilities.get(CapabilityKind::Tags),
-                CapabilityState::Supported
-            )
-        });
-        let (common_tags, mixed_tags, tag_writer) = if tags_supported {
-            let (common_tags, mixed_tags) = match self.catalog_binding.tag_states(&tag_targets) {
-                Ok(states) => states,
-                Err(error) => {
-                    self.operation_error = Some(error);
-                    cx.notify();
-                    return;
-                }
-            };
-            let app = cx.entity().downgrade();
-            let writer: TagWriter = Arc::new(move |desired, cx| {
-                app.update(cx, |state, cx| {
-                    let result = state.apply_properties_tags(&tag_targets, desired);
-                    if result.is_ok() {
-                        cx.notify();
-                    }
-                    result
-                })
-                .map_err(|error| Box::<str>::from(error.to_string()))?
-            });
-            (common_tags, mixed_tags, Some(writer))
-        } else {
-            (BTreeSet::new(), BTreeSet::new(), None)
+        let (common_tags, mixed_tags, tag_writer) = match tag_states {
+            Some(Ok((common_tags, mixed_tags))) => (
+                common_tags,
+                mixed_tags,
+                Some(self.properties_tag_writer(tag_targets, cx)),
+            ),
+            Some(Err(error)) => {
+                self.operation_error = Some(error);
+                cx.notify();
+                return;
+            }
+            None => (BTreeSet::new(), BTreeSet::new(), None),
         };
         let paths = targets
             .iter()
@@ -6527,22 +6537,32 @@ impl MusheenApp {
             tab.set_view_preferences(preferences.clone());
         }
         self.navigation
-            .set_preferences_for(location.clone(), preferences.clone());
-        if let Some(identity) = self.folder_identity(&location) {
-            let parent = self.parent_folder_identity(&location);
+            .set_preferences_for(location.clone(), preferences);
+        self.with_folder_identities(location, cx, |state, location, identity, parent, cx| {
+            let Some(identity) = identity else {
+                return;
+            };
+            // The folder's latest preferences: a later change whose identity
+            // resolved first is not overwritten by an earlier one.
+            let preferences = state.navigation.preferences_for(&location).clone();
             let mut reconciled = ViewPreferenceStore::new(preferences.clone());
             reconciled.set(location.clone(), preferences);
-            if let Err(error) = self.catalog_binding.update(|document| {
-                reconciled.persist_catalog(
-                    identity,
-                    location,
-                    parent,
-                    document.folder_preferences_mut(),
-                );
-            }) {
-                self.operation_error = Some(error);
-            }
-        }
+            let binding = state.catalog_binding.clone();
+            state.queue_catalog_work(
+                cx,
+                move || {
+                    binding.update(|document| {
+                        reconciled.persist_catalog(
+                            identity,
+                            location,
+                            parent,
+                            document.folder_preferences_mut(),
+                        );
+                    })
+                },
+                MusheenApp::report_catalog_error,
+            );
+        });
         self.schedule_session_save(cx);
     }
 
@@ -7981,14 +8001,19 @@ impl MusheenApp {
             WatchEvent::Changed(item) | WatchEvent::Renamed { item, .. } => {
                 self.executable_facts.remove(item.id());
                 self.location_facts.remove(item.path());
+                self.folder_identities.remove(item.path());
             }
             WatchEvent::Removed(id) => {
                 self.executable_facts.remove(id);
+                let removed = FolderIdentity::from_item(id.clone());
+                self.folder_identities
+                    .retain(|_, identity| identity.as_ref() != Some(&removed));
             }
             WatchEvent::Created(_) => {}
             WatchEvent::Invalidated { .. } => {
                 self.executable_facts.clear();
                 self.location_facts.clear();
+                self.folder_identities.clear();
             }
         }
     }
@@ -9720,7 +9745,7 @@ impl MusheenApp {
                     .first()
                     .filter(|_| targets.len() == 1)
                     .ok_or_else(|| Box::<str>::from("delete tag requires exactly one tag"))
-                    .and_then(|target| self.delete_captured_tag(target));
+                    .and_then(|target| self.delete_captured_tag(target, cx));
                 if let Err(error) = result {
                     self.operation_error = Some(error);
                 }
@@ -11405,32 +11430,29 @@ impl MusheenApp {
         let label = DisplayPath::from_store_path(target.path())
             .as_str()
             .to_owned();
-        let work = cx.background_spawn(async move {
-            if action == CommandAction::Pin {
-                binding.update(|document| {
-                    let _ = document.pins_mut().pin(item, path, label);
-                })
-            } else {
-                binding.update(|document| {
-                    document.pins_mut().unpin(&item);
-                })
-            }
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |state, cx| {
+        // Queued, so a pin followed by an unpin ends unpinned.
+        self.queue_catalog_work(
+            cx,
+            move || {
+                if action == CommandAction::Pin {
+                    binding.update(|document| {
+                        let _ = document.pins_mut().pin(item, path, label);
+                    })
+                } else {
+                    binding.update(|document| {
+                        document.pins_mut().unpin(&item);
+                    })
+                }
+            },
+            |state, result, cx| {
                 if let Err(error) = result {
                     state.operation_error = Some(error);
                 } else {
-                    state.sync_catalog_projection();
+                    state.sync_catalog_projection(cx);
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     fn dispatch_manage_tags(
@@ -12536,7 +12558,7 @@ impl MusheenApp {
                 LocalOperationOutcome::Transfer(TransferOutcome::MetadataReview {
                     review, ..
                 }) => self.open_metadata_review(id, *review, cx),
-                outcome => self.finish_catalog_move(id, outcome),
+                outcome => self.finish_catalog_move(id, outcome, cx),
             }
             // A background completion refreshes the current tab; it must not
             // steal focus restored when a review closes.
@@ -12632,20 +12654,33 @@ impl MusheenApp {
         cx.notify();
     }
 
-    fn finish_catalog_move(&mut self, id: musheen_ops::JobId, outcome: LocalOperationOutcome) {
+    /// Moves a finished move's or rename's tags in the catalog. The
+    /// destination's capabilities and the catalog write run off the UI
+    /// thread.
+    fn finish_catalog_move(
+        &mut self,
+        id: musheen_ops::JobId,
+        outcome: LocalOperationOutcome,
+        cx: &mut Context<Self>,
+    ) {
         let Some(movement) = self.pending_catalog_moves.remove(&id) else {
             return;
         };
-        let result = match outcome {
+        let store = Arc::clone(&self.store);
+        let binding = self.catalog_binding.clone();
+        let work = match outcome {
             LocalOperationOutcome::Transfer(TransferOutcome::Skipped) => return,
             LocalOperationOutcome::Transfer(TransferOutcome::Completed(target)) => {
-                let capabilities = self.store.capabilities(target.path());
-                self.catalog_binding.complete_move(
-                    &movement.source,
-                    target.id().clone(),
-                    target.path().clone(),
-                    &capabilities,
-                )
+                let source = movement.source;
+                cx.background_spawn(async move {
+                    let capabilities = store.capabilities(target.path());
+                    binding.complete_move(
+                        &source,
+                        target.id().clone(),
+                        target.path().clone(),
+                        &capabilities,
+                    )
+                })
             }
             LocalOperationOutcome::Transfer(TransferOutcome::MetadataReview { .. }) => return,
             LocalOperationOutcome::Metadata => {
@@ -12663,27 +12698,38 @@ impl MusheenApp {
                 return;
             }
             LocalOperationOutcome::Mutation => {
-                let capabilities = self.store.capabilities(&movement.target_path);
-                self.catalog_binding.complete_rename(
-                    &movement.source,
-                    movement.target_path.clone(),
-                    &capabilities,
-                )
+                let source = movement.source;
+                let target_path = movement.target_path;
+                cx.background_spawn(async move {
+                    let capabilities = store.capabilities(&target_path);
+                    binding.complete_rename(&source, target_path, &capabilities)
+                })
             }
             LocalOperationOutcome::Trash(_) | LocalOperationOutcome::Archive => return,
         };
-        match result {
-            Ok(TagMoveOutcome::Preserved) => {}
-            Ok(TagMoveOutcome::UnsupportedDestination) => {
-                self.operation_error = Some(
-                    self.catalog
-                        .message("catalog-error-move-tags-unsupported")
-                        .expect("the unsupported-move catalog message exists")
-                        .into(),
-                );
-            }
-            Err(error) => self.operation_error = Some(error),
-        }
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                match result {
+                    Ok(TagMoveOutcome::Preserved) => {}
+                    Ok(TagMoveOutcome::UnsupportedDestination) => {
+                        state.operation_error = Some(
+                            state
+                                .catalog
+                                .message("catalog-error-move-tags-unsupported")
+                                .expect("the unsupported-move catalog message exists")
+                                .into(),
+                        );
+                    }
+                    Err(error) => state.operation_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn refresh_info_pane(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
@@ -20130,7 +20176,7 @@ mod tests {
         let (app, _) = open_selected_directory(temporary.path(), Layout::List, cx).await;
         let destination = StorePath::from_unix_path(temporary.path().join("after.txt"));
 
-        app.update(cx, |state, _| {
+        let item_id = app.update(cx, |state, cx| {
             state.catalog_binding = CatalogBinding::in_memory();
             let item = state.focused_directory().view().items()[0].clone();
             let capabilities = state.store.capabilities(item.path());
@@ -20153,12 +20199,13 @@ mod tests {
                 },
             );
 
-            state.finish_catalog_move(job, LocalOperationOutcome::Mutation);
+            state.finish_catalog_move(job, LocalOperationOutcome::Mutation, cx);
+            item.id().clone()
+        });
+        cx.run_until_parked();
 
-            assert_eq!(
-                state.catalog_binding.path_hint(item.id()),
-                Some(destination)
-            );
+        app.update(cx, |state, _| {
+            assert_eq!(state.catalog_binding.path_hint(&item_id), Some(destination));
         });
     }
 
@@ -28083,6 +28130,7 @@ mod tests {
                 .layout = Layout::List;
             state.persist_focused_view_preferences(cx);
         });
+        cx.run_until_parked();
 
         let persisted = catalog_store.load().unwrap();
         assert!(persisted.pins().entries().is_empty());
@@ -28403,7 +28451,7 @@ mod tests {
             .into_iter()
             .find(|window| *window != browser)
             .unwrap();
-        app.update(cx, |state, _| {
+        app.update(cx, |state, cx| {
             state
                 .catalog_binding
                 .update(|catalog| {
@@ -28421,7 +28469,7 @@ mod tests {
                         .unwrap();
                 })
                 .unwrap();
-            state.sync_catalog_projection();
+            state.sync_catalog_projection(cx);
         });
         cx.update_window(settings, |_, window, cx| {
             window.render_frame(cx);
@@ -28430,6 +28478,7 @@ mod tests {
             window.click("settings-clear-recent-locations", cx);
         })
         .unwrap();
+        cx.run_until_parked();
 
         app.update(cx, |state, _| {
             let snapshot = state.catalog_binding.snapshot();
@@ -28562,7 +28611,7 @@ mod tests {
                         .unwrap();
                 })
                 .unwrap();
-            state.sync_catalog_projection();
+            state.sync_catalog_projection(cx);
             cx.notify();
         });
 
@@ -28617,7 +28666,7 @@ mod tests {
         })
         .await;
 
-        app.update(cx, |state, cx| {
+        let (tab, target) = app.update(cx, |state, cx| {
             let target = (
                 item.id().clone(),
                 path.clone(),
@@ -28627,7 +28676,7 @@ mod tests {
                 .catalog_binding
                 .assign_tag(&target.0, &target.1, &target.2, "old")
                 .unwrap();
-            state.sync_catalog_projection();
+            state.sync_catalog_projection(cx);
             state.apply_tag_filter("fresh", cx);
             let tab = state.navigation.focused_tab().id();
             assert!(
@@ -28638,16 +28687,28 @@ mod tests {
                     .apply(state.focused_directory().view())
                     .is_empty()
             );
-            state
-                .apply_properties_tags(
-                    &[target],
-                    &TagDelta {
-                        added: [Box::<str>::from("fresh")].into_iter().collect(),
-                        removed: [Box::<str>::from("old")].into_iter().collect(),
-                    },
-                )
-                .unwrap();
+            (tab, target)
+        });
+        let writer = app.update(cx, |state, cx| {
+            state.properties_tag_writer(vec![target], cx)
+        });
+        let written = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let written = std::rc::Rc::clone(&written);
+            writer(
+                &TagDelta {
+                    added: [Box::<str>::from("fresh")].into_iter().collect(),
+                    removed: [Box::<str>::from("old")].into_iter().collect(),
+                },
+                cx,
+                Box::new(move |result, _| *written.borrow_mut() = Some(result)),
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(*written.borrow(), Some(Ok(())));
 
+        let provider = ProviderId::new("musheen-tag").unwrap();
+        app.update(cx, |state, cx| {
             assert_eq!(
                 state.filters[&tab]
                     .filter
@@ -28684,7 +28745,6 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(home_tags, ["fresh"]);
 
-            let provider = ProviderId::new("musheen-tag").unwrap();
             let fresh_target = CommandTargetRef::new(
                 ItemId::new(provider.clone(), b"fresh".to_vec()).unwrap(),
                 StorePath::from_provider_key(provider.clone(), b"fresh".to_vec()).unwrap(),
@@ -28705,7 +28765,11 @@ mod tests {
             );
             assert!(cx.windows().len() >= 2);
 
-            state.rename_catalog_tag("fresh", "renamed").unwrap();
+            state.rename_catalog_tag("fresh", "renamed", cx, |result, _| result.unwrap());
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |state, cx| {
             assert!(
                 state.filters[&tab]
                     .filter
@@ -28716,7 +28780,7 @@ mod tests {
             );
             let tag_target = CommandTargetRef::new(
                 ItemId::new(provider.clone(), b"renamed".to_vec()).unwrap(),
-                StorePath::from_provider_key(provider, b"renamed".to_vec()).unwrap(),
+                StorePath::from_provider_key(provider.clone(), b"renamed".to_vec()).unwrap(),
             )
             .unwrap();
             state.dispatch_typed_context_command(
@@ -28727,6 +28791,10 @@ mod tests {
                 true,
                 cx,
             );
+        });
+        cx.run_until_parked();
+
+        app.update(cx, |state, _| {
             assert!(state.catalog_binding.tag_names().is_empty());
             assert!(
                 state.operation_error.is_none(),
@@ -30546,7 +30614,7 @@ mod tests {
                     let gate = close_store_gate(state);
                     state.navigate(child.clone(), true, cx);
                     // A finished page remembers its folder the same way.
-                    state.remember_folder_location(&child);
+                    state.remember_folder_location(child.clone(), None, cx);
                     gate
                 })
             })
@@ -30622,6 +30690,56 @@ mod tests {
         );
     }
 
+    // UXF-023: a view change queued while the catalog is locked is still
+    // written when its window closes before the lock is released.
+    #[gpui_kit::test]
+    async fn ui_thread_view_preference_is_written_after_its_window_closes(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::write(folder.join("item.txt"), b"item").unwrap(),
+            cx,
+        )
+        .await;
+        let root = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(window.folder.as_os_str()))
+            .unwrap()
+            .unwrap();
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .layout = Layout::Details;
+                state.persist_focused_view_preferences(cx);
+            });
+        })
+        .unwrap();
+        cx.update_window(window.browser, |_, window, _| window.remove_window())
+            .unwrap();
+        let CatalogWindow {
+            app,
+            catalog_store,
+            _temporary,
+            ..
+        } = window;
+        drop(app);
+        lock.release();
+        cx.run_until_parked();
+
+        assert_eq!(
+            catalog_store
+                .load()
+                .unwrap()
+                .folder_preferences()
+                .resolve(&FolderIdentity::from_item(root.id().clone()))
+                .view(),
+            musheen_desktop::FolderView::Details,
+            "the queued write lands after the window is gone"
+        );
+    }
+
     // UXF-023: a tag edit from the Properties window is written after the
     // UI thread returns.
     #[gpui_kit::test]
@@ -30647,19 +30765,36 @@ mod tests {
             removed: BTreeSet::new(),
         };
 
+        let writer = window
+            .app
+            .update(cx, |state, cx| state.properties_tag_writer(targets, cx));
+        let written = std::rc::Rc::new(std::cell::RefCell::new(None));
+
         let lock = CatalogLockHolder::hold(&window.catalog_path);
         let started = Instant::now();
-        cx.update_window(window.browser, |_, _, cx| {
-            window.app.update(cx, |state, _| {
-                state.apply_properties_tags(&targets, &delta).unwrap();
-            });
-        })
-        .unwrap();
+        cx.update(|cx| {
+            let written = std::rc::Rc::clone(&written);
+            writer(
+                &delta,
+                cx,
+                Box::new(move |result, _| *written.borrow_mut() = Some(result)),
+            );
+        });
         let elapsed = started.elapsed();
+        assert_eq!(
+            *written.borrow(),
+            None,
+            "the writer returns before the write"
+        );
         lock.release();
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "a Properties tag edit");
+        assert_eq!(
+            *written.borrow(),
+            Some(Ok(())),
+            "the window hears the result"
+        );
         assert!(
             window
                 .catalog_store
@@ -30705,10 +30840,10 @@ mod tests {
         let lock = CatalogLockHolder::hold(&window.catalog_path);
         let started = Instant::now();
         cx.update_window(window.browser, |_, _, cx| {
-            window.app.update(cx, |state, _| {
-                state.rename_catalog_tag("Work", "Projects").unwrap();
+            window.app.update(cx, |state, cx| {
+                state.rename_catalog_tag("Work", "Projects", cx, |result, _| result.unwrap());
                 state
-                    .delete_captured_tag(&tag_command_target("Old"))
+                    .delete_captured_tag(&tag_command_target("Old"), cx)
                     .unwrap();
             });
         })
@@ -30752,9 +30887,9 @@ mod tests {
         let started = Instant::now();
         let gate = cx
             .update_window(window.browser, |_, _, cx| {
-                window.app.update(cx, |state, _| {
+                window.app.update(cx, |state, cx| {
                     let gate = close_store_gate(state);
-                    state.sync_catalog_projection();
+                    state.sync_catalog_projection(cx);
                     gate
                 })
             })
@@ -30864,7 +30999,7 @@ mod tests {
         let started = Instant::now();
         let gate = cx
             .update_window(window.browser, |_, _, cx| {
-                window.app.update(cx, |state, _| {
+                window.app.update(cx, |state, cx| {
                     state.pending_catalog_moves.insert(
                         job,
                         PendingCatalogMove {
@@ -30874,7 +31009,7 @@ mod tests {
                         },
                     );
                     let gate = close_store_gate(state);
-                    state.finish_catalog_move(job, LocalOperationOutcome::Mutation);
+                    state.finish_catalog_move(job, LocalOperationOutcome::Mutation, cx);
                     gate
                 })
             })
