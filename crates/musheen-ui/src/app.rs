@@ -482,6 +482,86 @@ struct PendingMenuProbe {
     deferring: bool,
 }
 
+/// The store questions the window has queued. `composing` is open while a
+/// menu is composed, and what that composition queues belongs to it alone.
+#[derive(Default)]
+struct StoreProbeQueue {
+    composing: Option<MenuComposition>,
+    /// Probes queued outside a menu, by toolbar and command state during a
+    /// frame, and probes a menu handed on; the next frame runs them.
+    render: Vec<StoreProbe>,
+    /// Probes a background task is answering, so a frame does not ask the
+    /// same question twice.
+    in_flight: std::collections::HashSet<StoreProbe>,
+}
+
+/// What one menu composition queued: the probes the caches could not
+/// answer, each with whether the popup waits for it, and how to compose the
+/// menu again once they answer.
+#[derive(Default)]
+struct MenuComposition {
+    probes: Vec<(StoreProbe, bool)>,
+    recompose: Option<MenuRecompose>,
+}
+
+/// A composed context menu with what its composition queued. A popup takes
+/// the probes it waits for with `into_popup`; any other caller takes the
+/// menu with `into_menu`, which hands the probes to the next frame. Either
+/// way nothing is left for another menu.
+#[must_use]
+struct ComposedMenu {
+    menu: ContextMenu,
+    composition: MenuComposition,
+}
+
+impl ComposedMenu {
+    /// The menu, for a caller that opens no popup waiting on the store. The
+    /// probes go to the next frame, so the caches still fill.
+    fn into_menu(self, app: &MusheenApp) -> ContextMenu {
+        app.queue_render_probes(self.composition.probes.into_iter().map(|(probe, _)| probe));
+        self.menu
+    }
+
+    /// The menu and the probe its popup starts: `None` when the caches
+    /// answered everything, or when the menu cannot be composed again, in
+    /// which case the probes go to the next frame.
+    fn into_popup(self, app: &MusheenApp) -> PendingContextMenu {
+        let MenuComposition { probes, recompose } = self.composition;
+        let probe = match recompose {
+            Some(recompose) if !probes.is_empty() => Some(PendingMenuProbe {
+                deferring: probes.iter().any(|(_, defers)| *defers),
+                probes: probes.into_iter().map(|(probe, _)| probe).collect(),
+                recompose,
+            }),
+            _ => {
+                app.queue_render_probes(probes.into_iter().map(|(probe, _)| probe));
+                None
+            }
+        };
+        PendingContextMenu {
+            menu: self.menu,
+            probe,
+        }
+    }
+}
+
+/// A composed menu kept for the popup its click opens, with the probe that
+/// popup starts.
+struct PendingContextMenu {
+    menu: ContextMenu,
+    probe: Option<PendingMenuProbe>,
+}
+
+impl PendingContextMenu {
+    /// Hands the probe's questions to the next frame, for a kept menu no
+    /// popup opens.
+    fn release(self, app: &MusheenApp) {
+        if let Some(probe) = self.probe {
+            app.queue_render_probes(probe.probes);
+        }
+    }
+}
+
 /// The most executable states and location facts the caches keep; both
 /// start over when full.
 const EXECUTABLE_FACTS_LIMIT: usize = 4_096;
@@ -3602,7 +3682,7 @@ struct MusheenApp {
     pending_cut_jobs: std::collections::HashSet<musheen_ops::JobId>,
     pending_catalog_moves: HashMap<musheen_ops::JobId, PendingCatalogMove>,
     pending_directory_restores: HashMap<TabId, PendingDirectoryRestore>,
-    pending_context_menu: Option<ContextMenu>,
+    pending_context_menu: Option<PendingContextMenu>,
     pending_indexed_context_menu: Option<DeferredIndexedContextMenu>,
     /// Tabs whose index is merging a batch of changes right now.
     index_merges_running: std::collections::HashSet<TabId>,
@@ -3619,18 +3699,9 @@ struct MusheenApp {
     executable_facts: HashMap<ItemId, Option<CapabilityState>>,
     /// Location facts by location, answered by background probes.
     location_facts: HashMap<StorePath, LocationFacts>,
-    /// Set while a context menu is composed: the probes queued then belong
-    /// to that menu, whose popup may wait for them.
-    composing_menu: std::cell::Cell<bool>,
-    /// The probes the menu being composed could not answer from the
-    /// caches, each with whether the popup waits for it.
-    pending_store_probes: std::cell::RefCell<Vec<(StoreProbe, bool)>>,
-    /// Probes queued outside a menu, by toolbar and command state during
-    /// a frame; the next frame runs them and repaints when they answer.
-    render_probes: std::cell::RefCell<Vec<StoreProbe>>,
-    /// Render probes in flight, so a frame does not ask the same question
-    /// twice.
-    probes_in_flight: std::collections::HashSet<StoreProbe>,
+    /// The store questions queued by the menu being composed, by frames
+    /// and by menus that handed theirs on, and the ones in flight.
+    store_probes: std::cell::RefCell<StoreProbeQueue>,
     /// Folder identities the store resolved, by location; `None` is a
     /// location the store did not find. The UI thread reads only this and
     /// the catalog; the store answers on a background executor.
@@ -3650,8 +3721,6 @@ struct MusheenApp {
     /// the write lands.
     pending_view_preferences: HashMap<StorePath, u64>,
     view_preference_generation: u64,
-    /// How to compose the last menu again once its probes answer.
-    pending_menu_recompose: std::cell::RefCell<Option<MenuRecompose>>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
     /// Dialog windows are tracked by their GPUI identity. The close observer
     /// clears only its own immutable pending workflow; opening a second review
@@ -4402,10 +4471,7 @@ impl MusheenApp {
             sidebar_menu_generation: 0,
             executable_facts: HashMap::new(),
             location_facts: HashMap::new(),
-            composing_menu: std::cell::Cell::new(false),
-            pending_store_probes: std::cell::RefCell::new(Vec::new()),
-            render_probes: std::cell::RefCell::new(Vec::new()),
-            probes_in_flight: std::collections::HashSet::new(),
+            store_probes: std::cell::RefCell::default(),
             folder_identities: HashMap::new(),
             folder_identities_in_flight: std::collections::HashSet::new(),
             folder_identity_waiters: Vec::new(),
@@ -4414,7 +4480,6 @@ impl MusheenApp {
             orphan_cleanups: std::collections::HashSet::new(),
             pending_view_preferences: HashMap::new(),
             view_preference_generation: 0,
-            pending_menu_recompose: std::cell::RefCell::new(None),
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
             context_dialog_close_subscription: None,
@@ -7346,9 +7411,25 @@ impl MusheenApp {
         }
     }
 
-    fn queue_plain_context_menu(&mut self, menu: ContextMenu) {
+    fn queue_plain_context_menu(&mut self, composed: ComposedMenu) {
         self.pending_indexed_context_menu = None;
-        self.pending_context_menu = Some(menu);
+        self.keep_context_menu_for_popup(composed);
+    }
+
+    /// Keeps a composed menu for the popup the same click opens. A menu kept
+    /// before and never opened hands its probes to the next frame.
+    fn keep_context_menu_for_popup(&mut self, composed: ComposedMenu) {
+        let pending = composed.into_popup(self);
+        if let Some(replaced) = self.pending_context_menu.replace(pending) {
+            replaced.release(self);
+        }
+    }
+
+    /// Drops the kept menu; its probes go to the next frame.
+    fn discard_pending_context_menu(&mut self) {
+        if let Some(pending) = self.pending_context_menu.take() {
+            pending.release(self);
+        }
     }
 
     /// Builds a menu request from the pane that received the pointer event.
@@ -7360,9 +7441,21 @@ impl MusheenApp {
         clicked: ItemId,
         cx: &mut Context<Self>,
     ) -> ContextMenu {
+        self.composed_item_context_menu(tab_id, clicked, cx)
+            .into_menu(self)
+    }
+
+    /// As `item_context_menu`, with what the composition queued, for the
+    /// popup the click opens.
+    fn composed_item_context_menu(
+        &mut self,
+        tab_id: TabId,
+        clicked: ItemId,
+        cx: &mut Context<Self>,
+    ) -> ComposedMenu {
         let (clicked_target, selected, deferred) = {
             let Some(directory) = self.directories.get(&tab_id) else {
-                return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+                return self.composed_context_menu(tab_id, MenuTarget::Background, Vec::new());
             };
             let view = directory.view();
             let viewport = self
@@ -7382,7 +7475,7 @@ impl MusheenApp {
                 })
             };
             let Some(item) = cached_item(&clicked) else {
-                return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+                return self.composed_context_menu(tab_id, MenuTarget::Background, Vec::new());
             };
             let clicked_target = CommandTargetRef::new(item.id().clone(), item.path().clone())
                 .expect("directory items have stable command targets");
@@ -7442,7 +7535,7 @@ impl MusheenApp {
         self.pending_indexed_context_menu = deferred;
         if self.pending_indexed_context_menu.is_some() {
             self.focus_directory_item(tab_id, Some(clicked_target.id().clone()), cx);
-            return self.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+            return self.composed_context_menu(tab_id, MenuTarget::Background, Vec::new());
         }
         let prepared = self
             .shell
@@ -7465,7 +7558,7 @@ impl MusheenApp {
             cx,
         );
         self.refresh_application_snapshot(prepared.selection(), cx);
-        self.compose_context_menu(tab_id, MenuTarget::Item, prepared.selection().to_vec())
+        self.composed_context_menu(tab_id, MenuTarget::Item, prepared.selection().to_vec())
     }
 
     fn start_indexed_context_menu(
@@ -7574,21 +7667,23 @@ impl MusheenApp {
                 state.refresh_application_snapshot(&targets, cx);
                 let send_to = state.send_to_destinations(tab_id);
                 let open_with = state.open_with_applications(&targets);
-                let menu = state.while_composing_menu(|state| {
-                    state.compose_context_request(
-                        state
-                            .context_menu_request_with_item(
-                                tab_id,
-                                MenuTarget::Item,
-                                location,
-                                targets,
-                                first_item.as_ref(),
-                            )
-                            .with_send_to(&send_to)
-                            .with_open_with(&open_with),
-                    )
-                });
-                if let Some(pending) = state.take_pending_menu_probe() {
+                let PendingContextMenu { menu, probe } = state
+                    .compose_menu(|state| {
+                        state.compose_context_request(
+                            state
+                                .context_menu_request_with_item(
+                                    tab_id,
+                                    MenuTarget::Item,
+                                    location,
+                                    targets,
+                                    first_item.as_ref(),
+                                )
+                                .with_send_to(&send_to)
+                                .with_open_with(&open_with),
+                        )
+                    })
+                    .into_popup(state);
+                if let Some(pending) = probe {
                     let deferring = pending.deferring;
                     state.start_menu_probe(pending, popup.clone(), window, path.clone(), cx);
                     if deferring {
@@ -7657,8 +7752,8 @@ impl MusheenApp {
         })
     }
 
-    fn sidebar_context_menu(&self, tab_id: TabId) -> ContextMenu {
-        self.compose_context_menu(tab_id, MenuTarget::SidebarLocation, Vec::new())
+    fn sidebar_context_menu(&self, tab_id: TabId) -> ComposedMenu {
+        self.composed_context_menu(tab_id, MenuTarget::SidebarLocation, Vec::new())
     }
 
     fn open_keyboard_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7693,11 +7788,12 @@ impl MusheenApp {
                 MenuTarget::Item
             };
             self.refresh_application_snapshot(prepared.selection(), cx);
-            let menu =
-                self.compose_context_menu(tab_id, menu_target, prepared.selection().to_vec());
-            probe = self.take_pending_menu_probe();
+            let pending = self
+                .composed_context_menu(tab_id, menu_target, prepared.selection().to_vec())
+                .into_popup(self);
+            probe = pending.probe;
             let deferring = probe.as_ref().is_some_and(|pending| pending.deferring);
-            (!deferring).then_some(menu)
+            (!deferring).then_some(pending.menu)
         } else {
             None
         };
@@ -7766,7 +7862,20 @@ impl MusheenApp {
         location: StorePath,
         identity: Option<ItemId>,
     ) -> ContextMenu {
-        self.while_composing_menu(|this| {
+        self.composed_sidebar_entry_context_menu(tab_id, target, location, identity)
+            .into_menu(self)
+    }
+
+    /// As `sidebar_entry_context_menu`, with what the composition queued,
+    /// for the popup the click opens.
+    fn composed_sidebar_entry_context_menu(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        identity: Option<ItemId>,
+    ) -> ComposedMenu {
+        self.compose_menu(|this| {
             this.sidebar_entry_context_menu_inner(tab_id, target, location, identity)
         })
     }
@@ -7833,7 +7942,7 @@ impl MusheenApp {
             )
             .with_send_to(&send_to)
             .with_open_with(&open_with);
-        *self.pending_menu_recompose.borrow_mut() = Some(MenuRecompose::Sidebar {
+        self.record_menu_recompose(|| MenuRecompose::Sidebar {
             tab_id,
             target,
             location,
@@ -7892,50 +8001,71 @@ impl MusheenApp {
     /// Queues a question for the store. `defers_menu` says the popup waits
     /// for the answer because it decides which commands the menu offers.
     fn queue_store_probe(&self, probe: StoreProbe, defers_menu: bool) {
-        if !self.composing_menu.get() {
-            let mut probes = self.render_probes.borrow_mut();
-            if !probes.contains(&probe) {
-                probes.push(probe);
+        let mut queue = self.store_probes.borrow_mut();
+        let queue = &mut *queue;
+        match &mut queue.composing {
+            Some(composition) => {
+                match composition
+                    .probes
+                    .iter_mut()
+                    .find(|(queued, _)| *queued == probe)
+                {
+                    Some((_, defers)) => *defers |= defers_menu,
+                    None => composition.probes.push((probe, defers_menu)),
+                }
             }
-            return;
-        }
-        let mut probes = self.pending_store_probes.borrow_mut();
-        match probes.iter_mut().find(|(queued, _)| *queued == probe) {
-            Some((_, defers)) => *defers |= defers_menu,
-            None => probes.push((probe, defers_menu)),
+            None => {
+                if !queue.render.contains(&probe) {
+                    queue.render.push(probe);
+                }
+            }
         }
     }
 
-    /// Runs `compose` as a menu composition: the probes it queues belong to
-    /// the menu and the recompose record is written for it.
-    fn while_composing_menu<R>(&self, compose: impl FnOnce(&Self) -> R) -> R {
-        let previous = self.composing_menu.replace(true);
-        let result = compose(self);
-        self.composing_menu.set(previous);
-        result
+    /// Queues probes for the next frame, skipping ones already queued.
+    fn queue_render_probes(&self, probes: impl IntoIterator<Item = StoreProbe>) {
+        let mut queue = self.store_probes.borrow_mut();
+        for probe in probes {
+            if !queue.render.contains(&probe) {
+                queue.render.push(probe);
+            }
+        }
     }
 
-    /// Hands the probes a menu composition left behind to the next frame,
-    /// so the caches still fill when no popup waits for them.
-    fn move_menu_probes_to_render(&self) {
-        let queued = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
-        self.pending_menu_recompose.borrow_mut().take();
-        let mut render = self.render_probes.borrow_mut();
-        for (probe, _) in queued {
-            if !render.contains(&probe) {
-                render.push(probe);
-            }
+    /// Composes a menu as one composition: the probes `compose` queues and
+    /// how to compose the menu again go to the returned record and to no
+    /// state another menu could pick up.
+    fn compose_menu(&self, compose: impl FnOnce(&Self) -> ContextMenu) -> ComposedMenu {
+        let outer = self
+            .store_probes
+            .borrow_mut()
+            .composing
+            .replace(MenuComposition::default());
+        let menu = compose(self);
+        let composition = std::mem::replace(&mut self.store_probes.borrow_mut().composing, outer)
+            .unwrap_or_default();
+        ComposedMenu { menu, composition }
+    }
+
+    /// Records how to compose the menu being composed again. Does nothing
+    /// outside a composition.
+    fn record_menu_recompose(&self, recompose: impl FnOnce() -> MenuRecompose) {
+        if let Some(composition) = self.store_probes.borrow_mut().composing.as_mut() {
+            composition.recompose = Some(recompose());
         }
     }
 
     /// Runs the probes toolbar and command state queued during the last
-    /// frame, and repaints when they answer.
+    /// frame, and the ones menus handed on, and repaints when they answer.
     fn flush_render_probes(&mut self, cx: &mut Context<Self>) {
-        let queued = std::mem::take(&mut *self.render_probes.borrow_mut());
-        let probes = queued
-            .into_iter()
-            .filter(|probe| self.probes_in_flight.insert(probe.clone()))
-            .collect::<Vec<_>>();
+        let probes = {
+            let mut queue = self.store_probes.borrow_mut();
+            let queue = &mut *queue;
+            std::mem::take(&mut queue.render)
+                .into_iter()
+                .filter(|probe| queue.in_flight.insert(probe.clone()))
+                .collect::<Vec<_>>()
+        };
         if probes.is_empty() {
             return;
         }
@@ -7946,31 +8076,17 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| {
-                for probe in &probes {
-                    state.probes_in_flight.remove(probe);
+                {
+                    let mut queue = state.store_probes.borrow_mut();
+                    for probe in &probes {
+                        queue.in_flight.remove(probe);
+                    }
                 }
                 state.apply_store_probe_results(results);
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    /// The probes the last composition queued, with how to compose it
-    /// again, or `None` when the caches answered everything.
-    fn take_pending_menu_probe(&mut self) -> Option<PendingMenuProbe> {
-        let queued = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
-        let recompose = self.pending_menu_recompose.borrow_mut().take();
-        if queued.is_empty() {
-            return None;
-        }
-        let deferring = queued.iter().any(|(_, defers)| *defers);
-        let probes = queued.into_iter().map(|(probe, _)| probe).collect();
-        recompose.map(|recompose| PendingMenuProbe {
-            probes,
-            recompose,
-            deferring,
-        })
     }
 
     fn spawn_store_probes(
@@ -8077,24 +8193,19 @@ impl MusheenApp {
             return;
         }
         // The render queue skips a probe that is already in flight.
-        self.render_probes.borrow_mut().push(StoreProbe::Location {
+        self.queue_render_probes([StoreProbe::Location {
             location,
             resolve: false,
-        });
+        }]);
         self.flush_render_probes(cx);
     }
 
-    /// Runs the probes the last composition queued, for a caller that holds
-    /// no popup to rebuild. Returns whether there were any.
+    /// Runs the probes queued for the next frame, which include the ones a
+    /// menu composed with no popup handed on, for a test that draws no
+    /// frame. Returns whether there were any.
     #[cfg(test)]
     fn run_pending_menu_probes(&mut self, cx: &mut Context<Self>) -> bool {
-        let queued = std::mem::take(&mut *self.pending_store_probes.borrow_mut());
-        self.pending_menu_recompose.borrow_mut().take();
-        let mut probes = queued
-            .into_iter()
-            .map(|(probe, _)| probe)
-            .collect::<Vec<_>>();
-        probes.extend(std::mem::take(&mut *self.render_probes.borrow_mut()));
+        let probes = std::mem::take(&mut self.store_probes.borrow_mut().render);
         if probes.is_empty() {
             return false;
         }
@@ -8168,10 +8279,9 @@ impl MusheenApp {
                 if popup.upgrade().is_none() {
                     return;
                 }
+                // The caches answer the menu now; anything it still asks
+                // is a Send To destination the next frame fills in.
                 let menu = state.compose_from_recompose(&recompose);
-                // The caches answer the menu now; anything still queued is
-                // a Send To destination the next frame fills in.
-                state.move_menu_probes_to_render();
                 let live = custom_actions::LiveActionPopup {
                     popup,
                     window,
@@ -8197,12 +8307,24 @@ impl MusheenApp {
         target: MenuTarget,
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
+        self.composed_context_menu(tab_id, target, selection)
+            .into_menu(self)
+    }
+
+    /// As `compose_context_menu`, with what the composition queued, for a
+    /// popup.
+    fn composed_context_menu(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        selection: Vec<CommandTargetRef>,
+    ) -> ComposedMenu {
         let location = self
             .navigation
             .tab(tab_id)
             .map(|tab| tab.location().clone())
             .unwrap_or_else(|| self.navigation.focused_tab().location().clone());
-        self.compose_context_menu_at(tab_id, target, location, selection)
+        self.composed_context_menu_at(tab_id, target, location, selection)
     }
 
     fn context_menu_request(
@@ -8243,15 +8365,13 @@ impl MusheenApp {
         } else {
             self.context_for_menu(tab_id, target, &location, &selection)
         };
-        if self.composing_menu.get() {
-            *self.pending_menu_recompose.borrow_mut() = Some(MenuRecompose::Request {
-                tab_id,
-                target,
-                location: location.clone(),
-                selection: selection.clone(),
-                resolved_item: resolved_item.cloned(),
-            });
-        }
+        self.record_menu_recompose(|| MenuRecompose::Request {
+            tab_id,
+            target,
+            location: location.clone(),
+            selection: selection.clone(),
+            resolved_item: resolved_item.cloned(),
+        });
         let trash_contents = if target == MenuTarget::TrashBackground {
             selection.clone()
         } else {
@@ -8475,7 +8595,6 @@ impl MusheenApp {
         for (popup, menu) in refreshes {
             popup.rebuild(menu, cx);
         }
-        self.move_menu_probes_to_render();
     }
 
     fn send_to_destinations(&self, tab_id: TabId) -> Vec<crate::SendToDestination> {
@@ -8548,7 +8667,18 @@ impl MusheenApp {
         location: StorePath,
         selection: Vec<CommandTargetRef>,
     ) -> ContextMenu {
-        self.while_composing_menu(|this| {
+        self.composed_context_menu_at(tab_id, target, location, selection)
+            .into_menu(self)
+    }
+
+    fn composed_context_menu_at(
+        &self,
+        tab_id: TabId,
+        target: MenuTarget,
+        location: StorePath,
+        selection: Vec<CommandTargetRef>,
+    ) -> ComposedMenu {
+        self.compose_menu(|this| {
             let send_to = this.send_to_destinations(tab_id);
             let open_with = this.open_with_applications(&selection);
             let request = this
@@ -14248,7 +14378,7 @@ impl MusheenApp {
                                                     return;
                                                 }
                                                 this.begin_sidebar_menu();
-                                                let menu = this.sidebar_entry_context_menu(
+                                                let menu = this.composed_sidebar_entry_context_menu(
                                                     sidebar_tab,
                                                     if kind == SidebarSectionKind::Tags {
                                                         MenuTarget::Tag
@@ -14361,17 +14491,16 @@ impl MusheenApp {
                 let Some((menu, probe, loading_label)) = context_menu_host
                     .update(popup_cx, |this, cx| {
                         if this.browser_input_blocked() {
-                            this.pending_context_menu = None;
+                            this.discard_pending_context_menu();
                             this.pending_indexed_context_menu = None;
                             return None;
                         }
                         this.remember_context_invocation_focus(window, cx);
                         this.pending_indexed_context_menu = None;
-                        let menu = this
-                            .pending_context_menu
-                            .take()
-                            .unwrap_or_else(|| this.sidebar_context_menu(sidebar_tab));
-                        let probe = this.take_pending_menu_probe();
+                        let PendingContextMenu { menu, probe } =
+                            this.pending_context_menu.take().unwrap_or_else(|| {
+                                this.sidebar_context_menu(sidebar_tab).into_popup(this)
+                            });
                         let loading_label =
                             probe.as_ref().filter(|pending| pending.deferring).map(|_| {
                                 this.catalog
@@ -14544,7 +14673,7 @@ impl MusheenApp {
                     }
                     this.focus_directory_item(tab_id, None, cx);
                     let menu =
-                        this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+                        this.composed_context_menu(tab_id, MenuTarget::Background, Vec::new());
                     this.queue_plain_context_menu(menu);
                 }),
             )
@@ -14552,19 +14681,32 @@ impl MusheenApp {
                 let Some((menu, deferred, probe, loading_label)) = context_menu_host
                     .update(popup_cx, |this, cx| {
                         if this.browser_input_blocked() {
-                            this.pending_context_menu = None;
+                            this.discard_pending_context_menu();
                             this.pending_indexed_context_menu = None;
                             return None;
                         }
                         this.remember_context_invocation_focus(window, cx);
-                        let menu = this.pending_context_menu.take().unwrap_or_else(|| {
-                            this.compose_context_menu(tab_id, MenuTarget::Background, Vec::new())
-                        });
+                        let PendingContextMenu { menu, probe } =
+                            this.pending_context_menu.take().unwrap_or_else(|| {
+                                this.composed_context_menu(
+                                    tab_id,
+                                    MenuTarget::Background,
+                                    Vec::new(),
+                                )
+                                .into_popup(this)
+                            });
                         let deferred = this.pending_indexed_context_menu.take();
-                        let probe = if deferred.is_none() {
-                            this.take_pending_menu_probe()
-                        } else {
-                            None
+                        // An indexed selection's menu is composed once its
+                        // targets are read; this menu's probes go to the
+                        // next frame.
+                        let probe = match (deferred.is_none(), probe) {
+                            (true, probe) => probe,
+                            (false, probe) => {
+                                if let Some(probe) = probe {
+                                    this.queue_render_probes(probe.probes);
+                                }
+                                None
+                            }
                         };
                         let deferring = deferred.is_some()
                             || probe.as_ref().is_some_and(|pending| pending.deferring);
@@ -14710,7 +14852,7 @@ impl MusheenApp {
                                         _ => None,
                                     })
                                     .unwrap_or_else(|| vec![pointer_target.clone()]);
-                                let menu = this.compose_context_menu(
+                                let menu = this.composed_context_menu(
                                     tab_id,
                                     MenuTarget::TrashItem,
                                     selection,
@@ -16251,7 +16393,7 @@ impl MusheenApp {
                     let selection = vec![target.clone()];
                     this.preflight_custom_actions(&selection, context_location.clone(), cx);
                     this.refresh_application_snapshot(&selection, cx);
-                    let menu = this.compose_context_menu_at(
+                    let menu = this.composed_context_menu_at(
                         tab_id,
                         MenuTarget::Item,
                         context_location.clone(),
@@ -16985,8 +17127,8 @@ impl MusheenApp {
                 if !this.context_dialog_windows.is_empty() {
                     return;
                 }
-                this.pending_context_menu =
-                    Some(this.item_context_menu(tab_id, context_menu_id.clone(), cx));
+                let menu = this.composed_item_context_menu(tab_id, context_menu_id.clone(), cx);
+                this.keep_context_menu_for_popup(menu);
             }),
         )
         .when_some(drag_payload, |item, payload| {
@@ -25075,7 +25217,7 @@ mod tests {
                 state.item_context_menu(tab_id, item.id().clone(), cx);
                 assert!(state.pending_indexed_context_menu.is_some());
                 let background =
-                    state.compose_context_menu(tab_id, MenuTarget::Background, Vec::new());
+                    state.composed_context_menu(tab_id, MenuTarget::Background, Vec::new());
                 state.queue_plain_context_menu(background);
                 assert!(state.pending_indexed_context_menu.is_none());
             });
@@ -30375,7 +30517,12 @@ mod tests {
                 let tab = state.navigation.focused_tab().id();
                 let item = state.focused_directory().view().items()[0].id().clone();
                 // The store is blocked, and the menu still opens.
-                let menu = state.item_context_menu(tab, item, cx);
+                let composed = state.composed_item_context_menu(tab, item, cx);
+                assert!(
+                    !composed.composition.probes.is_empty(),
+                    "the menu queued the store questions it could not answer"
+                );
+                let menu = composed.into_menu(state);
                 assert!(
                     MusheenApp::menu_entry_by_id(&menu, "file.open_with").is_some(),
                     "the menu opens for the file while the store is blocked"
@@ -30387,10 +30534,9 @@ mod tests {
         gate.open();
         cx.update_window(browser, |_, _, cx| {
             app.update(cx, |state, cx| {
-                assert!(
-                    state.run_pending_menu_probes(cx),
-                    "the menu queued the store questions it could not answer"
-                );
+                // The menu handed its questions to the next frame; ask them
+                // now unless a frame already did.
+                state.run_pending_menu_probes(cx);
             });
         })
         .unwrap();
@@ -31687,6 +31833,79 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    // UXF-023: a menu composed with no popup, as a command does, hands its
+    // probes to the next frame and leaves no probe and no recompose record
+    // for the next menu; a kept menu that is replaced does the same.
+    #[gpui_kit::test]
+    async fn ui_thread_menu_composed_without_a_popup_leaves_nothing_for_the_next_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, _browser, _temporary, location) =
+            open_app_with_external_location(ExternalLocation::LinkToDirectory, cx).await;
+
+        app.update(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
+            state.begin_sidebar_menu();
+            let first = state.composed_sidebar_entry_context_menu(
+                tab,
+                MenuTarget::SidebarLocation,
+                location.clone(),
+                None,
+            );
+            let asked = first
+                .composition
+                .probes
+                .iter()
+                .map(|(probe, _)| probe.clone())
+                .collect::<Vec<_>>();
+            assert!(!asked.is_empty(), "the link's place is asked of the store");
+            let _ = first.into_menu(state);
+
+            let next = state
+                .composed_context_menu(tab, MenuTarget::Background, Vec::new())
+                .into_popup(state);
+            assert!(
+                next.probe.as_ref().is_none_or(|pending| {
+                    asked.iter().all(|probe| !pending.probes.contains(probe))
+                        && pending.recompose.target() == MenuTarget::Background
+                }),
+                "the next popup waits on none of the first menu's probes"
+            );
+            let queue = state.store_probes.borrow();
+            assert!(queue.composing.is_none(), "no composition stays open");
+            assert!(
+                asked.iter().all(|probe| queue.render.contains(probe)),
+                "the first menu's probes go to the next frame"
+            );
+        });
+
+        app.update(cx, |state, _| {
+            let tab = state.navigation.focused_tab().id();
+            state.store_probes.borrow_mut().render.clear();
+            state.begin_sidebar_menu();
+            let kept = state.composed_sidebar_entry_context_menu(
+                tab,
+                MenuTarget::SidebarLocation,
+                location.clone(),
+                None,
+            );
+            state.queue_plain_context_menu(kept);
+            assert!(
+                state
+                    .pending_context_menu
+                    .as_ref()
+                    .is_some_and(|pending| pending.probe.is_some()),
+                "the kept menu holds the probe its popup starts"
+            );
+            let replacement = state.composed_context_menu(tab, MenuTarget::Background, Vec::new());
+            state.queue_plain_context_menu(replacement);
+            assert!(
+                !state.store_probes.borrow().render.is_empty(),
+                "a kept menu that is replaced hands its probes to the next frame"
+            );
+        });
     }
 
     #[gpui_kit::test]
