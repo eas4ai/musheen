@@ -64,7 +64,6 @@ pub enum SettingKind {
     Boolean,
     Choice(&'static [&'static str]),
     Integer { maximum: usize, units: &'static str },
-    CredentialReference,
     ConnectionProfiles,
     Toolbar,
     Shortcuts,
@@ -434,17 +433,6 @@ const SETTINGS: &[SettingSpec] = &[
         feature: SettingsFeature::Terminal,
     },
     SettingSpec {
-        key: "remote.credential",
-        page: SettingsPage::Integrations,
-        label: "setting-remote-credential",
-        group: "settings-group-remote",
-        aliases: "remote password secret",
-        default: "",
-        kind: SettingKind::CredentialReference,
-        restart_required: true,
-        feature: SettingsFeature::Remote,
-    },
-    SettingSpec {
         key: "remote.connections",
         page: SettingsPage::Integrations,
         label: "setting-remote-connections",
@@ -669,38 +657,6 @@ const SETTINGS: &[SettingSpec] = &[
 ];
 
 impl SettingsDocument {
-    pub fn credential_reference(
-        &self,
-    ) -> Result<Option<crate::CredentialReference>, SettingsError> {
-        let value = self.value("remote.credential").expect("schema key");
-        if value.is_empty() {
-            Ok(None)
-        } else {
-            crate::CredentialReference::from_setting_value(&value)
-                .map(Some)
-                .map_err(|_| SettingsError::InvalidValue {
-                    key: "remote.credential".into(),
-                })
-        }
-    }
-
-    pub fn set_credential_reference(
-        &mut self,
-        reference: Option<&crate::CredentialReference>,
-    ) -> Result<(), SettingsError> {
-        let value = match reference {
-            Some(reference) => {
-                reference
-                    .to_setting_value()
-                    .ok_or_else(|| SettingsError::InvalidValue {
-                        key: "remote.credential".into(),
-                    })?
-            }
-            None => String::new(),
-        };
-        self.set_value("remote.credential", &value)
-    }
-
     pub fn value(&self, key: &str) -> Option<String> {
         let limits = &self.resource_limits;
         let limit = match key {

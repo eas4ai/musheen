@@ -21,14 +21,6 @@ pub(super) fn display_value(spec: &SettingSpec, value: &str, catalog: &Catalog) 
             .expect("schema option is localized")
             .to_owned(),
         SettingKind::Integer { .. } => display_number(value, catalog.locale()),
-        SettingKind::CredentialReference if value.is_empty() => catalog
-            .message("settings-value-none")
-            .expect("empty reference is localized")
-            .to_owned(),
-        SettingKind::CredentialReference => catalog
-            .message("settings-value-credential-stored")
-            .expect("stored credential status is localized")
-            .to_owned(),
         SettingKind::ConnectionProfiles => {
             let count = musheen_desktop::ConnectionProfiles::import(value)
                 .map(|profiles| profiles.profiles().len())
@@ -38,13 +30,10 @@ pub(super) fn display_value(spec: &SettingSpec, value: &str, catalog: &Catalog) 
     }
 }
 
-/// References are managed by the connection editor rather than exposed as
-/// editable settings text. This helper remains for non-secret input controls.
+/// Connection profiles are managed by the connection editor rather than
+/// exposed as editable settings text. This helper serves the input controls.
 pub(super) fn input_value(spec: &SettingSpec, value: &str, catalog: &Catalog) -> String {
-    if matches!(
-        spec.kind,
-        SettingKind::CredentialReference | SettingKind::ConnectionProfiles
-    ) {
+    if matches!(spec.kind, SettingKind::ConnectionProfiles) {
         value.to_owned()
     } else {
         display_value(spec, value, catalog)

@@ -294,7 +294,6 @@ impl SettingsWindow {
                     | SettingKind::Theme
                     | SettingKind::CustomActions
                     | SettingKind::ConnectionProfiles
-                    | SettingKind::CredentialReference
             ) {
                 this.choices_focus.insert(spec.key, cx.focus_handle());
                 continue;
@@ -630,21 +629,6 @@ impl SettingsWindow {
                         .aria_label(self.label(spec.label)),
                 );
             }
-            if matches!(spec.kind, SettingKind::CredentialReference) {
-                let status = display_value(
-                    spec,
-                    &self.state.draft().value(spec.key).expect("schema key"),
-                    &self.catalog,
-                );
-                row = row.child(
-                    div()
-                        .id(spec.key)
-                        .test_support()
-                        .role(Role::Status)
-                        .aria_label(status.clone())
-                        .child(status),
-                );
-            }
             let values = match spec.kind {
                 SettingKind::Boolean
                 | SettingKind::Choice(_)
@@ -659,7 +643,6 @@ impl SettingsWindow {
                     display_number(&maximum.to_string(), self.catalog.locale()),
                     self.label(units)
                 ),
-                SettingKind::CredentialReference => self.label("settings-credential-hint"),
             };
             row = row.child(
                 observed_label(
@@ -1199,9 +1182,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    async fn localized_numeric_edits_round_trip_and_empty_credentials_remain_empty(
-        cx: &mut TestAppContext,
-    ) {
+    async fn localized_numeric_edits_round_trip(cx: &mut TestAppContext) {
         init_settings_pointer_test(cx);
         let root = tempfile::tempdir().unwrap();
         let mut view = None;
@@ -1220,7 +1201,6 @@ mod tests {
         });
         let view = view.unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
-            assert!(!view.read(cx).inputs.contains_key("remote.credential"));
             view.update(cx, |this, cx| {
                 this.state.navigate_to("directory_page_items").unwrap();
                 this.focus_pending = true;

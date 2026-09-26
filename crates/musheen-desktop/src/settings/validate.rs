@@ -11,9 +11,6 @@ pub(super) fn validate_value(spec: &SettingSpec, value: &str) -> Result<(), Sett
         SettingKind::Integer { maximum, .. } => value
             .parse::<usize>()
             .is_ok_and(|value| (1..=maximum).contains(&value)),
-        SettingKind::CredentialReference => {
-            value.is_empty() || crate::CredentialReference::from_setting_value(value).is_ok()
-        }
         SettingKind::ConnectionProfiles => crate::ConnectionProfiles::import(value).is_ok(),
     };
     if valid {

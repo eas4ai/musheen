@@ -4,7 +4,6 @@ use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::{
     ConnectionId, CredentialReference, CredentialVault, MutationDispatch, SecretBuffer,
     SecretError, SecretPersistence, SecretServiceBackend, SecretServiceState, SecretStorage,
-    SettingsDocument, SettingsStore,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -327,27 +326,6 @@ fn secret_values_are_redacted_and_can_be_cleared_explicitly() {
     assert!(!rendered.contains("credential-that-must-not-leak"));
     value.clear();
     assert!(value.is_empty());
-}
-
-#[test]
-fn settings_export_contains_only_persistent_references() {
-    let root = tempfile::tempdir().unwrap();
-    let store = SettingsStore::from_config_home(root.path());
-    let persistent = CredentialReference::persistent(ConnectionId::new("connection-42").unwrap());
-    let session = CredentialReference::session_only(ConnectionId::new("connection-42").unwrap());
-    let mut document = SettingsDocument::default();
-
-    document
-        .set_credential_reference(Some(&persistent))
-        .unwrap();
-    assert_eq!(document.credential_reference().unwrap(), Some(persistent));
-    assert!(document.set_credential_reference(Some(&session)).is_err());
-    store.save(&document).unwrap();
-
-    let exported = fs::read_to_string(store.path()).unwrap();
-    assert!(exported.contains("remote.credential=secret-service:connection-42"));
-    assert!(!exported.contains("password"));
-    assert!(!exported.contains("token"));
 }
 
 #[test]
