@@ -5,8 +5,8 @@ use std::time::Instant;
 use musheen_core::{CancellationToken, ProviderId};
 
 use super::ArchivePath;
-use super::format::{ArchiveCopyContext, ArchiveScanner, RawArchiveEntry, RawEntryKind};
-use super::io::{DecodeReader, PositionedFile, TimedReader};
+use super::format::{ArchiveScanner, RawArchiveEntry, RawEntryKind};
+use super::io::{PositionedFile, TimedReader};
 use super::store::{
     AllocationLease, ArchiveError, ArchiveLimits, DecodeCounterState, elapsed_limit,
 };
@@ -16,8 +16,8 @@ pub(crate) fn open_plain(
     provider: ProviderId,
     limits: ArchiveLimits,
     counters: Arc<DecodeCounterState>,
-) -> Box<dyn ArchiveScanner> {
-    Box::new(TarScanner::new_seekable(source, provider, limits, counters))
+) -> TarScanner {
+    TarScanner::new_seekable(source, provider, limits, counters)
 }
 
 pub(crate) fn open_stream(
@@ -26,14 +26,8 @@ pub(crate) fn open_stream(
     limits: ArchiveLimits,
     counters: Arc<DecodeCounterState>,
     compressed_bytes: u64,
-) -> Box<dyn ArchiveScanner> {
-    Box::new(TarScanner::new_stream(
-        source,
-        provider,
-        limits,
-        counters,
-        compressed_bytes,
-    ))
+) -> TarScanner {
+    TarScanner::new_stream(source, provider, limits, counters, compressed_bytes)
 }
 
 enum TarInput {
@@ -62,13 +56,18 @@ impl TarInput {
     }
 }
 
-struct TarScanner {
+/// Reads a tar stream one header at a time. Listing, extraction and
+/// browsing all read tar through it, so each sees the same entries, with the
+/// same numbers and sizes, and its extension headers stay in the metadata
+/// budget.
+pub(crate) struct TarScanner {
     input: TarInput,
     provider: ProviderId,
     limits: ArchiveLimits,
     counters: Arc<DecodeCounterState>,
     pending_skip: u64,
     pending_path: Option<(Vec<u8>, AllocationLease)>,
+    pending_size: Option<u64>,
     ordinal: u64,
     finished: bool,
     started: Instant,
@@ -95,6 +94,7 @@ impl TarScanner {
             counters,
             pending_skip: 0,
             pending_path: None,
+            pending_size: None,
             ordinal: 0,
             finished: false,
             started: Instant::now(),
@@ -118,6 +118,7 @@ impl TarScanner {
             counters,
             pending_skip: 0,
             pending_path: None,
+            pending_size: None,
             ordinal: 0,
             finished: false,
             started: Instant::now(),
@@ -271,7 +272,11 @@ impl ArchiveScanner for TarScanner {
             }
             if entry_type.is_pax_local_extensions() {
                 let (bytes, allocation) = self.read_extension(size, cancellation)?;
-                if let Some(path) = pax_path(&bytes)? {
+                let (path, pax_size) = pax_records(&bytes)?;
+                if pax_size.is_some() {
+                    self.pending_size = pax_size;
+                }
+                if let Some(path) = path {
                     self.pending_path = Some((path, allocation));
                 }
                 continue;
@@ -280,6 +285,9 @@ impl ArchiveScanner for TarScanner {
                 let _discarded = self.read_extension(size, cancellation)?;
                 continue;
             }
+            // A pax size record replaces the header's size, as in tar-rs and
+            // GNU tar.
+            let size = self.pending_size.take().unwrap_or(size);
             let raw_path = self
                 .pending_path
                 .take()
@@ -320,60 +328,116 @@ impl ArchiveScanner for TarScanner {
     }
 }
 
-pub(crate) fn copy_tar<R: Read, W: Write>(
-    reader: R,
+impl TarScanner {
+    /// Hands the bytes of the entry `next_entry` just returned, `size` of
+    /// them, to `visit`, and skips whatever `visit` leaves.
+    fn visit_current(
+        &mut self,
+        size: u64,
+        cancellation: &CancellationToken,
+        visit: &mut dyn FnMut(&mut dyn Read) -> Result<(), ArchiveError>,
+    ) -> Result<(), ArchiveError> {
+        let padding = self.pending_skip.saturating_sub(size);
+        self.pending_skip = 0;
+        let mut data = EntryData {
+            scanner: self,
+            remaining: size,
+            cancellation,
+            error: None,
+        };
+        let visited = visit(&mut data);
+        let remaining = data.remaining;
+        if let Some(error) = data.error.take() {
+            return Err(error);
+        }
+        visited?;
+        self.pending_skip = remaining.saturating_add(padding);
+        Ok(())
+    }
+}
+
+/// The bytes of one tar entry, read through the scanner so its limits,
+/// counters and cancellation apply.
+struct EntryData<'a> {
+    scanner: &'a mut TarScanner,
+    remaining: u64,
+    cancellation: &'a CancellationToken,
+    error: Option<ArchiveError>,
+}
+
+impl Read for EntryData<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let requested =
+            usize::try_from(self.remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let scanner = &mut *self.scanner;
+        let read = scanner.check_runtime(self.cancellation).and_then(|()| {
+            let count = scanner
+                .input
+                .read(&mut buffer[..requested])
+                .map_err(|_| time_or_invalid(&scanner.counters, &scanner.limits))?;
+            if count == 0 {
+                return Err(ArchiveError::InvalidArchive);
+            }
+            scanner.record_stream_read(count)?;
+            Ok(count)
+        });
+        match read {
+            Ok(count) => {
+                self.remaining -= count as u64;
+                Ok(count)
+            }
+            Err(error) => {
+                self.error = Some(error);
+                Err(std::io::Error::other("tar entry could not be read"))
+            }
+        }
+    }
+}
+
+/// Copies the entry numbered `ordinal` into `destination`.
+pub(crate) fn copy_entry(
+    mut scanner: TarScanner,
     ordinal: u64,
-    destination: &mut W,
+    cancellation: &CancellationToken,
+    destination: &mut dyn Write,
 ) -> Result<(), ArchiveError> {
-    let mut archive = tar::Archive::new(reader);
-    let mut entries = archive
-        .entries()
-        .map_err(|_| ArchiveError::InvalidArchive)?;
-    let mut entry = entries
-        .nth(usize::try_from(ordinal).map_err(|_| ArchiveError::NotArchiveEntry)?)
-        .ok_or(ArchiveError::NotArchiveEntry)?
-        .map_err(|_| ArchiveError::InvalidArchive)?;
-    std::io::copy(&mut entry, destination).map_err(|_| ArchiveError::Io)?;
-    Ok(())
+    while let Some(entry) = scanner.next_entry(cancellation)? {
+        if entry.ordinal == ordinal {
+            return scanner.visit_current(
+                entry.size.unwrap_or(0),
+                cancellation,
+                &mut |contents| {
+                    std::io::copy(contents, destination)
+                        .map(|_| ())
+                        .map_err(|_| ArchiveError::Io)
+                },
+            );
+        }
+    }
+    Err(ArchiveError::NotArchiveEntry)
 }
 
 /// Visits the regular files of a tar stream in archive order, in one pass,
 /// handing each one `wanted` names to `visit` with a reader over its bytes.
-pub(crate) fn copy_files_in_order<R: Read>(
-    reader: R,
+/// A read error inside `visit` ends the pass with the scanner's own error.
+pub(crate) fn copy_files_in_order(
+    mut scanner: TarScanner,
+    cancellation: &CancellationToken,
     wanted: &dyn Fn(u64) -> bool,
     visit: &mut dyn FnMut(u64, &mut dyn Read) -> Result<(), ArchiveError>,
 ) -> Result<(), ArchiveError> {
-    let mut archive = tar::Archive::new(reader);
-    let entries = archive
-        .entries()
-        .map_err(|_| ArchiveError::InvalidArchive)?;
-    for (ordinal, entry) in entries.enumerate() {
-        let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
-        let ordinal = u64::try_from(ordinal).map_err(|_| ArchiveError::InvalidArchive)?;
-        if wanted(ordinal) {
-            visit(ordinal, &mut entry)?;
+    while let Some(entry) = scanner.next_entry(cancellation)? {
+        if entry.kind == RawEntryKind::RegularFile && wanted(entry.ordinal) {
+            let ordinal = entry.ordinal;
+            scanner.visit_current(entry.size.unwrap_or(0), cancellation, &mut |contents| {
+                visit(ordinal, contents)
+            })?;
         }
     }
     Ok(())
-}
-
-pub(crate) fn copy_guarded_tar<R: Read, W: Write>(
-    reader: R,
-    ordinal: u64,
-    destination: &mut W,
-    context: &ArchiveCopyContext<'_>,
-    compressed_size: u64,
-) -> Result<(), ArchiveError> {
-    let mut guarded = DecodeReader::new(
-        reader,
-        context.cancellation.clone(),
-        context.limits.max_elapsed,
-        context.limits.max_expanded_bytes,
-        compressed_size.saturating_mul(context.limits.max_compression_ratio),
-    );
-    let result = copy_tar(&mut guarded, ordinal, destination);
-    guarded.take_error().map_or(result, Err)
 }
 
 pub(crate) fn valid_tar_checksum(block: &[u8; 512]) -> bool {
@@ -390,9 +454,11 @@ pub(crate) fn valid_tar_checksum(block: &[u8; 512]) -> bool {
     stored == calculated
 }
 
-fn pax_path(bytes: &[u8]) -> Result<Option<Vec<u8>>, ArchiveError> {
+/// The path and size records of a pax extended header.
+fn pax_records(bytes: &[u8]) -> Result<(Option<Vec<u8>>, Option<u64>), ArchiveError> {
     let mut offset = 0_usize;
     let mut path = None;
+    let mut size = None;
     while offset < bytes.len() {
         let space = bytes[offset..]
             .iter()
@@ -410,9 +476,18 @@ fn pax_path(bytes: &[u8]) -> Result<Option<Vec<u8>>, ArchiveError> {
         if let Some(value) = record.strip_prefix(b"path=") {
             path = Some(value.strip_suffix(b"\n").unwrap_or(value).to_vec());
         }
+        if let Some(value) = record.strip_prefix(b"size=") {
+            let value = value.strip_suffix(b"\n").unwrap_or(value);
+            size = Some(
+                std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|text| text.parse::<u64>().ok())
+                    .ok_or(ArchiveError::InvalidArchive)?,
+            );
+        }
         offset += length;
     }
-    Ok(path)
+    Ok((path, size))
 }
 
 fn time_or_invalid(counters: &DecodeCounterState, limits: &ArchiveLimits) -> ArchiveError {

@@ -1,4 +1,5 @@
-use super::io::{BoundedWriter, DecodeReader, PositionedFile, TimedReader};
+use super::io::{BoundedWriter, PositionedFile, TimedReader};
+use super::tar_codec::TarScanner;
 use super::store::{
     AllocationLease, ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState,
 };
@@ -65,6 +66,36 @@ pub(crate) fn open_scanner(
         ArchiveFormat::Zip => {
             super::zip_codec::open_scanner(source, provider, limits.clone(), Arc::clone(counters))
         }
+        ArchiveFormat::Tar | ArchiveFormat::TarGzip | ArchiveFormat::TarZstd => Ok(Box::new(
+            tar_scanner(source, source_bytes, provider, format, limits, counters)?,
+        )),
+        ArchiveFormat::SevenZip => super::seven_codec::open_scanner(
+            source,
+            provider,
+            limits.clone(),
+            Arc::clone(counters),
+            passwords,
+        ),
+        #[cfg(feature = "archive-libarchive")]
+        ArchiveFormat::Rar | ArchiveFormat::Iso => super::libarchive_codec::open_scanner(
+            source.into_inner(),
+            provider,
+            limits.clone(),
+            Arc::clone(counters),
+        ),
+    }
+}
+
+/// A scanner over a plain, gzip or zstd tar.
+fn tar_scanner(
+    source: PositionedFile,
+    source_bytes: u64,
+    provider: ProviderId,
+    format: ArchiveFormat,
+    limits: &ArchiveLimits,
+    counters: &Arc<DecodeCounterState>,
+) -> Result<TarScanner, ArchiveError> {
+    match format {
         ArchiveFormat::Tar => Ok(super::tar_codec::open_plain(
             source,
             provider,
@@ -105,21 +136,13 @@ pub(crate) fn open_scanner(
                 source_bytes,
             ))
         }
-        ArchiveFormat::SevenZip => super::seven_codec::open_scanner(
-            source,
-            provider,
-            limits.clone(),
-            Arc::clone(counters),
-            passwords,
-        ),
-        #[cfg(feature = "archive-libarchive")]
-        ArchiveFormat::Rar | ArchiveFormat::Iso => super::libarchive_codec::open_scanner(
-            source.into_inner(),
-            provider,
-            limits.clone(),
-            Arc::clone(counters),
-        ),
+        _ => Err(ArchiveError::UnsupportedNestedFormat),
     }
+}
+
+/// The provider named on the entries a copy scans; nothing reads it.
+fn copy_provider() -> Result<ProviderId, ArchiveError> {
+    ProviderId::new("archive-copy").map_err(|_| ArchiveError::Io)
 }
 
 pub(crate) struct ArchiveCopyContext<'a> {
@@ -143,56 +166,40 @@ pub(crate) fn copy_files_in_order(
 ) -> Result<(), ArchiveError> {
     let source_bytes = file.metadata().map_err(|_| ArchiveError::Io)?.len();
     let source = PositionedFile::new(file).map_err(|_| ArchiveError::Io)?;
-    let reader = TimedReader::new_cancellable(
-        source,
-        context.limits.max_elapsed,
-        Arc::clone(context.counters),
-        context.cancellation.clone(),
-    );
+    let timed = |source| {
+        TimedReader::new_cancellable(
+            source,
+            context.limits.max_elapsed,
+            Arc::clone(context.counters),
+            context.cancellation.clone(),
+        )
+    };
     let result = match format {
         ArchiveFormat::Zip => super::zip_codec::copy_files_in_order(
-            reader,
+            timed(source),
             context.passwords,
             context.limits,
             context.counters,
             wanted,
             visit,
         ),
-        ArchiveFormat::Tar => super::tar_codec::copy_files_in_order(reader, wanted, visit),
-        ArchiveFormat::TarGzip => {
-            let workspace = reserve_decode_workspace(
-                context.counters,
-                context.limits,
-                gzip_decoder_workspace_bytes(),
-            )?;
-            let decoder = flate2::read::GzDecoder::new(reader);
-            let mut guarded = tar_stream_guard(
-                WorkspaceReader::new(decoder, workspace),
-                context,
-                source_bytes,
-            );
-            let result = super::tar_codec::copy_files_in_order(&mut guarded, wanted, visit);
-            guarded.take_error().map_or(result, Err)
-        }
-        ArchiveFormat::TarZstd => {
-            let workspace = reserve_decode_workspace(
-                context.counters,
-                context.limits,
-                zstd_decoder_workspace_bytes()?,
-            )?;
-            let mut decoder = zstd::stream::read::Decoder::new(reader)
-                .map_err(|_| ArchiveError::InvalidArchive)?;
-            configure_zstd_decoder(&mut decoder).map_err(|_| ArchiveError::InvalidArchive)?;
-            let mut guarded = tar_stream_guard(
-                WorkspaceReader::new(decoder, workspace),
-                context,
-                source_bytes,
-            );
-            let result = super::tar_codec::copy_files_in_order(&mut guarded, wanted, visit);
-            guarded.take_error().map_or(result, Err)
+        ArchiveFormat::Tar | ArchiveFormat::TarGzip | ArchiveFormat::TarZstd => {
+            super::tar_codec::copy_files_in_order(
+                tar_scanner(
+                    source,
+                    source_bytes,
+                    copy_provider()?,
+                    format,
+                    context.limits,
+                    context.counters,
+                )?,
+                context.cancellation,
+                wanted,
+                visit,
+            )
         }
         ArchiveFormat::SevenZip => super::seven_codec::copy_files_in_order(
-            reader,
+            timed(source),
             context.passwords,
             context.limits,
             context.counters,
@@ -206,25 +213,6 @@ pub(crate) fn copy_files_in_order(
         return Err(ArchiveError::Cancelled);
     }
     result
-}
-
-/// A compressed tar decodes into one stream of headers and file bytes; this
-/// bounds the whole stream, and the caller bounds each file.
-fn tar_stream_guard<R>(
-    inner: R,
-    context: &ArchiveCopyContext<'_>,
-    source_bytes: u64,
-) -> DecodeReader<R> {
-    DecodeReader::new(
-        inner,
-        context.cancellation.clone(),
-        context.limits.max_elapsed,
-        context
-            .limits
-            .max_expanded_bytes
-            .saturating_add(context.limits.max_metadata_bytes as u64),
-        source_bytes.saturating_mul(context.limits.max_compression_ratio),
-    )
 }
 
 pub(crate) fn copy_entry<W: Write>(
@@ -263,37 +251,21 @@ pub(crate) fn copy_entry<W: Write>(
             context.limits,
             context.counters,
         ),
-        ArchiveFormat::Tar => super::tar_codec::copy_tar(reader, ordinal, &mut destination),
-        ArchiveFormat::TarGzip => {
-            let workspace = reserve_decode_workspace(
-                context.counters,
-                context.limits,
-                gzip_decoder_workspace_bytes(),
-            )?;
-            let decoder = flate2::read::GzDecoder::new(reader);
-            super::tar_codec::copy_guarded_tar(
-                WorkspaceReader::new(decoder, workspace),
+        ArchiveFormat::Tar | ArchiveFormat::TarGzip | ArchiveFormat::TarZstd => {
+            let source = PositionedFile::new(file).map_err(|_| ArchiveError::Io)?;
+            let source_bytes = file.metadata().map_err(|_| ArchiveError::Io)?.len();
+            super::tar_codec::copy_entry(
+                tar_scanner(
+                    source,
+                    source_bytes,
+                    copy_provider()?,
+                    format,
+                    context.limits,
+                    context.counters,
+                )?,
                 ordinal,
+                context.cancellation,
                 &mut destination,
-                &context,
-                compressed_size,
-            )
-        }
-        ArchiveFormat::TarZstd => {
-            let workspace = reserve_decode_workspace(
-                context.counters,
-                context.limits,
-                zstd_decoder_workspace_bytes()?,
-            )?;
-            let mut decoder = zstd::stream::read::Decoder::new(reader)
-                .map_err(|_| ArchiveError::InvalidArchive)?;
-            configure_zstd_decoder(&mut decoder).map_err(|_| ArchiveError::InvalidArchive)?;
-            super::tar_codec::copy_guarded_tar(
-                WorkspaceReader::new(decoder, workspace),
-                ordinal,
-                &mut destination,
-                &context,
-                compressed_size,
             )
         }
         ArchiveFormat::SevenZip => super::seven_codec::copy_seven_zip(

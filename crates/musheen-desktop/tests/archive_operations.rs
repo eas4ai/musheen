@@ -1215,7 +1215,7 @@ fn cancellation_after_commit_admission_is_rejected_and_publication_completes() {
 }
 
 #[test]
-fn extraction_remains_bound_to_snapshot_after_source_rewrite() {
+fn extraction_publishes_nothing_when_the_source_is_rewritten_after_decoding() {
     let root = tempdir().expect("temporary root");
     let source = root.path().join("source.zip");
     let destination = root.path().join("output");
@@ -1250,6 +1250,8 @@ fn extraction_remains_bound_to_snapshot_after_source_rewrite() {
         .expect("archive queues");
     let job = scheduler.start_ready().expect("starts").pop().expect("job");
 
+    // The fourth append comes after decoding. The archive is read where it
+    // is (OPS-034), and the last check before publishing sees the rewrite.
     assert_eq!(
         execute_scheduled_archive_operation(
             &scheduler,
@@ -1257,18 +1259,10 @@ fn extraction_remains_bound_to_snapshot_after_source_rewrite() {
             &ArchiveOperationLimits::default(),
             &Passwords("unused"),
             &mut journal,
-        )
-        .expect("owned source snapshot remains valid"),
-        ArchiveOperationOutcome::Published
+        ),
+        Err(ArchiveOperationError::SourceChanged)
     );
-    assert_eq!(
-        std::fs::read(destination.join("x")).expect("snapshot payload"),
-        b"payload"
-    );
-    assert_eq!(
-        journal.records().last().map(|record| record.phase()),
-        Some(JournalPhase::Completed)
-    );
+    assert!(!destination.exists());
 }
 
 #[test]
@@ -1317,7 +1311,7 @@ fn extraction_publishes_nothing_when_the_source_is_rewritten_during_decode() {
         &Passwords("unused"),
         &mut journal,
     );
-    assert!(result.is_err(), "{result:?}");
+    assert_eq!(result, Err(ArchiveOperationError::SourceChanged));
     assert!(!destination.exists());
 }
 
@@ -3885,8 +3879,40 @@ fn extract_cost_reads_the_archive_at_most_twice_and_writes_only_its_files() {
 
 #[test]
 fn extract_cost_publishes_nothing_when_the_archive_changes_during_the_run() {
-    let root = tempdir().expect("temporary root");
-    let archive = root.path().join("fixture.tar");
+    // The second journal append comes before decoding; the fourth after it,
+    // just before publishing.
+    for (hook_at, moment) in [(2, "before decoding"), (4, "after decoding")] {
+        let root = tempdir().expect("temporary root");
+        let result = extract_while_the_archive_changes(root.path(), hook_at);
+        assert!(
+            matches!(result, Err(ArchiveOperationError::SourceChanged)),
+            "an archive changed {moment} is refused: {result:?}"
+        );
+        assert!(
+            !root.path().join("output").exists(),
+            "nothing is published after a change {moment}"
+        );
+        assert!(
+            std::fs::read_dir(root.path())
+                .expect("archive folder")
+                .all(|entry| !entry
+                    .expect("folder entry")
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(b".musheen-stage-v1-")),
+            "the staging folder is cleaned after a change {moment}"
+        );
+    }
+}
+
+/// Extracts a tar into `root/output` while the tar's file bytes are
+/// rewritten in place, at the same size and with the same modification
+/// time, at journal append `hook_at`.
+fn extract_while_the_archive_changes(
+    root: &Path,
+    hook_at: usize,
+) -> Result<ArchiveOperationOutcome, ArchiveOperationError> {
+    let archive = root.join("fixture.tar");
     let mut tar_bytes = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_bytes);
@@ -3900,7 +3926,7 @@ fn extract_cost_publishes_nothing_when_the_archive_changes_during_the_run() {
         builder.finish().expect("tar finish");
     }
     std::fs::write(&archive, &tar_bytes).expect("fixture archive");
-    let output = root.path().join("output");
+    let output = root.join("output");
     let plan = ArchiveOperationPlan::extract(
         local(&archive),
         local(&output),
@@ -3912,7 +3938,7 @@ fn extract_cost_publishes_nothing_when_the_archive_changes_during_the_run() {
     let changed = archive.clone();
     let storage = HookJournal {
         inner: MemoryJournal::default(),
-        hook_at: 2,
+        hook_at,
         // Rewrite the file's bytes in place, at the same size and with the
         // same modification time, so the archive still decodes.
         hook: Some(Box::new(move || {
@@ -3944,26 +3970,294 @@ fn extract_cost_publishes_nothing_when_the_archive_changes_during_the_run() {
         .expect("archive queues");
     let job = scheduler.start_ready().expect("starts").pop().expect("job");
 
-    let result = execute_scheduled_archive_operation(
+    execute_scheduled_archive_operation(
         &scheduler,
         &job,
         &ArchiveOperationLimits::default(),
         &Passwords("unused"),
         &mut journal,
+    )
+}
+
+/// Extracts `archive` into `root/output` with the default limits.
+fn extract_into_output(
+    root: &Path,
+    archive: &Path,
+    codec: ArchiveCodec,
+) -> Result<(ArchiveOperationOutcome, Vec<JournalPhase>), ArchiveOperationError> {
+    let plan = ArchiveOperationPlan::extract(
+        local(archive),
+        local(&root.join("output")),
+        codec,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    run(
+        &plan,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &CancellationToken::new(),
+    )
+}
+
+/// A tar that starts, as `git archive` writes it, with a pax global header,
+/// then a folder and two files.
+fn tar_with_a_global_header() -> Vec<u8> {
+    let record = format!(" comment={}\n", "0".repeat(40));
+    let record = format!("{}{record}", record.len() + 2);
+    let mut bytes = Vec::new();
+    let mut builder = tar::Builder::new(&mut bytes);
+    let mut global = tar::Header::new_ustar();
+    global.set_entry_type(tar::EntryType::XGlobalHeader);
+    global.set_path("pax_global_header").expect("global header path");
+    global.set_size(record.len() as u64);
+    global.set_mode(0o666);
+    global.set_cksum();
+    builder
+        .append(&global, record.as_bytes())
+        .expect("global header");
+    let mut folder = tar::Header::new_ustar();
+    folder.set_entry_type(tar::EntryType::Directory);
+    folder.set_size(0);
+    folder.set_mode(0o755);
+    builder
+        .append_data(&mut folder, "p/", io::empty())
+        .expect("folder entry");
+    for (name, contents) in [
+        ("p/first.txt", &b"first file"[..]),
+        ("p/second.txt", &b"second file bytes"[..]),
+    ] {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, name, contents)
+            .expect("file entry");
+    }
+    builder.finish().expect("tar finish");
+    drop(builder);
+    bytes
+}
+
+#[test]
+fn extraction_gives_each_tar_file_its_own_bytes_after_a_pax_global_header() {
+    let tar = tar_with_a_global_header();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&tar).expect("gzip");
+    let gzip = gzip.finish().expect("gzip finish");
+    for (name, codec, bytes) in [
+        ("plain.tar", ArchiveCodec::Tar, tar.clone()),
+        ("source.tar.gz", ArchiveCodec::TarGzip, gzip),
+    ] {
+        let root = tempdir().expect("temporary root");
+        let archive = root.path().join(name);
+        std::fs::write(&archive, bytes).expect("tar fixture");
+        extract_into_output(root.path(), &archive, codec).expect("extraction");
+        let output = root.path().join("output").join("p");
+        assert_eq!(
+            std::fs::read(output.join("first.txt")).expect("first file"),
+            b"first file",
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read(output.join("second.txt")).expect("second file"),
+            b"second file bytes",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn extraction_takes_a_tar_file_size_from_its_pax_size_record() {
+    // The header says 0 bytes and the pax record says 11, as for a file too
+    // large for the header's size field. The listing and the decode pass
+    // both follow the record, so neither reads the data as a header.
+    let contents = b"eleven byte";
+    let mut bytes = Vec::new();
+    let mut builder = tar::Builder::new(&mut bytes);
+    builder
+        .append_pax_extensions([("size", &b"11"[..])])
+        .expect("pax size record");
+    let mut header = tar::Header::new_ustar();
+    header.set_path("big.txt").expect("file path");
+    header.set_size(0);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .get_mut()
+        .write_all(header.as_bytes())
+        .expect("file header");
+    let mut data = contents.to_vec();
+    data.resize(512, 0);
+    builder.get_mut().write_all(&data).expect("file data");
+    builder.finish().expect("tar finish");
+    drop(builder);
+    let root = tempdir().expect("temporary root");
+    let archive = root.path().join("sized.tar");
+    std::fs::write(&archive, bytes).expect("tar fixture");
+
+    extract_into_output(root.path(), &archive, ArchiveCodec::Tar).expect("extraction");
+    assert_eq!(
+        std::fs::read(root.path().join("output").join("big.txt")).expect("file"),
+        contents
+    );
+}
+
+#[test]
+fn extraction_refuses_zip_entries_that_share_local_bytes() {
+    // Two central records, x and y, name one local entry. Decoding both
+    // would read its bytes twice.
+    let mut bytes = zip_bytes(zip::CompressionMethod::Stored, b"shared bytes");
+    let end = bytes.len() - 22;
+    assert_eq!(&bytes[end..end + 4], b"PK\x05\x06", "no archive comment");
+    let size = u32::from_le_bytes(bytes[end + 12..end + 16].try_into().unwrap()) as usize;
+    let offset = u32::from_le_bytes(bytes[end + 16..end + 20].try_into().unwrap()) as usize;
+    let mut second = bytes[offset..offset + size].to_vec();
+    assert_eq!(&second[46..47], b"x", "the one entry is x");
+    second[46] = b'y';
+    let mut eocd = bytes[end..].to_vec();
+    eocd[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    eocd[10..12].copy_from_slice(&2_u16.to_le_bytes());
+    eocd[12..16].copy_from_slice(&u32::try_from(2 * size).unwrap().to_le_bytes());
+    bytes.truncate(end);
+    bytes.extend_from_slice(&second);
+    bytes.extend_from_slice(&eocd);
+    let root = tempdir().expect("temporary root");
+    let archive = root.path().join("shared.zip");
+    std::fs::write(&archive, bytes).expect("ZIP fixture");
+
+    assert_eq!(
+        extract_into_output(root.path(), &archive, ArchiveCodec::Zip),
+        Err(ArchiveOperationError::InvalidArchive)
+    );
+    assert!(!root.path().join("output").exists());
+}
+
+#[test]
+fn extract_cost_reads_a_zip_of_small_entries_at_most_twice() {
+    // Short names, tiny files and no extra fields, as Python's zipfile
+    // writes them: the entries are smaller than the end-record search.
+    let root = tempdir().expect("temporary root");
+    let archive = root.path().join("small.zip");
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut file_bytes = 0_u64;
+    for index in 0..3_000 {
+        zip.start_file(
+            format!("f/{index:04}"),
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .expect("ZIP entry");
+        let contents = format!("entry {index:04}");
+        file_bytes += contents.len() as u64;
+        zip.write_all(contents.as_bytes()).expect("ZIP payload");
+    }
+    std::fs::write(&archive, zip.finish().expect("ZIP finish").into_inner())
+        .expect("ZIP fixture");
+    let archive_bytes = std::fs::metadata(&archive).expect("ZIP fixture").len();
+    let output = root.path().join("output");
+
+    let (read, written) = measured_in_child("extract", "zip", &archive, &output);
+    assert!(
+        read <= 2 * archive_bytes + MIB,
+        "extraction read {read} bytes of a {archive_bytes}-byte archive"
     );
     assert!(
-        matches!(result, Err(ArchiveOperationError::Conflict)),
-        "an archive changed during the run is refused: {result:?}"
+        written <= file_bytes + MIB,
+        "extraction wrote {written} bytes for {file_bytes} bytes of files"
     );
-    assert!(!output.exists(), "nothing is published");
+    assert_eq!(
+        std::fs::read(output.join("f").join("2999")).expect("last file"),
+        b"entry 2999"
+    );
+}
+
+/// Names the extraction `few_open_files_child` runs while it may hold at
+/// most 256 open files: source and destination, one per line.
+const FEW_OPEN_FILES_REQUEST: &str = "MUSHEEN_FEW_OPEN_FILES_REQUEST";
+
+/// Runs one ZIP extraction under a low open-file limit when
+/// `extraction_publishes_a_folder_with_more_files_than_may_be_open` starts
+/// this test binary as a child, and does nothing otherwise.
+#[test]
+fn few_open_files_child() {
+    let Ok(request) = std::env::var(FEW_OPEN_FILES_REQUEST) else {
+        return;
+    };
+    let lines = request.lines().collect::<Vec<_>>();
+    let [source, destination] = lines.as_slice() else {
+        panic!("malformed request {request:?}");
+    };
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        rustix::process::Rlimit {
+            current: Some(256),
+            maximum: limit.maximum,
+        },
+    )
+    .expect("open-file limit");
+    let plan = ArchiveOperationPlan::extract(
+        local(Path::new(source)),
+        local(Path::new(destination)),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    let (outcome, _) = run(
+        &plan,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &CancellationToken::new(),
+    )
+    .expect("extraction");
+    assert_eq!(outcome, ArchiveOperationOutcome::Published);
+}
+
+#[test]
+fn extraction_publishes_a_folder_with_more_files_than_may_be_open() {
+    // Desktop sessions allow 1,024 open files; the child allows 256.
+    let root = tempdir().expect("temporary root");
+    let archive = root.path().join("many.zip");
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..1_000 {
+        zip.start_file(
+            format!("many/file-{index:04}.txt"),
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .expect("ZIP entry");
+        zip.write_all(b"one of many").expect("ZIP payload");
+    }
+    std::fs::write(&archive, zip.finish().expect("ZIP finish").into_inner())
+        .expect("ZIP fixture");
+    let output = root.path().join("output");
+
+    let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "few_open_files_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            FEW_OPEN_FILES_REQUEST,
+            format!("{}\n{}", archive.display(), output.display()),
+        )
+        .output()
+        .expect("child test runs");
     assert!(
-        std::fs::read_dir(root.path())
-            .expect("archive folder")
-            .all(|entry| !entry
-                .expect("folder entry")
-                .file_name()
-                .as_bytes()
-                .starts_with(b".musheen-stage-v1-")),
-        "the staging folder is cleaned"
+        child.status.success(),
+        "extraction under 256 open files failed: {}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert_eq!(
+        std::fs::read_dir(output.join("many"))
+            .expect("extracted folder")
+            .count(),
+        1_000
     );
 }

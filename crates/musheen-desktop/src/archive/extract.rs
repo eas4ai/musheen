@@ -107,7 +107,8 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         budget.reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
     let counters = DecodeCounterState::with_memory_budget(budget.shared_memory());
     // The archive is read where it is, never copied. Its identity is checked
-    // again after decoding, so nothing is published when it changed meanwhile.
+    // again just before publishing, so nothing is published when it changed
+    // during the run.
     let source_file = open_archive_source(&source)?;
     let source_before = SourceIdentity::of(&source_file)?;
     let source_bytes = source_before.size;
@@ -226,15 +227,16 @@ pub(crate) fn execute_extract<S: JournalStorage>(
                 })
             },
         );
-        if let Some(error) = failure {
-            return Err(error);
+        // A visit that fails returns `ArchiveError::Io` and leaves its own
+        // error in `failure`. A reader that fails keeps its own error, which
+        // names the cause the visit saw only as a failed read.
+        match (copied, failure) {
+            (Err(error), _) if error != ArchiveError::Io => return Err(error.into()),
+            (_, Some(error)) => return Err(error),
+            (copied, None) => copied.map_err(ArchiveOperationError::from)?,
         }
-        copied.map_err(ArchiveOperationError::from)?;
         if written.contains(&false) {
             return Err(ArchiveOperationError::InvalidArchive);
-        }
-        if SourceIdentity::of(&source_file)? != source_before {
-            return Err(ArchiveOperationError::Conflict);
         }
         sync_tree(&staging)?;
         append_archive_phase(
@@ -264,6 +266,11 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         let staging_before_publish =
             path_identity_with_controls(&staging, Some(&budget), Some(cancellation))?
                 .ok_or(ArchiveOperationError::Conflict)?;
+        // The last check before publishing: the archive is still the one
+        // that was listed and decoded.
+        if SourceIdentity::of(&source_file)? != source_before {
+            return Err(ArchiveOperationError::SourceChanged);
+        }
         begin_commit()?;
         transaction_started = true;
         if let Some(merge) = merge {
@@ -1129,7 +1136,8 @@ fn decode_limits(limits: &ArchiveOperationLimits) -> ArchiveLimits {
         max_expanded_bytes: limits.max_expanded_bytes,
         max_compression_ratio: limits.max_compression_ratio,
         max_elapsed: Duration::MAX,
-        max_nested_archives: limits.max_nesting,
+        // Extraction never opens an archive inside the archive.
+        max_nested_archives: 0,
         max_nested_archive_bytes: limits.max_temporary_bytes,
     }
 }
