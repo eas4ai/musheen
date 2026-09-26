@@ -30407,6 +30407,496 @@ mod tests {
         .unwrap();
     }
 
+    /// A window over one folder with a catalog file, for the tests that
+    /// block the catalog or the store under a UI path.
+    struct CatalogWindow {
+        app: Entity<MusheenApp>,
+        browser: AnyWindowHandle,
+        _temporary: tempfile::TempDir,
+        folder: PathBuf,
+        catalog_path: PathBuf,
+        catalog_store: CatalogStore,
+    }
+
+    /// Opens a window over a new folder. `prepare` fills the folder and the
+    /// catalog before the window reads them.
+    async fn open_catalog_window(
+        prepare: impl FnOnce(&Path, &mut CatalogDocument),
+        cx: &mut TestAppContext,
+    ) -> CatalogWindow {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("folder");
+        filesystem::create_dir(&folder).unwrap();
+        let catalog_path = temporary.path().join("private/catalog.json");
+        let catalog_store = CatalogStore::at(&catalog_path);
+        let mut document = CatalogDocument::default();
+        prepare(&folder, &mut document);
+        catalog_store.save(&document).unwrap();
+        let mut app = None;
+        let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+            let view = cx.new(|cx| {
+                MusheenApp::new_with_catalog_store(folder.clone(), catalog_store.clone(), cx)
+            });
+            app = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let app = app.unwrap();
+        let browser: AnyWindowHandle = handle.into();
+        cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+            matches!(
+                app.read(cx).focused_directory().state(),
+                DirectoryState::Ready | DirectoryState::Empty
+            )
+        })
+        .await;
+        cx.run_until_parked();
+        CatalogWindow {
+            app,
+            browser,
+            _temporary: temporary,
+            folder,
+            catalog_path,
+            catalog_store,
+        }
+    }
+
+    /// Another open file holds the catalog's lock, as another Musheen
+    /// process would, until `release` or for two seconds at most.
+    struct CatalogLockHolder {
+        release: std::sync::mpsc::Sender<()>,
+        holder: std::thread::JoinHandle<()>,
+    }
+
+    impl CatalogLockHolder {
+        fn hold(catalog_path: &Path) -> Self {
+            let mut lock_path = catalog_path.as_os_str().to_owned();
+            lock_path.push(".lock");
+            let lock_file = standard_library::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _ = released.recv_timeout(Duration::from_secs(2));
+                drop(lock_file);
+            });
+            Self { release, holder }
+        }
+
+        fn release(self) {
+            let _ = self.release.send(());
+            self.holder.join().unwrap();
+        }
+    }
+
+    /// Puts the window's store behind a closed gate and returns the gate.
+    fn close_store_gate(state: &mut MusheenApp) -> Arc<StoreGate> {
+        let gate = Arc::new(StoreGate::default());
+        gate.close();
+        state.store = Arc::new(GatedStore {
+            inner: Arc::clone(&state.store),
+            gate: Arc::clone(&gate),
+        });
+        gate
+    }
+
+    fn assert_ui_thread_returned(elapsed: Duration, path: &str) {
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "{path} took {elapsed:?}: the UI thread waited on the catalog lock or the store"
+        );
+    }
+
+    fn tag_command_target(tag: &str) -> CommandTargetRef {
+        let provider = ProviderId::new("musheen-tag").unwrap();
+        CommandTargetRef::new(
+            ItemId::new(provider.clone(), tag.as_bytes().to_vec()).unwrap(),
+            StorePath::from_provider_key(provider, tag.as_bytes().to_vec()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    // UXF-023: navigating into a folder records the recent location and the
+    // folder's remembered location, and finds its view preferences, without
+    // the UI thread waiting on the store or the catalog lock.
+    #[gpui_kit::test]
+    async fn ui_thread_navigation_returns_while_the_store_and_the_catalog_are_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::create_dir(folder.join("child")).unwrap(),
+            cx,
+        )
+        .await;
+        let child = StorePath::from_unix_path(window.folder.join("child").into_os_string());
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        let started = Instant::now();
+        let gate = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, cx| {
+                    let gate = close_store_gate(state);
+                    state.navigate(child.clone(), true, cx);
+                    // A finished page remembers its folder the same way.
+                    state.remember_folder_location(&child);
+                    gate
+                })
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        lock.release();
+        gate.open();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "navigation");
+        let document = window.catalog_store.load().unwrap();
+        assert!(
+            document
+                .recents()
+                .entries()
+                .iter()
+                .any(|recent| recent.path_hint() == &child),
+            "the navigation is recorded once the catalog is free"
+        );
+        assert!(
+            document
+                .folder_preferences()
+                .identity_for_path(&child)
+                .is_some(),
+            "the folder's location is remembered once the catalog is free"
+        );
+    }
+
+    // UXF-023: a view change is written to the catalog after the UI thread
+    // returns.
+    #[gpui_kit::test]
+    async fn ui_thread_view_preference_change_returns_while_the_catalog_lock_is_held(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::write(folder.join("item.txt"), b"item").unwrap(),
+            cx,
+        )
+        .await;
+        let root = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(window.folder.as_os_str()))
+            .unwrap()
+            .unwrap();
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        let started = Instant::now();
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .layout = Layout::Details;
+                state.persist_focused_view_preferences(cx);
+            });
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+        lock.release();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "a view preference change");
+        assert_eq!(
+            window
+                .catalog_store
+                .load()
+                .unwrap()
+                .folder_preferences()
+                .resolve(&FolderIdentity::from_item(root.id().clone()))
+                .view(),
+            musheen_desktop::FolderView::Details,
+            "the view is written once the catalog is free"
+        );
+    }
+
+    // UXF-023: a tag edit from the Properties window is written after the
+    // UI thread returns.
+    #[gpui_kit::test]
+    async fn ui_thread_properties_tag_edit_returns_while_the_catalog_lock_is_held(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::write(folder.join("tagged.txt"), b"tagged").unwrap(),
+            cx,
+        )
+        .await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(window.folder.join("tagged.txt")))
+            .unwrap()
+            .unwrap();
+        let targets = vec![(
+            item.id().clone(),
+            item.path().clone(),
+            LocalStore::new().capabilities(item.path()),
+        )];
+        let delta = TagDelta {
+            added: [Box::<str>::from("Work")].into_iter().collect(),
+            removed: BTreeSet::new(),
+        };
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        let started = Instant::now();
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, _| {
+                state.apply_properties_tags(&targets, &delta).unwrap();
+            });
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+        lock.release();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "a Properties tag edit");
+        assert!(
+            window
+                .catalog_store
+                .load()
+                .unwrap()
+                .tags()
+                .tags_for(item.id())
+                .contains("Work"),
+            "the tag is written once the catalog is free"
+        );
+    }
+
+    // UXF-023: renaming and deleting a tag from the sidebar ask the tagged
+    // paths' capabilities and write the catalog after the UI thread returns.
+    #[gpui_kit::test]
+    async fn ui_thread_tag_rename_and_delete_return_while_the_catalog_lock_is_held(
+        cx: &mut TestAppContext,
+    ) {
+        let mut tagged = None;
+        let window = open_catalog_window(
+            |folder, document| {
+                let path = folder.join("tagged.txt");
+                filesystem::write(&path, b"tagged").unwrap();
+                let item = LocalStore::new()
+                    .resolve_item(&StorePath::from_unix_path(path))
+                    .unwrap()
+                    .unwrap();
+                document
+                    .tags_mut()
+                    .assign(item.id(), item.path().clone(), "Work")
+                    .unwrap();
+                document
+                    .tags_mut()
+                    .assign(item.id(), item.path().clone(), "Old")
+                    .unwrap();
+                tagged = Some(item);
+            },
+            cx,
+        )
+        .await;
+        let item = tagged.unwrap();
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        let started = Instant::now();
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, _| {
+                state.rename_catalog_tag("Work", "Projects").unwrap();
+                state
+                    .delete_captured_tag(&tag_command_target("Old"))
+                    .unwrap();
+            });
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+        lock.release();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "a tag rename and delete");
+        let document = window.catalog_store.load().unwrap();
+        let tags = document.tags().tags_for(item.id());
+        assert!(tags.contains("Projects"), "the rename is written: {tags:?}");
+        assert!(!tags.contains("Work"), "the old name is gone: {tags:?}");
+        assert!(!tags.contains("Old"), "the deleted tag is gone: {tags:?}");
+    }
+
+    // UXF-023: the catalog projection asks the store about every pin; it
+    // does so after the UI thread returns.
+    #[gpui_kit::test]
+    async fn ui_thread_catalog_projection_returns_while_the_store_is_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(
+            |folder, document| {
+                let pinned = folder.join("pinned");
+                filesystem::create_dir(&pinned).unwrap();
+                let item = LocalStore::new()
+                    .resolve_item(&StorePath::from_unix_path(pinned))
+                    .unwrap()
+                    .unwrap();
+                document
+                    .pins_mut()
+                    .pin(item.id().clone(), item.path().clone(), "Pinned")
+                    .unwrap();
+            },
+            cx,
+        )
+        .await;
+        filesystem::remove_dir(window.folder.join("pinned")).unwrap();
+
+        let started = Instant::now();
+        let gate = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, _| {
+                    let gate = close_store_gate(state);
+                    state.sync_catalog_projection();
+                    gate
+                })
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        gate.open();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "the catalog projection");
+        let document = window.catalog_store.load().unwrap();
+        assert!(
+            matches!(
+                document.pins().entries()[0].state(),
+                musheen_desktop::PinState::Unavailable(_)
+            ),
+            "the removed pin is marked unavailable once the store answers"
+        );
+    }
+
+    // UXF-023: Home's orphan cleanup asks the store whether the item came
+    // back, after the UI thread returns.
+    #[gpui_kit::test]
+    async fn ui_thread_orphan_cleanup_returns_while_the_store_is_blocked(cx: &mut TestAppContext) {
+        let mut orphan = None;
+        let window = open_catalog_window(
+            |folder, document| {
+                let path = folder.join("gone.txt");
+                filesystem::write(&path, b"gone").unwrap();
+                let item = LocalStore::new()
+                    .resolve_item(&StorePath::from_unix_path(path.clone()))
+                    .unwrap()
+                    .unwrap();
+                document
+                    .tags_mut()
+                    .assign(item.id(), item.path().clone(), "Work")
+                    .unwrap();
+                document.tags_mut().observe_missing(item.id());
+                filesystem::remove_file(path).unwrap();
+                orphan = Some(item);
+            },
+            cx,
+        )
+        .await;
+        let orphan = orphan.unwrap();
+
+        let started = Instant::now();
+        let gate = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, cx| {
+                    let gate = close_store_gate(state);
+                    state.cleanup_reviewed_orphan(orphan.id().clone(), cx);
+                    gate
+                })
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        gate.open();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "an orphan cleanup");
+        assert!(
+            window
+                .catalog_store
+                .load()
+                .unwrap()
+                .tags()
+                .tags_for(orphan.id())
+                .is_empty(),
+            "the orphan's tags are removed once the store answers"
+        );
+    }
+
+    // UXF-023: a finished rename asks the destination's capabilities and
+    // moves the item's tags in the catalog after the UI thread returns.
+    #[gpui_kit::test]
+    async fn ui_thread_move_completion_returns_while_the_store_and_the_catalog_are_blocked(
+        cx: &mut TestAppContext,
+    ) {
+        let mut tagged = None;
+        let window = open_catalog_window(
+            |folder, document| {
+                let path = folder.join("before.txt");
+                filesystem::write(&path, b"item").unwrap();
+                let item = LocalStore::new()
+                    .resolve_item(&StorePath::from_unix_path(path))
+                    .unwrap()
+                    .unwrap();
+                document
+                    .tags_mut()
+                    .assign(item.id(), item.path().clone(), "tracked")
+                    .unwrap();
+                tagged = Some(item);
+            },
+            cx,
+        )
+        .await;
+        let item = tagged.unwrap();
+        let destination = StorePath::from_unix_path(window.folder.join("after.txt"));
+        filesystem::rename(
+            item.path().as_unix_path().unwrap(),
+            destination.as_unix_path().unwrap(),
+        )
+        .unwrap();
+        let job = JobId::new(92).unwrap();
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        let started = Instant::now();
+        let gate = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, _| {
+                    state.pending_catalog_moves.insert(
+                        job,
+                        PendingCatalogMove {
+                            source: item.id().clone(),
+                            source_path: item.path().clone(),
+                            target_path: destination.clone(),
+                        },
+                    );
+                    let gate = close_store_gate(state);
+                    state.finish_catalog_move(job, LocalOperationOutcome::Mutation);
+                    gate
+                })
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        lock.release();
+        gate.open();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "a move completion");
+        assert_eq!(
+            window
+                .catalog_store
+                .load()
+                .unwrap()
+                .tags()
+                .path_hint(item.id()),
+            Some(&destination),
+            "the tags follow the item once the store and the catalog answer"
+        );
+    }
+
     #[gpui_kit::test]
     async fn theme_fallback_installs_the_preferred_variant_last(cx: &mut TestAppContext) {
         cx.update(|cx| {

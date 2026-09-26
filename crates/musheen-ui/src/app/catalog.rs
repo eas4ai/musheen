@@ -1311,7 +1311,7 @@ impl MusheenApp {
         }
     }
 
-    fn cleanup_reviewed_orphan(&mut self, item: ItemId, cx: &mut Context<Self>) {
+    pub(super) fn cleanup_reviewed_orphan(&mut self, item: ItemId, cx: &mut Context<Self>) {
         let store = Arc::clone(&self.store);
         match self.catalog_binding.cleanup_reviewed_orphan(&item, |path| {
             store
