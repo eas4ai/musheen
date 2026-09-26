@@ -53,6 +53,16 @@ fn workspace_contains_each_domain_crate() {
     }
 }
 
+/// Whether `file` is a `tests.rs` that its parent module declares only for
+/// tests (`#[cfg(test)] mod tests;`): test code, like an inline test module.
+fn is_test_module_file(file: &Path) -> bool {
+    file.file_name().is_some_and(|name| name == "tests.rs")
+        && file.parent().is_some_and(|directory| {
+            fs::read_to_string(directory.with_extension("rs"))
+                .is_ok_and(|parent| parent.contains("\n#[cfg(test)]\nmod tests;"))
+        })
+}
+
 #[test]
 fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
     let crates_root = repository_root().join("crates");
@@ -79,7 +89,7 @@ fn ui_and_operation_domains_do_not_access_the_filesystem_directly() {
         let mut rust_files = Vec::new();
         rust_files_below(&crates_root.join(crate_name).join("src"), &mut rust_files);
         for file in rust_files {
-            if file == private_directory_index {
+            if file == private_directory_index || is_test_module_file(&file) {
                 continue;
             }
             let source = fs::read_to_string(&file).expect("Rust source should be readable");
