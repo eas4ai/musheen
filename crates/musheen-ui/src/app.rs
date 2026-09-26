@@ -4682,25 +4682,17 @@ impl MusheenApp {
         }));
     }
 
+    /// Writes the attribute tags the catalog has staged now and then, for
+    /// the writes that failed or were left from an earlier run.
     fn start_pending_xattr_reconciliation(&mut self, cx: &mut Context<Self>) {
-        let binding = self.catalog_binding.clone();
         cx.spawn(async move |this, cx| {
             loop {
-                let worker = binding.clone();
-                let written = binding.queue_work(cx.background_executor(), move || {
-                    worker.reconcile_pending_xattrs()
-                });
-                let result = catalog_work_result(written).await;
-                let Some(this) = this.upgrade() else {
+                if this
+                    .update(cx, |state, cx| state.start_attribute_writes(cx))
+                    .is_err()
+                {
                     return;
-                };
-                this.update(cx, |state, cx| {
-                    if let Err(error) = result {
-                        state.operation_error = Some(error);
-                        cx.notify();
-                    }
-                });
-                drop(this);
+                }
                 cx.background_executor()
                     .timer(XATTR_RECONCILIATION_INTERVAL)
                     .await;
@@ -6284,12 +6276,15 @@ impl MusheenApp {
                     CapabilityState::Supported
                 )
             });
-            // Reading the tag states can import extended attributes into the
-            // catalog, so it runs in the write queue.
+            // The attribute reads run here, outside the catalog write queue;
+            // importing what they found into the catalog is a queued job.
             let tag_states = tags_supported.then(|| {
-                let reader = binding.clone();
+                let reads = binding.read_attribute_tags(&tag_targets);
+                let importer = binding.clone();
                 let read = tag_targets.clone();
-                binding.queue_work(&executor, move || reader.tag_states(&read))
+                binding.queue_work(&executor, move || {
+                    importer.import_and_tag_states(&read, &reads)
+                })
             });
             (tag_targets, tag_states)
         });
@@ -6311,6 +6306,8 @@ impl MusheenApp {
                     page,
                     cx,
                 );
+                // An import the tag states staged writes the file's tags.
+                state.start_attribute_writes(cx);
             });
         })
         .detach();
