@@ -31,10 +31,9 @@ fn provider_root_item(
 
 mod remote;
 pub(crate) use remote::BrowseConnectionTester;
-use remote::{
-    RemoteProfileAdapter, RemoteProfileStore, RemoteStoreConnector, default_remote_connector,
-    remote_connector,
-};
+#[cfg(test)]
+use remote::default_remote_connector;
+use remote::{RemoteProfileAdapter, RemoteProfileStore, RemoteStoreConnector, remote_connector};
 
 pub(crate) trait ProviderAdapter: Send + Sync {
     fn store(&self) -> Arc<dyn Store>;
@@ -116,6 +115,9 @@ impl ProviderRuntime {
             .expect("the built-in provider registrations are valid")
     }
 
+    /// Providers for `settings` with a fresh secret-service connection; the
+    /// app itself shares its credentials through `from_settings_with_credentials`.
+    #[cfg(test)]
     pub(crate) fn from_settings(
         settings: &musheen_desktop::SettingsDocument,
     ) -> Result<Self, ProviderRuntimeError> {

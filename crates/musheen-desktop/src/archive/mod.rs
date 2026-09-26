@@ -24,6 +24,7 @@ pub use create::{
     ArchiveOperationOutcome, execute_archive_plan, execute_scheduled_archive_operation,
     execute_scheduled_archive_operation_with_accounting,
 };
+pub use extract::{ExtractCollision, ExtractDestination, extract_destination};
 pub use format::ArchiveFormat;
 #[cfg(feature = "archive-libarchive")]
 #[doc(hidden)]

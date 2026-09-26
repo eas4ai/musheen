@@ -57,6 +57,30 @@ pub enum ArchiveConflictPolicy {
     Replace,
 }
 
+/// How an extraction merges into a destination folder that already exists.
+/// It names, relative to that folder, each colliding entry the user chose to
+/// replace; every other collision is skipped, including one that appeared
+/// after the user answered.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExtractMerge {
+    replace: std::collections::BTreeSet<Vec<u8>>,
+}
+
+impl ExtractMerge {
+    /// `replace` holds entry paths relative to the destination folder, with
+    /// `/` between components.
+    pub fn new(replace: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            replace: replace.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn replaces(&self, relative: &[u8]) -> bool {
+        self.replace.contains(relative)
+    }
+}
+
 /// A validated archive request submitted to the operation engine.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArchiveOperationPlan {
@@ -66,6 +90,10 @@ pub struct ArchiveOperationPlan {
     codec: ArchiveCodec,
     conflict_policy: ArchiveConflictPolicy,
     encrypted: bool,
+    /// Set when an extraction merges into an existing folder. Journals
+    /// written before merging existed read as `None`.
+    #[serde(default)]
+    merge: Option<ExtractMerge>,
 }
 
 impl ArchiveOperationPlan {
@@ -127,7 +155,23 @@ impl ArchiveOperationPlan {
             codec,
             conflict_policy,
             encrypted,
+            merge: None,
         })
+    }
+
+    /// Makes an extraction merge into its destination folder when that
+    /// folder exists, following `merge` for each collision.
+    pub fn with_merge(mut self, merge: ExtractMerge) -> Result<Self, PlanError> {
+        if self.kind != OperationKind::Extract {
+            return Err(PlanError::MergeNeedsExtraction);
+        }
+        self.merge = Some(merge);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn merge(&self) -> Option<&ExtractMerge> {
+        self.merge.as_ref()
     }
 
     #[must_use]
@@ -492,6 +536,7 @@ pub enum PlanError {
     EmptyArchiveSources,
     ArchiveSourceIsDestination,
     UnsupportedArchiveEncryption(ArchiveCodec),
+    MergeNeedsExtraction,
 }
 
 impl fmt::Display for PlanError {
@@ -508,6 +553,9 @@ impl fmt::Display for PlanError {
             Self::EmptyArchiveSources => formatter.write_str("archive creation requires a source"),
             Self::ArchiveSourceIsDestination => {
                 formatter.write_str("archive source and destination must differ")
+            }
+            Self::MergeNeedsExtraction => {
+                formatter.write_str("only an extraction merges into an existing folder")
             }
             Self::UnsupportedArchiveEncryption(codec) => {
                 write!(formatter, "{codec:?} does not support archive encryption")

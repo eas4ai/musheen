@@ -71,25 +71,31 @@ fn open_editor(
     }
 }
 
-/// Scrolls the Settings controls until `id` is on screen, from the top down.
+/// Whether `id` is shown with its centre inside the scrolled Settings
+/// controls, where a click lands on it.
+fn clickable(window: &gpui_kit::Window, id: &str) -> bool {
+    let (Some(target), Some(controls)) = (
+        window.try_find(id.to_owned()),
+        window.try_find("settings-controls"),
+    ) else {
+        return false;
+    };
+    target.visible() && controls.bounds().contains(&target.bounds().center())
+}
+
+/// Scrolls the Settings controls until `id` can be clicked, from the top down.
 fn reveal(window: &mut gpui_kit::Window, id: &str, cx: &mut gpui_kit::App) {
     window.render_frame(cx);
-    if window
-        .try_find(id.to_owned())
-        .is_some_and(|found| found.visible())
-    {
+    if clickable(window, id) {
         return;
     }
     window.scroll("settings-controls", ScrollDelta::Lines(point(0., 400.)), cx);
-    for _ in 0..40 {
+    for _ in 0..80 {
         window.render_frame(cx);
-        if window
-            .try_find(id.to_owned())
-            .is_some_and(|found| found.visible())
-        {
+        if clickable(window, id) {
             return;
         }
-        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -5.)), cx);
+        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -3.)), cx);
     }
 }
 
