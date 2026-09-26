@@ -80,6 +80,12 @@ Mechanism: uxf-023
 Rationale: docs/opus-audit-2.md A-F4 and A-F7: catalog file I/O ran on the UI thread on every watch event, and stat and statfs ran on the UI thread for every context menu and command target check, so a hung mount froze the window.
 Status: Agreed 2026-09-25
 
+[UXF-024] Reading or writing a file's extended-attribute tags never holds the catalog write queue. The catalog records the tags a user sets before their attribute write runs; other catalog writes land while a file's store blocks, and the attribute write finishes when the store answers.
+Falsifier: a tag read or write on a file whose store blocks keeps a later catalog write for anything else (a view change, a recent location, a pin, another item's tags) from landing, or the tags the user set never reach the file after the store answers.
+Mechanism: uxf-024
+Rationale: review 54e960e8 finding 4 on catalog-writes-off-ui-thread: a Properties tag edit wrote the attributes inside the shared write queue, so a tagged file on a hung mount held every later catalog write from every window until the mount answered.
+Status: Agreed 2026-09-26
+
 ## Direct manipulation
 
 [UXF-011] Drag feedback distinguishes copy, move, link, pin, tag, and rejected drops before release.
