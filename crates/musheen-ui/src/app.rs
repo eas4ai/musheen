@@ -32097,6 +32097,132 @@ mod tests {
         });
     }
 
+    /// Extended-attribute tags kept in memory. Each read and write notes
+    /// whether it ran inside a catalog write queue job.
+    #[derive(Debug, Default)]
+    struct RecordedAttributeTags {
+        tags: Mutex<HashMap<StorePath, BTreeSet<Box<str>>>>,
+        calls: std::sync::atomic::AtomicUsize,
+        calls_in_queue: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordedAttributeTags {
+        fn note(&self) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if catalog::in_write_job() {
+                self.calls_in_queue
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl catalog::AttributeTags for RecordedAttributeTags {
+        fn read(&self, _item: &ItemId, path: &StorePath) -> Result<BTreeSet<Box<str>>, Box<str>> {
+            self.note();
+            Ok(self
+                .tags
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn write(
+            &self,
+            _item: &ItemId,
+            path: &StorePath,
+            tags: &BTreeSet<Box<str>>,
+        ) -> Result<(), Box<str>> {
+            self.note();
+            self.tags.lock().unwrap().insert(path.clone(), tags.clone());
+            Ok(())
+        }
+    }
+
+    // UXF-024: a Properties tag edit on a file whose tags live in extended
+    // attributes reads and writes those attributes outside the catalog
+    // write queue; the catalog records the tags and the tags reach the file.
+    #[gpui_kit::test]
+    async fn xattr_queue_tag_edit_reads_and_writes_attributes_outside_the_queue(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::write(folder.join("tagged.txt"), b"tagged").unwrap(),
+            cx,
+        )
+        .await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(window.folder.join("tagged.txt")))
+            .unwrap()
+            .unwrap();
+        let attributes = Arc::new(RecordedAttributeTags::default());
+        // The file already carries a tag in its attributes.
+        attributes.tags.lock().unwrap().insert(
+            item.path().clone(),
+            [Box::<str>::from("Old")].into_iter().collect(),
+        );
+        let recorded: Arc<dyn catalog::AttributeTags> = attributes.clone();
+        window.app.update(cx, |state, _| {
+            state.catalog_binding = CatalogBinding::persistent_with_xattr_opt_in(
+                window.catalog_store.clone(),
+                window.catalog_store.load().unwrap(),
+                true,
+            )
+            .with_attribute_tags(recorded);
+        });
+        let targets = vec![(
+            item.id().clone(),
+            item.path().clone(),
+            musheen_core::CapabilityMatrix::new(|_| CapabilityState::Supported),
+        )];
+        let writer = window
+            .app
+            .update(cx, |state, cx| state.properties_tag_writer(targets, cx));
+        let written = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        cx.update(|cx| {
+            let written = std::rc::Rc::clone(&written);
+            writer(
+                &TagDelta {
+                    added: [Box::<str>::from("Work")].into_iter().collect(),
+                    removed: BTreeSet::new(),
+                },
+                cx,
+                Box::new(move |result, _| *written.borrow_mut() = Some(result)),
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(*written.borrow(), Some(Ok(())), "the window hears the edit");
+        assert!(
+            attributes.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the edit read and wrote the file's attributes"
+        );
+        assert_eq!(
+            attributes
+                .calls_in_queue
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no attribute read or write ran inside a catalog write queue job"
+        );
+        let expected = ["Old", "Work"]
+            .into_iter()
+            .map(Box::<str>::from)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            attributes.tags.lock().unwrap().get(item.path()),
+            Some(&expected),
+            "the tags reach the file"
+        );
+        let document = window.catalog_store.load().unwrap();
+        assert_eq!(document.tags().tags_for(item.id()), expected);
+        assert!(
+            !document.tags().is_xattr_pending(item.id()),
+            "the attribute write finished"
+        );
+    }
+
     #[gpui_kit::test]
     async fn theme_fallback_installs_the_preferred_variant_last(cx: &mut TestAppContext) {
         cx.update(|cx| {
