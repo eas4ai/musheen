@@ -23244,6 +23244,169 @@ mod tests {
         );
     }
 
+    /// Gives the app an operation hub that runs archive jobs, with their
+    /// journal in `journal` rather than the user's configuration directory.
+    fn run_archive_jobs(app: &Entity<MusheenApp>, journal: &Path, cx: &mut TestAppContext) {
+        app.update(cx, |state, _| {
+            state.operation_hub =
+                OperationHub::new_with_provider_runtime(&ResourceLimits::default(), &state.providers)
+                    .with_archive_journal_at(journal);
+        });
+    }
+
+    /// Compresses `source` into `<name>.zip` beside it with the app's own
+    /// Compress command, and returns the archive once it is published.
+    async fn compressed_fixture(
+        app: &Entity<MusheenApp>,
+        browser: AnyWindowHandle,
+        source: &Path,
+        cx: &mut TestAppContext,
+    ) -> PathBuf {
+        let mut name = source.file_name().unwrap().to_os_string();
+        name.push(".zip");
+        let archive = source.with_file_name(name);
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::Compress,
+                CommandParameters::targets(vec![local_command_target(source)]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.wait_for(browser, Duration::from_secs(5), |_, _| archive.exists())
+            .await;
+        archive
+    }
+
+    /// Chooses Extract… on `archive` from its context menu and picks
+    /// `destination` by typing its path in the destination chooser.
+    fn extract_to_through_the_chooser(
+        app: &Entity<MusheenApp>,
+        browser: AnyWindowHandle,
+        archive: &Path,
+        destination: &Path,
+        cx: &mut TestAppContext,
+    ) {
+        let before = cx.windows();
+        cx.update_window(browser, |_, window, cx| {
+            app.update(cx, |state, cx| {
+                let tab = state.navigation.focused_tab().id();
+                let menu = state.compose_context_menu(
+                    tab,
+                    MenuTarget::Item,
+                    vec![local_command_target(archive)],
+                );
+                let entry = MusheenApp::menu_entry_by_id(&menu, "archive.extract")
+                    .expect("a local archive offers Extract…")
+                    .clone();
+                assert!(
+                    entry.state().is_enabled(),
+                    "Extract… is enabled for a local archive: {:?}",
+                    entry.state()
+                );
+                state.remember_context_invocation_focus(window, cx);
+                state.dispatch_context_entry(entry, cx);
+            });
+        })
+        .unwrap();
+        let chooser = cx
+            .windows()
+            .into_iter()
+            .find(|window| !before.contains(window))
+            .expect("Extract… opens the destination chooser");
+        cx.update_window(chooser, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("context-destination-path", cx);
+            window.input(destination.to_str().unwrap(), cx);
+            window.click("context-destination-use-path", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_a_picked_folder_writes_the_archive_entries_there(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("notes.txt");
+        filesystem::write(&source, b"notes").unwrap();
+        let picked = temporary.path().join("picked");
+        filesystem::create_dir(&picked).unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = compressed_fixture(&app, browser, &source, cx).await;
+
+        extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
+
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).operation_error,
+                None,
+                "Extract… queues an extraction into the picked folder"
+            )
+        });
+        let extracted = picked.join("notes.txt");
+        cx.wait_for(browser, Duration::from_secs(5), |_, _| extracted.exists())
+            .await;
+        assert_eq!(filesystem::read(&extracted).unwrap(), b"notes");
+        assert!(
+            !temporary.path().join("notes").exists(),
+            "nothing is extracted beside the archive"
+        );
+        assert!(
+            !picked.join("notes").exists(),
+            "the entries land in the picked folder itself, not in a subfolder"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_a_folder_that_holds_an_entry_keeps_that_item(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("notes.txt");
+        filesystem::write(&source, b"notes").unwrap();
+        let picked = temporary.path().join("picked");
+        filesystem::create_dir(&picked).unwrap();
+        filesystem::write(picked.join("notes.txt"), b"already here").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = compressed_fixture(&app, browser, &source, cx).await;
+        let before = cx.read(|cx| {
+            app.read(cx)
+                .operation_hub
+                .status()
+                .lock()
+                .unwrap()
+                .highest_job_id()
+        });
+
+        extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
+
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).operation_error,
+                None,
+                "Extract… queues an extraction into the picked folder"
+            )
+        });
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            let status = app.read(cx).operation_hub.status();
+            let status = status.lock().unwrap();
+            status.highest_job_id() > before && status.active_count() == 0
+        })
+        .await;
+        assert_eq!(
+            filesystem::read(picked.join("notes.txt")).unwrap(),
+            b"already here",
+            "an extraction never replaces an item already in the picked folder"
+        );
+    }
+
     #[gpui_kit::test]
     async fn hide_context_action_renames_the_selected_local_item(cx: &mut TestAppContext) {
         let temporary = tempfile::tempdir().unwrap();

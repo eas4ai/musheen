@@ -120,6 +120,15 @@ impl ProviderRuntime {
         Self::from_settings_with_connector(settings, default_remote_connector())
     }
 
+    /// Providers for `settings` whose remote connections log in with
+    /// `credentials`.
+    pub(crate) fn from_settings_with_credentials(
+        settings: &musheen_desktop::SettingsDocument,
+        _credentials: Arc<musheen_desktop::RemoteCredentials>,
+    ) -> Result<Self, ProviderRuntimeError> {
+        Self::from_settings(settings)
+    }
+
     fn from_settings_with_connector(
         settings: &musheen_desktop::SettingsDocument,
         connector: RemoteStoreConnector,
@@ -1810,5 +1819,203 @@ mod tests {
                 .get(CapabilityKind::Watching),
             CapabilityState::Unsupported(_)
         ));
+    }
+
+    fn saved_profiles(profiles: Vec<ConnectionProfile>) -> SettingsDocument {
+        let mut settings = SettingsDocument::default();
+        settings
+            .set_value(
+                "remote.connections",
+                &ConnectionProfiles::new(profiles).export().unwrap(),
+            )
+            .unwrap();
+        settings
+    }
+
+    fn fake_ftp_profile(
+        protocol: RemoteProtocol,
+        port: u16,
+        security: SecurityPolicy,
+    ) -> ConnectionProfile {
+        ConnectionProfile::new(
+            ConnectionId::new("fake-ftp").unwrap(),
+            "Fake FTP",
+            protocol,
+            RemoteHost::new(protocol, "127.0.0.1").unwrap(),
+            Some(port),
+            "/",
+            None::<&str>,
+            None,
+            security,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Opens `profile` the way browsing does and lists its root.
+    fn browse_root(profile: ConnectionProfile) -> Result<Vec<String>, StoreError> {
+        let saved = RemoteProfileStore::new(profile, default_remote_connector()).unwrap();
+        let root = StorePath::from_provider_key(saved.provider_id().clone(), b"/".to_vec())
+            .unwrap();
+        future::block_on(saved.read_directory(
+            &root,
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .map(|page| {
+            page.items()
+                .iter()
+                .map(|item| item.display_name().as_str().to_owned())
+                .collect()
+        })
+    }
+
+    fn run_connection_test(
+        profile: &ConnectionProfile,
+    ) -> Result<(), musheen_desktop::RemoteError> {
+        future::block_on(
+            crate::settings::default_connection_tester().test(profile, CancellationToken::new()),
+        )
+    }
+
+    #[test]
+    fn remote_parity_ftps_test_and_browsing_both_start_explicit_tls() {
+        let server = crate::test_fixtures::FakeFtp::start(Default::default());
+        let profile = fake_ftp_profile(
+            RemoteProtocol::Ftps,
+            server.port(),
+            SecurityPolicy::Tls(musheen_desktop::TlsPolicy::SystemRoots),
+        );
+
+        assert!(browse_root(profile.clone()).is_err(), "the server offers no TLS");
+        let browsed = server.first_commands();
+        assert!(
+            !browsed.is_empty() && browsed.iter().all(|command| command == "AUTH TLS"),
+            "fixture: browsing starts FTPS with AUTH TLS: {browsed:?}"
+        );
+        assert!(run_connection_test(&profile).is_err());
+        let tested = server.first_commands()[browsed.len()..].to_vec();
+        assert!(
+            !tested.is_empty() && tested.iter().all(|command| command == "AUTH TLS"),
+            "Test connection starts FTPS the way browsing does: {tested:?}"
+        );
+    }
+
+    #[test]
+    fn remote_parity_a_root_browsing_cannot_list_fails_the_test() {
+        let server = crate::test_fixtures::FakeFtp::start(crate::test_fixtures::FtpServerOptions {
+            password: None,
+            lists_root: false,
+        });
+        let profile = fake_ftp_profile(
+            RemoteProtocol::Ftp,
+            server.port(),
+            SecurityPolicy::PlaintextConfirmed,
+        );
+
+        assert!(
+            browse_root(profile.clone()).is_err(),
+            "fixture: browsing cannot list this server's root"
+        );
+        assert!(
+            run_connection_test(&profile).is_err(),
+            "Test connection fails when browsing cannot list the connection's root"
+        );
+    }
+
+    #[test]
+    fn remote_parity_a_root_browsing_lists_passes_the_test() {
+        let server = crate::test_fixtures::FakeFtp::start(crate::test_fixtures::FtpServerOptions {
+            password: None,
+            lists_root: true,
+        });
+        let profile = fake_ftp_profile(
+            RemoteProtocol::Ftp,
+            server.port(),
+            SecurityPolicy::PlaintextConfirmed,
+        );
+
+        assert_eq!(browse_root(profile.clone()).unwrap(), ["hello.txt"]);
+        assert!(run_connection_test(&profile).is_ok());
+    }
+
+    #[test]
+    fn remote_parity_network_hides_saved_connections_browsing_refuses() {
+        let host = |protocol| RemoteHost::new(protocol, "files.example.test").unwrap();
+        let named = |id: &str, name: &str, protocol, security, proxy| {
+            ConnectionProfile::new(
+                ConnectionId::new(id).unwrap(),
+                name,
+                protocol,
+                host(protocol),
+                None,
+                "/",
+                None::<&str>,
+                None,
+                security,
+                proxy,
+            )
+            .unwrap()
+        };
+        let socks = musheen_desktop::ProxySettings::new(
+            RemoteProtocol::Ftp,
+            musheen_desktop::ProxyKind::Socks5,
+            host(RemoteProtocol::Ftp),
+            1080,
+            None::<&str>,
+            None,
+        )
+        .unwrap();
+        let settings = saved_profiles(vec![
+            named(
+                "plain",
+                "Plain FTP",
+                RemoteProtocol::Ftp,
+                SecurityPolicy::PlaintextConfirmed,
+                None,
+            ),
+            named(
+                "windows-share",
+                "Windows share",
+                RemoteProtocol::Smb,
+                SecurityPolicy::SystemManaged,
+                None,
+            ),
+            named(
+                "nfs-export",
+                "NFS export",
+                RemoteProtocol::Nfs,
+                SecurityPolicy::SystemManaged,
+                None,
+            ),
+            named(
+                "pinned-ftps",
+                "Pinned FTPS",
+                RemoteProtocol::Ftps,
+                SecurityPolicy::Tls(musheen_desktop::TlsPolicy::PinnedSha256([7; 32])),
+                None,
+            ),
+            named(
+                "proxied",
+                "Proxied FTP",
+                RemoteProtocol::Ftp,
+                SecurityPolicy::PlaintextConfirmed,
+                Some(socks),
+            ),
+        ]);
+
+        let runtime = ProviderRuntime::from_settings(&settings).unwrap();
+        let listed = future::block_on(runtime.store().read_directory(
+            &network_root_path(),
+            PageRequest::new(16, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap()
+        .items()
+        .iter()
+        .map(|item| item.display_name().as_str().to_owned())
+        .collect::<Vec<_>>();
+
+        assert_eq!(listed, ["Plain FTP"]);
     }
 }
