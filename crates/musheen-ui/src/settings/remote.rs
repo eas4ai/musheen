@@ -7,11 +7,11 @@ use musheen_core::{BoxFuture, CancellationToken};
 use musheen_desktop::{
     BrowseRefusal, ConnectionId, ConnectionProfile, ConnectionProfiles, CredentialReference,
     HostKeyPolicy, ProxyKind, ProxySettings, RemoteError, RemoteErrorCategory, RemoteHost,
-    RemoteProtocol, SaveConfirmation, SaveRequirement, SecurityPolicy, SettingSpec, SettingsPage,
-    TLS_PIN_BYTES, TestReport, TlsPolicy, settings_schema,
+    RemoteProtocol, SaveConfirmation, SaveRequirement, SecurityPolicy, SettingSpec,
+    SettingsDocument, SettingsPage, TLS_PIN_BYTES, TestReport, TlsPolicy, settings_schema,
 };
 use musheen_desktop::{CredentialResolver, SecretBuffer, SshLogin};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub const PROFILE_ID: &str = "remote-profile-id";
@@ -381,6 +381,30 @@ impl CredentialResolver for EditorCredentials {
     }
 }
 
+/// The secret IDs the connections saved in `document` use, or `None` when
+/// its connections cannot be read, so that nothing is deleted on a guess.
+fn referenced_secrets(document: &SettingsDocument) -> Option<BTreeSet<ConnectionId>> {
+    let Some(encoded) = document.value("remote.connections") else {
+        return Some(BTreeSet::new());
+    };
+    let profiles = ConnectionProfiles::import(&encoded).ok()?;
+    Some(
+        profiles
+            .profiles()
+            .iter()
+            .flat_map(|profile| {
+                profile
+                    .credential()
+                    .cloned()
+                    .into_iter()
+                    .chain(profile.stored_key_reference())
+                    .chain(profile.proxy().and_then(ProxySettings::credential).cloned())
+            })
+            .map(|reference| reference.connection_id().clone())
+            .collect(),
+    )
+}
+
 impl super::SettingsWindow {
     /// The login the editor shows: an SFTP connection's chosen method, with
     /// its key file path; every other protocol logs in with a password.
@@ -676,9 +700,7 @@ impl super::SettingsWindow {
         if self.state.edit("remote.connections", &encoded).is_ok() {
             self.remote_save_requirement = None;
             self.remote_validation_failed = false;
-            self.forget_retired_secrets(&profile, cx);
             self.remote_credential = profile.credential().cloned();
-            self.remote_stored_key = profile.stored_key_reference().is_some();
             self.remote_inputs[PROFILE_PASSWORD]
                 .update(cx, |input, cx| input.set_value("", window, cx));
             self.remote_key_text
@@ -689,23 +711,21 @@ impl super::SettingsWindow {
         cx.notify();
     }
 
-    /// Removes secrets the connection kept before this save and no longer
-    /// uses, such as a password after a switch to agent login.
-    fn forget_retired_secrets(&self, profile: &ConnectionProfile, cx: &mut Context<Self>) {
-        let mut retired = Vec::new();
-        if profile.credential().is_none()
-            && let Some(previous) = &self.remote_credential
-            && previous.connection_id() == profile.id()
-        {
-            retired.push(previous.connection_id().clone());
-        }
-        if self.remote_stored_key
-            && profile.stored_key_reference().is_none()
-            && let Ok(key) = ConnectionId::new(format!("{}.key", profile.id().as_str()))
-        {
-            retired.push(key);
-        }
-        self.forget_secrets(retired, cx);
+    /// Deletes the secrets the saved connections used before an apply and no
+    /// longer use after it: the password or stored key of a removed
+    /// connection, or of one whose login changed. Runs only once the apply
+    /// is saved, so a cancelled edit keeps every secret.
+    pub(super) fn forget_unreferenced_secrets(
+        &self,
+        before: &SettingsDocument,
+        after: &SettingsDocument,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(before), Some(after)) = (referenced_secrets(before), referenced_secrets(after))
+        else {
+            return;
+        };
+        self.forget_secrets(before.difference(&after).cloned().collect(), cx);
     }
 
     fn forget_secrets(&self, ids: Vec<ConnectionId>, cx: &mut Context<Self>) {
@@ -723,8 +743,9 @@ impl super::SettingsWindow {
         .detach();
     }
 
-    /// Removes the connection being edited from the draft settings and its
-    /// password and stored key from the secret service.
+    /// Removes the connection being edited from the draft settings. Its
+    /// password and stored key leave the secret service when the removal is
+    /// applied.
     fn remove_remote_connection(&mut self, cx: &mut Context<Self>) {
         let Ok(id) = ConnectionId::new(self.remote_inputs[PROFILE_ID].read(cx).value().trim())
         else {
@@ -747,11 +768,7 @@ impl super::SettingsWindow {
             cx.notify();
             return;
         }
-        let mut ids = vec![id.clone()];
-        ids.extend(ConnectionId::new(format!("{}.key", id.as_str())));
-        self.forget_secrets(ids, cx);
         self.remote_credential = None;
-        self.remote_stored_key = false;
         self.remote_editor_open = false;
         self.invalidate_remote_test();
         cx.notify();
@@ -803,7 +820,6 @@ impl super::SettingsWindow {
         self.remote_security = default_security(RemoteProtocol::Sftp);
         self.remote_proxy = None;
         self.remote_credential = None;
-        self.remote_stored_key = false;
         self.remote_login = SshLogin::Password;
         self.remote_key_text
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -839,7 +855,6 @@ impl super::SettingsWindow {
         self.remote_security = profile.security().clone();
         self.remote_proxy = profile.proxy().map(ProxySettings::kind);
         self.remote_credential = profile.credential().cloned();
-        self.remote_stored_key = profile.stored_key_reference().is_some();
         self.remote_login = profile.login().clone();
         self.remote_key_text
             .update(cx, |input, cx| input.set_value("", window, cx));

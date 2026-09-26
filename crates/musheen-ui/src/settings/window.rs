@@ -143,8 +143,6 @@ pub struct SettingsWindow {
     pub(super) remote_proxy: Option<ProxyKind>,
     /// The credential the connection being edited already stores.
     pub(super) remote_credential: Option<CredentialReference>,
-    /// Whether the connection being edited already stores a private key.
-    pub(super) remote_stored_key: bool,
     pub(super) remote_login: musheen_desktop::SshLogin,
     pub(super) remote_key_text: Entity<gpui_kit::component::input::TextareaState>,
     pub(super) remote_credentials: Arc<musheen_desktop::RemoteCredentials>,
@@ -226,7 +224,6 @@ impl SettingsWindow {
             remote_security: super::remote::default_security(RemoteProtocol::Sftp),
             remote_proxy: None,
             remote_credential: None,
-            remote_stored_key: false,
             remote_login: musheen_desktop::SshLogin::Password,
             remote_key_text: super::remote::key_text_input(window, cx),
             remote_credentials,
@@ -387,6 +384,11 @@ impl SettingsWindow {
                         this.saving = false;
                         match result {
                             Ok(document) => {
+                                this.forget_unreferenced_secrets(
+                                    &this.state.committed,
+                                    &document,
+                                    cx,
+                                );
                                 this.state.committed = document;
                                 this.failure = None;
                             }

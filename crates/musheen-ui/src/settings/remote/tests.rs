@@ -455,11 +455,18 @@ async fn remote_password_typed_in_the_editor_reaches_the_test_the_keyring_and_br
     );
 
     editor.click(cx, "settings-remote-remove");
+    cx.run_until_parked();
+    assert!(!editor.saved_connections(cx).contains("team-ftp"));
+    assert_eq!(
+        keyring.secret("team-ftp").as_deref(),
+        Some(b"hunter2".as_slice()),
+        "a removal not yet applied keeps the password, so Cancel keeps a working connection"
+    );
+    editor.click(cx, "settings-apply");
     assert!(
         settle(cx, |_| keyring.secret("team-ftp").is_none()),
-        "removing the connection deletes its password"
+        "applying the removal deletes the connection's password"
     );
-    assert!(!editor.saved_connections(cx).contains("team-ftp"));
 }
 
 #[gpui_kit::test]
@@ -608,4 +615,22 @@ async fn sftp_login_the_editor_offers_each_login_method_and_saves_it(cx: &mut Te
     );
     let saved = editor.saved_connections(cx);
     assert!(!saved.contains("stored-key-body") && !saved.contains("key passphrase"));
+
+    editor.click(cx, "settings-apply");
+    let view = editor.view.clone();
+    assert!(settle(cx, |cx| !view.read(cx).saving));
+    editor.click(cx, "settings-remote-login-agent");
+    editor.test_connection(cx);
+    editor.click(cx, "settings-remote-save");
+    cx.run_until_parked();
+    assert!(
+        keyring.secret("office.key").is_some(),
+        "a login change not yet applied keeps the stored key"
+    );
+    editor.click(cx, "settings-apply");
+    assert!(
+        settle(cx, |_| keyring.secret("office.key").is_none()
+            && keyring.secret("office").is_none()),
+        "applying a switch to agent login deletes the stored key and its passphrase"
+    );
 }
