@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: ui-thread-growth-2026-09-25
+Current: catalog-writes-off-ui-thread
 
 ## 1. Foundation
 
