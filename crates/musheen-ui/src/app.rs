@@ -31847,31 +31847,53 @@ mod tests {
 
         app.update(cx, |state, _| {
             let tab = state.navigation.focused_tab().id();
+            let probes_of = |composed: &ComposedMenu| {
+                composed
+                    .composition
+                    .probes
+                    .iter()
+                    .map(|(probe, _)| probe.clone())
+                    .collect::<Vec<_>>()
+            };
+            // A new sidebar menu asks about its place again; the background
+            // menus below see the same caches as the sidebar menu.
             state.begin_sidebar_menu();
+            // What the background menu asks on its own: Send To asks the
+            // place's writability, which the caches do not hold yet.
+            let alone = state.composed_context_menu(tab, MenuTarget::Background, Vec::new());
+            let own = probes_of(&alone);
+            let _ = alone.into_menu(state);
+
             let first = state.composed_sidebar_entry_context_menu(
                 tab,
                 MenuTarget::SidebarLocation,
                 location.clone(),
                 None,
             );
-            let asked = first
-                .composition
-                .probes
-                .iter()
-                .map(|(probe, _)| probe.clone())
-                .collect::<Vec<_>>();
-            assert!(!asked.is_empty(), "the link's place is asked of the store");
+            let asked = probes_of(&first);
+            assert!(
+                asked.iter().any(|probe| !own.contains(probe)),
+                "the sidebar menu asks the store something the background menu does not"
+            );
             let _ = first.into_menu(state);
 
             let next = state
                 .composed_context_menu(tab, MenuTarget::Background, Vec::new())
                 .into_popup(state);
+            let waited = next
+                .probe
+                .as_ref()
+                .map(|pending| pending.probes.clone())
+                .unwrap_or_default();
             assert!(
-                next.probe.as_ref().is_none_or(|pending| {
-                    asked.iter().all(|probe| !pending.probes.contains(probe))
-                        && pending.recompose.target() == MenuTarget::Background
-                }),
-                "the next popup waits on none of the first menu's probes"
+                waited.len() == own.len() && waited.iter().all(|probe| own.contains(probe)),
+                "the next popup waits only on its own probes: {waited:?}, not the first menu's"
+            );
+            assert!(
+                next.probe
+                    .as_ref()
+                    .is_none_or(|pending| pending.recompose.target() == MenuTarget::Background),
+                "the next popup composes itself again, not the first menu"
             );
             let queue = state.store_probes.borrow();
             assert!(queue.composing.is_none(), "no composition stays open");
