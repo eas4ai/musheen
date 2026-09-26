@@ -28,16 +28,4 @@
     <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/musheen/musheen-broker</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.run-executable-as-administrator</annotate>
   </action>
-
-  <action id="org.musheen.browse-directory-as-administrator">
-    <description>Browse a directory as administrator</description>
-    <message>Authentication is required to run $(command_line)</message>
-    <defaults>
-      <allow_any>no</allow_any>
-      <allow_inactive>no</allow_inactive>
-      <allow_active>auth_admin</allow_active>
-    </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/musheen/musheen-broker</annotate>
-    <annotate key="org.freedesktop.policykit.exec.argv1">--action-id=org.musheen.browse-directory-as-administrator</annotate>
-  </action>
 </policyconfig>

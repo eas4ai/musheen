@@ -22,7 +22,9 @@ use crate::directory::{
     ApplyPageResult, DirectoryIndexReader, DirectoryIndexResult, DirectoryIndexWork, DirectoryLoad,
     DirectoryModel, DirectoryState, IndexedSelection,
 };
-use crate::elevated_browser::{PrivilegeBackend, RootedFilesystemStore, SystemPrivilegeBackend};
+use crate::elevated_browser::{
+    ElevatedSession, PrivilegeBackend, RootedFilesystemStore, SystemPrivilegeBackend,
+};
 use crate::i18n::{Catalog, Locale};
 use crate::icons::{ApplicationIdentity, ContentIdentity, freedesktop_icon_name};
 use crate::info_pane::{
@@ -85,15 +87,14 @@ use musheen_desktop::{
     ApplicationIconProvider, ArchiveFormat, ArchiveLimits, ArchiveStore, BrokerError, BrokerOutput,
     BrokerRequest, CatalogDocument, CatalogStore, ClipboardOperation, ClipboardPayload,
     ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher, DesktopEntryTerminalLauncher,
-    DesktopPaths, ElevatedRootReference, ExternalTerminalCommand, FolderIdentity,
-    FreedesktopIconProvider, LaunchError, LaunchTarget, MimeAppsError, MimeAppsResolver,
-    MimeAppsSnapshot, MimeDetector, MountOperation, OperationReservation, OperationUsage,
-    OperationUse, PreparedLaunch, PreviewDocument, PrivilegeProvider, ProcessRunner, PtyEvent,
-    SecretBuffer, SessionStore, SystemClock, SystemFileClipboard, SystemProcessRunner,
-    TagMoveOutcome, TerminalCommand, TerminalError, TerminalModel, TerminalProfile,
-    TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits, ThumbnailLookup, ThumbnailMode,
-    ThumbnailRequest, ThumbnailService, ThumbnailSize, UsageResolution, VolumeAction, VolumeError,
-    VolumeId, VolumeRuntime,
+    DesktopPaths, ExternalTerminalCommand, FolderIdentity, FreedesktopIconProvider, LaunchError,
+    LaunchTarget, MimeAppsError, MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation,
+    OperationReservation, OperationUsage, OperationUse, PreparedLaunch, PreviewDocument,
+    PrivilegeProvider, ProcessRunner, PtyEvent, SecretBuffer, SessionStore, SystemClock,
+    SystemFileClipboard, SystemProcessRunner, TagMoveOutcome, TerminalCommand, TerminalError,
+    TerminalModel, TerminalProfile, TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits,
+    ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
+    UsageResolution, VolumeAction, VolumeError, VolumeId, VolumeRuntime,
 };
 use musheen_local::LocalStore;
 use musheen_ops::{
@@ -1009,6 +1010,14 @@ struct ExtractCheck {
 
 /// How long a collision check runs before it shows its window.
 const EXTRACT_CHECK_WINDOW_DELAY: Duration = Duration::from_millis(500);
+
+/// What an authorized privilege action returns to the app.
+enum PrivilegeResult {
+    /// Open as Administrator: the session of the elevated window.
+    Window(Arc<dyn ElevatedSession>),
+    /// Run as Administrator: the broker's answer.
+    Output(BrokerOutput),
+}
 
 /// An extraction waiting for the user's answers about its collisions.
 struct PendingExtract {
@@ -10796,23 +10805,31 @@ impl MusheenApp {
         let authentication = self.pending_privilege_authentication.take();
         cx.spawn(async move |this, cx| {
             let worker_request = request.clone();
+            // Open as Administrator authorizes once for the whole window; the
+            // window's listings go through the session it returns (SYS-034).
             let result = cx
                 .background_spawn(async move {
-                    backend
-                        .perform(&worker_request, cancellation, authentication)
-                        .await
+                    if matches!(action, CommandAction::OpenAsAdministrator) {
+                        backend
+                            .open_window(&worker_request, cancellation, authentication)
+                            .await
+                            .map(PrivilegeResult::Window)
+                    } else {
+                        backend
+                            .perform(&worker_request, cancellation, authentication)
+                            .await
+                            .map(PrivilegeResult::Output)
+                    }
                 })
                 .await;
             let Some(this) = this.upgrade() else {
                 return;
             };
             this.update(cx, |state, cx| match result {
-                Ok(BrokerOutput::RootReferenced(root_reference))
-                    if matches!(action, CommandAction::OpenAsAdministrator) =>
-                {
-                    state.open_elevated_window(root_reference, cx);
+                Ok(PrivilegeResult::Window(session)) => {
+                    state.open_elevated_window(session, cx);
                 }
-                Ok(BrokerOutput::Exited(code))
+                Ok(PrivilegeResult::Output(BrokerOutput::Exited(code)))
                     if matches!(action, CommandAction::RunAsAdministrator) =>
                 {
                     if code != 0 {
@@ -10845,16 +10862,9 @@ impl MusheenApp {
         .detach();
     }
 
-    fn open_elevated_window(
-        &mut self,
-        root_reference: ElevatedRootReference,
-        cx: &mut Context<Self>,
-    ) {
-        let root = root_reference.root().to_path_buf();
-        let elevated_store = Arc::new(RootedFilesystemStore::<SystemClock>::remote(
-            root_reference,
-            Arc::clone(&self.privilege_backend),
-        ));
+    fn open_elevated_window(&mut self, session: Arc<dyn ElevatedSession>, cx: &mut Context<Self>) {
+        let root = session.root_reference().root().to_path_buf();
+        let elevated_store = Arc::new(RootedFilesystemStore::<SystemClock>::remote(session));
         let providers = match ProviderRuntime::with_primary_store(elevated_store.clone()) {
             Ok(providers) => providers,
             Err(_) => {
@@ -25696,6 +25706,8 @@ mod tests {
     async fn administrator_action_requires_review_and_opens_a_visibly_elevated_surface(
         cx: &mut TestAppContext,
     ) {
+        use musheen_desktop::{BrokerDirectoryEntry, ElevatedRootReference};
+
         #[derive(Clone, Default)]
         struct RecordingPrivilegeBackend(Arc<Mutex<Vec<BrokerRequest>>>);
 
@@ -25723,6 +25735,48 @@ mod tests {
                         Box::pin(async { Ok(BrokerOutput::Exited(0)) })
                     }
                 }
+            }
+
+            fn open_window<'a>(
+                &'a self,
+                request: &'a BrokerRequest,
+                _cancellation: CancellationToken,
+                _authentication: Option<SecretBuffer>,
+            ) -> musheen_core::BoxFuture<'a, Result<Arc<dyn ElevatedSession>, BrokerError>>
+            {
+                self.0.lock().unwrap().push(request.clone());
+                let calls = Arc::clone(&self.0);
+                let root = ElevatedRootReference::capture(request.target());
+                Box::pin(async move {
+                    Ok(Arc::new(RecordingSession { root: root?, calls })
+                        as Arc<dyn ElevatedSession>)
+                })
+            }
+        }
+
+        /// A window session that records each listing it is asked for.
+        struct RecordingSession {
+            root: ElevatedRootReference,
+            calls: Arc<Mutex<Vec<BrokerRequest>>>,
+        }
+
+        impl ElevatedSession for RecordingSession {
+            fn root_reference(&self) -> &ElevatedRootReference {
+                &self.root
+            }
+
+            fn read_directory<'a>(
+                &'a self,
+                root: ElevatedRootReference,
+                relative: PathBuf,
+                _cancellation: CancellationToken,
+            ) -> musheen_core::BoxFuture<'a, Result<Vec<BrokerDirectoryEntry>, BrokerError>>
+            {
+                let request = BrokerRequest::read_directory(root, relative);
+                Box::pin(async move {
+                    self.calls.lock().unwrap().push(request?);
+                    Ok(Vec::new())
+                })
             }
         }
 

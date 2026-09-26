@@ -2,14 +2,15 @@ use musheen_core::{CancellationToken, PageRequest, ResourceLimits, Store, StoreP
 use musheen_desktop::SecretBuffer;
 use musheen_desktop::privilege::{
     AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker, BrokerLaunch,
-    BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, ElevatedRootReference, NoopAudit,
-    ProcessBrokerTransport, SUDO_BROKER_READY, SudoPtyBrokerTransport, SystemClock,
-    SystemOperationRunner, decode_broker_request, encode_broker_response,
+    BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, ELEVATED_SESSION_IDLE,
+    ElevatedRootReference, NoopAudit, ProcessBrokerTransport, RequestLines, SUDO_BROKER_READY,
+    SudoPtyBrokerTransport, SystemClock, SystemOperationRunner, decode_broker_request,
+    prepare_sudo_terminal, serve_session, write_response,
 };
 use musheen_desktop::{Clock, PrivilegeProvider, RootGrant, RootedStore};
 use musheen_ui::{
-    AppearanceMode, Catalog, ElevatedBrowser, Locale, PrivilegeBackend, RootedFilesystemStore,
-    SystemPrivilegeBackend,
+    AppearanceMode, Catalog, ElevatedBrowser, ElevatedSession, Locale, PrivilegeBackend,
+    RootedFilesystemStore, SystemPrivilegeBackend,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -130,10 +131,11 @@ impl Authorizer for AllowInvoker {
 }
 
 /// Plays musheen-broker when a fake pkexec or sudo starts this test binary,
-/// and does nothing otherwise.
+/// and does nothing otherwise. It runs the broker's own session code, with an
+/// authorizer that allows the invoking user.
 #[test]
 fn elevated_session_broker_child() {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::Write as _;
 
     let Ok(arguments) = std::env::var(BROKER_ARGUMENTS) else {
         return;
@@ -151,20 +153,22 @@ fn elevated_session_broker_child() {
             .unwrap();
         writeln!(file, "{}", std::process::id()).unwrap();
     }
+    let idle = std::env::var(BROKER_IDLE_MILLIS)
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+        .map_or(ELEVATED_SESSION_IDLE, Duration::from_millis);
     if provider == PrivilegeProvider::Sudo {
+        prepare_sudo_terminal().unwrap();
         println!("{SUDO_BROKER_READY}");
     }
-    // The broker as it stands answers one request per authorization.
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line).unwrap();
-    let mut request = decode_broker_request(line.trim()).unwrap();
-    request
-        .bind_to_invoker(
-            provider,
-            &std::env::vars().collect(),
-            std::os::unix::process::parent_id(),
-        )
-        .unwrap();
+    let requests = RequestLines::spawn(std::io::stdin()).unwrap();
+    let first = requests.first().unwrap().unwrap();
+    let mut request = decode_broker_request(first.trim()).unwrap();
+    let environment = std::env::vars().collect();
+    let parent = std::os::unix::process::parent_id();
+    let bind =
+        |request: &mut BrokerRequest| request.bind_to_invoker(provider, &environment, parent);
+    bind(&mut request).unwrap();
     let broker = Broker::new(
         AllowInvoker,
         SystemOperationRunner::default(),
@@ -172,11 +176,19 @@ fn elevated_session_broker_child() {
         SystemClock,
     )
     .with_provider(provider);
-    let response = broker.handle(request).map_or_else(
-        |error| BrokerResponse::failure(&error),
-        BrokerResponse::success,
-    );
-    println!("{}", encode_broker_response(&response).unwrap());
+    let mut output = std::io::stdout();
+    let opened = broker.handle(request);
+    write_response(
+        &mut output,
+        &opened.clone().map_or_else(
+            |error| BrokerResponse::failure(&error),
+            BrokerResponse::success,
+        ),
+    )
+    .unwrap();
+    if let Ok(BrokerOutput::RootReferenced(root)) = opened {
+        serve_session(&broker, &root, &requests, &mut output, &bind, idle);
+    }
 }
 
 fn executable_script(directory: &Path, name: &str, body: &str) -> PathBuf {
@@ -284,23 +296,20 @@ impl FakeElevation {
 }
 
 /// Opens `root` as administrator, as Open as Administrator does, and returns
-/// the elevated window's store.
+/// the elevated window's store and session.
 fn open_window(
     fake: &FakeElevation,
     backend: &Arc<SystemPrivilegeBackend>,
     root: &Path,
-) -> RootedFilesystemStore<SystemClock> {
+) -> (RootedFilesystemStore<SystemClock>, Arc<dyn ElevatedSession>) {
     let request = BrokerRequest::open_directory(root).unwrap();
-    let output = futures_lite::future::block_on(backend.perform(
+    let session = futures_lite::future::block_on(backend.open_window(
         &request,
         CancellationToken::new(),
         fake.password(),
     ))
     .expect("Open as Administrator authorizes");
-    let BrokerOutput::RootReferenced(reference) = output else {
-        panic!("Open as Administrator returns the root reference: {output:?}");
-    };
-    RootedFilesystemStore::remote(reference, Arc::clone(backend) as Arc<dyn PrivilegeBackend>)
+    (RootedFilesystemStore::remote(Arc::clone(&session)), session)
 }
 
 /// Lists every page of `folder` through the window's store.
@@ -345,7 +354,7 @@ fn elevated_session_authorizes_once_for_a_window_of_listings() {
         for index in 0..5 {
             fs::write(root.path().join("many").join(format!("{index}.txt")), b"x").unwrap();
         }
-        let store = open_window(&fake, &backend, root.path());
+        let (store, _session) = open_window(&fake, &backend, root.path());
 
         for folder in ["", "a", "b", "c"] {
             list_all(&store, &root.path().join(folder), 100)
@@ -377,7 +386,7 @@ fn elevated_session_lists_more_than_the_pipe_holds() {
             )
             .unwrap();
         }
-        let store = open_window(&fake, &backend, root.path());
+        let (store, _session) = open_window(&fake, &backend, root.path());
 
         let started = std::time::Instant::now();
         let names = list_all(&store, root.path(), 1_000)
@@ -403,7 +412,7 @@ fn elevated_session_lists_a_folder_whose_path_fits_the_limit() {
         }
         fs::create_dir_all(&deep).unwrap();
         fs::write(deep.join("leaf.txt"), b"leaf").unwrap();
-        let store = open_window(&fake, &backend, root.path());
+        let (store, _session) = open_window(&fake, &backend, root.path());
 
         let names = list_all(&store, &deep, 100)
             .unwrap_or_else(|error| panic!("{provider:?} lists a deep folder: {error}"));
@@ -421,10 +430,10 @@ fn elevated_session_refuses_what_it_was_not_granted() {
         let other = parent.path().join("other");
         fs::create_dir(&granted).unwrap();
         fs::create_dir(&other).unwrap();
-        let store = open_window(&fake, &backend, &granted);
+        let (store, session) = open_window(&fake, &backend, &granted);
         list_all(&store, &granted, 100).unwrap();
 
-        let outside = futures_lite::future::block_on(backend.read_directory(
+        let outside = futures_lite::future::block_on(session.read_directory(
             ElevatedRootReference::capture(&other).unwrap(),
             PathBuf::new(),
             CancellationToken::new(),
@@ -461,16 +470,18 @@ fn running(pid: u32) -> bool {
 
 #[test]
 fn elevated_session_ends_with_its_window_and_after_idle() {
+    assert_eq!(ELEVATED_SESSION_IDLE, Duration::from_secs(15 * 60));
     for provider in PROVIDERS {
         let fake = FakeElevation::new(provider, IDLE);
         let backend = fake.backend();
         let root = tempfile::tempdir().unwrap();
-        let store = open_window(&fake, &backend, root.path());
+        let (store, session) = open_window(&fake, &backend, root.path());
         list_all(&store, root.path(), 100).unwrap();
         let brokers = fake.broker_pids();
         assert!(!brokers.is_empty(), "{provider:?} started a broker");
 
         drop(store);
+        drop(session);
         drop(backend);
         let closed = std::time::Instant::now();
         while brokers.iter().any(|pid| running(*pid)) && closed.elapsed() < Duration::from_secs(5) {
@@ -483,7 +494,7 @@ fn elevated_session_ends_with_its_window_and_after_idle() {
 
         let fake = FakeElevation::new(provider, Duration::from_millis(500));
         let backend = fake.backend();
-        let store = open_window(&fake, &backend, root.path());
+        let (store, _session) = open_window(&fake, &backend, root.path());
         list_all(&store, root.path(), 100).unwrap();
         std::thread::sleep(Duration::from_millis(1_500));
         let expired = list_all(&store, root.path(), 100);
