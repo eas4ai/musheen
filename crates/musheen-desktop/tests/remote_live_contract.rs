@@ -449,10 +449,12 @@ fn reviewed_sftp_cleanup_keeps_source_on_identity_mismatch() {
             "MUSHEEN_LIVE_SSH_SHA256",
         ))),
     );
-    let store = block_on(sftp_store_from_profile(
+    let ssh_home = tempfile::tempdir().expect("a temporary SSH home is available");
+    let store = block_on(sftp_store_from_profile_in(
         provider("sftp-mismatch"),
         &profile,
         &StaticCredentials,
+        &test_ssh_environment(ssh_home.path()),
         CancellationToken::new(),
     ))
     .expect("the SFTP fixture connects");
