@@ -23244,6 +23244,16 @@ mod tests {
         );
     }
 
+    /// Gives the app an operation hub that runs archive jobs, with their
+    /// journal in `journal` rather than the user's configuration directory.
+    fn run_archive_jobs(app: &Entity<MusheenApp>, journal: &Path, cx: &mut TestAppContext) {
+        app.update(cx, |state, _| {
+            state.operation_hub =
+                OperationHub::new_with_provider_runtime(&ResourceLimits::default(), &state.providers)
+                    .with_archive_journal_at(journal);
+        });
+    }
+
     /// Compresses `source` into `<name>.zip` beside it with the app's own
     /// Compress command, and returns the archive once it is published.
     async fn compressed_fixture(
@@ -23327,6 +23337,8 @@ mod tests {
         let picked = temporary.path().join("picked");
         filesystem::create_dir(&picked).unwrap();
         let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
         let archive = compressed_fixture(&app, browser, &source, cx).await;
 
         extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
@@ -23361,6 +23373,8 @@ mod tests {
         filesystem::create_dir(&picked).unwrap();
         filesystem::write(picked.join("notes.txt"), b"already here").unwrap();
         let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
         let archive = compressed_fixture(&app, browser, &source, cx).await;
         let before = cx.read(|cx| {
             app.read(cx)
