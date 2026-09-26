@@ -4,8 +4,8 @@ use musheen_core::{
 };
 use musheen_desktop::remote::{
     ConnectionProfile, CredentialResolver, HostKeyPolicy, RemoteHost, RemoteProtocol,
-    SecurityPolicy, TlsPolicy, ftp_store_from_profile, http_store_from_profile,
-    sftp_store_from_profile, webdav_store_from_profile,
+    SecurityPolicy, SshEnvironment, TlsPolicy, ftp_store_from_profile, http_store_from_profile,
+    sftp_store_from_profile_in, webdav_store_from_profile,
 };
 use musheen_desktop::{ConnectionId, CredentialReference, SecretBuffer};
 use musheen_ops::{EventGeneration, JobId, StagingPath};
@@ -167,10 +167,12 @@ fn ftp_http_and_webdav_profiles_reach_live_services() {
             "MUSHEEN_LIVE_SSH_SHA256",
         ))),
     );
-    let sftp = block_on(sftp_store_from_profile(
+    let ssh_home = tempfile::tempdir().expect("a temporary SSH home is available");
+    let sftp = block_on(sftp_store_from_profile_in(
         provider("sftp"),
         &sftp_profile,
         &credentials,
+        &test_ssh_environment(ssh_home.path()),
         CancellationToken::new(),
     ))
     .expect("the pinned SFTP profile connects");
@@ -384,10 +386,12 @@ fn reviewed_sftp_source_is_removed_after_quarantine_check() {
             "MUSHEEN_LIVE_SSH_SHA256",
         ))),
     );
-    let store = block_on(sftp_store_from_profile(
+    let ssh_home = tempfile::tempdir().expect("a temporary SSH home is available");
+    let store = block_on(sftp_store_from_profile_in(
         provider("sftp-cleanup"),
         &profile,
         &StaticCredentials,
+        &test_ssh_environment(ssh_home.path()),
         CancellationToken::new(),
     ))
     .expect("the SFTP fixture connects");
@@ -531,4 +535,15 @@ fn reviewed_webdav_source_is_removed_after_quarantine_check() {
             .expect("the original path resolves")
             .is_none()
     );
+}
+
+/// The live servers are pinned, so the test's own SSH folder stands in for
+/// the developer's ~/.ssh, which no test reads.
+fn test_ssh_environment(home: &std::path::Path) -> SshEnvironment {
+    SshEnvironment {
+        home: home.to_path_buf(),
+        config: None,
+        known_hosts: home.join("known_hosts"),
+        agent_socket: None,
+    }
 }
