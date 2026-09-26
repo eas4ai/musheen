@@ -1,3 +1,0 @@
-[D-BUS Service]
-Name=org.musheen.Musheen
-Exec=/usr/bin/musheen
