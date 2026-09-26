@@ -495,55 +495,94 @@ struct StoreProbeQueue {
     in_flight: std::collections::HashSet<StoreProbe>,
 }
 
-/// What one menu composition queued: the probes the caches could not
-/// answer, each with whether the popup waits for it, and how to compose the
-/// menu again once they answer.
-#[derive(Default)]
-struct MenuComposition {
-    probes: Vec<(StoreProbe, bool)>,
-    recompose: Option<MenuRecompose>,
-}
+/// A menu composition's record. It is a module of its own so that its
+/// fields are private: the rest of the app takes a composed menu only with
+/// `into_menu` or `into_popup`, and so never drops what it queued.
+mod menu_composition {
+    use super::{
+        ContextMenu, MenuRecompose, MusheenApp, PendingContextMenu, PendingMenuProbe, StoreProbe,
+    };
 
-/// A composed context menu with what its composition queued. A popup takes
-/// the probes it waits for with `into_popup`; any other caller takes the
-/// menu with `into_menu`, which hands the probes to the next frame. Either
-/// way nothing is left for another menu.
-#[must_use]
-struct ComposedMenu {
-    menu: ContextMenu,
-    composition: MenuComposition,
-}
-
-impl ComposedMenu {
-    /// The menu, for a caller that opens no popup waiting on the store. The
-    /// probes go to the next frame, so the caches still fill.
-    fn into_menu(self, app: &MusheenApp) -> ContextMenu {
-        app.queue_render_probes(self.composition.probes.into_iter().map(|(probe, _)| probe));
-        self.menu
+    /// What one menu composition queued: the probes the caches could not
+    /// answer, each with whether the popup waits for it, and how to compose
+    /// the menu again once they answer.
+    #[derive(Default)]
+    pub(super) struct MenuComposition {
+        probes: Vec<(StoreProbe, bool)>,
+        recompose: Option<MenuRecompose>,
     }
 
-    /// The menu and the probe its popup starts: `None` when the caches
-    /// answered everything, or when the menu cannot be composed again, in
-    /// which case the probes go to the next frame.
-    fn into_popup(self, app: &MusheenApp) -> PendingContextMenu {
-        let MenuComposition { probes, recompose } = self.composition;
-        let probe = match recompose {
-            Some(recompose) if !probes.is_empty() => Some(PendingMenuProbe {
-                deferring: probes.iter().any(|(_, defers)| *defers),
-                probes: probes.into_iter().map(|(probe, _)| probe).collect(),
-                recompose,
-            }),
-            _ => {
-                app.queue_render_probes(probes.into_iter().map(|(probe, _)| probe));
-                None
+    impl MenuComposition {
+        /// Queues `probe`; the popup waits for it when any request for it
+        /// says so.
+        pub(super) fn queue(&mut self, probe: StoreProbe, defers_menu: bool) {
+            match self.probes.iter_mut().find(|(queued, _)| *queued == probe) {
+                Some((_, defers)) => *defers |= defers_menu,
+                None => self.probes.push((probe, defers_menu)),
             }
-        };
-        PendingContextMenu {
-            menu: self.menu,
-            probe,
+        }
+
+        pub(super) fn set_recompose(&mut self, recompose: MenuRecompose) {
+            self.recompose = Some(recompose);
+        }
+    }
+
+    /// A composed context menu with what its composition queued. A popup
+    /// takes the probes it waits for with `into_popup`; any other caller
+    /// takes the menu with `into_menu`, which hands the probes to the next
+    /// frame. Either way nothing is left for another menu.
+    #[must_use]
+    pub(super) struct ComposedMenu {
+        menu: ContextMenu,
+        composition: MenuComposition,
+    }
+
+    impl ComposedMenu {
+        pub(super) fn new(menu: ContextMenu, composition: MenuComposition) -> Self {
+            Self { menu, composition }
+        }
+
+        /// The menu, for a caller that opens no popup waiting on the store.
+        /// The probes go to the next frame, so the caches still fill.
+        pub(super) fn into_menu(self, app: &MusheenApp) -> ContextMenu {
+            app.queue_render_probes(self.composition.probes.into_iter().map(|(probe, _)| probe));
+            self.menu
+        }
+
+        /// The menu and the probe its popup starts: `None` when the caches
+        /// answered everything, or when the menu cannot be composed again,
+        /// in which case the probes go to the next frame.
+        pub(super) fn into_popup(self, app: &MusheenApp) -> PendingContextMenu {
+            let MenuComposition { probes, recompose } = self.composition;
+            let probe = match recompose {
+                Some(recompose) if !probes.is_empty() => Some(PendingMenuProbe {
+                    deferring: probes.iter().any(|(_, defers)| *defers),
+                    probes: probes.into_iter().map(|(probe, _)| probe).collect(),
+                    recompose,
+                }),
+                _ => {
+                    app.queue_render_probes(probes.into_iter().map(|(probe, _)| probe));
+                    None
+                }
+            };
+            PendingContextMenu {
+                menu: self.menu,
+                probe,
+            }
+        }
+
+        /// The probes the composition queued.
+        #[cfg(test)]
+        pub(super) fn probes(&self) -> Vec<StoreProbe> {
+            self.composition
+                .probes
+                .iter()
+                .map(|(probe, _)| probe.clone())
+                .collect()
         }
     }
 }
+use menu_composition::{ComposedMenu, MenuComposition};
 
 /// A composed menu kept for the popup its click opens, with the probe that
 /// popup starts.
@@ -7434,7 +7473,9 @@ impl MusheenApp {
 
     /// Builds a menu request from the pane that received the pointer event.
     /// Capturing the pane's tab id here prevents the other pane's selection
-    /// from becoming an accidental target after focus changes.
+    /// from becoming an accidental target after focus changes. The app opens
+    /// the popup with `composed_item_context_menu`; tests read the menu.
+    #[cfg(test)]
     fn item_context_menu(
         &mut self,
         tab_id: TabId,
@@ -8004,16 +8045,7 @@ impl MusheenApp {
         let mut queue = self.store_probes.borrow_mut();
         let queue = &mut *queue;
         match &mut queue.composing {
-            Some(composition) => {
-                match composition
-                    .probes
-                    .iter_mut()
-                    .find(|(queued, _)| *queued == probe)
-                {
-                    Some((_, defers)) => *defers |= defers_menu,
-                    None => composition.probes.push((probe, defers_menu)),
-                }
-            }
+            Some(composition) => composition.queue(probe, defers_menu),
             None => {
                 if !queue.render.contains(&probe) {
                     queue.render.push(probe);
@@ -8034,24 +8066,48 @@ impl MusheenApp {
 
     /// Composes a menu as one composition: the probes `compose` queues and
     /// how to compose the menu again go to the returned record and to no
-    /// state another menu could pick up.
+    /// state another menu could pick up. The composition closes even when
+    /// `compose` panics.
     fn compose_menu(&self, compose: impl FnOnce(&Self) -> ContextMenu) -> ComposedMenu {
+        /// Puts the composition that was open before back when this one
+        /// ends, also when it ends by a panic.
+        struct Close<'a> {
+            queue: &'a std::cell::RefCell<StoreProbeQueue>,
+            outer: Option<Option<MenuComposition>>,
+        }
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                if let Some(outer) = self.outer.take() {
+                    self.queue.borrow_mut().composing = outer;
+                }
+            }
+        }
         let outer = self
             .store_probes
             .borrow_mut()
             .composing
             .replace(MenuComposition::default());
+        let mut close = Close {
+            queue: &self.store_probes,
+            outer: Some(outer),
+        };
         let menu = compose(self);
+        let outer = close.outer.take().expect("the composition is still open");
         let composition = std::mem::replace(&mut self.store_probes.borrow_mut().composing, outer)
             .unwrap_or_default();
-        ComposedMenu { menu, composition }
+        ComposedMenu::new(menu, composition)
     }
 
     /// Records how to compose the menu being composed again. Does nothing
-    /// outside a composition.
+    /// outside a composition. `recompose` runs with the queue free, so it
+    /// may queue probes itself.
     fn record_menu_recompose(&self, recompose: impl FnOnce() -> MenuRecompose) {
+        if self.store_probes.borrow().composing.is_none() {
+            return;
+        }
+        let recompose = recompose();
         if let Some(composition) = self.store_probes.borrow_mut().composing.as_mut() {
-            composition.recompose = Some(recompose());
+            composition.set_recompose(recompose);
         }
     }
 
@@ -30519,7 +30575,7 @@ mod tests {
                 // The store is blocked, and the menu still opens.
                 let composed = state.composed_item_context_menu(tab, item, cx);
                 assert!(
-                    !composed.composition.probes.is_empty(),
+                    !composed.probes().is_empty(),
                     "the menu queued the store questions it could not answer"
                 );
                 let menu = composed.into_menu(state);
@@ -31847,14 +31903,7 @@ mod tests {
 
         app.update(cx, |state, _| {
             let tab = state.navigation.focused_tab().id();
-            let probes_of = |composed: &ComposedMenu| {
-                composed
-                    .composition
-                    .probes
-                    .iter()
-                    .map(|(probe, _)| probe.clone())
-                    .collect::<Vec<_>>()
-            };
+            let probes_of = ComposedMenu::probes;
             // A new sidebar menu asks about its place again; the background
             // menus below see the same caches as the sidebar menu.
             state.begin_sidebar_menu();
@@ -31862,6 +31911,10 @@ mod tests {
             // place's writability, which the caches do not hold yet.
             let alone = state.composed_context_menu(tab, MenuTarget::Background, Vec::new());
             let own = probes_of(&alone);
+            assert!(
+                !own.is_empty(),
+                "the background menu asks the store something, so its popup has a probe"
+            );
             let _ = alone.into_menu(state);
 
             let first = state.composed_sidebar_entry_context_menu(
@@ -31880,21 +31933,28 @@ mod tests {
             let next = state
                 .composed_context_menu(tab, MenuTarget::Background, Vec::new())
                 .into_popup(state);
-            let waited = next
+            let pending = next
                 .probe
                 .as_ref()
-                .map(|pending| pending.probes.clone())
-                .unwrap_or_default();
+                .expect("the next popup starts a probe for its own questions");
             assert!(
-                waited.len() == own.len() && waited.iter().all(|probe| own.contains(probe)),
-                "the next popup waits only on its own probes: {waited:?}, not the first menu's"
+                pending.probes.len() == own.len()
+                    && pending.probes.iter().all(|probe| own.contains(probe)),
+                "the next popup waits only on its own probes: {:?}, not the first menu's",
+                pending.probes
             );
             assert!(
-                next.probe
-                    .as_ref()
-                    .is_none_or(|pending| pending.recompose.target() == MenuTarget::Background),
-                "the next popup composes itself again, not the first menu"
+                matches!(
+                    &pending.recompose,
+                    MenuRecompose::Request {
+                        target: MenuTarget::Background,
+                        ..
+                    }
+                ),
+                "the next popup composes the Background menu again, not the sidebar menu"
             );
+            // The recompose record lives only in the open composition, and
+            // none stays open, so no record is left for another menu.
             let queue = state.store_probes.borrow();
             assert!(queue.composing.is_none(), "no composition stays open");
             assert!(
@@ -31913,6 +31973,8 @@ mod tests {
                 location.clone(),
                 None,
             );
+            let kept_probes = kept.probes();
+            assert!(!kept_probes.is_empty(), "the kept menu asks the store");
             state.queue_plain_context_menu(kept);
             assert!(
                 state
@@ -31923,9 +31985,36 @@ mod tests {
             );
             let replacement = state.composed_context_menu(tab, MenuTarget::Background, Vec::new());
             state.queue_plain_context_menu(replacement);
+            let queue = state.store_probes.borrow();
             assert!(
-                !state.store_probes.borrow().render.is_empty(),
+                kept_probes.iter().all(|probe| queue.render.contains(probe)),
                 "a kept menu that is replaced hands its probes to the next frame"
+            );
+        });
+    }
+
+    // UXF-023: a composition that panics still closes, so the probes queued
+    // after it go to the next frame instead of a record no one takes.
+    #[gpui_kit::test]
+    async fn ui_thread_a_menu_composition_that_panics_closes(cx: &mut TestAppContext) {
+        let window = open_catalog_window(|_, _| {}, cx).await;
+        window.app.update(cx, |state, _| {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = state.compose_menu(|_| panic!("the composition fails"));
+            }));
+            assert!(panicked.is_err(), "the composition panicked");
+            assert!(
+                state.store_probes.borrow().composing.is_none(),
+                "the composition closed"
+            );
+            let probe = StoreProbe::Location {
+                location: StorePath::from_unix_path("/after-the-panic"),
+                resolve: false,
+            };
+            state.queue_store_probe(probe.clone(), false);
+            assert!(
+                state.store_probes.borrow().render.contains(&probe),
+                "a probe queued after the panic goes to the next frame"
             );
         });
     }
