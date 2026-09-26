@@ -437,7 +437,7 @@ const SETTINGS: &[SettingSpec] = &[
         page: SettingsPage::Integrations,
         label: "setting-remote-connections",
         group: "settings-group-remote",
-        aliases: "remote connection profile ftp ftps sftp webdav http smb nfs",
+        aliases: "remote connection profile password credential login ssh key ftp ftps sftp webdav http smb nfs",
         default: "{\"version\":1,\"profiles\":[]}",
         kind: SettingKind::ConnectionProfiles,
         restart_required: false,

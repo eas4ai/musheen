@@ -27,6 +27,17 @@ fn open_editor(
     keyring: Option<MemoryKeyring>,
     tester: Option<Arc<dyn ConnectionTestService>>,
 ) -> Editor {
+    open_editor_on(cx, keyring, tester, None)
+}
+
+/// Opens Settings as `open_editor` does, on a settings file that holds
+/// `settings` when one is given.
+fn open_editor_on(
+    cx: &mut TestAppContext,
+    keyring: Option<MemoryKeyring>,
+    tester: Option<Arc<dyn ConnectionTestService>>,
+    settings: Option<&str>,
+) -> Editor {
     cx.update(|cx| {
         gpui_kit::init(cx);
         cx.set_reduce_motion(true);
@@ -38,6 +49,10 @@ fn open_editor(
     });
     let config = tempfile::tempdir().unwrap();
     let store = SettingsStore::from_config_home(config.path());
+    if let Some(settings) = settings {
+        std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        std::fs::write(store.path(), settings).unwrap();
+    }
     let tester = tester.unwrap_or_else(default_connection_tester);
     let mut view = None;
     let handle = cx.open_window(size(px(900.), px(1400.)), |window, cx| {
@@ -899,55 +914,89 @@ async fn remote_global_credential_of_an_older_file_stays_unread_and_its_secret_s
         password: Some("hunter2"),
         lists_root: true,
     });
-    let _editor = open_editor(cx, Some(keyring.clone()), None);
     // A connection an older build saved with the global credential.
-    let profile = ConnectionProfile::new(
-        ConnectionId::new("team-ftp").unwrap(),
-        "Team FTP",
-        RemoteProtocol::Ftp,
-        RemoteHost::new(RemoteProtocol::Ftp, "127.0.0.1").unwrap(),
-        Some(server.port()),
-        "/",
-        Some("alice"),
-        Some(CredentialReference::persistent(
-            ConnectionId::new("shared").unwrap(),
-        )),
-        SecurityPolicy::PlaintextConfirmed,
-        None,
-    )
-    .unwrap();
-    let connections = ConnectionProfiles::new(vec![profile.clone()])
+    let profile = |name: &str| {
+        ConnectionProfile::new(
+            ConnectionId::new("team-ftp").unwrap(),
+            name,
+            RemoteProtocol::Ftp,
+            RemoteHost::new(RemoteProtocol::Ftp, "127.0.0.1").unwrap(),
+            Some(server.port()),
+            "/",
+            Some("alice"),
+            Some(CredentialReference::persistent(
+                ConnectionId::new("shared").unwrap(),
+            )),
+            SecurityPolicy::PlaintextConfirmed,
+            None,
+        )
+        .unwrap()
+    };
+    let connections = ConnectionProfiles::new(vec![profile("Team FTP")])
         .export()
         .unwrap();
-    let config = tempfile::tempdir().unwrap();
-    let store = SettingsStore::from_config_home(config.path());
-    std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
-    std::fs::write(
-        store.path(),
-        format!(
-            "schema_version=3\nremote.credential=secret-service:shared\nremote.connections={connections}\n"
-        ),
-    )
-    .unwrap();
+    let editor = open_editor_on(
+        cx,
+        Some(keyring.clone()),
+        None,
+        Some(&format!(
+            "schema_version=3\nappearance.mode=dark\nremote.credential=secret-service:shared\nremote.connections={connections}\n"
+        )),
+    );
+    assert_eq!(
+        editor.failure(cx),
+        None,
+        "a settings file with the global credential loads"
+    );
+    assert_eq!(
+        ConnectionProfiles::import(&editor.saved_connections(cx))
+            .expect("its connections load")
+            .profiles(),
+        [profile("Team FTP")]
+    );
 
-    let document = store
-        .load()
-        .expect("a settings file with the global credential loads");
-    let loaded = ConnectionProfiles::import(&document.value("remote.connections").unwrap())
-        .expect("its connections load");
-    assert_eq!(loaded.profiles(), [profile]);
-    store.save(&document).unwrap();
+    // Save the connection in the editor with the password field empty.
+    editor.view.update(cx, |view, cx| {
+        view.remote_editor_open = false;
+        cx.notify();
+    });
+    editor.click(cx, "settings-remote-edit-team-ftp");
+    editor.fill(cx, &[("remote-profile-name", " renamed")]);
+    editor.test_connection(cx);
+    editor.save_connection(cx, "team-ftp");
+    editor.apply(cx);
+    assert_eq!(editor.failure(cx), None);
+
+    let saved = editor.store.load().expect("the saved file loads");
+    let connections = saved.value("remote.connections").unwrap();
+    assert_eq!(
+        ConnectionProfiles::import(&connections).unwrap().profiles(),
+        [profile("Team FTP renamed")],
+        "the saved connection keeps its reference to the old global secret"
+    );
+    assert_eq!(
+        saved.value("appearance.mode").as_deref(),
+        Some("dark"),
+        "the file keeps its other settings"
+    );
     assert!(
-        std::fs::read_to_string(store.path())
+        std::fs::read_to_string(editor.store.path())
             .unwrap()
             .contains("remote.credential=secret-service:shared"),
         "the old value stays in the file, unread"
     );
-
+    assert!(
+        keyring.secret("shared").is_some(),
+        "Apply keeps the secret a saved connection uses"
+    );
     assert_eq!(
         browse_saved_connection(&connections, cx).unwrap(),
         ["hello.txt"],
         "a connection that refers to the old global secret still logs in with it"
     );
-    assert_eq!(server.passwords(), ["hunter2"]);
+    assert_eq!(
+        server.passwords(),
+        ["hunter2", "hunter2"],
+        "Test connection and browsing both log in with the old global secret"
+    );
 }

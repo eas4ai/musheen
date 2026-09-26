@@ -280,6 +280,21 @@ fn search_navigation_focuses_owner_and_resource_controls_expose_contract() {
 }
 
 #[test]
+fn search_for_a_password_finds_the_connections() {
+    let catalog = Catalog::load(Locale::EnUs).unwrap();
+    let state = SettingsState::new(SettingsDocument::default(), SettingsBackends::all());
+    for query in ["password", "credential", "ssh key"] {
+        assert!(
+            state
+                .search(query, &catalog)
+                .iter()
+                .any(|hit| hit.key == "remote.connections"),
+            "a search for {query:?} leads to the connections, where passwords are set"
+        );
+    }
+}
+
+#[test]
 fn failed_save_keeps_draft_and_committed_values_for_retry() {
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("file");
