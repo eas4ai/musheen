@@ -612,6 +612,8 @@ pub enum ArchiveOperationError {
     UnsupportedFileType,
     UnsupportedName,
     Conflict,
+    /// The archive being extracted changed during the run.
+    SourceChanged,
     PasswordRequired,
     InvalidPassword,
     Cancelled,
@@ -643,6 +645,9 @@ impl fmt::Display for ArchiveOperationError {
                 formatter.write_str("the archive format cannot represent this file name")
             }
             Self::Conflict => formatter.write_str("the archive destination already exists"),
+            Self::SourceChanged => {
+                formatter.write_str("the archive changed while it was being extracted")
+            }
             Self::PasswordRequired => formatter.write_str("the archive requires a password"),
             Self::InvalidPassword => formatter.write_str("the archive password is invalid"),
             Self::Cancelled => formatter.write_str("the archive operation was cancelled"),

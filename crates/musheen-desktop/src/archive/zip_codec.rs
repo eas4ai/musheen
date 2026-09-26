@@ -46,6 +46,7 @@ pub(crate) fn copy_entry<R: Read + Seek, W: Write>(
         passwords,
         limits,
         counters,
+        None,
         &mut |contents| {
             std::io::copy(contents, destination)
                 .map(|_| ())
@@ -55,7 +56,8 @@ pub(crate) fn copy_entry<R: Read + Seek, W: Write>(
 }
 
 /// Reads the central directory once and hands each entry `wanted` names to
-/// `visit`, in archive order, with a reader over its bytes.
+/// `visit`, in archive order, with a reader over its bytes. Two entries whose
+/// local bytes overlap make the archive invalid, so no byte is decoded twice.
 pub(crate) fn copy_files_in_order<R: Read + Seek>(
     mut reader: R,
     passwords: &dyn ArchivePasswordProvider,
@@ -65,6 +67,7 @@ pub(crate) fn copy_files_in_order<R: Read + Seek>(
     visit: &mut dyn FnMut(u64, &mut dyn Read) -> Result<(), ArchiveError>,
 ) -> Result<(), ArchiveError> {
     let mut directory = CentralDirectory::open(&mut reader, limits, counters)?;
+    let mut claimed = ClaimedRanges::new(directory.entries, limits, counters)?;
     loop {
         let parse = wanted(directory.index);
         let Some((ordinal, target)) = directory.next(&mut reader, parse, limits, counters)? else {
@@ -77,19 +80,66 @@ pub(crate) fn copy_files_in_order<R: Read + Seek>(
                 passwords,
                 limits,
                 counters,
+                Some(&mut claimed),
                 &mut |contents| visit(ordinal, contents),
             )?;
         }
     }
 }
 
+/// The local byte ranges of the entries one pass has decoded.
+struct ClaimedRanges {
+    ranges: std::collections::BTreeMap<u64, u64>,
+    _memory: AllocationLease,
+}
+
+impl ClaimedRanges {
+    fn new(
+        entries: u64,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<Self, ArchiveError> {
+        // A B-tree holds each start and end in well under 64 bytes.
+        let memory = counters.reserve(
+            usize::try_from(entries.saturating_mul(64)).unwrap_or(usize::MAX),
+            limits.max_metadata_bytes,
+        )?;
+        Ok(Self {
+            ranges: std::collections::BTreeMap::new(),
+            _memory: memory,
+        })
+    }
+
+    /// Records `start..end`, or refuses it when it overlaps a range already
+    /// recorded.
+    fn claim(&mut self, start: u64, end: u64) -> Result<(), ArchiveError> {
+        let overlaps_before = self
+            .ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, previous_end)| *previous_end > start);
+        let overlaps_after = self
+            .ranges
+            .range(start..)
+            .next()
+            .is_some_and(|(next_start, _)| *next_start < end);
+        if overlaps_before || overlaps_after {
+            return Err(ArchiveError::InvalidArchive);
+        }
+        self.ranges.insert(start, end);
+        Ok(())
+    }
+}
+
 /// Decodes the entry a central record names and hands its bytes to `visit`.
+/// With `claimed`, its local bytes must not overlap an entry decoded before.
 fn copy_found<R: Read + Seek>(
     reader: &mut R,
     target: BudgetedZipEntry,
     passwords: &dyn ArchivePasswordProvider,
     limits: &ArchiveLimits,
     counters: &Arc<DecodeCounterState>,
+    claimed: Option<&mut ClaimedRanges>,
     visit: &mut dyn FnMut(&mut dyn Read) -> Result<(), ArchiveError>,
 ) -> Result<(), ArchiveError> {
     reader
@@ -128,6 +178,15 @@ fn copy_found<R: Read + Seek>(
         .and_then(|length| length.checked_add(extra_length as u64))
         .and_then(|length| length.checked_add(target.compressed_size))
         .ok_or(ArchiveError::InvalidArchive)?;
+    if let Some(claimed) = claimed {
+        claimed.claim(
+            target.local_header_offset,
+            target
+                .local_header_offset
+                .checked_add(local_length)
+                .ok_or(ArchiveError::InvalidArchive)?,
+        )?;
+    }
     let virtual_reader = SingleEntryZip::new(
         reader,
         target.local_header_offset,
@@ -369,6 +428,10 @@ fn compression_method(header: &[u8; 46], extra: &[u8]) -> Result<u16, ArchiveErr
     Err(ArchiveError::InvalidArchive)
 }
 
+/// One local entry of the archive, followed by zeros, then a central
+/// directory and end record that name only that entry. The zeros keep the
+/// zip crate's backward search for the end record, which reads 2,048 bytes
+/// at a time, away from the entry's bytes, so they are read once.
 struct SingleEntryZip<R> {
     source: R,
     source_offset: u64,
@@ -378,6 +441,8 @@ struct SingleEntryZip<R> {
     position: u64,
 }
 
+const END_SEARCH_GAP: u64 = 4_096;
+
 impl<R> SingleEntryZip<R> {
     fn new(
         source: R,
@@ -385,8 +450,8 @@ impl<R> SingleEntryZip<R> {
         source_length: u64,
         central: Vec<u8>,
     ) -> Result<Self, ArchiveError> {
-        let central_offset =
-            u32::try_from(source_length).map_err(|_| ArchiveError::UnsupportedNestedFormat)?;
+        let central_offset = u32::try_from(source_length.saturating_add(END_SEARCH_GAP))
+            .map_err(|_| ArchiveError::UnsupportedNestedFormat)?;
         let central_size =
             u32::try_from(central.len()).map_err(|_| ArchiveError::UnsupportedNestedFormat)?;
         let mut eocd = [0_u8; 22];
@@ -405,8 +470,12 @@ impl<R> SingleEntryZip<R> {
         })
     }
 
+    fn central_start(&self) -> u64 {
+        self.source_length.saturating_add(END_SEARCH_GAP)
+    }
+
     fn length(&self) -> u64 {
-        self.source_length
+        self.central_start()
             .saturating_add(self.central.len() as u64)
             .saturating_add(self.eocd.len() as u64)
     }
@@ -417,6 +486,7 @@ impl<R: Read + Seek> Read for SingleEntryZip<R> {
         if buffer.is_empty() || self.position >= self.length() {
             return Ok(0);
         }
+        let central_start = self.central_start();
         let count = if self.position < self.source_length {
             let available = self.source_length - self.position;
             let requested =
@@ -424,13 +494,18 @@ impl<R: Read + Seek> Read for SingleEntryZip<R> {
             self.source
                 .seek(SeekFrom::Start(self.source_offset + self.position))?;
             self.source.read(&mut buffer[..requested])?
-        } else if self.position < self.source_length + self.central.len() as u64 {
-            let offset = (self.position - self.source_length) as usize;
+        } else if self.position < central_start {
+            let available = central_start - self.position;
+            let count = usize::try_from(available.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            buffer[..count].fill(0);
+            count
+        } else if self.position < central_start + self.central.len() as u64 {
+            let offset = (self.position - central_start) as usize;
             let count = (self.central.len() - offset).min(buffer.len());
             buffer[..count].copy_from_slice(&self.central[offset..offset + count]);
             count
         } else {
-            let offset = (self.position - self.source_length - self.central.len() as u64) as usize;
+            let offset = (self.position - central_start - self.central.len() as u64) as usize;
             let count = (self.eocd.len() - offset).min(buffer.len());
             buffer[..count].copy_from_slice(&self.eocd[offset..offset + count]);
             count

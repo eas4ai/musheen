@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use musheen_core::CancellationToken;
 
-use super::store::{ArchiveError, DecodeCounterState, elapsed_limit};
+use super::store::{ArchiveError, DecodeCounterState};
 
 /// A logical cursor backed by positional reads.
 ///
@@ -156,77 +156,6 @@ impl<R: Seek> Seek for TimedReader<R> {
         let started = Instant::now();
         let result = self.inner.seek(position);
         self.finish_call(started, result)
-    }
-}
-
-pub(crate) struct DecodeReader<R> {
-    inner: R,
-    cancellation: CancellationToken,
-    started: Instant,
-    maximum_elapsed: Duration,
-    read: u64,
-    expanded_maximum: u64,
-    ratio_maximum: u64,
-    failure: Option<ArchiveError>,
-}
-
-impl<R> DecodeReader<R> {
-    pub(crate) fn new(
-        inner: R,
-        cancellation: CancellationToken,
-        maximum_elapsed: Duration,
-        expanded_maximum: u64,
-        ratio_maximum: u64,
-    ) -> Self {
-        Self {
-            inner,
-            cancellation,
-            started: Instant::now(),
-            maximum_elapsed,
-            read: 0,
-            expanded_maximum,
-            ratio_maximum,
-            failure: None,
-        }
-    }
-
-    pub(crate) fn take_error(&mut self) -> Option<ArchiveError> {
-        self.failure.take()
-    }
-
-    fn stop(&mut self, error: ArchiveError) -> io::Error {
-        self.failure = Some(error);
-        io::Error::other("archive decode stopped")
-    }
-}
-
-impl<R: Read> Read for DecodeReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if self.cancellation.wait_if_paused().is_err() {
-            return Err(self.stop(ArchiveError::Cancelled));
-        }
-        if self.started.elapsed() > self.maximum_elapsed {
-            let error = elapsed_limit(self.started.elapsed(), self.maximum_elapsed);
-            return Err(self.stop(error));
-        }
-        let count = self.inner.read(buffer)?;
-        let next = self.read.saturating_add(count as u64);
-        let limit = if next > self.expanded_maximum {
-            Some(("expanded bytes", self.expanded_maximum))
-        } else if next > self.ratio_maximum {
-            Some(("compression ratio", self.ratio_maximum))
-        } else {
-            None
-        };
-        if let Some((resource, maximum)) = limit {
-            return Err(self.stop(ArchiveError::LimitExceeded {
-                resource,
-                value: usize::try_from(next).unwrap_or(usize::MAX),
-                maximum: usize::try_from(maximum).unwrap_or(usize::MAX),
-            }));
-        }
-        self.read = next;
-        Ok(count)
     }
 }
 

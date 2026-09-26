@@ -1599,12 +1599,29 @@ fn identity_digest(
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// An item the identity walk has yet to digest. Only the root arrives open.
+/// A folder below it is opened, from its parent, when the walk enters it,
+/// and a file is never opened, so the walk holds one open folder per level
+/// however many items a folder has.
 struct IdentityNode {
-    opened: File,
+    location: IdentityLocation,
     metadata: std::fs::Metadata,
-    name: Option<Vec<u8>>,
     depth: usize,
     _memory: Option<ArchiveMemoryLease>,
+}
+
+enum IdentityLocation {
+    Root(File),
+    Child { parent: Rc<File>, name: Vec<u8> },
+}
+
+impl IdentityNode {
+    fn name(&self) -> &[u8] {
+        match &self.location {
+            IdentityLocation::Root(_) => &[],
+            IdentityLocation::Child { name, .. } => name,
+        }
+    }
 }
 
 fn hash_identity_tree(
@@ -1623,9 +1640,8 @@ fn hash_identity_tree(
         })
         .transpose()?;
     let mut stack = vec![IdentityNode {
-        opened,
+        location: IdentityLocation::Root(opened),
         metadata: metadata.clone(),
-        name: None,
         depth: 0,
         _memory: root_memory,
     }];
@@ -1645,7 +1661,7 @@ fn hash_identity_tree(
         }
         hasher.update(&node.metadata.mode().to_le_bytes());
         hasher.update(&node.metadata.len().to_le_bytes());
-        if let Some(name) = &node.name {
+        if let IdentityLocation::Child { name, .. } = &node.location {
             hasher.update(&(name.len() as u64).to_le_bytes());
             hasher.update(name);
             for value in [
@@ -1665,8 +1681,33 @@ fn hash_identity_tree(
         if !node.metadata.is_dir() {
             return Err(ArchiveOperationError::UnsupportedFileType);
         }
+        let directory = match node.location {
+            IdentityLocation::Root(opened) => opened,
+            IdentityLocation::Child { parent, name } => {
+                let opened = File::from(
+                    rustix::fs::openat(
+                        &*parent,
+                        name.as_slice(),
+                        rustix::fs::OFlags::RDONLY
+                            | rustix::fs::OFlags::DIRECTORY
+                            | rustix::fs::OFlags::NOFOLLOW
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    )
+                    .map_err(map_errno)?,
+                );
+                let opened_metadata = opened.metadata().map_err(|error| map_io(&error))?;
+                if opened_metadata.dev() != node.metadata.dev()
+                    || opened_metadata.ino() != node.metadata.ino()
+                {
+                    return Err(ArchiveOperationError::Conflict);
+                }
+                opened
+            }
+        };
+        let directory = Rc::new(directory);
         let mut children = Vec::new();
-        let directory_path = proc_fd_path(&node.opened);
+        let directory_path = proc_fd_path(&directory);
         for child in std::fs::read_dir(&directory_path).map_err(|error| map_io(&error))? {
             if let Some(budget) = budget {
                 budget
@@ -1704,31 +1745,17 @@ fn hash_identity_tree(
             {
                 return Err(ArchiveOperationError::UnsupportedFileType);
             }
-            let opened = rustix::fs::openat(
-                &node.opened,
-                &child_name,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )
-            .map_err(map_errno)?;
-            let opened = File::from(opened);
-            let opened_metadata = opened.metadata().map_err(|error| map_io(&error))?;
-            if opened_metadata.dev() != child_metadata.dev()
-                || opened_metadata.ino() != child_metadata.ino()
-            {
-                return Err(ArchiveOperationError::Conflict);
-            }
             children.push(IdentityNode {
-                opened,
+                location: IdentityLocation::Child {
+                    parent: Rc::clone(&directory),
+                    name,
+                },
                 metadata: child_metadata,
-                name: Some(name),
                 depth: node.depth.saturating_add(1),
                 _memory: memory,
             });
         }
-        children.sort_by(|left, right| left.name.cmp(&right.name));
+        children.sort_by(|left, right| left.name().cmp(right.name()));
         stack.extend(children.into_iter().rev());
     }
     Ok(())

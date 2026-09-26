@@ -1130,3 +1130,55 @@ fn libarchive_worker_cancellation_retries_and_drop_is_bounded() {
         "worker teardown must kill and reap without an indefinite join"
     );
 }
+
+#[test]
+fn nested_open_in_a_tar_after_a_pax_global_header_copies_its_own_entry() {
+    // `git archive` starts every tar with a pax global header.
+    let inner = zip_fixture(&[("leaf.txt", b"leaf")]);
+    let record = format!(" comment={}\n", "0".repeat(40));
+    let record = format!("{}{record}", record.len() + 2);
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        let mut global = tar::Header::new_ustar();
+        global.set_entry_type(tar::EntryType::XGlobalHeader);
+        global
+            .set_path("pax_global_header")
+            .expect("global header path");
+        global.set_size(record.len() as u64);
+        global.set_mode(0o666);
+        global.set_cksum();
+        builder
+            .append(&global, record.as_bytes())
+            .expect("global header writes");
+        for (name, contents) in [("before.txt", &b"before"[..]), ("inner.zip", &inner[..])] {
+            let mut header = tar::Header::new_ustar();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            builder
+                .append_data(&mut header, name, contents)
+                .expect("tar entry writes");
+        }
+        builder.finish().expect("tar closes");
+    }
+    let store = open_bytes(
+        &tar_bytes,
+        ArchiveFormat::Tar,
+        ArchiveLimits::default(),
+        Arc::new(RecordingPasswords::default()),
+    );
+    let root = read_root(&store, 10).expect("tar root reads");
+    let nested_path = root
+        .iter()
+        .find(|item| item.display_name().as_str() == "inner.zip")
+        .expect("inner.zip is listed")
+        .path()
+        .clone();
+
+    let child = store
+        .open_nested(&nested_path, ArchiveFormat::Zip, CancellationToken::new())
+        .expect("the nested ZIP holds its own bytes");
+    let leaves = read_root(&child, 10).expect("nested root reads");
+    assert_eq!(leaves.len(), 1);
+    assert_eq!(leaves[0].display_name().as_str(), "leaf.txt");
+}

@@ -8,14 +8,14 @@ use catalog::{
 
 use crate::date_time::format_modified;
 use crate::dialogs::{
-    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, ExtractConflictChoice,
-    ExtractConflictDialog, ExtractConflictEvent, ExtractConflictStrings, MetadataReviewChoice,
-    MetadataReviewDialog, MetadataReviewDialogEvent, MetadataReviewDialogModel, OpenWithDialog,
-    OpenWithDialogEvent, OpenWithIntent as DialogOpenWithIntent, OpenWithModel,
-    PropertiesFailureWindow, PropertiesPage, PropertiesWindow, PropertiesWindowData,
-    ProviderPropertiesWindow, ProviderPropertiesWindowData, TagDelta, TagWriteDone, TagWriter,
-    VolumePropertiesModel, VolumePropertiesWindow, conflict_window_options,
-    install_open_with_key_bindings, install_properties_key_bindings,
+    ConflictDialog, ConflictDialogEvent, ConflictDialogModel, ExtractCheckDialog,
+    ExtractCheckEvent, ExtractCheckStrings, ExtractConflictChoice, ExtractConflictDialog,
+    ExtractConflictEvent, ExtractConflictStrings, MetadataReviewChoice, MetadataReviewDialog,
+    MetadataReviewDialogEvent, MetadataReviewDialogModel, OpenWithDialog, OpenWithDialogEvent,
+    OpenWithIntent as DialogOpenWithIntent, OpenWithModel, PropertiesFailureWindow, PropertiesPage,
+    PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow, ProviderPropertiesWindowData,
+    TagDelta, TagWriteDone, TagWriter, VolumePropertiesModel, VolumePropertiesWindow,
+    conflict_window_options, install_open_with_key_bindings, install_properties_key_bindings,
     metadata_review_window_options, open_with_window_options, properties_window_options,
 };
 use crate::directory::{
@@ -997,6 +997,18 @@ struct ExtractQuestion {
     whole_folder: bool,
     item: musheen_ops::AnsweredItem,
 }
+
+/// A collision check still looking at an extraction's destination folder.
+struct ExtractCheck {
+    cancellation: CancellationToken,
+    /// The window that shows the check once it has run for a moment.
+    window: Option<AnyWindowHandle>,
+    // Keeps the dialog alive until the check ends.
+    dialog: Option<Entity<ExtractCheckDialog>>,
+}
+
+/// How long a collision check runs before it shows its window.
+const EXTRACT_CHECK_WINDOW_DELAY: Duration = Duration::from_millis(500);
 
 /// An extraction waiting for the user's answers about its collisions.
 struct PendingExtract {
@@ -3824,6 +3836,8 @@ struct MusheenApp {
     pending_metadata_reviews: HashMap<WindowId, JobId>,
     pending_drop: Option<PendingDrop>,
     pending_extract: Option<PendingExtract>,
+    extract_checks: std::collections::BTreeMap<u64, ExtractCheck>,
+    next_extract_check: u64,
     /// Extractions that reached their questions while another one waited
     /// for answers; each looks at its destination again when its turn comes.
     waiting_extracts: std::collections::VecDeque<ArchiveOperationPlan>,
@@ -4610,6 +4624,8 @@ impl MusheenApp {
             pending_metadata_reviews: HashMap::new(),
             pending_drop: None,
             pending_extract: None,
+            extract_checks: std::collections::BTreeMap::new(),
+            next_extract_check: 0,
             waiting_extracts: std::collections::VecDeque::new(),
             transfer_preflights: 0,
             file_clipboard: None,
@@ -9543,6 +9559,19 @@ impl MusheenApp {
         {
             self.pending_drop = None;
         }
+        // A collision check's window closed without Cancel stops the check.
+        if let Some(id) = self
+            .extract_checks
+            .iter()
+            .find(|(_, check)| {
+                check
+                    .window
+                    .is_some_and(|window| window.window_id() == closed)
+            })
+            .map(|(id, _)| *id)
+        {
+            self.cancel_extract_check(id);
+        }
         // A collision question closed without an answer cancels its
         // extraction; the next waiting one asks its questions.
         if self
@@ -10279,21 +10308,139 @@ impl MusheenApp {
             }
         };
         let preflight = plan.clone();
-        let destination = cx.background_spawn(async move {
+        let cancellation = CancellationToken::new();
+        let check_cancellation = cancellation.clone();
+        let check = cx.background_spawn(async move {
             musheen_desktop::extract_destination(
                 &preflight,
                 &musheen_desktop::ArchiveOperationLimits::default(),
                 &NoArchivePasswords,
-                &CancellationToken::new(),
+                &check_cancellation,
             )
         });
+        self.watch_extract_check(plan, cancellation, check, cx);
+    }
+
+    /// Waits for a collision check, and shows it with Cancel once it has run
+    /// for a moment. The check has no time limit, so the user stops it.
+    fn watch_extract_check(
+        &mut self,
+        plan: ArchiveOperationPlan,
+        cancellation: CancellationToken,
+        check: gpui_kit::Task<
+            Result<musheen_desktop::ExtractDestination, musheen_desktop::ArchiveOperationError>,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_extract_check;
+        self.next_extract_check = id.wrapping_add(1);
+        self.extract_checks.insert(
+            id,
+            ExtractCheck {
+                cancellation,
+                window: None,
+                dialog: None,
+            },
+        );
+        let folder = plan
+            .destination()
+            .as_unix_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         cx.spawn(async move |this, cx| {
-            let destination = destination.await;
+            cx.background_executor()
+                .timer(EXTRACT_CHECK_WINDOW_DELAY)
+                .await;
+            let _ = this.update(cx, |state, cx| state.show_extract_check(id, &folder, cx));
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let destination = check.await;
             let _ = this.update(cx, |state, cx| {
-                state.continue_extract(plan, destination, cx)
+                state.finish_extract_check(id, plan, destination, cx);
             });
         })
         .detach();
+    }
+
+    /// Opens the window of a collision check that is still running.
+    fn show_extract_check(&mut self, id: u64, folder: &Path, cx: &mut Context<Self>) {
+        if self
+            .extract_checks
+            .get(&id)
+            .is_none_or(|check| check.window.is_some())
+        {
+            return;
+        }
+        let message = |id| {
+            self.catalog
+                .message(id)
+                .expect("extract check messages are localized")
+                .to_owned()
+        };
+        let text = format!("{} {}", message("extract-check-looking"), folder.display());
+        let strings = ExtractCheckStrings {
+            title: message("extract-check-title"),
+            cancel: message("dialog-cancel"),
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(480.), px(160.)), cx)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from(strings.title.clone())),
+                ..TitlebarOptions::default()
+            }),
+            window_min_size: Some(size(px(360.), px(140.))),
+            ..WindowOptions::default()
+        };
+        let mut dialog = None;
+        let opened = cx.open_window(options, |window, cx| {
+            let view = cx.new(|cx| ExtractCheckDialog::new(text, strings, cx));
+            dialog = Some(view.clone());
+            cx.new(|cx| Root::new(view, window, cx))
+        });
+        // Without its window the check still runs and still reports.
+        let (Ok(handle), Some(dialog)) = (opened, dialog) else {
+            return;
+        };
+        let origin_tab = self.navigation.focused_tab().id();
+        self.track_context_dialog_window(handle.window_id(), Some(origin_tab), cx);
+        let subscription = cx.subscribe(&dialog, move |this, _, event: &ExtractCheckEvent, _| {
+            let ExtractCheckEvent::Cancelled = *event;
+            this.cancel_extract_check(id);
+        });
+        self.conflict_subscriptions.push(subscription);
+        if let Some(check) = self.extract_checks.get_mut(&id) {
+            check.window = Some(handle.into());
+            check.dialog = Some(dialog);
+        }
+    }
+
+    /// Stops a collision check; its extraction is not queued.
+    fn cancel_extract_check(&mut self, id: u64) {
+        if let Some(check) = self.extract_checks.remove(&id) {
+            check.cancellation.cancel();
+        }
+    }
+
+    /// Closes a finished check's window and moves its extraction on, unless
+    /// the user cancelled it.
+    fn finish_extract_check(
+        &mut self,
+        id: u64,
+        plan: ArchiveOperationPlan,
+        destination: Result<
+            musheen_desktop::ExtractDestination,
+            musheen_desktop::ArchiveOperationError,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(check) = self.extract_checks.remove(&id) else {
+            return;
+        };
+        if let Some(window) = check.window {
+            let _ = cx.update_window(window, |_, window, _| window.remove_window());
+        }
+        self.continue_extract(plan, destination, cx);
     }
 
     fn continue_extract(
@@ -23914,6 +24061,111 @@ mod tests {
             cx.executor().advance_clock(Duration::from_millis(20));
         }
         panic!("the extraction asks its question");
+    }
+
+    /// The window, if any, that shows the element `id`.
+    fn window_showing(id: &str, cx: &mut TestAppContext) -> Option<AnyWindowHandle> {
+        cx.windows().into_iter().find(|window| {
+            cx.update_window(*window, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find(id.to_owned()).is_some()
+            })
+            .unwrap_or(false)
+        })
+    }
+
+    #[gpui_kit::test]
+    async fn extract_check_shows_itself_after_a_moment_and_cancel_stops_it(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("Archive");
+        filesystem::create_dir(&folder).unwrap();
+        let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let before = highest_job(&app, cx);
+        let store_path = |path: &Path| StorePath::from_unix_path(path.as_os_str());
+        let plan = ArchiveOperationPlan::extract(
+            store_path(&temporary.path().join("Archive.zip")),
+            store_path(&folder),
+            musheen_ops::ArchiveCodec::Zip,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .unwrap();
+
+        // A check that ends at once shows no window.
+        app.update(cx, |state, cx| {
+            let check = cx.background_spawn(async {
+                Err(musheen_desktop::ArchiveOperationError::InvalidArchive)
+            });
+            state.watch_extract_check(plan.clone(), CancellationToken::new(), check, cx);
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(EXTRACT_CHECK_WINDOW_DELAY + EXTRACT_CHECK_WINDOW_DELAY);
+        cx.run_until_parked();
+        assert!(
+            window_showing("extract-check-dialog", cx).is_none(),
+            "a quick check shows no window"
+        );
+
+        // A check still running after a moment shows its folder and Cancel.
+        let (finish, finished) = async_channel::bounded(1);
+        let cancellation = CancellationToken::new();
+        app.update(cx, |state, cx| {
+            let check = cx.background_spawn(async move {
+                finished.recv().await.expect("the test ends the check")
+            });
+            state.watch_extract_check(plan, cancellation.clone(), check, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            window_showing("extract-check-dialog", cx).is_none(),
+            "a check shows no window before the moment passes"
+        );
+        cx.executor().advance_clock(EXTRACT_CHECK_WINDOW_DELAY);
+        cx.run_until_parked();
+        let window = window_showing("extract-check-dialog", cx)
+            .expect("a check that runs on shows its window");
+        let label = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window
+                    .try_find("extract-check-folder")
+                    .and_then(|item| item.label().map(str::to_owned))
+            })
+            .unwrap()
+            .unwrap_or_default();
+        assert!(label.contains(&folder.display().to_string()), "{label}");
+
+        cx.update_window(window, |_, window, cx| {
+            window.click("extract-check-cancel".to_owned(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(cancellation.is_cancelled(), "Cancel stops the check");
+        assert!(
+            window_showing("extract-check-dialog", cx).is_none(),
+            "Cancel closes the window"
+        );
+
+        // The stopped check reports late; nothing is queued or asked.
+        finish
+            .try_send(Ok(musheen_desktop::ExtractDestination::Absent))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            highest_job(&app, cx),
+            before,
+            "a cancelled check queues no extraction"
+        );
+        cx.read(|cx| {
+            let state = app.read(cx);
+            assert!(state.pending_extract.is_none());
+            assert!(state.extract_checks.is_empty());
+        });
     }
 
     #[gpui_kit::test]
