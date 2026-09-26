@@ -1281,7 +1281,11 @@ impl LocalOperationQueue {
     /// Records how a running job ended and returns its terminal state. A
     /// completed or cancelled job is reported here and its scheduler record
     /// goes with it; a failed job keeps its record for retry.
-    pub fn finish(&mut self, id: JobId, result: Result<(), Box<str>>) -> Result<JobState, DropError> {
+    pub fn finish(
+        &mut self,
+        id: JobId,
+        result: Result<(), Box<str>>,
+    ) -> Result<JobState, DropError> {
         if self.scheduler.state(id) == Some(JobState::Cancelling) {
             self.scheduler.finish_cancel(id)?;
             self.failures.remove(&id);
