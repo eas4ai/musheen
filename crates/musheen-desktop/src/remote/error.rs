@@ -24,6 +24,23 @@ pub enum RemoteErrorCategory {
     /// An RSA private key outside the SSH agent: Musheen signs with RSA only
     /// through the agent.
     KeyNeedsAgent,
+    /// The secret service is locked or missing, or holds no secret for the
+    /// connection.
+    CredentialUnavailable,
+    /// The private key file could not be read.
+    KeyUnreadable,
+    /// The private key could not be decoded: a wrong passphrase, or a format
+    /// Musheen cannot read.
+    KeyUndecodable,
+    /// No SSH agent answers for agent login.
+    NoAgent,
+    /// ~/.ssh/config could not be read or holds a value Musheen cannot use.
+    SshConfigUnreadable,
+    /// ~/.ssh/config applies options to this host through a Match block,
+    /// which Musheen does not read.
+    SshConfigMatch,
+    /// The server's host key is not in known_hosts.
+    UnknownHost,
 }
 
 /// A credential-safe provider error. Transport text is deliberately not kept

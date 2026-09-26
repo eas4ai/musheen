@@ -137,11 +137,12 @@ impl<T: CredentialResolver + ?Sized> CredentialResolver for Arc<T> {
     }
 }
 
+/// Why a stored secret could not be read: the secret service is the cause,
+/// not the server, which was never asked.
 pub(crate) fn resolve_error(error: SecretError) -> RemoteErrorCategory {
     match error {
         SecretError::Cancelled => RemoteErrorCategory::Cancelled,
-        SecretError::Locked | SecretError::NotFound => RemoteErrorCategory::Authentication,
-        _ => RemoteErrorCategory::Unavailable,
+        _ => RemoteErrorCategory::CredentialUnavailable,
     }
 }
 
