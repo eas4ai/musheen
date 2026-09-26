@@ -70,6 +70,36 @@ impl RecentLocations {
         self.entries.truncate(MAX_RECENT_LOCATIONS);
     }
 
+    /// Records a visit made before the visits to `newer`, which stay above
+    /// it. A folder in `newer` already has its newer place and is left as
+    /// it is.
+    pub fn record_before(
+        &mut self,
+        newer: &[FolderIdentity],
+        identity: FolderIdentity,
+        path_hint: StorePath,
+        label: impl Into<Box<str>>,
+    ) {
+        if !self.recording_enabled || newer.contains(&identity) {
+            return;
+        }
+        self.entries.retain(|entry| entry.identity != identity);
+        let below = self
+            .entries
+            .iter()
+            .take_while(|entry| newer.contains(&entry.identity))
+            .count();
+        self.entries.insert(
+            below,
+            RecentLocation {
+                identity,
+                path_hint,
+                label: label.into(),
+            },
+        );
+        self.entries.truncate(MAX_RECENT_LOCATIONS);
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
     }
