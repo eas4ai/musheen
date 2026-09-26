@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: menu-composition-state
+Current: fallback-theme-follows-appearance-changes
 
 ## 1. Foundation
 
@@ -137,4 +137,25 @@ so nothing is left for another menu. Done when that record replaces the
 five fields, a test shows that a menu composed without taking its probes
 leaves no probe and no recompose record for the next menu, the UXF-023
 tests still pass, the workspace tests and clippy are clean, and every
+finding of the review and the report is resolved or declined.
+
+## fallback-theme-follows-appearance-changes
+
+Requirements: UIV-014
+
+Make the fallback theme follow the window appearance after startup
+(backlog item fallback-theme-follows-appearance-changes, adversary report
+9fa1a7b3 finding 11). When the native-theme bridge cannot read the system
+theme, install_native_theme installs the Adwaita preset for the window
+appearance once, at startup; a later switch between dark and light keeps
+the old variant until the next start, so the fallback shows a variant the
+window appearance did not request. Each browser window now observes its
+appearance and, while the fallback is in use, installs the variant the
+new appearance asks for and applies the appearance settings again. When
+the system theme becomes readable later, the fallback stops following, so
+an appearance change never replaces a system theme with Adwaita. Done when
+a test switches a window's appearance while the fallback is in use and
+sees the matching variant, a test shows the fallback does nothing when the
+system theme is in use, the UIV-014 check passes, the workspace tests,
+cargo fmt --check and clippy with warnings denied are clean, and every
 finding of the review and the report is resolved or declined.
