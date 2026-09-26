@@ -1,8 +1,8 @@
 use gpui_kit::test::TestWindowExt;
 use musheen_core::{BoxFuture, CancellationToken, ItemId, ProviderId, StorePath};
 use musheen_desktop::{
-    CatalogDocument, CatalogStore, ConnectionId, ConnectionProbe, ConnectionProfile,
-    ConnectionProfiles, CredentialReference, FolderIdentity, ProfileConnectionTest,
+    CatalogDocument, CatalogStore, ConnectionProbe, ConnectionProfile, ConnectionProfiles,
+    FolderIdentity, ProfileConnectionTest,
     ProfileConnectionTester, RemoteError, RemoteErrorCategory, RemoteProtocol, SecurityPolicy,
     SettingsDocument, SettingsPage, SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
 };
@@ -151,7 +151,6 @@ fn invalid_drafts_never_change_committed_state_or_disk() {
         ("operation_data_mutations", "33"),
         ("files.hidden", "maybe"),
         ("appearance.mode", "purple"),
-        ("remote.credential", "plaintext-password"),
     ] {
         assert!(state.edit(key, invalid).is_err());
         assert!(!state.errors().is_empty());
@@ -234,7 +233,7 @@ fn unavailable_backends_do_not_accept_edits_or_appear_in_search() {
     let mut state = SettingsState::new(SettingsDocument::default(), SettingsBackends::default());
     for key in [
         "terminal.program",
-        "remote.credential",
+        "remote.connections",
         "integrations.privilege",
     ] {
         assert!(state.edit(key, "true").is_err());
@@ -716,60 +715,6 @@ fn reset_all_needs_confirmation_and_preserves_unknown_fields() {
 }
 
 #[gpui_kit::test]
-async fn credential_reference_renders_as_localized_read_only_status(
-    cx: &mut gpui_kit::TestAppContext,
-) {
-    use gpui_kit::component::Root;
-    use gpui_kit::{AppContext, Role, px, size};
-    cx.update(|cx| {
-        gpui_kit::init(cx);
-        let preferences = native_theme::AccessibilityPreferences::default();
-        let (theme, resolved) =
-            native_theme_gpui::from_preset("adwaita", false, &preferences).expect("test theme");
-        native_theme_gpui::apply(theme, &resolved, &preferences, cx);
-    });
-    let root = tempfile::tempdir().unwrap();
-    let store = SettingsStore::from_config_home(root.path());
-    let mut document = SettingsDocument::default();
-    document
-        .set_credential_reference(Some(&CredentialReference::persistent(
-            ConnectionId::new("private-connection-id").unwrap(),
-        )))
-        .unwrap();
-    store.save(&document).unwrap();
-
-    for locale in [Locale::EnUs, Locale::EnXa, Locale::Ar] {
-        let catalog = Catalog::load(locale).unwrap();
-        let handle = cx.open_window(size(px(720.), px(580.)), |window, cx| {
-            let settings = cx.new(|cx| {
-                musheen_ui::settings::SettingsWindow::new(
-                    store.clone(),
-                    SettingsBackends::all(),
-                    catalog.clone(),
-                    window,
-                    cx,
-                )
-            });
-            Root::new(settings, window, cx)
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            window.click(SettingsPage::Integrations.label(), cx);
-            window.render_frame(cx);
-            let status = window.find("remote.credential");
-            assert_eq!(status.role(), Some(Role::Status));
-            assert_eq!(
-                status.label(),
-                Some(catalog.message("settings-value-credential-stored").unwrap())
-            );
-            assert!(!status.label().unwrap().contains("private-connection-id"));
-            window.remove_window();
-        })
-        .unwrap();
-    }
-}
-
-#[gpui_kit::test]
 async fn settings_gallery_checks_rendered_controls_labels_and_confirmation_at_double_scale(
     cx: &mut gpui_kit::TestAppContext,
 ) {
@@ -876,7 +821,6 @@ async fn settings_gallery_checks_rendered_controls_labels_and_confirmation_at_do
                         | SettingKind::Shortcuts
                         | SettingKind::CustomActions
                         | SettingKind::ConnectionProfiles => Role::Group,
-                        SettingKind::CredentialReference => Role::Status,
                         _ => Role::TextInput,
                     };
                     assert_eq!(control.role(), Some(expected_role), "{}", spec.key);
