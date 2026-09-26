@@ -2473,6 +2473,7 @@ pub fn run(initial_path: PathBuf) {
                             state.start_initial_load(initial_location, cx);
                         });
                         register_file_manager_window(&view, window, cx);
+                        follow_window_appearance(window);
                         window.on_next_frame(move |_, _| {
                             window_readiness.mark_first_window_ready();
                         });
@@ -3075,14 +3076,74 @@ fn install_native_theme(cx: &mut App) {
         Err(error) => {
             eprintln!("Musheen could not read the system theme: {error}. Using Adwaita.");
             let preferences = native_theme::AccessibilityPreferences::from_system();
-            install_fallback_theme(
+            use_fallback_theme(
                 prefers_dark_appearance(cx.window_appearance()),
-                &preferences,
+                preferences,
                 cx,
             );
         }
     }
     crate::theme::runtime::install(cx);
+}
+
+/// The Adwaita fallback in use because the system theme could not be read:
+/// the preferences it was built with and whether the dark variant is
+/// installed. While it is set, the browser windows install the variant a
+/// new appearance asks for.
+struct FallbackTheme {
+    preferences: native_theme::AccessibilityPreferences,
+    dark: bool,
+}
+
+impl Global for FallbackTheme {}
+
+/// Installs the fallback for `prefers_dark` and records it, so an
+/// appearance change later installs the other variant.
+fn use_fallback_theme(
+    prefers_dark: bool,
+    preferences: native_theme::AccessibilityPreferences,
+    cx: &mut App,
+) {
+    install_fallback_theme(prefers_dark, &preferences, cx);
+    cx.set_global(FallbackTheme {
+        preferences,
+        dark: prefers_dark,
+    });
+}
+
+/// Stops the fallback from following the window appearance, once the system
+/// theme is installed after all.
+pub(crate) fn forget_fallback_theme(cx: &mut App) {
+    if cx.has_global::<FallbackTheme>() {
+        cx.remove_global::<FallbackTheme>();
+    }
+}
+
+/// Lets `window` install the fallback variant its new appearance asks for,
+/// while the fallback is in use.
+fn follow_window_appearance(window: &Window) {
+    window
+        .observe_window_appearance(|window, cx| {
+            refresh_fallback_theme(window.appearance(), cx);
+        })
+        .detach();
+}
+
+/// Installs the fallback variant `appearance` asks for when the fallback is
+/// in use and shows the other one, then applies the appearance settings
+/// again, as a system theme change does.
+fn refresh_fallback_theme(appearance: gpui_kit::WindowAppearance, cx: &mut App) {
+    let prefers_dark = prefers_dark_appearance(appearance);
+    let Some(preferences) = cx
+        .try_global::<FallbackTheme>()
+        .filter(|fallback| fallback.dark != prefers_dark)
+        .map(|fallback| fallback.preferences.clone())
+    else {
+        return;
+    };
+    use_fallback_theme(prefers_dark, preferences, cx);
+    crate::settings::accept_native_theme_change(cx);
+    cx.refresh_windows();
 }
 
 /// Resolves every target at the store and refuses one that is gone or was
@@ -3158,9 +3219,6 @@ fn run_store_probe(
     }
 }
 
-/// Installs both Adwaita presets when the system theme cannot be read. The
-/// bridge keeps the variant applied last as the current mode, so the
-/// variant the window prefers goes last.
 /// Whether a window appearance asks for the dark fallback theme.
 fn prefers_dark_appearance(appearance: gpui_kit::WindowAppearance) -> bool {
     matches!(
@@ -3169,6 +3227,9 @@ fn prefers_dark_appearance(appearance: gpui_kit::WindowAppearance) -> bool {
     )
 }
 
+/// Installs both Adwaita presets when the system theme cannot be read. The
+/// bridge keeps the variant applied last as the current mode, so the
+/// variant the window prefers goes last.
 fn install_fallback_theme(
     prefers_dark: bool,
     preferences: &native_theme::AccessibilityPreferences,
@@ -10136,6 +10197,7 @@ impl MusheenApp {
                     app
                 });
                 register_file_manager_window(&view, window, cx);
+                follow_window_appearance(window);
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .is_err()
@@ -13354,6 +13416,7 @@ impl MusheenApp {
                     )
                 });
                 register_file_manager_window(&view, window, cx);
+                follow_window_appearance(window);
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("Musheen could not open a detached tab window");
@@ -32033,6 +32096,50 @@ mod tests {
             assert!(
                 !cx.theme().mode.is_dark(),
                 "a window that prefers light gets the light fallback"
+            );
+        });
+    }
+
+    // UIV-014: while the fallback is in use, a window appearance that
+    // switches between dark and light gets the variant it now asks for.
+    // This is what each browser window's appearance observer runs.
+    #[gpui_kit::test]
+    async fn theme_fallback_follows_a_window_appearance_change(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            use_fallback_theme(false, native_theme::AccessibilityPreferences::default(), cx);
+            assert!(!cx.theme().mode.is_dark(), "the fallback starts light");
+            refresh_fallback_theme(gpui_kit::WindowAppearance::Dark, cx);
+            assert!(
+                cx.theme().mode.is_dark(),
+                "a window that turns dark gets the dark fallback"
+            );
+            refresh_fallback_theme(gpui_kit::WindowAppearance::VibrantDark, cx);
+            assert!(
+                cx.theme().mode.is_dark(),
+                "a second dark appearance keeps it"
+            );
+            refresh_fallback_theme(gpui_kit::WindowAppearance::Light, cx);
+            assert!(
+                !cx.theme().mode.is_dark(),
+                "a window that turns light gets the light fallback"
+            );
+        });
+    }
+
+    // UIV-014: when the system theme is installed after the fallback, an
+    // appearance change does not put the fallback back.
+    #[gpui_kit::test]
+    async fn theme_fallback_leaves_a_system_theme_alone(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            use_fallback_theme(false, native_theme::AccessibilityPreferences::default(), cx);
+            // The system theme became readable and was installed.
+            forget_fallback_theme(cx);
+            refresh_fallback_theme(gpui_kit::WindowAppearance::Dark, cx);
+            assert!(
+                !cx.theme().mode.is_dark(),
+                "no fallback variant replaces the system theme"
             );
         });
     }
