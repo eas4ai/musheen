@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: extraction-cost
+Current: elevated-session
 
 ## 1. Foundation
 
@@ -263,3 +263,21 @@ and Extract Here keep working as OPS-033 says. Done when the ops-034 and
 ops-033 checks pass on the final tree, the workspace tests, cargo fmt
 --check and clippy with warnings denied are clean, and every finding of
 the review and the report is resolved or declined.
+
+## elevated-session
+
+Requirements: SYS-034
+
+Give each elevated window one broker session (docs/opus-audit-2.md
+C-N2). Open as Administrator authorizes once, with Polkit or sudo, and
+starts a broker that stays with its window. It lists folders inside the
+granted folder, checking each request against that folder and its
+identity, and ends when the window closes, when Musheen exits, or after
+15 minutes without a request. The transports read broker output as it
+arrives, so a large listing no longer blocks on the pipe; the sudo
+broker's terminal runs raw, so a long request is not cut; the window
+keeps a fetched listing for its later pages; and the per-listing Polkit
+browse action goes. Run as Administrator keeps one authorization per
+run. Done when the sys-034 check passes on the final tree, the workspace
+tests, cargo fmt --check and clippy with warnings denied are clean, and
+every finding of the review and the report is resolved or declined.

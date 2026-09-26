@@ -191,3 +191,9 @@ Status: Draft
 Falsifier: sudo executes a shell-built command, elevates the ordinary app, or exposes authentication input outside the dedicated PTY.
 Mechanism: recording-sudo, hostile-argument, cancelled-authentication, wrong-password, timeout, and captured-output tests.
 Status: Draft
+
+[SYS-034] Open as Administrator asks for authorization once for each elevated window, with Polkit or sudo. That authorization starts one broker that serves only that window. It lists folders inside the granted folder, checks each request against that folder and its identity, and refuses anything else without asking again. A listing reaches the window whole, however many entries it has, up to 64 MiB, and a folder whose path fits in 4,096 bytes can be listed with either provider. The broker stops when its window closes, when Musheen exits, or after 15 minutes without a request; the window then says that the authorization expired.
+Falsifier: opening a folder as administrator and then listing folders and pages inside it runs more than one authorization; a listing larger than 64 KiB, or of a folder whose path fits in 4,096 bytes, fails or takes more than 10 seconds; a request outside the granted folder, or for a granted folder that was replaced, is served; or the broker still runs 5 seconds after its window closed or Musheen exited, or serves a request after 15 minutes without one.
+Mechanism: sys-034
+Rationale: docs/opus-audit-2.md C-N2: each folder listing ran its own pkexec under auth_admin, so every folder and every page asked for the password again, the sudo provider could list nothing, and a listing over 64 KiB blocked the broker on its pipe until the 120-second timeout.
+Status: Agreed 2026-09-26
