@@ -34,6 +34,47 @@ thread_local! {
     static IN_WRITE_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether this thread runs a queued catalog write now.
+#[cfg(test)]
+pub(super) fn in_write_job() -> bool {
+    IN_WRITE_JOB.get()
+}
+
+/// Reads and writes a file's extended-attribute tags. The app uses the
+/// system's attributes; tests keep them in memory.
+pub(super) trait AttributeTags: std::fmt::Debug + Send + Sync {
+    fn read(&self, item: &ItemId, path: &StorePath) -> Result<BTreeSet<Box<str>>, Box<str>>;
+    fn write(
+        &self,
+        item: &ItemId,
+        path: &StorePath,
+        tags: &BTreeSet<Box<str>>,
+    ) -> Result<(), Box<str>>;
+}
+
+/// The system's extended attributes.
+#[derive(Debug)]
+struct SystemAttributeTags;
+
+impl AttributeTags for SystemAttributeTags {
+    fn read(&self, item: &ItemId, path: &StorePath) -> Result<BTreeSet<Box<str>>, Box<str>> {
+        BackendTagService::new(XattrTagBackend::new(true, true))
+            .tags(item, path)
+            .map_err(|error| Box::<str>::from(error.to_string()))
+    }
+
+    fn write(
+        &self,
+        item: &ItemId,
+        path: &StorePath,
+        tags: &BTreeSet<Box<str>>,
+    ) -> Result<(), Box<str>> {
+        XattrTagBackend::new(true, true)
+            .write_tags(item, path, tags)
+            .map_err(|error| Box::<str>::from(error.to_string()))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct CatalogBinding {
     store: Option<CatalogStore>,
@@ -48,6 +89,8 @@ pub(super) struct CatalogBinding {
     /// Keeps recent locations in navigation order for every window that
     /// shares this catalog.
     recents_order: Arc<Mutex<RecentsOrder>>,
+    /// Where files' extended-attribute tags are read and written.
+    attribute_tags: Arc<dyn AttributeTags>,
     xattr_opt_in: bool,
     /// Catalog writes that ran outside the write queue.
     #[cfg(test)]
@@ -181,6 +224,7 @@ impl CatalogBinding {
             update_lock: Arc::new(Mutex::new(())),
             writes: CatalogWriteQueue::default(),
             recents_order: Arc::default(),
+            attribute_tags: Arc::new(SystemAttributeTags),
             xattr_opt_in,
             #[cfg(test)]
             writes_outside_queue: Arc::default(),
@@ -205,10 +249,18 @@ impl CatalogBinding {
             update_lock: Arc::new(Mutex::new(())),
             writes: CatalogWriteQueue::default(),
             recents_order: Arc::default(),
+            attribute_tags: Arc::new(SystemAttributeTags),
             xattr_opt_in,
             #[cfg(test)]
             writes_outside_queue: Arc::default(),
         }
+    }
+
+    /// This binding with its extended-attribute tags kept by `tags`.
+    #[cfg(test)]
+    pub(super) fn with_attribute_tags(mut self, tags: Arc<dyn AttributeTags>) -> Self {
+        self.attribute_tags = tags;
+        self
     }
 
     pub(super) fn snapshot(&self) -> CatalogDocument {
@@ -463,16 +515,8 @@ impl CatalogBinding {
             item,
             path,
             capabilities,
-            |item, path| {
-                BackendTagService::new(XattrTagBackend::new(true, true))
-                    .tags(item, path)
-                    .map_err(|error| Box::<str>::from(error.to_string()))
-            },
-            |item, path, tags| {
-                XattrTagBackend::new(true, true)
-                    .write_tags(item, path, tags)
-                    .map_err(|error| Box::<str>::from(error.to_string()))
-            },
+            |item, path| self.attribute_tags.read(item, path),
+            |item, path, tags| self.attribute_tags.write(item, path, tags),
         )
     }
 
@@ -554,9 +598,7 @@ impl CatalogBinding {
         removed: &BTreeSet<Box<str>>,
     ) -> Result<(), Box<str>> {
         self.apply_tag_delta_with_xattr_writer(targets, added, removed, |item, path, tags| {
-            XattrTagBackend::new(true, true)
-                .write_tags(item, path, tags)
-                .map_err(|error| Box::<str>::from(error.to_string()))
+            self.attribute_tags.write(item, path, tags)
         })
     }
 
@@ -694,9 +736,7 @@ impl CatalogBinding {
 
     pub(super) fn reconcile_pending_xattrs(&self) -> Result<(), Box<str>> {
         self.reconcile_pending_xattrs_with(|item, path, tags| {
-            XattrTagBackend::new(true, true)
-                .write_tags(item, path, tags)
-                .map_err(|error| Box::<str>::from(error.to_string()))
+            self.attribute_tags.write(item, path, tags)
         })
     }
 
