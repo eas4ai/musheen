@@ -496,8 +496,7 @@ impl<R: Read + Seek> Read for SingleEntryZip<R> {
             self.source.read(&mut buffer[..requested])?
         } else if self.position < central_start {
             let available = central_start - self.position;
-            let count =
-                usize::try_from(available.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            let count = usize::try_from(available.min(buffer.len() as u64)).unwrap_or(buffer.len());
             buffer[..count].fill(0);
             count
         } else if self.position < central_start + self.central.len() as u64 {

@@ -230,13 +230,27 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         // A visit that fails returns `ArchiveError::Io` and leaves its own
         // error in `failure`. A reader that fails keeps its own error, which
         // names the cause the visit saw only as a failed read.
-        match (copied, failure) {
-            (Err(error), _) if error != ArchiveError::Io => return Err(error.into()),
-            (_, Some(error)) => return Err(error),
-            (copied, None) => copied.map_err(ArchiveOperationError::from)?,
+        let decoded = match (copied, failure) {
+            (Err(error), _) if error != ArchiveError::Io => Err(error.into()),
+            (_, Some(error)) => Err(error),
+            (copied, None) => copied.map_err(ArchiveOperationError::from),
         }
-        if written.contains(&false) {
-            return Err(ArchiveOperationError::InvalidArchive);
+        .and_then(|()| {
+            if written.contains(&false) {
+                Err(ArchiveOperationError::InvalidArchive)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = decoded {
+            // An archive that changed under the decoder reports the change,
+            // not what the decoder made of the new bytes.
+            if error != ArchiveOperationError::Cancelled
+                && SourceIdentity::of(&source_file)? != source_before
+            {
+                return Err(ArchiveOperationError::SourceChanged);
+            }
+            return Err(error);
         }
         sync_tree(&staging)?;
         append_archive_phase(

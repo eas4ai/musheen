@@ -406,15 +406,11 @@ pub(crate) fn copy_entry(
 ) -> Result<(), ArchiveError> {
     while let Some(entry) = scanner.next_entry(cancellation)? {
         if entry.ordinal == ordinal {
-            return scanner.visit_current(
-                entry.size.unwrap_or(0),
-                cancellation,
-                &mut |contents| {
-                    std::io::copy(contents, destination)
-                        .map(|_| ())
-                        .map_err(|_| ArchiveError::Io)
-                },
-            );
+            return scanner.visit_current(entry.size.unwrap_or(0), cancellation, &mut |contents| {
+                std::io::copy(contents, destination)
+                    .map(|_| ())
+                    .map_err(|_| ArchiveError::Io)
+            });
         }
     }
     Err(ArchiveError::NotArchiveEntry)

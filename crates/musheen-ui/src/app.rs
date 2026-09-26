@@ -10,13 +10,12 @@ use crate::date_time::format_modified;
 use crate::dialogs::{
     ConflictDialog, ConflictDialogEvent, ConflictDialogModel, ExtractCheckDialog,
     ExtractCheckEvent, ExtractCheckStrings, ExtractConflictChoice, ExtractConflictDialog,
-    ExtractConflictEvent, ExtractConflictStrings, MetadataReviewChoice,
-    MetadataReviewDialog, MetadataReviewDialogEvent, MetadataReviewDialogModel, OpenWithDialog,
-    OpenWithDialogEvent, OpenWithIntent as DialogOpenWithIntent, OpenWithModel,
-    PropertiesFailureWindow, PropertiesPage, PropertiesWindow, PropertiesWindowData,
-    ProviderPropertiesWindow, ProviderPropertiesWindowData, TagDelta, TagWriteDone, TagWriter,
-    VolumePropertiesModel, VolumePropertiesWindow, conflict_window_options,
-    install_open_with_key_bindings, install_properties_key_bindings,
+    ExtractConflictEvent, ExtractConflictStrings, MetadataReviewChoice, MetadataReviewDialog,
+    MetadataReviewDialogEvent, MetadataReviewDialogModel, OpenWithDialog, OpenWithDialogEvent,
+    OpenWithIntent as DialogOpenWithIntent, OpenWithModel, PropertiesFailureWindow, PropertiesPage,
+    PropertiesWindow, PropertiesWindowData, ProviderPropertiesWindow, ProviderPropertiesWindowData,
+    TagDelta, TagWriteDone, TagWriter, VolumePropertiesModel, VolumePropertiesWindow,
+    conflict_window_options, install_open_with_key_bindings, install_properties_key_bindings,
     metadata_review_window_options, open_with_window_options, properties_window_options,
 };
 use crate::directory::{
@@ -9564,7 +9563,11 @@ impl MusheenApp {
         if let Some(id) = self
             .extract_checks
             .iter()
-            .find(|(_, check)| check.window.is_some_and(|window| window.window_id() == closed))
+            .find(|(_, check)| {
+                check
+                    .window
+                    .is_some_and(|window| window.window_id() == closed)
+            })
             .map(|(id, _)| *id)
         {
             self.cancel_extract_check(id);

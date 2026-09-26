@@ -1,8 +1,8 @@
 use super::io::{BoundedWriter, PositionedFile, TimedReader};
-use super::tar_codec::TarScanner;
 use super::store::{
     AllocationLease, ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState,
 };
+use super::tar_codec::TarScanner;
 use super::workspace::{
     WorkspaceReader, configure_zstd_decoder, gzip_decoder_workspace_bytes,
     reserve_decode_workspace, zstd_decoder_workspace_bytes,

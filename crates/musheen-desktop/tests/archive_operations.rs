@@ -4010,7 +4010,9 @@ fn tar_with_a_global_header() -> Vec<u8> {
     let mut builder = tar::Builder::new(&mut bytes);
     let mut global = tar::Header::new_ustar();
     global.set_entry_type(tar::EntryType::XGlobalHeader);
-    global.set_path("pax_global_header").expect("global header path");
+    global
+        .set_path("pax_global_header")
+        .expect("global header path");
     global.set_size(record.len() as u64);
     global.set_mode(0o666);
     global.set_cksum();
@@ -4153,8 +4155,7 @@ fn extract_cost_reads_a_zip_of_small_entries_at_most_twice() {
         file_bytes += contents.len() as u64;
         zip.write_all(contents.as_bytes()).expect("ZIP payload");
     }
-    std::fs::write(&archive, zip.finish().expect("ZIP finish").into_inner())
-        .expect("ZIP fixture");
+    std::fs::write(&archive, zip.finish().expect("ZIP finish").into_inner()).expect("ZIP fixture");
     let archive_bytes = std::fs::metadata(&archive).expect("ZIP fixture").len();
     let output = root.path().join("output");
 
@@ -4231,8 +4232,7 @@ fn extraction_publishes_a_folder_with_more_files_than_may_be_open() {
         .expect("ZIP entry");
         zip.write_all(b"one of many").expect("ZIP payload");
     }
-    std::fs::write(&archive, zip.finish().expect("ZIP finish").into_inner())
-        .expect("ZIP fixture");
+    std::fs::write(&archive, zip.finish().expect("ZIP finish").into_inner()).expect("ZIP fixture");
     let output = root.path().join("output");
 
     let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
