@@ -1873,7 +1873,6 @@ mod tests {
     fn run_connection_test(
         profile: &ConnectionProfile,
     ) -> Result<(), musheen_desktop::RemoteError> {
-        use musheen_desktop::ProfileConnectionTest;
         future::block_on(
             crate::settings::default_connection_tester().test(profile, CancellationToken::new()),
         )

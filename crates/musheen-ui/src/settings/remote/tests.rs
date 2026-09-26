@@ -6,7 +6,7 @@ use crate::{Catalog, Locale};
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, TestAppContext, px, size};
-use musheen_core::{BoxFuture, CancellationToken, PageRequest, Store, StoreError};
+use musheen_core::{BoxFuture, CancellationToken, PageRequest, StoreError};
 use musheen_desktop::{
     RemoteCredentials, RemoteErrorCategory, SettingsDocument, SettingsStore, SshLogin,
 };
@@ -76,7 +76,7 @@ impl Editor {
         cx.update_window(self.handle, |_, window, cx| {
             window.render_frame(cx);
             for (id, value) in fields {
-                window.click(*id, cx);
+                window.click(id.to_string(), cx);
                 window.input(value, cx);
             }
             window.render_frame(cx);
