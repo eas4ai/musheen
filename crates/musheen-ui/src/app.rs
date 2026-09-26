@@ -1,7 +1,10 @@
 mod catalog;
 mod custom_actions;
 
-use catalog::{CatalogBinding, DirectoryObservation, TagStates, TagTarget};
+use catalog::{
+    CatalogBinding, DirectoryObservation, FolderIdentityWaiter, TagStates, TagTarget,
+    catalog_work_result,
+};
 
 use crate::date_time::format_modified;
 use crate::dialogs::{
@@ -3634,10 +3637,19 @@ struct MusheenApp {
     folder_identities: HashMap<StorePath, Option<FolderIdentity>>,
     /// Locations whose identity a background task is resolving.
     folder_identities_in_flight: std::collections::HashSet<StorePath>,
-    /// A pin reconciliation runs; `pins_reconcile_again` asks for one more
-    /// when it ends.
-    pins_reconciling: bool,
-    pins_reconcile_again: bool,
+    /// Work waiting for the store to answer for folder identities, with the
+    /// locations it waits on.
+    folder_identity_waiters: Vec<(Vec<StorePath>, FolderIdentityWaiter)>,
+    /// Pins whose store probe runs, and pins waiting for a free probe.
+    pin_probes: std::collections::HashSet<(ItemId, StorePath)>,
+    pins_waiting: std::collections::VecDeque<(ItemId, StorePath)>,
+    /// Reviewed orphans whose cleanup runs.
+    orphan_cleanups: std::collections::HashSet<ItemId>,
+    /// Locations with a view change on its way to the catalog, by the
+    /// change's generation. The catalog does not override their view until
+    /// the write lands.
+    pending_view_preferences: HashMap<StorePath, u64>,
+    view_preference_generation: u64,
     /// How to compose the last menu again once its probes answer.
     pending_menu_recompose: std::cell::RefCell<Option<MenuRecompose>>,
     keyboard_context_popup: Option<Entity<PopupMenu>>,
@@ -4396,8 +4408,12 @@ impl MusheenApp {
             probes_in_flight: std::collections::HashSet::new(),
             folder_identities: HashMap::new(),
             folder_identities_in_flight: std::collections::HashSet::new(),
-            pins_reconciling: false,
-            pins_reconcile_again: false,
+            folder_identity_waiters: Vec::new(),
+            pin_probes: std::collections::HashSet::new(),
+            pins_waiting: std::collections::VecDeque::new(),
+            orphan_cleanups: std::collections::HashSet::new(),
+            pending_view_preferences: HashMap::new(),
+            view_preference_generation: 0,
             pending_menu_recompose: std::cell::RefCell::new(None),
             keyboard_context_popup: None,
             context_dialog_windows: Vec::new(),
@@ -4427,6 +4443,7 @@ impl MusheenApp {
         });
         this.start_operation_status_refresh(cx);
         this.start_pending_xattr_reconciliation(cx);
+        this.settle_catalog_writes_on_quit(cx);
         // Production windows enable filesystem watching and consume the same
         // event channel for volume changes. Deterministic test windows keep all
         // host watchers disabled and inject model changes explicitly.
@@ -4506,8 +4523,10 @@ impl MusheenApp {
         cx.spawn(async move |this, cx| {
             loop {
                 let worker = binding.clone();
-                let work = cx.background_spawn(async move { worker.reconcile_pending_xattrs() });
-                let result = work.await;
+                let written = binding.queue_work(cx.background_executor(), move || {
+                    worker.reconcile_pending_xattrs()
+                });
+                let result = catalog_work_result(written).await;
                 let Some(this) = this.upgrade() else {
                     return;
                 };
@@ -4892,20 +4911,11 @@ impl MusheenApp {
             return;
         }
         let binding = self.catalog_binding.clone();
-        let work = cx.background_spawn(async move { binding.observe_batch(observations) });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            if let Err(error) = result {
-                this.update(cx, |state, cx| {
-                    state.operation_error = Some(error);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.queue_catalog_work(
+            cx,
+            move || binding.observe_batch(observations),
+            MusheenApp::report_catalog_error,
+        );
     }
 
     fn handle_watch_event(
@@ -5189,23 +5199,15 @@ impl MusheenApp {
         let binding = self.catalog_binding.clone();
         let location = load.location().clone();
         let generation = load.generation();
-        let work = cx.background_spawn(async move {
-            binding.reconcile_directory(
-                &location,
-                &items,
-                if complete && !indexed {
-                    DirectoryObservation::Complete
-                } else {
-                    DirectoryObservation::Partial
-                },
-            )
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |state, cx| {
+        let observation = if complete && !indexed {
+            DirectoryObservation::Complete
+        } else {
+            DirectoryObservation::Partial
+        };
+        self.queue_catalog_work(
+            cx,
+            move || binding.reconcile_directory(&location, &items, observation),
+            move |state, result, cx| {
                 if let Err(error) = result {
                     state.operation_error = Some(error);
                 }
@@ -5219,9 +5221,8 @@ impl MusheenApp {
                     state.start_next_directory_page(tab_id, cx);
                 }
                 cx.notify();
-            });
-        })
-        .detach();
+            },
+        );
         if !complete && !indexed {
             self.start_next_directory_page(tab_id, cx);
         }
@@ -5577,6 +5578,9 @@ impl MusheenApp {
         self.sync_terminal_location(&location, cx);
         let recent_label =
             remember.then(|| DisplayPath::from_store_path(&location).as_str().to_owned());
+        // The navigation's writes use the store's answer for the folder, not
+        // a cached one; the load below asks again anyway.
+        self.folder_identities.remove(&location);
         self.remember_folder_location(location.clone(), recent_label, cx);
         let mut preferences = self.preferences_with_catalog(
             &location,
@@ -6097,6 +6101,7 @@ impl MusheenApp {
         // the window opens when they answer.
         let store = Arc::clone(&self.store);
         let binding = self.catalog_binding.clone();
+        let executor = cx.background_executor().clone();
         let probed = targets.to_vec();
         let work = cx.background_spawn(async move {
             let tag_targets = probed
@@ -6115,12 +6120,22 @@ impl MusheenApp {
                     CapabilityState::Supported
                 )
             });
-            let tag_states = tags_supported.then(|| binding.tag_states(&tag_targets));
+            // Reading the tag states can import extended attributes into the
+            // catalog, so it runs in the write queue.
+            let tag_states = tags_supported.then(|| {
+                let reader = binding.clone();
+                let read = tag_targets.clone();
+                binding.queue_work(&executor, move || reader.tag_states(&read))
+            });
             (tag_targets, tag_states)
         });
         let targets = targets.to_vec();
         cx.spawn(async move |this, cx| {
             let (tag_targets, tag_states) = work.await;
+            let tag_states = match tag_states {
+                Some(read) => Some(catalog_work_result(read).await),
+                None => None,
+            };
             let Some(this) = this.upgrade() else {
                 return;
             };
@@ -6538,32 +6553,55 @@ impl MusheenApp {
         }
         self.navigation
             .set_preferences_for(location.clone(), preferences);
-        self.with_folder_identities(location, cx, |state, location, identity, parent, cx| {
-            let Some(identity) = identity else {
-                return;
-            };
-            // The folder's latest preferences: a later change whose identity
-            // resolved first is not overwritten by an earlier one.
-            let preferences = state.navigation.preferences_for(&location).clone();
-            let mut reconciled = ViewPreferenceStore::new(preferences.clone());
-            reconciled.set(location.clone(), preferences);
-            let binding = state.catalog_binding.clone();
-            state.queue_catalog_work(
-                cx,
-                move || {
-                    binding.update(|document| {
-                        reconciled.persist_catalog(
-                            identity,
-                            location,
-                            parent,
-                            document.folder_preferences_mut(),
-                        );
-                    })
-                },
-                MusheenApp::report_catalog_error,
-            );
-        });
+        // Until the write lands, a catalog refresh keeps this change on
+        // screen instead of the catalog's older view.
+        self.view_preference_generation += 1;
+        let generation = self.view_preference_generation;
+        self.pending_view_preferences
+            .insert(location.clone(), generation);
+        self.with_folder_identities(
+            location,
+            cx,
+            move |state, location, identity, parent, cx| {
+                let Some(identity) = identity else {
+                    state.settle_view_preferences(&location, generation);
+                    return;
+                };
+                // The folder's latest preferences: a later change whose identity
+                // resolved first is not overwritten by an earlier one.
+                let preferences = state.navigation.preferences_for(&location).clone();
+                let mut reconciled = ViewPreferenceStore::new(preferences.clone());
+                reconciled.set(location.clone(), preferences);
+                let binding = state.catalog_binding.clone();
+                let written = location.clone();
+                state.queue_catalog_work(
+                    cx,
+                    move || {
+                        binding.update(|document| {
+                            reconciled.persist_catalog(
+                                identity,
+                                location,
+                                parent,
+                                document.folder_preferences_mut(),
+                            );
+                        })
+                    },
+                    move |state, result, cx| {
+                        state.settle_view_preferences(&written, generation);
+                        state.report_catalog_error(result, cx);
+                    },
+                );
+            },
+        );
         self.schedule_session_save(cx);
+    }
+
+    /// Lets the catalog set `location`'s view again once the view change of
+    /// `generation`, the latest there, has landed or failed.
+    fn settle_view_preferences(&mut self, location: &StorePath, generation: u64) {
+        if self.pending_view_preferences.get(location) == Some(&generation) {
+            self.pending_view_preferences.remove(location);
+        }
     }
 
     fn dispatch_selection_action(&mut self, action: CommandAction, cx: &mut Context<Self>) {
@@ -7998,10 +8036,20 @@ impl MusheenApp {
     /// Drops the cached facts a watch event made stale.
     fn forget_store_facts(&mut self, event: &WatchEvent) {
         match event {
-            WatchEvent::Changed(item) | WatchEvent::Renamed { item, .. } => {
+            WatchEvent::Changed(item) => {
                 self.executable_facts.remove(item.id());
                 self.location_facts.remove(item.path());
                 self.folder_identities.remove(item.path());
+            }
+            WatchEvent::Renamed {
+                previous_path,
+                item,
+            } => {
+                self.executable_facts.remove(item.id());
+                self.location_facts.remove(item.path());
+                self.location_facts.remove(previous_path);
+                self.folder_identities.remove(item.path());
+                self.folder_identities.remove(previous_path);
             }
             WatchEvent::Removed(id) => {
                 self.executable_facts.remove(id);
@@ -8009,7 +8057,11 @@ impl MusheenApp {
                 self.folder_identities
                     .retain(|_, identity| identity.as_ref() != Some(&removed));
             }
-            WatchEvent::Created(_) => {}
+            WatchEvent::Created(item) => {
+                // A folder made where another was keeps nothing of it.
+                self.location_facts.remove(item.path());
+                self.folder_identities.remove(item.path());
+            }
             WatchEvent::Invalidated { .. } => {
                 self.executable_facts.clear();
                 self.location_facts.clear();
@@ -12655,8 +12707,8 @@ impl MusheenApp {
     }
 
     /// Moves a finished move's or rename's tags in the catalog. The
-    /// destination's capabilities and the catalog write run off the UI
-    /// thread.
+    /// destination's capabilities are asked off the UI thread, then the
+    /// catalog write is queued.
     fn finish_catalog_move(
         &mut self,
         id: musheen_ops::JobId,
@@ -12668,18 +12720,22 @@ impl MusheenApp {
         };
         let store = Arc::clone(&self.store);
         let binding = self.catalog_binding.clone();
+        let executor = cx.background_executor().clone();
         let work = match outcome {
             LocalOperationOutcome::Transfer(TransferOutcome::Skipped) => return,
             LocalOperationOutcome::Transfer(TransferOutcome::Completed(target)) => {
                 let source = movement.source;
                 cx.background_spawn(async move {
                     let capabilities = store.capabilities(target.path());
-                    binding.complete_move(
-                        &source,
-                        target.id().clone(),
-                        target.path().clone(),
-                        &capabilities,
-                    )
+                    let writer = binding.clone();
+                    binding.queue_work(&executor, move || {
+                        writer.complete_move(
+                            &source,
+                            target.id().clone(),
+                            target.path().clone(),
+                            &capabilities,
+                        )
+                    })
                 })
             }
             LocalOperationOutcome::Transfer(TransferOutcome::MetadataReview { .. }) => return,
@@ -12702,13 +12758,16 @@ impl MusheenApp {
                 let target_path = movement.target_path;
                 cx.background_spawn(async move {
                     let capabilities = store.capabilities(&target_path);
-                    binding.complete_rename(&source, target_path, &capabilities)
+                    let writer = binding.clone();
+                    binding.queue_work(&executor, move || {
+                        writer.complete_rename(&source, target_path, &capabilities)
+                    })
                 })
             }
             LocalOperationOutcome::Trash(_) | LocalOperationOutcome::Archive => return,
         };
         cx.spawn(async move |this, cx| {
-            let result = work.await;
+            let result = catalog_work_result(work.await).await;
             let Some(this) = this.upgrade() else {
                 return;
             };
@@ -30470,6 +30529,11 @@ mod tests {
         cx.update_window(browser, |_, _, cx| {
             app.update(cx, |state, _| {
                 assert_eq!(state.operation_error, None);
+                assert_eq!(
+                    state.catalog_binding.writes_outside_queue(),
+                    0,
+                    "the watch event's catalog write went through the write queue"
+                );
             });
         })
         .unwrap();
@@ -30576,6 +30640,22 @@ mod tests {
         gate
     }
 
+    /// Draws a frame and presses a key in the window, as a user would while
+    /// the catalog or the store is blocked. The UI thread must answer both
+    /// without waiting on either.
+    fn draw_and_take_input(browser: AnyWindowHandle, cx: &mut TestAppContext) {
+        cx.update_window(browser, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.dispatch_keystroke(browser, gpui_kit::Keystroke::parse("down").unwrap());
+    }
+
+    /// Every catalog write so far went through the write queue, so a held
+    /// catalog lock keeps one background thread waiting, not one per write.
+    fn assert_every_write_was_queued(window: &CatalogWindow, cx: &mut TestAppContext) {
+        let outside = cx.update(|cx| window.app.read(cx).catalog_binding.writes_outside_queue());
+        assert_eq!(outside, 0, "a catalog write ran outside the write queue");
+    }
+
     fn assert_ui_thread_returned(elapsed: Duration, path: &str) {
         assert!(
             elapsed < Duration::from_secs(1),
@@ -30619,12 +30699,14 @@ mod tests {
                 })
             })
             .unwrap();
+        draw_and_take_input(window.browser, cx);
         let elapsed = started.elapsed();
         lock.release();
         gate.open();
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "navigation");
+        assert_every_write_was_queued(&window, cx);
         let document = window.catalog_store.load().unwrap();
         assert!(
             document
@@ -30672,11 +30754,13 @@ mod tests {
             });
         })
         .unwrap();
+        draw_and_take_input(window.browser, cx);
         let elapsed = started.elapsed();
         lock.release();
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "a view preference change");
+        assert_every_write_was_queued(&window, cx);
         assert_eq!(
             window
                 .catalog_store
@@ -30780,6 +30864,7 @@ mod tests {
                 Box::new(move |result, _| *written.borrow_mut() = Some(result)),
             );
         });
+        draw_and_take_input(window.browser, cx);
         let elapsed = started.elapsed();
         assert_eq!(
             *written.borrow(),
@@ -30790,6 +30875,7 @@ mod tests {
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "a Properties tag edit");
+        assert_every_write_was_queued(&window, cx);
         assert_eq!(
             *written.borrow(),
             Some(Ok(())),
@@ -30848,11 +30934,13 @@ mod tests {
             });
         })
         .unwrap();
+        draw_and_take_input(window.browser, cx);
         let elapsed = started.elapsed();
         lock.release();
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "a tag rename and delete");
+        assert_every_write_was_queued(&window, cx);
         let document = window.catalog_store.load().unwrap();
         let tags = document.tags().tags_for(item.id());
         assert!(tags.contains("Projects"), "the rename is written: {tags:?}");
@@ -30894,11 +30982,13 @@ mod tests {
                 })
             })
             .unwrap();
+        draw_and_take_input(window.browser, cx);
         let elapsed = started.elapsed();
         gate.open();
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "the catalog projection");
+        assert_every_write_was_queued(&window, cx);
         let document = window.catalog_store.load().unwrap();
         assert!(
             matches!(
@@ -30945,11 +31035,13 @@ mod tests {
                 })
             })
             .unwrap();
+        draw_and_take_input(window.browser, cx);
         let elapsed = started.elapsed();
         gate.open();
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "an orphan cleanup");
+        assert_every_write_was_queued(&window, cx);
         assert!(
             window
                 .catalog_store
@@ -31014,12 +31106,14 @@ mod tests {
                 })
             })
             .unwrap();
+        draw_and_take_input(window.browser, cx);
         let elapsed = started.elapsed();
         lock.release();
         gate.open();
         cx.run_until_parked();
 
         assert_ui_thread_returned(elapsed, "a move completion");
+        assert_every_write_was_queued(&window, cx);
         assert_eq!(
             window
                 .catalog_store
@@ -31030,6 +31124,569 @@ mod tests {
             Some(&destination),
             "the tags follow the item once the store and the catalog answer"
         );
+    }
+
+    // UXF-023: a catalog write that stops without a result still reports to
+    // the window that queued it, so no window waits for it forever.
+    #[gpui_kit::test]
+    async fn ui_thread_catalog_write_that_stops_reports_an_error_to_its_window(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(|_, _| {}, cx).await;
+        let heard = std::rc::Rc::new(std::cell::RefCell::new(None));
+        window.app.update(cx, |state, cx| {
+            let heard = std::rc::Rc::clone(&heard);
+            state.queue_catalog_work(
+                cx,
+                || -> Result<(), Box<str>> { panic!("the catalog write fails") },
+                move |_, result, _| *heard.borrow_mut() = Some(result),
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            *heard.borrow(),
+            Some(Err(Box::<str>::from(
+                "the catalog write stopped before it finished"
+            ))),
+            "the window hears that its write stopped"
+        );
+    }
+
+    // UXF-023: a folder the store is still resolving is not asked about
+    // again; the second request waits for the first answer.
+    #[gpui_kit::test]
+    async fn ui_thread_folder_identity_is_asked_once_while_it_resolves(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::create_dir(folder.join("child")).unwrap(),
+            cx,
+        )
+        .await;
+        let child = StorePath::from_unix_path(window.folder.join("child").into_os_string());
+
+        let gate = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, cx| {
+                    let gate = close_store_gate(state);
+                    state.remember_folder_location(child.clone(), None, cx);
+                    state.remember_folder_location(child.clone(), None, cx);
+                    gate
+                })
+            })
+            .unwrap();
+        gate.open();
+        cx.run_until_parked();
+
+        assert_eq!(
+            gate.passes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the store is asked about the folder once"
+        );
+        assert!(
+            window
+                .catalog_store
+                .load()
+                .unwrap()
+                .folder_preferences()
+                .identity_for_path(&child)
+                .is_some(),
+            "the waiting request writes with the first answer"
+        );
+    }
+
+    // UXF-023: a view change waiting on the catalog lock stays on screen
+    // when a catalog refresh runs before its write lands.
+    #[gpui_kit::test]
+    async fn ui_thread_view_change_is_kept_until_its_write_lands(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::write(folder.join("item.txt"), b"item").unwrap(),
+            cx,
+        )
+        .await;
+        let root = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(window.folder.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let set_layout = |layout: Layout, cx: &mut TestAppContext| {
+            cx.update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, cx| {
+                    state
+                        .focused_directory_mut()
+                        .view_mut()
+                        .preferences_mut()
+                        .layout = layout;
+                    state.persist_focused_view_preferences(cx);
+                });
+            })
+            .unwrap();
+        };
+        set_layout(Layout::Details, cx);
+        cx.run_until_parked();
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        set_layout(Layout::List, cx);
+        let shown = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, _| {
+                    // A refresh shows the catalog, which still holds Details.
+                    state.project_catalog();
+                    state.focused_directory().view().preferences().layout
+                })
+            })
+            .unwrap();
+        lock.release();
+        cx.run_until_parked();
+
+        assert_eq!(
+            shown,
+            Layout::List,
+            "the tab keeps the change that is on its way to the catalog"
+        );
+        assert_eq!(
+            window
+                .catalog_store
+                .load()
+                .unwrap()
+                .folder_preferences()
+                .resolve(&FolderIdentity::from_item(root.id().clone()))
+                .view(),
+            musheen_desktop::FolderView::List,
+            "the change lands once the catalog is free"
+        );
+    }
+
+    // UXF-023: watch events drop the folder identities they made stale, so
+    // the next write asks the store again.
+    #[gpui_kit::test]
+    async fn ui_thread_watch_events_forget_the_folder_identities_they_changed(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(|_, _| {}, cx).await;
+        let provider = ProviderId::new("local").unwrap();
+        let folder = |key: &[u8], path: &str| {
+            StoreItem::new(
+                ItemId::new(provider.clone(), key.to_vec()).unwrap(),
+                StorePath::from_unix_path(path),
+                DisplayPath::new(path),
+                ItemKind::Directory,
+                None,
+            )
+        };
+        window.app.update(cx, |state, _| {
+            state.folder_identities.clear();
+            for path in ["/renamed-from", "/renamed-to", "/created"] {
+                state
+                    .folder_identities
+                    .insert(StorePath::from_unix_path(path), None);
+            }
+            state.forget_store_facts(&WatchEvent::Renamed {
+                previous_path: StorePath::from_unix_path("/renamed-from"),
+                item: folder(b"renamed", "/renamed-to"),
+            });
+            state.forget_store_facts(&WatchEvent::Created(folder(b"created", "/created")));
+            assert!(
+                state.folder_identities.is_empty(),
+                "a rename forgets both of its paths and a create forgets its path"
+            );
+
+            let removed = ItemId::new(provider.clone(), b"removed".to_vec()).unwrap();
+            state.folder_identities.insert(
+                StorePath::from_unix_path("/removed"),
+                Some(FolderIdentity::from_item(removed.clone())),
+            );
+            state.forget_store_facts(&WatchEvent::Removed(removed));
+            assert!(
+                state.folder_identities.is_empty(),
+                "a removed folder's identity is forgotten"
+            );
+
+            state
+                .folder_identities
+                .insert(StorePath::from_unix_path("/kept"), None);
+            state.forget_store_facts(&WatchEvent::Invalidated {
+                location: StorePath::from_unix_path("/"),
+                cause: musheen_core::WatchFailure::Overflow,
+            });
+            assert!(
+                state.folder_identities.is_empty(),
+                "an invalidated watch forgets every identity"
+            );
+        });
+    }
+
+    // UXF-023: a navigation records the store's identity for the folder it
+    // opens, not one the cache kept from before the folder changed.
+    #[gpui_kit::test]
+    async fn ui_thread_navigation_records_the_store_identity_of_the_folder(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::create_dir(folder.join("child")).unwrap(),
+            cx,
+        )
+        .await;
+        let child = StorePath::from_unix_path(window.folder.join("child").into_os_string());
+        let current = LocalStore::new().resolve_item(&child).unwrap().unwrap();
+        let stale = FolderIdentity::from_item(
+            ItemId::new(ProviderId::new("local").unwrap(), b"stale".to_vec()).unwrap(),
+        );
+
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                state
+                    .folder_identities
+                    .insert(child.clone(), Some(stale.clone()));
+                state.navigate(child.clone(), true, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let document = window.catalog_store.load().unwrap();
+        let recent = document
+            .recents()
+            .entries()
+            .iter()
+            .find(|recent| recent.path_hint() == &child)
+            .expect("the navigation is recorded");
+        assert_eq!(
+            recent.identity(),
+            &FolderIdentity::from_item(current.id().clone()),
+            "the recent carries the folder's current identity"
+        );
+    }
+
+    // CUSTOM-034, UXF-023: clearing history while a navigation's folder is
+    // still resolving leaves the history empty.
+    #[gpui_kit::test]
+    async fn ui_thread_clearing_history_drops_a_recent_still_resolving(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::create_dir(folder.join("child")).unwrap(),
+            cx,
+        )
+        .await;
+        let child = StorePath::from_unix_path(window.folder.join("child").into_os_string());
+
+        let gate = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, cx| {
+                    let gate = close_store_gate(state);
+                    state.navigate(child.clone(), true, cx);
+                    state.clear_recent_locations(cx).unwrap();
+                    gate
+                })
+            })
+            .unwrap();
+        gate.open();
+        cx.run_until_parked();
+
+        assert!(
+            window
+                .catalog_store
+                .load()
+                .unwrap()
+                .recents()
+                .entries()
+                .is_empty(),
+            "the clear wins over the navigation made before it"
+        );
+    }
+
+    // UXF-023: a recent whose folder answers late never shows as newer than
+    // the navigation made after it.
+    #[gpui_kit::test]
+    async fn ui_thread_a_late_recent_does_not_jump_ahead(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, _| {
+                filesystem::create_dir(folder.join("first")).unwrap();
+                filesystem::create_dir(folder.join("second")).unwrap();
+            },
+            cx,
+        )
+        .await;
+        let first = StorePath::from_unix_path(window.folder.join("first").into_os_string());
+        let second = StorePath::from_unix_path(window.folder.join("second").into_os_string());
+
+        let gate = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, cx| {
+                    let gate = close_store_gate(state);
+                    state.navigate(first.clone(), true, cx);
+                    state.navigate(second.clone(), true, cx);
+                    gate
+                })
+            })
+            .unwrap();
+        gate.open();
+        cx.run_until_parked();
+
+        let document = window.catalog_store.load().unwrap();
+        assert_eq!(
+            document
+                .recents()
+                .entries()
+                .iter()
+                .map(|recent| recent.path_hint().clone())
+                .collect::<Vec<_>>(),
+            [second, first],
+            "the last navigation is the newest recent and the first stays below it"
+        );
+    }
+
+    // UXF-023: a Properties window hears its tag write's result even when
+    // the window that opened it closed while the write waited.
+    #[gpui_kit::test]
+    async fn ui_thread_properties_hears_its_tag_write_after_its_opener_closes(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::write(folder.join("tagged.txt"), b"tagged").unwrap(),
+            cx,
+        )
+        .await;
+        let item = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(window.folder.join("tagged.txt")))
+            .unwrap()
+            .unwrap();
+        let targets = vec![(
+            item.id().clone(),
+            item.path().clone(),
+            LocalStore::new().capabilities(item.path()),
+        )];
+        let delta = TagDelta {
+            added: [Box::<str>::from("Work")].into_iter().collect(),
+            removed: BTreeSet::new(),
+        };
+        let writer = window
+            .app
+            .update(cx, |state, cx| state.properties_tag_writer(targets, cx));
+        let written = std::rc::Rc::new(std::cell::RefCell::new(None));
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        cx.update(|cx| {
+            let written = std::rc::Rc::clone(&written);
+            writer(
+                &delta,
+                cx,
+                Box::new(move |result, _| *written.borrow_mut() = Some(result)),
+            );
+        });
+        cx.update_window(window.browser, |_, window, _| window.remove_window())
+            .unwrap();
+        let CatalogWindow {
+            app,
+            catalog_store,
+            _temporary,
+            ..
+        } = window;
+        drop(app);
+        lock.release();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *written.borrow(),
+            Some(Ok(())),
+            "the Properties window hears the result"
+        );
+        assert!(
+            catalog_store
+                .load()
+                .unwrap()
+                .tags()
+                .tags_for(item.id())
+                .contains("Work"),
+            "the tag is written"
+        );
+    }
+
+    // CUSTOM-032, UXF-023: a pin whose store never answers does not stop
+    // the other pins from being checked, and is not asked again while its
+    // probe waits.
+    #[gpui_kit::test]
+    async fn ui_thread_a_pin_that_never_answers_does_not_stop_the_other_pins(
+        cx: &mut TestAppContext,
+    ) {
+        let mut pinned = Vec::new();
+        let window = open_catalog_window(
+            |folder, document| {
+                for name in ["hung", "gone"] {
+                    let path = folder.join(name);
+                    filesystem::create_dir(&path).unwrap();
+                    let item = LocalStore::new()
+                        .resolve_item(&StorePath::from_unix_path(path))
+                        .unwrap()
+                        .unwrap();
+                    document
+                        .pins_mut()
+                        .pin(item.id().clone(), item.path().clone(), name)
+                        .unwrap();
+                    pinned.push(item);
+                }
+            },
+            cx,
+        )
+        .await;
+        filesystem::remove_dir(window.folder.join("gone")).unwrap();
+        let hung = (pinned[0].id().clone(), pinned[0].path().clone());
+
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                // The hung pin's probe still waits on its store.
+                state.pin_probes.insert(hung.clone());
+                state.sync_catalog_projection(cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let document = window.catalog_store.load().unwrap();
+        let gone = document
+            .pins()
+            .entries()
+            .iter()
+            .find(|pin| pin.item() == pinned[1].id())
+            .unwrap();
+        assert!(
+            matches!(gone.state(), musheen_desktop::PinState::Unavailable(_)),
+            "the other pin is checked"
+        );
+        window.app.update(cx, |state, _| {
+            assert!(
+                state.pin_probes.contains(&hung) && !state.pins_waiting.contains(&hung),
+                "the hung pin is not asked again while its probe waits"
+            );
+        });
+    }
+
+    // UXF-023: when the store answers another identity for a tab's folder
+    // than the one its view came from, the tab takes that folder's view.
+    #[gpui_kit::test]
+    async fn ui_thread_a_new_folder_identity_brings_its_saved_view(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, _| filesystem::write(folder.join("item.txt"), b"item").unwrap(),
+            cx,
+        )
+        .await;
+        let root_path = StorePath::from_unix_path(window.folder.as_os_str());
+        let root = LocalStore::new().resolve_item(&root_path).unwrap().unwrap();
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .layout = Layout::Details;
+                state.persist_focused_view_preferences(cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let shown = cx
+            .update_window(window.browser, |_, _, cx| {
+                window.app.update(cx, |state, _| {
+                    let stale = FolderIdentity::from_item(
+                        ItemId::new(ProviderId::new("local").unwrap(), b"stale".to_vec()).unwrap(),
+                    );
+                    state
+                        .folder_identities
+                        .insert(root_path.clone(), Some(stale));
+                    let tab = state.navigation.focused_tab().id();
+                    state
+                        .focused_directory_mut()
+                        .view_mut()
+                        .preferences_mut()
+                        .layout = Layout::Grid;
+                    if let Some(tab) = state.navigation.tab_mut(tab) {
+                        let mut preferences = tab.view_preferences().clone();
+                        preferences.layout = Layout::Grid;
+                        tab.set_view_preferences(preferences);
+                    }
+                    state.remember_folder_identities(vec![(
+                        root_path.clone(),
+                        Some(FolderIdentity::from_item(root.id().clone())),
+                    )]);
+                    state.focused_directory().view().preferences().layout
+                })
+            })
+            .unwrap();
+
+        assert_eq!(
+            shown,
+            Layout::Details,
+            "the tab takes the saved view of the folder the store answered"
+        );
+    }
+
+    // UXF-023: the tag rename dialog returns at once and shows the rename's
+    // result when the catalog answers.
+    #[gpui_kit::test]
+    async fn ui_thread_tag_rename_dialog_shows_a_late_result(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, document| {
+                let path = folder.join("tagged.txt");
+                filesystem::write(&path, b"tagged").unwrap();
+                let item = LocalStore::new()
+                    .resolve_item(&StorePath::from_unix_path(path))
+                    .unwrap()
+                    .unwrap();
+                document
+                    .tags_mut()
+                    .assign(item.id(), item.path().clone(), "Work")
+                    .unwrap();
+            },
+            cx,
+        )
+        .await;
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                state
+                    .open_captured_tag_rename(&tag_command_target("Work"), cx)
+                    .unwrap();
+            });
+        })
+        .unwrap();
+        let dialog = cx
+            .windows()
+            .into_iter()
+            .find(|handle| *handle != window.browser)
+            .expect("the rename dialog opened");
+        // The tag goes away before the rename is confirmed.
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                state
+                    .delete_captured_tag(&tag_command_target("Work"), cx)
+                    .unwrap();
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let lock = CatalogLockHolder::hold(&window.catalog_path);
+        let started = Instant::now();
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("tag-rename-confirm", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("tag-rename-error").is_none(),
+                "the dialog has no result before the catalog answers"
+            );
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+        lock.release();
+        cx.run_until_parked();
+
+        assert_ui_thread_returned(elapsed, "a tag rename confirmation");
+        cx.update_window(dialog, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("tag-rename-error").is_some(),
+                "the dialog shows the rename's result"
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

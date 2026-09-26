@@ -1,6 +1,6 @@
 use super::*;
 use crate::Locale;
-use gpui_kit::WeakEntity;
+use gpui_kit::{BackgroundExecutor, WeakEntity};
 use musheen_core::CapabilityMatrix;
 use musheen_desktop::{
     BackendTagService, HomeItemKind, HomeSection, MountShortcut, TagBackend, TagService,
@@ -16,7 +16,23 @@ const MAX_XATTR_RECONCILIATION_WRITES: usize = 32;
 /// The most folder identities the window keeps; the cache starts over when
 /// full.
 const FOLDER_IDENTITIES_LIMIT: usize = 1_024;
+/// The most recorded navigations kept to order a late recent below the
+/// ones after it: more than the catalog keeps recents.
+const RECENT_CLAIMS_LIMIT: usize = 64;
+/// The most pins the window asks the store about at once. A pin on a store
+/// that never answers holds one background thread, so this bounds the
+/// threads pins can hold.
+const PIN_PROBES_LIMIT: usize = 4;
 type ObservedScopes = Vec<(StorePath, BTreeMap<ItemId, StorePath>)>;
+/// Work that waits for folder identities, run once the store answered.
+pub(super) type FolderIdentityWaiter = Box<dyn FnOnce(&mut MusheenApp, &mut Context<MusheenApp>)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread runs a queued catalog write, so a test can count
+    /// the writes that did not go through the queue.
+    static IN_WRITE_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct CatalogBinding {
@@ -29,12 +45,34 @@ pub(super) struct CatalogBinding {
     update_lock: Arc<Mutex<()>>,
     /// Writes queued by every window that shares this catalog, run in order.
     writes: CatalogWriteQueue,
+    /// Keeps recent locations in navigation order for every window that
+    /// shares this catalog.
+    recents_order: Arc<Mutex<RecentsOrder>>,
     xattr_opt_in: bool,
+    /// Catalog writes that ran outside the write queue.
+    #[cfg(test)]
+    writes_outside_queue: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Navigation order for recent locations. A navigation's recent is written
+/// once the store answers for its folder, so a later navigation can answer
+/// first; its recent then goes below the later ones. A navigation made
+/// before a clear records no recent.
+#[derive(Debug, Default)]
+struct RecentsOrder {
+    /// The last sequence number given to a navigation.
+    issued: u64,
+    /// The last navigation before the latest clear.
+    cleared_at: u64,
+    /// The latest navigations whose recent was queued, with their folders.
+    claimed: VecDeque<(u64, FolderIdentity)>,
 }
 
 /// Catalog writes run one at a time, in the order they were queued, on a
 /// background executor. A queued write runs even when the window that
-/// queued it closes first.
+/// queued it closes first. Every catalog write goes through this queue, so
+/// a catalog lock that another process holds keeps one background thread
+/// waiting, not one per write.
 #[derive(Clone, Default)]
 pub(super) struct CatalogWriteQueue {
     state: Arc<Mutex<CatalogWriteQueueState>>,
@@ -44,6 +82,8 @@ pub(super) struct CatalogWriteQueue {
 struct CatalogWriteQueueState {
     jobs: VecDeque<Box<dyn FnOnce() + Send>>,
     draining: bool,
+    /// Dropped when the queue runs empty, which wakes their receivers.
+    settled: Vec<async_channel::Sender<()>>,
 }
 
 impl std::fmt::Debug for CatalogWriteQueue {
@@ -73,11 +113,33 @@ impl CatalogWriteQueue {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let Some(job) = state.jobs.pop_front() else {
                     state.draining = false;
+                    state.settled.clear();
                     return;
                 };
                 job
             };
+            #[cfg(test)]
+            IN_WRITE_JOB.set(true);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            #[cfg(test)]
+            IN_WRITE_JOB.set(false);
+        }
+    }
+
+    /// Resolves once every job queued so far has run.
+    fn settled(&self) -> impl std::future::Future<Output = ()> + Send + use<> {
+        let receiver = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.draining.then(|| {
+                let (sender, receiver) = async_channel::bounded::<()>(1);
+                state.settled.push(sender);
+                receiver
+            })
+        };
+        async move {
+            if let Some(receiver) = receiver {
+                let _ = receiver.recv().await;
+            }
         }
     }
 }
@@ -118,7 +180,10 @@ impl CatalogBinding {
             observed_scopes: Arc::new(Mutex::new(Vec::new())),
             update_lock: Arc::new(Mutex::new(())),
             writes: CatalogWriteQueue::default(),
+            recents_order: Arc::default(),
             xattr_opt_in,
+            #[cfg(test)]
+            writes_outside_queue: Arc::default(),
         }
     }
 
@@ -139,7 +204,10 @@ impl CatalogBinding {
             observed_scopes: Arc::new(Mutex::new(Vec::new())),
             update_lock: Arc::new(Mutex::new(())),
             writes: CatalogWriteQueue::default(),
+            recents_order: Arc::default(),
             xattr_opt_in,
+            #[cfg(test)]
+            writes_outside_queue: Arc::default(),
         }
     }
 
@@ -156,16 +224,90 @@ impl CatalogBinding {
         self.revision.load(Ordering::Acquire)
     }
 
-    /// Queues a write behind the ones every window sharing this catalog
-    /// queued before it. Returns whether the caller must start a drain.
-    pub(super) fn queue_write(&self, job: Box<dyn FnOnce() + Send>) -> bool {
-        self.writes.push(job)
+    /// Queues `work` behind the writes every window sharing this catalog
+    /// queued before it, and starts a drain on `executor` when none runs.
+    /// The receiver hears the result; it closes without one when the work
+    /// panicked.
+    pub(super) fn queue_work<R: Send + 'static>(
+        &self,
+        executor: &BackgroundExecutor,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> async_channel::Receiver<R> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let job = Box::new(move || {
+            let _ = sender.try_send(work());
+        });
+        if self.writes.push(job) {
+            let binding = self.clone();
+            executor
+                .spawn(async move { binding.writes.drain() })
+                .detach();
+        }
+        receiver
     }
 
-    /// Runs the queued writes until none is left. Call it on a background
-    /// executor.
-    pub(super) fn drain_writes(&self) {
-        self.writes.drain();
+    /// Resolves once every write queued so far has run.
+    pub(super) fn writes_settled(&self) -> impl std::future::Future<Output = ()> + Send + use<> {
+        self.writes.settled()
+    }
+
+    /// How many catalog writes ran outside the write queue.
+    #[cfg(test)]
+    pub(super) fn writes_outside_queue(&self) -> usize {
+        self.writes_outside_queue
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A sequence number for a navigation that records a recent location.
+    pub(super) fn next_recent_sequence(&self) -> u64 {
+        let mut order = self
+            .recents_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        order.issued += 1;
+        order.issued
+    }
+
+    /// Claims navigation `sequence`'s recent for `identity`. `None` when a
+    /// clear came after the navigation or a later navigation already
+    /// recorded the folder; otherwise the folders later navigations
+    /// recorded, which stay above it.
+    pub(super) fn claim_recent(
+        &self,
+        sequence: u64,
+        identity: &FolderIdentity,
+    ) -> Option<Vec<FolderIdentity>> {
+        let mut order = self
+            .recents_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if sequence <= order.cleared_at {
+            return None;
+        }
+        let newer = order
+            .claimed
+            .iter()
+            .filter(|(claimed, _)| *claimed > sequence)
+            .map(|(_, newer)| newer.clone())
+            .collect::<Vec<_>>();
+        if newer.contains(identity) {
+            return None;
+        }
+        order.claimed.push_back((sequence, identity.clone()));
+        if order.claimed.len() > RECENT_CLAIMS_LIMIT {
+            order.claimed.pop_front();
+        }
+        Some(newer)
+    }
+
+    /// Notes a clear of the recent locations: the navigations made before it
+    /// no longer record theirs.
+    pub(super) fn note_recents_cleared(&self) {
+        let mut order = self
+            .recents_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        order.cleared_at = order.issued;
     }
 
     fn remember_directory_observation(
@@ -221,6 +363,11 @@ impl CatalogBinding {
         &self,
         change: impl FnOnce(&mut CatalogDocument) -> Result<T, Box<str>>,
     ) -> Result<T, Box<str>> {
+        #[cfg(test)]
+        if !IN_WRITE_JOB.get() {
+            self.writes_outside_queue
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         // Updates run one at a time. The in-memory copy is locked only to
         // read or install a document, never while the catalog file's lock
         // is awaited, so a reader on the UI thread does not wait on another
@@ -651,6 +798,20 @@ impl CatalogBinding {
         Ok(changed)
     }
 
+    /// The paths of the live items that carry `tag`: the paths whose
+    /// capabilities a rename or a delete of the tag asks the store for.
+    pub(super) fn tagged_paths(&self, tag: &str) -> Vec<StorePath> {
+        let document = self.snapshot();
+        document
+            .tags()
+            .tracked_items()
+            .filter(|(item, _, orphaned)| {
+                !*orphaned && document.tags().tags_for(item).contains(tag)
+            })
+            .map(|(_, path, _)| path.clone())
+            .collect()
+    }
+
     pub(super) fn items_with_tag(&self, tag: &str) -> BTreeSet<ItemId> {
         let mut document = self.document.lock().expect("catalog lock is not poisoned");
         TagService::new(document.tags_mut(), self.xattr_opt_in).items_with_tag(tag)
@@ -733,21 +894,43 @@ impl CatalogBinding {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn cleanup_reviewed_orphan(
         &self,
         reviewed: &ItemId,
         mut resolve: impl FnMut(&StorePath) -> Result<Option<StoreItem>, Box<str>>,
     ) -> Result<OrphanCleanupOutcome, Box<str>> {
+        let Some(path) = self.orphan_path(reviewed)? else {
+            return Ok(OrphanCleanupOutcome::NoLongerOrphaned);
+        };
+        self.finish_orphan_cleanup(reviewed, &path, resolve(&path))
+    }
+
+    /// The path hint of a reviewed orphan, or `None` when the item is no
+    /// longer orphaned.
+    pub(super) fn orphan_path(&self, reviewed: &ItemId) -> Result<Option<StorePath>, Box<str>> {
         let snapshot = self.snapshot();
         if !snapshot.tags().is_orphaned(reviewed) {
-            return Ok(OrphanCleanupOutcome::NoLongerOrphaned);
+            return Ok(None);
         }
-        let path = snapshot
+        snapshot
             .tags()
             .path_hint(reviewed)
             .cloned()
-            .ok_or_else(|| Box::<str>::from("the reviewed tag record has no path hint"))?;
-        if let Some(item) = resolve(&path)?
+            .map(Some)
+            .ok_or_else(|| Box::<str>::from("the reviewed tag record has no path hint"))
+    }
+
+    /// Removes a reviewed orphan's tags unless `found`, the store's answer
+    /// for `path`, is the item itself. The record must still be the orphan
+    /// at `path`.
+    pub(super) fn finish_orphan_cleanup(
+        &self,
+        reviewed: &ItemId,
+        path: &StorePath,
+        found: Result<Option<StoreItem>, Box<str>>,
+    ) -> Result<OrphanCleanupOutcome, Box<str>> {
+        if let Some(item) = found?
             && item.id() == reviewed
         {
             self.observe_present(reviewed, item.path().clone())?;
@@ -755,7 +938,7 @@ impl CatalogBinding {
         }
         self.update_result(|document| {
             if !document.tags().is_orphaned(reviewed)
-                || document.tags().path_hint(reviewed) != Some(&path)
+                || document.tags().path_hint(reviewed) != Some(path)
             {
                 return Ok(OrphanCleanupOutcome::NoLongerOrphaned);
             }
@@ -795,44 +978,50 @@ impl CatalogBinding {
             .collect()
     }
 
+    /// Checks every pin in turn. The app asks the store about each pin on
+    /// its own and records each answer with `record_pin_resolution`.
+    #[cfg(test)]
     pub(super) fn reconcile_pins(
         &self,
         mut resolve: impl FnMut(&StorePath) -> Result<Option<StoreItem>, Box<str>>,
     ) -> Result<(), Box<str>> {
-        let resolutions = self
-            .snapshot()
-            .pins()
-            .entries()
-            .iter()
-            .map(|pin| {
-                let resolution = match resolve(pin.path_hint()) {
-                    Ok(Some(item)) if item.id() == pin.item() => Ok(item.path().clone()),
-                    Ok(Some(_)) => Err(Box::<str>::from(
-                        "the stored path now identifies a different item",
-                    )),
-                    Ok(None) => Err(Box::<str>::from("the target is missing")),
-                    Err(error) => Err(error),
-                };
-                (pin.item().clone(), pin.path_hint().clone(), resolution)
-            })
-            .collect::<Vec<_>>();
+        for pin in self.snapshot().pins().entries() {
+            self.record_pin_resolution(pin.item(), pin.path_hint(), resolve(pin.path_hint()))?;
+        }
+        Ok(())
+    }
+
+    /// Records the store's answer for one pin, while the pin still has the
+    /// path the store was asked about.
+    pub(super) fn record_pin_resolution(
+        &self,
+        item: &ItemId,
+        expected_path: &StorePath,
+        found: Result<Option<StoreItem>, Box<str>>,
+    ) -> Result<(), Box<str>> {
+        let resolution = match found {
+            Ok(Some(found)) if found.id() == item => Ok(found.path().clone()),
+            Ok(Some(_)) => Err(Box::<str>::from(
+                "the stored path now identifies a different item",
+            )),
+            Ok(None) => Err(Box::<str>::from("the target is missing")),
+            Err(error) => Err(error),
+        };
         self.update(|document| {
-            for (item, expected_path, resolution) in resolutions {
-                if !document
-                    .pins()
-                    .entries()
-                    .iter()
-                    .any(|pin| pin.item() == &item && pin.path_hint() == &expected_path)
-                {
-                    continue;
+            if !document
+                .pins()
+                .entries()
+                .iter()
+                .any(|pin| pin.item() == item && pin.path_hint() == expected_path)
+            {
+                return;
+            }
+            match resolution {
+                Ok(path) => {
+                    document.pins_mut().mark_available(item, path);
                 }
-                match resolution {
-                    Ok(path) => {
-                        document.pins_mut().mark_available(&item, path);
-                    }
-                    Err(reason) => {
-                        document.pins_mut().mark_unavailable(&item, reason);
-                    }
+                Err(reason) => {
+                    document.pins_mut().mark_unavailable(item, reason);
                 }
             }
         })
@@ -884,32 +1073,29 @@ impl MusheenApp {
     /// the same entry land in the order they were made. Work that asks the
     /// store runs the store call first and queues only the write, so a
     /// store that blocks never holds the queue. The work runs even when
-    /// this window closes first; `then` runs only while it is open.
-    pub(super) fn queue_catalog_work<R: Send + 'static>(
+    /// this window closes first; `then` runs only while it is open, and
+    /// hears an error when the work stopped without a result.
+    pub(super) fn queue_catalog_work<T: Send + 'static>(
         &mut self,
         cx: &mut Context<Self>,
-        work: impl FnOnce() -> R + Send + 'static,
-        then: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
+        work: impl FnOnce() -> Result<T, Box<str>> + Send + 'static,
+        then: impl FnOnce(&mut Self, Result<T, Box<str>>, &mut Context<Self>) + 'static,
     ) {
-        let (sender, receiver) = async_channel::bounded(1);
-        let start = self.catalog_binding.queue_write(Box::new(move || {
-            let _ = sender.try_send(work());
-        }));
-        if start {
-            let binding = self.catalog_binding.clone();
-            cx.background_spawn(async move { binding.drain_writes() })
-                .detach();
-        }
+        let written = self
+            .catalog_binding
+            .queue_work(cx.background_executor(), work);
         cx.spawn(async move |this, cx| {
-            let Ok(result) = receiver.recv().await else {
-                return;
-            };
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |state, cx| then(state, result, cx));
+            let result = catalog_work_result(written).await;
+            let _ = this.update(cx, |state, cx| then(state, result, cx));
         })
         .detach();
+    }
+
+    /// Lets the queued catalog writes finish when the app quits, for as long
+    /// as GPUI waits on its quit handlers.
+    pub(super) fn settle_catalog_writes_on_quit(&mut self, cx: &mut Context<Self>) {
+        cx.on_app_quit(|state, _| state.catalog_binding.writes_settled())
+            .detach();
     }
 
     /// Shows a failed catalog write on the error line.
@@ -928,6 +1114,9 @@ impl MusheenApp {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<(), Box<str>> {
+        // A navigation made before the clear whose folder the store has not
+        // answered for yet records no recent after it.
+        self.catalog_binding.note_recents_cleared();
         let binding = self.catalog_binding.clone();
         self.queue_catalog_work(
             cx,
@@ -977,39 +1166,83 @@ impl MusheenApp {
         cx: &mut Context<Self>,
     ) {
         let binding = self.catalog_binding.clone();
-        self.queue_catalog_work(
-            cx,
-            move || binding.apply_tag_delta(&targets, &delta.added, &delta.removed),
-            move |state, result, cx| {
-                let result = result.map(|_| ());
-                if result.is_ok() {
+        let written = self
+            .catalog_binding
+            .queue_work(cx.background_executor(), move || {
+                binding.apply_tag_delta(&targets, &delta.added, &delta.removed)
+            });
+        // The Properties window outlives the window that opened it, so
+        // `done` hears the result whether or not this window is still open.
+        cx.spawn(async move |this, cx| {
+            let result = catalog_work_result(written).await;
+            if result.is_ok() {
+                let _ = this.update(cx, |state, cx| {
                     state.sync_catalog_projection(cx);
-                }
-                cx.notify();
-                cx.defer(move |cx| done(result, cx));
-            },
-        );
+                    cx.notify();
+                });
+            }
+            cx.update(|cx| done(result, cx));
+        })
+        .detach();
     }
 
-    /// Deletes a sidebar tag. The tagged paths' capabilities and the catalog
-    /// write run off the UI thread; a failure shows on the error line.
+    /// Asks the store for the capabilities of the paths that carry `tag`,
+    /// then queues `change`, which reads and writes the catalog inside the
+    /// write queue. A path tagged after the probe is asked inside the job.
+    /// The task gives the receiver of the change's result.
+    fn queue_tag_change(
+        &self,
+        tag: &str,
+        change: impl FnOnce(
+            &CatalogBinding,
+            &mut dyn FnMut(&StorePath) -> CapabilityMatrix,
+        ) -> Result<usize, Box<str>>
+        + Send
+        + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Task<async_channel::Receiver<Result<usize, Box<str>>>> {
+        let paths = self.catalog_binding.tagged_paths(tag);
+        let store = Arc::clone(&self.store);
+        let binding = self.catalog_binding.clone();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            let probed = paths
+                .into_iter()
+                .map(|path| {
+                    let capabilities = store.capabilities(&path);
+                    (path, capabilities)
+                })
+                .collect::<HashMap<_, _>>();
+            let writer = binding.clone();
+            binding.queue_work(&executor, move || {
+                change(&writer, &mut |path: &StorePath| {
+                    probed
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| store.capabilities(path))
+                })
+            })
+        })
+    }
+
+    /// Deletes a sidebar tag. The tagged paths' capabilities are asked off
+    /// the UI thread, then the delete is queued; a failure shows on the
+    /// error line.
     pub(super) fn delete_captured_tag(
         &mut self,
         target: &CommandTargetRef,
         cx: &mut Context<Self>,
     ) -> Result<(), Box<str>> {
         let tag = self.catalog_binding.tag_name_from_target(target)?;
-        let store = Arc::clone(&self.store);
-        let binding = self.catalog_binding.clone();
-        let work = cx.background_spawn(async move {
-            binding.delete_tag(&tag, |path| store.capabilities(path))
-        });
+        let deleted = tag.clone();
+        let written = self.queue_tag_change(
+            &tag,
+            move |binding, capabilities| binding.delete_tag(&deleted, capabilities),
+            cx,
+        );
         cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |state, cx| {
+            let result = catalog_work_result(written.await).await;
+            let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(_) => state.sync_catalog_projection(cx),
                     Err(error) => state.operation_error = Some(error),
@@ -1021,8 +1254,8 @@ impl MusheenApp {
         Ok(())
     }
 
-    /// Renames a sidebar tag. The tagged paths' capabilities and the catalog
-    /// write run off the UI thread; `done` hears the result.
+    /// Renames a sidebar tag. The tagged paths' capabilities are asked off
+    /// the UI thread, then the rename is queued; `done` hears the result.
     pub(super) fn rename_catalog_tag(
         &mut self,
         old: &str,
@@ -1030,31 +1263,31 @@ impl MusheenApp {
         cx: &mut Context<Self>,
         done: impl FnOnce(Result<(), Box<str>>, &mut App) + 'static,
     ) {
-        let store = Arc::clone(&self.store);
-        let binding = self.catalog_binding.clone();
-        let (old, new) = (old.to_owned(), new.to_owned());
-        let work = cx.background_spawn(async move {
-            binding.rename_tag(&old, &new, |path| store.capabilities(path))
-        });
+        let (renamed, name) = (old.to_owned(), new.to_owned());
+        let written = self.queue_tag_change(
+            old,
+            move |binding, capabilities| binding.rename_tag(&renamed, &name, capabilities),
+            cx,
+        );
+        // The rename window outlives the window that opened it, so `done`
+        // hears the result whether or not this window is still open.
         cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |state, cx| {
-                let result = result.and_then(|changed| {
+            let result = catalog_work_result(written.await)
+                .await
+                .and_then(|changed| {
                     if changed == 0 {
                         Err(Box::<str>::from("the captured tag no longer exists"))
                     } else {
                         Ok(())
                     }
                 });
-                if result.is_ok() {
+            if result.is_ok() {
+                let _ = this.update(cx, |state, cx| {
                     state.sync_catalog_projection(cx);
-                }
-                cx.notify();
-                cx.defer(move |cx| done(result, cx));
-            });
+                    cx.notify();
+                });
+            }
+            cx.update(|cx| done(result, cx));
         })
         .detach();
     }
@@ -1089,43 +1322,64 @@ impl MusheenApp {
     }
 
     /// Asks the store whether each pin still resolves, on a background
-    /// executor, and records the answers in the catalog. One runs at a time;
-    /// a request while one runs asks for one more when it ends.
+    /// executor, and queues each answer's catalog write as it comes. A pin
+    /// is asked once at a time and at most `PIN_PROBES_LIMIT` pins at once,
+    /// so a pin on a store that never answers holds one background thread
+    /// and the other pins are still checked.
     pub(super) fn reconcile_pins(&mut self, cx: &mut Context<Self>) {
-        if self.pins_reconciling {
-            self.pins_reconcile_again = true;
-            return;
+        for pin in self.catalog_binding.snapshot().pins().entries() {
+            let key = (pin.item().clone(), pin.path_hint().clone());
+            if !self.pin_probes.contains(&key) && !self.pins_waiting.contains(&key) {
+                self.pins_waiting.push_back(key);
+            }
         }
-        self.pins_reconciling = true;
-        let store = Arc::clone(&self.store);
-        let binding = self.catalog_binding.clone();
-        let work = cx.background_spawn(async move {
-            binding.reconcile_pins(|path| {
-                store
-                    .resolve_item(path)
-                    .map_err(|error| Box::<str>::from(error.to_string()))
-            })
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let Some(this) = this.upgrade() else {
+        self.start_pin_probes(cx);
+    }
+
+    /// Starts probes for the waiting pins while fewer than
+    /// `PIN_PROBES_LIMIT` run.
+    fn start_pin_probes(&mut self, cx: &mut Context<Self>) {
+        while self.pin_probes.len() < PIN_PROBES_LIMIT {
+            let Some((item, path)) = self.pins_waiting.pop_front() else {
                 return;
             };
-            this.update(cx, |state, cx| {
-                state.pins_reconciling = false;
-                if let Err(error) = result {
-                    state.operation_error = Some(error);
-                }
-                if state.catalog_binding.revision() != state.catalog_projection_revision {
-                    state.project_catalog();
-                }
-                if std::mem::take(&mut state.pins_reconcile_again) {
-                    state.reconcile_pins(cx);
-                }
-                cx.notify();
+            let key = (item.clone(), path.clone());
+            self.pin_probes.insert(key.clone());
+            let store = Arc::clone(&self.store);
+            let binding = self.catalog_binding.clone();
+            let executor = cx.background_executor().clone();
+            let probe = cx.background_spawn(async move {
+                let found = store
+                    .resolve_item(&path)
+                    .map_err(|error| Box::<str>::from(error.to_string()));
+                let writer = binding.clone();
+                binding.queue_work(&executor, move || {
+                    writer.record_pin_resolution(&item, &path, found)
+                })
             });
-        })
-        .detach();
+            cx.spawn(async move |this, cx| {
+                let written = probe.await;
+                // The probe's thread is free again, so the next pin starts.
+                let open = this.update(cx, |state, cx| {
+                    state.pin_probes.remove(&key);
+                    state.start_pin_probes(cx);
+                });
+                if open.is_err() {
+                    return;
+                }
+                let result = catalog_work_result(written).await;
+                let _ = this.update(cx, |state, cx| {
+                    if let Err(error) = result {
+                        state.operation_error = Some(error);
+                    }
+                    if state.catalog_binding.revision() != state.catalog_projection_revision {
+                        state.project_catalog();
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// Shows the catalog's current document: pins, tag names, tag filters
@@ -1212,7 +1466,8 @@ impl MusheenApp {
 
     /// Runs `then` with the folder identity of `location` and of its parent:
     /// now when the store already answered for both, or once it has, on a
-    /// background executor.
+    /// background executor. A location already being resolved is not asked
+    /// again; `then` waits for that answer.
     pub(super) fn with_folder_identities(
         &mut self,
         location: StorePath,
@@ -1226,31 +1481,38 @@ impl MusheenApp {
         ) + 'static,
     ) {
         let parent = Self::parent_location(&location);
-        let missing = std::iter::once(location.clone())
+        let paths = std::iter::once(location.clone())
             .chain(parent.clone())
-            .filter(|path| !self.folder_identities.contains_key(path))
             .collect::<Vec<_>>();
-        if missing.is_empty() {
-            let identity = self.folder_identity(&location);
-            let parent_identity = parent.as_ref().and_then(|path| self.folder_identity(path));
-            then(self, location, identity, parent_identity, cx);
-            return;
-        }
-        let store = Arc::clone(&self.store);
-        let work = cx.background_spawn(async move { resolve_folder_identities(&*store, missing) });
-        cx.spawn(async move |this, cx| {
-            let resolved = work.await;
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |state, cx| {
-                state.remember_folder_identities(resolved);
+        let run: FolderIdentityWaiter =
+            Box::new(move |state: &mut Self, cx: &mut Context<Self>| {
                 let identity = state.folder_identity(&location);
                 let parent_identity = parent.as_ref().and_then(|path| state.folder_identity(path));
                 then(state, location, identity, parent_identity, cx);
             });
-        })
-        .detach();
+        self.request_folder_identities(paths.clone(), cx);
+        if paths
+            .iter()
+            .any(|path| self.folder_identities_in_flight.contains(path))
+        {
+            self.folder_identity_waiters.push((paths, run));
+        } else {
+            run(self, cx);
+        }
+    }
+
+    /// Runs the waiters whose locations the store has answered for.
+    fn run_folder_identity_waiters(&mut self, cx: &mut Context<Self>) {
+        for (paths, run) in std::mem::take(&mut self.folder_identity_waiters) {
+            if paths
+                .iter()
+                .any(|path| self.folder_identities_in_flight.contains(path))
+            {
+                self.folder_identity_waiters.push((paths, run));
+            } else {
+                run(self, cx);
+            }
+        }
     }
 
     /// Asks the store, in the background, for the identities of the
@@ -1284,6 +1546,7 @@ impl MusheenApp {
                     state.folder_identities_in_flight.remove(path);
                 }
                 state.remember_folder_identities(resolved);
+                state.run_folder_identity_waiters(cx);
                 cx.notify();
             });
         })
@@ -1293,7 +1556,10 @@ impl MusheenApp {
     /// Keeps the store's answers. A tab whose folder now has another
     /// identity than the one its view preferences came from takes that
     /// folder's catalog preferences.
-    fn remember_folder_identities(&mut self, resolved: Vec<(StorePath, Option<FolderIdentity>)>) {
+    pub(super) fn remember_folder_identities(
+        &mut self,
+        resolved: Vec<(StorePath, Option<FolderIdentity>)>,
+    ) {
         let before = resolved
             .iter()
             .map(|(path, _)| (path.clone(), self.folder_identity(path)))
@@ -1316,37 +1582,51 @@ impl MusheenApp {
 
     /// Records a visit to `location` in the catalog: its remembered location
     /// and, with a label, a recent location. The identities are resolved
-    /// and the catalog is written off the UI thread.
+    /// and the catalog is written off the UI thread. Recents keep
+    /// navigation order: a recent whose folder answers after a later
+    /// navigation's goes below it, and one made before a clear is left out.
     pub(super) fn remember_folder_location(
         &mut self,
         location: StorePath,
         recent_label: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.with_folder_identities(location, cx, |state, location, identity, parent, cx| {
-            let Some(identity) = identity else {
-                return;
-            };
-            let binding = state.catalog_binding.clone();
-            state.queue_catalog_work(
-                cx,
-                move || {
-                    binding.update(|document| {
-                        if let Some(label) = recent_label {
-                            document.recents_mut().record(
-                                identity.clone(),
-                                location.clone(),
-                                label,
-                            );
-                        }
-                        document
-                            .folder_preferences_mut()
-                            .remember_location(identity, location, parent);
-                    })
-                },
-                MusheenApp::report_catalog_error,
-            );
-        });
+        let sequence = recent_label
+            .is_some()
+            .then(|| self.catalog_binding.next_recent_sequence());
+        self.with_folder_identities(
+            location,
+            cx,
+            move |state, location, identity, parent, cx| {
+                let Some(identity) = identity else {
+                    return;
+                };
+                let recent = recent_label.and_then(|label| {
+                    let newer = state.catalog_binding.claim_recent(sequence?, &identity)?;
+                    Some((label, newer))
+                });
+                let binding = state.catalog_binding.clone();
+                state.queue_catalog_work(
+                    cx,
+                    move || {
+                        binding.update(|document| {
+                            if let Some((label, newer)) = recent {
+                                document.recents_mut().record_before(
+                                    &newer,
+                                    identity.clone(),
+                                    location.clone(),
+                                    label,
+                                );
+                            }
+                            document
+                                .folder_preferences_mut()
+                                .remember_location(identity, location, parent);
+                        })
+                    },
+                    MusheenApp::report_catalog_error,
+                );
+            },
+        );
     }
 
     pub(super) fn preferences_with_catalog(
@@ -1355,6 +1635,10 @@ impl MusheenApp {
         base: crate::views::ViewPreferences,
         catalog: &CatalogDocument,
     ) -> crate::views::ViewPreferences {
+        // A view change still on its way to the catalog wins over it.
+        if self.pending_view_preferences.contains_key(location) {
+            return base;
+        }
         let Some(identity) = self.folder_identity(location) else {
             return base;
         };
@@ -1728,23 +2012,38 @@ impl MusheenApp {
     }
 
     /// Removes a reviewed orphan's tags unless the store finds the item
-    /// again. The store call and the catalog write run off the UI thread.
+    /// again. The store call runs off the UI thread, then the catalog write
+    /// is queued. A second request while one runs is ignored.
     pub(super) fn cleanup_reviewed_orphan(&mut self, item: ItemId, cx: &mut Context<Self>) {
+        if !self.orphan_cleanups.insert(item.clone()) {
+            return;
+        }
         let store = Arc::clone(&self.store);
         let binding = self.catalog_binding.clone();
-        let work = cx.background_spawn(async move {
-            binding.cleanup_reviewed_orphan(&item, |path| {
-                store
-                    .resolve_item(path)
-                    .map_err(|error| Box::<str>::from(error.to_string()))
+        let executor = cx.background_executor().clone();
+        let reviewed = item.clone();
+        let probe = cx.background_spawn(async move {
+            let path = match binding.orphan_path(&reviewed) {
+                Ok(Some(path)) => path,
+                outcome => {
+                    let (sender, receiver) = async_channel::bounded(1);
+                    let _ =
+                        sender.try_send(outcome.map(|_| OrphanCleanupOutcome::NoLongerOrphaned));
+                    return receiver;
+                }
+            };
+            let found = store
+                .resolve_item(&path)
+                .map_err(|error| Box::<str>::from(error.to_string()));
+            let writer = binding.clone();
+            binding.queue_work(&executor, move || {
+                writer.finish_orphan_cleanup(&reviewed, &path, found)
             })
         });
         cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let Some(this) = this.upgrade() else {
-                return;
-            };
-            this.update(cx, |state, cx| {
+            let result = catalog_work_result(probe.await).await;
+            let _ = this.update(cx, |state, cx| {
+                state.orphan_cleanups.remove(&item);
                 match result {
                     Ok(OrphanCleanupOutcome::Removed | OrphanCleanupOutcome::StillPresent) => {
                         state.sync_catalog_projection(cx);
@@ -1765,6 +2064,18 @@ impl MusheenApp {
         })
         .detach();
     }
+}
+
+/// The result of queued catalog work: an error when the work stopped
+/// without one, as a job that panicked does.
+pub(super) async fn catalog_work_result<T>(
+    written: async_channel::Receiver<Result<T, Box<str>>>,
+) -> Result<T, Box<str>> {
+    written.recv().await.unwrap_or_else(|_| {
+        Err(Box::<str>::from(
+            "the catalog write stopped before it finished",
+        ))
+    })
 }
 
 /// Resolves folder identities at the store. Runs on a background executor.
@@ -2675,6 +2986,157 @@ mod tests {
         assert!(
             queue.push(Box::new(|| {})),
             "a drained queue asks for a new drain"
+        );
+    }
+
+    // UXF-023: while one queued write waits, as a write waiting on another
+    // process's catalog lock does, writes queued from other threads wait in
+    // the queue and hold no thread of their own.
+    #[test]
+    fn ui_thread_a_waiting_write_keeps_the_queue_on_one_thread() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        let queue = CatalogWriteQueue::default();
+        let started = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        {
+            let (started, order) = (Arc::clone(&started), Arc::clone(&order));
+            assert!(queue.push(Box::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+                order.lock().unwrap().push(0);
+            })));
+        }
+        let drain = {
+            let queue = queue.clone();
+            std::thread::spawn(move || queue.drain())
+        };
+        entered_rx.recv().unwrap();
+        let pushers = (1..=8)
+            .map(|number| {
+                let (queue, started, order) =
+                    (queue.clone(), Arc::clone(&started), Arc::clone(&order));
+                std::thread::spawn(move || {
+                    queue.push(Box::new(move || {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        order.lock().unwrap().push(number);
+                    }))
+                })
+            })
+            .collect::<Vec<_>>();
+        for pusher in pushers {
+            assert!(
+                !pusher.join().unwrap(),
+                "the running drain takes the write; no new thread starts"
+            );
+        }
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "only the waiting write has started"
+        );
+        release.send(()).unwrap();
+        drain.join().unwrap();
+        let order = order.lock().unwrap();
+        assert_eq!(order.len(), 9, "every queued write runs");
+        assert_eq!(order[0], 0, "the waiting write lands first");
+    }
+
+    // UXF-023: the queue settles once the writes queued before the question
+    // have run; an idle queue is settled at once. Quitting waits on this.
+    #[test]
+    fn ui_thread_catalog_write_queue_settles_after_its_last_write() {
+        use futures_lite::future::{block_on, poll_once};
+        let queue = CatalogWriteQueue::default();
+        assert!(
+            block_on(poll_once(Box::pin(queue.settled()))).is_some(),
+            "an idle queue is settled"
+        );
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        assert!(queue.push(Box::new(move || {
+            released.recv().unwrap();
+        })));
+        let mut settled = Box::pin(queue.settled());
+        assert!(
+            block_on(poll_once(&mut settled)).is_none(),
+            "a queue with a write left is not settled"
+        );
+        let drain = {
+            let queue = queue.clone();
+            std::thread::spawn(move || queue.drain())
+        };
+        release.send(()).unwrap();
+        drain.join().unwrap();
+        block_on(settled);
+    }
+
+    // UXF-023: a tag rename and a tag delete queued while another process
+    // holds the catalog lock both apply once it is released, because each
+    // reads the catalog inside the queue after the write before it.
+    #[test]
+    fn ui_thread_queued_tag_rename_and_delete_both_apply_after_the_lock_is_released() {
+        let temporary = tempfile::tempdir().unwrap();
+        let catalog_path = temporary.path().join("catalog.json");
+        let store = musheen_desktop::CatalogStore::at(&catalog_path);
+        let tagged = item("local", b"tagged");
+        let path = StorePath::from_unix_path("/tagged");
+        let mut document = musheen_desktop::CatalogDocument::default();
+        document
+            .tags_mut()
+            .assign(&tagged, path.clone(), "Work")
+            .unwrap();
+        document.tags_mut().assign(&tagged, path, "Old").unwrap();
+        store.save(&document).unwrap();
+        let binding = CatalogBinding::persistent(store, document);
+
+        let mut lock_path = catalog_path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_file = filesystem::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&lock_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let results = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queue_change = |change: fn(&CatalogBinding) -> Result<usize, Box<str>>| {
+            let binding = binding.clone();
+            let results = std::sync::Arc::clone(&results);
+            std::thread::spawn(move || {
+                let writer = binding.clone();
+                let starts_drain = binding.writes.push(Box::new(move || {
+                    results.lock().unwrap().push(change(&writer));
+                }));
+                if starts_drain {
+                    binding.writes.drain();
+                }
+            })
+        };
+        let rename = queue_change(|binding| {
+            binding.rename_tag("Work", "Projects", |_| capabilities(true, false))
+        });
+        let delete =
+            queue_change(|binding| binding.delete_tag("Old", |_| capabilities(true, false)));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(lock_file);
+        rename.join().unwrap();
+        delete.join().unwrap();
+
+        let results = results.lock().unwrap();
+        assert!(
+            results.len() == 2 && results.iter().all(Result::is_ok),
+            "both changes apply: {results:?}"
+        );
+        assert_eq!(
+            binding.snapshot().tags().tags_for(&tagged),
+            [Box::<str>::from("Projects")]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
         );
     }
 }

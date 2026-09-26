@@ -31,6 +31,48 @@ fn tags(names: &[&str]) -> BTreeSet<Box<str>> {
     names.iter().map(|name| Box::<str>::from(*name)).collect()
 }
 
+// UXF-023: a visit whose folder identity arrives after a later visit's was
+// recorded goes below that later visit, not above it.
+#[test]
+fn a_late_recent_goes_below_the_newer_visits() {
+    let first = location("local", b"first");
+    let second = location("local", b"second");
+    let third = location("local", b"third");
+    let mut recents = RecentLocations::default();
+    recents.record(first.clone(), path(b"/first"), "First");
+    recents.record(third.clone(), path(b"/third"), "Third");
+
+    recents.record_before(
+        std::slice::from_ref(&third),
+        second.clone(),
+        path(b"/second"),
+        "Second",
+    );
+    let order = |recents: &RecentLocations| {
+        recents
+            .entries()
+            .iter()
+            .map(|entry| entry.identity().clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        order(&recents),
+        [third.clone(), second.clone(), first.clone()]
+    );
+
+    recents.record_before(
+        std::slice::from_ref(&third),
+        third.clone(),
+        path(b"/third"),
+        "Third",
+    );
+    assert_eq!(
+        order(&recents),
+        [third, second, first],
+        "a folder a newer visit recorded keeps its place"
+    );
+}
+
 #[test]
 fn fallback_tags_follow_identity_not_reused_paths() {
     let original = item("local", b"inode:41");
