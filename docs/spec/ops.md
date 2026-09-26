@@ -109,6 +109,12 @@ Falsifier: an archive credential appears in settings, logs, errors, or operation
 Mechanism: encrypted round-trip test plus captured-log and persistence scan.
 Status: Draft
 
+[OPS-033] Extract… asks for a destination folder and queues one extract operation that writes the archive's entries into that folder, with the same limits, path checks, and conflict policy as Extract Here.
+Falsifier: choosing a writable local folder for Extract… queues no extraction, writes the entries anywhere but that folder, or replaces an item already in it.
+Mechanism: ops-033
+Rationale: docs/opus-audit-2.md 4.5: Extract… was refused after its destination picker because only Copy To and Move To accepted a picked destination.
+Status: Agreed 2026-09-26
+
 ## Creation
 
 [OPS-018] The create action supports empty files and directories through one queued operation after validating the proposed name against the destination store.

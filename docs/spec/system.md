@@ -135,20 +135,34 @@ Falsifier: a remote request waits without a deadline or blindly retries a non-id
 Mechanism: timeout and retry-policy tests for reads, creates, moves, and deletes.
 Status: Draft
 
-[SYS-024] Remote credentials live in the desktop secret service and never appear in URLs, settings files, logs, notifications, or error text.
-Falsifier: a captured credential appears in any listed output or persisted location.
-Mechanism: credential-flow integration test with captured storage and diagnostic outputs.
-Status: Draft
+[SYS-024] Remote credentials live in the desktop secret service and never appear in URLs, settings files, logs, notifications, or error text. The connection editor takes a connection's password. Test connection uses the password typed, or the stored one when the field is empty. Saving stores the password in the secret service under the connection's ID and writes only its reference to the settings file; browsing the saved connection logs in with it; saving with the password field empty keeps the stored password; and removing the connection deletes it from the secret service.
+Falsifier: Test connection or the saved connection's browse login does not receive the password typed in the editor, saving with the password field empty loses the stored password, the password stays in the secret service after its connection is removed, or the password appears in the settings file, a connection URL, an error text, or the debug rendering of a profile or credential.
+Mechanism: sys-024
+Rationale: 1.x mechanism: credential-flow integration test with captured storage and diagnostic outputs; docs/opus-audit-2.md 4.5: nothing in the app could store a password, so a saved connection that needs one could not log in unless another tool had put it in the keyring.
+Status: Agreed 2026-09-26
 
 [SYS-025] Each remote provider maps its actual read, write, rename, link, trash, watch, metadata, and atomic-publication support into the core capability matrix before browser commands are enabled.
 Falsifier: a remote command is enabled from protocol name alone and then fails for a known unsupported capability.
 Mechanism: provider contract fixtures per supported protocol and server capability set.
 Status: Draft
 
-[SYS-026] If the desktop secret service is unavailable or locked, Musheen may use a session-only credential after consent but never stores it in settings or URLs.
-Falsifier: secret-service failure silently writes a credential elsewhere or prevents the user from choosing session-only use.
-Mechanism: locked, missing, cancelled, session-only, and restored-service tests.
-Status: Draft
+[SYS-026] If the desktop secret service is unavailable or locked when a connection is saved, the connection editor offers session-only use of its password. After the user chooses it, the password stays in memory until Musheen exits, serves Test connection and browsing, and is never written to settings, URLs, or any file.
+Falsifier: a secret-service failure silently writes a credential elsewhere or leaves the user no session-only choice, or a password chosen for session-only use does not reach the saved connection's browse login or is written to the settings file.
+Mechanism: sys-026
+Rationale: 1.x mechanism: locked, missing, cancelled, session-only, and restored-service tests.
+Status: Agreed 2026-09-26
+
+[SYS-031] Test connection passes only when browsing can open the connection and list its root, using the same host, port, TLS mode, and credentials, and a failed test names its cause. The connection editor offers only the protocols and settings browsing can open; FTPS uses explicit TLS (AUTH TLS) on port 21 unless the connection names another port. A saved connection that browsing cannot open stays in Settings with the reason and is not listed under Network.
+Falsifier: a connection passes Test connection while browsing cannot open it or list its root, or fails the test while browsing can; the editor offers a protocol or setting that browsing refuses; a failed test does not name its cause; or Network lists a saved connection that browsing refuses.
+Mechanism: sys-031
+Rationale: docs/opus-audit-2.md 4.5: the FTPS test used implicit TLS on port 990 while browsing sent AUTH TLS, every browse store refused the proxies the editor offered, and the SFTP test always failed.
+Status: Agreed 2026-09-26
+
+[SYS-032] An SFTP connection logs in with the method its profile selects: a password, the keys held by the running SSH agent, a private key file, or a private key stored in the secret service. An encrypted key's passphrase is kept like a password under SYS-024 and SYS-026. An RSA key is used only through the SSH agent, which is asked for a SHA-2 signature; a private key file or stored key must be Ed25519 or ECDSA, and an RSA one is refused with a message that points to the agent. When the connection's host names a Host entry in ~/.ssh/config, that entry's HostName and ProxyJump apply, and its User, Port, and IdentityFile fill the fields the profile leaves empty. The server's key must pass the connection's host-key policy, and each jump host's key must match known_hosts.
+Falsifier: an SFTP login does not offer the selected password, agent key, or Ed25519 or ECDSA private key to a server that accepts it; an agent-held RSA key is asked for a SHA-1 signature; Musheen itself signs with an RSA key file or stored RSA key; a passphrase or a stored key is written anywhere but the secret service; a Host entry's HostName, User, Port, IdentityFile, or ProxyJump is ignored; or a connection goes through a jump host whose key does not match known_hosts.
+Mechanism: sys-032
+Rationale: the developer asked for key login on 2026-09-26 and ruled RSA to the agent only, because the rsa crate carries the unpatched timing advisory RUSTSEC-2023-0071; the SFTP code accepted only an unencrypted key placed in the keyring by another tool and read ~/.ssh/config only on a system-ssh path that the test never used.
+Status: Agreed 2026-09-26
 
 ## Portals and privilege
 
