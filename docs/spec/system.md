@@ -164,6 +164,12 @@ Mechanism: sys-032
 Rationale: the developer asked for key login on 2026-09-26 and ruled RSA to the agent only, because the rsa crate carries the unpatched timing advisory RUSTSEC-2023-0071; the SFTP code accepted only an unencrypted key placed in the keyring by another tool and read ~/.ssh/config only on a system-ssh path that the test never used.
 Status: Agreed 2026-09-26
 
+[SYS-033] Each saved connection names its own credential, and Settings has no global remote credential. A settings file that still holds the global value from an older build loads with every setting and connection intact and keeps that value unread. A connection that refers to that secret still logs in with it.
+Falsifier: Settings shows, searches or edits a global remote credential; a settings file that holds one fails to load or loses a setting or a connection; or a connection that refers to the old global secret no longer logs in, or loses its reference when saved.
+Mechanism: sys-033
+Rationale: since remote-usable-extract each connection stores its own password under its ID, so the global remote.credential setting was shown on the Integrations page but read by nothing (adversary report 4c4ba543 finding 18, backlog item retire-global-remote-credential); the developer agreed this text on 2026-09-26.
+Status: Agreed 2026-09-26
+
 ## Portals and privilege
 
 [SYS-027] When enabled in Integrations settings, Musheen serves the FileChooser portal backend through `ashpd::backend`, returns only user-confirmed selections, and remains separate from its portal-client path.

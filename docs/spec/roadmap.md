@@ -229,3 +229,20 @@ fail receipt 75755a98 for the revised text), no test reads the user's
 keyring or ~/.ssh, the workspace tests, cargo fmt --check and clippy with
 warnings denied are clean, and every finding of the review and the report
 is resolved or declined.
+
+## retire-global-remote-credential
+
+Requirements: SYS-033
+
+Retire the global remote.credential setting (backlog item
+retire-global-remote-credential, adversary report 4c4ba543 finding 18).
+Each connection stores its own password under its ID, so the setting is
+shown on the Integrations page and in settings search but read by nothing.
+It leaves the settings schema, the page, settings search and the three
+locales, with the document helpers that only it used. A settings file an
+older build wrote with the value still loads: the document keeps an
+unknown key as it is, and a connection that refers to that secret keeps
+its reference and logs in with it. Done when the sys-033 check passes on
+the final tree, the workspace tests, cargo fmt --check and clippy with
+warnings denied are clean, and every finding of the review and the report
+is resolved or declined.
