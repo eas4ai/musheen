@@ -1327,3 +1327,18 @@ fn sync_tree(root: &Path) -> Result<(), ArchiveOperationError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_cost_decoding_has_no_time_limit() {
+        // The entry, size, ratio, path, memory and temporary-space limits
+        // bound an extraction, and Cancel stops it (OPS-034).
+        assert_eq!(
+            decode_limits(&ArchiveOperationLimits::default()).max_elapsed,
+            Duration::MAX
+        );
+    }
+}
