@@ -31,7 +31,7 @@ pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
 };
 pub use elevated_browser::{
-    ElevatedBrowser, ElevatedChrome, PrivilegeBackend, RootedFilesystemStore,
+    ElevatedBrowser, ElevatedChrome, ElevatedSession, PrivilegeBackend, RootedFilesystemStore,
     SystemPrivilegeBackend,
 };
 pub use i18n::{Catalog, CatalogError, Locale};

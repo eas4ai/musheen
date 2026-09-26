@@ -5,14 +5,23 @@ use musheen_core::{
     Store, StoreError, StoreItem, StorePath, TotalHint,
 };
 use musheen_desktop::{
-    BrokerDirectoryEntry, BrokerError, BrokerLaunch, BrokerOutput, BrokerRequest, BrokerTransport,
-    Clock, ElevatedRootReference, INSTALLED_BROKER_PATH, PrivilegeProvider, ProcessBrokerTransport,
-    RootedEntryKind, RootedStore, SecretBuffer, SudoPtyBrokerTransport,
+    BrokerDirectoryEntry, BrokerError, BrokerLaunch, BrokerOutput, BrokerRequest, BrokerSession,
+    BrokerTransport, Clock, ElevatedRootReference, INSTALLED_BROKER_PATH, PrivilegeProvider,
+    ProcessBrokerTransport, RootedEntryKind, RootedStore, SecretBuffer, SudoPtyBrokerTransport,
 };
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// One entry of a listing: name, identity, kind, size and modification time.
+type ListedEntry = (
+    OsString,
+    [u8; 16],
+    RootedEntryKind,
+    Option<u64>,
+    Option<i64>,
+);
 
 pub struct ElevatedBrowser<C> {
     store: Arc<RootedStore<C>>,
@@ -72,8 +81,10 @@ pub struct RootedFilesystemStore<C> {
     root: PathBuf,
     root_identity: Box<[u8]>,
     store: Option<Arc<RootedStore<C>>>,
-    root_reference: Option<ElevatedRootReference>,
-    backend: Option<Arc<dyn PrivilegeBackend>>,
+    session: Option<Arc<dyn ElevatedSession>>,
+    /// The last listing fetched through the session, which serves that
+    /// folder's later pages without asking the broker again.
+    listing: Mutex<Option<(PathBuf, Arc<[ListedEntry]>)>>,
 }
 
 impl<C: Clock> RootedFilesystemStore<C> {
@@ -86,24 +97,67 @@ impl<C: Clock> RootedFilesystemStore<C> {
             root,
             root_identity,
             store: Some(Arc::new(store)),
-            root_reference: None,
-            backend: None,
+            session: None,
+            listing: Mutex::new(None),
         }
     }
 
+    /// The store of an elevated window, whose listings go through the
+    /// window's broker session. Dropping the store ends the session.
     #[must_use]
-    pub fn remote(
-        root_reference: ElevatedRootReference,
-        backend: Arc<dyn PrivilegeBackend>,
-    ) -> Self {
+    pub fn remote(session: Arc<dyn ElevatedSession>) -> Self {
+        let root_reference = session.root_reference();
         Self {
             provider: ProviderId::new("local").expect("the built-in provider ID is valid"),
             root: root_reference.root().to_path_buf(),
             root_identity: root_reference.identity().to_vec().into_boxed_slice(),
             store: None,
-            root_reference: Some(root_reference),
-            backend: Some(backend),
+            listing: Mutex::new(None),
+            session: Some(session),
         }
+    }
+
+    /// Lists `relative` through the session. A continuation page of the
+    /// folder listed last comes from that listing.
+    async fn session_listing(
+        &self,
+        session: &Arc<dyn ElevatedSession>,
+        relative: &Path,
+        continued: bool,
+        cancellation: CancellationToken,
+    ) -> Result<Arc<[ListedEntry]>, StoreError> {
+        if continued
+            && let Some((listed, entries)) = self
+                .listing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            && listed == relative
+        {
+            return Ok(Arc::clone(entries));
+        }
+        let entries = session
+            .read_directory(
+                session.root_reference().clone(),
+                relative.to_path_buf(),
+                cancellation,
+            )
+            .await
+            .map_err(Self::map_error)?
+            .into_iter()
+            .map(|entry| {
+                (
+                    OsString::from_vec(entry.name().to_vec()),
+                    *entry.identity(),
+                    entry.kind(),
+                    entry.size(),
+                    entry.modified_unix_seconds(),
+                )
+            })
+            .collect::<Arc<[_]>>();
+        *self.listing.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((relative.to_path_buf(), Arc::clone(&entries)));
+        Ok(entries)
     }
 
     #[must_use]
@@ -185,7 +239,7 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
         Box::pin(async move {
             cancellation.check()?;
             let relative = self.relative(location)?;
-            let entries = if let Some(store) = &self.store {
+            let entries: Arc<[ListedEntry]> = if let Some(store) = &self.store {
                 store
                     .read_directory(&relative)
                     .map_err(Self::map_error)?
@@ -199,31 +253,19 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
                             entry.modified_unix_seconds(),
                         )
                     })
-                    .collect::<Vec<_>>()
+                    .collect()
             } else {
-                let root_reference = self
-                    .root_reference
-                    .clone()
-                    .ok_or_else(|| StoreError::Backend("missing elevated root reference".into()))?;
-                let backend = self
-                    .backend
+                let session = self
+                    .session
                     .as_ref()
                     .ok_or_else(|| StoreError::Backend("missing elevated broker".into()))?;
-                backend
-                    .read_directory(root_reference, relative.clone(), cancellation.clone())
-                    .await
-                    .map_err(Self::map_error)?
-                    .into_iter()
-                    .map(|entry| {
-                        (
-                            OsString::from_vec(entry.name().to_vec()),
-                            *entry.identity(),
-                            entry.kind(),
-                            entry.size(),
-                            entry.modified_unix_seconds(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                self.session_listing(
+                    session,
+                    &relative,
+                    request.continuation().is_some(),
+                    cancellation.clone(),
+                )
+                .await?
             };
             let total = entries.len();
             let offset = request
@@ -234,7 +276,8 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
             }
             let root = &self.root;
             let items = entries
-                .into_iter()
+                .iter()
+                .cloned()
                 .skip(offset)
                 .take(request.page_size())
                 .map(|(name, identity, entry_kind, size, modified)| {
@@ -331,14 +374,24 @@ impl ElevatedChrome<'_> {
     }
 }
 
-pub trait PrivilegeBackend: Send + Sync + 'static {
-    fn provider(&self) -> PrivilegeProvider;
-    fn perform<'a>(
+/// The broker session of one elevated window (SYS-034): authorized once by
+/// Open as Administrator, it lists folders under the granted root until the
+/// window drops it.
+pub trait ElevatedSession: Send + Sync + 'static {
+    fn root_reference(&self) -> &ElevatedRootReference;
+
+    fn read_directory<'a>(
         &'a self,
-        request: &'a BrokerRequest,
+        root: ElevatedRootReference,
+        relative: PathBuf,
         cancellation: CancellationToken,
-        authentication: Option<SecretBuffer>,
-    ) -> BoxFuture<'a, Result<BrokerOutput, BrokerError>>;
+    ) -> BoxFuture<'a, Result<Vec<BrokerDirectoryEntry>, BrokerError>>;
+}
+
+impl ElevatedSession for BrokerSession {
+    fn root_reference(&self) -> &ElevatedRootReference {
+        BrokerSession::root_reference(self)
+    }
 
     fn read_directory<'a>(
         &'a self,
@@ -346,14 +399,30 @@ pub trait PrivilegeBackend: Send + Sync + 'static {
         relative: PathBuf,
         cancellation: CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<BrokerDirectoryEntry>, BrokerError>> {
-        Box::pin(async move {
-            let request = BrokerRequest::read_directory(root, relative)?;
-            match self.perform(&request, cancellation, None).await? {
-                BrokerOutput::DirectoryEntries(entries) => Ok(entries),
-                _ => Err(BrokerError::BrokerCrashed),
-            }
-        })
+        Box::pin(async move { BrokerSession::read_directory(self, root, &relative, &cancellation) })
     }
+}
+
+pub trait PrivilegeBackend: Send + Sync + 'static {
+    fn provider(&self) -> PrivilegeProvider;
+
+    /// Runs one request under its own authorization, as Run as
+    /// Administrator does.
+    fn perform<'a>(
+        &'a self,
+        request: &'a BrokerRequest,
+        cancellation: CancellationToken,
+        authentication: Option<SecretBuffer>,
+    ) -> BoxFuture<'a, Result<BrokerOutput, BrokerError>>;
+
+    /// Authorizes an Open as Administrator request once and returns the
+    /// session that serves the elevated window's listings.
+    fn open_window<'a>(
+        &'a self,
+        request: &'a BrokerRequest,
+        cancellation: CancellationToken,
+        authentication: Option<SecretBuffer>,
+    ) -> BoxFuture<'a, Result<Arc<dyn ElevatedSession>, BrokerError>>;
 }
 
 pub struct SystemPrivilegeBackend {
@@ -401,6 +470,20 @@ impl PrivilegeBackend for SystemPrivilegeBackend {
         Box::pin(async move {
             self.transport
                 .perform_with_authentication(request, &cancellation, authentication)
+        })
+    }
+
+    fn open_window<'a>(
+        &'a self,
+        request: &'a BrokerRequest,
+        cancellation: CancellationToken,
+        authentication: Option<SecretBuffer>,
+    ) -> BoxFuture<'a, Result<Arc<dyn ElevatedSession>, BrokerError>> {
+        Box::pin(async move {
+            let session = self
+                .transport
+                .open_session(request, &cancellation, authentication)?;
+            Ok(Arc::new(session) as Arc<dyn ElevatedSession>)
         })
     }
 }

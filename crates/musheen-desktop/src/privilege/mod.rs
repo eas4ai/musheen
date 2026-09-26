@@ -1,6 +1,7 @@
 mod broker;
 mod request;
 mod rooted_store;
+mod session;
 
 pub use broker::{
     AuditOutcome, AuditPhase, AuditRecord, AuditSink, AuthorizationError, AuthorizationGrant,
@@ -12,11 +13,14 @@ pub use broker::{
     encode_broker_response,
 };
 pub use request::{
-    ADMIN_ACTION_IDS, BROWSE_DIRECTORY_ACTION_ID, BrokerOperation, BrokerRequest,
-    ConfirmationSummary, OPEN_DIRECTORY_ACTION_ID, PrivilegeProvider, RUN_EXECUTABLE_ACTION_ID,
-    RequestSubject,
+    ADMIN_ACTION_IDS, BrokerOperation, BrokerRequest, ConfirmationSummary,
+    OPEN_DIRECTORY_ACTION_ID, PrivilegeProvider, RUN_EXECUTABLE_ACTION_ID, RequestSubject,
 };
 pub use rooted_store::{
     ElevatedRootReference, RootGrant, RootedDirectoryEntry, RootedEntry, RootedEntryKind,
     RootedStore,
+};
+pub use session::{
+    BROKER_END_FRAME, BrokerSession, ELEVATED_SESSION_IDLE, MAX_REQUEST_LINE_BYTES,
+    MAX_SESSION_LISTING_BYTES, RequestLines, prepare_sudo_terminal, serve_session, write_response,
 };

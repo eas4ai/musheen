@@ -4,17 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::session::{BrokerChannel, BrokerProcess, ChannelError, spawn_output_reader};
 use super::{
-    BrokerOperation, BrokerRequest, ElevatedRootReference, PrivilegeProvider, RequestSubject,
-    RootGrant, RootedEntryKind, RootedStore,
+    BrokerOperation, BrokerRequest, BrokerSession, ElevatedRootReference, PrivilegeProvider,
+    RequestSubject, RootGrant, RootedEntryKind, RootedStore,
 };
 use crate::SecretBuffer;
 use musheen_core::CancellationToken;
@@ -536,6 +537,47 @@ pub trait BrokerTransport: Send + Sync + 'static {
         drop(authentication);
         self.perform_cancellable(request, cancellation)
     }
+
+    /// Authorizes an Open as Administrator request once and keeps its broker
+    /// for the elevated window: the session answers the window's listings
+    /// (SYS-034). A transport that cannot keep a broker refuses.
+    fn open_session(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+        authentication: Option<SecretBuffer>,
+    ) -> Result<BrokerSession, BrokerError> {
+        drop(authentication);
+        let _ = (request, cancellation);
+        Err(BrokerError::AuthorizationUnavailable)
+    }
+}
+
+/// Turns the first answer to an Open as Administrator request into the
+/// window's session.
+fn session_from(
+    request: &BrokerRequest,
+    output: BrokerOutput,
+    channel: BrokerChannel,
+    timeout: Duration,
+) -> Result<BrokerSession, BrokerError> {
+    match (request.operation(), output) {
+        (BrokerOperation::OpenDirectory { target }, BrokerOutput::RootReferenced(root))
+            if root.root() == target =>
+        {
+            Ok(BrokerSession::new(root, channel, timeout))
+        }
+        _ => Err(BrokerError::BrokerCrashed),
+    }
+}
+
+/// Maps a channel that gave no first answer to the transport's error.
+const fn start_error(error: ChannelError) -> BrokerError {
+    match error {
+        ChannelError::Cancelled => BrokerError::AuthorizationCancelled,
+        ChannelError::TimedOut => BrokerError::ExecutionTimedOut,
+        ChannelError::Ended | ChannelError::Oversized => BrokerError::BrokerCrashed,
+    }
 }
 
 #[derive(Clone)]
@@ -572,16 +614,14 @@ impl ProcessBrokerTransport {
     }
 }
 
-impl BrokerTransport for ProcessBrokerTransport {
-    fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError> {
-        self.perform_cancellable(request, &CancellationToken::new())
-    }
-
-    fn perform_cancellable(
+impl ProcessBrokerTransport {
+    /// Starts pkexec with the broker, sends `request`, and waits for the
+    /// broker's first answer. The channel stays open for later requests.
+    fn start(
         &self,
         request: &BrokerRequest,
         cancellation: &CancellationToken,
-    ) -> Result<BrokerOutput, BrokerError> {
+    ) -> Result<(BrokerOutput, BrokerChannel), BrokerError> {
         use std::os::unix::process::CommandExt as _;
         use std::process::Stdio;
 
@@ -593,9 +633,7 @@ impl BrokerTransport for ProcessBrokerTransport {
             return Err(BrokerError::AuthorizationUnavailable);
         }
         let deadline = Instant::now() + self.timeout;
-        if Instant::now() >= deadline {
-            return Err(BrokerError::ExecutionTimedOut);
-        }
+        let encoded = encode_broker_request(request)?;
         let mut child = std::process::Command::new(self.launch.program())
             .args(self.launch.arguments_for(request))
             .env_clear()
@@ -605,35 +643,81 @@ impl BrokerTransport for ProcessBrokerTransport {
             .process_group(0)
             .spawn()
             .map_err(|_| BrokerError::BrokerCrashed)?;
-        let encoded = encode_broker_request(request)?;
-        let mut stdin = child.stdin.take().ok_or(BrokerError::BrokerCrashed)?;
-        stdin
-            .write_all(encoded.as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"))
-            .map_err(|_| BrokerError::BrokerCrashed)?;
-        drop(stdin);
-        loop {
-            if cancellation.is_cancelled() {
+        let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+            kill_and_reap_process_group(&mut child);
+            return Err(BrokerError::BrokerCrashed);
+        };
+        let chunks = match spawn_output_reader(output, 64 * 1024) {
+            Ok(chunks) => chunks,
+            Err(error) => {
                 kill_and_reap_process_group(&mut child);
-                return Err(BrokerError::AuthorizationCancelled);
+                return Err(error);
             }
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Ok(None) => {
-                    kill_and_reap_process_group(&mut child);
-                    return Err(BrokerError::ExecutionTimedOut);
-                }
-                Err(_) => return Err(BrokerError::BrokerCrashed),
+        };
+        let mut channel = BrokerChannel::new(
+            Box::new(input),
+            chunks,
+            Vec::new(),
+            Box::new(PolkitBroker(child)),
+        );
+        if channel.send(&encoded).is_err() {
+            channel.stop_now();
+            return Err(BrokerError::BrokerCrashed);
+        }
+        match channel.next_response(deadline, cancellation) {
+            Ok(response) => Ok((decode_broker_response(&response)?, channel)),
+            Err(error) => {
+                channel.stop_now();
+                Err(start_error(error))
             }
         }
-        let output = child
-            .wait_with_output()
-            .map_err(|_| BrokerError::BrokerCrashed)?;
-        let frame = std::str::from_utf8(&output.stdout).map_err(|_| BrokerError::BrokerCrashed)?;
-        decode_broker_response(frame.trim())
+    }
+}
+
+impl BrokerTransport for ProcessBrokerTransport {
+    fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError> {
+        self.perform_cancellable(request, &CancellationToken::new())
+    }
+
+    fn perform_cancellable(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<BrokerOutput, BrokerError> {
+        self.start(request, cancellation)
+            .map(|(output, _channel)| output)
+    }
+
+    fn open_session(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+        authentication: Option<SecretBuffer>,
+    ) -> Result<BrokerSession, BrokerError> {
+        drop(authentication);
+        if !matches!(request.operation(), BrokerOperation::OpenDirectory { .. }) {
+            return Err(BrokerError::InvalidRequest);
+        }
+        let (output, channel) = self.start(request, cancellation)?;
+        session_from(request, output, channel, self.timeout)
+    }
+}
+
+/// A pkexec-started broker. Once its input closes it exits on its own; one
+/// that has not after two seconds is killed.
+struct PolkitBroker(std::process::Child);
+
+impl BrokerProcess for PolkitBroker {
+    fn end(self: Box<Self>, graceful: bool) {
+        let mut child = self.0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while graceful && Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        kill_and_reap_process_group(&mut child);
     }
 }
 
@@ -673,6 +757,137 @@ impl SudoPtyBrokerTransport {
     }
 }
 
+impl SudoPtyBrokerTransport {
+    /// Starts sudo with the broker on a dedicated pseudoterminal, answers
+    /// its password prompt, sends `request` once the broker is ready, and
+    /// waits for the broker's first answer. The channel stays open for later
+    /// requests.
+    fn start(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+        mut authentication: Option<SecretBuffer>,
+    ) -> Result<(BrokerOutput, BrokerChannel), BrokerError> {
+        let _admission = TransportAdmission::enter(&self.active)?;
+        if cancellation.is_cancelled() {
+            return Err(BrokerError::AuthorizationCancelled);
+        }
+        if authentication.as_ref().is_some_and(|secret| {
+            secret.expose_secret(|bytes| {
+                bytes.len() > 1024
+                    || bytes
+                        .iter()
+                        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+            })
+        }) {
+            return Err(BrokerError::InvalidRequest);
+        }
+        let encoded = encode_broker_request(request)?;
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize::default())
+            .map_err(|_| BrokerError::AuthorizationUnavailable)?;
+        let mut command = portable_pty::CommandBuilder::new(self.launch.program());
+        command.args(self.launch.arguments_for(request));
+        command.env_clear();
+        command.env("LC_ALL", "C");
+        command.env("SUDO_PROMPT", "MUSHEEN_SUDO_PASSWORD:");
+        let child = pty
+            .slave
+            .spawn_command(command)
+            .map_err(|_| BrokerError::AuthorizationUnavailable)?;
+        drop(pty.slave);
+        let process_group = pty.master.process_group_leader();
+        let process = SudoBroker {
+            child,
+            process_group,
+        };
+        let (writer, reader) = match (pty.master.take_writer(), pty.master.try_clone_reader()) {
+            (Ok(writer), Ok(reader)) => (writer, reader),
+            _ => {
+                Box::new(process).end(false);
+                return Err(BrokerError::BrokerCrashed);
+            }
+        };
+        let chunks = match spawn_output_reader(reader, 4096) {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                Box::new(process).end(false);
+                return Err(error);
+            }
+        };
+        let mut channel = BrokerChannel::new(
+            writer,
+            chunks,
+            Vec::new(),
+            Box::new(SudoMaster {
+                process,
+                master: pty.master,
+            }),
+        );
+        let deadline = Instant::now() + self.timeout;
+        let mut request_sent = false;
+        let mut authentication_sent = false;
+        let mut denied = false;
+        let result = 'handshake: loop {
+            if cancellation.is_cancelled() {
+                break Err(BrokerError::AuthorizationCancelled);
+            }
+            if Instant::now() >= deadline {
+                break Err(BrokerError::ExecutionTimedOut);
+            }
+            if channel.receive_chunk(Duration::from_millis(20)).is_err() {
+                break Err(if denied {
+                    BrokerError::AuthorizationDenied
+                } else {
+                    BrokerError::BrokerCrashed
+                });
+            }
+            if channel.pending_output().len() > MAX_BROKER_OUTPUT {
+                break Err(BrokerError::BrokerCrashed);
+            }
+            if !request_sent
+                && channel
+                    .pending_output()
+                    .windows(b"MUSHEEN_SUDO_PASSWORD:".len())
+                    .any(|window| window == b"MUSHEEN_SUDO_PASSWORD:")
+            {
+                if authentication_sent {
+                    break Err(BrokerError::AuthorizationDenied);
+                }
+                let Some(mut secret) = authentication.take() else {
+                    break Err(BrokerError::AuthorizationCancelled);
+                };
+                let written = secret.expose_secret(|bytes| channel.send_bytes(bytes));
+                secret.clear();
+                if written.is_err() {
+                    break Err(BrokerError::BrokerCrashed);
+                }
+                authentication_sent = true;
+                channel.clear_output();
+            }
+            for line in channel.take_lines() {
+                if !request_sent && line == SUDO_BROKER_READY {
+                    if channel.send(&encoded).is_err() {
+                        break 'handshake Err(BrokerError::BrokerCrashed);
+                    }
+                    request_sent = true;
+                } else if line.contains("Sorry, try again.") {
+                    denied = true;
+                } else if request_sent && line.starts_with(BROKER_RESPONSE_FRAME) {
+                    break 'handshake decode_broker_response(&line);
+                }
+            }
+        };
+        match result {
+            Ok(output) => Ok((output, channel)),
+            Err(error) => {
+                channel.stop_now();
+                Err(error)
+            }
+        }
+    }
+}
+
 impl BrokerTransport for SudoPtyBrokerTransport {
     fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError> {
         self.perform_cancellable(request, &CancellationToken::new())
@@ -690,158 +905,82 @@ impl BrokerTransport for SudoPtyBrokerTransport {
         &self,
         request: &BrokerRequest,
         cancellation: &CancellationToken,
-        mut authentication: Option<SecretBuffer>,
+        authentication: Option<SecretBuffer>,
     ) -> Result<BrokerOutput, BrokerError> {
-        let _admission = TransportAdmission::enter(&self.active)?;
-        if cancellation.is_cancelled() {
-            return Err(BrokerError::AuthorizationCancelled);
-        }
-        if authentication.as_ref().is_some_and(|secret| {
-            secret.expose_secret(|bytes| {
-                bytes.len() > 1024
-                    || bytes
-                        .iter()
-                        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
-            })
-        }) {
+        self.start(request, cancellation, authentication)
+            .map(|(output, _channel)| output)
+    }
+
+    fn open_session(
+        &self,
+        request: &BrokerRequest,
+        cancellation: &CancellationToken,
+        authentication: Option<SecretBuffer>,
+    ) -> Result<BrokerSession, BrokerError> {
+        if !matches!(request.operation(), BrokerOperation::OpenDirectory { .. }) {
             return Err(BrokerError::InvalidRequest);
         }
-        let pty = portable_pty::native_pty_system()
-            .openpty(portable_pty::PtySize::default())
-            .map_err(|_| BrokerError::AuthorizationUnavailable)?;
-        let mut command = portable_pty::CommandBuilder::new(self.launch.program());
-        command.args(self.launch.arguments_for(request));
-        command.env_clear();
-        command.env("LC_ALL", "C");
-        command.env("SUDO_PROMPT", "MUSHEEN_SUDO_PASSWORD:");
-        let mut child = pty
-            .slave
-            .spawn_command(command)
-            .map_err(|_| BrokerError::AuthorizationUnavailable)?;
-        drop(pty.slave);
-        let process_group = pty.master.process_group_leader();
-        let mut writer = pty
-            .master
-            .take_writer()
-            .map_err(|_| BrokerError::BrokerCrashed)?;
-        let mut reader = pty
-            .master
-            .try_clone_reader()
-            .map_err(|_| BrokerError::BrokerCrashed)?;
-        let (chunks, incoming) = mpsc::sync_channel::<Vec<u8>>(8);
-        let reader_thread = std::thread::Builder::new()
-            .name("musheen-sudo-pty".to_owned())
-            .spawn(move || {
-                let mut chunk = [0_u8; 4096];
-                loop {
-                    match reader.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(length) if chunks.send(chunk[..length].to_vec()).is_err() => break,
-                        Ok(_) => {}
-                    }
-                }
-            })
-            .map_err(|_| BrokerError::BrokerCrashed)?;
-        let deadline = Instant::now() + self.timeout;
-        let encoded = encode_broker_request(request)?;
-        let mut buffer = Vec::new();
-        let mut request_sent = false;
-        let mut authentication_sent = false;
-        let mut denied = false;
-        let mut child_exit_deadline = None;
-        let result = 'transport: loop {
-            if cancellation.is_cancelled() {
-                break Err(BrokerError::AuthorizationCancelled);
+        let (output, channel) = self.start(request, cancellation, authentication)?;
+        session_from(request, output, channel, self.timeout)
+    }
+}
+
+/// A sudo-started broker and its process group. It ends when the session's
+/// end line arrives or its terminal closes; one still running after two
+/// seconds is killed.
+struct SudoBroker {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    process_group: Option<i32>,
+}
+
+impl SudoBroker {
+    /// Waits up to two seconds for the broker to exit; true when it did.
+    fn exited_within_grace(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return true,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             }
-            if Instant::now() >= deadline {
-                break Err(BrokerError::ExecutionTimedOut);
-            }
-            match incoming.recv_timeout(Duration::from_millis(20)) {
-                Ok(chunk) => {
-                    buffer.extend_from_slice(&chunk);
-                    if buffer.len() > MAX_BROKER_OUTPUT {
-                        break Err(BrokerError::BrokerCrashed);
-                    }
-                    if buffer
-                        .windows(b"MUSHEEN_SUDO_PASSWORD:".len())
-                        .any(|window| window == b"MUSHEEN_SUDO_PASSWORD:")
-                    {
-                        if authentication_sent {
-                            break Err(BrokerError::AuthorizationDenied);
-                        }
-                        let Some(mut secret) = authentication.take() else {
-                            break Err(BrokerError::AuthorizationCancelled);
-                        };
-                        let write_result = secret.expose_secret(|bytes| {
-                            writer
-                                .write_all(bytes)
-                                .and_then(|()| writer.write_all(b"\n"))
-                                .and_then(|()| writer.flush())
-                        });
-                        secret.clear();
-                        if write_result.is_err() {
-                            break Err(BrokerError::BrokerCrashed);
-                        }
-                        authentication_sent = true;
-                        buffer.clear();
-                    }
-                    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
-                        let line = buffer.drain(..=newline).collect::<Vec<_>>();
-                        let line = String::from_utf8_lossy(&line);
-                        let line = line.trim_matches(['\r', '\n']);
-                        if line == SUDO_BROKER_READY {
-                            if writer
-                                .write_all(encoded.as_bytes())
-                                .and_then(|()| writer.write_all(b"\n"))
-                                .and_then(|()| writer.flush())
-                                .is_err()
-                            {
-                                break 'transport Err(BrokerError::BrokerCrashed);
-                            }
-                            request_sent = true;
-                        } else if line.contains("Sorry, try again.") {
-                            denied = true;
-                        } else if request_sent && line.starts_with(BROKER_RESPONSE_FRAME) {
-                            break 'transport decode_broker_response(line);
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break if denied {
-                        Err(BrokerError::AuthorizationDenied)
-                    } else {
-                        Err(BrokerError::BrokerCrashed)
-                    };
-                }
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    let drain_deadline = child_exit_deadline
-                        .get_or_insert_with(|| Instant::now() + Duration::from_millis(100));
-                    if Instant::now() >= *drain_deadline {
-                        break if denied {
-                            Err(BrokerError::AuthorizationDenied)
-                        } else {
-                            Err(BrokerError::BrokerCrashed)
-                        };
-                    }
-                }
-                Ok(None) => {}
-                Err(_) => break Err(BrokerError::BrokerCrashed),
-            }
-        };
-        if let Some(process_group) = process_group
+        }
+        false
+    }
+}
+
+impl BrokerProcess for SudoBroker {
+    fn end(mut self: Box<Self>, graceful: bool) {
+        if graceful && self.exited_within_grace() {
+            return;
+        }
+        if let Some(process_group) = self.process_group
             && let Some(pid) = rustix::process::Pid::from_raw(process_group)
         {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(writer);
-        drop(pty.master);
-        let _ = reader_thread.join();
-        result
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Keeps the pseudoterminal's master open while the broker runs. A broker
+/// still running after the end line and its grace is hung up by closing the
+/// master, which stops even a root process, then killed and reaped.
+struct SudoMaster {
+    process: SudoBroker,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl BrokerProcess for SudoMaster {
+    fn end(self: Box<Self>, graceful: bool) {
+        let Self {
+            mut process,
+            master,
+        } = *self;
+        if graceful && process.exited_within_grace() {
+            return;
+        }
+        drop(master);
+        Box::new(process).end(false);
     }
 }
 

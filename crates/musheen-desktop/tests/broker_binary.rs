@@ -101,3 +101,35 @@ fn broker_binary_rejects_a_target_that_differs_from_the_approved_argv() {
         "request binding mismatch"
     );
 }
+
+#[test]
+fn broker_binary_refuses_a_listing_that_does_not_follow_its_open_request() {
+    let target = tempfile::tempdir().unwrap();
+    let root = musheen_desktop::privilege::ElevatedRootReference::capture(target.path()).unwrap();
+    let request = BrokerRequest::read_directory(root, std::path::PathBuf::new()).unwrap();
+    let frame = encode_broker_request(&request).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_musheen-broker"))
+        .args(broker_arguments(&request))
+        .env_clear()
+        .env(
+            "PKEXEC_UID",
+            rustix::process::geteuid().as_raw().to_string(),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{frame}").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+
+    // A listing runs only inside the session its Open as Administrator
+    // request authorized (SYS-034), even when its arguments match.
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "request binding mismatch"
+    );
+}
