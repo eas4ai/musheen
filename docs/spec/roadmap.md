@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: catalog-writes-off-ui-thread
+Current: menu-composition-state
 
 ## 1. Foundation
 
@@ -117,3 +117,24 @@ store and the window still repaints and takes input, the paths still
 apply their change once the lock or the store is released, the workspace
 tests and clippy are clean, and every finding of the review and the
 report is resolved or declined.
+
+## menu-composition-state
+
+Requirements: UXF-023
+
+Fold the menu composition state into one record (backlog item
+menu-composition-state, adversary report 9fa1a7b3 finding 12). The probes
+a menu queues, how to compose that menu again, the probes queued outside a
+menu and the probes in flight now live in five fields: composing_menu,
+pending_store_probes, pending_menu_recompose, render_probes and
+probes_in_flight. Three paths take or move them: take_pending_menu_probe,
+move_menu_probes_to_render and flush_render_probes. A composition that
+does not take its probes leaves them, with its recompose record, for the
+next menu, and several callers compose a menu without taking them. A menu
+composition now opens a record and closes it when it ends; what it queued
+either goes to the popup that waits for it or to the next frame's probes,
+so nothing is left for another menu. Done when that record replaces the
+five fields, a test shows that a menu composed without taking its probes
+leaves no probe and no recompose record for the next menu, the UXF-023
+tests still pass, the workspace tests and clippy are clean, and every
+finding of the review and the report is resolved or declined.
