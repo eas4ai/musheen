@@ -121,8 +121,10 @@ pub enum ProxyKind {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "method")]
 pub enum SshLogin {
-    /// The profile's credential is the password.
+    /// The profile's credential is the password. Its wire name is
+    /// `credential`: the settings file never holds the word for a secret.
     #[default]
+    #[serde(rename = "credential")]
     Password,
     /// The keys held by the running SSH agent.
     Agent,
@@ -909,6 +911,7 @@ mod tests {
             exported.contains("\"login\""),
             "an SFTP profile always names its login: {exported}"
         );
+        assert!(!exported.contains("password"), "{exported}");
         assert_eq!(
             ConnectionProfiles::import(&exported).unwrap().profiles()[0].login(),
             &SshLogin::Password,
