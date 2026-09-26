@@ -787,6 +787,7 @@ pub fn extract_destination(
         parent,
     )?;
     let mut collisions: Vec<ExtractCollision> = Vec::new();
+    let mut collided = std::collections::HashSet::new();
     for entry in &entries {
         let relative = ArchivePath::normalize_bytes(&entry.path, limits.max_path_bytes)?;
         let components = relative.split(|byte| *byte == b'/').collect::<Vec<_>>();
@@ -796,7 +797,7 @@ pub fn extract_destination(
                 prefix.push(b'/');
             }
             prefix.extend_from_slice(component);
-            if collisions.iter().any(|collision| collision.path == prefix) {
+            if collided.contains(&prefix) {
                 break;
             }
             let entry_is_folder =
@@ -811,6 +812,7 @@ pub fn extract_destination(
             if existing.is_dir() && entry_is_folder {
                 continue;
             }
+            collided.insert(prefix.clone());
             collisions.push(ExtractCollision {
                 path: prefix.clone(),
                 existing_is_folder: existing.is_dir(),

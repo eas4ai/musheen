@@ -10329,6 +10329,13 @@ impl MusheenApp {
             self.submit_archive_plan(merged, cx);
             return;
         };
+        // One extraction asks at a time, so every answer reaches the
+        // extraction its dialog names.
+        if self.pending_extract.is_some() {
+            self.operation_error = Some("another extraction is awaiting a decision".into());
+            cx.notify();
+            return;
+        }
         self.pending_extract = Some(PendingExtract {
             plan,
             current,
@@ -23892,6 +23899,66 @@ mod tests {
         assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"old a");
         assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"old b");
         assert_eq!(filesystem::read(folder.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_a_second_extraction_is_refused_while_one_awaits_answers(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("Archive");
+        filesystem::create_dir_all(&folder).unwrap();
+        filesystem::write(folder.join("a.txt"), b"old a").unwrap();
+        filesystem::write(folder.join("b.txt"), b"old b").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+        let before = highest_job(&app, cx);
+
+        // Both start before the first one's question opens, as a fast double
+        // request does while the archive is read.
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            for _ in 0..2 {
+                state.dispatch_typed_context_command(
+                    CommandAction::ExtractHere,
+                    CommandParameters::targets(vec![local_command_target(&archive)]),
+                    Some(tab),
+                    None,
+                    false,
+                    cx,
+                );
+            }
+        });
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if cx.read(|cx| app.read(cx).operation_error.is_some()) {
+                break;
+            }
+            cx.executor().advance_clock(Duration::from_millis(20));
+        }
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).operation_error.as_deref(),
+                Some("another extraction is awaiting a decision"),
+                "a second extraction does not take over the open question"
+            )
+        });
+
+        answer_extract_collision("extract-conflict-replace-all", cx)
+            .expect("the first extraction's question is open");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+        assert_eq!(
+            filesystem::read(folder.join("a.txt")).unwrap(),
+            b"new a",
+            "the answer reaches the extraction its dialog names"
+        );
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        assert!(
+            answer_extract_collision("extract-conflict-skip", cx).is_none(),
+            "the refused extraction asks nothing"
+        );
     }
 
     #[gpui_kit::test]

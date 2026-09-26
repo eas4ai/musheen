@@ -344,6 +344,13 @@ fn resume_publish<S: JournalStorage>(
     let checkpoint = record
         .archive_checkpoint()
         .ok_or(ArchiveOperationError::InvalidArchive)?;
+    // A merge moves entries into a folder the user kept; publishing its
+    // staging in that folder's place would drop everything else in it.
+    if checkpoint.plan().merge().is_some() {
+        return Err(ArchiveOperationError::UnsafePath(
+            "a merged extraction cannot be published again",
+        ));
+    }
     let current_staging = path_identity_with_controls(staging, Some(budget), Some(cancellation))?;
     let cleanup = if checkpoint.cleanup_kind() == Some(ArchiveCleanupKind::PublishedDestination) {
         checkpoint.cleanup().map(local_path).transpose()?.ok_or(
