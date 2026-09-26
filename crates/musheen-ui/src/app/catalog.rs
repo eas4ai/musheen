@@ -95,9 +95,12 @@ pub(super) struct AttributeWrite {
 /// lane per mount point. The lanes never use the pool that runs the
 /// catalog write queue, and a mount whose store blocks holds only its own
 /// lane; a lane's thread ends when its work runs out.
+/// The work waiting in one attribute lane.
+type LaneWork = VecDeque<Box<dyn FnOnce() + Send>>;
+
 #[derive(Clone)]
 pub(super) struct AttributeLanes {
-    lanes: Arc<Mutex<HashMap<PathBuf, VecDeque<Box<dyn FnOnce() + Send>>>>>,
+    lanes: Arc<Mutex<HashMap<PathBuf, LaneWork>>>,
     /// The lane a path's work runs in: its mount point.
     key: fn(&StorePath) -> PathBuf,
 }
@@ -197,11 +200,12 @@ impl AttributeLanes {
 
 /// The order of tag changes, shared by every window on one catalog: each
 /// change takes a number when the user makes it, and a change never stages
-/// over a later one for the same item.
+/// over a later one that touched the same tag of the same item. Changes
+/// to other tags stage in whatever order they arrive.
 #[derive(Debug, Default)]
 struct TagChangeOrder {
     issued: u64,
-    staged: HashMap<ItemId, u64>,
+    staged: HashMap<(ItemId, Box<str>), u64>,
 }
 
 /// Attribute write failures for the windows to show: the last one per
@@ -212,10 +216,10 @@ struct AttributeErrors {
     fresh: Option<Box<str>>,
 }
 
-/// The refusal a tag change gets when a later change for one of its items
-/// staged first.
+/// The refusal a tag change gets when a later change to the same tag of
+/// one of its items staged first.
 const LATER_TAG_CHANGE: &str =
-    "a later tag change for the same item landed first; retry the action";
+    "a later change to the same tag of the same item landed first; retry the action";
 
 /// The system's extended attributes.
 #[derive(Debug)]
@@ -965,27 +969,37 @@ impl CatalogBinding {
         order.issued
     }
 
-    /// Whether change `order` may stage `items`: no later change staged any
-    /// of them first.
-    fn tag_change_is_current<'a>(
+    /// Whether change `order` may stage `tags` on `targets`: no later change
+    /// staged any of those tags on any of those items first.
+    fn tag_change_is_current(
         &self,
-        mut items: impl Iterator<Item = &'a ItemId>,
+        targets: &[TagTarget],
+        tags: &BTreeSet<Box<str>>,
         order: u64,
     ) -> bool {
         let staged = self
             .tag_change_order
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        items.all(|item| staged.staged.get(item).is_none_or(|later| *later < order))
+        targets.iter().all(|(item, _, _)| {
+            tags.iter().all(|tag| {
+                staged
+                    .staged
+                    .get(&(item.clone(), tag.clone()))
+                    .is_none_or(|later| *later < order)
+            })
+        })
     }
 
-    fn note_tag_change_staged<'a>(&self, items: impl Iterator<Item = &'a ItemId>, order: u64) {
+    fn note_tag_change_staged(&self, targets: &[TagTarget], tags: &BTreeSet<Box<str>>, order: u64) {
         let mut staged = self
             .tag_change_order
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for item in items {
-            staged.staged.insert(item.clone(), order);
+        for (item, _, _) in targets {
+            for tag in tags {
+                staged.staged.insert((item.clone(), tag.clone()), order);
+            }
         }
     }
 
@@ -1006,13 +1020,14 @@ impl CatalogBinding {
         for tag in added {
             TagService::validate_tag(tag).map_err(|error| Box::<str>::from(error.to_string()))?;
         }
-        if !self.tag_change_is_current(targets.iter().map(|(item, _, _)| item), order) {
+        let touched = added.union(removed).cloned().collect();
+        if !self.tag_change_is_current(targets, &touched, order) {
             return Err(Box::<str>::from(LATER_TAG_CHANGE));
         }
         self.update_result(|document| {
             self.stage_delta_in(document, targets, added, removed, reads)
         })?;
-        self.note_tag_change_staged(targets.iter().map(|(item, _, _)| item), order);
+        self.note_tag_change_staged(targets, &touched, order);
         Ok(())
     }
 
@@ -1506,16 +1521,17 @@ impl CatalogBinding {
         order: u64,
         finish: impl FnOnce(&mut CatalogDocument) -> Result<(), Box<str>>,
     ) -> Result<usize, Box<str>> {
+        let touched = added.union(removed).cloned().collect();
         let (targets, changed) = self.update_result(|document| {
             let (targets, changed) = Self::tagged_in(document, tag, &mut capabilities)?;
-            if !self.tag_change_is_current(targets.iter().map(|(item, _, _)| item), order) {
+            if !self.tag_change_is_current(&targets, &touched, order) {
                 return Err(Box::<str>::from(LATER_TAG_CHANGE));
             }
             self.stage_delta_in(document, &targets, added, removed, reads)?;
             finish(document)?;
             Ok((targets, changed))
         })?;
-        self.note_tag_change_staged(targets.iter().map(|(item, _, _)| item), order);
+        self.note_tag_change_staged(&targets, &touched, order);
         Ok(changed)
     }
 

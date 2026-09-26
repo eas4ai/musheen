@@ -28497,6 +28497,9 @@ mod tests {
 
     #[gpui_kit::test]
     async fn production_window_bootstrap_replays_pending_xattr_records(cx: &mut TestAppContext) {
+        // The replayed write runs on an attribute lane's thread, which wakes
+        // the app from outside the test scheduler.
+        cx.executor().allow_parking();
         cx.update(|cx| {
             gpui_kit::init(cx);
             install_navigation_key_bindings(cx);
