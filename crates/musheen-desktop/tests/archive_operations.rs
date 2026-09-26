@@ -12,8 +12,9 @@ use musheen_desktop::{
 };
 use musheen_ops::{
     ArchiveCheckpoint, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy,
-    ArchiveOperationPlan, ArchivePathIdentity, CorruptSource, Durability, EventGeneration, JobId,
-    Journal, JournalPhase, JournalStorage, ProviderLimits, ProviderSnapshot, Scheduler,
+    ArchiveOperationPlan, ArchivePathIdentity, CorruptSource, Durability, EventGeneration,
+    ExtractMerge, JobId, Journal, JournalPhase, JournalStorage, ProviderLimits, ProviderSnapshot,
+    Scheduler,
 };
 use std::io::{self, Cursor, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -1537,6 +1538,58 @@ fn reopened_file_journal_rolls_back_or_completes_real_archive_checkpoints() {
             })
         );
     }
+}
+
+#[test]
+fn recovery_never_publishes_a_merged_extraction_over_the_folder_it_merges_into() {
+    let root = tempdir().expect("temporary root");
+    let archive = root.path().join("Archive.zip");
+    std::fs::write(&archive, b"archive").expect("archive");
+    let destination = root.path().join("Archive");
+    std::fs::create_dir(&destination).expect("existing folder");
+    std::fs::write(destination.join("keep.txt"), b"keep").expect("kept item");
+    let staging = test_staging(root.path(), 76);
+    std::fs::create_dir(&staging).expect("staging folder");
+    std::fs::write(staging.join("a.txt"), b"new a").expect("staged entry");
+    let plan = ArchiveOperationPlan::extract(
+        local(&archive),
+        local(&destination),
+        ArchiveCodec::Zip,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .and_then(|plan| plan.with_merge(ExtractMerge::default()))
+    .expect("merge plan");
+    let checkpoint = ArchiveCheckpoint::new(
+        plan,
+        local(&staging),
+        Some(identity(&staging)),
+        Some(identity(&destination)),
+        None,
+    )
+    .with_staging_nonce(TEST_STAGE_NONCE);
+    let mut journal = Journal::open(MemoryJournal::default()).expect("journal");
+    journal
+        .append_archive(
+            JobId::new(76).expect("job id"),
+            EventGeneration::new(0),
+            JournalPhase::MetadataApplied,
+            Durability::CrashDurable,
+            checkpoint,
+        )
+        .expect("checkpoint");
+    let requests = recover_archive_operations(&journal).expect("recovery scan");
+    assert_eq!(requests.len(), 1);
+
+    assert!(
+        apply_archive_recovery(&mut journal, &requests[0], ArchiveRecoveryAction::Resume).is_err(),
+        "a merge interrupted before it ends is never published as a whole folder"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("keep.txt")).expect("the folder keeps its items"),
+        b"keep"
+    );
+    assert!(!destination.join("a.txt").exists());
 }
 
 #[test]
