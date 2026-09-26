@@ -48,12 +48,7 @@ impl fmt::Debug for DesktopArchiveRoute {
 
 impl DesktopArchiveRoute {
     fn for_current_user() -> Result<Self, Box<str>> {
-        Self::with_storage(
-            FileJournalStorage::for_current_user().map_err(|error| error.to_string())?,
-        )
-    }
-
-    fn with_storage(storage: FileJournalStorage) -> Result<Self, Box<str>> {
+        let storage = FileJournalStorage::for_current_user().map_err(|error| error.to_string())?;
         let journal = Journal::open(storage).map_err(|error| error.to_string())?;
         Ok(Self {
             journal: Mutex::new(journal),
@@ -392,19 +387,6 @@ impl OperationHub {
             }
         }
         hub
-    }
-
-    /// Runs archive jobs with their journal in `directory`, so a test never
-    /// writes the user's archive journal.
-    #[cfg(test)]
-    pub(crate) fn with_archive_journal_at(self, directory: &std::path::Path) -> Self {
-        let storage = FileJournalStorage::at(directory).expect("the test archive journal opens");
-        let route = DesktopArchiveRoute::with_storage(storage).expect("the test archive route opens");
-        self.queue
-            .lock()
-            .expect("the operation queue lock is available")
-            .register_archive_route(Arc::new(route));
-        self
     }
 
     #[must_use]

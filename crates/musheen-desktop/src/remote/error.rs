@@ -21,9 +21,6 @@ pub enum RemoteErrorCategory {
     Permission,
     Unsupported,
     Permanent,
-    /// An RSA private key outside the SSH agent: Musheen signs with RSA only
-    /// through the agent.
-    KeyNeedsAgent,
 }
 
 /// A credential-safe provider error. Transport text is deliberately not kept

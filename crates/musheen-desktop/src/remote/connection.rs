@@ -117,30 +117,6 @@ pub enum ProxyKind {
     HttpConnect,
 }
 
-/// How an SFTP connection logs in. Every other protocol uses `Password`.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case", tag = "method")]
-pub enum SshLogin {
-    /// The profile's credential is the password.
-    #[default]
-    Password,
-    /// The keys held by the running SSH agent.
-    Agent,
-    /// A private key file; the profile's credential is its passphrase. With
-    /// no path, the IdentityFile of the host's ~/.ssh/config entry applies.
-    KeyFile { path: Option<Box<str>> },
-    /// A private key kept in the secret service under the connection's key
-    /// reference; the profile's credential is its passphrase.
-    StoredKey,
-}
-
-impl SshLogin {
-    #[must_use]
-    pub const fn is_password(&self) -> bool {
-        matches!(self, Self::Password)
-    }
-}
-
 #[derive(Clone, Eq, PartialEq)]
 pub struct ProxySettings {
     kind: ProxyKind,
@@ -236,7 +212,6 @@ pub struct ConnectionProfile {
     credential: Option<CredentialReference>,
     security: SecurityPolicy,
     proxy: Option<ProxySettings>,
-    login: SshLogin,
 }
 
 impl ConnectionProfile {
@@ -298,49 +273,7 @@ impl ConnectionProfile {
             credential,
             security,
             proxy,
-            login: SshLogin::Password,
         })
-    }
-
-    /// Sets how an SFTP connection logs in. Other protocols accept only
-    /// `SshLogin::Password`; agent login keeps no credential; a key file path
-    /// is plain text; a stored key needs a key reference the ID can name.
-    pub fn with_login(mut self, login: SshLogin) -> Result<Self, RemoteError> {
-        let valid = match &login {
-            SshLogin::Password => true,
-            _ if self.protocol != RemoteProtocol::Sftp => false,
-            SshLogin::Agent => self.credential.is_none(),
-            SshLogin::KeyFile { path } => path.as_deref().is_none_or(|path| {
-                !path.is_empty()
-                    && path.len() <= 4096
-                    && !path.bytes().any(|byte| byte.is_ascii_control())
-            }),
-            SshLogin::StoredKey => key_connection_id(&self.id).is_some(),
-        };
-        if !valid {
-            return Err(RemoteError::new(
-                self.protocol,
-                RemoteErrorCategory::InvalidProfile,
-                Some(self.host.clone()),
-            ));
-        }
-        self.login = login;
-        Ok(self)
-    }
-
-    #[must_use]
-    pub fn login(&self) -> &SshLogin {
-        &self.login
-    }
-
-    /// Where a stored private key lives in the secret service, for a profile
-    /// that logs in with one.
-    #[must_use]
-    pub fn stored_key_reference(&self) -> Option<CredentialReference> {
-        matches!(self.login, SshLogin::StoredKey)
-            .then(|| key_connection_id(&self.id))
-            .flatten()
-            .map(CredentialReference::persistent)
     }
 
     #[must_use]
@@ -423,15 +356,6 @@ impl ConnectionProfile {
                 hash_credential(&mut hasher, proxy.credential.as_ref());
             }
         }
-        match &self.login {
-            SshLogin::Password => hash_byte(&mut hasher, 0),
-            SshLogin::Agent => hash_byte(&mut hasher, 1),
-            SshLogin::KeyFile { path } => {
-                hash_byte(&mut hasher, 2);
-                hash_optional_bytes(&mut hasher, path.as_deref().map(str::as_bytes));
-            }
-            SshLogin::StoredKey => hash_byte(&mut hasher, 3),
-        }
         *hasher.finalize().as_bytes()
     }
 
@@ -457,11 +381,6 @@ impl ConnectionProfile {
             (true, true) => SaveRequirement::ConfirmFailedTestAndSecurityChange,
         }
     }
-}
-
-/// The secret-service ID of a connection's stored private key.
-fn key_connection_id(id: &ConnectionId) -> Option<ConnectionId> {
-    ConnectionId::new(format!("{}.key", id.as_str())).ok()
 }
 
 fn hash_byte(hasher: &mut blake3::Hasher, value: u8) {
@@ -543,7 +462,6 @@ impl fmt::Debug for ConnectionProfile {
             .field("credential", &self.credential.as_ref().map(|_| "<stored>"))
             .field("security", &self.security)
             .field("proxy", &self.proxy)
-            .field("login", &self.login)
             .finish()
     }
 }
@@ -683,8 +601,6 @@ struct ProfileWire {
     credential: Option<String>,
     security: SecurityPolicy,
     proxy: Option<ProxyWire>,
-    #[serde(default, skip_serializing_if = "SshLogin::is_password")]
-    login: SshLogin,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -716,7 +632,6 @@ impl TryFrom<&ConnectionProfile> for ProfileWire {
                 .as_ref()
                 .map(|proxy| ProxyWire::from_settings(profile.protocol, proxy))
                 .transpose()?,
-            login: profile.login.clone(),
         })
     }
 }
@@ -749,8 +664,7 @@ impl TryFrom<ProfileWire> for ConnectionProfile {
             credential,
             profile.security,
             proxy,
-        )?
-        .with_login(profile.login)
+        )
     }
 }
 

@@ -124,7 +124,7 @@ pub struct SettingsWindow {
     sync_inputs: bool,
     focus_pending: bool,
     scroll: ScrollHandle,
-    pub(super) saving: bool,
+    saving: bool,
     choices_focus: BTreeMap<&'static str, FocusHandle>,
     reset_trigger: FocusHandle,
     appearance_base: AppearanceSnapshot,
@@ -165,7 +165,7 @@ impl SettingsWindow {
             store,
             backends,
             catalog,
-            super::default_connection_tester(),
+            Arc::new(musheen_desktop::ProfileConnectionTester::default()),
             window,
             cx,
         )

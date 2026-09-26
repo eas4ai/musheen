@@ -19,8 +19,6 @@ pub mod sidebar;
 mod status_bar;
 mod status_center;
 pub mod terminal;
-#[cfg(test)]
-mod test_fixtures;
 pub mod theme;
 pub mod toolbar;
 pub mod views;

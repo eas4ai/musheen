@@ -137,7 +137,7 @@ impl SecretBuffer {
         self.0.is_empty()
     }
 
-    pub(crate) fn duplicate(&self) -> Self {
+    fn duplicate(&self) -> Self {
         Self(self.0.clone())
     }
 
