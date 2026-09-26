@@ -654,7 +654,10 @@ fn local_trash_restore_returns_a_link_to_a_directory() {
 }
 
 /// Trashes `path` through the store and returns its receipt.
-fn trash_through_store(store: &mut LocalStore, path: &std::path::Path) -> musheen_ops::TrashReceipt {
+fn trash_through_store(
+    store: &mut LocalStore,
+    path: &std::path::Path,
+) -> musheen_ops::TrashReceipt {
     let store_path = StorePath::from_unix_path(path.to_path_buf().into_os_string());
     let identity = MutationProvider::identity(store, &store_path)
         .unwrap()
@@ -729,10 +732,14 @@ fn local_trash_listing_shows_an_unreadable_record_as_unrestorable_and_purgeable(
         fs::write(&kept_path, b"kept").unwrap();
         let mut store = LocalStore::new();
         let kept = trash_through_store(&mut store, &kept_path);
-        let trash = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
-            .join("Trash");
+        let trash =
+            std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("Trash");
         // A record nothing can parse, with its data still in Trash.
-        fs::write(trash.join("info").join("garbled.trashinfo"), b"not a trash record\n").unwrap();
+        fs::write(
+            trash.join("info").join("garbled.trashinfo"),
+            b"not a trash record\n",
+        )
+        .unwrap();
         fs::write(trash.join("files").join("garbled"), b"data").unwrap();
         // A record the process may not read, with its data in a folder.
         fs::write(
@@ -762,7 +769,11 @@ fn local_trash_listing_shows_an_unreadable_record_as_unrestorable_and_purgeable(
         );
         let garbled = listed
             .iter()
-            .find(|item| item.receipt().provider_reference().ends_with(b"garbled.trashinfo"))
+            .find(|item| {
+                item.receipt()
+                    .provider_reference()
+                    .ends_with(b"garbled.trashinfo")
+            })
             .expect("the garbled record is listed");
         assert!(!garbled.restorable());
         assert_eq!(garbled.kind(), ConflictItemKind::File);
@@ -773,7 +784,11 @@ fn local_trash_listing_shows_an_unreadable_record_as_unrestorable_and_purgeable(
         );
         let sealed = listed
             .iter()
-            .find(|item| item.receipt().provider_reference().ends_with(b"sealed.trashinfo"))
+            .find(|item| {
+                item.receipt()
+                    .provider_reference()
+                    .ends_with(b"sealed.trashinfo")
+            })
             .expect("the unreadable record is listed");
         assert!(!sealed.restorable());
         assert_eq!(sealed.kind(), ConflictItemKind::Directory);
@@ -781,7 +796,10 @@ fn local_trash_listing_shows_an_unreadable_record_as_unrestorable_and_purgeable(
             execute_restore(&mut store, garbled.receipt()).is_err(),
             "an entry without a readable record does not restore"
         );
-        assert_eq!(fs::read(trash.join("files").join("garbled")).unwrap(), b"data");
+        assert_eq!(
+            fs::read(trash.join("files").join("garbled")).unwrap(),
+            b"data"
+        );
 
         store
             .purge_trash(&[garbled.receipt().clone(), sealed.receipt().clone()])
@@ -836,8 +854,8 @@ fn local_trash_purge_removes_a_read_only_tree_and_the_other_entries() {
             .purge_trash(&[locked_receipt, kept_receipt])
             .expect("a tree with a read-only folder is purged with the rest");
 
-        let trash = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap())
-            .join("Trash");
+        let trash =
+            std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("Trash");
         // The listing also shows the trash folders of other mounts, so only
         // the entries of the private trash count.
         assert!(store.list_trash().unwrap().iter().all(|item| {

@@ -630,7 +630,9 @@ fn trash_payload_kind(metadata: &fs::Metadata) -> musheen_ops::ConflictItemKind 
 /// parse. Each is listed as unrestorable so it can be purged. Its original
 /// location and deletion time are unknown, so the entry shows where its data
 /// sits in Trash and when its record was written.
-fn unreadable_trash_entries(listed_ids: &std::collections::HashSet<OsString>) -> Vec<LocalTrashEntry> {
+fn unreadable_trash_entries(
+    listed_ids: &std::collections::HashSet<OsString>,
+) -> Vec<LocalTrashEntry> {
     let Ok(folders) = trash::os_limited::trash_folders() else {
         return Vec::new();
     };
@@ -658,7 +660,9 @@ fn unreadable_trash_entries(listed_ids: &std::collections::HashSet<OsString>) ->
                 .and_then(|metadata| metadata.modified())
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |since_epoch| i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX));
+                .map_or(0, |since_epoch| {
+                    i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX)
+                });
             entries.push(LocalTrashEntry {
                 receipt: TrashReceipt::new(
                     StorePath::from_unix_path(payload.into_os_string()),
