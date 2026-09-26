@@ -4645,6 +4645,10 @@ impl MusheenApp {
                         state.sync_catalog_projection(cx);
                         changed = true;
                     }
+                    if let Some(error) = state.catalog_binding.take_attribute_error() {
+                        state.operation_error = Some(error);
+                        changed = true;
+                    }
                     if state.status_center_open
                         && state.undo_availability_checked_at.is_none_or(|checked| {
                             checked.elapsed() >= UNDO_AVAILABILITY_REFRESH_INTERVAL
@@ -4688,7 +4692,11 @@ impl MusheenApp {
         cx.spawn(async move |this, cx| {
             loop {
                 if this
-                    .update(cx, |state, cx| state.start_attribute_writes(cx))
+                    .update(cx, |state, cx| {
+                        state
+                            .catalog_binding
+                            .start_attribute_writes(cx.background_executor());
+                    })
                     .is_err()
                 {
                     return;
@@ -6276,16 +6284,19 @@ impl MusheenApp {
                     CapabilityState::Supported
                 )
             });
-            // The attribute reads run here, outside the catalog write queue;
-            // importing what they found into the catalog is a queued job.
-            let tag_states = tags_supported.then(|| {
-                let reads = binding.read_attribute_tags(&tag_targets);
+            // The attribute reads run in their mounts' lanes, outside the
+            // catalog write queue; importing what they found into the
+            // catalog is a queued job.
+            let tag_states = if tags_supported {
+                let reads = binding.read_attribute_tags_in_lanes(&tag_targets).await;
                 let importer = binding.clone();
                 let read = tag_targets.clone();
-                binding.queue_work(&executor, move || {
+                Some(binding.queue_work(&executor, move || {
                     importer.import_and_tag_states(&read, &reads)
-                })
-            });
+                }))
+            } else {
+                None
+            };
             (tag_targets, tag_states)
         });
         let targets = targets.to_vec();
@@ -6307,7 +6318,9 @@ impl MusheenApp {
                     cx,
                 );
                 // An import the tag states staged writes the file's tags.
-                state.start_attribute_writes(cx);
+                state
+                    .catalog_binding
+                    .start_attribute_writes(cx.background_executor());
             });
         })
         .detach();
@@ -32095,27 +32108,71 @@ mod tests {
     }
 
     /// Extended-attribute tags kept in memory. Each read and write notes
-    /// whether it ran inside a catalog write queue job.
+    /// whether it ran inside a catalog write queue job and on which thread;
+    /// reads and writes for the held path wait until it is released, as a
+    /// file on a hung mount would.
     #[derive(Debug, Default)]
     struct RecordedAttributeTags {
         tags: Mutex<HashMap<StorePath, BTreeSet<Box<str>>>>,
         calls: std::sync::atomic::AtomicUsize,
         calls_in_queue: std::sync::atomic::AtomicUsize,
+        threads: Mutex<Vec<Option<String>>>,
+        held: Mutex<Option<StorePath>>,
+        opened: std::sync::Condvar,
+        waiting: std::sync::atomic::AtomicUsize,
     }
 
     impl RecordedAttributeTags {
-        fn note(&self) {
+        fn note(&self, path: &StorePath) {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if catalog::in_write_job() {
                 self.calls_in_queue
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().map(str::to_owned));
+            let mut held = self.held.lock().unwrap();
+            if held.as_ref() == Some(path) {
+                self.waiting
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            while held.as_ref() == Some(path) {
+                held = self.opened.wait(held).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.held.lock().unwrap() = None;
+            self.opened.notify_all();
+        }
+
+        fn tags_of(&self, path: &StorePath) -> Option<BTreeSet<Box<str>>> {
+            self.tags.lock().unwrap().get(path).cloned()
+        }
+    }
+
+    /// Runs the app until `ready`, letting the attribute lanes' threads work
+    /// in real time: they wake the app from outside the test scheduler.
+    fn settle_attribute_lanes(cx: &mut TestAppContext, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if ready() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the attribute lanes did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
     impl catalog::AttributeTags for RecordedAttributeTags {
         fn read(&self, _item: &ItemId, path: &StorePath) -> Result<BTreeSet<Box<str>>, Box<str>> {
-            self.note();
+            self.note(path);
             Ok(self
                 .tags
                 .lock()
@@ -32131,7 +32188,7 @@ mod tests {
             path: &StorePath,
             tags: &BTreeSet<Box<str>>,
         ) -> Result<(), Box<str>> {
-            self.note();
+            self.note(path);
             self.tags.lock().unwrap().insert(path.clone(), tags.clone());
             Ok(())
         }
@@ -32153,6 +32210,7 @@ mod tests {
             .resolve_item(&StorePath::from_unix_path(window.folder.join("tagged.txt")))
             .unwrap()
             .unwrap();
+        cx.executor().allow_parking();
         let attributes = Arc::new(RecordedAttributeTags::default());
         // The file already carries a tag in its attributes.
         attributes.tags.lock().unwrap().insert(
@@ -32189,7 +32247,19 @@ mod tests {
                 Box::new(move |result, _| *written.borrow_mut() = Some(result)),
             );
         });
-        cx.run_until_parked();
+        let expected = ["Old", "Work"]
+            .into_iter()
+            .map(Box::<str>::from)
+            .collect::<BTreeSet<_>>();
+        settle_attribute_lanes(cx, || {
+            attributes.tags_of(item.path()).as_ref() == Some(&expected)
+                && !window
+                    .catalog_store
+                    .load()
+                    .unwrap()
+                    .tags()
+                    .is_xattr_pending(item.id())
+        });
 
         assert_eq!(*written.borrow(), Some(Ok(())), "the window hears the edit");
         assert!(
@@ -32203,10 +32273,15 @@ mod tests {
             0,
             "no attribute read or write ran inside a catalog write queue job"
         );
-        let expected = ["Old", "Work"]
-            .into_iter()
-            .map(Box::<str>::from)
-            .collect::<BTreeSet<_>>();
+        assert!(
+            attributes
+                .threads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|thread| thread.as_deref() == Some("musheen-attributes")),
+            "every attribute read and write ran on an attribute lane's thread"
+        );
         assert_eq!(
             attributes.tags.lock().unwrap().get(item.path()),
             Some(&expected),
@@ -32218,6 +32293,122 @@ mod tests {
             !document.tags().is_xattr_pending(item.id()),
             "the attribute write finished"
         );
+    }
+
+    // UXF-024: while one file's store blocks its attribute write, a
+    // Properties tag change for another file, a pin and a view change all
+    // land, and the file gets its tags once its store answers.
+    #[gpui_kit::test]
+    async fn xattr_queue_a_hung_file_holds_only_its_own_attribute_write(cx: &mut TestAppContext) {
+        let window = open_catalog_window(
+            |folder, _| {
+                filesystem::write(folder.join("hung.txt"), b"hung").unwrap();
+                filesystem::write(folder.join("healthy.txt"), b"healthy").unwrap();
+            },
+            cx,
+        )
+        .await;
+        cx.executor().allow_parking();
+        let resolve = |name: &str| {
+            LocalStore::new()
+                .resolve_item(&StorePath::from_unix_path(window.folder.join(name)))
+                .unwrap()
+                .unwrap()
+        };
+        let (hung, healthy) = (resolve("hung.txt"), resolve("healthy.txt"));
+        let root = LocalStore::new()
+            .resolve_item(&StorePath::from_unix_path(window.folder.as_os_str()))
+            .unwrap()
+            .unwrap();
+        let attributes = Arc::new(RecordedAttributeTags::default());
+        *attributes.held.lock().unwrap() = Some(hung.path().clone());
+        let recorded: Arc<dyn catalog::AttributeTags> = attributes.clone();
+        window.app.update(cx, |state, _| {
+            state.catalog_binding = CatalogBinding::persistent_with_xattr_opt_in(
+                window.catalog_store.clone(),
+                window.catalog_store.load().unwrap(),
+                true,
+            )
+            .with_attribute_tags(recorded)
+            // Each file its own lane, as files on two mounts would have.
+            .with_lane_key(|path| {
+                path.as_unix_path()
+                    .expect("the test paths are Unix paths")
+                    .to_path_buf()
+            });
+        });
+        let supported = musheen_core::CapabilityMatrix::new(|_| CapabilityState::Supported);
+        let edit = |item: &StoreItem, tag: &str, cx: &mut TestAppContext| {
+            let writer = window.app.update(cx, |state, cx| {
+                state.properties_tag_writer(
+                    vec![(item.id().clone(), item.path().clone(), supported.clone())],
+                    cx,
+                )
+            });
+            cx.update(|cx| {
+                writer(
+                    &TagDelta {
+                        added: [Box::<str>::from(tag)].into_iter().collect(),
+                        removed: BTreeSet::new(),
+                    },
+                    cx,
+                    Box::new(|result, _| result.unwrap()),
+                );
+            });
+        };
+
+        // The hung file's read waits on its store; nothing else does.
+        edit(&hung, "Work", cx);
+        settle_attribute_lanes(cx, || {
+            attributes.waiting.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+        edit(&healthy, "Home", cx);
+        cx.update_window(window.browser, |_, _, cx| {
+            window.app.update(cx, |state, cx| {
+                let target =
+                    CommandTargetRef::new(healthy.id().clone(), healthy.path().clone()).unwrap();
+                state.apply_pin_command(CommandAction::Pin, &target, cx);
+                state
+                    .focused_directory_mut()
+                    .view_mut()
+                    .preferences_mut()
+                    .layout = Layout::Details;
+                state.persist_focused_view_preferences(cx);
+            });
+        })
+        .unwrap();
+        let home = [Box::<str>::from("Home")]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        settle_attribute_lanes(cx, || {
+            let document = window.catalog_store.load().unwrap();
+            attributes.tags_of(healthy.path()).as_ref() == Some(&home)
+                && !document.tags().is_xattr_pending(healthy.id())
+                && document.pins().contains(healthy.id())
+                && document
+                    .folder_preferences()
+                    .resolve(&FolderIdentity::from_item(root.id().clone()))
+                    .view()
+                    == musheen_desktop::FolderView::Details
+        });
+        assert!(
+            attributes.tags_of(hung.path()).is_none(),
+            "the hung file has not been written"
+        );
+
+        attributes.release();
+        let work = [Box::<str>::from("Work")]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        settle_attribute_lanes(cx, || {
+            attributes.tags_of(hung.path()).as_ref() == Some(&work)
+                && !window
+                    .catalog_store
+                    .load()
+                    .unwrap()
+                    .tags()
+                    .is_xattr_pending(hung.id())
+        });
     }
 
     #[gpui_kit::test]
