@@ -23353,22 +23353,33 @@ mod tests {
         });
     }
 
-    /// Compresses `source` into `<name>.zip` beside it with the app's own
-    /// Compress command, and returns the archive once it is published.
+    /// Compresses `sources` with the app's own Compress command and returns
+    /// the archive once it is published: `<name>.zip` for one source,
+    /// `Archive.zip` for several.
     async fn compressed_fixture(
         app: &Entity<MusheenApp>,
         browser: AnyWindowHandle,
-        source: &Path,
+        sources: &[PathBuf],
         cx: &mut TestAppContext,
     ) -> PathBuf {
-        let mut name = source.file_name().unwrap().to_os_string();
-        name.push(".zip");
-        let archive = source.with_file_name(name);
+        let archive = match sources {
+            [source] => {
+                let mut name = source.file_name().unwrap().to_os_string();
+                name.push(".zip");
+                source.with_file_name(name)
+            }
+            _ => sources[0].with_file_name("Archive.zip"),
+        };
         app.update(cx, |state, cx| {
             let tab = state.navigation.focused_tab().id();
             state.dispatch_typed_context_command(
                 CommandAction::Compress,
-                CommandParameters::targets(vec![local_command_target(source)]),
+                CommandParameters::targets(
+                    sources
+                        .iter()
+                        .map(|source| local_command_target(source))
+                        .collect(),
+                ),
                 Some(tab),
                 None,
                 false,
@@ -23378,6 +23389,20 @@ mod tests {
         cx.wait_for(browser, Duration::from_secs(5), |_, _| archive.exists())
             .await;
         archive
+    }
+
+    /// Writes `a.txt` and `b.txt` in `directory` and compresses them into
+    /// `Archive.zip` there.
+    async fn two_entry_archive(
+        app: &Entity<MusheenApp>,
+        browser: AnyWindowHandle,
+        directory: &Path,
+        cx: &mut TestAppContext,
+    ) -> PathBuf {
+        let sources = [directory.join("a.txt"), directory.join("b.txt")];
+        filesystem::write(&sources[0], b"new a").unwrap();
+        filesystem::write(&sources[1], b"new b").unwrap();
+        compressed_fixture(app, browser, &sources, cx).await
     }
 
     /// Chooses Extract… on `archive` from its context menu and picks
@@ -23426,61 +23451,73 @@ mod tests {
         cx.run_until_parked();
     }
 
-    #[gpui_kit::test]
-    async fn extract_to_a_picked_folder_writes_the_archive_entries_there(cx: &mut TestAppContext) {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("notes.txt");
-        filesystem::write(&source, b"notes").unwrap();
-        let picked = temporary.path().join("picked");
-        filesystem::create_dir(&picked).unwrap();
-        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
-        let journal = tempfile::tempdir().unwrap();
-        run_archive_jobs(&app, journal.path(), cx);
-        let archive = compressed_fixture(&app, browser, &source, cx).await;
-
-        extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
-
-        cx.read(|cx| {
-            assert_eq!(
-                app.read(cx).operation_error,
-                None,
-                "Extract… queues an extraction into the picked folder"
-            )
-        });
-        let extracted = picked.join("notes.txt");
-        cx.wait_for(browser, Duration::from_secs(5), |_, _| extracted.exists())
-            .await;
-        assert_eq!(filesystem::read(&extracted).unwrap(), b"notes");
-        assert!(
-            !temporary.path().join("notes").exists(),
-            "nothing is extracted beside the archive"
-        );
-        assert!(
-            !picked.join("notes").exists(),
-            "the entries land in the picked folder itself, not in a subfolder"
-        );
+    /// Answers the extraction's collision question with `choice` once it
+    /// shows, in whichever window holds it. Returns the colliding item it
+    /// named, or `None` when no question came.
+    fn answer_extract_collision(choice: &str, cx: &mut TestAppContext) -> Option<String> {
+        for _ in 0..100 {
+            cx.run_until_parked();
+            for window in cx.windows() {
+                let answered = cx
+                    .update_window(window, |_, window, cx| {
+                        window.render_frame(cx);
+                        window.try_find(choice.to_owned())?;
+                        let item = window
+                            .try_find("extract-conflict-item")
+                            .and_then(|item| item.label().map(str::to_owned))
+                            .unwrap_or_default();
+                        window.click(choice.to_owned(), cx);
+                        Some(item)
+                    })
+                    .ok()
+                    .flatten();
+                if answered.is_some() {
+                    cx.run_until_parked();
+                    return answered;
+                }
+            }
+            cx.executor().advance_clock(Duration::from_millis(20));
+        }
+        None
     }
 
-    #[gpui_kit::test]
-    async fn extract_to_a_folder_that_holds_an_entry_keeps_that_item(cx: &mut TestAppContext) {
-        let temporary = tempfile::tempdir().unwrap();
-        let source = temporary.path().join("notes.txt");
-        filesystem::write(&source, b"notes").unwrap();
-        let picked = temporary.path().join("picked");
-        filesystem::create_dir(&picked).unwrap();
-        filesystem::write(picked.join("notes.txt"), b"already here").unwrap();
-        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
-        let journal = tempfile::tempdir().unwrap();
-        run_archive_jobs(&app, journal.path(), cx);
-        let archive = compressed_fixture(&app, browser, &source, cx).await;
-        let before = cx.read(|cx| {
+    fn highest_job(app: &Entity<MusheenApp>, cx: &mut TestAppContext) -> Option<JobId> {
+        cx.read(|cx| {
             app.read(cx)
                 .operation_hub
                 .status()
                 .lock()
                 .unwrap()
                 .highest_job_id()
-        });
+        })
+    }
+
+    async fn wait_for_jobs_after(
+        app: &Entity<MusheenApp>,
+        browser: AnyWindowHandle,
+        before: Option<JobId>,
+        cx: &mut TestAppContext,
+    ) {
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            let status = app.read(cx).operation_hub.status();
+            let status = status.lock().unwrap();
+            status.highest_job_id() > before && status.active_count() == 0
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_a_picked_folder_creates_a_folder_named_after_the_archive(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let picked = temporary.path().join("picked");
+        filesystem::create_dir(&picked).unwrap();
+        filesystem::write(picked.join("keep.txt"), b"keep").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
 
         extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
 
@@ -23488,20 +23525,163 @@ mod tests {
             assert_eq!(
                 app.read(cx).operation_error,
                 None,
-                "Extract… queues an extraction into the picked folder"
+                "Extract… queues an extraction into a folder named after the archive"
             )
         });
-        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
-            let status = app.read(cx).operation_hub.status();
-            let status = status.lock().unwrap();
-            status.highest_job_id() > before && status.active_count() == 0
+        let folder = picked.join("Archive");
+        cx.wait_for(browser, Duration::from_secs(5), |_, _| {
+            folder.join("b.txt").exists()
         })
         .await;
-        assert_eq!(
-            filesystem::read(picked.join("notes.txt")).unwrap(),
-            b"already here",
-            "an extraction never replaces an item already in the picked folder"
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        assert_eq!(filesystem::read(picked.join("keep.txt")).unwrap(), b"keep");
+        assert!(
+            !picked.join("a.txt").exists(),
+            "the entries go into the folder named after the archive"
         );
+        assert!(
+            !temporary.path().join("Archive").exists(),
+            "nothing is extracted beside the archive"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_the_archive_folder_with_extract_here_creates_a_folder_named_after_it(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        filesystem::write(temporary.path().join("readme.txt"), b"readme").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+
+        app.update(cx, |state, cx| {
+            let tab = state.navigation.focused_tab().id();
+            state.dispatch_typed_context_command(
+                CommandAction::ExtractHere,
+                CommandParameters::targets(vec![local_command_target(&archive)]),
+                Some(tab),
+                None,
+                false,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            assert_eq!(
+                app.read(cx).operation_error,
+                None,
+                "Extract Here extracts into a folder named after the archive beside it"
+            )
+        });
+        let folder = temporary.path().join("Archive");
+        cx.wait_for(browser, Duration::from_secs(5), |_, _| {
+            folder.join("b.txt").exists()
+        })
+        .await;
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+    }
+
+    /// Picks a folder that already holds `Archive/a.txt`, `Archive/b.txt`
+    /// and `Archive/keep.txt`, and extracts `Archive.zip` into it.
+    async fn extract_into_an_existing_folder(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Entity<MusheenApp>,
+        AnyWindowHandle,
+        PathBuf,
+        Option<JobId>,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let picked = temporary.path().join("picked");
+        let folder = picked.join("Archive");
+        filesystem::create_dir_all(&folder).unwrap();
+        filesystem::write(folder.join("a.txt"), b"old a").unwrap();
+        filesystem::write(folder.join("b.txt"), b"old b").unwrap();
+        filesystem::write(folder.join("keep.txt"), b"keep").unwrap();
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let journal = tempfile::tempdir().unwrap();
+        run_archive_jobs(&app, journal.path(), cx);
+        let archive = two_entry_archive(&app, browser, temporary.path(), cx).await;
+        let before = highest_job(&app, cx);
+        extract_to_through_the_chooser(&app, browser, &archive, &picked, cx);
+        (temporary, journal, app, browser, folder, before)
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_existing_folder_asks_for_each_collision_and_follows_the_choice(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temporary, _journal, app, browser, folder, before) =
+            extract_into_an_existing_folder(cx).await;
+
+        let replaced = answer_extract_collision("extract-conflict-replace", cx)
+            .expect("a colliding file asks Replace, Replace All, Skip or Skip All");
+        let skipped = answer_extract_collision("extract-conflict-skip", cx)
+            .expect("every colliding file is asked about");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        let (replaced, skipped) = if replaced.contains("a.txt") {
+            assert!(skipped.contains("b.txt"), "{skipped}");
+            ("a.txt", "b.txt")
+        } else {
+            assert!(replaced.contains("b.txt") && skipped.contains("a.txt"));
+            ("b.txt", "a.txt")
+        };
+        let expected = |name: &str, age: &str| format!("{age} {}", &name[..1]).into_bytes();
+        assert_eq!(
+            filesystem::read(folder.join(replaced)).unwrap(),
+            expected(replaced, "new"),
+            "Replace writes the archive's entry"
+        );
+        assert_eq!(
+            filesystem::read(folder.join(skipped)).unwrap(),
+            expected(skipped, "old"),
+            "Skip keeps the existing item"
+        );
+        assert_eq!(
+            filesystem::read(folder.join("keep.txt")).unwrap(),
+            b"keep",
+            "an item no entry collides with does not change"
+        );
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_existing_folder_with_replace_all_answers_every_collision(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temporary, _journal, app, browser, folder, before) =
+            extract_into_an_existing_folder(cx).await;
+
+        answer_extract_collision("extract-conflict-replace-all", cx)
+            .expect("a colliding file asks Replace, Replace All, Skip or Skip All");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"new a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"new b");
+        assert_eq!(filesystem::read(folder.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[gpui_kit::test]
+    async fn extract_to_an_existing_folder_with_skip_all_keeps_every_colliding_item(
+        cx: &mut TestAppContext,
+    ) {
+        let (_temporary, _journal, app, browser, folder, before) =
+            extract_into_an_existing_folder(cx).await;
+
+        answer_extract_collision("extract-conflict-skip-all", cx)
+            .expect("a colliding file asks Replace, Replace All, Skip or Skip All");
+        wait_for_jobs_after(&app, browser, before, cx).await;
+
+        assert_eq!(filesystem::read(folder.join("a.txt")).unwrap(), b"old a");
+        assert_eq!(filesystem::read(folder.join("b.txt")).unwrap(), b"old b");
+        assert_eq!(filesystem::read(folder.join("keep.txt")).unwrap(), b"keep");
     }
 
     #[gpui_kit::test]
