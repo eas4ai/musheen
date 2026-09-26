@@ -113,6 +113,7 @@ fn elevated_store_enumerates_through_the_granted_descriptor_after_root_path_repl
 const BROKER_ARGUMENTS: &str = "MUSHEEN_SESSION_BROKER_ARGUMENTS";
 const BROKER_PIDS: &str = "MUSHEEN_SESSION_BROKER_PIDS";
 const BROKER_IDLE_MILLIS: &str = "MUSHEEN_SESSION_BROKER_IDLE_MILLIS";
+const BROKER_PROBES: &str = "MUSHEEN_SESSION_BROKER_PROBES";
 const PASSWORD: &[u8] = b"correct horse";
 
 /// Allows the invoking user, as pkexec or sudo does once it authenticated.
@@ -127,6 +128,55 @@ impl Authorizer for AllowInvoker {
             format!("uid:{}", rustix::process::getuid().as_raw()),
             SystemClock.now_unix_millis() + 60_000,
         ))
+    }
+}
+
+/// Tries, from inside the broker, what another process of the user would try
+/// to reach the session, and returns one `probe=opened|refused` line each.
+/// Polkit: reopening the broker's input through /proc, after reopening an
+/// ordinary pipe the same way to show the probe works. Sudo: opening the
+/// broker's terminal by name as Musheen left it, again with its lock cleared
+/// to show the probe works, and after the broker prepared it.
+fn probe_channel(provider: PrivilegeProvider) -> Vec<String> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsRawFd as _;
+
+    let outcome = |opened: bool| if opened { "opened" } else { "refused" };
+    let reopen = |fd: i32| {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{fd}"))
+            .is_ok()
+    };
+    match provider {
+        PrivilegeProvider::Polkit => {
+            let (pipe, _writer) = std::io::pipe().unwrap();
+            vec![
+                format!("pipe={}", outcome(reopen(pipe.as_raw_fd()))),
+                format!("input={}", outcome(reopen(0))),
+            ]
+        }
+        PrivilegeProvider::Sudo => {
+            let terminal = fs::read_link("/proc/self/fd/0").unwrap();
+            let open_terminal = || {
+                rustix::fs::open(
+                    terminal.as_path(),
+                    OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .is_ok()
+            };
+            let musheen = outcome(open_terminal());
+            rustix::termios::ioctl_tiocnxcl(std::io::stdin()).unwrap();
+            let unlocked = outcome(open_terminal());
+            prepare_sudo_terminal().unwrap();
+            let broker = outcome(open_terminal());
+            vec![
+                format!("musheen={musheen}"),
+                format!("unlocked={unlocked}"),
+                format!("broker={broker}"),
+            ]
+        }
     }
 }
 
@@ -157,6 +207,16 @@ fn elevated_session_broker_child() {
         .ok()
         .and_then(|millis| millis.parse().ok())
         .map_or(ELEVATED_SESSION_IDLE, Duration::from_millis);
+    if let Ok(probes) = std::env::var(BROKER_PROBES) {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(probes)
+            .unwrap();
+        for line in probe_channel(provider) {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
     if provider == PrivilegeProvider::Sudo {
         prepare_sudo_terminal().unwrap();
         println!("{SUDO_BROKER_READY}");
@@ -212,14 +272,17 @@ impl FakeElevation {
         let directory = tempfile::tempdir().unwrap();
         let runs = directory.path().join("runs");
         let pids = directory.path().join("pids");
+        let probes = directory.path().join("probes");
         let broker = executable_script(
             directory.path(),
             "broker",
             &format!(
-                "{BROKER_ARGUMENTS}=\"$*\" {BROKER_PIDS}='{}' {BROKER_IDLE_MILLIS}='{}' '{}' \
+                "{BROKER_ARGUMENTS}=\"$*\" {BROKER_PIDS}='{}' {BROKER_PROBES}='{}' \
+                 {BROKER_IDLE_MILLIS}='{}' '{}' \
                  elevated_session_broker_child --exact --nocapture --test-threads=1 \
                  | /usr/bin/grep --line-buffered -o 'MUSHEEN_.*'",
                 pids.display(),
+                probes.display(),
                 idle.as_millis(),
                 std::env::current_exe().unwrap().display(),
             ),
@@ -270,6 +333,13 @@ impl FakeElevation {
     fn broker_pids(&self) -> Vec<u32> {
         fs::read_to_string(self.directory.path().join("pids"))
             .map(|pids| pids.lines().map(|pid| pid.parse().unwrap()).collect())
+            .unwrap_or_default()
+    }
+
+    /// What the brokers' probes found, one `probe=result` line each.
+    fn probes(&self) -> Vec<String> {
+        fs::read_to_string(self.directory.path().join("probes"))
+            .map(|probes| probes.lines().map(str::to_owned).collect())
             .unwrap_or_default()
     }
 
@@ -454,6 +524,25 @@ fn elevated_session_refuses_what_it_was_not_granted() {
             1,
             "{provider:?}: refusals ask for no new authorization"
         );
+    }
+}
+
+#[test]
+fn elevated_session_is_closed_to_other_processes() {
+    for provider in PROVIDERS {
+        let fake = FakeElevation::new(provider, IDLE);
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        let (store, _session) = open_window(&fake, &backend, root.path());
+        list_all(&store, root.path(), 100).unwrap();
+
+        // Only Musheen can write into the session: another process of the
+        // user can neither reopen the broker's input nor open its terminal.
+        let expected: &[&str] = match provider {
+            PrivilegeProvider::Polkit => &["pipe=opened", "input=refused"],
+            PrivilegeProvider::Sudo => &["musheen=refused", "unlocked=opened", "broker=refused"],
+        };
+        assert_eq!(fake.probes(), expected, "{provider:?}");
     }
 }
 
