@@ -3848,3 +3848,295 @@ fn production_expansion_ratio_and_nesting_limits_reject_real_bombs() {
         })
     ));
 }
+
+/// Names the one measured extraction or collision check that
+/// `extract_cost_child` runs: mode, codec, source and destination, one per
+/// line.
+const EXTRACT_COST_REQUEST: &str = "MUSHEEN_EXTRACT_COST_REQUEST";
+const MIB: u64 = 1_024 * 1_024;
+
+/// The bytes this process has read and written so far.
+fn process_io() -> (u64, u64) {
+    let text = std::fs::read_to_string("/proc/self/io").expect("process I/O counters");
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .expect("process I/O field")
+    };
+    (field("rchar:"), field("wchar:"))
+}
+
+fn extract_cost_codec(name: &str) -> ArchiveCodec {
+    match name {
+        "zip" => ArchiveCodec::Zip,
+        "tar.gz" => ArchiveCodec::TarGzip,
+        "tar.zst" => ArchiveCodec::TarZstd,
+        "7z" => ArchiveCodec::SevenZip,
+        other => panic!("unknown codec {other}"),
+    }
+}
+
+/// Runs one measured extraction or collision check when
+/// `extract_cost_reads_the_archive_at_most_twice_and_writes_only_its_files`
+/// starts this test binary as a child, and does nothing otherwise. Alone in
+/// its own process, /proc/self/io counts only that work.
+#[test]
+fn extract_cost_child() {
+    let Ok(request) = std::env::var(EXTRACT_COST_REQUEST) else {
+        return;
+    };
+    let lines = request.lines().collect::<Vec<_>>();
+    let [mode, codec, source, destination] = lines.as_slice() else {
+        panic!("malformed request {request:?}");
+    };
+    let plan = ArchiveOperationPlan::extract(
+        local(Path::new(source)),
+        local(Path::new(destination)),
+        extract_cost_codec(codec),
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    // An archive inside the archive is never opened, so no nesting is needed.
+    let limits = ArchiveOperationLimits {
+        max_nesting: 0,
+        ..ArchiveOperationLimits::default()
+    };
+    let before = process_io();
+    match *mode {
+        "extract" => {
+            run(
+                &plan,
+                &limits,
+                &Passwords("unused"),
+                &CancellationToken::new(),
+            )
+            .expect("extraction");
+        }
+        "check" => {
+            musheen_desktop::extract_destination(
+                &plan,
+                &limits,
+                &Passwords("unused"),
+                &CancellationToken::new(),
+            )
+            .expect("collision check");
+        }
+        other => panic!("unknown mode {other}"),
+    }
+    let after = process_io();
+    println!(
+        "EXTRACT_COST read={} written={}",
+        after.0 - before.0,
+        after.1 - before.1
+    );
+}
+
+/// Runs `extract_cost_child` in a child copy of this test binary and returns
+/// the bytes it read and wrote during the measured work.
+fn measured_in_child(mode: &str, codec: &str, source: &Path, destination: &Path) -> (u64, u64) {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "extract_cost_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            EXTRACT_COST_REQUEST,
+            format!(
+                "{mode}\n{codec}\n{}\n{}",
+                source.display(),
+                destination.display()
+            ),
+        )
+        .output()
+        .expect("child test runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{codec} {mode} failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("EXTRACT_COST "))
+        .unwrap_or_else(|| panic!("no measurement in {stdout}"));
+    let value = |name: &str| {
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix(name))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("measurement field")
+    };
+    (value("read="), value("written="))
+}
+
+/// About 2.5 MiB of files that do not compress, and one file that is itself
+/// a ZIP archive. Returns the folder and the bytes of its files.
+fn extract_cost_input(root: &Path) -> (std::path::PathBuf, u64) {
+    let input = root.join("input");
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut total = 0;
+    for index in 0..200_usize {
+        let folder = input.join(format!("folder-{}", index % 10));
+        std::fs::create_dir_all(&folder).expect("input folder");
+        let bytes = (0..12_000 + index * 7)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        total += bytes.len() as u64;
+        std::fs::write(folder.join(format!("file-{index}.bin")), &bytes).expect("input file");
+    }
+    let inner = zip_bytes(
+        zip::CompressionMethod::Deflated,
+        b"an archive inside the archive",
+    );
+    total += inner.len() as u64;
+    std::fs::write(input.join("inner.zip"), &inner).expect("inner archive");
+    (input, total)
+}
+
+#[test]
+fn extract_cost_reads_the_archive_at_most_twice_and_writes_only_its_files() {
+    let root = tempdir().expect("temporary root");
+    let (input, file_bytes) = extract_cost_input(root.path());
+    for (codec, name) in [
+        (ArchiveCodec::Zip, "zip"),
+        (ArchiveCodec::TarGzip, "tar.gz"),
+        (ArchiveCodec::TarZstd, "tar.zst"),
+        (ArchiveCodec::SevenZip, "7z"),
+    ] {
+        let archive = root.path().join(format!("fixture.{name}"));
+        let create = ArchiveOperationPlan::create(
+            vec![local(&input)],
+            local(&archive),
+            codec,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .expect("create plan");
+        run(
+            &create,
+            &ArchiveOperationLimits::default(),
+            &Passwords("unused"),
+            &CancellationToken::new(),
+        )
+        .expect("fixture archive");
+        let archive_bytes = std::fs::metadata(&archive).expect("fixture archive").len();
+        let output = root.path().join(format!("output-{name}"));
+
+        let (read, written) = measured_in_child("extract", name, &archive, &output);
+        assert!(
+            read <= 2 * archive_bytes + MIB,
+            "{name}: extraction read {read} bytes of a {archive_bytes}-byte archive"
+        );
+        assert!(
+            written <= file_bytes + MIB,
+            "{name}: extraction wrote {written} bytes for {file_bytes} bytes of files"
+        );
+        for file in ["inner.zip", "folder-3/file-123.bin"] {
+            assert_eq!(
+                std::fs::read(output.join("input").join(file)).expect("extracted file"),
+                std::fs::read(input.join(file)).expect("input file"),
+                "{name}: {file} is extracted as it was archived"
+            );
+        }
+
+        let (read, written) = measured_in_child("check", name, &archive, &output);
+        assert!(
+            read <= archive_bytes + MIB,
+            "{name}: the collision check read {read} bytes of a {archive_bytes}-byte archive"
+        );
+        assert!(
+            written <= MIB,
+            "{name}: the collision check wrote {written} bytes"
+        );
+    }
+}
+
+#[test]
+fn extract_cost_publishes_nothing_when_the_archive_changes_during_the_run() {
+    let root = tempdir().expect("temporary root");
+    let archive = root.path().join("fixture.tar");
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4_096);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "data.txt", &[b'a'; 4_096][..])
+            .expect("tar entry");
+        builder.finish().expect("tar finish");
+    }
+    std::fs::write(&archive, &tar_bytes).expect("fixture archive");
+    let output = root.path().join("output");
+    let plan = ArchiveOperationPlan::extract(
+        local(&archive),
+        local(&output),
+        ArchiveCodec::Tar,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    let changed = archive.clone();
+    let storage = HookJournal {
+        inner: MemoryJournal::default(),
+        hook_at: 2,
+        // Rewrite the file's bytes in place, at the same size and with the
+        // same modification time, so the archive still decodes.
+        hook: Some(Box::new(move || {
+            use std::os::unix::fs::FileExt;
+            let modified = std::fs::metadata(&changed)
+                .and_then(|metadata| metadata.modified())
+                .expect("archive time");
+            let mut bytes = std::fs::read(&changed).expect("archive bytes");
+            let start = bytes
+                .windows(4_096)
+                .position(|window| window.iter().all(|byte| *byte == b'a'))
+                .expect("file bytes");
+            bytes[start..start + 4_096].fill(b'b');
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&changed)
+                .expect("archive opens");
+            file.write_all_at(&bytes, 0).expect("archive rewritten");
+            file.set_modified(modified).expect("archive time restored");
+        })),
+    };
+    let mut journal = Journal::open(storage).expect("journal opens");
+    let scheduler = Scheduler::new(&ResourceLimits::default());
+    scheduler
+        .enqueue_archive(plan, provider())
+        .expect("archive queues");
+    let job = scheduler.start_ready().expect("starts").pop().expect("job");
+
+    let result = execute_scheduled_archive_operation(
+        &scheduler,
+        &job,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &mut journal,
+    );
+    assert!(
+        matches!(result, Err(ArchiveOperationError::Conflict)),
+        "an archive changed during the run is refused: {result:?}"
+    );
+    assert!(!output.exists(), "nothing is published");
+    assert!(
+        std::fs::read_dir(root.path())
+            .expect("archive folder")
+            .all(|entry| !entry
+                .expect("folder entry")
+                .file_name()
+                .as_bytes()
+                .starts_with(b".musheen-stage-v1-")),
+        "the staging folder is cleaned"
+    );
+}
