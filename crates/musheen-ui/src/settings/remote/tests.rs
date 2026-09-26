@@ -330,8 +330,7 @@ fn remote_parity_every_offered_choice_reaches_the_server() {
                     PageRequest::new(16, None).unwrap(),
                     CancellationToken::new(),
                 ))
-                .err()
-                .expect("nothing listens on the closed port");
+                .expect_err("nothing listens on the closed port");
                 assert!(
                     !refused(&error),
                     "browsing tries to reach the server of every choice the editor offers: {described}: {error:?}"
