@@ -109,10 +109,10 @@ Falsifier: an archive credential appears in settings, logs, errors, or operation
 Mechanism: encrypted round-trip test plus captured-log and persistence scan.
 Status: Draft
 
-[OPS-033] Extract… asks for a destination folder and queues one extract operation that writes the archive's entries into that folder, with the same limits, path checks, and conflict policy as Extract Here.
-Falsifier: choosing a writable local folder for Extract… queues no extraction, writes the entries anywhere but that folder, or replaces an item already in it.
+[OPS-033] Extract… asks for a destination folder, and Extract Here uses the archive's own folder. Either one extracts the archive into a folder named after it inside that folder, under the same limits and path checks. When that folder does not exist, the extraction publishes it in one step. When it exists, the archive's entries merge into it: folders merge entry by entry, and for each entry that collides with an existing file, or with an existing item of the other kind, the user chooses Replace, Replace All, Skip, or Skip All, and the extraction does what was chosen. Nothing else in the folder changes.
+Falsifier: choosing a writable local folder for Extract… queues no extraction or writes entries anywhere but the folder named after the archive inside it; Extract Here fails where that folder is absent; a colliding item is replaced without Replace or Replace All, or written after Skip or Skip All; or an item no archive entry collides with changes.
 Mechanism: ops-033
-Rationale: docs/opus-audit-2.md 4.5: Extract… was refused after its destination picker because only Copy To and Move To accepted a picked destination.
+Rationale: docs/opus-audit-2.md 4.5 and escalation 407ae943: Extract… was refused after its destination picker, the extract engine refused any existing destination so Extract Here always failed, and the developer asked for a folder named after the archive with a Replace, Replace All, Skip, or Skip All question for each colliding item.
 Status: Agreed 2026-09-26
 
 ## Creation

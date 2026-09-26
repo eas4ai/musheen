@@ -205,3 +205,27 @@ agent and jump host with throwaway keys, and no test reads the user's
 keyring or ~/.ssh; the workspace tests, cargo fmt --check and clippy with
 warnings denied are clean; and every finding of the review and the report
 is resolved or declined.
+
+## remote-usable-extract
+
+Requirements: SYS-024, SYS-026, SYS-031, SYS-032, OPS-033, DEP-022
+
+Continue remote-usable, superseded when the developer revised OPS-033
+(escalation 407ae943), with its work carried: passwords in the secret
+service with session-only use and Remove, Test connection through the
+browse connector with a named cause, FTPS as explicit TLS on port 21, no
+SMB, NFS, HTTP, proxy or FTPS-pin choice in the editor or Network, and
+SFTP on russh with the agent, key files, stored keys, RSA through the
+agent only, and ~/.ssh/config through ssh2-config. Extract… and Extract
+Here now extract into a folder named after the archive: published in one
+step when absent; when present, the entries merge into it, folders merge
+entry by entry, and each colliding file, or item of the other kind, asks
+Replace, Replace All, Skip or Skip All before the job runs. The engine
+follows those answers and skips a collision that appeared after the
+question. This also fixes Extract Here, which failed on every archive
+because its destination always existed. Done when each mechanism's
+current receipt passes on the final tree (the OPS-033 review is bound to
+fail receipt 75755a98 for the revised text), no test reads the user's
+keyring or ~/.ssh, the workspace tests, cargo fmt --check and clippy with
+warnings denied are clean, and every finding of the review and the report
+is resolved or declined.
