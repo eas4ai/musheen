@@ -5331,6 +5331,7 @@ dependencies = [
  "portable-pty",
  "posix-acl",
  "proc-mounts",
+ "rand 0.10.2",
  "rcgen",
  "reqwest",
  "ring",
