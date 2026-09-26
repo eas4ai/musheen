@@ -47,10 +47,12 @@ pub(crate) fn install(cx: &mut App) {
                 .spawn(async { native_theme::SystemTheme::from_system() });
             match load.await {
                 Ok(system) => cx.update(|cx| {
-                    native_theme_gpui::apply_system_theme(&system, cx);
-                    // The system theme is readable now; the fallback no
-                    // longer follows the window appearance.
-                    crate::app::forget_fallback_theme(cx);
+                    // The system theme is readable now; installing it ends
+                    // the fallback.
+                    crate::app::install_system_theme(
+                        |cx| native_theme_gpui::apply_system_theme(&system, cx),
+                        cx,
+                    );
                     crate::settings::accept_native_theme_change(cx);
                 }),
                 Err(error) => {

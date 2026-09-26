@@ -572,6 +572,19 @@ impl TestAppContext {
         .unwrap();
     }
 
+    /// Simulates the desktop changing `window`'s appearance, as between a
+    /// dark and a light color scheme. The window's appearance observers run
+    /// as they would for a real change. (Musheen patch: the test window is
+    /// crate-private, and UI tests need to drive appearance observers.)
+    pub fn simulate_window_appearance(
+        &self,
+        window: AnyWindowHandle,
+        appearance: crate::WindowAppearance,
+    ) {
+        self.test_window(window)
+            .simulate_appearance_change(appearance);
+    }
+
     /// Returns the `TestWindow` backing the given handle.
     pub(crate) fn test_window(&self, window: AnyWindowHandle) -> TestWindow {
         self.app
