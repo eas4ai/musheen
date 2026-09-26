@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: fallback-theme-follows-appearance-changes
+Current: xattr-io-outside-catalog-queue
 
 ## 1. Foundation
 
@@ -159,3 +159,23 @@ sees the matching variant, a test shows the fallback does nothing when the
 system theme is in use, the UIV-014 check passes, the workspace tests,
 cargo fmt --check and clippy with warnings denied are clean, and every
 finding of the review and the report is resolved or declined.
+
+## xattr-io-outside-catalog-queue
+
+Requirements: UXF-024
+
+Take extended-attribute I/O out of the catalog write queue (backlog item
+xattr-io-outside-catalog-queue, review 54e960e8 finding 4). A tag edit's
+attribute write, the attribute read and import behind the Properties tag
+states, and the pending-attribute pass all run inside a queue job today,
+so a tagged file on a hung mount holds every later catalog write, from
+every window, until the mount answers. The attribute reads now run before
+the job is queued, the job records the desired tags in the catalog, and
+the attribute writes run one at a time in their own background lane; each
+write that lands is finished in the catalog by another queued job, which
+stages the tags again when they changed meanwhile. Done when a test blocks
+one tagged file's attribute read or write and a later catalog write for
+something else lands, the tags reach the file once it is unblocked, the
+UXF-024 and UXF-023 checks pass, the workspace tests, cargo fmt --check
+and clippy with warnings denied are clean, and every finding of the
+review and the report is resolved or declined.
