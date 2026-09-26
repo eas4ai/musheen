@@ -50,6 +50,24 @@ impl LocalFilesystemInfo {
     }
 }
 
+/// The mount point of the filesystem that holds `path`, from the mount
+/// table alone: it reads `/proc/mounts` and never touches `path`, so it
+/// answers while the filesystem that holds `path` hangs. `None` when the
+/// table cannot be read.
+pub fn mount_point_of(path: &std::path::Path) -> Option<PathBuf> {
+    let mut mount: Option<PathBuf> = None;
+    for candidate in MountIter::new().ok()?.flatten() {
+        if path.starts_with(&candidate.dest)
+            && mount
+                .as_ref()
+                .is_none_or(|current| candidate.dest.as_os_str().len() > current.as_os_str().len())
+        {
+            mount = Some(candidate.dest);
+        }
+    }
+    mount
+}
+
 pub(crate) fn probe(path: &StorePath) -> Result<LocalFilesystemInfo, StoreError> {
     let unix_path = path.as_unix_path().ok_or_else(|| {
         StoreError::unsupported("probe", "the local provider accepts only Unix paths")

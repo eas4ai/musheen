@@ -19,9 +19,6 @@ const FOLDER_IDENTITIES_LIMIT: usize = 1_024;
 /// The most recorded navigations kept to order a late recent below the
 /// ones after it: more than the catalog keeps recents.
 const RECENT_CLAIMS_LIMIT: usize = 64;
-/// The most attribute writes that run at once. A file whose store never
-/// answers holds one; the others keep writing.
-const ATTRIBUTE_WRITES_LIMIT: usize = 4;
 /// The most pins the window asks the store about at once. A pin on a store
 /// that never answers holds one background thread, so this bounds the
 /// threads pins can hold.
@@ -94,6 +91,132 @@ pub(super) struct AttributeWrite {
     result: Result<(), Box<str>>,
 }
 
+/// Runs extended-attribute reads and writes on threads of their own, one
+/// lane per mount point. The lanes never use the pool that runs the
+/// catalog write queue, and a mount whose store blocks holds only its own
+/// lane; a lane's thread ends when its work runs out.
+#[derive(Clone)]
+pub(super) struct AttributeLanes {
+    lanes: Arc<Mutex<HashMap<PathBuf, VecDeque<Box<dyn FnOnce() + Send>>>>>,
+    /// The lane a path's work runs in: its mount point.
+    key: fn(&StorePath) -> PathBuf,
+}
+
+impl Default for AttributeLanes {
+    fn default() -> Self {
+        Self {
+            lanes: Arc::default(),
+            key: mount_lane,
+        }
+    }
+}
+
+impl std::fmt::Debug for AttributeLanes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
+        formatter
+            .debug_struct("AttributeLanes")
+            .field("running", &lanes.len())
+            .finish()
+    }
+}
+
+/// The mount point that holds `path`, or `/` when the mount table does not
+/// say.
+fn mount_lane(path: &StorePath) -> PathBuf {
+    path.as_unix_path()
+        .and_then(musheen_local::mount_point_of)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+impl AttributeLanes {
+    /// Runs `work` in the lane of `path`'s mount, after the work queued
+    /// there before it. The receiver hears the result; it closes without
+    /// one when the work panicked or no thread could start.
+    fn run<R: Send + 'static>(
+        &self,
+        path: &StorePath,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> async_channel::Receiver<R> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let key = (self.key)(path);
+        let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let _ = sender.try_send(work());
+        });
+        let start = {
+            let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
+            match lanes.get_mut(&key) {
+                Some(jobs) => {
+                    jobs.push_back(job);
+                    false
+                }
+                None => {
+                    lanes.insert(key.clone(), VecDeque::from([job]));
+                    true
+                }
+            }
+        };
+        if start {
+            let lanes = self.clone();
+            let lane = key.clone();
+            let started = std::thread::Builder::new()
+                .name("musheen-attributes".into())
+                .spawn(move || lanes.drain(&lane));
+            if started.is_err() {
+                // Dropping the lane's work closes its receivers.
+                self.lanes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+            }
+        }
+        receiver
+    }
+
+    /// Runs a lane's work until none is left, then closes the lane. Work
+    /// that panics is dropped and the next runs.
+    fn drain(&self, lane: &PathBuf) {
+        loop {
+            let job = {
+                let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(jobs) = lanes.get_mut(lane) else {
+                    return;
+                };
+                match jobs.pop_front() {
+                    Some(job) => job,
+                    None => {
+                        lanes.remove(lane);
+                        return;
+                    }
+                }
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        }
+    }
+}
+
+/// The order of tag changes, shared by every window on one catalog: each
+/// change takes a number when the user makes it, and a change never stages
+/// over a later one for the same item.
+#[derive(Debug, Default)]
+struct TagChangeOrder {
+    issued: u64,
+    staged: HashMap<ItemId, u64>,
+}
+
+/// Attribute write failures for the windows to show: the last one per
+/// item, and the newest one not shown yet.
+#[derive(Debug, Default)]
+struct AttributeErrors {
+    by_item: HashMap<ItemId, Box<str>>,
+    fresh: Option<Box<str>>,
+}
+
+/// The refusal a tag change gets when a later change for one of its items
+/// staged first.
+const LATER_TAG_CHANGE: &str =
+    "a later tag change for the same item landed first; retry the action";
+
 /// The system's extended attributes.
 #[derive(Debug)]
 struct SystemAttributeTags;
@@ -136,6 +259,12 @@ pub(super) struct CatalogBinding {
     /// The items whose attribute write runs, for every window that shares
     /// this catalog.
     attribute_writes: Arc<Mutex<std::collections::HashSet<ItemId>>>,
+    /// The threads attribute reads and writes run on.
+    attribute_lanes: AttributeLanes,
+    /// The order of tag changes.
+    tag_change_order: Arc<Mutex<TagChangeOrder>>,
+    /// Attribute write failures the windows have not shown yet.
+    attribute_errors: Arc<Mutex<AttributeErrors>>,
     xattr_opt_in: bool,
     /// Catalog writes that ran outside the write queue.
     #[cfg(test)]
@@ -271,6 +400,9 @@ impl CatalogBinding {
             recents_order: Arc::default(),
             attribute_tags: Arc::new(SystemAttributeTags),
             attribute_writes: Arc::default(),
+            attribute_lanes: AttributeLanes::default(),
+            tag_change_order: Arc::default(),
+            attribute_errors: Arc::default(),
             xattr_opt_in,
             #[cfg(test)]
             writes_outside_queue: Arc::default(),
@@ -297,6 +429,9 @@ impl CatalogBinding {
             recents_order: Arc::default(),
             attribute_tags: Arc::new(SystemAttributeTags),
             attribute_writes: Arc::default(),
+            attribute_lanes: AttributeLanes::default(),
+            tag_change_order: Arc::default(),
+            attribute_errors: Arc::default(),
             xattr_opt_in,
             #[cfg(test)]
             writes_outside_queue: Arc::default(),
@@ -307,6 +442,14 @@ impl CatalogBinding {
     #[cfg(test)]
     pub(super) fn with_attribute_tags(mut self, tags: Arc<dyn AttributeTags>) -> Self {
         self.attribute_tags = tags;
+        self
+    }
+
+    /// This binding with its attribute lanes chosen by `key` instead of the
+    /// mount point, so a test can give each file a lane of its own.
+    #[cfg(test)]
+    pub(super) fn with_lane_key(mut self, key: fn(&StorePath) -> PathBuf) -> Self {
+        self.attribute_lanes.key = key;
         self
     }
 
@@ -608,7 +751,7 @@ impl CatalogBinding {
         writer: impl FnMut(&ItemId, &StorePath, &BTreeSet<Box<str>>) -> Result<(), Box<str>>,
     ) -> Result<(), Box<str>> {
         let reads = self.read_attribute_tags(targets);
-        self.stage_tag_delta(targets, added, removed, &reads)?;
+        self.stage_tag_delta(targets, added, removed, &reads, self.next_tag_change())?;
         self.reconcile_pending_xattrs_with(writer)
     }
 
@@ -652,36 +795,88 @@ impl CatalogBinding {
         })
     }
 
-    /// Reads the attribute tags of the targets whose tags live in extended
-    /// attributes and have no attribute write pending. It takes no catalog
-    /// lock and runs before the catalog job that uses the reads, so a file
-    /// whose store blocks holds only this read.
+    /// The targets whose tags live in extended attributes and have no
+    /// attribute write pending, with their catalog records: the targets a
+    /// tag change reads before its catalog job. Reads memory only.
+    fn attribute_read_targets(
+        &self,
+        targets: &[TagTarget],
+    ) -> Vec<(ItemId, StorePath, TagRecordState)> {
+        let mut snapshot = self.snapshot();
+        let mut wanted = Vec::new();
+        for (item, path, capabilities) in targets {
+            let storage = TagService::new(snapshot.tags_mut(), self.xattr_opt_in)
+                .storage_for(path, capabilities);
+            if matches!(storage, Ok(TagStorage::ExtendedAttribute))
+                && !snapshot.tags().is_xattr_pending(item)
+            {
+                wanted.push((
+                    item.clone(),
+                    path.clone(),
+                    TagRecordState::of(&snapshot, item),
+                ));
+            }
+        }
+        wanted
+    }
+
+    /// Reads the targets' attribute tags in their mounts' lanes, off the
+    /// pool that runs the catalog write queue. Ready at once when no target
+    /// keeps its tags in extended attributes.
+    pub(super) fn read_attribute_tags_in_lanes(
+        &self,
+        targets: &[TagTarget],
+    ) -> impl std::future::Future<Output = Vec<AttributeRead>> + Send + use<> {
+        let pending = self
+            .attribute_read_targets(targets)
+            .into_iter()
+            .map(|(item, path, expected)| {
+                let tags = Arc::clone(&self.attribute_tags);
+                let (read_item, read_path) = (item.clone(), path.clone());
+                let read = self
+                    .attribute_lanes
+                    .run(&path, move || tags.read(&read_item, &read_path));
+                (item, expected, read)
+            })
+            .collect::<Vec<_>>();
+        async move {
+            let mut reads = Vec::with_capacity(pending.len());
+            for (item, expected, read) in pending {
+                let tags = read.recv().await.unwrap_or_else(|_| {
+                    Err(Box::<str>::from(
+                        "the attribute read stopped before it finished",
+                    ))
+                });
+                reads.push(AttributeRead {
+                    item,
+                    expected,
+                    tags,
+                });
+            }
+            reads
+        }
+    }
+
+    /// Reads the targets' attribute tags on this thread, as the tests do.
+    #[cfg(test)]
     pub(super) fn read_attribute_tags(&self, targets: &[TagTarget]) -> Vec<AttributeRead> {
         self.read_attribute_tags_with(targets, |item, path| self.attribute_tags.read(item, path))
     }
 
+    #[cfg(test)]
     fn read_attribute_tags_with(
         &self,
         targets: &[TagTarget],
         mut reader: impl FnMut(&ItemId, &StorePath) -> Result<BTreeSet<Box<str>>, Box<str>>,
     ) -> Vec<AttributeRead> {
-        let mut snapshot = self.snapshot();
-        let mut reads = Vec::new();
-        for (item, path, capabilities) in targets {
-            let storage = TagService::new(snapshot.tags_mut(), self.xattr_opt_in)
-                .storage_for(path, capabilities);
-            if !matches!(storage, Ok(TagStorage::ExtendedAttribute))
-                || snapshot.tags().is_xattr_pending(item)
-            {
-                continue;
-            }
-            reads.push(AttributeRead {
-                item: item.clone(),
-                expected: TagRecordState::of(&snapshot, item),
-                tags: reader(item, path),
-            });
-        }
-        reads
+        self.attribute_read_targets(targets)
+            .into_iter()
+            .map(|(item, path, expected)| AttributeRead {
+                tags: reader(&item, &path),
+                item,
+                expected,
+            })
+            .collect()
     }
 
     /// A target's tags inside a catalog job: the catalog's, merged with what
@@ -759,21 +954,66 @@ impl CatalogBinding {
         Ok(())
     }
 
+    /// A number for a tag change the user just made; changes stage in the
+    /// order of their numbers.
+    pub(super) fn next_tag_change(&self) -> u64 {
+        let mut order = self
+            .tag_change_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        order.issued += 1;
+        order.issued
+    }
+
+    /// Whether change `order` may stage `items`: no later change staged any
+    /// of them first.
+    fn tag_change_is_current<'a>(
+        &self,
+        mut items: impl Iterator<Item = &'a ItemId>,
+        order: u64,
+    ) -> bool {
+        let staged = self
+            .tag_change_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        items.all(|item| staged.staged.get(item).is_none_or(|later| *later < order))
+    }
+
+    fn note_tag_change_staged<'a>(&self, items: impl Iterator<Item = &'a ItemId>, order: u64) {
+        let mut staged = self
+            .tag_change_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for item in items {
+            staged.staged.insert(item.clone(), order);
+        }
+    }
+
     /// Records a tag change in the catalog, a catalog job: each target's
     /// current tags, with `removed` taken out and `added` put in. `reads`
     /// are the targets' attribute reads, made before the job; the attribute
-    /// writes run after it, outside the queue.
+    /// writes run after it, in the lanes. `order` is the change's number:
+    /// a change that arrives after a later one for the same item staged is
+    /// refused, never applied over it.
     pub(super) fn stage_tag_delta(
         &self,
         targets: &[TagTarget],
         added: &BTreeSet<Box<str>>,
         removed: &BTreeSet<Box<str>>,
         reads: &[AttributeRead],
+        order: u64,
     ) -> Result<(), Box<str>> {
         for tag in added {
             TagService::validate_tag(tag).map_err(|error| Box::<str>::from(error.to_string()))?;
         }
-        self.update_result(|document| self.stage_delta_in(document, targets, added, removed, reads))
+        if !self.tag_change_is_current(targets.iter().map(|(item, _, _)| item), order) {
+            return Err(Box::<str>::from(LATER_TAG_CHANGE));
+        }
+        self.update_result(|document| {
+            self.stage_delta_in(document, targets, added, removed, reads)
+        })?;
+        self.note_tag_change_staged(targets.iter().map(|(item, _, _)| item), order);
+        Ok(())
     }
 
     /// Whether `read` found attribute tags other than the catalog's, so an
@@ -861,19 +1101,24 @@ impl CatalogBinding {
         }
     }
 
-    /// The items with an attribute write pending.
+    /// The items with an attribute write pending that may be written now:
+    /// none while the tags opt-in is off, and never an orphaned item, whose
+    /// path may now hold another file.
     pub(super) fn pending_attribute_items(&self) -> Vec<ItemId> {
+        if !self.xattr_opt_in {
+            return Vec::new();
+        }
         let document = self.document.lock().expect("catalog lock is not poisoned");
         document
             .tags()
             .pending_xattr_records()
+            .filter(|(item, _, _)| !document.tags().is_orphaned(item))
             .map(|(item, _, _)| item.clone())
             .collect()
     }
 
     /// Writes an item's pending attribute tags as the catalog wants them
-    /// now, outside the catalog write queue. `None` when nothing is pending
-    /// for the item.
+    /// now. `None` when nothing may be written for the item.
     pub(super) fn write_pending_attribute(&self, item: &ItemId) -> Option<AttributeWrite> {
         self.write_pending_attribute_with(item, |item, path, tags| {
             self.attribute_tags.write(item, path, tags)
@@ -885,8 +1130,14 @@ impl CatalogBinding {
         item: &ItemId,
         mut writer: impl FnMut(&ItemId, &StorePath, &BTreeSet<Box<str>>) -> Result<(), Box<str>>,
     ) -> Option<AttributeWrite> {
+        if !self.xattr_opt_in {
+            return None;
+        }
         let (path, tags) = {
             let document = self.document.lock().expect("catalog lock is not poisoned");
+            if document.tags().is_orphaned(item) {
+                return None;
+            }
             let (_, path, tags) = document
                 .tags()
                 .pending_xattr_records()
@@ -895,6 +1146,127 @@ impl CatalogBinding {
         };
         let result = writer(item, &path, &tags);
         Some(AttributeWrite { path, tags, result })
+    }
+
+    /// Writes the attribute tags the catalog has staged, in their mounts'
+    /// lanes: one write per item at a time. A queued job finishes each
+    /// write that lands, and an item whose tags changed meanwhile is
+    /// written again. A failed write stays pending for the next pass and is
+    /// reported once. The writes run whether or not the window that asked
+    /// is still open.
+    pub(super) fn start_attribute_writes(&self, executor: &BackgroundExecutor) {
+        for item in self.pending_attribute_items() {
+            if !self.claim_attribute_write(&item) {
+                continue;
+            }
+            let binding = self.clone();
+            let settling = executor.clone();
+            executor
+                .spawn(async move { binding.settle_attribute(item, settling).await })
+                .detach();
+        }
+    }
+
+    /// Writes `item`'s attribute tags until the catalog wants no newer ones,
+    /// then lets the next items start.
+    async fn settle_attribute(self, item: ItemId, executor: BackgroundExecutor) {
+        let mut attempt = 0;
+        let outcome = loop {
+            attempt += 1;
+            let Some(path) = self.pending_attribute_path(&item) else {
+                break Ok(());
+            };
+            let writer = self.clone();
+            let written = item.clone();
+            let lane = self
+                .attribute_lanes
+                .run(&path, move || writer.write_pending_attribute(&written));
+            let write = match lane.recv().await {
+                Ok(Some(write)) => write,
+                Ok(None) => break Ok(()),
+                Err(_) => {
+                    break Err(Box::<str>::from(
+                        "the attribute write stopped before it finished",
+                    ));
+                }
+            };
+            if let Err(error) = write.result {
+                break Err(Box::<str>::from(format!(
+                    "Musheen could not write the tags of {}: {error}",
+                    DisplayPath::from_store_path(&write.path).as_str()
+                )));
+            }
+            let finisher = self.clone();
+            let finished = item.clone();
+            let receiver = self.queue_work(&executor, move || {
+                finisher.finish_attribute_write(&finished, &write.path, &write.tags)
+            });
+            match catalog_work_result(receiver).await {
+                Ok(false) => break Ok(()),
+                Ok(true) if attempt < MAX_XATTR_RECONCILIATION_WRITES => {}
+                Ok(true) => {
+                    break Err(Box::<str>::from(
+                        "tag metadata changed too often to reconcile extended attributes safely",
+                    ));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        self.release_attribute_write(&item);
+        match outcome {
+            Ok(()) => {
+                self.forget_attribute_error(&item);
+                self.start_attribute_writes(&executor);
+            }
+            Err(error) => self.report_attribute_error(&item, error),
+        }
+    }
+
+    /// The path an item's pending attribute write goes to, while one may be
+    /// written.
+    fn pending_attribute_path(&self, item: &ItemId) -> Option<StorePath> {
+        if !self.xattr_opt_in {
+            return None;
+        }
+        let document = self.document.lock().expect("catalog lock is not poisoned");
+        if document.tags().is_orphaned(item) {
+            return None;
+        }
+        document
+            .tags()
+            .pending_xattr_records()
+            .find(|(pending, _, _)| *pending == item)
+            .map(|(_, path, _)| path.clone())
+    }
+
+    /// Records a failed attribute write for a window to show, once per item
+    /// until the write succeeds or fails another way.
+    fn report_attribute_error(&self, item: &ItemId, error: Box<str>) {
+        let mut errors = self
+            .attribute_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if errors.by_item.get(item) != Some(&error) {
+            errors.by_item.insert(item.clone(), error.clone());
+            errors.fresh = Some(error);
+        }
+    }
+
+    fn forget_attribute_error(&self, item: &ItemId) {
+        self.attribute_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_item
+            .remove(item);
+    }
+
+    /// The newest attribute write failure no window has shown yet.
+    pub(super) fn take_attribute_error(&self) -> Option<Box<str>> {
+        self.attribute_errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fresh
+            .take()
     }
 
     /// Finishes an attribute write in the catalog, a catalog job: clears the
@@ -944,18 +1316,12 @@ impl CatalogBinding {
         })
     }
 
-    /// Claims `item` for an attribute write: false while one runs for it or
-    /// `ATTRIBUTE_WRITES_LIMIT` run.
+    /// Claims `item` for an attribute write: false while one runs for it.
     pub(super) fn claim_attribute_write(&self, item: &ItemId) -> bool {
-        let mut running = self
-            .attribute_writes
+        self.attribute_writes
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if running.len() >= ATTRIBUTE_WRITES_LIMIT || running.contains(item) {
-            return false;
-        }
-        running.insert(item.clone());
-        true
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(item.clone())
     }
 
     pub(super) fn release_attribute_write(&self, item: &ItemId) {
@@ -998,26 +1364,36 @@ impl CatalogBinding {
     }
 
     /// The live items that carry `tag`, with their capabilities, and how
-    /// many items carry it, orphans included.
+    /// many items carry it, orphans included. Fails when `capabilities`
+    /// has no answer for a path: the item was tagged after the change's
+    /// probe, and the change retries rather than asking the store here.
     fn tagged_in(
         document: &CatalogDocument,
         tag: &str,
-        capabilities: &mut impl FnMut(&StorePath) -> CapabilityMatrix,
-    ) -> (Vec<TagTarget>, usize) {
+        capabilities: &mut impl FnMut(&StorePath) -> Option<CapabilityMatrix>,
+    ) -> Result<(Vec<TagTarget>, usize), Box<str>> {
         let targets = document
             .tags()
             .tracked_items()
             .filter(|(item, _, orphaned)| {
                 !*orphaned && document.tags().tags_for(item).contains(tag)
             })
-            .map(|(item, path, _)| (item.clone(), path.clone(), capabilities(path)))
-            .collect();
+            .map(|(item, path, _)| {
+                capabilities(path)
+                    .map(|found| (item.clone(), path.clone(), found))
+                    .ok_or_else(|| {
+                        Box::<str>::from(
+                            "the items that carry the tag changed while the change was prepared; retry the action",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let changed = document
             .tags()
             .tracked_items()
             .filter(|(item, _, _)| document.tags().tags_for(item).contains(tag))
             .count();
-        (targets, changed)
+        Ok((targets, changed))
     }
 
     /// The live items that carry `tag`, with the capabilities `capabilities`
@@ -1028,7 +1404,9 @@ impl CatalogBinding {
         tag: &str,
         mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
     ) -> Vec<TagTarget> {
-        Self::tagged_in(&self.snapshot(), tag, &mut capabilities).0
+        Self::tagged_in(&self.snapshot(), tag, &mut |path| Some(capabilities(path)))
+            .map(|(targets, _)| targets)
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -1039,7 +1417,9 @@ impl CatalogBinding {
         mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
     ) -> Result<usize, Box<str>> {
         let reads = self.read_attribute_tags(&self.tagged_targets(old, &mut capabilities));
-        let changed = self.stage_tag_rename(old, new, capabilities, &reads)?;
+        let order = self.next_tag_change();
+        let changed =
+            self.stage_tag_rename(old, new, |path| Some(capabilities(path)), &reads, order)?;
         self.reconcile_pending_xattrs()?;
         Ok(changed)
     }
@@ -1051,33 +1431,41 @@ impl CatalogBinding {
         mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
     ) -> Result<usize, Box<str>> {
         let reads = self.read_attribute_tags(&self.tagged_targets(tag, &mut capabilities));
-        let changed = self.stage_tag_delete(tag, capabilities, &reads)?;
+        let order = self.next_tag_change();
+        let changed = self.stage_tag_delete(tag, |path| Some(capabilities(path)), &reads, order)?;
         self.reconcile_pending_xattrs()?;
         Ok(changed)
     }
 
     /// Renames a tag in the catalog, a catalog job: each live item that
     /// carries `old` carries `new` instead, and the tag list renames it.
-    /// Returns how many items carried the tag.
+    /// Returns how many items carried the tag. `order` is the change's
+    /// number, as for `stage_tag_delta`.
     pub(super) fn stage_tag_rename(
         &self,
         old: &str,
         new: &str,
-        mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
+        capabilities: impl FnMut(&StorePath) -> Option<CapabilityMatrix>,
         reads: &[AttributeRead],
+        order: u64,
     ) -> Result<usize, Box<str>> {
         TagService::validate_tag(new).map_err(|error| Box::<str>::from(error.to_string()))?;
         let added = [Box::<str>::from(new.trim())].into_iter().collect();
         let removed = [Box::<str>::from(old)].into_iter().collect();
-        self.update_result(|document| {
-            let (targets, changed) = Self::tagged_in(document, old, &mut capabilities);
-            self.stage_delta_in(document, &targets, &added, &removed, reads)?;
-            document
-                .tags_mut()
-                .rename(old, new)
-                .map_err(|error| Box::<str>::from(error.to_string()))?;
-            Ok(changed)
-        })
+        self.stage_tag_change(
+            old,
+            &added,
+            &removed,
+            capabilities,
+            reads,
+            order,
+            |document| {
+                document
+                    .tags_mut()
+                    .rename(old, new)
+                    .map_err(|error| Box::<str>::from(error.to_string()))
+            },
+        )
     }
 
     /// Deletes a tag in the catalog, a catalog job: no item carries it and
@@ -1085,16 +1473,49 @@ impl CatalogBinding {
     pub(super) fn stage_tag_delete(
         &self,
         tag: &str,
-        mut capabilities: impl FnMut(&StorePath) -> CapabilityMatrix,
+        capabilities: impl FnMut(&StorePath) -> Option<CapabilityMatrix>,
         reads: &[AttributeRead],
+        order: u64,
     ) -> Result<usize, Box<str>> {
         let removed = [Box::<str>::from(tag)].into_iter().collect();
-        self.update_result(|document| {
-            let (targets, changed) = Self::tagged_in(document, tag, &mut capabilities);
-            self.stage_delta_in(document, &targets, &BTreeSet::new(), &removed, reads)?;
-            document.tags_mut().delete(tag);
-            Ok(changed)
-        })
+        self.stage_tag_change(
+            tag,
+            &BTreeSet::new(),
+            &removed,
+            capabilities,
+            reads,
+            order,
+            |document| {
+                document.tags_mut().delete(tag);
+                Ok(())
+            },
+        )
+    }
+
+    /// Stages a catalog-wide tag change for the live items that carry
+    /// `tag`, then applies `finish` to the tag list.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_tag_change(
+        &self,
+        tag: &str,
+        added: &BTreeSet<Box<str>>,
+        removed: &BTreeSet<Box<str>>,
+        mut capabilities: impl FnMut(&StorePath) -> Option<CapabilityMatrix>,
+        reads: &[AttributeRead],
+        order: u64,
+        finish: impl FnOnce(&mut CatalogDocument) -> Result<(), Box<str>>,
+    ) -> Result<usize, Box<str>> {
+        let (targets, changed) = self.update_result(|document| {
+            let (targets, changed) = Self::tagged_in(document, tag, &mut capabilities)?;
+            if !self.tag_change_is_current(targets.iter().map(|(item, _, _)| item), order) {
+                return Err(Box::<str>::from(LATER_TAG_CHANGE));
+            }
+            self.stage_delta_in(document, &targets, added, removed, reads)?;
+            finish(document)?;
+            Ok((targets, changed))
+        })?;
+        self.note_tag_change_staged(targets.iter().map(|(item, _, _)| item), order);
+        Ok(changed)
     }
 
     pub(super) fn items_with_tag(&self, tag: &str) -> BTreeSet<ItemId> {
@@ -1452,23 +1873,23 @@ impl MusheenApp {
     ) {
         let binding = self.catalog_binding.clone();
         let executor = cx.background_executor().clone();
-        // The attribute reads run first, outside the catalog write queue; the
-        // queued job records the tags, and the attribute writes run after it.
-        let staged = cx.background_spawn(async move {
-            let reads = binding.read_attribute_tags(&targets);
-            let writer = binding.clone();
-            binding.queue_work(&executor, move || {
-                writer.stage_tag_delta(&targets, &delta.added, &delta.removed, &reads)
-            })
-        });
+        let order = binding.next_tag_change();
+        // The attribute reads run in their mounts' lanes; the queued job
+        // records the tags, and the attribute writes follow in the lanes.
+        let reads = binding.read_attribute_tags_in_lanes(&targets);
         // The Properties window outlives the window that opened it, so
         // `done` hears the result whether or not this window is still open.
         cx.spawn(async move |this, cx| {
-            let result = catalog_work_result(staged.await).await;
+            let reads = reads.await;
+            let writer = binding.clone();
+            let staged = binding.queue_work(&executor, move || {
+                writer.stage_tag_delta(&targets, &delta.added, &delta.removed, &reads, order)
+            });
+            let result = catalog_work_result(staged).await;
             if result.is_ok() {
+                binding.start_attribute_writes(&executor);
                 let _ = this.update(cx, |state, cx| {
                     state.sync_catalog_projection(cx);
-                    state.start_attribute_writes(cx);
                     cx.notify();
                 });
             }
@@ -1477,92 +1898,19 @@ impl MusheenApp {
         .detach();
     }
 
-    /// Writes the attribute tags the catalog has staged, outside the catalog
-    /// write queue: one write per item at a time and at most
-    /// `ATTRIBUTE_WRITES_LIMIT` at once, so a file whose store blocks holds
-    /// only its own write. A queued job finishes each write that lands, and
-    /// an item whose tags changed meanwhile is written again. A failed
-    /// write stays pending until the next pass.
-    pub(super) fn start_attribute_writes(&mut self, cx: &mut Context<Self>) {
-        for item in self.catalog_binding.pending_attribute_items() {
-            if self.catalog_binding.claim_attribute_write(&item) {
-                self.write_attribute(item, 1, cx);
-            }
-        }
-    }
-
-    fn write_attribute(&mut self, item: ItemId, attempt: usize, cx: &mut Context<Self>) {
-        let binding = self.catalog_binding.clone();
-        let executor = cx.background_executor().clone();
-        let written = item.clone();
-        let write = cx.background_spawn(async move {
-            let write = binding.write_pending_attribute(&written)?;
-            Some(match write.result {
-                Ok(()) => {
-                    let finisher = binding.clone();
-                    Ok(binding.queue_work(&executor, move || {
-                        finisher.finish_attribute_write(&written, &write.path, &write.tags)
-                    }))
-                }
-                Err(error) => Err(error),
-            })
-        });
-        let binding = self.catalog_binding.clone();
-        let released = item.clone();
-        cx.spawn(async move |this, cx| {
-            let outcome = match write.await {
-                None => Ok(false),
-                Some(Err(error)) => Err(error),
-                Some(Ok(finished)) => catalog_work_result(finished).await,
-            };
-            let open = this.update(cx, |state, cx| {
-                match outcome {
-                    Ok(true) if attempt < MAX_XATTR_RECONCILIATION_WRITES => {
-                        // The tags changed while the write ran: write the
-                        // newer ones; the item stays claimed.
-                        state.write_attribute(item, attempt + 1, cx);
-                        return;
-                    }
-                    Ok(true) => {
-                        state.operation_error = Some(Box::<str>::from(
-                            "tag metadata changed too often to reconcile extended attributes safely",
-                        ));
-                        state.catalog_binding.release_attribute_write(&item);
-                    }
-                    Ok(false) => {
-                        state.catalog_binding.release_attribute_write(&item);
-                        // The next items waiting for a write may start.
-                        state.start_attribute_writes(cx);
-                    }
-                    Err(error) => {
-                        state.operation_error = Some(error);
-                        state.catalog_binding.release_attribute_write(&item);
-                    }
-                }
-                if state.catalog_binding.revision() != state.catalog_projection_revision {
-                    state.project_catalog();
-                }
-                cx.notify();
-            });
-            if open.is_err() {
-                binding.release_attribute_write(&released);
-            }
-        })
-        .detach();
-    }
-
     /// Asks the store for the capabilities of the paths that carry `tag`
-    /// and reads their attribute tags, then queues `change`, which reads and
-    /// writes the catalog inside the write queue. A path tagged after the
-    /// probe is asked inside the job. The task gives the receiver of the
-    /// change's result.
+    /// and reads their attribute tags in their lanes, then queues `change`,
+    /// which reads and writes the catalog inside the write queue. The
+    /// change's number is taken now, when the user makes it. The task gives
+    /// the receiver of the change's result.
     fn queue_tag_change(
         &self,
         tag: &str,
         change: impl FnOnce(
             &CatalogBinding,
-            &mut dyn FnMut(&StorePath) -> CapabilityMatrix,
+            &mut dyn FnMut(&StorePath) -> Option<CapabilityMatrix>,
             &[AttributeRead],
+            u64,
         ) -> Result<usize, Box<str>>
         + Send
         + 'static,
@@ -1572,9 +1920,10 @@ impl MusheenApp {
         let store = Arc::clone(&self.store);
         let binding = self.catalog_binding.clone();
         let executor = cx.background_executor().clone();
+        let order = binding.next_tag_change();
         cx.background_spawn(async move {
             let targets = binding.tagged_targets(&tag, |path| store.capabilities(path));
-            let reads = binding.read_attribute_tags(&targets);
+            let reads = binding.read_attribute_tags_in_lanes(&targets).await;
             let probed = targets
                 .into_iter()
                 .map(|(_, path, capabilities)| (path, capabilities))
@@ -1583,21 +1932,17 @@ impl MusheenApp {
             binding.queue_work(&executor, move || {
                 change(
                     &writer,
-                    &mut |path: &StorePath| {
-                        probed
-                            .get(path)
-                            .cloned()
-                            .unwrap_or_else(|| store.capabilities(path))
-                    },
+                    &mut |path: &StorePath| probed.get(path).cloned(),
                     &reads,
+                    order,
                 )
             })
         })
     }
 
-    /// Deletes a sidebar tag. The tagged paths' capabilities are asked off
-    /// the UI thread, then the delete is queued; a failure shows on the
-    /// error line.
+    /// Deletes a sidebar tag. The tagged paths' capabilities are asked and
+    /// their attributes read off the UI thread, then the delete is queued;
+    /// a failure shows on the error line.
     pub(super) fn delete_captured_tag(
         &mut self,
         target: &CommandTargetRef,
@@ -1607,19 +1952,21 @@ impl MusheenApp {
         let deleted = tag.clone();
         let written = self.queue_tag_change(
             &tag,
-            move |binding, capabilities, reads| {
-                binding.stage_tag_delete(&deleted, capabilities, reads)
+            move |binding, capabilities, reads, order| {
+                binding.stage_tag_delete(&deleted, capabilities, reads, order)
             },
             cx,
         );
+        let binding = self.catalog_binding.clone();
+        let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let result = catalog_work_result(written.await).await;
+            if result.is_ok() {
+                binding.start_attribute_writes(&executor);
+            }
             let _ = this.update(cx, |state, cx| {
                 match result {
-                    Ok(_) => {
-                        state.sync_catalog_projection(cx);
-                        state.start_attribute_writes(cx);
-                    }
+                    Ok(_) => state.sync_catalog_projection(cx),
                     Err(error) => state.operation_error = Some(error),
                 }
                 cx.notify();
@@ -1629,8 +1976,9 @@ impl MusheenApp {
         Ok(())
     }
 
-    /// Renames a sidebar tag. The tagged paths' capabilities are asked off
-    /// the UI thread, then the rename is queued; `done` hears the result.
+    /// Renames a sidebar tag. The tagged paths' capabilities are asked and
+    /// their attributes read off the UI thread, then the rename is queued;
+    /// `done` hears the result.
     pub(super) fn rename_catalog_tag(
         &mut self,
         old: &str,
@@ -1641,11 +1989,13 @@ impl MusheenApp {
         let (renamed, name) = (old.to_owned(), new.to_owned());
         let written = self.queue_tag_change(
             old,
-            move |binding, capabilities, reads| {
-                binding.stage_tag_rename(&renamed, &name, capabilities, reads)
+            move |binding, capabilities, reads, order| {
+                binding.stage_tag_rename(&renamed, &name, capabilities, reads, order)
             },
             cx,
         );
+        let binding = self.catalog_binding.clone();
+        let executor = cx.background_executor().clone();
         // The rename window outlives the window that opened it, so `done`
         // hears the result whether or not this window is still open.
         cx.spawn(async move |this, cx| {
@@ -1659,9 +2009,9 @@ impl MusheenApp {
                     }
                 });
             if result.is_ok() {
+                binding.start_attribute_writes(&executor);
                 let _ = this.update(cx, |state, cx| {
                     state.sync_catalog_projection(cx);
-                    state.start_attribute_writes(cx);
                     cx.notify();
                 });
             }
@@ -3462,6 +3812,7 @@ mod tests {
                 &tag_set(&["Work"]),
                 &BTreeSet::new(),
                 &[],
+                binding.next_tag_change(),
             )
             .unwrap();
 
@@ -3472,12 +3823,19 @@ mod tests {
         attributes.until_waiting();
 
         let staged = binding.clone();
+        let order = binding.next_tag_change();
         let second_target = [(second.clone(), second_path.clone(), matrix.clone())];
         let pinned = binding.clone();
         let pin = item("local", b"pinned");
         assert!(binding.writes.push(Box::new(move || {
             staged
-                .stage_tag_delta(&second_target, &tag_set(&["Home"]), &BTreeSet::new(), &[])
+                .stage_tag_delta(
+                    &second_target,
+                    &tag_set(&["Home"]),
+                    &BTreeSet::new(),
+                    &[],
+                    order,
+                )
                 .unwrap();
         })));
         binding.writes.push(Box::new(move || {
@@ -3522,6 +3880,143 @@ mod tests {
             Some(tag_set(&["Work"]))
         );
         assert!(!binding.snapshot().tags().is_xattr_pending(&first));
+    }
+
+    // UXF-024: attribute work in one lane waits only for that lane: a lane
+    // whose work blocks, as a hung mount's would, holds the next work in it
+    // and none in another lane; each lane runs its work in order on a
+    // thread of its own.
+    #[test]
+    fn xattr_queue_a_blocked_lane_holds_only_its_own_work() {
+        use futures_lite::future::block_on;
+        let lanes = super::AttributeLanes {
+            lanes: std::sync::Arc::default(),
+            key: |path| {
+                path.as_unix_path()
+                    .expect("the test paths are Unix paths")
+                    .to_path_buf()
+            },
+        };
+        let hung = StorePath::from_unix_path("/hung");
+        let healthy = StorePath::from_unix_path("/healthy");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let blocked = lanes.run(&hung, move || {
+            released.recv().unwrap();
+            std::thread::current().name().map(str::to_owned)
+        });
+        let behind = lanes.run(&hung, || "second in the hung lane");
+        let other = lanes.run(&healthy, || "in the healthy lane");
+
+        assert_eq!(
+            block_on(other.recv()).unwrap(),
+            "in the healthy lane",
+            "another lane's work runs while the hung lane waits"
+        );
+        assert!(
+            behind.try_recv().is_err(),
+            "the hung lane's next work waits"
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            block_on(blocked.recv()).unwrap().as_deref(),
+            Some("musheen-attributes"),
+            "lane work runs on the lane's own thread"
+        );
+        assert_eq!(block_on(behind.recv()).unwrap(), "second in the hung lane");
+    }
+
+    // UXF-024: a tag change that arrives after a later change for the same
+    // item staged is refused, not applied over the later one.
+    #[test]
+    fn xattr_queue_an_older_tag_change_never_stages_over_a_newer_one() {
+        let binding = CatalogBinding::in_memory();
+        let target = [(
+            item("remote", b"tagged"),
+            remote_path("remote", b"tagged"),
+            capabilities(true, false),
+        )];
+        let older = binding.next_tag_change();
+        let newer = binding.next_tag_change();
+        binding
+            .stage_tag_delta(&target, &BTreeSet::new(), &tag_set(&["A"]), &[], newer)
+            .unwrap();
+
+        let refused = binding
+            .stage_tag_delta(&target, &tag_set(&["A"]), &BTreeSet::new(), &[], older)
+            .unwrap_err();
+
+        assert_eq!(refused.as_ref(), super::LATER_TAG_CHANGE);
+        assert!(
+            binding.tags_for_identity(&target[0].0).is_empty(),
+            "the newer change, which removed A, stands"
+        );
+    }
+
+    // UXF-024: an orphaned item's pending attribute write is not written, so
+    // a file now at its old path never gets its tags; nothing is written
+    // while the tags opt-in is off.
+    #[test]
+    fn xattr_queue_attribute_writes_skip_orphans_and_the_opt_out() {
+        let attributes = std::sync::Arc::new(HeldAttributeTags::default());
+        let binding = CatalogBinding::in_memory_with_xattr_opt_in(true)
+            .with_attribute_tags(attributes.clone());
+        let orphan = item("local", b"orphan");
+        let path = StorePath::from_unix_path("/orphan");
+        binding
+            .stage_tag_delta(
+                &[(orphan.clone(), path.clone(), capabilities(true, true))],
+                &tag_set(&["Work"]),
+                &BTreeSet::new(),
+                &[],
+                binding.next_tag_change(),
+            )
+            .unwrap();
+        binding.observe_missing(&orphan).unwrap();
+
+        assert!(binding.pending_attribute_items().is_empty());
+        assert!(binding.write_pending_attribute(&orphan).is_none());
+        assert!(attributes.last_written(&path).is_none());
+
+        let opted_out = CatalogBinding::in_memory_with_xattr_opt_in(false);
+        opted_out
+            .update(|document| {
+                document
+                    .tags_mut()
+                    .stage_xattr_tags(&orphan, path.clone(), tag_set(&["Work"]));
+            })
+            .unwrap();
+        assert!(opted_out.pending_attribute_items().is_empty());
+        assert!(opted_out.write_pending_attribute(&orphan).is_none());
+    }
+
+    // UXF-024: a failed attribute write is shown once, naming nothing twice,
+    // until it succeeds or fails another way.
+    #[test]
+    fn xattr_queue_an_attribute_write_failure_is_shown_once() {
+        let binding = CatalogBinding::in_memory_with_xattr_opt_in(true);
+        let failing = item("local", b"failing");
+        let error = Box::<str>::from("Musheen could not write the tags of /failing: denied");
+
+        binding.report_attribute_error(&failing, error.clone());
+        assert_eq!(binding.take_attribute_error(), Some(error.clone()));
+        binding.report_attribute_error(&failing, error.clone());
+        assert_eq!(
+            binding.take_attribute_error(),
+            None,
+            "the same failure is not shown again"
+        );
+        binding.report_attribute_error(&failing, Box::<str>::from("another failure"));
+        assert_eq!(
+            binding.take_attribute_error().as_deref(),
+            Some("another failure")
+        );
+        binding.forget_attribute_error(&failing);
+        binding.report_attribute_error(&failing, error.clone());
+        assert_eq!(
+            binding.take_attribute_error(),
+            Some(error),
+            "after a success the failure shows again"
+        );
     }
 
     // UXF-024: while one file's attribute read waits on its store, a catalog

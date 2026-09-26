@@ -24,7 +24,7 @@ use posix_acl::{ACL_EXECUTE, ACL_WRITE, PosixACL, Qualifier};
 use std::path::PathBuf;
 
 pub use mutation::LocalTrashEntry;
-pub use probe::LocalFilesystemInfo;
+pub use probe::{LocalFilesystemInfo, mount_point_of};
 pub use queue::{
     ActiveOperationPaths, ArchiveOperationExecution, ArchiveOperationRoute, DropAction, DropError,
     FileDragPayload, LocalFailureDisposition, LocalOperationFailure, LocalOperationOutcome,
