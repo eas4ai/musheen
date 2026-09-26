@@ -1,0 +1,164 @@
+[package]
+name = "musheen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[workspace]
+members = [
+    "crates/musheen-core",
+    "crates/musheen-desktop",
+    "crates/musheen-local",
+    "crates/musheen-ops",
+    "crates/musheen-test-support",
+    "crates/musheen-ui",
+    "crates/musheen-zstd-budget",
+    "vendor/sevenz-rust2",
+]
+resolver = "3"
+exclude = [
+    "vendor/gpui-component",
+    "vendor/gpui-pre",
+    "vendor/gpui-pre-linux",
+    "vendor/native-theme-gpui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+async-channel = "2"
+async-executor = "1"
+async-io = "2"
+async-net = "2"
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "backend", "frontend"] }
+base64 = "0.22"
+blake3 = "1"
+camino = "1"
+compress-tools = { version = "0.16", default-features = false }
+flate2 = "1"
+freedesktop = "0.0"
+fast_image_resize = { version = "6", default-features = false, features = ["std"] }
+futures-lite = "2"
+futures-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+gpui-kit = "0.6.4"
+native-theme = { version = "0.5", features = ["watch"] }
+native-theme-gpui = { version = "0.5", default-features = false, features = ["svg-rasterize"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+jiff = "0.2.35"
+md-5 = "0.10"
+miniz_oxide = "=0.9.1"
+musheen-zstd-budget = { path = "crates/musheen-zstd-budget" }
+nix = { version = "0.31", features = ["fs", "poll"] }
+notify = "8"
+notify-rust = "4"
+open = "5"
+opendal = { version = "0.59.3", default-features = false, features = ["executors-tokio", "http-transport-reqwest", "layers-concurrent-limit", "layers-timeout", "services-ftp", "services-http", "services-memory", "services-sftp", "services-webdav"] }
+opendal-http-transport-reqwest = { version = "0.59.3", default-features = false, features = ["rustls"] }
+portable-pty = "0.9"
+pavao = { version = "0.3.1", default-features = false }
+proc-mounts = "0.3"
+posix-acl = "1.2"
+png = "0.18"
+reflink-copy = "0.1"
+ring = "0.17"
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+russh-sftp = "3.0.0"
+ssh2-config = { version = "0.8", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }
+rcgen = "0.14"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+rustix = { version = "1", features = ["fs", "process"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+semver = "1"
+sevenz-rust2 = "0.23"
+secret-service = { version = "5", default-features = false, features = ["rt-async-io-crypto-rust"] }
+sha2 = "0.11"
+trybuild = "1"
+tempfile = "3"
+tar = "0.4"
+tokio = { version = "1", features = ["fs", "io-util", "net", "rt-multi-thread", "sync", "time"] }
+tree_magic_mini = { version = "3.2", default-features = false }
+ureq = { version = "3.1.4", default-features = false, features = ["rustls"] }
+trash = "5"
+walkdir = "2"
+wax = "0.7"
+xattr = "1"
+xdg-mime = "0.4"
+zbus = "5"
+zeroize = "1"
+zip = { version = "=6.0.0", default-features = false, features = ["aes-crypto", "deflate-flate2", "zstd"] }
+zstd = "0.13"
+zstd-safe = { version = "7", features = ["experimental"] }
+
+[dependencies]
+futures-lite.workspace = true
+musheen-core = { path = "crates/musheen-core" }
+musheen-desktop = { path = "crates/musheen-desktop" }
+musheen-local = { path = "crates/musheen-local" }
+musheen-ui = { path = "crates/musheen-ui" }
+rustix.workspace = true
+
+[dev-dependencies]
+async-channel.workspace = true
+musheen-test-support = { path = "crates/musheen-test-support" }
+musheen-ops = { path = "crates/musheen-ops" }
+png.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tar.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "directory"
+harness = false
+
+[[bench]]
+name = "search"
+harness = false
+
+[[bench]]
+name = "operations"
+harness = false
+
+[[bench]]
+name = "thumbnail"
+harness = false
+
+[[bench]]
+name = "archive"
+harness = false
+
+[[bench]]
+name = "terminal"
+harness = false
+
+[[bench]]
+name = "remote"
+harness = false
+
+[[bench]]
+name = "startup"
+harness = false
+
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+native-theme-gpui = { path = "vendor/native-theme-gpui" }
+sevenz-rust2 = { path = "vendor/sevenz-rust2" }
