@@ -75,6 +75,8 @@ reflink-copy = "0.1"
 ring = "0.17"
 russh = { version = "0.63.3", default-features = false, features = ["ring"] }
 russh-sftp = "3.0.0"
+ssh2-config = { version = "0.8", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }
 rcgen = "0.14"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rustix = { version = "1", features = ["fs", "process"] }
