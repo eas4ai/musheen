@@ -472,13 +472,6 @@ impl SettingsWindow {
         if self.sync_inputs {
             self.sync_inputs = false;
             self.theme_error = None;
-            let theme_value = self
-                .state
-                .draft()
-                .value("appearance.theme")
-                .expect("theme schema key");
-            self.theme_input
-                .update(cx, |input, cx| input.set_value(theme_value, window, cx));
             for (key, input) in &self.inputs {
                 let value = self.state.draft().value(key).expect("schema key");
                 let spec = settings_schema()
@@ -1591,6 +1584,49 @@ mod tests {
                 Some("false")
             );
             assert!(prior.is_focused(window));
+            window.remove_window();
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn restoring_defaults_puts_the_theme_document_back_in_its_box(cx: &mut TestAppContext) {
+        init_settings_pointer_test(cx);
+        let root = tempfile::tempdir().unwrap();
+        let mut view = None;
+        let handle = cx.open_window(size(px(840.), px(680.)), |window, cx| {
+            let entity = cx.new(|cx| {
+                SettingsWindow::new(
+                    SettingsStore::from_config_home(root.path()),
+                    SettingsBackends::all(),
+                    Catalog::load(Locale::EnUs).unwrap(),
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-page-appearance", cx);
+            window.render_frame(cx);
+            window.click("theme-starter", cx);
+            window.render_frame(cx);
+            window.click("settings-reset-all", cx);
+            window.render_frame(cx);
+            window.click("settings-confirm", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).theme_input.read(cx).value().as_ref(),
+                "native",
+                "the theme box shows the restored theme document"
+            );
+            window.click("theme-preview", cx);
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).theme_error, None);
+            assert!(view.read(cx).state.errors().is_empty());
             window.remove_window();
         })
         .unwrap();

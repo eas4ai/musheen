@@ -30,10 +30,10 @@ pub(super) fn display_value(spec: &SettingSpec, value: &str, catalog: &Catalog) 
     }
 }
 
-/// Connection profiles are managed by the connection editor rather than
-/// exposed as editable settings text. This helper serves the input controls.
+/// The text an input control shows: the theme box edits the theme document
+/// itself, and every other input shows the value as `display_value` does.
 pub(super) fn input_value(spec: &SettingSpec, value: &str, catalog: &Catalog) -> String {
-    if matches!(spec.kind, SettingKind::ConnectionProfiles) {
+    if matches!(spec.kind, SettingKind::Theme) {
         value.to_owned()
     } else {
         display_value(spec, value, catalog)
