@@ -337,6 +337,27 @@ pub(crate) fn copy_tar<R: Read, W: Write>(
     Ok(())
 }
 
+/// Visits the regular files of a tar stream in archive order, in one pass,
+/// handing each one `wanted` names to `visit` with a reader over its bytes.
+pub(crate) fn copy_files_in_order<R: Read>(
+    reader: R,
+    wanted: &dyn Fn(u64) -> bool,
+    visit: &mut dyn FnMut(u64, &mut dyn Read) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
+    let mut archive = tar::Archive::new(reader);
+    let entries = archive
+        .entries()
+        .map_err(|_| ArchiveError::InvalidArchive)?;
+    for (ordinal, entry) in entries.enumerate() {
+        let mut entry = entry.map_err(|_| ArchiveError::InvalidArchive)?;
+        let ordinal = u64::try_from(ordinal).map_err(|_| ArchiveError::InvalidArchive)?;
+        if wanted(ordinal) {
+            visit(ordinal, &mut entry)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn copy_guarded_tar<R: Read, W: Write>(
     reader: R,
     ordinal: u64,

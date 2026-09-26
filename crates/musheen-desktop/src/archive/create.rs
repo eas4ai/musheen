@@ -1553,7 +1553,7 @@ pub(crate) fn path_identity_with_controls(
     if opened_metadata.dev() != metadata.dev() || opened_metadata.ino() != metadata.ino() {
         return Err(ArchiveOperationError::Conflict);
     }
-    let digest = content_digest(
+    let digest = identity_digest(
         opened,
         &metadata,
         path.as_os_str().len(),
@@ -1573,38 +1573,12 @@ pub(crate) fn path_identity_with_controls(
     ))
 }
 
-pub(crate) fn file_identity(file: &File) -> Result<ArchivePathIdentity, ArchiveOperationError> {
-    let metadata = file.metadata().map_err(|error| map_io(&error))?;
-    if !metadata.is_file() {
-        return Err(ArchiveOperationError::UnsupportedFileType);
-    }
-    let mut reader = file.try_clone().map_err(|error| map_io(&error))?;
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| map_io(&error))?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&metadata.mode().to_le_bytes());
-    hasher.update(&metadata.len().to_le_bytes());
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = reader.read(&mut buffer).map_err(|error| map_io(&error))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(ArchivePathIdentity::new(
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        false,
-    )
-    .with_content_digest(*hasher.finalize().as_bytes()))
-}
-
-fn content_digest(
+/// Digests an item and, for a folder, everything in it, from names and
+/// metadata alone. It reads no file contents: any write changes a file's size,
+/// modification time or change time, and a user process cannot set the change
+/// time back. The item's own change time is left out, because renaming the
+/// item, as publishing does, changes it.
+fn identity_digest(
     opened: File,
     metadata: &std::fs::Metadata,
     path_bytes: usize,
@@ -1613,7 +1587,7 @@ fn content_digest(
 ) -> Result<[u8; 32], ArchiveOperationError> {
     let mut hasher = blake3::Hasher::new();
     let deadline = budget.map(ArchiveBudget::identity_walk_deadline);
-    hash_path_content(
+    hash_identity_tree(
         opened,
         metadata,
         path_bytes,
@@ -1633,7 +1607,7 @@ struct IdentityNode {
     _memory: Option<ArchiveMemoryLease>,
 }
 
-fn hash_path_content(
+fn hash_identity_tree(
     opened: File,
     metadata: &std::fs::Metadata,
     path_bytes: usize,
@@ -1669,34 +1643,23 @@ fn hash_path_content(
                 maximum: MAX_IDENTITY_DEPTH as u64,
             });
         }
+        hasher.update(&node.metadata.mode().to_le_bytes());
+        hasher.update(&node.metadata.len().to_le_bytes());
         if let Some(name) = &node.name {
             hasher.update(&(name.len() as u64).to_le_bytes());
             hasher.update(name);
-        }
-        hasher.update(&node.metadata.mode().to_le_bytes());
-        hasher.update(&node.metadata.len().to_le_bytes());
-        if node.metadata.is_file() {
-            let mut file = node.opened;
-            let buffer_memory = budget
-                .map(|budget| budget.reserve_memory(8 * 1_024))
-                .transpose()?;
-            let mut buffer = [0_u8; 8 * 1024];
-            loop {
-                if let Some(budget) = budget {
-                    budget.identity_checkpoint(
-                        deadline.expect("budgeted identity walk has deadline"),
-                    )?;
-                }
-                if let Some(cancellation) = cancellation {
-                    cancellation.wait_if_paused()?;
-                }
-                let count = file.read(&mut buffer).map_err(|error| map_io(&error))?;
-                if count == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..count]);
+            for value in [
+                node.metadata.dev(),
+                node.metadata.ino(),
+                node.metadata.mtime() as u64,
+                node.metadata.mtime_nsec() as u64,
+                node.metadata.ctime() as u64,
+                node.metadata.ctime_nsec() as u64,
+            ] {
+                hasher.update(&value.to_le_bytes());
             }
-            drop(buffer_memory);
+        }
+        if node.metadata.is_file() {
             continue;
         }
         if !node.metadata.is_dir() {
