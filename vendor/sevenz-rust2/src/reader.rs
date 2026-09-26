@@ -2012,6 +2012,38 @@ impl<R: Read + Seek> ArchiveReader<R> {
         Ok(())
     }
 
+    /// Decodes every block once, in order, and visits each file with its index in the
+    /// archive; the files that have no data come last. Each visit must read the file to
+    /// its end, because the files of a solid block decode one after another.
+    pub fn for_each_entries_indexed<
+        F: FnMut(usize, &ArchiveEntry, &mut dyn Read) -> Result<(), Error>,
+    >(
+        &mut self,
+        mut each: F,
+    ) -> Result<(), Error> {
+        for block_index in 0..self.archive.blocks.len() {
+            BlockDecoder::new(
+                self.thread_count,
+                block_index,
+                &self.archive,
+                &self.password,
+                &mut self.source,
+            )
+            .with_memory_budget(Arc::clone(&self.memory_budget))
+            .for_each_indexed_entries(&mut |index, entry, contents| {
+                each(index, entry, contents)?;
+                Ok(true)
+            })?;
+        }
+        for file_index in 0..self.archive.files.len() {
+            if self.archive.stream_map.file_block_index[file_index].is_none() {
+                let empty_reader: &mut dyn Read = &mut ([0_u8; 0].as_slice());
+                each(file_index, &self.archive.files[file_index], empty_reader)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the data of a file with the given path inside the archive.
     ///
     /// # Notice
@@ -2213,6 +2245,16 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         self,
         each: &mut F,
     ) -> Result<bool, Error> {
+        self.for_each_indexed_entries(&mut |_, entry, contents| each(entry, contents))
+    }
+
+    /// Like `for_each_entries`, and also passes each file's index in the archive.
+    pub fn for_each_indexed_entries<
+        F: FnMut(usize, &ArchiveEntry, &mut dyn Read) -> Result<bool, Error>,
+    >(
+        self,
+        each: &mut F,
+    ) -> Result<bool, Error> {
         let Self {
             thread_count,
             block_index,
@@ -2244,14 +2286,14 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                         file.crc,
                     ));
                 }
-                if !each(file, &mut decoder)
+                if !each(file_index, file, &mut decoder)
                     .map_err(|e| e.maybe_bad_password(!self.password.is_empty()))?
                 {
                     return Ok(false);
                 }
             } else {
                 let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
-                if !each(file, empty_reader)? {
+                if !each(file_index, file, empty_reader)? {
                     return Ok(false);
                 }
             }

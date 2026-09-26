@@ -4,14 +4,14 @@ use super::budget::{
 };
 use super::create::{
     ArchiveCleanupIntent, ArchiveOperationOutcome, ArchivePublicationPaths, append_archive_phase,
-    cleanup_path, cleanup_phase, deletion_path, file_identity, local_path, map_errno,
-    path_identity_with_controls, publication_phase, publication_quarantine_path, publish_staging,
-    remove_owned_journaled, remove_owned_journaled_by_identity, staging_path, sync_parent,
+    cleanup_path, cleanup_phase, deletion_path, local_path, map_errno, path_identity_with_controls,
+    publication_phase, publication_quarantine_path, publish_staging, remove_owned_journaled,
+    remove_owned_journaled_by_identity, staging_path, sync_parent,
 };
-use super::format::{ArchiveCopyContext, RawEntryKind, copy_entry, open_scanner};
+use super::format::{ArchiveCopyContext, RawEntryKind, copy_files_in_order, open_scanner};
+use super::io::BoundedWriter;
 use super::store::{ArchiveError, ArchiveLimits, ArchivePasswordProvider, DecodeCounterState};
 use super::{ArchiveFormat, ArchivePath};
-use super::{tar_codec, zip_codec};
 use musheen_core::{CancellationToken, ProviderId};
 use musheen_ops::{
     AnsweredItem, ArchiveCleanupKind, ArchiveCodec, ArchiveConflictPolicy, ArchiveEventPhase,
@@ -21,7 +21,7 @@ use musheen_ops::{
 use nix::libc::O_NOFOLLOW;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -86,12 +86,12 @@ pub(crate) fn execute_extract<S: JournalStorage>(
             ArchiveConflictPolicy::Replace => {}
         }
     }
-    let snapshot_parent = destination
+    let parent = destination
         .parent()
         .ok_or(ArchiveOperationError::UnsafePath(
             "archive destination needs a parent",
         ))?;
-    let operation_limits = limits.for_staging(snapshot_parent)?;
+    let operation_limits = extraction_limits(limits, parent)?;
     let mut budget = ArchiveBudget::with_accounting(operation_limits.clone(), accounting.clone())
         .with_identity_cancellation(cancellation.clone());
     let plan_path_bytes = plan
@@ -106,35 +106,15 @@ pub(crate) fn execute_extract<S: JournalStorage>(
     let _plan_paths_memory =
         budget.reserve_memory(u64::try_from(plan_path_bytes).unwrap_or(u64::MAX))?;
     let counters = DecodeCounterState::with_memory_budget(budget.shared_memory());
+    // The archive is read where it is, never copied. Its identity is checked
+    // again after decoding, so nothing is published when it changed meanwhile.
     let source_file = open_archive_source(&source)?;
-    let source_identity = file_identity(&source_file)?;
-    let source_metadata = source_file.metadata().map_err(|error| map_io(&error))?;
-    let source_bytes = source_metadata.len();
-    budget.charge_temporary(source_bytes)?;
-    let mut source_snapshot =
-        tempfile::tempfile_in(snapshot_parent).map_err(|error| map_io(&error))?;
-    copy_source_snapshot(
-        &source_file,
-        &mut source_snapshot,
-        source_bytes,
-        source_metadata.mode(),
-        source_identity.content_digest(),
-        cancellation,
-        &budget,
-    )?;
-    if path_identity_with_controls(&source, Some(&budget), Some(cancellation))?
-        != Some(source_identity)
-        || file_identity(&source_file)? != source_identity
-    {
-        return Err(ArchiveOperationError::Conflict);
-    }
-    source_snapshot
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| map_io(&error))?;
+    let source_before = SourceIdentity::of(&source_file)?;
+    let source_bytes = source_before.size;
     let format = archive_format(plan.codec());
     let decode_limits = decode_limits(&operation_limits);
     let entries = collect_extract_entries(
-        &source_snapshot,
+        &source_file,
         source_bytes,
         format,
         &decode_limits,
@@ -142,11 +122,6 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         cancellation,
         &mut budget,
         &counters,
-        destination
-            .parent()
-            .ok_or(ArchiveOperationError::UnsafePath(
-                "archive destination needs a parent",
-            ))?,
     )?;
     let staging = staging_path(plan, job_id, generation)?;
     let rollback = cleanup_path(&staging)?;
@@ -190,57 +165,76 @@ pub(crate) fn execute_extract<S: JournalStorage>(
         )?;
         report_phase(ArchiveEventPhase::Decoding)?;
         let mut actual_budget = budget.next_phase();
-        for entry in &entries {
+        for entry in entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, ExtractEntryKind::Directory))
+        {
             cancellation.wait_if_paused()?;
             let _path_memory = actual_budget.reserve_memory(
                 u64::try_from(entry.path.len().saturating_add(256)).unwrap_or(u64::MAX),
             )?;
             actual_budget.charge_temporary(4 * 1_024)?;
             let output = output_path(&staging, &entry.path, limits.max_path_bytes)?;
-            match entry.kind {
-                ExtractEntryKind::Directory => {
-                    std::fs::create_dir_all(&output).map_err(|error| map_io(&error))?;
-                    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700))
-                        .map_err(|error| map_io(&error))?;
+            std::fs::create_dir_all(&output).map_err(|error| map_io(&error))?;
+            std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| map_io(&error))?;
+        }
+        // Every file is decoded once, in archive order, in one pass.
+        let mut files = entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, ExtractEntryKind::File))
+            .map(|entry| (entry.ordinal, entry))
+            .collect::<Vec<_>>();
+        files.sort_by_key(|(ordinal, _)| *ordinal);
+        let _file_index_memory = actual_budget
+            .reserve_memory(u64::try_from(files.len().saturating_mul(24)).unwrap_or(u64::MAX))?;
+        let mut written = vec![false; files.len()];
+        let mut failure = None;
+        let position = |ordinal: u64| files.binary_search_by_key(&ordinal, |(key, _)| *key);
+        let copied = copy_files_in_order(
+            &source_file,
+            format,
+            &ArchiveCopyContext {
+                passwords,
+                limits: &decode_limits,
+                counters: &counters,
+                cancellation,
+                compressed_size: None,
+            },
+            &|ordinal| position(ordinal).is_ok(),
+            &mut |ordinal, contents| {
+                let Ok(index) = position(ordinal) else {
+                    return Ok(());
+                };
+                if written[index] {
+                    return Err(ArchiveError::InvalidArchive);
                 }
-                ExtractEntryKind::File => {
-                    let parent = output.parent().ok_or(ArchiveOperationError::UnsafePath(
-                        "archive entry needs a parent",
-                    ))?;
-                    std::fs::create_dir_all(parent).map_err(|error| map_io(&error))?;
-                    let file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .custom_flags(O_NOFOLLOW)
-                        .mode(0o600)
-                        .open(&output)
-                        .map_err(|error| map_io(&error))?;
-                    let mut writer = BudgetWriter {
-                        inner: file,
-                        budget: &mut actual_budget,
-                        source_bytes,
-                        error: None,
-                    };
-                    let copy_result = copy_entry(
-                        &source_snapshot,
-                        format,
-                        entry.ordinal,
-                        &mut writer,
-                        ArchiveCopyContext {
-                            passwords,
-                            limits: &decode_limits,
-                            counters: &counters,
-                            cancellation,
-                            compressed_size: entry.compressed_size,
-                        },
-                    );
-                    if let Some(error) = writer.error.take() {
-                        return Err(error);
-                    }
-                    copy_result.map_err(ArchiveOperationError::from)?;
-                    writer.inner.sync_all().map_err(|error| map_io(&error))?;
-                }
-            }
+                written[index] = true;
+                extract_file(
+                    files[index].1,
+                    contents,
+                    &staging,
+                    limits.max_path_bytes,
+                    &decode_limits,
+                    source_bytes,
+                    &mut actual_budget,
+                    cancellation,
+                )
+                .map_err(|error| {
+                    failure = Some(error);
+                    ArchiveError::Io
+                })
+            },
+        );
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        copied.map_err(ArchiveOperationError::from)?;
+        if written.contains(&false) {
+            return Err(ArchiveOperationError::InvalidArchive);
+        }
+        if SourceIdentity::of(&source_file)? != source_before {
+            return Err(ArchiveOperationError::Conflict);
         }
         sync_tree(&staging)?;
         append_archive_phase(
@@ -845,7 +839,7 @@ pub fn extract_destination(
         .ok_or(ArchiveOperationError::UnsafePath(
             "archive destination needs a parent",
         ))?;
-    let operation_limits = limits.for_staging(parent)?;
+    let operation_limits = extraction_limits(limits, parent)?;
     let mut budget = ArchiveBudget::new(operation_limits.clone());
     let counters = DecodeCounterState::with_memory_budget(budget.shared_memory());
     let source_file = open_archive_source(&source)?;
@@ -862,7 +856,6 @@ pub fn extract_destination(
         cancellation,
         &mut budget,
         &counters,
-        parent,
     )?;
     let mut collisions: Vec<ExtractCollision> = Vec::new();
     let mut collided = std::collections::HashSet::new();
@@ -905,43 +898,6 @@ pub fn extract_destination(
     Ok(ExtractDestination::Folder(collisions))
 }
 
-fn copy_source_snapshot(
-    source: &File,
-    snapshot: &mut File,
-    source_bytes: u64,
-    source_mode: u32,
-    expected_digest: [u8; 32],
-    cancellation: &CancellationToken,
-    budget: &ArchiveBudget,
-) -> Result<(), ArchiveOperationError> {
-    let _memory = budget.reserve_memory(8 * 1_024)?;
-    let mut reader = source.try_clone().map_err(|error| map_io(&error))?;
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| map_io(&error))?;
-    let mut copied = 0_u64;
-    let mut digest = blake3::Hasher::new();
-    digest.update(&source_mode.to_le_bytes());
-    digest.update(&source_bytes.to_le_bytes());
-    let mut buffer = [0_u8; 8 * 1_024];
-    loop {
-        cancellation.wait_if_paused()?;
-        let count = reader.read(&mut buffer).map_err(|error| map_io(&error))?;
-        if count == 0 {
-            break;
-        }
-        snapshot
-            .write_all(&buffer[..count])
-            .map_err(|error| map_io(&error))?;
-        digest.update(&buffer[..count]);
-        copied = copied.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-    }
-    if copied != source_bytes || *digest.finalize().as_bytes() != expected_digest {
-        return Err(ArchiveOperationError::Conflict);
-    }
-    snapshot.sync_all().map_err(|error| map_io(&error))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn collect_extract_entries(
     source: &File,
@@ -952,7 +908,6 @@ fn collect_extract_entries(
     cancellation: &CancellationToken,
     budget: &mut ArchiveBudget,
     counters: &std::sync::Arc<DecodeCounterState>,
-    temporary_root: &Path,
 ) -> Result<Vec<ExtractEntry>, ArchiveOperationError> {
     let provider = ProviderId::new("archive-extract").map_err(|_| ArchiveOperationError::Io)?;
     let mut scanner = open_scanner(source, provider, format, limits, counters, passwords)?;
@@ -1004,21 +959,6 @@ fn collect_extract_entries(
                 all_file_sizes_known = false;
             }
         }
-        if matches!(kind, ExtractEntryKind::File) {
-            inspect_nested_entry(
-                source,
-                format,
-                raw.ordinal,
-                raw.compressed_size,
-                limits,
-                passwords,
-                cancellation,
-                budget,
-                counters,
-                temporary_root,
-                1,
-            )?;
-        }
         entries.push(ExtractEntry {
             path: raw.path,
             kind,
@@ -1038,191 +978,6 @@ fn collect_extract_entries(
     };
     budget.charge_expanded(total_expanded, compressed_budget)?;
     Ok(entries)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn inspect_nested_entry(
-    source: &File,
-    format: ArchiveFormat,
-    ordinal: u64,
-    compressed_size: Option<u64>,
-    limits: &ArchiveLimits,
-    passwords: &dyn ArchivePasswordProvider,
-    cancellation: &CancellationToken,
-    budget: &mut ArchiveBudget,
-    counters: &std::sync::Arc<DecodeCounterState>,
-    temporary_root: &Path,
-    depth: usize,
-) -> Result<(), ArchiveOperationError> {
-    let temporary =
-        tempfile::NamedTempFile::new_in(temporary_root).map_err(|error| map_io(&error))?;
-    let error = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let mut writer = NestedBudgetWriter {
-        inner: temporary.reopen().map_err(|error| map_io(&error))?,
-        budget,
-        error: std::rc::Rc::clone(&error),
-    };
-    let copy_result = copy_entry(
-        source,
-        format,
-        ordinal,
-        &mut writer,
-        ArchiveCopyContext {
-            passwords,
-            limits,
-            counters,
-            cancellation,
-            compressed_size,
-        },
-    );
-    if let Some(error) = error.borrow_mut().take() {
-        return Err(error);
-    }
-    copy_result.map_err(ArchiveOperationError::from)?;
-    writer.inner.flush().map_err(|error| map_io(&error))?;
-    let NestedBudgetWriter { mut inner, .. } = writer;
-    inner
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| map_io(&error))?;
-    let Some(nested_format) = detect_archive_format(&mut inner, limits, counters)? else {
-        return Ok(());
-    };
-    budget.check_nesting(depth)?;
-    scan_nested_archive(
-        &inner,
-        nested_format,
-        limits,
-        passwords,
-        cancellation,
-        budget,
-        counters,
-        temporary_root,
-        depth,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_nested_archive(
-    source: &File,
-    format: ArchiveFormat,
-    limits: &ArchiveLimits,
-    passwords: &dyn ArchivePasswordProvider,
-    cancellation: &CancellationToken,
-    budget: &mut ArchiveBudget,
-    counters: &std::sync::Arc<DecodeCounterState>,
-    temporary_root: &Path,
-    depth: usize,
-) -> Result<(), ArchiveOperationError> {
-    let provider = ProviderId::new("archive-nested").map_err(|_| ArchiveOperationError::Io)?;
-    let mut scanner = open_scanner(source, provider, format, limits, counters, passwords)?;
-    let source_bytes = source
-        .metadata()
-        .map_err(|error| map_io(&error))?
-        .len()
-        .max(1);
-    let mut expanded = 0_u64;
-    let mut compressed = 0_u64;
-    while let Some(raw) = scanner.next_entry(cancellation)? {
-        budget.charge_entry()?;
-        budget.check_path(&raw.path)?;
-        match raw.kind {
-            RawEntryKind::Directory => {}
-            RawEntryKind::RegularFile => {
-                let size = raw.size.unwrap_or(0);
-                expanded = expanded.saturating_add(size);
-                compressed = compressed.saturating_add(raw.compressed_size.unwrap_or(0));
-                inspect_nested_entry(
-                    source,
-                    format,
-                    raw.ordinal,
-                    raw.compressed_size,
-                    limits,
-                    passwords,
-                    cancellation,
-                    budget,
-                    counters,
-                    temporary_root,
-                    depth.saturating_add(1),
-                )?;
-            }
-            RawEntryKind::SymbolicLink | RawEntryKind::HardLink | RawEntryKind::Other => {
-                return Err(ArchiveOperationError::UnsupportedFileType);
-            }
-        }
-    }
-    budget.check_compression_ratio(expanded, compressed.max(source_bytes))?;
-    budget.charge_expanded_bytes(expanded)
-}
-
-fn detect_archive_format(
-    file: &mut File,
-    limits: &ArchiveLimits,
-    counters: &std::sync::Arc<DecodeCounterState>,
-) -> Result<Option<ArchiveFormat>, ArchiveOperationError> {
-    match zip_codec::preflight(file, limits, counters) {
-        Ok(_) => {
-            file.seek(SeekFrom::Start(0))
-                .map_err(|error| map_io(&error))?;
-            return Ok(Some(ArchiveFormat::Zip));
-        }
-        Err(ArchiveError::InvalidArchive) => {}
-        Err(error) => return Err(error.into()),
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| map_io(&error))?;
-    let mut prefix = [0_u8; 1_024];
-    let count = file.read(&mut prefix).map_err(|error| map_io(&error))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| map_io(&error))?;
-    let bytes = &prefix[..count];
-    let format = if bytes.starts_with(b"7z\xBC\xAF\x27\x1C") {
-        Some(ArchiveFormat::SevenZip)
-    } else if bytes.starts_with(&[0x1f, 0x8b]) {
-        Some(ArchiveFormat::TarGzip)
-    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
-        || bytes.get(..4).is_some_and(|magic| {
-            (0x184d_2a50..=0x184d_2a5f).contains(&u32::from_le_bytes([
-                magic[0], magic[1], magic[2], magic[3],
-            ]))
-        })
-    {
-        Some(ArchiveFormat::TarZstd)
-    } else if count == prefix.len()
-        && (prefix.iter().all(|byte| *byte == 0)
-            || tar_codec::valid_tar_checksum(
-                prefix[..512]
-                    .try_into()
-                    .map_err(|_| ArchiveOperationError::InvalidArchive)?,
-            ))
-    {
-        Some(ArchiveFormat::Tar)
-    } else {
-        None
-    };
-    Ok(format)
-}
-
-struct NestedBudgetWriter<'a> {
-    inner: File,
-    budget: &'a mut ArchiveBudget,
-    error: std::rc::Rc<std::cell::RefCell<Option<ArchiveOperationError>>>,
-}
-
-impl Write for NestedBudgetWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if let Err(error) = self.budget.charge_temporary(count) {
-            *self.error.borrow_mut() = Some(error);
-            return Err(io::Error::other(
-                "nested archive temporary-space budget exceeded",
-            ));
-        }
-        self.inner.write(bytes)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 fn output_path(
@@ -1268,6 +1023,104 @@ fn archive_format(codec: ArchiveCodec) -> ArchiveFormat {
     }
 }
 
+/// The limits one extraction runs under: the operation's limits with the free
+/// space beside the destination, and no time limit on its identity checks.
+/// The entry, size, ratio, path, memory and temporary-space limits bound an
+/// extraction, and Cancel stops it (OPS-034).
+fn extraction_limits(
+    limits: &ArchiveOperationLimits,
+    parent: &Path,
+) -> Result<ArchiveOperationLimits, ArchiveOperationError> {
+    Ok(ArchiveOperationLimits {
+        max_identity_millis: u64::MAX,
+        ..limits.for_staging(parent)?
+    })
+}
+
+/// What must stay the same about the archive while it is extracted from
+/// where it is. Any write changes its size, modification or change time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl SourceIdentity {
+    fn of(file: &File) -> Result<Self, ArchiveOperationError> {
+        let metadata = file.metadata().map_err(|error| map_io(&error))?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+}
+
+/// Writes one archive file into staging from its decoded bytes.
+#[allow(clippy::too_many_arguments)]
+fn extract_file(
+    entry: &ExtractEntry,
+    contents: &mut dyn Read,
+    staging: &Path,
+    max_path_bytes: usize,
+    limits: &ArchiveLimits,
+    source_bytes: u64,
+    budget: &mut ArchiveBudget,
+    cancellation: &CancellationToken,
+) -> Result<(), ArchiveOperationError> {
+    cancellation.wait_if_paused()?;
+    let _path_memory = budget
+        .reserve_memory(u64::try_from(entry.path.len().saturating_add(256)).unwrap_or(u64::MAX))?;
+    budget.charge_temporary(4 * 1_024)?;
+    let output = output_path(staging, &entry.path, max_path_bytes)?;
+    let parent = output.parent().ok_or(ArchiveOperationError::UnsafePath(
+        "archive entry needs a parent",
+    ))?;
+    std::fs::create_dir_all(parent).map_err(|error| map_io(&error))?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(O_NOFOLLOW)
+        .mode(0o600)
+        .open(&output)
+        .map_err(|error| map_io(&error))?;
+    let mut writer = BudgetWriter {
+        inner: file,
+        budget,
+        source_bytes,
+        error: None,
+    };
+    let mut bounded = BoundedWriter::new(
+        &mut writer,
+        limits.max_nested_archive_bytes,
+        limits.max_expanded_bytes,
+        entry
+            .compressed_size
+            .unwrap_or(source_bytes)
+            .saturating_mul(limits.max_compression_ratio),
+        cancellation.clone(),
+        limits.max_elapsed,
+    );
+    let copied = io::copy(contents, &mut bounded);
+    let limit = bounded.take_error();
+    if let Some(error) = writer.error.take() {
+        return Err(error);
+    }
+    if let Some(error) = limit {
+        return Err(error.into());
+    }
+    if copied.is_err() {
+        cancellation.wait_if_paused()?;
+        return Err(ArchiveOperationError::InvalidArchive);
+    }
+    writer.inner.sync_all().map_err(|error| map_io(&error))
+}
+
 fn decode_limits(limits: &ArchiveOperationLimits) -> ArchiveLimits {
     ArchiveLimits {
         max_entries: usize::try_from(limits.max_entries).unwrap_or(usize::MAX),
@@ -1275,7 +1128,7 @@ fn decode_limits(limits: &ArchiveOperationLimits) -> ArchiveLimits {
         max_metadata_bytes: usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX),
         max_expanded_bytes: limits.max_expanded_bytes,
         max_compression_ratio: limits.max_compression_ratio,
-        max_elapsed: Duration::from_secs(30),
+        max_elapsed: Duration::MAX,
         max_nested_archives: limits.max_nesting,
         max_nested_archive_bytes: limits.max_temporary_bytes,
     }
@@ -1326,4 +1179,19 @@ fn sync_tree(root: &Path) -> Result<(), ArchiveOperationError> {
             .map_err(|error| map_io(&error))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_cost_extraction_has_no_time_limit() {
+        // The entry, size, ratio, path, memory and temporary-space limits
+        // bound an extraction, and Cancel stops it (OPS-034).
+        let limits = extraction_limits(&ArchiveOperationLimits::default(), &std::env::temp_dir())
+            .expect("extraction limits");
+        assert_eq!(limits.max_identity_millis, u64::MAX);
+        assert_eq!(decode_limits(&limits).max_elapsed, Duration::MAX);
+    }
 }

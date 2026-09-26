@@ -230,7 +230,7 @@ fn provider() -> ProviderSnapshot {
 fn identity(path: &Path) -> ArchivePathIdentity {
     let metadata = std::fs::symlink_metadata(path).expect("path identity");
     let mut hasher = blake3::Hasher::new();
-    hash_test_path(path, &metadata, &mut hasher);
+    hash_test_path(path, &metadata, None, &mut hasher);
     ArchivePathIdentity::new(
         metadata.dev(),
         metadata.ino(),
@@ -242,11 +242,32 @@ fn identity(path: &Path) -> ArchivePathIdentity {
     .with_content_digest(*hasher.finalize().as_bytes())
 }
 
-fn hash_test_path(path: &Path, metadata: &std::fs::Metadata, hasher: &mut blake3::Hasher) {
+/// The identity digest from names and metadata, walked as the implementation
+/// walks it: each item, then its children in name order. Every item below the
+/// root adds its name, device, inode, and modification and change times.
+fn hash_test_path(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    name: Option<&[u8]>,
+    hasher: &mut blake3::Hasher,
+) {
     hasher.update(&metadata.mode().to_le_bytes());
     hasher.update(&metadata.len().to_le_bytes());
+    if let Some(name) = name {
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name);
+        for value in [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+        ] {
+            hasher.update(&value.to_le_bytes());
+        }
+    }
     if metadata.is_file() {
-        hasher.update(&std::fs::read(path).expect("identity content"));
         return;
     }
     let mut children = std::fs::read_dir(path)
@@ -259,11 +280,13 @@ fn hash_test_path(path: &Path, metadata: &std::fs::Metadata, hasher: &mut blake3
             .cmp(right.file_name().as_bytes())
     });
     for child in children {
-        let name = child.file_name();
-        hasher.update(&(name.as_bytes().len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
         let metadata = std::fs::symlink_metadata(child.path()).expect("child identity");
-        hash_test_path(&child.path(), &metadata, hasher);
+        hash_test_path(
+            &child.path(),
+            &metadata,
+            Some(child.file_name().as_bytes()),
+            hasher,
+        );
     }
 }
 
@@ -1249,7 +1272,7 @@ fn extraction_remains_bound_to_snapshot_after_source_rewrite() {
 }
 
 #[test]
-fn extraction_decodes_only_from_its_owned_source_snapshot() {
+fn extraction_publishes_nothing_when_the_source_is_rewritten_during_decode() {
     let root = tempdir().expect("temporary root");
     let source = root.path().join("source.zip");
     let destination = root.path().join("output");
@@ -1285,18 +1308,17 @@ fn extraction_decodes_only_from_its_owned_source_snapshot() {
         .expect("archive queues");
     let job = scheduler.start_ready().expect("starts").pop().expect("job");
 
-    execute_scheduled_archive_operation(
+    // The archive is read where it is (OPS-034), so a rewrite during the run
+    // fails it, even one that restores the bytes, and nothing is published.
+    let result = execute_scheduled_archive_operation(
         &scheduler,
         &job,
         &ArchiveOperationLimits::default(),
         &Passwords("unused"),
         &mut journal,
-    )
-    .expect("owned snapshot is immune to source rewrites during decode");
-    assert_eq!(
-        std::fs::read(destination.join("x")).expect("extracted payload"),
-        b"stable snapshot payload"
     );
+    assert!(result.is_err(), "{result:?}");
+    assert!(!destination.exists());
 }
 
 #[test]
@@ -2825,7 +2847,7 @@ fn creation_rejects_symlinks_special_files_and_temporary_space_exhaustion() {
 }
 
 #[test]
-fn extraction_rejects_traversal_links_special_entries_and_nested_archives_before_writing() {
+fn extraction_rejects_traversal_links_and_special_entries_and_writes_nested_archives_as_files() {
     let root = tempdir().expect("temporary root");
     let fixtures = root.path().join("fixtures");
     std::fs::create_dir(&fixtures).expect("fixture directory");
@@ -2896,48 +2918,18 @@ fn extraction_rejects_traversal_links_special_entries_and_nested_archives_before
         assert!(!output.exists());
     }
 
+    // An archive inside the archive is extracted as a file and never opened,
+    // even when no nesting is allowed (OPS-034).
+    let limits = ArchiveOperationLimits {
+        max_nesting: 0,
+        ..ArchiveOperationLimits::default()
+    };
     let mut inner_zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     inner_zip
         .start_file("payload.txt", zip::write::SimpleFileOptions::default())
         .expect("inner entry");
     inner_zip.write_all(b"nested payload").expect("inner data");
     let inner_bytes = inner_zip.finish().expect("inner zip finish").into_inner();
-    let nested = fixtures.join("nested.zip");
-    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    zip.start_file(
-        "no-archive-suffix.bin",
-        zip::write::SimpleFileOptions::default(),
-    )
-    .expect("nested entry");
-    zip.write_all(&inner_bytes).expect("nested bytes");
-    std::fs::write(&nested, zip.finish().expect("zip finish").into_inner())
-        .expect("nested fixture");
-    let output = root.path().join("nested-output");
-    let plan = ArchiveOperationPlan::extract(
-        local(&nested),
-        local(&output),
-        ArchiveCodec::Zip,
-        ArchiveConflictPolicy::Fail,
-        false,
-    )
-    .expect("nested plan");
-    let limits = ArchiveOperationLimits {
-        max_nesting: 0,
-        ..ArchiveOperationLimits::default()
-    };
-    assert!(matches!(
-        run(
-            &plan,
-            &limits,
-            &Passwords("unused"),
-            &CancellationToken::new(),
-        ),
-        Err(ArchiveOperationError::LimitExceeded {
-            resource: "archive nesting",
-            ..
-        })
-    ));
-    assert!(!output.exists());
 
     let mut v7_bytes = Vec::new();
     {
@@ -2960,6 +2952,7 @@ fn extraction_rejects_traversal_links_special_entries_and_nested_archives_before
     skippable_zstd
         .extend_from_slice(&zstd::stream::encode_all(&v7_bytes[..], 0).expect("zstd V7 tar"));
     for (label, nested_bytes) in [
+        ("zip", inner_bytes),
         ("v7-tar", v7_bytes),
         ("prefixed-zip", prefixed_zip),
         ("skippable-zstd", skippable_zstd),
@@ -2984,39 +2977,17 @@ fn extraction_rejects_traversal_links_special_entries_and_nested_archives_before
             false,
         )
         .expect("nested content plan");
-        assert!(matches!(
-            run(
-                &plan,
-                &limits,
-                &Passwords("unused"),
-                &CancellationToken::new(),
-            ),
-            Err(ArchiveOperationError::LimitExceeded {
-                resource: "archive nesting",
-                ..
-            })
-        ));
-        assert!(!output.exists());
-
-        let accepted_output = root.path().join(format!("{label}-accepted"));
-        let accepted_plan = ArchiveOperationPlan::extract(
-            local(&source),
-            local(&accepted_output),
-            ArchiveCodec::Zip,
-            ArchiveConflictPolicy::Fail,
-            false,
-        )
-        .expect("accepted nested content plan");
         run(
-            &accepted_plan,
-            &ArchiveOperationLimits::default(),
+            &plan,
+            &limits,
             &Passwords("unused"),
             &CancellationToken::new(),
         )
-        .expect("valid nested content is accepted");
+        .expect("an archive inside the archive is extracted as a file");
         assert_eq!(
-            std::fs::read(accepted_output.join("opaque.bin")).expect("extracted nested payload"),
-            nested_bytes
+            std::fs::read(output.join("opaque.bin")).expect("extracted nested archive"),
+            nested_bytes,
+            "{label}"
         );
     }
 }
@@ -3120,20 +3091,14 @@ fn every_ceiling_rejects_a_real_archive_operation_before_publication() {
     std::fs::write(&simple, zip.finish().expect("simple zip").into_inner())
         .expect("simple fixture");
 
-    let mut inner = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    inner
-        .start_file("leaf", zip::write::SimpleFileOptions::default())
-        .expect("leaf entry");
-    inner.write_all(b"leaf").expect("leaf payload");
-    let inner = inner.finish().expect("inner zip").into_inner();
-    let nested = root.path().join("nested.zip");
-    let mut outer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    outer
-        .start_file("opaque.bin", zip::write::SimpleFileOptions::default())
-        .expect("outer entry");
-    outer.write_all(&inner).expect("outer payload");
-    std::fs::write(&nested, outer.finish().expect("outer zip").into_inner())
-        .expect("nested fixture");
+    let pair = root.path().join("pair.zip");
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for name in ["one.txt", "two.txt"] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .expect("pair entry");
+        zip.write_all(b"pair payload").expect("pair payload");
+    }
+    std::fs::write(&pair, zip.finish().expect("pair zip").into_inner()).expect("pair fixture");
 
     let cases = [
         (
@@ -3157,14 +3122,6 @@ fn every_ceiling_rejects_a_real_archive_operation_before_publication() {
             simple.as_path(),
             ArchiveOperationLimits {
                 max_compression_ratio: 0,
-                ..ArchiveOperationLimits::default()
-            },
-        ),
-        (
-            "archive nesting",
-            nested.as_path(),
-            ArchiveOperationLimits {
-                max_nesting: 0,
                 ..ArchiveOperationLimits::default()
             },
         ),
@@ -3232,7 +3189,7 @@ fn every_ceiling_rejects_a_real_archive_operation_before_publication() {
     };
     let combined_output = root.path().join("combined-output");
     let combined_plan = ArchiveOperationPlan::extract(
-        local(&nested),
+        local(&pair),
         local(&combined_output),
         ArchiveCodec::Zip,
         ArchiveConflictPolicy::Fail,
@@ -3261,7 +3218,6 @@ fn every_ceiling_rejects_a_real_archive_operation_before_publication() {
         counters.compressed_bytes > 0 && counters.compression_ratio_checks > 0,
         "compression-ratio accounting was not exercised"
     );
-    assert!(counters.max_nesting >= 1, "nesting was not exercised");
     assert!(
         counters.max_path_bytes >= 4,
         "path accounting was not exercised"
@@ -3547,148 +3503,6 @@ fn zip_zstd_extraction_charges_decoder_workspace_before_allocation() {
 }
 
 #[test]
-fn nested_zip_extraction_combines_live_global_memory_charges() {
-    let root = tempdir().expect("temporary root");
-    let inner_bytes = zip_bytes(zip::CompressionMethod::Zstd, b"leaf");
-    let inner = root.path().join("inner.zip");
-    let outer = root.path().join("outer.zip");
-    std::fs::write(&inner, &inner_bytes).expect("inner fixture");
-    std::fs::write(
-        &outer,
-        zip_bytes(zip::CompressionMethod::Deflated, &inner_bytes),
-    )
-    .expect("outer fixture");
-
-    let inner_peak = extraction_peak(&inner, &root.path().join("inner-out"));
-    let nested_peak = extraction_peak(&outer, &root.path().join("outer-out"));
-    assert!(
-        nested_peak > inner_peak,
-        "nested ZIP charges did not overlap: inner={inner_peak}, nested={nested_peak}"
-    );
-
-    let output = root.path().join("outer-two");
-    let plan = ArchiveOperationPlan::extract(
-        local(&outer),
-        local(&output),
-        ArchiveCodec::Zip,
-        ArchiveConflictPolicy::Fail,
-        false,
-    )
-    .expect("limited nested plan");
-    let accounting = ArchiveOperationAccounting::default();
-    let limits = ArchiveOperationLimits {
-        max_memory_bytes: nested_peak - 1,
-        ..ArchiveOperationLimits::default()
-    };
-    assert!(matches!(
-        run_accounted(&plan, &limits, &accounting),
-        Err(ArchiveOperationError::LimitExceeded {
-            resource: "memory bytes",
-            ..
-        })
-    ));
-    assert_eq!(accounting.counters().memory_bytes, 0);
-    assert!(!output.exists());
-}
-
-#[test]
-fn nested_gzip_and_zstd_workspaces_share_the_operation_memory_ceiling() {
-    let root = tempdir().expect("temporary root");
-    let mut leaf_tar = Vec::new();
-    {
-        let mut tar = tar::Builder::new(&mut leaf_tar);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(4);
-        header.set_mode(0o600);
-        header.set_cksum();
-        tar.append_data(&mut header, "leaf", &b"leaf"[..])
-            .expect("leaf tar entry");
-        tar.finish().expect("leaf tar finish");
-    }
-    let nested_zstd = zstd::stream::encode_all(&leaf_tar[..], 0).expect("zstd nested tar");
-    let zstd_source = root.path().join("standalone.tar.zst");
-    std::fs::write(&zstd_source, &nested_zstd).expect("standalone zstd fixture");
-    let mut outer_tar = Vec::new();
-    {
-        let mut tar = tar::Builder::new(&mut outer_tar);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(nested_zstd.len() as u64);
-        header.set_mode(0o600);
-        header.set_cksum();
-        tar.append_data(&mut header, "opaque.bin", &nested_zstd[..])
-            .expect("nested zstd entry");
-        tar.finish().expect("outer tar finish");
-    }
-    let source = root.path().join("nested.tar.gz");
-    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    let mut encoder = encoder;
-    encoder.write_all(&outer_tar).expect("gzip outer tar");
-    std::fs::write(&source, encoder.finish().expect("gzip finish")).expect("gzip fixture");
-
-    let first_output = root.path().join("workspace-a");
-    let first_plan = ArchiveOperationPlan::extract(
-        local(&source),
-        local(&first_output),
-        ArchiveCodec::TarGzip,
-        ArchiveConflictPolicy::Fail,
-        false,
-    )
-    .expect("first extract plan");
-    let accounting = ArchiveOperationAccounting::default();
-    run_accounted(&first_plan, &ArchiveOperationLimits::default(), &accounting)
-        .expect("nested gzip/zstd extraction");
-    let peak = accounting.counters().peak_memory_bytes;
-
-    let zstd_output = root.path().join("standalone-zstd");
-    let zstd_plan = ArchiveOperationPlan::extract(
-        local(&zstd_source),
-        local(&zstd_output),
-        ArchiveCodec::TarZstd,
-        ArchiveConflictPolicy::Fail,
-        false,
-    )
-    .expect("standalone zstd plan");
-    let zstd_accounting = ArchiveOperationAccounting::default();
-    run_accounted(
-        &zstd_plan,
-        &ArchiveOperationLimits::default(),
-        &zstd_accounting,
-    )
-    .expect("standalone zstd extraction");
-    let zstd_peak = zstd_accounting.counters().peak_memory_bytes;
-    assert!(
-        peak > zstd_peak + 32 * 1024,
-        "nested codec workspaces did not overlap: nested={peak}, zstd={zstd_peak}"
-    );
-    assert_eq!(accounting.counters().memory_bytes, 0);
-    assert_eq!(zstd_accounting.counters().memory_bytes, 0);
-
-    let second_output = root.path().join("workspace-b");
-    let second_plan = ArchiveOperationPlan::extract(
-        local(&source),
-        local(&second_output),
-        ArchiveCodec::TarGzip,
-        ArchiveConflictPolicy::Fail,
-        false,
-    )
-    .expect("second extract plan");
-    let limits = ArchiveOperationLimits {
-        max_memory_bytes: peak - 1,
-        ..ArchiveOperationLimits::default()
-    };
-    let failed_accounting = ArchiveOperationAccounting::default();
-    assert!(matches!(
-        run_accounted(&second_plan, &limits, &failed_accounting),
-        Err(ArchiveOperationError::LimitExceeded {
-            resource: "memory bytes",
-            ..
-        })
-    ));
-    assert_eq!(failed_accounting.counters().memory_bytes, 0);
-    assert!(!second_output.exists());
-}
-
-#[test]
 fn archive_creation_charges_codec_workspaces() {
     let root = tempdir().expect("temporary root");
     let source = root.path().join("input");
@@ -3746,7 +3560,7 @@ fn archive_creation_charges_codec_workspaces() {
 }
 
 #[test]
-fn production_expansion_ratio_and_nesting_limits_reject_real_bombs() {
+fn production_limits_reject_real_bombs_and_a_nesting_bomb_is_extracted_as_a_file() {
     let root = tempdir().expect("temporary root");
 
     let declared_huge = root.path().join("declared-huge.tar");
@@ -3835,16 +3649,321 @@ fn production_expansion_ratio_and_nesting_limits_reject_real_bombs() {
         false,
     )
     .expect("nesting plan");
-    assert!(matches!(
+    // Extraction never opens an archive inside the archive (OPS-034).
+    let inner_bytes =
+        zip::ZipArchive::new(Cursor::new(std::fs::read(&nesting_bomb).expect("bomb")))
+            .expect("outer archive")
+            .by_name("opaque-9.bin")
+            .map(|mut entry| {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut bytes).expect("inner bytes");
+                bytes
+            })
+            .expect("outer entry");
+    run(
+        &nesting_plan,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &CancellationToken::new(),
+    )
+    .expect("a nesting bomb is extracted as a file");
+    assert_eq!(
+        std::fs::read(nesting_output.join("opaque-9.bin")).expect("extracted inner archive"),
+        inner_bytes
+    );
+}
+
+/// Names the one measured extraction or collision check that
+/// `extract_cost_child` runs: mode, codec, source and destination, one per
+/// line.
+const EXTRACT_COST_REQUEST: &str = "MUSHEEN_EXTRACT_COST_REQUEST";
+const MIB: u64 = 1_024 * 1_024;
+
+/// The bytes this process has read and written so far.
+fn process_io() -> (u64, u64) {
+    let text = std::fs::read_to_string("/proc/self/io").expect("process I/O counters");
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .expect("process I/O field")
+    };
+    (field("rchar:"), field("wchar:"))
+}
+
+fn extract_cost_codec(name: &str) -> ArchiveCodec {
+    match name {
+        "zip" => ArchiveCodec::Zip,
+        "tar.gz" => ArchiveCodec::TarGzip,
+        "tar.zst" => ArchiveCodec::TarZstd,
+        "7z" => ArchiveCodec::SevenZip,
+        other => panic!("unknown codec {other}"),
+    }
+}
+
+/// Runs one measured extraction or collision check when
+/// `extract_cost_reads_the_archive_at_most_twice_and_writes_only_its_files`
+/// starts this test binary as a child, and does nothing otherwise. Alone in
+/// its own process, /proc/self/io counts only that work.
+#[test]
+fn extract_cost_child() {
+    let Ok(request) = std::env::var(EXTRACT_COST_REQUEST) else {
+        return;
+    };
+    let lines = request.lines().collect::<Vec<_>>();
+    let [mode, codec, source, destination] = lines.as_slice() else {
+        panic!("malformed request {request:?}");
+    };
+    let plan = ArchiveOperationPlan::extract(
+        local(Path::new(source)),
+        local(Path::new(destination)),
+        extract_cost_codec(codec),
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    // An archive inside the archive is never opened, so no nesting is needed.
+    let limits = ArchiveOperationLimits {
+        max_nesting: 0,
+        ..ArchiveOperationLimits::default()
+    };
+    let before = process_io();
+    match *mode {
+        "extract" => {
+            run(
+                &plan,
+                &limits,
+                &Passwords("unused"),
+                &CancellationToken::new(),
+            )
+            .expect("extraction");
+        }
+        "check" => {
+            musheen_desktop::extract_destination(
+                &plan,
+                &limits,
+                &Passwords("unused"),
+                &CancellationToken::new(),
+            )
+            .expect("collision check");
+        }
+        other => panic!("unknown mode {other}"),
+    }
+    let after = process_io();
+    println!(
+        "EXTRACT_COST read={} written={}",
+        after.0 - before.0,
+        after.1 - before.1
+    );
+}
+
+/// Runs `extract_cost_child` in a child copy of this test binary and returns
+/// the bytes it read and wrote during the measured work.
+fn measured_in_child(mode: &str, codec: &str, source: &Path, destination: &Path) -> (u64, u64) {
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "extract_cost_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(
+            EXTRACT_COST_REQUEST,
+            format!(
+                "{mode}\n{codec}\n{}\n{}",
+                source.display(),
+                destination.display()
+            ),
+        )
+        .output()
+        .expect("child test runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{codec} {mode} failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout
+        .lines()
+        .find_map(|line| line.split_once("EXTRACT_COST ").map(|(_, rest)| rest))
+        .unwrap_or_else(|| panic!("no measurement in {stdout}"));
+    let value = |name: &str| {
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix(name))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("measurement field")
+    };
+    (value("read="), value("written="))
+}
+
+/// About 2.5 MiB of files that do not compress, and one file that is itself
+/// a ZIP archive. Returns the folder and the bytes of its files.
+fn extract_cost_input(root: &Path) -> (std::path::PathBuf, u64) {
+    let input = root.join("input");
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut total = 0;
+    for index in 0..200_usize {
+        let folder = input.join(format!("folder-{}", index % 10));
+        std::fs::create_dir_all(&folder).expect("input folder");
+        let bytes = (0..12_000 + index * 7)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        total += bytes.len() as u64;
+        std::fs::write(folder.join(format!("file-{index}.bin")), &bytes).expect("input file");
+    }
+    let inner = zip_bytes(
+        zip::CompressionMethod::Deflated,
+        b"an archive inside the archive",
+    );
+    total += inner.len() as u64;
+    std::fs::write(input.join("inner.zip"), &inner).expect("inner archive");
+    (input, total)
+}
+
+#[test]
+fn extract_cost_reads_the_archive_at_most_twice_and_writes_only_its_files() {
+    let root = tempdir().expect("temporary root");
+    let (input, file_bytes) = extract_cost_input(root.path());
+    for (codec, name) in [
+        (ArchiveCodec::Zip, "zip"),
+        (ArchiveCodec::TarGzip, "tar.gz"),
+        (ArchiveCodec::TarZstd, "tar.zst"),
+        (ArchiveCodec::SevenZip, "7z"),
+    ] {
+        let archive = root.path().join(format!("fixture.{name}"));
+        let create = ArchiveOperationPlan::create(
+            vec![local(&input)],
+            local(&archive),
+            codec,
+            ArchiveConflictPolicy::Fail,
+            false,
+        )
+        .expect("create plan");
         run(
-            &nesting_plan,
+            &create,
             &ArchiveOperationLimits::default(),
             &Passwords("unused"),
             &CancellationToken::new(),
-        ),
-        Err(ArchiveOperationError::LimitExceeded {
-            resource: "archive nesting",
-            ..
-        })
-    ));
+        )
+        .expect("fixture archive");
+        let archive_bytes = std::fs::metadata(&archive).expect("fixture archive").len();
+        let output = root.path().join(format!("output-{name}"));
+
+        let (read, written) = measured_in_child("extract", name, &archive, &output);
+        assert!(
+            read <= 2 * archive_bytes + MIB,
+            "{name}: extraction read {read} bytes of a {archive_bytes}-byte archive"
+        );
+        assert!(
+            written <= file_bytes + MIB,
+            "{name}: extraction wrote {written} bytes for {file_bytes} bytes of files"
+        );
+        for file in ["inner.zip", "folder-3/file-123.bin"] {
+            assert_eq!(
+                std::fs::read(output.join("input").join(file)).expect("extracted file"),
+                std::fs::read(input.join(file)).expect("input file"),
+                "{name}: {file} is extracted as it was archived"
+            );
+        }
+
+        let (read, written) = measured_in_child("check", name, &archive, &output);
+        assert!(
+            read <= archive_bytes + MIB,
+            "{name}: the collision check read {read} bytes of a {archive_bytes}-byte archive"
+        );
+        assert!(
+            written <= MIB,
+            "{name}: the collision check wrote {written} bytes"
+        );
+    }
+}
+
+#[test]
+fn extract_cost_publishes_nothing_when_the_archive_changes_during_the_run() {
+    let root = tempdir().expect("temporary root");
+    let archive = root.path().join("fixture.tar");
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4_096);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "data.txt", &[b'a'; 4_096][..])
+            .expect("tar entry");
+        builder.finish().expect("tar finish");
+    }
+    std::fs::write(&archive, &tar_bytes).expect("fixture archive");
+    let output = root.path().join("output");
+    let plan = ArchiveOperationPlan::extract(
+        local(&archive),
+        local(&output),
+        ArchiveCodec::Tar,
+        ArchiveConflictPolicy::Fail,
+        false,
+    )
+    .expect("extract plan");
+    let changed = archive.clone();
+    let storage = HookJournal {
+        inner: MemoryJournal::default(),
+        hook_at: 2,
+        // Rewrite the file's bytes in place, at the same size and with the
+        // same modification time, so the archive still decodes.
+        hook: Some(Box::new(move || {
+            use std::os::unix::fs::FileExt;
+            // Some file systems keep coarse timestamps; let the clock move
+            // past the fixture's change time first.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let modified = std::fs::metadata(&changed)
+                .and_then(|metadata| metadata.modified())
+                .expect("archive time");
+            let mut bytes = std::fs::read(&changed).expect("archive bytes");
+            let start = bytes
+                .windows(4_096)
+                .position(|window| window.iter().all(|byte| *byte == b'a'))
+                .expect("file bytes");
+            bytes[start..start + 4_096].fill(b'b');
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&changed)
+                .expect("archive opens");
+            file.write_all_at(&bytes, 0).expect("archive rewritten");
+            file.set_modified(modified).expect("archive time restored");
+        })),
+    };
+    let mut journal = Journal::open(storage).expect("journal opens");
+    let scheduler = Scheduler::new(&ResourceLimits::default());
+    scheduler
+        .enqueue_archive(plan, provider())
+        .expect("archive queues");
+    let job = scheduler.start_ready().expect("starts").pop().expect("job");
+
+    let result = execute_scheduled_archive_operation(
+        &scheduler,
+        &job,
+        &ArchiveOperationLimits::default(),
+        &Passwords("unused"),
+        &mut journal,
+    );
+    assert!(
+        matches!(result, Err(ArchiveOperationError::Conflict)),
+        "an archive changed during the run is refused: {result:?}"
+    );
+    assert!(!output.exists(), "nothing is published");
+    assert!(
+        std::fs::read_dir(root.path())
+            .expect("archive folder")
+            .all(|entry| !entry
+                .expect("folder entry")
+                .file_name()
+                .as_bytes()
+                .starts_with(b".musheen-stage-v1-")),
+        "the staging folder is cleaned"
+    );
 }

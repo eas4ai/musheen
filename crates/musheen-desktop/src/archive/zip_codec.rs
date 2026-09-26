@@ -40,6 +40,58 @@ pub(crate) fn copy_entry<R: Read + Seek, W: Write>(
     counters: &Arc<DecodeCounterState>,
 ) -> Result<(), ArchiveError> {
     let target = find_entry(&mut reader, ordinal, limits, counters)?;
+    copy_found(
+        &mut reader,
+        target,
+        passwords,
+        limits,
+        counters,
+        &mut |contents| {
+            std::io::copy(contents, destination)
+                .map(|_| ())
+                .map_err(|_| ArchiveError::Io)
+        },
+    )
+}
+
+/// Reads the central directory once and hands each entry `wanted` names to
+/// `visit`, in archive order, with a reader over its bytes.
+pub(crate) fn copy_files_in_order<R: Read + Seek>(
+    mut reader: R,
+    passwords: &dyn ArchivePasswordProvider,
+    limits: &ArchiveLimits,
+    counters: &Arc<DecodeCounterState>,
+    wanted: &dyn Fn(u64) -> bool,
+    visit: &mut dyn FnMut(u64, &mut dyn Read) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
+    let mut directory = CentralDirectory::open(&mut reader, limits, counters)?;
+    loop {
+        let parse = wanted(directory.index);
+        let Some((ordinal, target)) = directory.next(&mut reader, parse, limits, counters)? else {
+            return Ok(());
+        };
+        if let Some(target) = target {
+            copy_found(
+                &mut reader,
+                target,
+                passwords,
+                limits,
+                counters,
+                &mut |contents| visit(ordinal, contents),
+            )?;
+        }
+    }
+}
+
+/// Decodes the entry a central record names and hands its bytes to `visit`.
+fn copy_found<R: Read + Seek>(
+    reader: &mut R,
+    target: BudgetedZipEntry,
+    passwords: &dyn ArchivePasswordProvider,
+    limits: &ArchiveLimits,
+    counters: &Arc<DecodeCounterState>,
+    visit: &mut dyn FnMut(&mut dyn Read) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
     reader
         .seek(SeekFrom::Start(target.local_header_offset))
         .map_err(|_| ArchiveError::InvalidArchive)?;
@@ -69,7 +121,7 @@ pub(crate) fn copy_entry<R: Read + Seek, W: Write>(
         .and_then(|offset| offset.checked_add(name_length as u64))
         .and_then(|offset| offset.checked_add(extra_length as u64))
         .ok_or(ArchiveError::InvalidArchive)?;
-    let decoder_workspace = decoder_workspace_bytes(&mut reader, &target, data_offset)?;
+    let decoder_workspace = decoder_workspace_bytes(reader, &target, data_offset)?;
     let _decoder_workspace = reserve_decode_workspace(counters, limits, decoder_workspace)?;
     let local_length = 30_u64
         .checked_add(name_length as u64)
@@ -93,14 +145,13 @@ pub(crate) fn copy_entry<R: Read + Seek, W: Write>(
         let mut entry = archive
             .by_index_decrypt(0, password.as_bytes())
             .map_err(|_| ArchiveError::InvalidPassword)?;
-        std::io::copy(&mut entry, destination).map_err(|_| ArchiveError::Io)?;
+        visit(&mut entry)
     } else {
         let mut entry = archive
             .by_index(0)
             .map_err(|_| ArchiveError::InvalidArchive)?;
-        std::io::copy(&mut entry, destination).map_err(|_| ArchiveError::Io)?;
+        visit(&mut entry)
     }
-    Ok(())
 }
 
 struct BudgetedZipEntry {
@@ -120,22 +171,67 @@ fn find_entry<R: Read + Seek>(
     limits: &ArchiveLimits,
     counters: &Arc<DecodeCounterState>,
 ) -> Result<BudgetedZipEntry, ArchiveError> {
-    let (central_offset, central_size, entries, archive_prefix) =
-        preflight(reader, limits, counters)?;
-    if ordinal >= entries {
+    let mut directory = CentralDirectory::open(reader, limits, counters)?;
+    if ordinal >= directory.entries {
         return Err(ArchiveError::NotArchiveEntry);
     }
-    let central_end = central_offset.saturating_add(central_size);
-    reader
-        .seek(SeekFrom::Start(central_offset))
-        .map_err(|_| ArchiveError::InvalidArchive)?;
-    for index in 0..entries {
-        let position = reader
-            .stream_position()
-            .map_err(|_| ArchiveError::InvalidArchive)?;
-        if position.saturating_add(46) > central_end {
+    loop {
+        let parse = directory.index == ordinal;
+        match directory.next(reader, parse, limits, counters)? {
+            Some((_, Some(target))) => return Ok(target),
+            Some((_, None)) => {}
+            None => return Err(ArchiveError::NotArchiveEntry),
+        }
+    }
+}
+
+/// Walks the central directory one record at a time. It keeps its own
+/// position, so a caller may read entry data between records.
+struct CentralDirectory {
+    next: u64,
+    end: u64,
+    entries: u64,
+    index: u64,
+    prefix: u64,
+}
+
+impl CentralDirectory {
+    fn open<R: Read + Seek>(
+        reader: &mut R,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<Self, ArchiveError> {
+        let (central_offset, central_size, entries, archive_prefix) =
+            preflight(reader, limits, counters)?;
+        Ok(Self {
+            next: central_offset,
+            end: central_offset.saturating_add(central_size),
+            entries,
+            index: 0,
+            prefix: archive_prefix,
+        })
+    }
+
+    /// Reads the next central record: in full, with its name budgeted, when
+    /// `parse` is set, and otherwise only its fixed header.
+    fn next<R: Read + Seek>(
+        &mut self,
+        reader: &mut R,
+        parse: bool,
+        limits: &ArchiveLimits,
+        counters: &Arc<DecodeCounterState>,
+    ) -> Result<Option<(u64, Option<BudgetedZipEntry>)>, ArchiveError> {
+        if self.index >= self.entries {
+            return Ok(None);
+        }
+        let index = self.index;
+        let position = self.next;
+        if position.saturating_add(46) > self.end {
             return Err(ArchiveError::InvalidArchive);
         }
+        reader
+            .seek(SeekFrom::Start(position))
+            .map_err(|_| ArchiveError::InvalidArchive)?;
         let mut header = [0_u8; 46];
         reader
             .read_exact(&mut header)
@@ -149,16 +245,14 @@ fn find_entry<R: Read + Seek>(
         let trailing = name_length
             .saturating_add(extra_length)
             .saturating_add(comment_length);
-        if position.saturating_add(46).saturating_add(trailing as u64) > central_end {
+        let record_end = position.saturating_add(46).saturating_add(trailing as u64);
+        if record_end > self.end {
             return Err(ArchiveError::InvalidArchive);
         }
-        if index != ordinal {
-            reader
-                .seek(SeekFrom::Current(
-                    i64::try_from(trailing).map_err(|_| ArchiveError::InvalidArchive)?,
-                ))
-                .map_err(|_| ArchiveError::InvalidArchive)?;
-            continue;
+        self.index = index.saturating_add(1);
+        self.next = record_end;
+        if !parse {
+            return Ok(Some((index, None)));
         }
         // CP437 can expand to three UTF-8 bytes per input byte. Five times the raw length covers
         // both the raw buffer and a four-byte-per-scalar decoded String before either allocation.
@@ -178,11 +272,6 @@ fn find_entry<R: Read + Seek>(
         reader
             .read_exact(&mut extra)
             .map_err(|_| ArchiveError::InvalidArchive)?;
-        reader
-            .seek(SeekFrom::Current(
-                i64::try_from(comment_length).map_err(|_| ArchiveError::InvalidArchive)?,
-            ))
-            .map_err(|_| ArchiveError::InvalidArchive)?;
         let flags = le_u16(&header[8..10]);
         let decoded_name = if flags & (1 << 11) != 0 {
             std::str::from_utf8(&raw_name)
@@ -194,7 +283,7 @@ fn find_entry<R: Read + Seek>(
         let (compressed_size, _expanded_size) = entry_sizes(&header, &extra)?;
         let compression_method = compression_method(&header, &extra)?;
         let local_header_offset = local_header_offset(&header, &extra)?
-            .checked_add(archive_prefix)
+            .checked_add(self.prefix)
             .ok_or(ArchiveError::InvalidArchive)?;
         let mut central_header = header;
         if local_header_offset > u32::MAX as u64 {
@@ -207,18 +296,20 @@ fn find_entry<R: Read + Seek>(
         central_record.extend_from_slice(&central_header);
         central_record.extend_from_slice(&raw_name);
         central_record.extend_from_slice(&extra);
-        return Ok(BudgetedZipEntry {
-            local_header_offset,
-            compressed_size,
-            encrypted: flags & 1 != 0,
-            compression_method,
-            central_record,
-            _allocation: allocation,
-            _raw_name: raw_name,
-            _decoded_name: decoded_name,
-        });
+        Ok(Some((
+            index,
+            Some(BudgetedZipEntry {
+                local_header_offset,
+                compressed_size,
+                encrypted: flags & 1 != 0,
+                compression_method,
+                central_record,
+                _allocation: allocation,
+                _raw_name: raw_name,
+                _decoded_name: decoded_name,
+            }),
+        )))
     }
-    Err(ArchiveError::NotArchiveEntry)
 }
 
 fn decoder_workspace_bytes<R: Read + Seek>(

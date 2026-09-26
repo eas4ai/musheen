@@ -246,6 +246,61 @@ pub(crate) fn copy_seven_zip<R: Read + Seek, W: Write>(
     found.then_some(()).ok_or(ArchiveError::NotArchiveEntry)
 }
 
+/// Decodes every block of a 7z archive once, in archive order, and hands each
+/// file `wanted` names to `visit` with a reader over its bytes. Whatever a
+/// visit leaves unread is read to the end here, because the files of a solid
+/// block decode one after another.
+pub(crate) fn copy_files_in_order<R: Read + Seek>(
+    mut reader: R,
+    passwords: &dyn ArchivePasswordProvider,
+    limits: &ArchiveLimits,
+    counters: &Arc<DecodeCounterState>,
+    wanted: &dyn Fn(u64) -> bool,
+    visit: &mut dyn FnMut(u64, &mut dyn Read) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
+    let (archive, _metadata, password, budget) =
+        read_seven_archive(&mut reader, passwords, limits, counters)?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ArchiveError::InvalidArchive)?;
+    let mut archive = sevenz_rust2::ArchiveReader::from_archive_sequential_with_memory_budget(
+        archive, reader, password, budget,
+    );
+    let mut visited = std::collections::HashSet::new();
+    let mut failure = None;
+    let result = archive.for_each_entries_indexed(|index, _entry, contents| {
+        let ordinal = index as u64;
+        let mut outcome = if wanted(ordinal) && visited.insert(ordinal) {
+            visit(ordinal, contents)
+        } else {
+            Ok(())
+        };
+        if outcome.is_ok() {
+            // Read what the visit left, up to the expanded-bytes limit.
+            let mut rest = contents.take(limits.max_expanded_bytes.saturating_add(1));
+            outcome = match std::io::copy(&mut rest, &mut std::io::sink()) {
+                Ok(count) if count > limits.max_expanded_bytes => {
+                    Err(ArchiveError::LimitExceeded {
+                        resource: "expanded bytes",
+                        value: usize::try_from(count).unwrap_or(usize::MAX),
+                        maximum: usize::try_from(limits.max_expanded_bytes).unwrap_or(usize::MAX),
+                    })
+                }
+                Ok(_) => Ok(()),
+                Err(_) => Err(ArchiveError::InvalidArchive),
+            };
+        }
+        outcome.map_err(|error| {
+            failure = Some(error);
+            sevenz_rust2::Error::from(std::io::Error::other("archive decode stopped"))
+        })
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    result.map_err(|error| map_seven_error(error, limits.max_metadata_bytes))
+}
+
 fn copy_with_guards<R: Read + ?Sized, W: Write>(
     reader: &mut R,
     destination: &mut W,
