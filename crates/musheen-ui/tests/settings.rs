@@ -2,13 +2,11 @@ use gpui_kit::test::TestWindowExt;
 use musheen_core::{BoxFuture, CancellationToken, ItemId, ProviderId, StorePath};
 use musheen_desktop::{
     CatalogDocument, CatalogStore, ConnectionId, ConnectionProbe, ConnectionProfile,
-    ConnectionProfiles, CredentialReference, FolderIdentity, ProfileConnectionTester, ProxyKind,
-    RemoteError, RemoteErrorCategory, RemoteProtocol, SecurityPolicy, SettingsDocument,
-    SettingsPage, SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
+    ConnectionProfiles, CredentialReference, FolderIdentity, ProfileConnectionTest,
+    ProfileConnectionTester, RemoteError, RemoteErrorCategory, RemoteProtocol, SecurityPolicy,
+    SettingsDocument, SettingsPage, SettingsStore, TLS_PIN_BYTES, TlsPolicy, settings_schema,
 };
-use musheen_ui::settings::{
-    ConnectionTestService, SettingsBackends, SettingsState, clear_recent_locations,
-};
+use musheen_ui::settings::{SettingsBackends, SettingsState, clear_recent_locations};
 use musheen_ui::{AppearanceMode, Catalog, Locale, ThemeProfile};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -16,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 struct FailingConnectionTester;
 
-impl ConnectionTestService for FailingConnectionTester {
+impl ProfileConnectionTest for FailingConnectionTester {
     fn test<'a>(
         &'a self,
         profile: &'a ConnectionProfile,
@@ -391,9 +389,7 @@ async fn remote_connection_editor_tests_before_save_and_confirms_failed_tests(
 }
 
 #[gpui_kit::test]
-async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
-    cx: &mut gpui_kit::TestAppContext,
-) {
+async fn remote_editor_configures_and_preserves_pinned_security(cx: &mut gpui_kit::TestAppContext) {
     use gpui_kit::component::Root;
     use gpui_kit::{AppContext, ScrollDelta, point, px, size};
 
@@ -435,23 +431,16 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
         }
         window.click("settings-remote-protocol-webdav", cx);
         window.render_frame(cx);
-        window.click("settings-remote-security-tls-pinned", cx);
-        window.render_frame(cx);
         window.scroll("settings-controls", ScrollDelta::Lines(point(0., -40.)), cx);
+        window.render_frame(cx);
+        window.click("settings-remote-security-tls-pinned", cx);
         window.render_frame(cx);
         window.click("remote-security-pin", cx);
         window.input(&"5a".repeat(TLS_PIN_BYTES), cx);
-        window.click("settings-remote-proxy-socks5", cx);
-        window.render_frame(cx);
-        for (id, value) in [
-            ("remote-proxy-host", "proxy.example.test"),
-            ("remote-proxy-port", "1080"),
-            ("remote-proxy-username", "proxy-user "),
-            ("remote-proxy-credential", "secret-service:proxy-secret"),
-        ] {
-            window.click(id, cx);
-            window.input(value, cx);
-        }
+        assert!(
+            window.try_find("settings-remote-proxy-socks5").is_none(),
+            "the editor offers no proxy, which browsing refuses"
+        );
         window.scroll("settings-controls", ScrollDelta::Lines(point(0., 40.)), cx);
         window.render_frame(cx);
         window.click("settings-remote-test", cx);
@@ -477,15 +466,9 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
         profile.security(),
         &SecurityPolicy::Tls(TlsPolicy::PinnedSha256([0x5a; TLS_PIN_BYTES]))
     );
-    let proxy = profile.proxy().unwrap();
-    assert_eq!(proxy.kind(), ProxyKind::Socks5);
+    assert!(profile.proxy().is_none());
     assert_eq!(profile.path(), "/files ");
     assert_eq!(profile.username(), Some("dav-user "));
-    assert_eq!(proxy.username(), Some("proxy-user "));
-    assert_eq!(
-        proxy.credential().unwrap().to_setting_value().as_deref(),
-        Some("secret-service:proxy-secret")
-    );
     assert_eq!(
         &*probe.calls.lock().unwrap(),
         &[("dav.example.test".to_owned(), 443)]
@@ -604,37 +587,7 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
             .clone()
     });
     assert_eq!(plaintext.security(), &SecurityPolicy::PlaintextConfirmed);
-    assert_eq!(plaintext.proxy().unwrap().kind(), ProxyKind::Socks5);
-
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.scroll("settings-controls", ScrollDelta::Lines(point(0., -40.)), cx);
-        window.render_frame(cx);
-        window.click("settings-remote-proxy-none", cx);
-        window.scroll("settings-controls", ScrollDelta::Lines(point(0., 40.)), cx);
-        window.render_frame(cx);
-        window.click("settings-remote-test", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        window.click("settings-remote-save", cx);
-    })
-    .unwrap();
-    let without_proxy = cx.update(|cx| {
-        ConnectionProfiles::import(
-            &view
-                .read(cx)
-                .state()
-                .draft()
-                .value("remote.connections")
-                .unwrap(),
-        )
-        .unwrap()
-        .profiles()[0]
-            .clone()
-    });
-    assert!(without_proxy.proxy().is_none());
+    assert!(plaintext.proxy().is_none());
 
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -657,17 +610,6 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
         window.render_frame(cx);
         window.click("remote-security-pin", cx);
         window.input(&"6b".repeat(TLS_PIN_BYTES), cx);
-        window.click("settings-remote-proxy-http-connect", cx);
-        window.render_frame(cx);
-        for (id, value) in [
-            ("remote-proxy-host", "connect.example.test"),
-            ("remote-proxy-port", "8443"),
-            ("remote-proxy-username", "connect-user"),
-            ("remote-proxy-credential", "secret-service:connect-secret"),
-        ] {
-            window.click(id, cx);
-            window.input(value, cx);
-        }
         window.scroll("settings-controls", ScrollDelta::Lines(point(0., 40.)), cx);
         window.render_frame(cx);
         window.click("settings-remote-test", cx);
@@ -699,15 +641,7 @@ async fn remote_editor_configures_and_preserves_pinned_security_and_proxy(
             [0x6b; TLS_PIN_BYTES]
         ))
     );
-    let proxy = sftp.proxy().unwrap();
-    assert_eq!(proxy.kind(), ProxyKind::HttpConnect);
-    assert_eq!(proxy.host().as_str(), "connect.example.test");
-    assert_eq!(proxy.port(), 8443);
-    assert_eq!(proxy.username(), Some("connect-user"));
-    assert_eq!(
-        proxy.credential().unwrap().to_setting_value().as_deref(),
-        Some("secret-service:connect-secret")
-    );
+    assert!(sftp.proxy().is_none());
 
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);

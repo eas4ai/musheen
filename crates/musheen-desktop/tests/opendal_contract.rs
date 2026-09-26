@@ -6,8 +6,9 @@ use musheen_core::{
 use musheen_desktop::remote::{
     ConnectionProfile, CredentialResolver, HostKeyPolicy, OpendalStore, ProxyKind, ProxySettings,
     RemoteCasePolicy, RemoteErrorCategory, RemoteErrorContext, RemoteHost, RemoteMutationPolicy,
-    RemoteProtocol, SecurityPolicy, TlsPolicy, classify_opendal_error, ftp_store_from_profile,
-    http_store_from_profile, sftp_store_from_profile, webdav_store_from_profile,
+    RemoteProtocol, SecurityPolicy, SshEnvironment, TlsPolicy, classify_opendal_error,
+    ftp_store_from_profile, http_store_from_profile, sftp_store_from_profile_in,
+    webdav_store_from_profile,
 };
 use musheen_desktop::{ConnectionId, CredentialReference, SecretBuffer};
 use musheen_ops::{EventGeneration, JobId, StagingPath};
@@ -648,10 +649,19 @@ fn profile_construction_fails_closed_for_unrepresentable_security_and_proxy_poli
         SecurityPolicy::Ssh(HostKeyPolicy::PinnedSha256(pin)),
     );
     let password = StaticCredentials(b"contract-password");
-    let error = block_on(sftp_store_from_profile(
+    // The test's own SSH files, so nothing reads the user's ~/.ssh.
+    let ssh_home = tempfile::tempdir().expect("a temporary SSH home is available");
+    let environment = SshEnvironment {
+        home: ssh_home.path().to_path_buf(),
+        config: None,
+        known_hosts: ssh_home.path().join("known_hosts"),
+        agent_socket: None,
+    };
+    let error = block_on(sftp_store_from_profile_in(
         provider(),
         &pinned_sftp,
         &password,
+        &environment,
         CancellationToken::new(),
     ))
     .err()
