@@ -6,12 +6,16 @@ use musheen_desktop::{
     BackendTagService, HomeItemKind, HomeSection, MountShortcut, TagBackend, TagService,
     TagStorage, XattrTagBackend,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_OBSERVED_SCOPES: usize = 16;
 const MAX_OBSERVED_ITEMS_PER_SCOPE: usize = 4_096;
 const MAX_XATTR_RECONCILIATION_WRITES: usize = 32;
+/// The most folder identities the window keeps; the cache starts over when
+/// full.
+const FOLDER_IDENTITIES_LIMIT: usize = 1_024;
 type ObservedScopes = Vec<(StorePath, BTreeMap<ItemId, StorePath>)>;
 
 #[derive(Clone, Debug)]
@@ -23,11 +27,63 @@ pub(super) struct CatalogBinding {
     /// Serializes updates without making a reader of the in-memory copy
     /// wait on the catalog file's lock.
     update_lock: Arc<Mutex<()>>,
+    /// Writes queued by every window that shares this catalog, run in order.
+    writes: CatalogWriteQueue,
     xattr_opt_in: bool,
 }
 
+/// Catalog writes run one at a time, in the order they were queued, on a
+/// background executor. A queued write runs even when the window that
+/// queued it closes first.
+#[derive(Clone, Default)]
+pub(super) struct CatalogWriteQueue {
+    state: Arc<Mutex<CatalogWriteQueueState>>,
+}
+
+#[derive(Default)]
+struct CatalogWriteQueueState {
+    jobs: VecDeque<Box<dyn FnOnce() + Send>>,
+    draining: bool,
+}
+
+impl std::fmt::Debug for CatalogWriteQueue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        formatter
+            .debug_struct("CatalogWriteQueue")
+            .field("queued", &state.jobs.len())
+            .field("draining", &state.draining)
+            .finish()
+    }
+}
+
+impl CatalogWriteQueue {
+    /// Queues `job`. Returns whether no drain runs, so the caller starts one.
+    fn push(&self, job: Box<dyn FnOnce() + Send>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.jobs.push_back(job);
+        !std::mem::replace(&mut state.draining, true)
+    }
+
+    /// Runs the queued jobs until none is left. A job that panics is dropped
+    /// and the next one runs.
+    fn drain(&self) {
+        loop {
+            let job = {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(job) = state.jobs.pop_front() else {
+                    state.draining = false;
+                    return;
+                };
+                job
+            };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        }
+    }
+}
+
 pub(super) type TagTarget = (ItemId, StorePath, CapabilityMatrix);
-type TagStates = (BTreeSet<Box<str>>, BTreeSet<Box<str>>);
+pub(super) type TagStates = (BTreeSet<Box<str>>, BTreeSet<Box<str>>);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DirectoryObservation {
@@ -61,6 +117,7 @@ impl CatalogBinding {
             revision: Arc::new(AtomicU64::new(0)),
             observed_scopes: Arc::new(Mutex::new(Vec::new())),
             update_lock: Arc::new(Mutex::new(())),
+            writes: CatalogWriteQueue::default(),
             xattr_opt_in,
         }
     }
@@ -81,6 +138,7 @@ impl CatalogBinding {
             revision: Arc::new(AtomicU64::new(0)),
             observed_scopes: Arc::new(Mutex::new(Vec::new())),
             update_lock: Arc::new(Mutex::new(())),
+            writes: CatalogWriteQueue::default(),
             xattr_opt_in,
         }
     }
@@ -96,6 +154,18 @@ impl CatalogBinding {
 
     pub(super) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    /// Queues a write behind the ones every window sharing this catalog
+    /// queued before it. Returns whether the caller must start a drain.
+    pub(super) fn queue_write(&self, job: Box<dyn FnOnce() + Send>) -> bool {
+        self.writes.push(job)
+    }
+
+    /// Runs the queued writes until none is left. Call it on a background
+    /// executor.
+    pub(super) fn drain_writes(&self) {
+        self.writes.drain();
     }
 
     fn remember_directory_observation(
@@ -808,50 +878,185 @@ impl CatalogBinding {
 }
 
 impl MusheenApp {
+    /// Runs catalog work on a background executor after the work queued
+    /// before it, then applies its result on the UI thread. The catalog
+    /// file's lock is taken there, never on the UI thread, and two edits of
+    /// the same entry land in the order they were made. Work that asks the
+    /// store runs the store call first and queues only the write, so a
+    /// store that blocks never holds the queue. The work runs even when
+    /// this window closes first; `then` runs only while it is open.
+    pub(super) fn queue_catalog_work<R: Send + 'static>(
+        &mut self,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> R + Send + 'static,
+        then: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
+    ) {
+        let (sender, receiver) = async_channel::bounded(1);
+        let start = self.catalog_binding.queue_write(Box::new(move || {
+            let _ = sender.try_send(work());
+        }));
+        if start {
+            let binding = self.catalog_binding.clone();
+            cx.background_spawn(async move { binding.drain_writes() })
+                .detach();
+        }
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = receiver.recv().await else {
+                return;
+            };
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| then(state, result, cx));
+        })
+        .detach();
+    }
+
+    /// Shows a failed catalog write on the error line.
+    pub(super) fn report_catalog_error(
+        &mut self,
+        result: Result<(), Box<str>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = result {
+            self.operation_error = Some(error);
+            cx.notify();
+        }
+    }
+
     pub(super) fn clear_recent_locations(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<(), Box<str>> {
-        self.catalog_binding
-            .update(|document| document.recents_mut().clear())?;
-        self.sync_catalog_projection();
-        cx.notify();
+        let binding = self.catalog_binding.clone();
+        self.queue_catalog_work(
+            cx,
+            move || binding.update(|document| document.recents_mut().clear()),
+            |state, result, cx| {
+                match result {
+                    Ok(()) => state.sync_catalog_projection(cx),
+                    Err(error) => state.operation_error = Some(error),
+                }
+                cx.notify();
+            },
+        );
         Ok(())
+    }
+
+    /// The writer a Properties window saves its tag edits with. The edit is
+    /// queued and `done` hears the result once the catalog took it.
+    pub(super) fn properties_tag_writer(
+        &self,
+        tag_targets: Vec<TagTarget>,
+        cx: &mut Context<Self>,
+    ) -> TagWriter {
+        let app = cx.entity().downgrade();
+        let writer: TagWriter = Arc::new(
+            move |desired: &TagDelta, cx: &mut App, done: TagWriteDone| {
+                let mut done = Some(done);
+                let targets = tag_targets.clone();
+                let delta = desired.clone();
+                let queued = app.update(cx, |state, cx| {
+                    if let Some(done) = done.take() {
+                        state.apply_properties_tags(targets, delta, done, cx);
+                    }
+                });
+                if let (Err(error), Some(done)) = (queued, done.take()) {
+                    done(Err(error.to_string().into()), cx);
+                }
+            },
+        );
+        writer
     }
 
     pub(super) fn apply_properties_tags(
         &mut self,
-        targets: &[TagTarget],
-        delta: &TagDelta,
-    ) -> Result<(), Box<str>> {
-        self.catalog_binding
-            .apply_tag_delta(targets, &delta.added, &delta.removed)?;
-        self.sync_catalog_projection();
-        Ok(())
+        targets: Vec<TagTarget>,
+        delta: TagDelta,
+        done: TagWriteDone,
+        cx: &mut Context<Self>,
+    ) {
+        let binding = self.catalog_binding.clone();
+        self.queue_catalog_work(
+            cx,
+            move || binding.apply_tag_delta(&targets, &delta.added, &delta.removed),
+            move |state, result, cx| {
+                let result = result.map(|_| ());
+                if result.is_ok() {
+                    state.sync_catalog_projection(cx);
+                }
+                cx.notify();
+                cx.defer(move |cx| done(result, cx));
+            },
+        );
     }
 
+    /// Deletes a sidebar tag. The tagged paths' capabilities and the catalog
+    /// write run off the UI thread; a failure shows on the error line.
     pub(super) fn delete_captured_tag(
         &mut self,
         target: &CommandTargetRef,
+        cx: &mut Context<Self>,
     ) -> Result<(), Box<str>> {
         let tag = self.catalog_binding.tag_name_from_target(target)?;
         let store = Arc::clone(&self.store);
-        self.catalog_binding
-            .delete_tag(&tag, |path| store.capabilities(path))?;
-        self.sync_catalog_projection();
+        let binding = self.catalog_binding.clone();
+        let work = cx.background_spawn(async move {
+            binding.delete_tag(&tag, |path| store.capabilities(path))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                match result {
+                    Ok(_) => state.sync_catalog_projection(cx),
+                    Err(error) => state.operation_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         Ok(())
     }
 
-    pub(super) fn rename_catalog_tag(&mut self, old: &str, new: &str) -> Result<(), Box<str>> {
+    /// Renames a sidebar tag. The tagged paths' capabilities and the catalog
+    /// write run off the UI thread; `done` hears the result.
+    pub(super) fn rename_catalog_tag(
+        &mut self,
+        old: &str,
+        new: &str,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(Result<(), Box<str>>, &mut App) + 'static,
+    ) {
         let store = Arc::clone(&self.store);
-        let changed = self
-            .catalog_binding
-            .rename_tag(old, new, |path| store.capabilities(path))?;
-        if changed == 0 {
-            return Err("the captured tag no longer exists".into());
-        }
-        self.sync_catalog_projection();
-        Ok(())
+        let binding = self.catalog_binding.clone();
+        let (old, new) = (old.to_owned(), new.to_owned());
+        let work = cx.background_spawn(async move {
+            binding.rename_tag(&old, &new, |path| store.capabilities(path))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let result = result.and_then(|changed| {
+                    if changed == 0 {
+                        Err(Box::<str>::from("the captured tag no longer exists"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if result.is_ok() {
+                    state.sync_catalog_projection(cx);
+                }
+                cx.notify();
+                cx.defer(move |cx| done(result, cx));
+            });
+        })
+        .detach();
     }
 
     pub(super) fn open_captured_tag_rename(
@@ -876,15 +1081,56 @@ impl MusheenApp {
         Ok(())
     }
 
-    pub(super) fn sync_catalog_projection(&mut self) {
-        let store = Arc::clone(&self.store);
-        if let Err(error) = self.catalog_binding.reconcile_pins(|path| {
-            store
-                .resolve_item(path)
-                .map_err(|error| Box::<str>::from(error.to_string()))
-        }) {
-            self.operation_error = Some(error);
+    /// Checks the pins against the store off the UI thread and shows the
+    /// catalog as it is now.
+    pub(super) fn sync_catalog_projection(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_pins(cx);
+        self.project_catalog();
+    }
+
+    /// Asks the store whether each pin still resolves, on a background
+    /// executor, and records the answers in the catalog. One runs at a time;
+    /// a request while one runs asks for one more when it ends.
+    pub(super) fn reconcile_pins(&mut self, cx: &mut Context<Self>) {
+        if self.pins_reconciling {
+            self.pins_reconcile_again = true;
+            return;
         }
+        self.pins_reconciling = true;
+        let store = Arc::clone(&self.store);
+        let binding = self.catalog_binding.clone();
+        let work = cx.background_spawn(async move {
+            binding.reconcile_pins(|path| {
+                store
+                    .resolve_item(path)
+                    .map_err(|error| Box::<str>::from(error.to_string()))
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.pins_reconciling = false;
+                if let Err(error) = result {
+                    state.operation_error = Some(error);
+                }
+                if state.catalog_binding.revision() != state.catalog_projection_revision {
+                    state.project_catalog();
+                }
+                if std::mem::take(&mut state.pins_reconcile_again) {
+                    state.reconcile_pins(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Shows the catalog's current document: pins, tag names, tag filters
+    /// and each tab's folder view preferences. Reads memory only.
+    pub(super) fn project_catalog(&mut self) {
         let (document, projection_revision) = self.catalog_binding.snapshot_with_revision();
         self.pins.replace_catalog(document.pins());
         let tag_names = document.tags().tag_names();
@@ -905,11 +1151,23 @@ impl MusheenApp {
             );
             active.error = None;
         }
+        self.apply_catalog_view_preferences(&document, None);
+        self.catalog_projection_revision = projection_revision;
+    }
+
+    /// Gives each tab its folder's view preferences from `document`; with
+    /// `only`, just the tabs at those locations.
+    fn apply_catalog_view_preferences(
+        &mut self,
+        document: &CatalogDocument,
+        only: Option<&std::collections::HashSet<StorePath>>,
+    ) {
         let locations = self
             .navigation
             .panes()
             .iter()
             .flat_map(|pane| pane.tabs())
+            .filter(|tab| only.is_none_or(|only| only.contains(tab.location())))
             .map(|tab| {
                 (
                     tab.id(),
@@ -919,7 +1177,7 @@ impl MusheenApp {
             })
             .collect::<Vec<_>>();
         for (tab_id, location, base) in locations {
-            let preferences = self.preferences_with_catalog(&location, base, &document);
+            let preferences = self.preferences_with_catalog(&location, base, document);
             if let Some(directory) = self.directories.get_mut(&tab_id) {
                 *directory.view_mut().preferences_mut() = preferences.clone();
             }
@@ -927,15 +1185,17 @@ impl MusheenApp {
                 tab.set_view_preferences(preferences);
             }
         }
-        self.catalog_projection_revision = projection_revision;
     }
 
+    /// The folder identity of `location` as the store last answered it, or
+    /// the one the catalog remembers for the path. Never asks the store; a
+    /// location the store has not answered for is resolved in the
+    /// background by `with_folder_identities` or `request_folder_identities`.
     pub(super) fn folder_identity(&self, location: &StorePath) -> Option<FolderIdentity> {
-        self.store
-            .resolve_item(location)
-            .ok()
+        self.folder_identities
+            .get(location)
+            .cloned()
             .flatten()
-            .map(|item| FolderIdentity::from_item(item.id().clone()))
             .or_else(|| {
                 self.catalog_binding
                     .snapshot()
@@ -945,23 +1205,148 @@ impl MusheenApp {
             })
     }
 
-    pub(super) fn parent_folder_identity(&self, location: &StorePath) -> Option<FolderIdentity> {
+    fn parent_location(location: &StorePath) -> Option<StorePath> {
         let parent = location.as_unix_path()?.parent()?;
-        self.folder_identity(&StorePath::from_unix_path(parent.as_os_str()))
+        Some(StorePath::from_unix_path(parent.as_os_str()))
     }
 
-    pub(super) fn remember_folder_location(&mut self, location: &StorePath) {
-        let Some(identity) = self.folder_identity(location) else {
+    /// Runs `then` with the folder identity of `location` and of its parent:
+    /// now when the store already answered for both, or once it has, on a
+    /// background executor.
+    pub(super) fn with_folder_identities(
+        &mut self,
+        location: StorePath,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(
+            &mut Self,
+            StorePath,
+            Option<FolderIdentity>,
+            Option<FolderIdentity>,
+            &mut Context<Self>,
+        ) + 'static,
+    ) {
+        let parent = Self::parent_location(&location);
+        let missing = std::iter::once(location.clone())
+            .chain(parent.clone())
+            .filter(|path| !self.folder_identities.contains_key(path))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            let identity = self.folder_identity(&location);
+            let parent_identity = parent.as_ref().and_then(|path| self.folder_identity(path));
+            then(self, location, identity, parent_identity, cx);
             return;
-        };
-        let parent = self.parent_folder_identity(location);
-        if let Err(error) = self.catalog_binding.update(|document| {
-            document
-                .folder_preferences_mut()
-                .remember_location(identity, location.clone(), parent);
-        }) {
-            self.operation_error = Some(error);
         }
+        let store = Arc::clone(&self.store);
+        let work = cx.background_spawn(async move { resolve_folder_identities(&*store, missing) });
+        cx.spawn(async move |this, cx| {
+            let resolved = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.remember_folder_identities(resolved);
+                let identity = state.folder_identity(&location);
+                let parent_identity = parent.as_ref().and_then(|path| state.folder_identity(path));
+                then(state, location, identity, parent_identity, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Asks the store, in the background, for the identities of the
+    /// locations it has not answered for, and repaints when it has.
+    pub(super) fn request_folder_identities(
+        &mut self,
+        locations: impl IntoIterator<Item = StorePath>,
+        cx: &mut Context<Self>,
+    ) {
+        let missing = locations
+            .into_iter()
+            .filter(|path| {
+                !self.folder_identities.contains_key(path)
+                    && !self.folder_identities_in_flight.contains(path)
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return;
+        }
+        self.folder_identities_in_flight
+            .extend(missing.iter().cloned());
+        let store = Arc::clone(&self.store);
+        let work = cx.background_spawn(async move { resolve_folder_identities(&*store, missing) });
+        cx.spawn(async move |this, cx| {
+            let resolved = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                for (path, _) in &resolved {
+                    state.folder_identities_in_flight.remove(path);
+                }
+                state.remember_folder_identities(resolved);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Keeps the store's answers. A tab whose folder now has another
+    /// identity than the one its view preferences came from takes that
+    /// folder's catalog preferences.
+    fn remember_folder_identities(&mut self, resolved: Vec<(StorePath, Option<FolderIdentity>)>) {
+        let before = resolved
+            .iter()
+            .map(|(path, _)| (path.clone(), self.folder_identity(path)))
+            .collect::<HashMap<_, _>>();
+        if self.folder_identities.len() + resolved.len() > FOLDER_IDENTITIES_LIMIT {
+            self.folder_identities.clear();
+        }
+        self.folder_identities.extend(resolved);
+        let changed = before
+            .into_iter()
+            .filter(|(path, identity)| self.folder_identity(path) != *identity)
+            .map(|(path, _)| path)
+            .collect::<std::collections::HashSet<_>>();
+        if changed.is_empty() {
+            return;
+        }
+        let document = self.catalog_binding.snapshot();
+        self.apply_catalog_view_preferences(&document, Some(&changed));
+    }
+
+    /// Records a visit to `location` in the catalog: its remembered location
+    /// and, with a label, a recent location. The identities are resolved
+    /// and the catalog is written off the UI thread.
+    pub(super) fn remember_folder_location(
+        &mut self,
+        location: StorePath,
+        recent_label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_folder_identities(location, cx, |state, location, identity, parent, cx| {
+            let Some(identity) = identity else {
+                return;
+            };
+            let binding = state.catalog_binding.clone();
+            state.queue_catalog_work(
+                cx,
+                move || {
+                    binding.update(|document| {
+                        if let Some(label) = recent_label {
+                            document.recents_mut().record(
+                                identity.clone(),
+                                location.clone(),
+                                label,
+                            );
+                        }
+                        document
+                            .folder_preferences_mut()
+                            .remember_location(identity, location, parent);
+                    })
+                },
+                MusheenApp::report_catalog_error,
+            );
+        });
     }
 
     pub(super) fn preferences_with_catalog(
@@ -1074,13 +1459,28 @@ impl Render for TagRenameWindow {
                     .label(rename)
                     .on_click(cx.listener(|this, _, window, cx| {
                         let new = this.input.read(cx).value().to_string();
-                        match this
-                            .app
-                            .update(cx, |app, _| app.rename_catalog_tag(&this.old, &new))
-                        {
-                            Ok(Ok(())) => window.remove_window(),
-                            Ok(Err(error)) => this.error = Some(error),
-                            Err(error) => this.error = Some(error.to_string().into()),
+                        let old = this.old.clone();
+                        let handle = window.window_handle();
+                        let dialog = cx.entity().downgrade();
+                        let queued =
+                            this.app.update(cx, |app, cx| {
+                                app.rename_catalog_tag(&old, &new, cx, move |result, cx| {
+                                    match result {
+                                        Ok(()) => {
+                                            let _ = handle
+                                                .update(cx, |_, window, _| window.remove_window());
+                                        }
+                                        Err(error) => {
+                                            let _ = dialog.update(cx, |this, cx| {
+                                                this.error = Some(error);
+                                                cx.notify();
+                                            });
+                                        }
+                                    }
+                                });
+                            });
+                        if let Err(error) = queued {
+                            this.error = Some(error.to_string().into());
                         }
                         cx.notify();
                     })),
@@ -1094,6 +1494,22 @@ impl MusheenApp {
         tab_id: TabId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let mount_locations = self
+            .sidebars
+            .get(&tab_id)
+            .into_iter()
+            .flat_map(SidebarModel::sections)
+            .find(|section| section.kind() == SidebarSectionKind::Mounts)
+            .into_iter()
+            .flat_map(|section| {
+                section
+                    .items()
+                    .iter()
+                    .map(|entry| entry.location().clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        self.request_folder_identities(mount_locations, cx);
         let mounts = self
             .sidebars
             .get(&tab_id)
@@ -1311,33 +1727,67 @@ impl MusheenApp {
         }
     }
 
+    /// Removes a reviewed orphan's tags unless the store finds the item
+    /// again. The store call and the catalog write run off the UI thread.
     pub(super) fn cleanup_reviewed_orphan(&mut self, item: ItemId, cx: &mut Context<Self>) {
         let store = Arc::clone(&self.store);
-        match self.catalog_binding.cleanup_reviewed_orphan(&item, |path| {
-            store
-                .resolve_item(path)
-                .map_err(|error| Box::<str>::from(error.to_string()))
-        }) {
-            Ok(OrphanCleanupOutcome::Removed | OrphanCleanupOutcome::StillPresent) => {
-                self.sync_catalog_projection();
-            }
-            Ok(OrphanCleanupOutcome::NoLongerOrphaned) => {
-                self.operation_error = Some(
-                    self.catalog
-                        .message("catalog-error-orphan-live")
-                        .expect("the orphan-live catalog message exists")
-                        .into(),
-                );
-            }
-            Err(error) => self.operation_error = Some(error),
-        }
-        cx.notify();
+        let binding = self.catalog_binding.clone();
+        let work = cx.background_spawn(async move {
+            binding.cleanup_reviewed_orphan(&item, |path| {
+                store
+                    .resolve_item(path)
+                    .map_err(|error| Box::<str>::from(error.to_string()))
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                match result {
+                    Ok(OrphanCleanupOutcome::Removed | OrphanCleanupOutcome::StillPresent) => {
+                        state.sync_catalog_projection(cx);
+                    }
+                    Ok(OrphanCleanupOutcome::NoLongerOrphaned) => {
+                        state.operation_error = Some(
+                            state
+                                .catalog
+                                .message("catalog-error-orphan-live")
+                                .expect("the orphan-live catalog message exists")
+                                .into(),
+                        );
+                    }
+                    Err(error) => state.operation_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
+}
+
+/// Resolves folder identities at the store. Runs on a background executor.
+fn resolve_folder_identities(
+    store: &dyn Store,
+    locations: Vec<StorePath>,
+) -> Vec<(StorePath, Option<FolderIdentity>)> {
+    locations
+        .into_iter()
+        .map(|location| {
+            let identity = store
+                .resolve_item(&location)
+                .ok()
+                .flatten()
+                .map(|item| FolderIdentity::from_item(item.id().clone()));
+            (location, identity)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CatalogBinding, DirectoryObservation, OrphanCleanupOutcome};
+    use super::{CatalogBinding, CatalogWriteQueue, DirectoryObservation, OrphanCleanupOutcome};
     use musheen_core::{
         CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, ItemId, ProviderId,
         StorePath,
@@ -2199,5 +2649,32 @@ mod tests {
             OrphanCleanupOutcome::Removed
         );
         assert!(binding.tags_for_identity(&target).is_empty());
+    }
+
+    // UXF-023: the catalog write queue runs jobs in the order they were
+    // queued, keeps going after a job that fails, and asks for a new drain
+    // once it is empty.
+    #[test]
+    fn ui_thread_catalog_write_queue_keeps_order_and_survives_a_failed_write() {
+        let queue = CatalogWriteQueue::default();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for number in 0..3 {
+            let order = std::sync::Arc::clone(&order);
+            let starts_drain = queue.push(Box::new(move || {
+                assert_ne!(number, 1, "the second write fails");
+                order.lock().unwrap().push(number);
+            }));
+            assert_eq!(
+                starts_drain,
+                number == 0,
+                "only the first job starts a drain"
+            );
+        }
+        queue.drain();
+        assert_eq!(*order.lock().unwrap(), [0, 2]);
+        assert!(
+            queue.push(Box::new(|| {})),
+            "a drained queue asks for a new drain"
+        );
     }
 }
