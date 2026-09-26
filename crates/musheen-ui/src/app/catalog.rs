@@ -1463,6 +1463,7 @@ impl CatalogBinding {
                 document
                     .tags_mut()
                     .rename(old, new)
+                    .map(|_| ())
                     .map_err(|error| Box::<str>::from(error.to_string()))
             },
         )
