@@ -553,15 +553,38 @@ fn elevated_session_lists_long_names_up_to_the_limit() {
 }
 
 #[test]
-fn elevated_session_names_the_limit_of_a_listing_too_large() {
-    // 160,000 names of 255 bytes encode to about 72 MB, more than 64 MiB.
+fn elevated_session_lists_to_the_limit_and_names_it_beyond() {
+    // Each name of 255 bytes adds 385 bytes to a listing: 170,000 of them
+    // make about 65.5 MB, just under 64 MiB, and 180,000 about 69.3 MB.
     let root = tempfile::tempdir().unwrap();
-    for index in 0..160_000 {
-        fs::File::create(root.path().join(format!("{index:06}{}", "x".repeat(249)))).unwrap();
-    }
+    let create = |names: std::ops::Range<u32>| {
+        for index in names {
+            fs::File::create(root.path().join(format!("{index:06}{}", "x".repeat(249)))).unwrap();
+        }
+    };
     let small = root.path().join("small");
     fs::create_dir(&small).unwrap();
     fs::write(small.join("leaf.txt"), b"leaf").unwrap();
+    create(0..170_000);
+    for provider in PROVIDERS {
+        let fake = FakeElevation::new(provider, IDLE);
+        let backend = fake.backend();
+        let (store, _session) = open_window(&fake, &backend, root.path());
+
+        let started = std::time::Instant::now();
+        let names = list_all(&store, root.path(), 1_000)
+            .unwrap_or_else(|error| panic!("{provider:?} lists up to the limit: {error}"));
+        assert_eq!(names.len(), 170_001, "{provider:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{provider:?} took {:?}",
+            started.elapsed()
+        );
+    }
+
+    create(170_000..180_000);
+    let english = Catalog::load(Locale::EnUs).unwrap();
+    let arabic = Catalog::load(Locale::Ar).unwrap();
     for provider in PROVIDERS {
         let fake = FakeElevation::new(provider, IDLE);
         let backend = fake.backend();
@@ -570,9 +593,17 @@ fn elevated_session_names_the_limit_of_a_listing_too_large() {
         let error = list_all(&store, root.path(), 1_000)
             .expect_err("a listing over 64 MiB is refused")
             .to_string();
-        assert!(
-            error.contains("too large to list as administrator") && error.contains("64 MiB"),
-            "{provider:?}: {error}"
+        assert_eq!(
+            error,
+            english
+                .message("privilege-error-listing-too-large")
+                .unwrap(),
+            "{provider:?}: the refusal names the limit"
+        );
+        assert_eq!(
+            arabic.localize_reason(&error),
+            arabic.message("privilege-error-listing-too-large").unwrap(),
+            "{provider:?}: the folder's error view shows it in the user's language"
         );
         let names = list_all(&store, &small, 100)
             .unwrap_or_else(|error| panic!("{provider:?} lists after a refusal: {error}"));

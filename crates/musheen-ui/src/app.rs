@@ -17259,7 +17259,7 @@ impl MusheenApp {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(message.into_string()),
+                    .child(self.catalog.localize_reason(&message)),
             )
             .child(
                 Button::new("retry-directory")

@@ -205,18 +205,71 @@ pub enum BrokerOutput {
     Exited(i32),
 }
 
-/// One entry of a folder listing. The name and the identity go as base64
-/// text, a third longer than their bytes; as JSON arrays of numbers they were
-/// up to four times as long.
+/// One entry of a folder listing. It goes as a [`WireEntry`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "WireEntry", into = "WireEntry")]
 pub struct BrokerDirectoryEntry {
-    #[serde(with = "base64_bytes")]
     name: Vec<u8>,
-    #[serde(with = "base64_bytes")]
     identity: [u8; 16],
     kind: RootedEntryKind,
     size: Option<u64>,
     modified_unix_seconds: Option<i64>,
+}
+
+/// A listing entry as the broker sends it: a JSON array of the name, the
+/// identity, a one-digit kind, the size and the modification time, with no
+/// key names. The name and the identity go as base64 text, a third longer
+/// than their bytes; as arrays of numbers they were up to four times as long.
+/// An entry with an 8-byte name and a 4-digit size adds 59 bytes to a
+/// listing, where an object with key names added 127.
+#[derive(Deserialize, Serialize)]
+struct WireEntry(
+    #[serde(with = "base64_bytes")] Vec<u8>,
+    #[serde(with = "base64_bytes")] [u8; 16],
+    u8,
+    Option<u64>,
+    Option<i64>,
+);
+
+impl From<BrokerDirectoryEntry> for WireEntry {
+    fn from(entry: BrokerDirectoryEntry) -> Self {
+        let kind = match entry.kind {
+            RootedEntryKind::Directory => 0,
+            RootedEntryKind::RegularFile => 1,
+            RootedEntryKind::SymbolicLink => 2,
+            RootedEntryKind::Other => 3,
+        };
+        Self(
+            entry.name,
+            entry.identity,
+            kind,
+            entry.size,
+            entry.modified_unix_seconds,
+        )
+    }
+}
+
+impl TryFrom<WireEntry> for BrokerDirectoryEntry {
+    type Error = &'static str;
+
+    fn try_from(
+        WireEntry(name, identity, kind, size, modified_unix_seconds): WireEntry,
+    ) -> Result<Self, Self::Error> {
+        let kind = match kind {
+            0 => RootedEntryKind::Directory,
+            1 => RootedEntryKind::RegularFile,
+            2 => RootedEntryKind::SymbolicLink,
+            3 => RootedEntryKind::Other,
+            _ => return Err("unknown entry kind"),
+        };
+        Ok(Self {
+            name,
+            identity,
+            kind,
+            size,
+            modified_unix_seconds,
+        })
+    }
 }
 
 impl From<&RootedDirectoryEntry> for BrokerDirectoryEntry {
@@ -1398,7 +1451,8 @@ fn executable_has_access_acl(file: &File) -> Result<bool, BrokerError> {
 mod listing_tests {
     use super::{
         BrokerDirectoryEntry, BrokerError, BrokerOutput, BrokerResponse, Clock, PrivilegeProvider,
-        RootGrant, RootedStore, decode_broker_response, encode_broker_response, list_directory,
+        RootGrant, RootedEntryKind, RootedStore, decode_broker_response, encode_broker_response,
+        list_directory,
     };
     use std::path::Path;
 
@@ -1458,6 +1512,52 @@ mod listing_tests {
                 .iter()
                 .any(|entry| entry.name() == b"caf\xe9-\x01\xff")
         );
+    }
+
+    #[test]
+    fn an_entry_goes_as_an_array_without_key_names() {
+        let entry = BrokerDirectoryEntry {
+            name: b"abcdefgh".to_vec(),
+            identity: [0; 16],
+            kind: RootedEntryKind::RegularFile,
+            size: Some(4096),
+            modified_unix_seconds: Some(1_790_000_000),
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"["YWJjZGVmZ2g","AAAAAAAAAAAAAAAAAAAAAA",1,4096,1790000000]"#
+        );
+        assert_eq!(entry.listing_bytes(), 59);
+        assert!(
+            serde_json::from_str::<BrokerDirectoryEntry>(
+                r#"["YQ","AAAAAAAAAAAAAAAAAAAAAA",4,null,null]"#
+            )
+            .is_err(),
+            "an unknown kind is refused"
+        );
+        assert!(
+            serde_json::from_str::<BrokerDirectoryEntry>(r#"["YQ","AAAA",1,null,null]"#).is_err(),
+            "an identity of the wrong length is refused"
+        );
+    }
+
+    #[test]
+    fn a_refused_entry_ends_the_read() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..100 {
+            std::fs::write(root.path().join(format!("file-{index:03}")), b"").unwrap();
+        }
+        let mut admitted = 0;
+        let result = store(root.path()).read_directory_with(Path::new(""), |_| {
+            admitted += 1;
+            if admitted == 10 {
+                Err(BrokerError::ListingTooLarge)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err(BrokerError::ListingTooLarge));
+        assert_eq!(admitted, 10, "admit sees no entry after the refusal");
     }
 
     #[test]
