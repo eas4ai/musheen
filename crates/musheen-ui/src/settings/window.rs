@@ -1060,7 +1060,7 @@ mod tests {
                 .as_ref()
                 .and_then(gpui_kit::WeakEntity::upgrade)
                 .expect("Settings opened");
-            view.read(cx).backends.supports(spec.feature)
+            view.read(cx).state().available(spec)
         })
     }
 
