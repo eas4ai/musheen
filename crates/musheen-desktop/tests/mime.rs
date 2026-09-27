@@ -117,3 +117,27 @@ fn default_backends_detect_content_when_the_name_is_unknown() {
     ));
     assert_eq!(detected.bytes_read(), 9);
 }
+
+#[cfg(unix)]
+#[test]
+fn sockets_pipes_and_devices_are_named_by_type_without_being_opened() {
+    let temporary = tempfile::tempdir().unwrap();
+    let socket = temporary.path().join("socket.txt");
+    let pipe = temporary.path().join("pipe.txt");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    nix::unistd::mkfifo(&pipe, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    let detector = MimeDetector::default();
+    assert_eq!(
+        detector.detect(&socket).unwrap().mime_type(),
+        "inode/socket"
+    );
+    // Opening the pipe would wait for a writer that never comes.
+    assert_eq!(detector.detect(&pipe).unwrap().mime_type(), "inode/fifo");
+    assert_eq!(
+        detector
+            .detect(std::path::Path::new("/dev/null"))
+            .unwrap()
+            .mime_type(),
+        "inode/chardevice"
+    );
+}

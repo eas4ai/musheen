@@ -4,10 +4,10 @@ use musheen_ops::{
     AclChange, AclEntry, AclQualifier, BatchRenameJournal, BatchRenamePlan, BatchRenameStep,
     ConflictChoice, ConflictDecision, ConflictDecisionJournal, ConflictItemKind, ConflictPolicies,
     ConflictRecord, CreateKind, CreateRequest, DeleteTarget, HardLinkRequest, MetadataChange,
-    MetadataPlan, MetadataScope, MutationError, MutationProvider, OperationKind,
-    PermanentDeleteRequest, RenameMapping, RenameRequest, SymbolicLinkRequest, execute_create,
-    execute_delete, execute_hard_link, execute_permanent_delete, execute_rename, execute_restore,
-    execute_symbolic_link,
+    MetadataPlan, MetadataScope, ModeEdit, ModeStep, MutationError, MutationProvider,
+    OperationKind, PermanentDeleteRequest, RenameMapping, RenameRequest, SymbolicLinkRequest,
+    execute_create, execute_delete, execute_hard_link, execute_permanent_delete, execute_rename,
+    execute_restore, execute_symbolic_link,
 };
 use posix_acl::{ACL_READ, PosixACL, Qualifier};
 use std::ffi::OsString;
@@ -393,6 +393,68 @@ fn local_recursive_metadata_separates_modes_and_does_not_follow_symlinks() {
         fs::read_link(link_path).unwrap(),
         std::path::Path::new("file")
     );
+}
+
+#[test]
+fn local_mode_edits_apply_to_the_mode_found_and_change_contents_first() {
+    let directory = tempdir().unwrap();
+    let folder = directory.path().join("folder");
+    let file = folder.join("file");
+    let socket = folder.join("socket");
+    fs::create_dir(&folder).unwrap();
+    fs::write(&file, b"content").unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+    let socket_mode = fs::symlink_metadata(&socket).unwrap().mode() & 0o7777;
+    let mode = |path: &std::path::Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    let no_access = |shift| ModeStep::Access {
+        shift,
+        file_bits: 0,
+        folder_bits: 0,
+    };
+    // Others and then the owner lose all access; the folder's owner can no
+    // longer search it, so its contents must change first.
+    let change =
+        MetadataChange::new().with_mode_edit(ModeEdit::new(vec![no_access(0), no_access(6)]));
+    let root = StorePath::from_unix_path(folder.as_os_str());
+    let mut store = LocalStore::new();
+    let identity = MutationProvider::identity(&mut store, &root)
+        .unwrap()
+        .unwrap();
+    let plan = MetadataPlan::preflight(
+        &mut store,
+        root,
+        identity.to_vec(),
+        MetadataScope::recursive(false, true),
+        change.clone(),
+    )
+    .expect("a socket inside does not fail the preview");
+
+    // A change made after the preview is kept.
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o664)).unwrap();
+    plan.execute(&mut store).unwrap();
+    assert_eq!(mode(&folder), 0o050);
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(mode(&file), 0o060);
+    assert_eq!(mode(&socket), socket_mode, "the socket is left as it is");
+
+    // A socket selected alone is left as it is, and does not fail.
+    let target = StorePath::from_unix_path(socket.as_os_str());
+    let identity = MutationProvider::identity(&mut store, &target)
+        .unwrap()
+        .unwrap();
+    MetadataPlan::preflight(
+        &mut store,
+        target,
+        identity.to_vec(),
+        MetadataScope::Single,
+        change,
+    )
+    .unwrap()
+    .execute(&mut store)
+    .unwrap();
+    assert_eq!(mode(&socket), socket_mode);
 }
 
 #[test]

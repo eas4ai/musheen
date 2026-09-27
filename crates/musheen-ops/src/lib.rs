@@ -40,7 +40,8 @@ pub use link::{
 };
 pub use metadata::{
     AclChange, AclEntry, AclQualifier, MetadataChange, MetadataEntry, MetadataEntryKind,
-    MetadataPlan, MetadataProvider, MetadataScope, ModeEdit, ResolvedMetadataChange,
+    MetadataPlan, MetadataProvider, MetadataScope, ModeEdit, ModeStep, ResolvedMetadataChange,
+    executes_where_readable, mode_after_ownership_change,
 };
 pub use metadata_copy::{MetadataKind, MetadataReport};
 pub use r#move::{

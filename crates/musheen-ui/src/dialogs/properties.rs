@@ -393,11 +393,19 @@ pub struct PropertiesDialogModel {
 }
 
 impl PropertiesDialogModel {
-    /// Loads the account names on the calling thread. The Properties window
-    /// loads them off the UI thread, in `PropertiesWindowData::load`.
+    /// Loads the account names and probes the filesystems' permission
+    /// support on the calling thread. The Properties window does both off
+    /// the UI thread, in `PropertiesWindowData::load`.
     pub fn new(snapshot: PropertySnapshot) -> Self {
         let accounts = Accounts::load(&snapshot);
-        Self::with_accounts(snapshot, accounts, CapabilityState::Supported)
+        let store = LocalStore::new();
+        let matrices = snapshot
+            .items()
+            .iter()
+            .map(|item| store.capabilities(&StorePath::from_unix_path(item.path().as_os_str())))
+            .collect::<Vec<_>>();
+        let capability = permission_capability(&matrices);
+        Self::with_accounts(snapshot, accounts, capability)
     }
 
     /// A model whose account names were loaded off the UI thread.
@@ -1239,11 +1247,7 @@ impl PropertiesWindowData {
                     .collect(),
             ),
         };
-        let permission_capability = capability_matrices
-            .iter()
-            .map(|matrix| matrix.get(CapabilityKind::Permissions).clone())
-            .find(|state| *state != CapabilityState::Supported)
-            .unwrap_or(CapabilityState::Supported);
+        let permission_capability = permission_capability(&capability_matrices);
         let capability_rows = CapabilityKind::ALL
             .iter()
             .copied()
@@ -1314,6 +1318,25 @@ struct PropertyRow {
     label: Box<str>,
     value: Box<str>,
     input: Entity<InputState>,
+}
+
+/// Why the last Apply did not finish, for the page's error line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PermissionError {
+    /// A message from submitting or running the change.
+    Message(Box<str>),
+    /// A job failed; the status center holds its error.
+    JobFailed,
+}
+
+impl PermissionError {
+    /// Keeps `message` for the page, and logs it, as the page may show only
+    /// a general failure when the message is the system's own text.
+    fn message(message: impl Into<Box<str>>) -> Self {
+        let message = message.into();
+        eprintln!("Musheen could not change permissions: {message}");
+        Self::Message(message)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1459,7 +1482,7 @@ pub(crate) struct PropertiesWindow {
     /// The Permissions page's Advanced section is open.
     advanced_open: bool,
     operation_hub: OperationHub,
-    permission_error: Option<Box<str>>,
+    permission_error: Option<PermissionError>,
     permission_batch: PermissionBatchState,
     tag_input: Entity<InputState>,
     tag_writer: Option<TagWriter>,
@@ -1561,12 +1584,15 @@ impl PropertiesWindow {
             });
         match submitted {
             Ok(jobs) => {
-                self.permission_error = self.operation_hub.persistence_error();
+                self.permission_error = self
+                    .operation_hub
+                    .persistence_error()
+                    .map(PermissionError::message);
                 self.permission_batch.begin(jobs);
                 self.pump_operation_queue(cx);
             }
             Err(error) => {
-                self.permission_error = Some(error);
+                self.permission_error = Some(PermissionError::message(error));
                 cx.notify();
             }
         }
@@ -1583,7 +1609,9 @@ impl PropertiesWindow {
                     return;
                 }
                 if let Some(error) = error {
-                    state.permission_error = Some(error);
+                    state.permission_error = Some(PermissionError::message(error));
+                } else if outcome == PermissionBatchOutcome::Failed {
+                    state.permission_error = Some(PermissionError::JobFailed);
                 }
                 if outcome == PermissionBatchOutcome::Succeeded {
                     state.model.clear_permission_edits();
@@ -1593,7 +1621,7 @@ impl PropertiesWindow {
             },
         );
         if let Err(error) = result {
-            self.permission_error = Some(error.to_string().into());
+            self.permission_error = Some(PermissionError::message(error.to_string()));
             cx.notify();
         }
     }
@@ -1662,10 +1690,7 @@ impl PropertiesWindow {
                 if let Some((snapshot, accounts)) = replacement {
                     if self.model.permissions().is_dirty() {
                         self.model.state = PropertiesState::Replaced;
-                        self.refresh_error = Some(
-                              "The selected item changed while you were editing. Close and reopen Properties."
-                                  .into(),
-                          );
+                        self.refresh_error = Some("properties-changed-while-editing".into());
                     } else {
                         self.model.replace_snapshot(snapshot, accounts);
                         self.refresh_error = None;
@@ -1675,7 +1700,10 @@ impl PropertiesWindow {
                     self.refresh_error = None;
                 }
             }
-            Err(error) => self.refresh_error = Some(error.to_string().into()),
+            Err(error) => {
+                eprintln!("Musheen could not refresh Properties: {error}");
+                self.refresh_error = Some(error.to_string().into());
+            }
         }
         cx.notify();
     }
@@ -2203,6 +2231,11 @@ impl PropertiesWindow {
                                 .expect("the descendant review message exists")
                                 .to_owned()
                         }))
+                        .child(permission_note(
+                            "permissions-special-inside",
+                            self.message("permissions-special-inside").to_string(),
+                            Role::Label,
+                        ))
                         .child(
                             Button::new("permissions-review-scope")
                                 .label(
@@ -2217,7 +2250,7 @@ impl PropertiesWindow {
                         ),
                 )
             })
-            .when_some(self.permission_error.as_deref(), |editor, message| {
+            .when_some(self.permission_error_text(), |editor, message| {
                 editor.child(
                     div()
                         .id("permissions-validation")
@@ -2236,8 +2269,8 @@ impl PropertiesWindow {
     /// the Advanced section.
     fn render_permission_controls(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let permissions = self.model.permissions();
-        let editable = self.model.state() == PropertiesState::Ready
-            && permissions.read_only_reason().is_none();
+        let ready = self.model.state() == PropertiesState::Ready;
+        let editable = ready && permissions.modes_editable();
         let varies = self.message("permissions-varies").to_string();
         let mut controls = Vec::new();
         if let Some(reason) = permissions.read_only_reason() {
@@ -2246,19 +2279,29 @@ impl PropertiesWindow {
                 self.message("permissions-read-only"),
                 self.catalog.localize_reason(reason)
             );
-            controls.push(
-                div()
-                    .id("permissions-read-only")
-                    .test_support()
-                    .role(Role::Alert)
-                    .aria_label(reason.clone())
-                    .child(reason)
-                    .into_any_element(),
-            );
+            controls.push(permission_note(
+                "permissions-read-only",
+                reason,
+                Role::Alert,
+            ));
+        } else if let Some(lock) = permissions.mode_lock() {
+            controls.push(permission_note(
+                "permissions-mode-lock",
+                self.message(lock.message_key()).to_string(),
+                Role::Label,
+            ));
+        }
+        if permissions.has_special_items() {
+            controls.push(permission_note(
+                "permissions-special-items",
+                self.message("permissions-special-items").to_string(),
+                Role::Label,
+            ));
         }
         let folders = permissions.only_folders();
         for class in AccessClass::ALL {
             let shown = permissions.access(class);
+            let chosen = permissions.access_chosen(class);
             let class_label = self.message(&format!("permissions-class-{}", class.key()));
             let mut row = div()
                 .flex()
@@ -2290,17 +2333,22 @@ impl PropertiesWindow {
                     })),
                 );
             }
-            if shown.is_none() {
+            // Varies shows while the items differ, and stays offered after
+            // a choice so the user can go back to leaving them as they are.
+            if shown.is_none() || (chosen && permissions.access_varies_unchanged(class)) {
                 row = row.child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "permissions-{}-varies",
-                            class.key()
-                        )))
-                        .test_support()
-                        .aria_label(varies.clone())
-                        .text_sm()
-                        .child(varies.clone()),
+                    Button::new(SharedString::from(format!(
+                        "permissions-{}-varies",
+                        class.key()
+                    )))
+                    .label(varies.clone())
+                    .small()
+                    .selected(shown.is_none())
+                    .disabled(!editable || !chosen)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model.permissions_mut().clear_access(class);
+                        cx.notify();
+                    })),
                 );
             }
             controls.push(row.into_any_element());
@@ -2324,14 +2372,7 @@ impl PropertiesWindow {
                             })),
                     )
                     .when(executable == Tristate::Varies, |row| {
-                        row.child(
-                            div()
-                                .id("permissions-executable-varies")
-                                .test_support()
-                                .aria_label(varies.clone())
-                                .text_sm()
-                                .child(varies.clone()),
-                        )
+                        row.child(varies_mark("permissions-executable-varies", &varies))
                     })
                     .into_any_element(),
             );
@@ -2360,23 +2401,39 @@ impl PropertiesWindow {
                         .aria_label(owner.clone())
                         .child(owner),
                 )
-                .child(
-                    div()
-                        .id("permissions-owner-needs-admin")
-                        .test_support()
-                        .role(Role::Label)
-                        .aria_label(needs_admin.clone())
-                        .text_sm()
-                        .child(needs_admin),
-                )
+                .child(permission_note(
+                    "permissions-owner-needs-admin",
+                    needs_admin,
+                    Role::Label,
+                ))
                 .into_any_element(),
         );
         let group = permissions.shown_group().map_or_else(
             || varies.clone(),
             |gid| permissions.accounts().group_name(gid),
         );
-        let group_editable = editable && permissions.group_editable();
-        let not_owner = self.message("permissions-group-not-owner").to_string();
+        let group_editable = ready && permissions.group_editable();
+        let choose = self.message("permissions-group-choose").to_string();
+        let picker = div()
+            .id("permissions-group-picker")
+            .test_support()
+            .px_2()
+            .border_1()
+            .rounded_md()
+            .child(group.clone());
+        // Only a group the user may choose is a button; otherwise the group
+        // is a label, with the reason beside it.
+        let picker = if group_editable {
+            picker
+                .role(Role::Button)
+                .aria_label(choose)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.group_picker_open = !this.group_picker_open;
+                    cx.notify();
+                }))
+        } else {
+            picker.role(Role::Label).aria_label(group)
+        };
         controls.push(
             div()
                 .flex()
@@ -2388,42 +2445,33 @@ impl PropertiesWindow {
                         .w(px(96.))
                         .child(self.message("permissions-class-group").to_string()),
                 )
-                .child(
-                    div()
-                        .id("permissions-group-picker")
-                        .test_support()
-                        .role(Role::Button)
-                        .aria_label(self.message("permissions-group-choose").to_string())
-                        .px_2()
-                        .border_1()
-                        .rounded_md()
-                        .child(group)
-                        .when(group_editable, |picker| {
-                            picker.on_click(cx.listener(|this, _, _, cx| {
-                                this.group_picker_open = !this.group_picker_open;
-                                cx.notify();
-                            }))
-                        }),
+                .child(picker)
+                .when(
+                    ready && permissions.read_only_reason().is_none() && !group_editable,
+                    |row| {
+                        row.child(permission_note(
+                            "permissions-group-not-owner",
+                            self.message("permissions-group-not-owner").to_string(),
+                            Role::Label,
+                        ))
+                    },
                 )
-                .when(editable && !group_editable, |row| {
-                    row.child(
-                        div()
-                            .id("permissions-group-not-owner")
-                            .test_support()
-                            .role(Role::Label)
-                            .aria_label(not_owner.clone())
-                            .text_sm()
-                            .child(not_owner),
-                    )
-                })
                 .into_any_element(),
         );
+        if permissions.has_named_acl() {
+            controls.push(permission_note(
+                "permissions-acl-mask-note",
+                self.message("permissions-acl-mask-note").to_string(),
+                Role::Label,
+            ));
+        }
         if self.group_picker_open && group_editable {
             let shown = permissions.shown_group();
             let options = permissions.accounts().user_groups().to_vec();
             controls.push(
                 div()
                     .id("permissions-group-options")
+                    .test_support()
                     .flex()
                     .flex_wrap()
                     .gap_1()
@@ -2456,14 +2504,16 @@ impl PropertiesWindow {
         );
         if self.advanced_open {
             controls.push(self.render_permission_bits(editable, cx));
-            controls.extend(self.render_access_entries());
+            controls.push(self.render_access_entries());
         }
         controls
     }
 
-    /// The Advanced section's mode bits, each a toggle.
+    /// The Advanced section's mode bits, each a toggle, with Varies where
+    /// the selected items differ.
     fn render_permission_bits(&self, editable: bool, cx: &mut Context<Self>) -> AnyElement {
         let permissions = self.model.permissions();
+        let varies = self.message("permissions-varies").to_string();
         div()
             .id("permissions-bits")
             .flex()
@@ -2481,24 +2531,37 @@ impl PropertiesWindow {
                         .to_string(),
                 };
                 let mask = bit.mask;
-                Button::new(SharedString::from(format!("permissions-bit-{}", bit.key)))
-                    .label(label)
-                    .small()
-                    .selected(permissions.bit(mask) == Tristate::On)
-                    .disabled(!editable)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.model.permissions_mut().toggle_bit(mask);
-                        cx.notify();
-                    }))
+                let shown = permissions.bit(mask);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new(SharedString::from(format!("permissions-bit-{}", bit.key)))
+                            .label(label)
+                            .small()
+                            .selected(shown == Tristate::On)
+                            .disabled(!editable)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.model.permissions_mut().toggle_bit(mask);
+                                cx.notify();
+                            })),
+                    )
+                    .when(shown == Tristate::Varies, |cell| {
+                        cell.child(varies_mark(
+                            SharedString::from(format!("permissions-bit-{}-varies", bit.key)),
+                            &varies,
+                        ))
+                    })
             }))
             .into_any_element()
     }
 
-    /// The Advanced section's ACL entries, read-only and with names, and the
-    /// note that the Group row sets their mask.
-    fn render_access_entries(&self) -> Vec<AnyElement> {
+    /// The Advanced section's ACL entries, read-only and with names.
+    fn render_access_entries(&self) -> AnyElement {
         let permissions = self.model.permissions();
         let accounts = permissions.accounts();
+        let separator = self.catalog.list_separator();
         let entry_label = |entry: &AclEntry| {
             let qualifier = match entry.qualifier() {
                 AclQualifier::Owner => self.message("permissions-acl-owner").to_string(),
@@ -2536,7 +2599,7 @@ impl PropertiesWindow {
                 .iter()
                 .map(entry_label)
                 .collect::<Vec<_>>()
-                .join(", "),
+                .join(separator),
             AclState::Unsupported(reason) => format!(
                 "{}: {}",
                 self.message("properties-unsupported"),
@@ -2548,7 +2611,6 @@ impl PropertiesWindow {
                 self.catalog.localize_reason(reason)
             ),
         };
-        let mut named = false;
         let mut rows = Vec::new();
         for (index, item) in self.model.snapshot().items().iter().enumerate() {
             let name = item
@@ -2556,22 +2618,14 @@ impl PropertiesWindow {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if let AclState::Available(entries) = item.permissions().acl() {
-                named |= entries.iter().any(|entry| {
-                    matches!(
-                        entry.qualifier(),
-                        AclQualifier::User(_) | AclQualifier::Group(_)
-                    )
-                });
-            }
             let mut text = format!(
-                "{name} — {}: {}",
+                "{name}{separator}{}: {}",
                 self.message("properties-access-acl"),
                 state_label(item.permissions().acl())
             );
             if let Some(default_acl) = item.permissions().default_acl() {
                 text.push_str(&format!(
-                    "; {}: {}",
+                    "{separator}{}: {}",
                     self.message("properties-default-acl"),
                     state_label(default_acl)
                 ));
@@ -2587,32 +2641,35 @@ impl PropertiesWindow {
                     .into_any_element(),
             );
         }
-        let mut entries = vec![
-            div()
-                .id("permissions-acl-entries")
-                .test_support()
-                .role(Role::Region)
-                .aria_label(self.message("properties-access-acl").to_string())
-                .flex()
-                .flex_col()
-                .gap_1()
-                .children(rows)
-                .into_any_element(),
-        ];
-        if named {
-            let note = self.message("permissions-acl-mask-note").to_string();
-            entries.push(
-                div()
-                    .id("permissions-acl-mask-note")
-                    .test_support()
-                    .role(Role::Label)
-                    .aria_label(note.clone())
-                    .text_sm()
-                    .child(note)
-                    .into_any_element(),
-            );
-        }
-        entries
+        div()
+            .id("permissions-acl-entries")
+            .test_support()
+            .role(Role::Region)
+            .aria_label(self.message("properties-access-acl").to_string())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// The page's error line, in the window's language.
+    fn permission_error_text(&self) -> Option<String> {
+        self.permission_error.as_ref().map(|error| match error {
+            PermissionError::Message(message) => {
+                self.localized_error(message, "permissions-apply-failed")
+            }
+            PermissionError::JobFailed => self.message("permissions-apply-failed").to_string(),
+        })
+    }
+
+    /// `error` in the window's language. A message the catalog knows is
+    /// translated; any other, such as the system's own text, shows
+    /// `fallback`.
+    fn localized_error(&self, error: &str, fallback: &str) -> String {
+        self.catalog
+            .localize_known_reason(error)
+            .unwrap_or_else(|| self.message(fallback).to_string())
     }
 
     fn render_tag_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2879,13 +2936,16 @@ impl Render for PropertiesWindow {
         self.sync_rows(window, cx);
         let title = identity_title(self.model.snapshot());
         let location = aggregate_location(self.model.snapshot());
+        let refresh_error = self
+            .refresh_error
+            .as_deref()
+            .map(|error| self.localized_error(error, "properties-refresh-failed"));
         let state_message = match self.model.state() {
-            PropertiesState::Ready => self.refresh_error.as_deref(),
-            PropertiesState::Replaced => self
-                .refresh_error
-                .as_deref()
-                .or_else(|| self.catalog.message("properties-replaced").ok()),
-            PropertiesState::Missing => self.catalog.message("properties-missing").ok(),
+            PropertiesState::Ready => refresh_error,
+            PropertiesState::Replaced => {
+                refresh_error.or_else(|| Some(self.message("properties-replaced").to_string()))
+            }
+            PropertiesState::Missing => Some(self.message("properties-missing").to_string()),
         };
         let properties_for = self
             .catalog
@@ -3240,6 +3300,33 @@ fn aggregate_text(value: AggregateValue<Box<str>>) -> String {
     }
 }
 
+/// The selection's POSIX permission support: the first item's filesystem
+/// that does not support them decides, with its reason.
+fn permission_capability(matrices: &[CapabilityMatrix]) -> CapabilityState {
+    matrices
+        .iter()
+        .map(|matrix| matrix.get(CapabilityKind::Permissions).clone())
+        .find(|state| *state != CapabilityState::Supported)
+        .unwrap_or(CapabilityState::Supported)
+}
+
+/// A labelled line of text on the Permissions page.
+fn permission_note(id: impl Into<SharedString>, text: String, role: Role) -> AnyElement {
+    div()
+        .id(id.into())
+        .test_support()
+        .role(role)
+        .aria_label(text.clone())
+        .text_sm()
+        .child(text)
+        .into_any_element()
+}
+
+/// The Varies mark beside a control whose selected items differ.
+fn varies_mark(id: impl Into<SharedString>, varies: &str) -> AnyElement {
+    permission_note(id, varies.to_owned(), Role::Label)
+}
+
 fn aggregate_u32(value: &AggregateValue<u32>) -> String {
     match value {
         AggregateValue::Same(value) => value.to_string(),
@@ -3337,6 +3424,7 @@ mod tests {
     use gpui_kit::component::Root;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use musheen_core::CapabilityReason;
+    use musheen_ops::MutationError;
     use standard_library::fs as filesystem;
     use std as standard_library;
     use std::cell::RefCell;
@@ -3773,7 +3861,7 @@ mod tests {
             data = data.with_catalog(catalog);
         }
         let mut properties = None;
-        let handle = cx.open_window(size(px(900.), px(900.)), |window, cx| {
+        let handle = cx.open_window(size(px(1000.), px(1600.)), |window, cx| {
             let view = cx.new(|cx| PropertiesWindow::new(data, window, cx));
             properties = Some(view.clone());
             Root::new(view, window, cx)
@@ -4063,6 +4151,480 @@ mod tests {
         click_all(handle, &["permissions-others-no-access"], cx);
         let checked = file.clone();
         apply_until(handle, cx, move || file_mode(&checked) == 0o750).await;
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_names_acl_entries_and_the_group_row_sets_their_mask(
+        cx: &mut TestAppContext,
+    ) {
+        use posix_acl::{ACL_READ, ACL_WRITE, PosixACL, Qualifier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("shared.txt");
+        filesystem::write(&file, b"shared").unwrap();
+        set_file_mode(&file, 0o660);
+        let mut acl = PosixACL::read_acl(&file).expect("the temporary filesystem has ACLs");
+        acl.set(
+            Qualifier::User(musheen_desktop::effective_user()),
+            ACL_READ | ACL_WRITE,
+        );
+        acl.fix_mask();
+        acl.write_acl(&file)
+            .expect("the temporary filesystem takes a named ACL entry");
+        let user = command_output("/usr/bin/id", &["-un"]);
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&file), None, cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window.find("permissions-acl-mask-note").visible(),
+                "the note shows beside the Group row, with Advanced closed"
+            );
+        })
+        .unwrap();
+        click_all(handle, &["permissions-advanced"], cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window
+                    .find("permissions-acl-item-0")
+                    .label()
+                    .is_some_and(|label| label.contains(&format!("User {user}: rw-"))),
+                "a named entry shows its user's name"
+            );
+        })
+        .unwrap();
+        click_all(handle, &["permissions-group-can-view"], cx);
+        let checked = file.clone();
+        apply_until(handle, cx, move || {
+            PosixACL::read_acl(&checked)
+                .ok()
+                .and_then(|acl| acl.get(Qualifier::Mask))
+                == Some(ACL_READ)
+        })
+        .await;
+    }
+
+    /// Whether `path` is owned by the current user.
+    fn owned_by_user(path: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        filesystem::symlink_metadata(path).unwrap().uid() == musheen_desktop::effective_user()
+    }
+
+    fn is_dirty(properties: &Entity<PropertiesWindow>, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| properties.read(cx).model.permissions().is_dirty())
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_later_changes_win_over_advanced_bits(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let notes = temporary.path().join("notes.txt");
+        filesystem::write(&notes, b"notes").unwrap();
+        set_file_mode(&notes, 0o600);
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&notes), None, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-advanced",
+                "permissions-bit-others-read",
+                "permissions-others-no-access",
+                "permissions-group-can-view",
+            ],
+            cx,
+        );
+        let checked = notes.clone();
+        apply_until(handle, cx, move || file_mode(&checked) == 0o640).await;
+
+        let tool = temporary.path().join("tool");
+        filesystem::write(&tool, b"#!/bin/sh\n").unwrap();
+        set_file_mode(&tool, 0o600);
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&tool), None, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-advanced",
+                "permissions-bit-group-read",
+                "permissions-bit-owner-execute",
+            ],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window.find("permissions-executable-varies").visible(),
+                "0o740 executes where the group may not"
+            );
+        })
+        .unwrap();
+        click_all(
+            handle,
+            &["permissions-executable", "permissions-executable"],
+            cx,
+        );
+        let checked = tool.clone();
+        apply_until(handle, cx, move || file_mode(&checked) == 0o640).await;
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_bits_show_varies_and_clicks_return_to_unchanged(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first.txt");
+        let second = temporary.path().join("second.txt");
+        filesystem::write(&first, b"first").unwrap();
+        filesystem::write(&second, b"second").unwrap();
+        set_file_mode(&first, 0o640);
+        set_file_mode(&second, 0o600);
+        let (handle, properties) =
+            open_permissions_page(&[first.clone(), second.clone()], None, cx);
+        click_all(handle, &["permissions-advanced"], cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(window.find("permissions-bit-group-read-varies").visible());
+            assert!(
+                window
+                    .try_find("permissions-bit-owner-read-varies")
+                    .is_none()
+            );
+        })
+        .unwrap();
+        click_all(
+            handle,
+            &[
+                "permissions-bit-group-read",
+                "permissions-bit-group-read",
+                "permissions-bit-group-read",
+            ],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(window.find("permissions-bit-group-read-varies").visible());
+            assert!(window.try_find("properties-apply").is_none());
+        })
+        .unwrap();
+        assert!(
+            !is_dirty(&properties, cx),
+            "set, cleared, then Varies again"
+        );
+        click_all(
+            handle,
+            &["permissions-group-can-view", "permissions-group-varies"],
+            cx,
+        );
+        assert!(!is_dirty(&properties, cx), "Varies drops the group choice");
+
+        let (handle, properties) = open_permissions_page(std::slice::from_ref(&first), None, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-advanced",
+                "permissions-bit-others-write",
+                "permissions-bit-others-write",
+            ],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(window.try_find("properties-apply").is_none());
+        })
+        .unwrap();
+        assert!(
+            !is_dirty(&properties, cx),
+            "a second click gives the bit back"
+        );
+        assert_eq!(file_mode(&first), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_locks_what_the_user_may_not_change(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("notes.txt");
+        let link = temporary.path().join("link");
+        filesystem::write(&file, b"notes").unwrap();
+        std::os::unix::fs::symlink("notes.txt", &link).unwrap();
+        set_file_mode(&file, 0o644);
+
+        // A link has no mode of its own, but its owner may change its group.
+        let (handle, properties) = open_permissions_page(std::slice::from_ref(&link), None, cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.find("permissions-mode-lock").visible());
+            window.click("permissions-others-no-access", cx);
+            window.render_frame(cx);
+            window.click("permissions-group-picker", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("permissions-group-options").is_some());
+        })
+        .unwrap();
+        assert!(!is_dirty(&properties, cx));
+
+        // Items another user owns, judged with POSIX permissions supported,
+        // as /etc and /dev may sit on filesystems the probe does not know:
+        // /etc for the mode, and the link /dev/stdin for the group. The
+        // superuser owns both.
+        for other in [PathBuf::from("/etc"), PathBuf::from("/dev/stdin")] {
+            if filesystem::symlink_metadata(&other).is_err() || owned_by_user(&other) {
+                continue;
+            }
+            let snapshot = PropertySnapshot::load(&[file.clone(), other.clone()]).unwrap();
+            let accounts = Accounts::load(&snapshot);
+            let mut permissions = PermissionsPageModel::from_snapshot(
+                &snapshot,
+                accounts,
+                &CapabilityState::Supported,
+            );
+            assert!(!permissions.group_editable(), "{other:?} is another user's");
+            let groups = permissions.accounts().user_groups().to_vec();
+            for (gid, _) in groups {
+                permissions.set_group(gid);
+            }
+            permissions.set_access(AccessClass::Others, Access::None);
+            let expected = other.is_dir().then_some(crate::ModeLock::NotOwner);
+            assert_eq!(permissions.mode_lock(), expected, "{other:?}");
+            assert_eq!(
+                permissions.is_dirty(),
+                expected.is_none(),
+                "only the user's own file may change"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_apply_to_contents_changes_contents_first(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("shared");
+        let file = folder.join("notes.txt");
+        let socket = folder.join("socket");
+        filesystem::create_dir(&folder).unwrap();
+        filesystem::write(&file, b"notes").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        set_file_mode(&file, 0o644);
+        set_file_mode(&folder, 0o755);
+        let socket_mode = file_mode(&socket);
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&folder), None, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-owner-no-access",
+                "permissions-advanced",
+                "permissions-bit-setgid",
+                "permissions-scope-recursive",
+            ],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(window.find("permissions-special-inside").visible());
+        })
+        .unwrap();
+        click_all(handle, &["permissions-review-scope"], cx);
+        let checked = folder.clone();
+        apply_until(handle, cx, move || file_mode(&checked) == 0o2055).await;
+        // The folder no longer lets its owner in; give it back to read its
+        // contents.
+        set_file_mode(&folder, 0o755);
+        assert_eq!(
+            file_mode(&file),
+            0o044,
+            "the file changed before its folder, without the folder's setgid"
+        );
+        assert_eq!(
+            file_mode(&socket),
+            socket_mode,
+            "the socket is left as it is"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_execute_follows_read_while_checked(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let program = temporary.path().join("program");
+        let partial = temporary.path().join("partial");
+        filesystem::write(&program, b"#!/bin/sh\n").unwrap();
+        filesystem::write(&partial, b"#!/bin/sh\n").unwrap();
+        set_file_mode(&program, 0o700);
+        set_file_mode(&partial, 0o744);
+
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&partial), None, cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window.find("permissions-executable-varies").visible(),
+                "group and others may read 0o744 but not execute it"
+            );
+        })
+        .unwrap();
+
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&program), None, cx);
+        click_all(handle, &["permissions-group-can-view"], cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(window.try_find("permissions-executable-varies").is_none());
+        })
+        .unwrap();
+        let checked = program.clone();
+        apply_until(handle, cx, move || file_mode(&checked) == 0o750).await;
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_group_change_skips_members_and_shows_cleared_setuid(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let moving = temporary.path().join("moving");
+        let member = temporary.path().join("member");
+        filesystem::write(&moving, b"#!/bin/sh\n").unwrap();
+        filesystem::write(&member, b"#!/bin/sh\n").unwrap();
+        let current = filesystem::metadata(&moving).unwrap().gid();
+        let groups = command_output("/usr/bin/id", &["-G"])
+            .split_whitespace()
+            .map(|gid| gid.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        let Some(other) = groups.iter().copied().find(|gid| *gid != current) else {
+            eprintln!("skipped: the user belongs to one group");
+            return;
+        };
+        std::os::unix::fs::chown(&member, None, Some(other)).unwrap();
+        set_file_mode(&moving, 0o4755);
+        set_file_mode(&member, 0o4755);
+        let (handle, _) = open_permissions_page(&[moving.clone(), member.clone()], None, cx);
+        let option = format!("permissions-group-option-{other}");
+        click_all(
+            handle,
+            &[
+                "permissions-group-picker",
+                option.as_str(),
+                "permissions-advanced",
+            ],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window.find("permissions-bit-setuid-varies").visible(),
+                "the file that changes group loses setuid; the member keeps it"
+            );
+        })
+        .unwrap();
+        let (checked_moving, checked_member) = (moving.clone(), member.clone());
+        apply_until(handle, cx, move || {
+            filesystem::metadata(&checked_moving).unwrap().gid() == other
+                && file_mode(&checked_moving) == 0o755
+        })
+        .await;
+        assert_eq!(
+            file_mode(&checked_member),
+            0o4755,
+            "no chown ran on the member"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_localizes_notes_reasons_and_errors(cx: &mut TestAppContext) {
+        use posix_acl::{ACL_READ, PosixACL, Qualifier};
+
+        let pseudo = Catalog::load(crate::Locale::EnXa).unwrap();
+        for error in [
+            MutationError::PermissionDenied,
+            MutationError::Missing,
+            MutationError::SourceChanged,
+            MutationError::Unsupported,
+            MutationError::Cancelled,
+            MutationError::ScopeNotReviewed,
+            MutationError::NoChanges,
+            MutationError::InvalidMetadata,
+            MutationError::InvalidScope,
+        ] {
+            assert!(
+                pseudo
+                    .localize_known_reason(&error.to_string())
+                    .is_some_and(|message| message.starts_with('⟦')),
+                "{error} is localized"
+            );
+        }
+        for reason in [
+            "properties-changed-while-editing",
+            "permissions-apply-failed",
+            "properties-refresh-failed",
+            "the filesystem could not be probed",
+            "the filesystem does not support POSIX ACLs",
+            "the ACL could not be read",
+        ] {
+            assert!(
+                pseudo
+                    .localize_known_reason(reason)
+                    .is_some_and(|message| message.starts_with('⟦')),
+                "{reason} is localized"
+            );
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let shared = temporary.path().join("shared.txt");
+        let private = temporary.path().join("private.txt");
+        let link = temporary.path().join("link");
+        let socket = temporary.path().join("socket");
+        filesystem::write(&shared, b"shared").unwrap();
+        filesystem::write(&private, b"private").unwrap();
+        std::os::unix::fs::symlink("shared.txt", &link).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        set_file_mode(&shared, 0o640);
+        set_file_mode(&private, 0o600);
+        let mut acl = PosixACL::read_acl(&shared).expect("the temporary filesystem has ACLs");
+        acl.set(Qualifier::User(musheen_desktop::effective_user()), ACL_READ);
+        acl.fix_mask();
+        acl.write_acl(&shared)
+            .expect("the temporary filesystem takes a named ACL entry");
+        let (handle, _) = open_permissions_page(
+            &[
+                shared.clone(),
+                private.clone(),
+                link.clone(),
+                socket.clone(),
+            ],
+            Some(pseudo.clone()),
+            cx,
+        );
+        click_all(handle, &["permissions-advanced"], cx);
+        let symlink_reason = pseudo
+            .localize_known_reason("POSIX ACLs are not read through symbolic links")
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, _| {
+            for id in [
+                "permissions-group-varies",
+                "permissions-special-items",
+                "permissions-acl-mask-note",
+                "permissions-bit-group-read-varies",
+                "permissions-acl-entries",
+            ] {
+                assert!(
+                    window
+                        .find(id)
+                        .label()
+                        .is_some_and(|label| label.starts_with('⟦')),
+                    "{id} is localized"
+                );
+            }
+            assert!(
+                window
+                    .find("permissions-acl-item-2")
+                    .label()
+                    .is_some_and(|label| label.contains(&symlink_reason)),
+                "the link's ACL reason is localized"
+            );
+        })
+        .unwrap();
+
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&link), Some(pseudo), cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window
+                    .find("permissions-mode-lock")
+                    .label()
+                    .is_some_and(|label| label.starts_with('⟦'))
+            );
+        })
+        .unwrap();
     }
 
     #[cfg(unix)]

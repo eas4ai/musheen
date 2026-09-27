@@ -5,7 +5,10 @@
 
 use musheen_core::{CapabilityState, ItemKind};
 use musheen_desktop::{AclQualifier, AclState, AggregateValue, PropertySnapshot};
-use musheen_ops::{MetadataChange, MetadataEntryKind, MetadataScope, ModeEdit};
+use musheen_ops::{
+    MetadataChange, MetadataEntryKind, MetadataScope, ModeEdit, ModeStep, executes_where_readable,
+    mode_after_ownership_change,
+};
 use std::collections::BTreeMap;
 
 /// A class of users the page sets access for.
@@ -24,14 +27,6 @@ impl AccessClass {
             Self::Owner => 6,
             Self::Group => 3,
             Self::Others => 0,
-        }
-    }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Owner => 0,
-            Self::Group => 1,
-            Self::Others => 2,
         }
     }
 
@@ -261,12 +256,55 @@ impl Accounts {
     }
 }
 
-/// One selected item as the page sees it.
+/// One selected file or folder as the page sees it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ItemMode {
     kind: MetadataEntryKind,
     mode: u32,
     owner: u32,
+    group: u32,
+}
+
+/// One change the user made, kept in the order made so a later change wins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Step {
+    Access(AccessClass, Access),
+    Executable(bool),
+    Bit(u32, bool),
+}
+
+impl Step {
+    /// Whether `self` and `other` set the same control, so the later one
+    /// replaces the earlier.
+    fn same_control(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Access(first, _), Self::Access(second, _)) => first == second,
+            (Self::Executable(_), Self::Executable(_)) => true,
+            (Self::Bit(first, _), Self::Bit(second, _)) => first == second,
+            _ => false,
+        }
+    }
+}
+
+/// Why the page may not change the selection's modes, though the
+/// filesystem supports them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModeLock {
+    /// A selected file or folder belongs to another user.
+    NotOwner,
+    /// The selection holds no file or folder; a link has no mode of its own.
+    NoModes,
+}
+
+impl ModeLock {
+    /// The message key of the reason the page shows.
+    #[must_use]
+    pub const fn message_key(self) -> &'static str {
+        match self {
+            Self::NotOwner => "permissions-not-owner",
+            Self::NoModes => "permissions-no-modes",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -275,12 +313,18 @@ pub struct PermissionsPageModel {
     group: AggregateValue<u32>,
     mode: AggregateValue<u32>,
     items: Vec<ItemMode>,
+    /// The owner of every selected item, links and special files included.
+    owners: Vec<u32>,
+    /// Whether the selection holds a socket, pipe or device, which Apply
+    /// leaves as it is.
+    special: bool,
+    /// Whether a selected item has ACL entries for named users or groups.
+    named_acl: bool,
     accounts: Accounts,
-    /// Why the page may not change anything, when it may not.
+    /// Why the filesystem lets the page change nothing, when it does not.
     read_only: Option<Box<str>>,
-    access: [Option<Access>; 3],
-    executable: Option<bool>,
-    bits: BTreeMap<u32, bool>,
+    mode_lock: Option<ModeLock>,
+    steps: Vec<Step>,
     group_edit: Option<u32>,
     scope: MetadataScope,
 }
@@ -294,38 +338,77 @@ impl PermissionsPageModel {
         accounts: Accounts,
         capability: &CapabilityState,
     ) -> Self {
-        let items = snapshot
+        let items: Vec<ItemMode> = snapshot
             .items()
             .iter()
             .filter_map(|item| {
                 let kind = match item.kind() {
                     ItemKind::RegularFile => MetadataEntryKind::File,
                     ItemKind::Directory => MetadataEntryKind::Directory,
-                    _ => return None,
+                    ItemKind::SymbolicLink | ItemKind::Other => return None,
                 };
                 Some(ItemMode {
                     kind,
                     mode: item.permissions().mode() & 0o7777,
                     owner: item.permissions().owner(),
+                    group: item.permissions().group(),
                 })
             })
             .collect();
+        let owners = snapshot
+            .items()
+            .iter()
+            .map(|item| item.permissions().owner())
+            .collect();
+        let special = snapshot
+            .items()
+            .iter()
+            .any(|item| item.kind() == ItemKind::Other);
+        let named_acl = snapshot.items().iter().any(|item| {
+            let permissions = item.permissions();
+            std::iter::once(permissions.acl())
+                .chain(permissions.default_acl())
+                .any(|acl| match acl {
+                    AclState::Available(entries) => entries.iter().any(|entry| {
+                        matches!(
+                            entry.qualifier(),
+                            AclQualifier::User(_) | AclQualifier::Group(_)
+                        )
+                    }),
+                    AclState::Unsupported(_) | AclState::Unavailable(_) => false,
+                })
+        });
         let read_only = match capability {
             CapabilityState::Supported => None,
             CapabilityState::Unsupported(reason) | CapabilityState::Unknown(reason) => {
                 Some(reason.as_str().into())
             }
         };
+        // Only an item's owner may change its mode; the superuser may
+        // change any.
+        let mode_lock = if items.is_empty() {
+            Some(ModeLock::NoModes)
+        } else if accounts.effective_user != 0
+            && items
+                .iter()
+                .any(|item| item.owner != accounts.effective_user)
+        {
+            Some(ModeLock::NotOwner)
+        } else {
+            None
+        };
         Self {
             owner: snapshot.aggregate().owner(),
             group: snapshot.aggregate().group(),
             mode: snapshot.aggregate().mode(),
             items,
+            owners,
+            special,
+            named_acl,
             accounts,
             read_only,
-            access: [None; 3],
-            executable: None,
-            bits: BTreeMap::new(),
+            mode_lock,
+            steps: Vec::new(),
             group_edit: None,
             scope: MetadataScope::Single,
         }
@@ -348,10 +431,37 @@ impl PermissionsPageModel {
         &self.accounts
     }
 
-    /// Why the page may not change anything, or `None` when it may.
+    /// Why the filesystem lets the page change nothing, or `None` when it
+    /// may.
     #[must_use]
     pub fn read_only_reason(&self) -> Option<&str> {
         self.read_only.as_deref()
+    }
+
+    /// Why the access choices, the checkbox and the bits are disabled
+    /// though the filesystem supports them.
+    #[must_use]
+    pub fn mode_lock(&self) -> Option<ModeLock> {
+        self.mode_lock
+    }
+
+    /// Whether the access choices, the checkbox and the bits may change.
+    #[must_use]
+    pub fn modes_editable(&self) -> bool {
+        self.read_only.is_none() && self.mode_lock.is_none()
+    }
+
+    /// Whether the selection holds a socket, pipe or device.
+    #[must_use]
+    pub fn has_special_items(&self) -> bool {
+        self.special
+    }
+
+    /// Whether a selected item has ACL entries for named users or groups,
+    /// so the Group row sets their mask.
+    #[must_use]
+    pub fn has_named_acl(&self) -> bool {
+        self.named_acl
     }
 
     /// Whether every selected item is a folder, so the access choices use
@@ -373,48 +483,80 @@ impl PermissionsPageModel {
             .any(|item| item.kind == MetadataEntryKind::File)
     }
 
+    fn has_folders(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.kind == MetadataEntryKind::Directory)
+    }
+
+    /// The edit `steps` make. An Advanced bit reaches only the kinds of
+    /// item the selection holds, so a bit chosen on a folder does not reach
+    /// the files Apply to contents covers.
+    fn edit_of(&self, steps: &[Step]) -> ModeEdit {
+        let (files, folders) = (self.has_files(), self.has_folders());
+        ModeEdit::new(
+            steps
+                .iter()
+                .map(|step| match *step {
+                    Step::Access(class, access) => ModeStep::Access {
+                        shift: class.shift(),
+                        file_bits: access.file_bits(),
+                        folder_bits: access.folder_bits(),
+                    },
+                    Step::Executable(on) => ModeStep::Executable(on),
+                    Step::Bit(mask, on) => ModeStep::Bit {
+                        mask,
+                        on,
+                        files,
+                        folders,
+                    },
+                })
+                .collect(),
+        )
+    }
+
     /// The edit to each item's mode that the page's choices make.
     #[must_use]
     pub fn mode_edit(&self) -> ModeEdit {
-        let mut edit = ModeEdit {
-            file_execute: self.executable,
-            ..ModeEdit::default()
-        };
-        for class in AccessClass::ALL {
-            if let Some(access) = self.access[class.index()] {
-                // No Access on a file also takes execute away; the other
-                // choices keep it, as the executable checkbox sets it.
-                let file_clear = if access == Access::None { 0o7 } else { 0o6 };
-                edit.file_clear |= file_clear << class.shift();
-                edit.file_set |= access.file_bits() << class.shift();
-                edit.directory_clear |= 0o7 << class.shift();
-                edit.directory_set |= access.folder_bits() << class.shift();
-            }
-        }
-        for (mask, on) in &self.bits {
-            if *on {
-                edit.bits_set |= mask;
-            } else {
-                edit.bits_clear |= mask;
-            }
-        }
-        edit
+        self.edit_of(&self.steps)
     }
 
-    /// Each item's mode as Apply would leave it.
-    fn projected(&self) -> impl Iterator<Item = (MetadataEntryKind, u32)> + '_ {
-        let edit = self.mode_edit();
+    /// Each item's mode as Apply would leave it with `steps`, including the
+    /// bits the kernel clears when the group changes.
+    fn projected_with(&self, steps: &[Step]) -> Vec<(MetadataEntryKind, u32)> {
+        let edit = self.edit_of(steps);
         self.items
             .iter()
-            .map(move |item| (item.kind, edit.apply(item.kind, item.mode)))
+            .map(|item| {
+                let mode = if self.group_edit.is_some_and(|group| group != item.group) {
+                    mode_after_ownership_change(item.kind, item.mode)
+                } else {
+                    item.mode
+                };
+                (item.kind, edit.apply(item.kind, mode))
+            })
+            .collect()
     }
 
-    /// The access `class` has across the selection, or `None` when the
-    /// items differ or their bits match no choice (Varies).
-    #[must_use]
-    pub fn access(&self, class: AccessClass) -> Option<Access> {
+    /// The steps without the one that sets the same control as `step`.
+    fn steps_without(&self, step: Step) -> Vec<Step> {
+        self.steps
+            .iter()
+            .copied()
+            .filter(|kept| !kept.same_control(step))
+            .collect()
+    }
+
+    /// Records `step` as the latest change, replacing an earlier one to the
+    /// same control.
+    fn record(&mut self, step: Step) {
+        self.steps.retain(|kept| !kept.same_control(step));
+        self.steps.push(step);
+    }
+
+    fn access_with(&self, steps: &[Step], class: AccessClass) -> Option<Access> {
         let mut shown = None;
-        for (kind, mode) in self.projected() {
+        for (kind, mode) in self.projected_with(steps) {
             let access = Access::of(kind, (mode >> class.shift()) & 0o7)?;
             if shown.is_some_and(|shown| shown != access) {
                 return None;
@@ -424,47 +566,122 @@ impl PermissionsPageModel {
         shown
     }
 
+    /// The access `class` has across the selection, or `None` when the
+    /// items differ or their bits match no choice (Varies).
+    #[must_use]
+    pub fn access(&self, class: AccessClass) -> Option<Access> {
+        self.access_with(&self.steps, class)
+    }
+
+    /// Whether `class` would show Varies without the user's choice for it,
+    /// so the page offers Varies to go back to leaving it as it is.
+    #[must_use]
+    pub fn access_varies_unchanged(&self, class: AccessClass) -> bool {
+        self.access_with(
+            &self.steps_without(Step::Access(class, Access::None)),
+            class,
+        )
+        .is_none()
+    }
+
+    /// Whether the user chose an access for `class`.
+    #[must_use]
+    pub fn access_chosen(&self, class: AccessClass) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Step::Access(chosen, _) if *chosen == class))
+    }
+
     pub fn set_access(&mut self, class: AccessClass, access: Access) {
-        if self.read_only.is_none() {
-            self.access[class.index()] = Some(access);
+        if self.modes_editable() {
+            self.record(Step::Access(class, access));
         }
     }
 
-    /// Whether the selected files may be executed, across the selection.
+    /// Drops the user's choice for `class`, leaving each item's bits as
+    /// they are.
+    pub fn clear_access(&mut self, class: AccessClass) {
+        self.steps
+            .retain(|step| !matches!(step, Step::Access(chosen, _) if *chosen == class));
+    }
+
+    fn executable_with(&self, steps: &[Step]) -> Tristate {
+        let mut shown = None;
+        for (kind, mode) in self.projected_with(steps) {
+            if kind != MetadataEntryKind::File {
+                continue;
+            }
+            let state = if mode & 0o111 == 0 {
+                Tristate::Off
+            } else if executes_where_readable(mode) {
+                Tristate::On
+            } else {
+                return Tristate::Varies;
+            };
+            if shown.is_some_and(|shown| shown != state) {
+                return Tristate::Varies;
+            }
+            shown = Some(state);
+        }
+        shown.unwrap_or(Tristate::Off)
+    }
+
+    /// Whether the selected files may be executed by each class that may
+    /// read them (On), by none (Off), or neither across the selection
+    /// (Varies).
     #[must_use]
     pub fn executable(&self) -> Tristate {
-        let modes = self
-            .projected()
-            .filter(|(kind, _)| *kind == MetadataEntryKind::File)
-            .map(|(_, mode)| mode & 0o111 != 0);
-        tristate(modes)
+        self.executable_with(&self.steps)
     }
 
     /// Checks the executable checkbox, or clears it when it is checked.
+    /// From Varies it goes to checked, cleared, and back to Varies.
     pub fn toggle_executable(&mut self) {
-        if self.read_only.is_none() {
-            self.executable = Some(self.executable() != Tristate::On);
+        if self.modes_editable() {
+            let control = Step::Executable(true);
+            let unchanged = self.executable_with(&self.steps_without(control));
+            let next = next_toggle(self.executable(), unchanged, self.chosen(control));
+            self.apply_toggle(control, next.map(Step::Executable));
         }
+    }
+
+    fn bit_with(&self, steps: &[Step], bit: u32) -> Tristate {
+        tristate(
+            self.projected_with(steps)
+                .into_iter()
+                .map(|(_, mode)| mode & bit != 0),
+        )
     }
 
     /// Whether `bit` is set across the selection.
     #[must_use]
     pub fn bit(&self, bit: u32) -> Tristate {
-        tristate(self.projected().map(|(_, mode)| mode & bit != 0))
+        self.bit_with(&self.steps, bit)
     }
 
-    /// Sets `bit`, or clears it when it is set.
+    /// Sets `bit`, or clears it when it is set. From Varies it goes to set,
+    /// cleared, and back to Varies.
     pub fn toggle_bit(&mut self, bit: u32) {
-        if self.read_only.is_none() {
-            let on = self.bit(bit) != Tristate::On;
-            self.bits.insert(bit, on);
+        if self.modes_editable() {
+            let control = Step::Bit(bit, true);
+            let unchanged = self.bit_with(&self.steps_without(control), bit);
+            let next = next_toggle(self.bit(bit), unchanged, self.chosen(control));
+            self.apply_toggle(control, next.map(|on| Step::Bit(bit, on)));
         }
     }
 
-    /// Sets every mode bit to `mode`, as one explicit edit.
-    pub fn set_file_mode(&mut self, mode: u32) {
-        for bit in MODE_BITS {
-            self.bits.insert(bit.mask, mode & bit.mask != 0);
+    /// The value the user chose for the control `step` sets, if any.
+    fn chosen(&self, step: Step) -> Option<bool> {
+        self.steps.iter().find_map(|kept| match *kept {
+            Step::Executable(on) | Step::Bit(_, on) if kept.same_control(step) => Some(on),
+            _ => None,
+        })
+    }
+
+    fn apply_toggle(&mut self, control: Step, next: Option<Step>) {
+        match next {
+            Some(step) => self.record(step),
+            None => self.steps.retain(|kept| !kept.same_control(control)),
         }
     }
 
@@ -478,15 +695,16 @@ impl PermissionsPageModel {
         }
     }
 
-    /// Whether the user may choose the group: only on items they own.
+    /// Whether the user may choose the group: only on items they own,
+    /// links and special files included.
     #[must_use]
     pub fn group_editable(&self) -> bool {
         self.read_only.is_none()
-            && !self.items.is_empty()
+            && !self.owners.is_empty()
             && self
-                .items
+                .owners
                 .iter()
-                .all(|item| item.owner == self.accounts.effective_user)
+                .all(|owner| *owner == self.accounts.effective_user)
     }
 
     /// Chooses group `gid`, when it is one of the user's groups.
@@ -514,8 +732,20 @@ impl PermissionsPageModel {
         self.scope = self.scope.reviewed();
     }
 
+    /// Whether Apply would change anything: for the selected items alone,
+    /// whether a mode or the group would differ; with Apply to contents,
+    /// whether the user made any change, as the contents may differ.
     pub fn is_dirty(&self) -> bool {
-        self.change().is_dirty()
+        if self.group_edit.is_some() {
+            return true;
+        }
+        if self.scope.is_recursive() {
+            return !self.steps.is_empty();
+        }
+        self.projected_with(&self.steps)
+            .iter()
+            .zip(&self.items)
+            .any(|((_, mode), item)| *mode != item.mode)
     }
 
     pub fn is_valid(&self) -> bool {
@@ -534,6 +764,20 @@ impl PermissionsPageModel {
 
     pub fn scope(&self) -> MetadataScope {
         self.scope
+    }
+}
+
+/// The value a toggle showing `shown` takes next, or `None` to drop the
+/// user's change and show `unchanged` again. `chosen` is the value the user
+/// chose, if any. From Varies the toggle goes to on, off and back to Varies;
+/// otherwise a second click gives back what the items have.
+fn next_toggle(shown: Tristate, unchanged: Tristate, chosen: Option<bool>) -> Option<bool> {
+    let next = shown != Tristate::On;
+    match (unchanged, chosen) {
+        (Tristate::Varies, Some(false)) => None,
+        (Tristate::Varies, _) | (Tristate::On | Tristate::Off, None) => Some(next),
+        (unchanged, Some(_)) if (unchanged == Tristate::On) == next => None,
+        (_, Some(_)) => Some(next),
     }
 }
 

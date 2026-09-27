@@ -6,8 +6,8 @@ use musheen_ops::{
     JobState, MutationError,
 };
 use musheen_ui::{
-    DropAction, DropError, FileDragPayload, LocalOperationOutcome, LocalOperationQueue,
-    PropertiesDialogModel, TransferOutcome,
+    Access, AccessClass, DropAction, DropError, FileDragPayload, LocalOperationOutcome,
+    LocalOperationQueue, PropertiesDialogModel, TransferOutcome,
 };
 use std::fs;
 
@@ -589,7 +589,12 @@ fn reviewed_properties_changes_execute_through_the_operation_queue() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     let snapshot = PropertySnapshot::load(std::slice::from_ref(&path)).unwrap();
     let mut model = PropertiesDialogModel::new(snapshot);
-    model.permissions_mut().set_file_mode(0o600);
+    model
+        .permissions_mut()
+        .set_access(AccessClass::Group, Access::None);
+    model
+        .permissions_mut()
+        .set_access(AccessClass::Others, Access::None);
     model.permissions_mut().set_recursive(false);
     assert!(!model.apply_visible());
     model.permissions_mut().review_recursive_scope();
