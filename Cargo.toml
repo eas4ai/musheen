@@ -162,3 +162,12 @@ gpui-pre = { path = "vendor/gpui-pre" }
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
 native-theme-gpui = { path = "vendor/native-theme-gpui" }
 sevenz-rust2 = { path = "vendor/sevenz-rust2" }
+
+# Test and debug builds keep file and line numbers for Musheen's own crates
+# and no debug info for dependencies. Full debug info made each test binary
+# about 1 GB and each link take several GB of memory.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
