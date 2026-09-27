@@ -334,10 +334,14 @@ mod backend {
     use musheen_desktop::{
         AshpdFileChooserBackend, BackendChooserDecision, BackendChooserRequest, BackendChooserUi,
     };
+    use std::ffi::OsStr;
     use std::future::poll_fn;
     use std::task::Poll;
 
-    struct ConfirmingUi;
+    /// Confirms `path`.
+    struct ConfirmingUi {
+        path: PathBuf,
+    }
 
     impl BackendChooserUi for ConfirmingUi {
         fn choose(
@@ -345,12 +349,19 @@ mod backend {
             _request: BackendChooserRequest,
             _cancellation: CancellationToken,
         ) -> BoxFuture<'static, Result<BackendChooserDecision, PortalError>> {
-            Box::pin(async {
-                Ok(BackendChooserDecision::Confirmed(vec![PathBuf::from(
-                    "/tmp/a b.txt",
-                )]))
-            })
+            let path = self.path.clone();
+            Box::pin(async move { Ok(BackendChooserDecision::Confirmed(vec![path])) })
         }
+    }
+
+    /// A folder holding the file `a b.txt`, the file, and its URI: the
+    /// backend returns only paths that exist and fit the request.
+    fn confirmed_file() -> (tempfile::TempDir, PathBuf, String) {
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("a b.txt");
+        std::fs::write(&file, b"a").unwrap();
+        let uri = format!("file://{}/a%20b.txt", folder.path().display());
+        (folder, file, uri)
     }
 
     struct CancellingUi;
@@ -407,8 +418,11 @@ mod backend {
 
     #[test]
     fn portal_backend_returns_only_confirmed_selection_and_refuses_self_call() {
-        let backend =
-            AshpdFileChooserBackend::new(Arc::new(ConfirmingUi), "com.github.musheen.Musheen");
+        let (_folder, file, uri) = confirmed_file();
+        let backend = AshpdFileChooserBackend::new(
+            Arc::new(ConfirmingUi { path: file }),
+            "com.github.musheen.Musheen",
+        );
         let token: HandleToken = "confirmed".parse().unwrap();
         let selected = futures_lite::future::block_on(backend.open_file(
             token,
@@ -418,7 +432,7 @@ mod backend {
             OpenFileOptions::default(),
         ))
         .unwrap();
-        assert_eq!(selected.uris()[0].as_str(), "file:///tmp/a%20b.txt");
+        assert_eq!(selected.uris()[0].as_str(), uri);
 
         let token: HandleToken = "self_call".parse().unwrap();
         let refused = futures_lite::future::block_on(backend.open_file(
@@ -432,7 +446,7 @@ mod backend {
     }
 
     #[test]
-    fn backend_close_cancels_the_exact_request() {
+    fn portal_backend_close_cancels_the_exact_request() {
         let backend = Arc::new(AshpdFileChooserBackend::new(
             Arc::new(CancellingUi),
             "com.github.musheen.Musheen",
@@ -468,7 +482,9 @@ mod backend {
         futures_lite::future::block_on(async {
             let _service = musheen_desktop::serve_file_chooser_backend(
                 Some(&bus.address),
-                Arc::new(ConfirmingUi),
+                Arc::new(ConfirmingUi {
+                    path: PathBuf::from("/"),
+                }),
                 "org.example.MusheenPortal",
                 "com.github.musheen.Musheen",
             )
@@ -496,7 +512,7 @@ mod backend {
 
     #[cfg(unix)]
     #[test]
-    fn exported_backend_close_ignores_a_late_confirmation() {
+    fn portal_backend_close_from_the_portal_cancels_and_ignores_a_late_confirmation() {
         let bus = PrivateBus::start();
         futures_lite::future::block_on(async {
             let (started_tx, started_rx) = async_channel::bounded(1);
@@ -564,11 +580,12 @@ mod backend {
         });
     }
 
-    /// Confirms `/tmp/a b.txt` once `confirm` receives, unless the request is
+    /// Confirms `path` once `confirm` receives, unless the request is
     /// cancelled first.
     struct SignalledUi {
         started: async_channel::Sender<()>,
         confirm: async_channel::Receiver<()>,
+        path: PathBuf,
     }
 
     impl BackendChooserUi for SignalledUi {
@@ -578,14 +595,13 @@ mod backend {
             cancellation: CancellationToken,
         ) -> BoxFuture<'static, Result<BackendChooserDecision, PortalError>> {
             let (started, confirm) = (self.started.clone(), self.confirm.clone());
+            let path = self.path.clone();
             Box::pin(async move {
                 let _ = started.try_send(());
                 futures_lite::future::race(
                     async move {
                         let _ = confirm.recv().await;
-                        Ok(BackendChooserDecision::Confirmed(vec![PathBuf::from(
-                            "/tmp/a b.txt",
-                        )]))
+                        Ok(BackendChooserDecision::Confirmed(vec![path]))
                     },
                     async move {
                         poll_fn(move |context| {
@@ -665,9 +681,10 @@ mod backend {
     fn portal_backend_answers_only_the_portal_service() {
         let bus = PrivateBus::start();
         futures_lite::future::block_on(async {
+            let (_folder, file, uri) = confirmed_file();
             let _service = musheen_desktop::serve_file_chooser_backend(
                 Some(&bus.address),
-                Arc::new(ConfirmingUi),
+                Arc::new(ConfirmingUi { path: file }),
                 BACKEND,
                 "com.github.musheen.Musheen",
             )
@@ -686,7 +703,7 @@ mod backend {
             let ashpd::desktop::Response::Ok(selected) = response else {
                 panic!("the portal service is answered");
             };
-            assert_eq!(selected.uris()[0].as_str(), "file:///tmp/a%20b.txt");
+            assert_eq!(selected.uris()[0].as_str(), uri);
         });
     }
 
@@ -697,11 +714,13 @@ mod backend {
         futures_lite::future::block_on(async {
             let (started_tx, started_rx) = async_channel::bounded(1);
             let (confirm_tx, confirm_rx) = async_channel::bounded(1);
+            let (_folder, file, _) = confirmed_file();
             let _service = musheen_desktop::serve_file_chooser_backend(
                 Some(&bus.address),
                 Arc::new(SignalledUi {
                     started: started_tx,
                     confirm: confirm_rx,
+                    path: file,
                 }),
                 BACKEND,
                 "com.github.musheen.Musheen",
@@ -775,11 +794,15 @@ mod backend {
     fn portal_backend_requests_carry_the_callers_options() {
         use ashpd::desktop::file_chooser::{FileFilter, SaveFileOptions, SaveFilesOptions};
 
+        let folder = tempfile::tempdir().unwrap();
+        let (a, b) = (folder.path().join("a"), folder.path().join("b"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let two = AshpdFileChooserBackend::new(
             Arc::new(RecordingUi {
                 requests: Arc::clone(&requests),
-                answer: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
+                answer: vec![a.clone(), b],
             }),
             "com.github.musheen.Musheen",
         );
@@ -843,7 +866,7 @@ mod backend {
             request.current_folder(),
             Some(std::path::Path::new("/tmp/folder"))
         );
-        assert_eq!(request.current_name(), Some("report.txt"));
+        assert_eq!(request.current_name(), Some(OsStr::new("report.txt")));
 
         let escaping = futures_lite::future::block_on(
             two.save_files(
@@ -873,20 +896,220 @@ mod backend {
                 .glob("photo-??.jpg")
                 .mimetype("image/*"),
         );
-        assert!(images.matches(OsStr::new("a.png"), None));
-        assert!(images.matches(OsStr::new("A.PNG"), None));
-        assert!(images.matches(OsStr::new("photo-01.jpg"), None));
-        assert!(!images.matches(OsStr::new("photo-1.jpg"), None));
-        assert!(images.matches(OsStr::new("scan"), Some("image/tiff")));
-        assert!(!images.matches(OsStr::new("notes.txt"), Some("text/plain")));
+        assert!(images.matches(OsStr::new("a.png"), None, None));
+        assert!(images.matches(OsStr::new("A.PNG"), None, None));
+        assert!(images.matches(OsStr::new("photo-01.jpg"), None, None));
+        assert!(!images.matches(OsStr::new("photo-1.jpg"), None, None));
+        assert!(images.matches(OsStr::new("scan"), Some("image/tiff"), None));
+        assert!(!images.matches(OsStr::new("notes.txt"), Some("text/plain"), None));
+
+        // With the MIME database, a subclass matches: C source is text.
+        let text = ChooserFilter::from(&FileFilter::new("Text").mimetype("text/plain"));
+        let types = musheen_desktop::NameMimeTypes::new();
+        assert!(text.matches(OsStr::new("main.c"), Some("text/x-csrc"), Some(&types)));
+        assert!(!text.matches(OsStr::new("a.png"), Some("image/png"), Some(&types)));
         assert!(images.needs_mime_types());
 
         let not_a = ChooserFilter::from(&FileFilter::new("Not a").glob("[!a]*"));
-        assert!(not_a.matches(OsStr::new("b"), None));
-        assert!(!not_a.matches(OsStr::new("a"), None));
+        assert!(not_a.matches(OsStr::new("b"), None, None));
+        assert!(!not_a.matches(OsStr::new("a"), None, None));
         assert!(!not_a.needs_mime_types());
         let exact = ChooserFilter::from(&FileFilter::new("Make").glob("Makefile"));
-        assert!(exact.matches(OsStr::new("Makefile"), None));
-        assert!(!exact.matches(OsStr::new("Makefile.am"), None));
+        assert!(exact.matches(OsStr::new("Makefile"), None, None));
+        assert!(!exact.matches(OsStr::new("Makefile.am"), None, None));
+    }
+
+    /// Returns `selection` and records each request.
+    struct SelectingUi {
+        requests: Arc<Mutex<Vec<BackendChooserRequest>>>,
+        selection: musheen_desktop::ChooserSelection,
+    }
+
+    impl BackendChooserUi for SelectingUi {
+        fn choose(
+            &self,
+            request: BackendChooserRequest,
+            _cancellation: CancellationToken,
+        ) -> BoxFuture<'static, Result<BackendChooserDecision, PortalError>> {
+            self.requests.lock().unwrap().push(request);
+            let selection = self.selection.clone();
+            Box::pin(async move { Ok(BackendChooserDecision::Selected(selection)) })
+        }
+    }
+
+    #[test]
+    fn portal_backend_refuses_paths_of_the_wrong_kind() {
+        let (folder, file, _) = confirmed_file();
+        let answer = |path: PathBuf| {
+            AshpdFileChooserBackend::new(
+                Arc::new(ConfirmingUi { path }),
+                "com.github.musheen.Musheen",
+            )
+        };
+        let open = |backend: &AshpdFileChooserBackend<ConfirmingUi>, options| {
+            futures_lite::future::block_on(backend.open_file(
+                "kind".parse().unwrap(),
+                Some(MaybeAppID::from("org.example.Caller")),
+                None,
+                "Open",
+                options,
+            ))
+        };
+        let folders = || OpenFileOptions::default().set_directory(true);
+        let invalid = |result: &ashpd::backend::Result<_>| {
+            matches!(result, Err(ashpd::PortalError::InvalidArgument(_)))
+        };
+        assert!(
+            invalid(&open(&answer(file.clone()), folders())),
+            "a file for a folder request"
+        );
+        assert!(
+            invalid(&open(&answer(folder.path().join("missing")), folders())),
+            "a missing path for a folder request"
+        );
+        assert!(open(&answer(folder.path().to_path_buf()), folders()).is_ok());
+        assert!(
+            invalid(&open(
+                &answer(folder.path().to_path_buf()),
+                OpenFileOptions::default()
+            )),
+            "a folder for a file request"
+        );
+        assert!(open(&answer(file), OpenFileOptions::default()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portal_backend_close_cancels_only_the_request_it_names() {
+        let bus = PrivateBus::start();
+        futures_lite::future::block_on(async {
+            let (started_tx, started_rx) = async_channel::bounded(2);
+            let (confirm_tx, confirm_rx) = async_channel::bounded(1);
+            let (_folder, file, uri) = confirmed_file();
+            let _service = musheen_desktop::serve_file_chooser_backend(
+                Some(&bus.address),
+                Arc::new(SignalledUi {
+                    started: started_tx,
+                    confirm: confirm_rx,
+                    path: file,
+                }),
+                BACKEND,
+                "com.github.musheen.Musheen",
+            )
+            .await
+            .unwrap();
+            let portal = bus_caller(&bus, true).await;
+            // Two apps chose the same token; the handles differ.
+            let first = call_open_file(&portal, "app_a/token");
+            let second = call_open_file(&portal, "app_b/token");
+            let close = async {
+                started_rx.recv().await.unwrap();
+                started_rx.recv().await.unwrap();
+                zbus::Proxy::new(
+                    &portal,
+                    BACKEND,
+                    request_handle("app_a/token"),
+                    "org.freedesktop.impl.portal.Request",
+                )
+                .await
+                .unwrap()
+                .call_method("Close", &())
+                .await
+                .unwrap();
+                confirm_tx.send(()).await.unwrap();
+            };
+            let ((first, second), ()) =
+                futures_lite::future::zip(futures_lite::future::zip(first, second), close).await;
+            let response = |reply: zbus::Result<zbus::Message>| {
+                reply
+                    .unwrap()
+                    .body()
+                    .deserialize::<ashpd::desktop::Response<ashpd::desktop::file_chooser::SelectedFiles>>()
+                    .unwrap()
+            };
+            assert!(
+                matches!(response(first), ashpd::desktop::Response::Err(_)),
+                "the closed request is cancelled"
+            );
+            let ashpd::desktop::Response::Ok(selected) = response(second) else {
+                panic!("the other app's request is not cancelled");
+            };
+            assert_eq!(selected.uris()[0].as_str(), uri);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portal_backend_replies_carry_writable_filter_and_choices() {
+        use ashpd::desktop::file_chooser::{Choice, FileFilter};
+        use std::collections::HashMap;
+        use zbus::zvariant::OwnedValue;
+
+        let bus = PrivateBus::start();
+        futures_lite::future::block_on(async {
+            let (_folder, file, uri) = confirmed_file();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let _service = musheen_desktop::serve_file_chooser_backend(
+                Some(&bus.address),
+                Arc::new(SelectingUi {
+                    requests: Arc::clone(&requests),
+                    selection: musheen_desktop::ChooserSelection {
+                        paths: vec![file],
+                        filter: Some(1),
+                        choices: vec![("encoding".into(), "latin1".into())],
+                    },
+                }),
+                BACKEND,
+                "com.github.musheen.Musheen",
+            )
+            .await
+            .unwrap();
+            let portal = bus_caller(&bus, true).await;
+            let options = OpenFileOptions::default()
+                .set_filters([
+                    FileFilter::new("Text").glob("*.txt"),
+                    FileFilter::new("Images").mimetype("image/png"),
+                ])
+                .set_choices([Choice::new("encoding", "Encoding", "utf8")
+                    .insert("utf8", "UTF-8")
+                    .insert("latin1", "Latin-1")])
+                .set_accept_label("Import");
+            let reply = zbus::Proxy::new(
+                &portal,
+                BACKEND,
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.impl.portal.FileChooser",
+            )
+            .await
+            .unwrap()
+            .call_method(
+                "OpenFile",
+                &(
+                    request_handle("fields"),
+                    ashpd::zvariant::Optional::from(Some(MaybeAppID::from("org.example.Caller"))),
+                    ashpd::zvariant::Optional::<ashpd::WindowIdentifierType>::default(),
+                    "Open",
+                    options,
+                ),
+            )
+            .await
+            .unwrap();
+            let (code, results) = reply
+                .body()
+                .deserialize::<(u32, HashMap<String, OwnedValue>)>()
+                .unwrap();
+            assert_eq!(code, 0);
+            assert!(format!("{:?}", results["uris"]).contains(&uri));
+            assert!(results["writable"].downcast_ref::<bool>().unwrap());
+            assert!(format!("{:?}", results["current_filter"]).contains("Images"));
+            let choices = format!("{:?}", results["choices"]);
+            assert!(choices.contains("encoding") && choices.contains("latin1"));
+
+            let request = requests.lock().unwrap().pop().unwrap();
+            assert_eq!(request.accept_label(), Some("Import"));
+            let choice = &request.choices()[0];
+            assert_eq!((choice.id(), choice.initial()), ("encoding", "utf8"));
+            assert_eq!(choice.options().len(), 2);
+        });
     }
 }

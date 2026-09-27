@@ -15,5 +15,5 @@ pub use metadata_review::*;
 pub use open_with::*;
 pub use permissions::*;
 #[cfg(feature = "portal-backend")]
-pub(crate) use portal_chooser::open_portal_chooser;
+pub(crate) use portal_chooser::{bind_portal_chooser_keys, open_portal_chooser};
 pub use properties::*;

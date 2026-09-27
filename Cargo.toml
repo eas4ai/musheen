@@ -94,6 +94,7 @@ tree_magic_mini = { version = "3.2", default-features = false }
 ureq = { version = "3.1.4", default-features = false, features = ["rustls"] }
 trash = "5"
 walkdir = "2"
+mime = "0.3"
 wax = "0.7"
 xattr = "1"
 xdg-mime = "0.4"

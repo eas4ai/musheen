@@ -5316,6 +5316,7 @@ dependencies = [
  "futures-rustls",
  "image",
  "md-5 0.10.6",
+ "mime",
  "miniz_oxide 0.9.1",
  "musheen-core",
  "musheen-local",
