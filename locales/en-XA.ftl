@@ -284,6 +284,7 @@ privilege-error-busy = ⟦Aanootheer aadmiinistraatoor reeqeest iis aalreeady ii
 privilege-error-timeout = ⟦Thee aadmiinistraatoor aactioon tiimeed oout······⟧
 privilege-error-audit = ⟦The administrator action could not be audited······⟧
 privilege-error-io = ⟦The administrator action failed····⟧
+privilege-error-listing-too-large = ⟦Thee fooldeer iis too laargee too liist aas aadmiinistraatoor: aan eeleevaateed wiindoow liists aat moost 64 MiB··················⟧
 settings-title = ⟦Settings ···⟧
 settings-search = ⟦Search settings ···⟧
 settings-apply = ⟦Apply ···⟧

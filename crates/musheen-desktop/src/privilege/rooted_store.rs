@@ -272,6 +272,17 @@ impl<C: Clock> RootedStore<C> {
         &self,
         relative: &Path,
     ) -> Result<Vec<RootedDirectoryEntry>, BrokerError> {
+        self.read_directory_with(relative, |_| Ok(()))
+    }
+
+    /// Reads `relative` as [`Self::read_directory`] does, passing each entry
+    /// to `admit` as it is read. The first error `admit` returns stops the
+    /// read, so a caller can bound a listing without reading the rest.
+    pub fn read_directory_with(
+        &self,
+        relative: &Path,
+        mut admit: impl FnMut(&RootedDirectoryEntry) -> Result<(), BrokerError>,
+    ) -> Result<Vec<RootedDirectoryEntry>, BrokerError> {
         let directory = self.resolve(relative)?;
         let descriptor_path =
             PathBuf::from(format!("/proc/self/fd/{}", directory.file().as_raw_fd()));
@@ -293,7 +304,7 @@ impl<C: Clock> RootedStore<C> {
                 let mut identity = [0_u8; 16];
                 identity[..8].copy_from_slice(&metadata.dev().to_le_bytes());
                 identity[8..].copy_from_slice(&metadata.ino().to_le_bytes());
-                Ok(RootedDirectoryEntry {
+                let entry = RootedDirectoryEntry {
                     name: entry.file_name(),
                     identity,
                     kind,
@@ -302,7 +313,9 @@ impl<C: Clock> RootedStore<C> {
                         .mtime()
                         .is_positive()
                         .then_some(metadata.mtime()),
-                })
+                };
+                admit(&entry)?;
+                Ok(entry)
             })
             .collect::<Result<Vec<_>, _>>()?;
         entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));

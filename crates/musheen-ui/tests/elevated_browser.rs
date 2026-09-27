@@ -553,6 +553,39 @@ fn elevated_session_lists_long_names_up_to_the_limit() {
 }
 
 #[test]
+fn elevated_session_names_the_limit_of_a_listing_too_large() {
+    // 160,000 names of 255 bytes encode to about 72 MB, more than 64 MiB.
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..160_000 {
+        fs::File::create(root.path().join(format!("{index:06}{}", "x".repeat(249)))).unwrap();
+    }
+    let small = root.path().join("small");
+    fs::create_dir(&small).unwrap();
+    fs::write(small.join("leaf.txt"), b"leaf").unwrap();
+    for provider in PROVIDERS {
+        let fake = FakeElevation::new(provider, IDLE);
+        let backend = fake.backend();
+        let (store, _session) = open_window(&fake, &backend, root.path());
+
+        let error = list_all(&store, root.path(), 1_000)
+            .expect_err("a listing over 64 MiB is refused")
+            .to_string();
+        assert!(
+            error.contains("too large to list as administrator") && error.contains("64 MiB"),
+            "{provider:?}: {error}"
+        );
+        let names = list_all(&store, &small, 100)
+            .unwrap_or_else(|error| panic!("{provider:?} lists after a refusal: {error}"));
+        assert_eq!(names, ["leaf.txt"], "{provider:?}");
+        assert_eq!(
+            fake.runs(),
+            1,
+            "{provider:?}: the window keeps its authorization"
+        );
+    }
+}
+
+#[test]
 fn elevated_session_lists_a_folder_whose_path_fits_the_limit() {
     for provider in PROVIDERS {
         let fake = FakeElevation::new(provider, IDLE);

@@ -19536,6 +19536,7 @@ fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str>
         BrokerError::ExecutionTimedOut => "privilege-error-timeout",
         BrokerError::AuditFailed => "privilege-error-audit",
         BrokerError::Io => "privilege-error-io",
+        BrokerError::ListingTooLarge => "privilege-error-listing-too-large",
     };
     catalog
         .message(key)

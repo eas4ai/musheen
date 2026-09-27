@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use super::session::{BrokerChannel, BrokerProcess, ChannelError, spawn_output_reader};
 use super::{
-    BrokerOperation, BrokerRequest, BrokerSession, ElevatedRootReference, PrivilegeProvider,
-    RequestSubject, RootGrant, RootedEntryKind, RootedStore,
+    BrokerOperation, BrokerRequest, BrokerSession, ElevatedRootReference,
+    MAX_SESSION_LISTING_BYTES, PrivilegeProvider, RequestSubject, RootGrant, RootedDirectoryEntry,
+    RootedEntryKind, RootedStore,
 };
 use crate::SecretBuffer;
 use musheen_core::CancellationToken;
@@ -204,16 +205,53 @@ pub enum BrokerOutput {
     Exited(i32),
 }
 
+/// One entry of a folder listing. The name and the identity go as base64
+/// text, a third longer than their bytes; as JSON arrays of numbers they were
+/// up to four times as long.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrokerDirectoryEntry {
+    #[serde(with = "base64_bytes")]
     name: Vec<u8>,
+    #[serde(with = "base64_bytes")]
     identity: [u8; 16],
     kind: RootedEntryKind,
     size: Option<u64>,
     modified_unix_seconds: Option<i64>,
 }
 
+impl From<&RootedDirectoryEntry> for BrokerDirectoryEntry {
+    fn from(entry: &RootedDirectoryEntry) -> Self {
+        Self {
+            name: entry.name().as_bytes().to_vec(),
+            identity: *entry.identity(),
+            kind: entry.kind(),
+            size: entry.size(),
+            modified_unix_seconds: entry.modified_unix_seconds(),
+        }
+    }
+}
+
 impl BrokerDirectoryEntry {
+    /// The bytes this entry adds to an encoded listing: its JSON and the
+    /// comma after it.
+    fn listing_bytes(&self) -> usize {
+        struct Counter(usize);
+        impl std::io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut counter = Counter(1);
+        // Writing to the counter cannot fail, and the entry's fields always
+        // serialize.
+        let _ = serde_json::to_writer(&mut counter, self);
+        counter.0
+    }
+
     #[must_use]
     pub fn name(&self) -> &[u8] {
         &self.name
@@ -237,6 +275,50 @@ impl BrokerDirectoryEntry {
     #[must_use]
     pub const fn modified_unix_seconds(&self) -> Option<i64> {
         self.modified_unix_seconds
+    }
+}
+
+/// Lists `relative` under `store`'s grant, sorted by name. The read stops
+/// with [`BrokerError::ListingTooLarge`] as soon as the encoded listing
+/// passes `limit` bytes, before the rest of the folder is read.
+fn list_directory<C: Clock>(
+    store: &RootedStore<C>,
+    relative: &Path,
+    limit: usize,
+) -> Result<Vec<BrokerDirectoryEntry>, BrokerError> {
+    let mut listed = 0_usize;
+    let entries = store.read_directory_with(relative, |entry| {
+        listed = listed.saturating_add(BrokerDirectoryEntry::from(entry).listing_bytes());
+        if listed > limit {
+            Err(BrokerError::ListingTooLarge)
+        } else {
+            Ok(())
+        }
+    })?;
+    Ok(entries.iter().map(BrokerDirectoryEntry::from).collect())
+}
+
+/// Bytes as unpadded URL-safe base64 text, as request paths are sent.
+mod base64_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    const ENGINE: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    pub fn serialize<S: Serializer>(
+        bytes: &impl AsRef<[u8]>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&ENGINE.encode(bytes.as_ref()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, B: TryFrom<Vec<u8>>>(
+        deserializer: D,
+    ) -> Result<B, D::Error> {
+        let bytes = ENGINE
+            .decode(String::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)?;
+        B::try_from(bytes).map_err(|_| serde::de::Error::custom("wrong number of bytes"))
     }
 }
 
@@ -1062,6 +1144,8 @@ pub enum BrokerError {
     ExecutionTimedOut,
     InvalidRequest,
     Io,
+    /// A folder's listing passed [`MAX_SESSION_LISTING_BYTES`].
+    ListingTooLarge,
     NotExecutable,
     ScopeEscape,
     SymlinkRefused,
@@ -1082,6 +1166,7 @@ impl fmt::Display for BrokerError {
             Self::ExecutionTimedOut => "the privileged command timed out",
             Self::InvalidRequest => "the privilege request is invalid",
             Self::Io => "the privilege operation failed",
+            Self::ListingTooLarge => "the folder's listing is larger than 64 MiB",
             Self::NotExecutable => "the selected target is not executable",
             Self::ScopeEscape => "the path leaves the authorized root",
             Self::SymlinkRefused => "symbolic links require new authorization",
@@ -1107,6 +1192,7 @@ impl BrokerError {
             Self::ExecutionTimedOut => "execution-timed-out",
             Self::InvalidRequest => "invalid-request",
             Self::Io => "io-failed",
+            Self::ListingTooLarge => "listing-too-large",
             Self::NotExecutable => "not-executable",
             Self::ScopeEscape => "scope-escape",
             Self::SymlinkRefused => "symlink-refused",
@@ -1127,6 +1213,7 @@ impl BrokerError {
             "execution-timed-out" => Self::ExecutionTimedOut,
             "invalid-request" => Self::InvalidRequest,
             "io-failed" => Self::Io,
+            "listing-too-large" => Self::ListingTooLarge,
             "not-executable" => Self::NotExecutable,
             "scope-escape" => Self::ScopeEscape,
             "symlink-refused" => Self::SymlinkRefused,
@@ -1308,6 +1395,93 @@ fn executable_has_access_acl(file: &File) -> Result<bool, BrokerError> {
 }
 
 #[cfg(test)]
+mod listing_tests {
+    use super::{
+        BrokerDirectoryEntry, BrokerError, BrokerOutput, BrokerResponse, Clock, PrivilegeProvider,
+        RootGrant, RootedStore, decode_broker_response, encode_broker_response, list_directory,
+    };
+    use std::path::Path;
+
+    struct At(u64);
+
+    impl Clock for At {
+        fn now_unix_millis(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn store(root: &Path) -> RootedStore<At> {
+        let grant = RootGrant::open(root, "grant", 1_000, PrivilegeProvider::Polkit).unwrap();
+        RootedStore::new(grant, At(100))
+    }
+
+    #[test]
+    fn a_listing_counts_what_it_encodes_and_keeps_every_name_byte() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("plain.txt"), b"plain").unwrap();
+        std::fs::write(
+            root.path()
+                .join(std::ffi::OsStr::from_bytes(b"caf\xe9-\x01\xff")),
+            b"",
+        )
+        .unwrap();
+        std::fs::create_dir(root.path().join("folder")).unwrap();
+        let entries = list_directory(&store(root.path()), Path::new(""), usize::MAX).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let encoded = |entries: Vec<BrokerDirectoryEntry>| -> usize {
+            serde_json::to_vec(&BrokerResponse::success(BrokerOutput::DirectoryEntries(
+                entries,
+            )))
+            .unwrap()
+            .len()
+        };
+        let counted: usize = entries
+            .iter()
+            .map(BrokerDirectoryEntry::listing_bytes)
+            .sum();
+        assert_eq!(encoded(entries.clone()), encoded(Vec::new()) + counted - 1);
+
+        let frame = encode_broker_response(&BrokerResponse::success(
+            BrokerOutput::DirectoryEntries(entries.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            decode_broker_response(&frame).unwrap(),
+            BrokerOutput::DirectoryEntries(entries.clone())
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name() == b"caf\xe9-\x01\xff")
+        );
+    }
+
+    #[test]
+    fn a_listing_stops_when_it_passes_its_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..100 {
+            std::fs::write(root.path().join(format!("file-{index:03}")), b"").unwrap();
+        }
+        let store = store(root.path());
+        let whole = list_directory(&store, Path::new(""), usize::MAX).unwrap();
+        let bytes: usize = whole.iter().map(BrokerDirectoryEntry::listing_bytes).sum();
+
+        assert_eq!(
+            list_directory(&store, Path::new(""), bytes).unwrap(),
+            whole,
+            "a listing of exactly the limit is served"
+        );
+        assert_eq!(
+            list_directory(&store, Path::new(""), bytes - 1),
+            Err(BrokerError::ListingTooLarge)
+        );
+    }
+}
+
+#[cfg(test)]
 mod executable_policy_tests {
     use super::executable_mode_is_trusted;
 
@@ -1441,17 +1615,7 @@ impl OperationRunner for SystemOperationRunner {
                     request.provider,
                 )?;
                 let store = RootedStore::new(grant, SystemClock);
-                let entries = store
-                    .read_directory(&relative)?
-                    .into_iter()
-                    .map(|entry| BrokerDirectoryEntry {
-                        name: entry.name().as_bytes().to_vec(),
-                        identity: *entry.identity(),
-                        kind: entry.kind(),
-                        size: entry.size(),
-                        modified_unix_seconds: entry.modified_unix_seconds(),
-                    })
-                    .collect();
+                let entries = list_directory(&store, &relative, MAX_SESSION_LISTING_BYTES)?;
                 Ok(BrokerOutput::DirectoryEntries(entries))
             }
             BrokerOperation::RunExecutable { arguments, .. } => {
