@@ -202,26 +202,32 @@ fn portable_pty_reports_normal_signal_and_loaded_child_exit_and_can_restart() {
         session
             .resize(TerminalSize::new(100, 30, 8, 16).unwrap())
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut exit = None;
-        while Instant::now() < deadline {
-            match session.recv_timeout(Duration::from_millis(100)) {
-                Ok(PtyEvent::Output(_)) => {}
-                Ok(PtyEvent::Exited(status)) => {
-                    exit = Some(status);
-                    break;
+        let wait_for_exit = |session: &mut TerminalSession| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match session.recv_timeout(Duration::from_millis(100)) {
+                    Ok(PtyEvent::Output(_)) => {}
+                    Ok(PtyEvent::Exited(status)) => return Some(status),
+                    Ok(PtyEvent::ReadFailed) => panic!("PTY reader failed for {script}"),
+                    Err(_) => {}
                 }
-                Ok(PtyEvent::ReadFailed) => panic!("PTY reader failed for {script}"),
-                Err(_) => {}
             }
-        }
+            None
+        };
         assert_eq!(
-            exit,
-            Some(expected),
+            wait_for_exit(&mut session),
+            Some(expected.clone()),
             "script did not exit as expected: {script}"
         );
+        // A restart runs the command again, which ends the same way. Its
+        // exit, not is_running, shows that: a short command may already have
+        // ended when is_running is read.
         session.restart().unwrap();
-        assert!(session.is_running());
+        assert_eq!(
+            wait_for_exit(&mut session),
+            Some(expected),
+            "the restarted script did not exit as expected: {script}"
+        );
         session.terminate().unwrap();
     }
 }
