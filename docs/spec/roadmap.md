@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: compact-broker-listings
+Current: admin-ownership-changes
 
 ## 1. Foundation
 
@@ -355,4 +355,24 @@ the window says that the folder is too large to list as administrator,
 naming the limit, instead of a general failure. Done when the sys-034
 check passes on the final tree, the workspace tests, cargo fmt --check
 and clippy with warnings denied are clean, and every finding of the
+review and the report is resolved or declined.
+
+## admin-ownership-changes
+
+Requirements: SEARCH-019, SYS-037
+
+Let the Permissions page change owners and groups as administrator (item
+admin-ownership-changes). The owner is chosen from the system's user
+accounts and the group from all of its groups. A change the user may not
+make alone turns Apply into Apply as Administrator, which first shows each
+item, or each folder with its contents, with its current and new owner and
+group. One Polkit authorization, through a new action that always asks for
+an administrator password, or one sudo password covers the Apply. A new
+broker operation changes owners and groups only: it follows no symbolic
+link, refuses an item replaced since the review, and stays within the
+reviewed scope, entering nested mounts only when the scope includes them.
+Mode changes stay the user's own and run first. The change runs in the
+operations queue, and a failure names its item. Done when the search-019
+and sys-037 checks pass on the final tree, the workspace tests, cargo fmt
+--check and clippy with warnings denied are clean, and every finding of the
 review and the report is resolved or declined.
