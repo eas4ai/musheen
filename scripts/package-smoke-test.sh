@@ -22,6 +22,13 @@ if [[ ! -f "$private_service" ]] \
     echo "package is missing Musheen D-Bus activation" >&2
     exit 1
 fi
+portal_service="$stage/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.musheen.service"
+if [[ ! -f "$stage/usr/share/xdg-desktop-portal/portals/musheen.portal" ]] \
+    || [[ ! -f "$portal_service" ]] \
+    || ! grep -Fxq 'Exec=/usr/bin/musheen --portal-backend' "$portal_service"; then
+    echo "package is missing the portal backend's files" >&2
+    exit 1
+fi
 if [[ -e "$stage/usr/share/dbus-1/services/org.freedesktop.FileManager1.service" ]]; then
     echo "package must not replace another file manager's D-Bus activation" >&2
     exit 1

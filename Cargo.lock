@@ -5406,6 +5406,7 @@ dependencies = [
 name = "musheen-ui"
 version = "0.1.0"
 dependencies = [
+ "ashpd",
  "async-channel",
  "blake3",
  "futures-lite",
