@@ -138,7 +138,7 @@ Falsifier: a navigation command changes the source unexpectedly or a provider-sp
 Mechanism: directory-menu matrix over local, mounted, archive, and remote stores.
 Status: Draft
 
-[CUSTOM-025] A file target additionally offers Preview, Copy Location, tags, and file-type actions. Archive files offer Browse and Extract Here; selected non-archive items offer Compress; executable files offer Run according to the executable-file preference. Preview selects the captured local file and reveals the info pane; providers without a preview backend disable it. Run is disabled by the `open` preference. Under `ask` or `run`, it still requires the menu's review confirmation, rechecks identity and executable metadata, then launches the exact local path with no shell or implicit arguments and its parent as the working directory.
+[CUSTOM-025] A file target additionally offers Preview, Copy Location, tags, and file-type actions. Archive files offer Browse and Extract Here; selected non-archive items offer Compress; executable files offer Run and Run in Terminal as SYS-035 and SYS-036 say. Preview selects the captured local file and reveals the info pane; providers without a preview backend disable it. Run is disabled by the `open` preference. Under `ask` or `run`, it still requires the menu's review confirmation, rechecks identity and executable metadata, then launches the exact local path with no shell or implicit arguments and its parent as the working directory.
 Falsifier: an archive action appears for an unsupported type or executable content runs contrary to the saved preference.
 Mechanism: MIME, archive, and executable-policy menu tests.
 Status: Draft

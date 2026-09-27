@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: elevated-session
+Current: run-files
 
 ## 1. Foundation
 
@@ -281,3 +281,25 @@ browse action goes. Run as Administrator keeps one authorization per
 run. Done when the sys-034 check passes on the final tree, the workspace
 tests, cargo fmt --check and clippy with warnings denied are clean, and
 every finding of the review and the report is resolved or declined.
+
+## run-files
+
+Requirements: SYS-035, SYS-036
+
+Run only what may run, and run exactly the reviewed file
+(docs/opus-audit-2.md C-N10). Musheen runs a local compiled program or
+executable desktop entry only when the kernel lets the user execute it.
+Double-click follows the executable-file preference: Open opens the
+file, Ask reviews it with Run, Open and Cancel, and Run runs it at once;
+the menu's Run always reviews first. A compiled program runs from the
+file Musheen opened and checked; a desktop entry starts the program its
+Exec line names; scripts and other files never run on double-click or
+through Run. Run in Terminal runs a script or compiled program the user
+may execute, in its own session in the terminal drawer or in the system
+terminal as a new setting chooses, keeping its output and exit code and
+asking before it closes or replaces a running one. The Settings window
+can change the executable-file preference and the new setting. Done
+when the sys-035 and sys-036 checks pass on the final tree, the
+workspace tests, cargo fmt --check and clippy with warnings denied are
+clean, and every finding of the review and the report is resolved or
+declined.
