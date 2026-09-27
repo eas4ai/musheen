@@ -6951,6 +6951,7 @@ impl MusheenApp {
         let options = properties_window_options(title, cx);
         let operation_hub = self.operation_hub.clone();
         let catalog = self.catalog.clone();
+        let privilege_backend = Arc::clone(&self.privilege_backend);
         let work = cx.background_spawn(async move { PropertiesWindowData::load(&paths) });
         cx.spawn(async move |_, cx| {
             let result = work.await;
@@ -6958,7 +6959,8 @@ impl MusheenApp {
                 Ok(data) => {
                     let data = data
                         .with_tag_states(common_tags, mixed_tags)
-                        .with_catalog(catalog);
+                        .with_catalog(catalog)
+                        .with_privilege_backend(privilege_backend);
                     let data = match tag_writer {
                         Some(writer) => data.with_tag_writer(writer),
                         None => data,
@@ -14306,7 +14308,9 @@ impl MusheenApp {
                     })
                 })
             }
-            LocalOperationOutcome::Trash(_) | LocalOperationOutcome::Archive => return,
+            LocalOperationOutcome::Trash(_)
+            | LocalOperationOutcome::Archive
+            | LocalOperationOutcome::Ownership => return,
         };
         cx.spawn(async move |this, cx| {
             let result = catalog_work_result(work.await).await;
@@ -19519,7 +19523,7 @@ fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
     }
 }
 
-fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str> {
+pub(crate) fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str> {
     let key = match error {
         BrokerError::AuthorizationCancelled => "privilege-error-cancelled",
         BrokerError::AuthorizationDenied => "privilege-error-denied",
@@ -19537,6 +19541,7 @@ fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str>
         BrokerError::AuditFailed => "privilege-error-audit",
         BrokerError::Io => "privilege-error-io",
         BrokerError::ListingTooLarge => "privilege-error-listing-too-large",
+        BrokerError::FilesystemUnsupported => "privilege-error-filesystem-unsupported",
     };
     catalog
         .message(key)

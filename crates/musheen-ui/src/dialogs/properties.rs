@@ -2,7 +2,7 @@ use crate::i18n::Catalog;
 use crate::operations::{OperationHub, spawn_ready_hub_operations};
 use crate::{
     Access, AccessClass, Accounts, ApplicationIdentity, DropError, LocalOperationQueue, MODE_BITS,
-    PermissionsPageModel, Tristate,
+    OwnershipEdit, PermissionsPageModel, PrivilegeBackend, Tristate,
 };
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputState};
@@ -17,17 +17,21 @@ use musheen_core::{
     CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityState, CommandTargetRef,
     DisplayPath, ItemKind, Store, StorePath,
 };
+use musheen_desktop::SecretBuffer;
+use musheen_desktop::privilege::{
+    BrokerOutput, BrokerRequest, OwnershipContents, OwnershipItem, PrivilegeProvider,
+};
 use musheen_desktop::{
     AclEntry, AclQualifier, AclState, AggregateValue, Capacity, ChecksumAlgorithm, ChecksumResult,
     ChecksumService, PropertyError, PropertyRefresh, PropertySnapshot, PropertyTimestamp,
     RecursiveSize, TagError, Volume, VolumeCapabilities, VolumeId, XattrState,
 };
-use musheen_local::LocalStore;
+use musheen_local::{LocalStore, OwnershipOperationRoute};
 use musheen_ops::{JobId, MetadataChange, MetadataScope};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -1190,6 +1194,8 @@ pub struct PropertiesWindowData {
     mixed_tags: BTreeSet<Box<str>>,
     tag_writer: Option<TagWriter>,
     catalog: Catalog,
+    /// Makes owner and group changes as administrator (SYS-037).
+    privilege_backend: Option<Arc<dyn PrivilegeBackend>>,
 }
 
 /// Hears the result of one tag write once the catalog took it.
@@ -1272,6 +1278,7 @@ impl PropertiesWindowData {
             mixed_tags: BTreeSet::new(),
             tag_writer: None,
             catalog: Catalog::system().expect("the built-in locale catalogs are valid"),
+            privilege_backend: None,
         })
     }
 
@@ -1299,6 +1306,11 @@ impl PropertiesWindowData {
     }
 
     #[must_use]
+    pub(crate) fn with_privilege_backend(mut self, backend: Arc<dyn PrivilegeBackend>) -> Self {
+        self.privilege_backend = Some(backend);
+        self
+    }
+
     pub(crate) fn with_catalog(mut self, catalog: Catalog) -> Self {
         self.catalog = catalog;
         self
@@ -1327,6 +1339,9 @@ enum PermissionError {
     Message(Box<str>),
     /// A job failed; the status center holds its error.
     JobFailed,
+    /// Text already in the window's language, such as an ownership change's
+    /// failure, which names its item (SYS-037).
+    Localized(Box<str>),
 }
 
 impl PermissionError {
@@ -1336,6 +1351,87 @@ impl PermissionError {
         let message = message.into();
         eprintln!("Musheen could not change permissions: {message}");
         Self::Message(message)
+    }
+}
+
+/// An owner and group change as administrator: the reviewed items, what
+/// changes, and Apply to contents (SYS-037).
+#[derive(Clone, Debug)]
+struct OwnershipJob {
+    items: Vec<OwnershipItem>,
+    edit: OwnershipEdit,
+    contents: Option<OwnershipContents>,
+}
+
+/// What Apply as Administrator shows before it asks for authorization:
+/// each item with its current and new owner and group, and the sudo
+/// password field when sudo authorizes.
+struct OwnershipReview {
+    rows: Vec<String>,
+    job: OwnershipJob,
+    password: Option<Entity<InputState>>,
+}
+
+struct PendingOwnership {
+    job: OwnershipJob,
+    authentication: Option<SecretBuffer>,
+}
+
+/// Runs one reviewed ownership change through the privilege broker as a
+/// job of the operations queue, with one authorization (SYS-037).
+struct OwnershipRoute {
+    backend: Arc<dyn PrivilegeBackend>,
+    job: OwnershipJob,
+    authentication: Mutex<Option<SecretBuffer>>,
+    catalog: Catalog,
+}
+
+impl std::fmt::Debug for OwnershipRoute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnershipRoute")
+            .field("job", &self.job)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnershipOperationRoute for OwnershipRoute {
+    fn execute_ownership(&self, cancellation: &CancellationToken) -> Result<(), Box<str>> {
+        let localized = |error| crate::app::localized_privilege_error(&self.catalog, &error);
+        let request = BrokerRequest::change_ownership(
+            self.job.items.clone(),
+            self.job.edit.owner,
+            self.job.edit.group,
+            self.job.contents,
+        )
+        .map_err(localized)?;
+        let authentication = self
+            .authentication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let answer = futures_lite::future::block_on(self.backend.perform(
+            &request,
+            cancellation.clone(),
+            authentication,
+        ));
+        match answer {
+            Ok(BrokerOutput::OwnershipChanged(report)) => match report.failure() {
+                None => Ok(()),
+                Some(failure) => Err(format!(
+                    "{}: {}",
+                    failure.path().display(),
+                    localized(failure.error())
+                )
+                .into()),
+            },
+            Ok(_) => Err(self
+                .catalog
+                .message("privilege-response-invalid")
+                .expect("the invalid privilege response is localized")
+                .into()),
+            Err(error) => Err(localized(error)),
+        }
     }
 }
 
@@ -1477,8 +1573,19 @@ pub(crate) struct PropertiesWindow {
     checksum: ChecksumState,
     checksum_cancellation: Option<CancellationToken>,
     close_requested: bool,
+    /// The Permissions page's owner list is open.
+    owner_picker_open: bool,
     /// The Permissions page's group list is open.
     group_picker_open: bool,
+    /// The review Apply as Administrator shows before it asks for
+    /// authorization (SYS-037).
+    ownership_review: Option<OwnershipReview>,
+    /// An ownership change that runs as administrator once the user's own
+    /// mode change of the same Apply succeeded.
+    pending_ownership: Option<PendingOwnership>,
+    /// The queued ownership change, whose error is already localized.
+    ownership_job: Option<JobId>,
+    privilege_backend: Option<Arc<dyn PrivilegeBackend>>,
     /// The Permissions page's Advanced section is open.
     advanced_open: bool,
     operation_hub: OperationHub,
@@ -1538,7 +1645,12 @@ impl PropertiesWindow {
             checksum: ChecksumState::Idle,
             checksum_cancellation: None,
             close_requested: false,
+            owner_picker_open: false,
             group_picker_open: false,
+            ownership_review: None,
+            pending_ownership: None,
+            ownership_job: None,
+            privilege_backend: data.privilege_backend,
             advanced_open: false,
             operation_hub,
             permission_error: None,
@@ -1569,10 +1681,20 @@ impl PropertiesWindow {
         this
     }
 
-    fn apply_permissions(&mut self, cx: &mut Context<Self>) {
-        if self.permission_batch.is_active() {
+    fn apply_permissions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.permission_batch.is_active() || self.ownership_review.is_some() {
             return;
         }
+        if self.model.permissions().ownership_edit().is_some() {
+            self.open_ownership_review(window, cx);
+            return;
+        }
+        self.submit_user_permissions(cx);
+    }
+
+    /// Submits the change the user makes alone: the modes, and a group
+    /// they may set themselves.
+    fn submit_user_permissions(&mut self, cx: &mut Context<Self>) {
         let submitted: Result<Vec<JobId>, Box<str>> = self
             .model
             .permission_request()
@@ -1598,6 +1720,139 @@ impl PropertiesWindow {
         }
     }
 
+    /// Shows each selected item with its current and new owner and group
+    /// before Apply as Administrator asks for authorization (SYS-037).
+    fn open_ownership_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let permissions = self.model.permissions();
+        let Some(edit) = permissions.ownership_edit() else {
+            return;
+        };
+        let accounts = permissions.accounts();
+        let contents = match permissions.scope() {
+            MetadataScope::Recursive {
+                include_nested_mounts,
+                ..
+            } => Some(OwnershipContents {
+                nested_mounts: include_nested_mounts,
+            }),
+            MetadataScope::Single => None,
+        };
+        let with_contents = self.message("ownership-review-contents").to_string();
+        let mut rows = Vec::new();
+        let mut items = Vec::new();
+        for item in self.model.snapshot().items() {
+            let current = item.permissions();
+            let owner = accounts.user_name(current.owner());
+            let group = accounts.group_name(current.group());
+            let new_owner = edit
+                .owner
+                .map_or_else(|| owner.clone(), |uid| accounts.user_name(uid));
+            let new_group = edit
+                .group
+                .map_or_else(|| group.clone(), |gid| accounts.group_name(gid));
+            let path = item.path().display().to_string();
+            let path = if contents.is_some() && item.kind() == ItemKind::Directory {
+                format!("{path} {with_contents}")
+            } else {
+                path
+            };
+            rows.push(format!(
+                "{path}: {owner}:{group} \u{2192} {new_owner}:{new_group}"
+            ));
+            items.push(OwnershipItem::new(
+                item.path(),
+                item.identity().device(),
+                item.identity().inode(),
+            ));
+        }
+        let sudo = self
+            .privilege_backend
+            .as_ref()
+            .is_some_and(|backend| backend.provider() == PrivilegeProvider::Sudo);
+        let password = sudo.then(|| {
+            let placeholder = self.message("dialog-sudo-password").to_string();
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .masked(true)
+            })
+        });
+        self.ownership_review = Some(OwnershipReview {
+            rows,
+            job: OwnershipJob {
+                items,
+                edit,
+                contents,
+            },
+            password,
+        });
+        cx.notify();
+    }
+
+    /// Runs the reviewed change: the user's own mode change first, then the
+    /// owner and group change as administrator.
+    fn confirm_ownership_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.ownership_review.take() else {
+            return;
+        };
+        let authentication = review.password.map(|password| {
+            let secret = SecretBuffer::new(password.read(cx).value().as_bytes().to_vec());
+            password.update(cx, |password, cx| password.set_value("", window, cx));
+            secret
+        });
+        let pending = PendingOwnership {
+            job: review.job,
+            authentication,
+        };
+        if self.model.permissions().change().is_dirty() {
+            self.pending_ownership = Some(pending);
+            self.submit_user_permissions(cx);
+            if !self.permission_batch.is_active() {
+                self.pending_ownership = None;
+            }
+        } else {
+            self.submit_ownership(pending, cx);
+        }
+    }
+
+    fn cancel_ownership_review(&mut self, cx: &mut Context<Self>) {
+        self.ownership_review = None;
+        cx.notify();
+    }
+
+    fn submit_ownership(&mut self, pending: PendingOwnership, cx: &mut Context<Self>) {
+        let Some(backend) = self.privilege_backend.clone() else {
+            self.permission_error = Some(PermissionError::message(
+                self.message("privilege-ownership-unavailable").to_string(),
+            ));
+            cx.notify();
+            return;
+        };
+        let paths = pending
+            .job
+            .items
+            .iter()
+            .map(|item| StorePath::from_unix_path(item.path().as_os_str()))
+            .collect();
+        let route = Arc::new(OwnershipRoute {
+            backend,
+            job: pending.job,
+            authentication: Mutex::new(pending.authentication),
+            catalog: self.catalog.clone(),
+        });
+        match self.operation_hub.submit_ownership(paths, route) {
+            Ok(id) => {
+                self.ownership_job = Some(id);
+                self.permission_batch.begin([id]);
+                self.pump_operation_queue(cx);
+            }
+            Err(error) => {
+                self.permission_error = Some(PermissionError::message(error.to_string()));
+            }
+        }
+        cx.notify();
+    }
+
     fn pump_operation_queue(&mut self, cx: &mut Context<Self>) {
         let result = spawn_ready_hub_operations(
             self.operation_hub.clone(),
@@ -1608,13 +1863,28 @@ impl PropertiesWindow {
                 if outcome == PermissionBatchOutcome::Ignored {
                     return;
                 }
+                let ownership = state.ownership_job == Some(id);
+                if ownership {
+                    state.ownership_job = None;
+                }
                 if let Some(error) = error {
-                    state.permission_error = Some(PermissionError::message(error));
+                    state.permission_error = Some(if ownership {
+                        PermissionError::Localized(error)
+                    } else {
+                        PermissionError::message(error)
+                    });
                 } else if outcome == PermissionBatchOutcome::Failed {
                     state.permission_error = Some(PermissionError::JobFailed);
                 }
-                if outcome == PermissionBatchOutcome::Succeeded {
-                    state.model.clear_permission_edits();
+                match outcome {
+                    // The user's own mode change came first; the owner and
+                    // group change as administrator runs next.
+                    PermissionBatchOutcome::Succeeded => match state.pending_ownership.take() {
+                        Some(pending) => state.submit_ownership(pending, cx),
+                        None => state.model.clear_permission_edits(),
+                    },
+                    PermissionBatchOutcome::Failed => state.pending_ownership = None,
+                    PermissionBatchOutcome::Ignored | PermissionBatchOutcome::Pending => {}
                 }
                 state.pump_operation_queue(cx);
                 cx.notify();
@@ -2273,6 +2543,9 @@ impl PropertiesWindow {
         let editable = ready && permissions.modes_editable();
         let varies = self.message("permissions-varies").to_string();
         let mut controls = Vec::new();
+        if let Some(review) = &self.ownership_review {
+            controls.push(self.render_ownership_review(review, cx));
+        }
         if let Some(reason) = permissions.read_only_reason() {
             let reason = format!(
                 "{} {}",
@@ -2377,11 +2650,30 @@ impl PropertiesWindow {
                     .into_any_element(),
             );
         }
-        let owner = match permissions.owner() {
-            AggregateValue::Same(uid) => permissions.accounts().user_name(*uid),
-            _ => varies.clone(),
+        let owner = permissions.shown_owner().map_or_else(
+            || varies.clone(),
+            |uid| permissions.accounts().user_name(uid),
+        );
+        let owner_editable = ready && permissions.owner_editable();
+        let owner_picker = div()
+            .id("permissions-owner-picker")
+            .test_support()
+            .px_2()
+            .border_1()
+            .rounded_md()
+            .aria_label(owner.clone())
+            .child(owner);
+        let owner_picker = if owner_editable {
+            owner_picker
+                .role(Role::Button)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.owner_picker_open = !this.owner_picker_open;
+                    this.group_picker_open = false;
+                    cx.notify();
+                }))
+        } else {
+            owner_picker.role(Role::Label)
         };
-        let needs_admin = self.message("permissions-owner-needs-admin").to_string();
         controls.push(
             div()
                 .flex()
@@ -2393,21 +2685,35 @@ impl PropertiesWindow {
                         .w(px(96.))
                         .child(self.message("permissions-class-owner").to_string()),
                 )
-                .child(
-                    div()
-                        .id("permissions-owner-name")
-                        .test_support()
-                        .role(Role::Label)
-                        .aria_label(owner.clone())
-                        .child(owner),
-                )
-                .child(permission_note(
-                    "permissions-owner-needs-admin",
-                    needs_admin,
-                    Role::Label,
-                ))
+                .child(owner_picker)
                 .into_any_element(),
         );
+        if self.owner_picker_open && owner_editable {
+            let shown = permissions.shown_owner();
+            let options = permissions.accounts().all_users().to_vec();
+            controls.push(
+                div()
+                    .id("permissions-owner-options")
+                    .test_support()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(options.into_iter().map(|(uid, name)| {
+                        Button::new(SharedString::from(format!(
+                            "permissions-owner-option-{uid}"
+                        )))
+                        .label(name)
+                        .small()
+                        .selected(shown == Some(uid))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.permissions_mut().set_owner(uid);
+                            this.owner_picker_open = false;
+                            cx.notify();
+                        }))
+                    }))
+                    .into_any_element(),
+            );
+        }
         let group = permissions.shown_group().map_or_else(
             || varies.clone(),
             |gid| permissions.accounts().group_name(gid),
@@ -2429,6 +2735,7 @@ impl PropertiesWindow {
                 .aria_label(choose)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.group_picker_open = !this.group_picker_open;
+                    this.owner_picker_open = false;
                     cx.notify();
                 }))
         } else {
@@ -2446,18 +2753,15 @@ impl PropertiesWindow {
                         .child(self.message("permissions-class-group").to_string()),
                 )
                 .child(picker)
-                .when(
-                    ready && permissions.read_only_reason().is_none() && !group_editable,
-                    |row| {
-                        row.child(permission_note(
-                            "permissions-group-not-owner",
-                            self.message("permissions-group-not-owner").to_string(),
-                            Role::Label,
-                        ))
-                    },
-                )
                 .into_any_element(),
         );
+        if permissions.needs_administrator() {
+            controls.push(permission_note(
+                "permissions-needs-admin",
+                self.message("permissions-needs-admin").to_string(),
+                Role::Label,
+            ));
+        }
         if permissions.has_named_acl() {
             controls.push(permission_note(
                 "permissions-acl-mask-note",
@@ -2467,7 +2771,7 @@ impl PropertiesWindow {
         }
         if self.group_picker_open && group_editable {
             let shown = permissions.shown_group();
-            let options = permissions.accounts().user_groups().to_vec();
+            let options = permissions.accounts().all_groups().to_vec();
             controls.push(
                 div()
                     .id("permissions-group-options")
@@ -2507,6 +2811,64 @@ impl PropertiesWindow {
             controls.push(self.render_access_entries());
         }
         controls
+    }
+
+    /// The review Apply as Administrator shows before it asks for
+    /// authorization: each item with its current and new owner and group
+    /// (SYS-037).
+    fn render_ownership_review(
+        &self,
+        review: &OwnershipReview,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title = self.message("ownership-review-title").to_string();
+        div()
+            .id("ownership-review")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label(title.clone())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .border_1()
+            .rounded_md()
+            .child(div().child(title))
+            .children(review.rows.iter().enumerate().map(|(index, row)| {
+                div()
+                    .id(SharedString::from(format!("ownership-review-item-{index}")))
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(row.clone())
+                    .text_sm()
+                    .child(row.clone())
+            }))
+            .when_some(review.password.clone(), |panel, password| {
+                panel.child(Input::new(&password))
+            })
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("ownership-review-cancel")
+                            .label(self.message("ownership-review-cancel").to_string())
+                            .small()
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.cancel_ownership_review(cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("ownership-review-confirm")
+                            .label(self.message("ownership-review-confirm").to_string())
+                            .small()
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_ownership_review(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The Advanced section's mode bits, each a toggle, with Varies where
@@ -2660,6 +3022,7 @@ impl PropertiesWindow {
                 self.localized_error(message, "permissions-apply-failed")
             }
             PermissionError::JobFailed => self.message("permissions-apply-failed").to_string(),
+            PermissionError::Localized(message) => message.to_string(),
         })
     }
 
@@ -2840,15 +3203,18 @@ impl PropertiesWindow {
             && self.model.apply_visible()
             && !self.permission_batch.is_active()
         {
+            let label = if self.model.permissions().needs_administrator() {
+                "properties-apply-as-administrator"
+            } else {
+                "properties-apply"
+            };
             actions = actions.child(
                 Button::new("properties-apply")
-                    .label(
-                        self.catalog
-                            .message("properties-apply")
-                            .expect("the apply message exists"),
-                    )
+                    .label(self.message(label).to_string())
                     .primary()
-                    .on_click(cx.listener(|this, _, _, cx| this.apply_permissions(cx))),
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.apply_permissions(window, cx)),
+                    ),
             );
         }
         if self.model.page() == PropertiesPage::Tags
@@ -3878,6 +4244,103 @@ mod tests {
         )
     }
 
+    /// A privilege backend that records each request, with the mode its
+    /// first item had then, and answers an ownership change, failing on
+    /// `failing` when given.
+    #[derive(Clone)]
+    struct RecordingBackend {
+        requests: Arc<Mutex<Vec<(BrokerRequest, u32)>>>,
+        failing: Option<PathBuf>,
+    }
+
+    impl RecordingBackend {
+        fn new(failing: Option<PathBuf>) -> Self {
+            Self {
+                requests: Arc::default(),
+                failing,
+            }
+        }
+
+        fn requests(&self) -> Vec<(BrokerRequest, u32)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl PrivilegeBackend for RecordingBackend {
+        fn provider(&self) -> PrivilegeProvider {
+            PrivilegeProvider::Polkit
+        }
+
+        fn perform<'a>(
+            &'a self,
+            request: &'a BrokerRequest,
+            _cancellation: CancellationToken,
+            _authentication: Option<SecretBuffer>,
+        ) -> musheen_core::BoxFuture<
+            'a,
+            Result<BrokerOutput, musheen_desktop::privilege::BrokerError>,
+        > {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = filesystem::symlink_metadata(request.target())
+                .map_or(0, |metadata| metadata.permissions().mode() & 0o7777);
+            self.requests.lock().unwrap().push((request.clone(), mode));
+            let report = match &self.failing {
+                None => musheen_desktop::privilege::OwnershipReport::new(1, None),
+                Some(path) => musheen_desktop::privilege::OwnershipReport::new(
+                    0,
+                    Some(musheen_desktop::privilege::OwnershipFailure::new(
+                        path,
+                        &musheen_desktop::privilege::BrokerError::Io,
+                    )),
+                ),
+            };
+            Box::pin(async move { Ok(BrokerOutput::OwnershipChanged(report)) })
+        }
+
+        fn open_window<'a>(
+            &'a self,
+            _request: &'a BrokerRequest,
+            _cancellation: CancellationToken,
+            _authentication: Option<SecretBuffer>,
+        ) -> musheen_core::BoxFuture<
+            'a,
+            Result<Arc<dyn crate::ElevatedSession>, musheen_desktop::privilege::BrokerError>,
+        > {
+            Box::pin(async { Err(musheen_desktop::privilege::BrokerError::InvalidRequest) })
+        }
+    }
+
+    fn open_permissions_page_with_backend(
+        paths: &[PathBuf],
+        backend: RecordingBackend,
+        cx: &mut TestAppContext,
+    ) -> (gpui_kit::WindowHandle<Root>, Entity<PropertiesWindow>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_properties_key_bindings(cx);
+        });
+        let data = PropertiesWindowData::load(paths)
+            .expect("the items load")
+            .with_privilege_backend(Arc::new(backend));
+        let mut properties = None;
+        let handle = cx.open_window(size(px(1000.), px(1600.)), |window, cx| {
+            let view = cx.new(|cx| PropertiesWindow::new(data, window, cx));
+            properties = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("properties-page-permissions", cx);
+            window.render_frame(cx);
+        })
+        .expect("the Properties window is open");
+        (
+            handle,
+            properties.expect("the Properties view is constructed"),
+        )
+    }
+
     /// Clicks each of `ids` on the page, in order.
     fn click_all(handle: gpui_kit::WindowHandle<Root>, ids: &[&str], cx: &mut TestAppContext) {
         cx.update_window(handle.into(), |_, window, cx| {
@@ -4202,6 +4665,94 @@ mod tests {
             owned_by_user(&first) && owned_by_user(&second),
             "Cancel changes nothing"
         );
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn change_ownership_runs_after_the_mode_change_in_the_queue(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("notes.txt");
+        filesystem::write(&file, b"notes").unwrap();
+        set_file_mode(&file, 0o644);
+        let backend = RecordingBackend::new(None);
+        let (handle, properties) =
+            open_permissions_page_with_backend(std::slice::from_ref(&file), backend.clone(), cx);
+        click_all(
+            handle,
+            &[
+                "permissions-others-no-access",
+                "permissions-owner-picker",
+                "permissions-owner-option-0",
+                "properties-apply",
+            ],
+            cx,
+        );
+        assert!(
+            backend.requests().is_empty(),
+            "nothing is asked before the review is confirmed"
+        );
+        click_all(handle, &["ownership-review-confirm"], cx);
+        let seen = backend.clone();
+        cx.wait_for(handle.into(), Duration::from_secs(5), move |_, _| {
+            seen.requests().len() == 1
+        })
+        .await;
+        let (request, mode_then) = backend.requests().remove(0);
+        assert_eq!(mode_then, 0o640, "the user's own mode change ran first");
+        match request.operation() {
+            musheen_desktop::privilege::BrokerOperation::ChangeOwnership {
+                items,
+                owner,
+                group,
+                contents,
+            } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].path(), file);
+                assert_eq!(*owner, Some(0));
+                assert_eq!(*group, None);
+                assert_eq!(*contents, None);
+            }
+            other => panic!("Apply as Administrator asked for {other:?}"),
+        }
+        let edited = properties.clone();
+        cx.wait_for(handle.into(), Duration::from_secs(5), move |_, cx| {
+            !edited.read(cx).model.permissions().is_dirty()
+        })
+        .await;
+        assert_eq!(
+            backend.requests().len(),
+            1,
+            "one authorization for the Apply"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn change_ownership_failure_names_its_item_on_the_page(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("notes.txt");
+        filesystem::write(&file, b"notes").unwrap();
+        let backend = RecordingBackend::new(Some(file.clone()));
+        let (handle, _) =
+            open_permissions_page_with_backend(std::slice::from_ref(&file), backend, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-owner-picker",
+                "permissions-owner-option-0",
+                "properties-apply",
+                "ownership-review-confirm",
+            ],
+            cx,
+        );
+        let expected = file.display().to_string();
+        cx.wait_for(handle.into(), Duration::from_secs(5), move |window, _| {
+            window
+                .try_find("permissions-validation")
+                .and_then(|error| error.label().map(str::to_owned))
+                .is_some_and(|label| label.contains(&expected))
+        })
+        .await;
     }
 
     #[cfg(unix)]
@@ -4816,14 +5367,24 @@ mod tests {
             Some(Catalog::load(crate::Locale::EnXa).unwrap()),
             cx,
         );
-        click_all(handle, &["permissions-advanced"], cx);
+        // Another owner makes the page say it needs administrator rights.
+        click_all(
+            handle,
+            &[
+                "permissions-owner-picker",
+                "permissions-owner-option-0",
+                "permissions-advanced",
+            ],
+            cx,
+        );
         cx.update_window(handle.into(), |_, window, _| {
             for id in [
                 "permissions-owner-no-access",
                 "permissions-group-can-view",
                 "permissions-others-can-modify",
                 "permissions-executable",
-                "permissions-owner-needs-admin",
+                "permissions-needs-admin",
+                "properties-apply",
                 "permissions-group-picker",
                 "permissions-advanced",
                 "permissions-bit-owner-read",

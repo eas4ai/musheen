@@ -11,7 +11,12 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 pub const OPEN_DIRECTORY_ACTION_ID: &str = "org.musheen.open-directory-as-administrator";
 pub const RUN_EXECUTABLE_ACTION_ID: &str = "org.musheen.run-executable-as-administrator";
-pub const ADMIN_ACTION_IDS: [&str; 2] = [OPEN_DIRECTORY_ACTION_ID, RUN_EXECUTABLE_ACTION_ID];
+pub const CHANGE_OWNERSHIP_ACTION_ID: &str = "org.musheen.change-ownership-as-administrator";
+pub const ADMIN_ACTION_IDS: [&str; 3] = [
+    OPEN_DIRECTORY_ACTION_ID,
+    RUN_EXECUTABLE_ACTION_ID,
+    CHANGE_OWNERSHIP_ACTION_ID,
+];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -47,6 +52,70 @@ pub enum BrokerOperation {
         #[serde(with = "path_bytes")]
         relative: PathBuf,
     },
+    /// Sets the owner, the group or both of `items`, each still the file the
+    /// user reviewed, and with `contents` of what their folders contain
+    /// (SYS-037).
+    ChangeOwnership {
+        items: Box<[OwnershipItem]>,
+        owner: Option<u32>,
+        group: Option<u32>,
+        contents: Option<OwnershipContents>,
+    },
+}
+
+/// A file or folder an ownership change names: its path and the identity the
+/// user reviewed. A symbolic link is the link itself.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipItem {
+    #[serde(with = "path_bytes")]
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl OwnershipItem {
+    /// `path` as it is now, without following a symbolic link at its end.
+    pub fn reviewed(path: impl AsRef<Path>) -> Result<Self, BrokerError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let path = path.as_ref();
+        validate_target(path)?;
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| BrokerError::Io)?;
+        Ok(Self::new(path, metadata.dev(), metadata.ino()))
+    }
+
+    #[must_use]
+    pub fn new(path: impl AsRef<Path>, device: u64, inode: u64) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            device,
+            inode,
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn device(&self) -> u64 {
+        self.device
+    }
+
+    #[must_use]
+    pub const fn inode(&self) -> u64 {
+        self.inode
+    }
+}
+
+/// Apply to contents for an ownership change: what a folder contains, and
+/// the folders of nested mounts only when the reviewed scope includes them.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipContents {
+    pub nested_mounts: bool,
 }
 
 impl BrokerOperation {
@@ -55,6 +124,9 @@ impl BrokerOperation {
         match self {
             Self::OpenDirectory { target } | Self::RunExecutable { target, .. } => target,
             Self::ReadDirectory { root, .. } => root.root(),
+            Self::ChangeOwnership { items, .. } => {
+                items.first().map_or(Path::new("/"), |item| &item.path)
+            }
         }
     }
 
@@ -65,6 +137,7 @@ impl BrokerOperation {
         match self {
             Self::OpenDirectory { .. } | Self::ReadDirectory { .. } => OPEN_DIRECTORY_ACTION_ID,
             Self::RunExecutable { .. } => RUN_EXECUTABLE_ACTION_ID,
+            Self::ChangeOwnership { .. } => CHANGE_OWNERSHIP_ACTION_ID,
         }
     }
 
@@ -74,6 +147,7 @@ impl BrokerOperation {
             Self::OpenDirectory { .. } => "Open as Administrator",
             Self::RunExecutable { .. } => "Run as Administrator",
             Self::ReadDirectory { .. } => "Browse as Administrator",
+            Self::ChangeOwnership { .. } => "Change Ownership as Administrator",
         }
     }
 
@@ -82,7 +156,7 @@ impl BrokerOperation {
         match self {
             Self::OpenDirectory { .. } => &[],
             Self::RunExecutable { arguments, .. } => arguments,
-            Self::ReadDirectory { .. } => &[],
+            Self::ReadDirectory { .. } | Self::ChangeOwnership { .. } => &[],
         }
     }
 }
@@ -225,6 +299,42 @@ impl BrokerRequest {
             },
             subject_is_trusted: true,
         })
+    }
+
+    /// One ownership change for every item of an Apply, so it asks for
+    /// authorization once (SYS-037). It must change an owner or a group, and
+    /// it must fit one broker request line.
+    pub fn change_ownership(
+        items: Vec<OwnershipItem>,
+        owner: Option<u32>,
+        group: Option<u32>,
+        contents: Option<OwnershipContents>,
+    ) -> Result<Self, BrokerError> {
+        if items.is_empty()
+            || (owner.is_none() && group.is_none())
+            || owner == Some(u32::MAX)
+            || group == Some(u32::MAX)
+        {
+            return Err(BrokerError::InvalidRequest);
+        }
+        for item in &items {
+            validate_target(&item.path)?;
+        }
+        let request = Self {
+            id: next_request_id(),
+            subject: RequestSubject::current()?,
+            operation: BrokerOperation::ChangeOwnership {
+                items: items.into_boxed_slice(),
+                owner,
+                group,
+                contents,
+            },
+            subject_is_trusted: true,
+        };
+        if super::encode_broker_request(&request)?.len() >= super::MAX_REQUEST_LINE_BYTES {
+            return Err(BrokerError::InvalidRequest);
+        }
+        Ok(request)
     }
 
     /// Replaces the untrusted JSON subject with identity established by the

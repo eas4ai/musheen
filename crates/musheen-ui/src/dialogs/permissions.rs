@@ -179,6 +179,10 @@ pub struct Accounts {
     user_groups: Vec<(u32, String)>,
     users: BTreeMap<u32, String>,
     groups: BTreeMap<u32, String>,
+    /// Every user account and every group the system lists, sorted by
+    /// name, for the owner and group choosers (SEARCH-019).
+    all_users: Vec<(u32, String)>,
+    all_groups: Vec<(u32, String)>,
 }
 
 impl Accounts {
@@ -216,18 +220,24 @@ impl Accounts {
             }
         }
         let user_groups = musheen_desktop::current_user_groups();
+        let all_users = musheen_desktop::all_users();
+        let all_groups = musheen_desktop::all_groups();
         Self {
             effective_user: musheen_desktop::effective_user(),
             users: users
                 .into_iter()
                 .filter_map(|(uid, name)| Some((uid, name?)))
+                .chain(all_users.iter().cloned())
                 .collect(),
             groups: groups
                 .into_iter()
                 .filter_map(|(gid, name)| Some((gid, name?)))
                 .chain(user_groups.iter().cloned())
+                .chain(all_groups.iter().cloned())
                 .collect(),
             user_groups,
+            all_users,
+            all_groups,
         }
     }
 
@@ -253,6 +263,22 @@ impl Accounts {
     #[must_use]
     pub fn user_groups(&self) -> &[(u32, String)] {
         &self.user_groups
+    }
+
+    /// Every user account the system lists, by name.
+    #[must_use]
+    pub fn all_users(&self) -> &[(u32, String)] {
+        &self.all_users
+    }
+
+    /// Every group the system lists, by name.
+    #[must_use]
+    pub fn all_groups(&self) -> &[(u32, String)] {
+        &self.all_groups
+    }
+
+    fn is_user_group(&self, gid: u32) -> bool {
+        self.user_groups.iter().any(|(group, _)| *group == gid)
     }
 }
 
@@ -325,8 +351,17 @@ pub struct PermissionsPageModel {
     read_only: Option<Box<str>>,
     mode_lock: Option<ModeLock>,
     steps: Vec<Step>,
+    owner_edit: Option<u32>,
     group_edit: Option<u32>,
     scope: MetadataScope,
+}
+
+/// The owner and group change Apply makes as administrator (SYS-037);
+/// `None` keeps one as it is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnershipEdit {
+    pub owner: Option<u32>,
+    pub group: Option<u32>,
 }
 
 impl PermissionsPageModel {
@@ -409,6 +444,7 @@ impl PermissionsPageModel {
             read_only,
             mode_lock,
             steps: Vec::new(),
+            owner_edit: None,
             group_edit: None,
             scope: MetadataScope::Single,
         }
@@ -528,12 +564,19 @@ impl PermissionsPageModel {
         self.items
             .iter()
             .map(|item| {
-                let mode = if self.group_edit.is_some_and(|group| group != item.group) {
-                    mode_after_ownership_change(item.kind, item.mode)
+                let ownership_changes = self.group_edit.is_some_and(|group| group != item.group)
+                    || self.owner_edit.is_some_and(|owner| owner != item.owner);
+                // The kernel clears setuid and setgid bits on an owner or
+                // group change. The user's own group change comes before the
+                // mode change; one made as administrator comes after it.
+                let mode = if !ownership_changes {
+                    edit.apply(item.kind, item.mode)
+                } else if self.needs_administrator() {
+                    mode_after_ownership_change(item.kind, edit.apply(item.kind, item.mode))
                 } else {
-                    item.mode
+                    edit.apply(item.kind, mode_after_ownership_change(item.kind, item.mode))
                 };
-                (item.kind, edit.apply(item.kind, mode))
+                (item.kind, mode)
             })
             .collect()
     }
@@ -695,29 +738,77 @@ impl PermissionsPageModel {
         }
     }
 
-    /// Whether the user may choose the group: only on items they own,
-    /// links and special files included.
+    /// The owner the page shows: the chosen one, or the one every item has.
     #[must_use]
-    pub fn group_editable(&self) -> bool {
-        self.read_only.is_none()
-            && !self.owners.is_empty()
-            && self
-                .owners
-                .iter()
-                .all(|owner| *owner == self.accounts.effective_user)
+    pub fn shown_owner(&self) -> Option<u32> {
+        match (self.owner_edit, &self.owner) {
+            (Some(owner), _) => Some(owner),
+            (None, AggregateValue::Same(owner)) => Some(*owner),
+            _ => None,
+        }
     }
 
-    /// Chooses group `gid`, when it is one of the user's groups.
+    /// Whether the page offers the owner and group choosers: on every
+    /// filesystem with POSIX permissions, links and special files included.
+    /// A change the user may not make alone applies as administrator.
+    #[must_use]
+    pub fn group_editable(&self) -> bool {
+        self.read_only.is_none() && !self.owners.is_empty()
+    }
+
+    /// Whether the owner may be chosen; the same rule as the group.
+    #[must_use]
+    pub fn owner_editable(&self) -> bool {
+        self.group_editable()
+    }
+
+    /// Chooses owner `uid`, one of the system's user accounts.
+    pub fn set_owner(&mut self, uid: u32) {
+        if self.owner_editable() && self.accounts.all_users.iter().any(|(user, _)| *user == uid) {
+            self.owner_edit = (self.owner != AggregateValue::Same(uid)).then_some(uid);
+        }
+    }
+
+    /// Chooses group `gid`, one of the system's groups.
     pub fn set_group(&mut self, gid: u32) {
         if self.group_editable()
-            && self
-                .accounts
-                .user_groups
-                .iter()
-                .any(|(group, _)| *group == gid)
+            && (self.accounts.is_user_group(gid)
+                || self
+                    .accounts
+                    .all_groups
+                    .iter()
+                    .any(|(group, _)| *group == gid))
         {
             self.group_edit = (self.group != AggregateValue::Same(gid)).then_some(gid);
         }
+    }
+
+    /// Whether Apply needs administrator rights (SEARCH-019, SYS-037): a
+    /// new owner, or a group that is not one of the user's own or is for an
+    /// item the user does not own. The superuser needs none.
+    #[must_use]
+    pub fn needs_administrator(&self) -> bool {
+        if self.accounts.effective_user == 0 {
+            return false;
+        }
+        self.owner_edit.is_some()
+            || self.group_edit.is_some_and(|gid| {
+                !self.accounts.is_user_group(gid)
+                    || self
+                        .owners
+                        .iter()
+                        .any(|owner| *owner != self.accounts.effective_user)
+            })
+    }
+
+    /// The owner and group change Apply makes as administrator, after the
+    /// user's own mode change.
+    #[must_use]
+    pub fn ownership_edit(&self) -> Option<OwnershipEdit> {
+        self.needs_administrator().then_some(OwnershipEdit {
+            owner: self.owner_edit,
+            group: self.group_edit,
+        })
     }
 
     pub fn set_single(&mut self) {
@@ -736,7 +827,7 @@ impl PermissionsPageModel {
     /// whether a mode or the group would differ; with Apply to contents,
     /// whether the user made any change, as the contents may differ.
     pub fn is_dirty(&self) -> bool {
-        if self.group_edit.is_some() {
+        if self.group_edit.is_some() || self.owner_edit.is_some() {
             return true;
         }
         if self.scope.is_recursive() {
@@ -752,13 +843,14 @@ impl PermissionsPageModel {
         self.read_only.is_none() && self.scope.is_reviewed()
     }
 
-    /// The change Apply submits.
+    /// The change Apply submits as the user: the modes, and the group when
+    /// the user may set it alone. The rest goes in [`Self::ownership_edit`].
     #[must_use]
     pub fn change(&self) -> MetadataChange {
         let change = MetadataChange::new().with_mode_edit(self.mode_edit());
         match self.group_edit {
-            Some(group) => change.with_group(group),
-            None => change,
+            Some(group) if !self.needs_administrator() => change.with_group(group),
+            _ => change,
         }
     }
 

@@ -29,8 +29,8 @@ pub use probe::{LocalFilesystemInfo, mount_point_of};
 pub use queue::{
     ActiveOperationPaths, ArchiveOperationExecution, ArchiveOperationRoute, DropAction, DropError,
     FileDragPayload, LocalFailureDisposition, LocalOperationFailure, LocalOperationOutcome,
-    LocalOperationQueue, ProviderTransferExecution, ProviderTransferRoute, ReadyLocalOperation,
-    TransferOutcome,
+    LocalOperationQueue, OwnershipOperationRoute, ProviderTransferExecution, ProviderTransferRoute,
+    ReadyLocalOperation, TransferOutcome,
 };
 pub use traverse::{LocalTraversal, TraversalOptions};
 

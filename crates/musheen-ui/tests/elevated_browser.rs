@@ -1,9 +1,10 @@
 use musheen_core::{CancellationToken, PageRequest, ResourceLimits, Store, StorePath};
 use musheen_desktop::SecretBuffer;
 use musheen_desktop::privilege::{
-    AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker, BrokerLaunch,
-    BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, ELEVATED_SESSION_IDLE,
-    ElevatedRootReference, NoopAudit, ProcessBrokerTransport, RequestLines, SUDO_BROKER_READY,
+    AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker, BrokerError,
+    BrokerLaunch, BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport,
+    ELEVATED_SESSION_IDLE, ElevatedRootReference, NoopAudit, OwnershipContents, OwnershipItem,
+    OwnershipReport, ProcessBrokerTransport, RequestLines, SUDO_BROKER_READY,
     SudoPtyBrokerTransport, SystemClock, SystemOperationRunner, boot_clock, decode_broker_request,
     prepare_sudo_terminal, serve_session, write_response,
 };
@@ -948,4 +949,327 @@ fn change_ownership_policy_always_asks_for_an_administrator_password() {
         musheen_desktop::privilege::ADMIN_ACTION_IDS
             .contains(&"org.musheen.change-ownership-as-administrator")
     );
+}
+
+// The broker's own ownership change, run as root in a user namespace that
+// maps this user's subordinate IDs, so owners really change without root on
+// the machine: `unshare --map-auto --map-root-user --mount` starts this test
+// binary as `change_ownership_scenario_child`, which runs one scenario and
+// checks it from inside. Where user namespaces are not allowed, the tests
+// say so and pass.
+
+const OWNERSHIP_SCENARIO: &str = "MUSHEEN_OWNERSHIP_SCENARIO";
+const OWNERSHIP_ROOT: &str = "MUSHEEN_OWNERSHIP_ROOT";
+
+/// Runs `scenario` in its own user and mount namespace over the folder
+/// `root`, and fails when it fails.
+fn run_ownership_scenario(scenario: &str) {
+    let allowed = std::process::Command::new("unshare")
+        .args(["--map-auto", "--map-root-user", "true"])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !allowed {
+        eprintln!("{scenario}: user namespaces are not allowed here; not checked");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("unshare")
+        .args(["--map-auto", "--map-root-user", "--mount"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "change_ownership_scenario_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(OWNERSHIP_SCENARIO, scenario)
+        .env(OWNERSHIP_ROOT, root.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{scenario} failed inside the namespace:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Counts authorizations and grants each, as pkexec does once it
+/// authenticated.
+#[derive(Clone, Default)]
+struct CountingAuthorizer(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Authorizer for CountingAuthorizer {
+    fn authorize(
+        &self,
+        request: &AuthorizationRequest,
+    ) -> Result<AuthorizationGrant, AuthorizationError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        AllowInvoker.authorize(request)
+    }
+}
+
+fn change_ownership(
+    authorizer: &CountingAuthorizer,
+    items: Vec<OwnershipItem>,
+    owner: Option<u32>,
+    group: Option<u32>,
+    contents: Option<OwnershipContents>,
+) -> Result<OwnershipReport, BrokerError> {
+    let request = BrokerRequest::change_ownership(items, owner, group, contents)?;
+    let broker = Broker::new(
+        authorizer.clone(),
+        SystemOperationRunner::default(),
+        NoopAudit,
+        SystemClock,
+    );
+    match broker.handle(request)? {
+        BrokerOutput::OwnershipChanged(report) => Ok(report),
+        other => panic!("an ownership change answered {other:?}"),
+    }
+}
+
+fn reviewed(path: &Path) -> OwnershipItem {
+    OwnershipItem::reviewed(path).unwrap()
+}
+
+/// The owner, group and mode of `path` itself, a link as the link.
+fn ownership(path: &Path) -> (u32, u32, u32) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::symlink_metadata(path).unwrap();
+    (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777)
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn mount(arguments: &[&str]) {
+    let status = std::process::Command::new("mount")
+        .args(arguments)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mount {arguments:?}");
+}
+
+#[test]
+fn change_ownership_scenario_child() {
+    let (Ok(scenario), Ok(root)) = (
+        std::env::var(OWNERSHIP_SCENARIO),
+        std::env::var(OWNERSHIP_ROOT),
+    ) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let authorizer = CountingAuthorizer::default();
+    let authorizations = || authorizer.0.load(std::sync::atomic::Ordering::SeqCst);
+    match scenario.as_str() {
+        "owners" => {
+            let (file, other, folder) = (root.join("a"), root.join("b"), root.join("d"));
+            fs::write(&file, b"a").unwrap();
+            fs::write(&other, b"b").unwrap();
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("x"), b"x").unwrap();
+            fs::create_dir(folder.join("y")).unwrap();
+            set_mode(&file, 0o640);
+            set_mode(&folder, 0o750);
+            set_mode(&folder.join("x"), 0o600);
+            let report = change_ownership(
+                &authorizer,
+                vec![reviewed(&file), reviewed(&folder)],
+                Some(1000),
+                Some(1001),
+                Some(OwnershipContents {
+                    nested_mounts: false,
+                }),
+            )
+            .unwrap();
+            assert_eq!(report.failure(), None);
+            assert_eq!(report.changed(), 4, "a, d, d/x and d/y");
+            assert_eq!(
+                authorizations(),
+                1,
+                "one authorization for the whole change"
+            );
+            assert_eq!(ownership(&file), (1000, 1001, 0o640), "no mode changes");
+            assert_eq!(ownership(&folder), (1000, 1001, 0o750));
+            assert_eq!(ownership(&folder.join("x")), (1000, 1001, 0o600));
+            assert_eq!(ownership(&folder.join("y")).0, 1000);
+            assert_eq!(ownership(&other).0, 0, "an item not named stays as it is");
+            let group_only =
+                change_ownership(&authorizer, vec![reviewed(&other)], None, Some(1002), None)
+                    .unwrap();
+            assert_eq!(group_only.changed(), 1);
+            assert_eq!(ownership(&other).0, 0, "no owner asked, none changed");
+            assert_eq!(ownership(&other).1, 1002);
+        }
+        "links" => {
+            let outside = root.join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("o"), b"o").unwrap();
+            let link = root.join("l");
+            std::os::unix::fs::symlink(outside.join("o"), &link).unwrap();
+            let folder = root.join("d");
+            fs::create_dir(&folder).unwrap();
+            std::os::unix::fs::symlink(&outside, folder.join("m")).unwrap();
+            let report = change_ownership(
+                &authorizer,
+                vec![reviewed(&link), reviewed(&folder)],
+                Some(1000),
+                None,
+                Some(OwnershipContents {
+                    nested_mounts: false,
+                }),
+            )
+            .unwrap();
+            assert_eq!(report.failure(), None);
+            assert_eq!(report.changed(), 3, "l, d and d/m, each itself");
+            assert_eq!(ownership(&link).0, 1000, "the link itself changed");
+            assert_eq!(ownership(&folder.join("m")).0, 1000);
+            assert_eq!(ownership(&outside.join("o")).0, 0, "never a link's target");
+            assert_eq!(ownership(&outside).0, 0);
+        }
+        "replaced" => {
+            let file = root.join("f");
+            fs::write(&file, b"reviewed").unwrap();
+            let item = reviewed(&file);
+            fs::write(root.join("new"), b"new").unwrap();
+            fs::rename(root.join("new"), &file).unwrap();
+            let refused = change_ownership(&authorizer, vec![item], Some(1000), None, None);
+            assert_eq!(refused, Err(BrokerError::TargetReplaced));
+            assert_eq!(ownership(&file).0, 0);
+            assert_eq!(authorizations(), 0, "refused before it asks");
+
+            // Replaced while authorization was asked.
+            let second = root.join("g");
+            fs::write(&second, b"reviewed").unwrap();
+            let request =
+                BrokerRequest::change_ownership(vec![reviewed(&second)], Some(1000), None, None)
+                    .unwrap();
+            struct Swapping(PathBuf);
+            impl Authorizer for Swapping {
+                fn authorize(
+                    &self,
+                    request: &AuthorizationRequest,
+                ) -> Result<AuthorizationGrant, AuthorizationError> {
+                    let spare = self.0.with_extension("spare");
+                    fs::write(&spare, b"swapped").unwrap();
+                    fs::rename(&spare, &self.0).unwrap();
+                    AllowInvoker.authorize(request)
+                }
+            }
+            let broker = Broker::new(
+                Swapping(second.clone()),
+                SystemOperationRunner::default(),
+                NoopAudit,
+                SystemClock,
+            );
+            assert_eq!(broker.handle(request), Err(BrokerError::TargetReplaced));
+            assert_eq!(ownership(&second).0, 0);
+        }
+        "scope" => {
+            let folder = root.join("d");
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("x"), b"x").unwrap();
+            let mounted = folder.join("mnt");
+            fs::create_dir(&mounted).unwrap();
+            mount(&["-t", "tmpfs", "none", mounted.to_str().unwrap()]);
+            fs::write(mounted.join("z"), b"z").unwrap();
+
+            let alone =
+                change_ownership(&authorizer, vec![reviewed(&folder)], Some(1000), None, None)
+                    .unwrap();
+            assert_eq!(
+                alone.changed(),
+                1,
+                "without Apply to contents, only the folder"
+            );
+            assert_eq!(ownership(&folder.join("x")).0, 0);
+
+            let without_mounts = change_ownership(
+                &authorizer,
+                vec![reviewed(&folder)],
+                Some(1001),
+                None,
+                Some(OwnershipContents {
+                    nested_mounts: false,
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                without_mounts.changed(),
+                2,
+                "d and d/x; not the nested mount"
+            );
+            assert_eq!(ownership(&folder.join("x")).0, 1001);
+            assert_eq!(ownership(&mounted).0, 0, "the nested mount is left out");
+            assert_eq!(ownership(&mounted.join("z")).0, 0);
+
+            let with_mounts = change_ownership(
+                &authorizer,
+                vec![reviewed(&folder)],
+                Some(1002),
+                None,
+                Some(OwnershipContents {
+                    nested_mounts: true,
+                }),
+            )
+            .unwrap();
+            assert_eq!(with_mounts.changed(), 4);
+            assert_eq!(ownership(&mounted.join("z")).0, 1002);
+        }
+        "failure" => {
+            let file = root.join("a");
+            fs::write(&file, b"a").unwrap();
+            let locked = root.join("locked");
+            fs::create_dir(&locked).unwrap();
+            let stuck = locked.join("b");
+            fs::write(&stuck, b"b").unwrap();
+            let after = root.join("c");
+            fs::write(&after, b"c").unwrap();
+            let items = vec![reviewed(&file), reviewed(&stuck), reviewed(&after)];
+            let locked_path = locked.to_str().unwrap();
+            mount(&["--bind", locked_path, locked_path]);
+            mount(&["-o", "remount,bind,ro", locked_path]);
+            let report = change_ownership(&authorizer, items, Some(1000), None, None).unwrap();
+            assert_eq!(report.changed(), 1, "the item before the failure changed");
+            let failure = report.failure().expect("a read-only item fails");
+            assert_eq!(failure.path(), stuck, "the failure names its item");
+            assert_eq!(
+                ownership(&file).0,
+                1000,
+                "items already changed stay changed"
+            );
+            assert_eq!(ownership(&after).0, 0, "the change stops at the failure");
+        }
+        other => panic!("unknown ownership scenario {other}"),
+    }
+}
+
+#[test]
+fn change_ownership_changes_owners_and_groups_after_one_authorization() {
+    run_ownership_scenario("owners");
+}
+
+#[test]
+fn change_ownership_changes_a_link_itself_and_never_its_target() {
+    run_ownership_scenario("links");
+}
+
+#[test]
+fn change_ownership_refuses_an_item_replaced_since_the_review() {
+    run_ownership_scenario("replaced");
+}
+
+#[test]
+fn change_ownership_stays_within_the_reviewed_scope() {
+    run_ownership_scenario("scope");
+}
+
+#[test]
+fn change_ownership_names_the_item_that_failed() {
+    run_ownership_scenario("failure");
 }
