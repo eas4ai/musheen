@@ -4107,20 +4107,20 @@ mod tests {
         let file = temporary.path().join("notes.txt");
         filesystem::write(&file, b"notes").unwrap();
         let (handle, properties) = open_permissions_page(std::slice::from_ref(&file), None, cx);
-        let english = Catalog::load(crate::Locale::EnUs).unwrap();
-        let apply_as_administrator = english
-            .message("properties-apply-as-administrator")
-            .unwrap()
-            .to_owned();
-        let needs_admin = english
-            .message("permissions-needs-admin")
-            .unwrap()
-            .to_owned();
         click_all(
             handle,
             &["permissions-owner-picker", "permissions-owner-option-0"],
             cx,
         );
+        let english = Catalog::load(crate::Locale::EnUs).unwrap();
+        let needs_admin = english
+            .message("permissions-needs-admin")
+            .unwrap()
+            .to_owned();
+        let apply_as_administrator = english
+            .message("properties-apply-as-administrator")
+            .unwrap()
+            .to_owned();
         cx.update_window(handle.into(), |_, window, _| {
             assert_eq!(
                 window.find("permissions-needs-admin").label(),
