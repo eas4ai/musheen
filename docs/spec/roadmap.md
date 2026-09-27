@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: permissions-page
+Current: portal-backend
 
 ## 1. Foundation
 
@@ -321,3 +321,21 @@ editing ACL entries come later. Done when the search-019 check passes on
 the final tree, the workspace tests, cargo fmt --check and clippy with
 warnings denied are clean, and every finding of the review and the report
 is resolved or declined.
+
+## portal-backend
+
+Requirements: SYS-027
+
+Make Musheen's FileChooser portal backend safe and usable. It answers only
+the portal service, refusing every other caller, Close included. Each
+request opens a chooser window of its own: Open picks one file, several
+files or a folder as the request asks; Save picks a folder and a name;
+Save Many picks a folder for the requested names; both ask before they
+replace a file; the request's filters are offered. Only a confirmed
+selection is returned. The package ships musheen.portal and a D-Bus
+activation file; started for a portal request, Musheen opens only the
+chooser, and with the setting off it exits without a window. The package
+installs no portals.conf. Done when the sys-027 check passes on the final
+tree, the workspace tests, cargo fmt --check and clippy with warnings
+denied are clean, and every finding of the review and the report is
+resolved or declined.
