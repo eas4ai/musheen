@@ -1402,6 +1402,7 @@ mod listing_tests {
     };
     use std::path::Path;
 
+    #[derive(Clone)]
     struct At(u64);
 
     impl Clock for At {
