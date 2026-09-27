@@ -40,6 +40,15 @@ install -D -m 0644 \
 install -D -m 0644 \
     "$script_dir/org.musheen.Musheen.service" \
     "$DESTDIR/usr/share/dbus-1/services/org.musheen.Musheen.service"
+# The FileChooser portal backend (SYS-027). The user turns it on with the
+# Integrations setting and a portals.conf line of their own; the package
+# installs no portals.conf.
+install -D -m 0644 \
+    "$script_dir/musheen.portal" \
+    "$DESTDIR/usr/share/xdg-desktop-portal/portals/musheen.portal"
+install -D -m 0644 \
+    "$script_dir/org.freedesktop.impl.portal.desktop.musheen.service" \
+    "$DESTDIR/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.musheen.service"
 install -D -m 0644 \
     "$icon" \
     "$DESTDIR/usr/share/icons/hicolor/scalable/apps/org.musheen.Musheen.svg"

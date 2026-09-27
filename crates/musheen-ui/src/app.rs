@@ -2599,9 +2599,47 @@ struct DesktopPortalClient {
 
 impl Global for DesktopPortalClient {}
 
+/// Whether the Integrations setting chooses Musheen's portal backend.
+#[must_use]
+pub fn portal_backend_enabled(settings: &musheen_desktop::SettingsDocument) -> bool {
+    settings.value("integrations.portal").as_deref() == Some("musheen")
+}
+
+/// Runs Musheen for xdg-desktop-portal, as its D-Bus activation file starts
+/// it (SYS-027). With the Integrations setting on, it serves the
+/// FileChooser backend, opens only chooser windows, and keeps running when
+/// they close, as other portal backends do. With the setting off, or
+/// without the backend built, it returns at once without a window.
+pub fn run_portal_backend() {
+    let settings = musheen_desktop::SettingsStore::for_current_user()
+        .load()
+        .unwrap_or_else(|error| {
+            eprintln!("Musheen could not load settings: {error}");
+            musheen_desktop::SettingsDocument::default()
+        });
+    if !portal_backend_enabled(&settings) {
+        eprintln!("Musheen's portal backend is off in its Integrations settings");
+        return;
+    }
+    #[cfg(feature = "portal-backend")]
+    gpui_kit::application()
+        .with_assets(MusheenAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            cx.set_quit_mode(gpui_kit::QuitMode::Explicit);
+            install_native_theme(cx);
+            if std::env::var_os("MUSHEEN_THEME_PREVIEW").is_none() {
+                crate::settings::apply_appearance(&settings, cx);
+            }
+            install_portal_backend(true, cx);
+        });
+    #[cfg(not(feature = "portal-backend"))]
+    eprintln!("Musheen's portal backend is enabled in settings but was not built");
+}
+
 fn install_desktop_portals(settings: &musheen_desktop::SettingsDocument, cx: &mut App) {
     let sandbox = musheen_desktop::SandboxState::detect();
-    let backend_enabled = settings.value("integrations.portal").as_deref() == Some("musheen");
+    let backend_enabled = portal_backend_enabled(settings);
     let own_backend = backend_enabled.then(|| musheen_desktop::MUSHEEN_PORTAL_BACKEND.into());
     cx.set_global(DesktopPortalClient {
         client: Arc::new(musheen_desktop::PortalClient::new(
@@ -2613,7 +2651,7 @@ fn install_desktop_portals(settings: &musheen_desktop::SettingsDocument, cx: &mu
     });
     #[cfg(feature = "portal-backend")]
     if backend_enabled {
-        install_portal_backend(cx);
+        install_portal_backend(false, cx);
     }
     #[cfg(not(feature = "portal-backend"))]
     if backend_enabled {
@@ -2678,8 +2716,10 @@ impl musheen_desktop::BackendChooserUi for GpuiPortalChooser {
     }
 }
 
+/// The chooser side of the portal backend: each request it receives opens a
+/// chooser window of its own (SYS-027).
 #[cfg(feature = "portal-backend")]
-fn install_portal_backend(cx: &mut App) {
+fn portal_chooser_ui(cx: &mut App) -> GpuiPortalChooser {
     let (requests, receiver) = async_channel::bounded(16);
     cx.spawn(async move |cx| {
         while let Ok(envelope) = receiver.recv().await {
@@ -2687,6 +2727,34 @@ fn install_portal_backend(cx: &mut App) {
         }
     })
     .detach();
+    GpuiPortalChooser { requests }
+}
+
+/// Serves the portal backend. `alone` is a start for the portal only: when
+/// the backend's name cannot be claimed, or the bus goes away, there is
+/// nothing left to do and Musheen ends. Otherwise the backend is claimed
+/// again after a failure, waiting longer each time.
+#[cfg(feature = "portal-backend")]
+fn install_portal_backend(alone: bool, cx: &mut App) {
+    let chooser = Arc::new(portal_chooser_ui(cx));
+    if alone {
+        cx.spawn(async move |cx| {
+            match musheen_desktop::serve_file_chooser_backend(
+                None,
+                chooser,
+                musheen_desktop::MUSHEEN_PORTAL_BACKEND,
+                ApplicationIdentity::ID,
+            )
+            .await
+            {
+                Ok(connection) => connection.closed().await,
+                Err(error) => eprintln!("Musheen could not export its portal backend: {error}"),
+            }
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+        return;
+    }
     let retry_executor = cx.background_executor().clone();
     cx.background_executor()
         .spawn(async move {
@@ -2694,9 +2762,7 @@ fn install_portal_backend(cx: &mut App) {
             loop {
                 match musheen_desktop::serve_file_chooser_backend(
                     None,
-                    Arc::new(GpuiPortalChooser {
-                        requests: requests.clone(),
-                    }),
+                    Arc::clone(&chooser),
                     musheen_desktop::MUSHEEN_PORTAL_BACKEND,
                     ApplicationIdentity::ID,
                 )
@@ -2719,19 +2785,7 @@ fn install_portal_backend(cx: &mut App) {
 
 #[cfg(feature = "portal-backend")]
 fn route_portal_chooser(envelope: PortalChooserEnvelope, cx: &mut App) {
-    let target = cx
-        .global::<FileManagerWindows>()
-        .entries
-        .iter()
-        .rev()
-        .find_map(|entry| entry.view.upgrade());
-    let Some(view) = target else {
-        let _ = envelope
-            .response
-            .try_send(musheen_desktop::BackendChooserDecision::Cancelled);
-        return;
-    };
-    view.update(cx, |state, cx| state.open_portal_chooser(envelope, cx));
+    crate::dialogs::open_portal_chooser(envelope.request, envelope.response, cx);
 }
 
 fn install_file_manager1(cx: &mut App) {
@@ -10033,62 +10087,6 @@ impl MusheenApp {
                 this.resolve_context_destination(pending.clone(), destination.clone(), cx);
             }
             ContextDestinationEvent::Cancelled => this.cancel_context_destination(cx),
-        });
-        self.conflict_subscriptions.push(subscription);
-    }
-
-    #[cfg(feature = "portal-backend")]
-    fn open_portal_chooser(&mut self, envelope: PortalChooserEnvelope, cx: &mut Context<Self>) {
-        if self.browser_input_blocked() {
-            let _ = envelope
-                .response
-                .try_send(musheen_desktop::BackendChooserDecision::Cancelled);
-            return;
-        }
-        let tab_id = self.navigation.focused_tab().id();
-        let choices = self.context_destination_choices(tab_id);
-        let strings = ContextDialogStrings::from_catalog(&self.catalog);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(520.), px(540.)), cx)),
-            titlebar: Some(TitlebarOptions {
-                title: Some(SharedString::from(envelope.request.title().to_owned())),
-                ..TitlebarOptions::default()
-            }),
-            window_min_size: Some(size(px(440.), px(300.))),
-            ..WindowOptions::default()
-        };
-        let mut dialog = None;
-        let dialog_window = match cx.open_window(options, |window, cx| {
-            let view = cx.new(|cx| ContextDestinationDialog::new(choices, strings, window, cx));
-            dialog = Some(view.clone());
-            cx.new(|cx| Root::new(view, window, cx))
-        }) {
-            Ok(window) => window,
-            Err(_) => {
-                let _ = envelope
-                    .response
-                    .try_send(musheen_desktop::BackendChooserDecision::Cancelled);
-                return;
-            }
-        };
-        self.track_context_dialog_window(dialog_window.window_id(), Some(tab_id), cx);
-        let dialog = dialog.expect("the portal chooser constructs its view");
-        let response = envelope.response;
-        let subscription = cx.subscribe(&dialog, move |_, _, event, _| {
-            let decision = match event {
-                ContextDestinationEvent::Chosen(destination) => {
-                    let paths = destination
-                        .as_unix_path()
-                        .map(Path::to_path_buf)
-                        .into_iter()
-                        .collect();
-                    musheen_desktop::BackendChooserDecision::Confirmed(paths)
-                }
-                ContextDestinationEvent::Cancelled => {
-                    musheen_desktop::BackendChooserDecision::Cancelled
-                }
-            };
-            let _ = response.try_send(decision);
         });
         self.conflict_subscriptions.push(subscription);
     }
@@ -35348,6 +35346,19 @@ mod tests {
         });
     }
 
+    #[test]
+    fn portal_backend_start_needs_the_setting() {
+        let mut settings = musheen_desktop::SettingsDocument::default();
+        assert!(
+            !portal_backend_enabled(&settings),
+            "the backend is off by default"
+        );
+        settings
+            .set_value("integrations.portal", "musheen")
+            .expect("the setting accepts musheen");
+        assert!(portal_backend_enabled(&settings));
+    }
+
     #[cfg(feature = "portal-backend")]
     type PortalBackend = musheen_desktop::AshpdFileChooserBackend<GpuiPortalChooser>;
 
@@ -35373,23 +35384,10 @@ mod tests {
     /// each request reaches the app as it would from xdg-desktop-portal.
     #[cfg(feature = "portal-backend")]
     fn portal_backend(cx: &mut TestAppContext) -> Arc<PortalBackend> {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            if !cx.has_global::<FileManagerWindows>() {
-                cx.set_global(FileManagerWindows::default());
-            }
-        });
-        let (requests, receiver) = async_channel::bounded(16);
-        cx.update(|cx| {
-            cx.spawn(async move |cx| {
-                while let Ok(envelope) = receiver.recv().await {
-                    cx.update(|cx| route_portal_chooser(envelope, cx));
-                }
-            })
-            .detach();
-        });
+        cx.update(gpui_kit::init);
+        let chooser = cx.update(portal_chooser_ui);
         Arc::new(musheen_desktop::AshpdFileChooserBackend::new(
-            Arc::new(GpuiPortalChooser { requests }),
+            Arc::new(chooser),
             ApplicationIdentity::ID,
         ))
     }

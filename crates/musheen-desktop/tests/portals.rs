@@ -510,11 +510,8 @@ mod backend {
             )
             .await
             .unwrap();
-            let client = zbus::connection::Builder::address(bus.address.as_str())
-                .unwrap()
-                .build()
-                .await
-                .unwrap();
+            // The portal service calls, and may close its own request.
+            let client = bus_caller(&bus, true).await;
             let chooser = zbus::Proxy::new(
                 &client,
                 "org.example.MusheenPortal",
@@ -741,5 +738,155 @@ mod backend {
                 "the request was not cancelled"
             );
         });
+    }
+
+    /// Records each request and confirms `answer`.
+    struct RecordingUi {
+        requests: Arc<Mutex<Vec<BackendChooserRequest>>>,
+        answer: Vec<PathBuf>,
+    }
+
+    impl BackendChooserUi for RecordingUi {
+        fn choose(
+            &self,
+            request: BackendChooserRequest,
+            _cancellation: CancellationToken,
+        ) -> BoxFuture<'static, Result<BackendChooserDecision, PortalError>> {
+            self.requests.lock().unwrap().push(request);
+            let answer = self.answer.clone();
+            Box::pin(async move { Ok(BackendChooserDecision::Confirmed(answer)) })
+        }
+    }
+
+    /// `path` as the portal sends it.
+    fn portal_file_path(path: &str) -> ashpd::FilePath {
+        use serde::Deserialize as _;
+
+        let mut bytes = path.as_bytes().to_vec();
+        bytes.push(0);
+        ashpd::FilePath::deserialize(serde::de::value::SeqDeserializer::<
+            _,
+            serde::de::value::Error,
+        >::new(bytes.into_iter()))
+        .unwrap()
+    }
+
+    #[test]
+    fn portal_backend_requests_carry_the_callers_options() {
+        use ashpd::desktop::file_chooser::{FileFilter, SaveFileOptions, SaveFilesOptions};
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let two = AshpdFileChooserBackend::new(
+            Arc::new(RecordingUi {
+                requests: Arc::clone(&requests),
+                answer: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
+            }),
+            "com.github.musheen.Musheen",
+        );
+        let caller = || Some(MaybeAppID::from("org.example.Caller"));
+        let text = FileFilter::new("Text").glob("*.txt");
+        let images = FileFilter::new("Images").mimetype("image/*");
+        let options = OpenFileOptions::default()
+            .set_multiple(true)
+            .set_current_folder(portal_file_path("/tmp/start"))
+            .set_filters([text])
+            .set_current_filter(images);
+        let selected = futures_lite::future::block_on(two.open_file(
+            "open".parse().unwrap(),
+            caller(),
+            None,
+            "Open",
+            options,
+        ))
+        .unwrap();
+        assert_eq!(selected.uris().len(), 2);
+        let request = requests.lock().unwrap().pop().unwrap();
+        assert!(request.multiple());
+        assert!(!request.directory());
+        assert_eq!(
+            request.current_folder(),
+            Some(std::path::Path::new("/tmp/start"))
+        );
+        assert_eq!(
+            request
+                .filters()
+                .iter()
+                .map(|filter| filter.label())
+                .collect::<Vec<_>>(),
+            ["Text", "Images"],
+            "a current filter the list lacks is added"
+        );
+        assert_eq!(request.current_filter(), Some(1));
+
+        let refused = futures_lite::future::block_on(two.open_file(
+            "single".parse().unwrap(),
+            caller(),
+            None,
+            "Open",
+            OpenFileOptions::default(),
+        ));
+        assert!(
+            matches!(refused, Err(ashpd::PortalError::InvalidArgument(_))),
+            "two files for a request that asked for one are refused"
+        );
+
+        let save = futures_lite::future::block_on(two.save_file(
+            "save".parse().unwrap(),
+            caller(),
+            None,
+            "Save",
+            SaveFileOptions::default().set_current_file(portal_file_path("/tmp/folder/report.txt")),
+        ));
+        assert!(save.is_err(), "Save returns one path");
+        let request = requests.lock().unwrap().pop().unwrap();
+        assert_eq!(
+            request.current_folder(),
+            Some(std::path::Path::new("/tmp/folder"))
+        );
+        assert_eq!(request.current_name(), Some("report.txt"));
+
+        let escaping = futures_lite::future::block_on(
+            two.save_files(
+                "save_many".parse().unwrap(),
+                caller(),
+                None,
+                "Save",
+                SaveFilesOptions::default()
+                    .set_files([portal_file_path("a.txt"), portal_file_path("../b.txt")]),
+            ),
+        );
+        assert!(
+            matches!(escaping, Err(ashpd::PortalError::InvalidArgument(_))),
+            "a name that could leave the folder is refused"
+        );
+    }
+
+    #[test]
+    fn portal_backend_filters_match_names_and_mime_types() {
+        use ashpd::desktop::file_chooser::FileFilter;
+        use musheen_desktop::ChooserFilter;
+        use std::ffi::OsStr;
+
+        let images = ChooserFilter::from(
+            &FileFilter::new("Images")
+                .glob("*.[pP][nN][gG]")
+                .glob("photo-??.jpg")
+                .mimetype("image/*"),
+        );
+        assert!(images.matches(OsStr::new("a.png"), None));
+        assert!(images.matches(OsStr::new("A.PNG"), None));
+        assert!(images.matches(OsStr::new("photo-01.jpg"), None));
+        assert!(!images.matches(OsStr::new("photo-1.jpg"), None));
+        assert!(images.matches(OsStr::new("scan"), Some("image/tiff")));
+        assert!(!images.matches(OsStr::new("notes.txt"), Some("text/plain")));
+        assert!(images.needs_mime_types());
+
+        let not_a = ChooserFilter::from(&FileFilter::new("Not a").glob("[!a]*"));
+        assert!(not_a.matches(OsStr::new("b"), None));
+        assert!(!not_a.matches(OsStr::new("a"), None));
+        assert!(!not_a.needs_mime_types());
+        let exact = ChooserFilter::from(&FileFilter::new("Make").glob("Makefile"));
+        assert!(exact.matches(OsStr::new("Makefile"), None));
+        assert!(!exact.matches(OsStr::new("Makefile.am"), None));
     }
 }

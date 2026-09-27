@@ -156,6 +156,39 @@ fn is_specific(value: &str) -> bool {
     )
 }
 
+/// MIME types judged from file names alone, with the shared MIME database
+/// loaded once for many names. Nothing is opened or read.
+pub struct NameMimeTypes {
+    database: xdg_mime::SharedMimeInfo,
+}
+
+impl NameMimeTypes {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            database: xdg_mime::SharedMimeInfo::new(),
+        }
+    }
+
+    /// The MIME type the name `name` suggests, if a specific one.
+    #[must_use]
+    pub fn mime_type(&self, name: &OsStr) -> Option<Box<str>> {
+        let name = name.to_str()?;
+        self.database
+            .get_mime_types_from_file_name(name)
+            .into_iter()
+            .map(|mime| mime.to_string())
+            .find(|mime| is_specific(mime))
+            .map(String::into_boxed_str)
+    }
+}
+
+impl Default for NameMimeTypes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct XdgMimeBackend;
 
 impl MimeBackend for XdgMimeBackend {

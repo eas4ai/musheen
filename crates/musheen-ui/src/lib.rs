@@ -25,7 +25,10 @@ pub mod theme;
 pub mod toolbar;
 pub mod views;
 
-pub use app::{installed_static_command_actions, installed_static_shortcut_bindings, run};
+pub use app::{
+    installed_static_command_actions, installed_static_shortcut_bindings, portal_backend_enabled,
+    run, run_portal_backend,
+};
 pub use dialogs::*;
 pub use directory::{
     ApplyPageResult, DirectoryLoad, DirectoryModel, DirectoryState, enumerate_directory,
