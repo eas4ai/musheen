@@ -54,24 +54,60 @@ pub fn all_groups() -> Vec<(u32, String)> {
     all_accounts("group")
 }
 
+/// How long listing an account database may take before the local file
+/// is read instead: a directory service that does not answer must not hold
+/// the Properties window.
+const LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The entries of an account database. `getent` sees every source the
 /// system uses (files, systemd, a directory service that allows listing);
-/// without it, the local file is read.
+/// without it, or when it takes too long, the local file is read.
 fn all_accounts(database: &str) -> Vec<(u32, String)> {
-    let listing = std::process::Command::new("getent")
-        .arg(database)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| output.stdout)
+    let listing = getent(database)
         .or_else(|| std::fs::read(format!("/etc/{database}")).ok())
         .unwrap_or_default();
     let mut accounts = parse_accounts(&listing);
     accounts.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
     accounts.dedup();
     accounts
+}
+
+/// The output of `getent <database>`, or `None` when getent is missing,
+/// fails, or runs longer than [`LISTING_TIMEOUT`]. Its output is read on its
+/// own thread, so a long listing cannot fill the pipe and stall it.
+fn getent(database: &str) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut child = std::process::Command::new("getent")
+        .arg(database)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = std::time::Instant::now() + LISTING_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let bytes = reader.join().ok()?.ok()?;
+    status
+        .filter(std::process::ExitStatus::success)
+        .map(|_| bytes)
 }
 
 /// `name:password:id:...` lines, as passwd and group files hold them.

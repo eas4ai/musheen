@@ -4,9 +4,9 @@ use musheen_desktop::privilege::{
     AuditOutcome, AuditPhase, AuditRecord, AuditSink, AuthorizationError, AuthorizationGrant,
     AuthorizationRequest, Authorizer, Broker, BrokerError, BrokerLaunch, BrokerOperation,
     BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, Clock, ElevatedRootReference,
-    JsonAuditLog, OperationRunner, OwnershipReport, PrivilegeProvider, ProcessBrokerTransport,
-    RootGrant, RootedStore, SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest,
-    encode_broker_response,
+    JsonAuditLog, OperationRunner, OwnershipContents, OwnershipItem, OwnershipReport,
+    PrivilegeProvider, ProcessBrokerTransport, RootGrant, RootedStore, SudoPtyBrokerTransport,
+    SystemOperationRunner, ValidatedRequest, encode_broker_response,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -909,4 +909,48 @@ fn broker_rejects_missing_invalid_and_conflicting_elevation_provenance() {
         missing_sudo.bind_to_invoker(PrivilegeProvider::Sudo, &BTreeMap::new(), caller_pid),
         Err(BrokerError::AuthorizationDenied)
     );
+}
+
+#[test]
+fn audit_records_an_ownership_changes_owner_group_scope_and_items() {
+    let root = tempfile::tempdir().unwrap();
+    let (first, second) = (root.path().join("a"), root.path().join("b"));
+    fs::write(&first, b"a").unwrap();
+    fs::write(&second, b"b").unwrap();
+    let audit = RecordingAudit::default();
+    let request = BrokerRequest::change_ownership(
+        vec![
+            OwnershipItem::reviewed(&first).unwrap(),
+            OwnershipItem::reviewed(&second).unwrap(),
+        ],
+        Some(1000),
+        None,
+        Some(OwnershipContents {
+            nested_mounts: false,
+        }),
+    )
+    .unwrap();
+    let _ = broker(
+        FakeAuthorizer::granting(1_000),
+        RecordingRunner::default(),
+        audit.clone(),
+        FixedClock::new(100),
+    )
+    .handle(request);
+    let records = audit.0.lock().unwrap();
+    assert!(!records.is_empty());
+    for record in records.iter() {
+        let change = record
+            .change()
+            .expect("an ownership record says what it sets");
+        for part in [
+            "owner=1000",
+            "group=-",
+            "scope=contents",
+            "items=2",
+            "request=",
+        ] {
+            assert!(change.contains(part), "{change} has {part}");
+        }
+    }
 }

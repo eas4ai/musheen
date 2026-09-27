@@ -1770,11 +1770,15 @@ impl MetadataProvider for LocalStore {
         // changes through the empty-path form, and the mode through the
         // open file's /proc entry. Owner, group and mode are decided from
         // the opened file, so a change made since the preview is kept and an
-        // entry that already matches is left as it is.
+        // entry that already matches is left as it is. The mode changes
+        // before the owner and group, as SEARCH-019 says; the kernel may
+        // then clear set-user-ID or set-group-ID, which the page shows.
         let found = rustix::fs::fstat(&target).map_err(map_errno)?;
         let owner = change.owner_for(found.st_uid);
         let group = change.group_for(found.st_gid);
-        let mut current = found.st_mode;
+        if let Some(mode) = change.mode_for(found.st_mode & 0o7777) {
+            rustix::fs::chmod(&proc_path, Mode::from_raw_mode(mode)).map_err(map_errno)?;
+        }
         if owner.is_some() || group.is_some() {
             let flags = if entry.kind() == MetadataEntryKind::SymbolicLink {
                 AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW
@@ -1789,11 +1793,6 @@ impl MetadataProvider for LocalStore {
                 flags,
             )
             .map_err(map_errno)?;
-            // The kernel may have cleared set-user-ID or set-group-ID.
-            current = rustix::fs::fstat(&target).map_err(map_errno)?.st_mode;
-        }
-        if let Some(mode) = change.mode_for(current & 0o7777) {
-            rustix::fs::chmod(&proc_path, Mode::from_raw_mode(mode)).map_err(map_errno)?;
         }
         if let Some(acl) = change.access_acl() {
             apply_acl(&proc_path, acl, false)?;

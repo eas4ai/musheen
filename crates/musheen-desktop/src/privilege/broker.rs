@@ -24,6 +24,9 @@ use musheen_core::CancellationToken;
 pub const SUDO_BROKER_READY: &str = "MUSHEEN_BROKER_READY";
 pub const BROKER_REQUEST_FRAME: &str = "MUSHEEN_REQUEST ";
 pub const BROKER_RESPONSE_FRAME: &str = "MUSHEEN_RESPONSE ";
+/// A line an ownership change writes while it walks: how many items it
+/// changed so far and the item it reached (SYS-037).
+pub const BROKER_PROGRESS_FRAME: &str = "MUSHEEN_PROGRESS ";
 pub const INSTALLED_BROKER_PATH: &str = "/usr/lib/musheen/musheen-broker";
 const MAX_BROKER_OUTPUT: usize = 1024 * 1024;
 
@@ -538,9 +541,20 @@ pub struct AuditRecord {
     phase: AuditPhase,
     outcome: AuditOutcome,
     timestamp_unix_millis: u64,
+    /// What an ownership change sets and over how much: the owner, the
+    /// group, the scope, the number of items and a digest of the request,
+    /// as the target names only its first item (SYS-037).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    change: Option<Box<str>>,
 }
 
 impl AuditRecord {
+    /// What an ownership change set, when the record is of one.
+    #[must_use]
+    pub fn change(&self) -> Option<&str> {
+        self.change.as_deref()
+    }
+
     #[must_use]
     pub fn target(&self) -> &Path {
         &self.target
@@ -867,11 +881,21 @@ impl ProcessBrokerTransport {
             channel.stop_now();
             return Err(BrokerError::BrokerCrashed);
         }
-        match channel.next_response(deadline, cancellation) {
+        // An ownership change reports progress while it walks; each report
+        // gives it the full timeout again (SYS-037).
+        let mut progress = OwnershipProgressSeen::default();
+        let answer =
+            channel.next_response_seeing(deadline, self.timeout, cancellation, &mut |line| {
+                progress.see(line)
+            });
+        match answer {
             Ok(response) => Ok((decode_broker_response(&response)?, channel)),
             Err(error) => {
                 channel.stop_now();
-                Err(start_error(error))
+                match progress.ended(start_error(error)) {
+                    Ok(output) => Ok((output, channel)),
+                    Err(error) => Err(error),
+                }
             }
         }
     }
@@ -1049,7 +1073,8 @@ impl SudoPtyBrokerTransport {
                 master: pty.master,
             }),
         );
-        let deadline = Instant::now() + self.timeout;
+        let mut deadline = Instant::now() + self.timeout;
+        let mut progress = OwnershipProgressSeen::default();
         let mut request_sent = false;
         let mut authentication_sent = false;
         let mut denied = false;
@@ -1098,6 +1123,8 @@ impl SudoPtyBrokerTransport {
                     request_sent = true;
                 } else if line.contains("Sorry, try again.") {
                     denied = true;
+                } else if request_sent && progress.see(&line) {
+                    deadline = Instant::now() + self.timeout;
                 } else if request_sent && line.starts_with(BROKER_RESPONSE_FRAME) {
                     break 'handshake decode_broker_response(&line);
                 }
@@ -1107,7 +1134,10 @@ impl SudoPtyBrokerTransport {
             Ok(output) => Ok((output, channel)),
             Err(error) => {
                 channel.stop_now();
-                Err(error)
+                match progress.ended(error) {
+                    Ok(output) => Ok((output, channel)),
+                    Err(error) => Err(error),
+                }
             }
         }
     }
@@ -1389,9 +1419,9 @@ where
         }
         let before = match ValidatedTarget::open(request.operation()) {
             Ok(target) => target,
-            Err(error) => {
+            Err(refusal) => {
                 self.record(&request, AuditPhase::Completion, AuditOutcome::Failed)?;
-                return Err(error);
+                return refusal.into_result();
             }
         };
         let authorization = AuthorizationRequest::from_broker_request(&request, self.provider);
@@ -1417,9 +1447,9 @@ where
         self.record(&request, AuditPhase::Authorization, AuditOutcome::Succeeded)?;
         let after = match ValidatedTarget::open(request.operation()) {
             Ok(target) => target,
-            Err(error) => {
+            Err(refusal) => {
                 self.record(&request, AuditPhase::Completion, AuditOutcome::Failed)?;
-                return Err(error);
+                return refusal.into_result();
             }
         };
         if before.identity != after.identity {
@@ -1454,6 +1484,36 @@ where
         phase: AuditPhase,
         outcome: AuditOutcome,
     ) -> Result<(), BrokerError> {
+        let change = match request.operation() {
+            BrokerOperation::ChangeOwnership {
+                items,
+                owner,
+                group,
+                contents,
+            } => {
+                let id = |id: &Option<u32>| id.map_or_else(|| "-".to_owned(), |id| id.to_string());
+                let scope = match contents {
+                    None => "items",
+                    Some(OwnershipContents {
+                        nested_mounts: false,
+                    }) => "contents",
+                    Some(OwnershipContents {
+                        nested_mounts: true,
+                    }) => "contents-and-nested-mounts",
+                };
+                Some(
+                    format!(
+                        "owner={} group={} scope={scope} items={} request={}",
+                        id(owner),
+                        id(group),
+                        items.len(),
+                        request.operation_digest().to_hex()
+                    )
+                    .into(),
+                )
+            }
+            _ => None,
+        };
         let record = AuditRecord {
             request_id: request.id().into(),
             operation: request.operation().command_label().into(),
@@ -1462,6 +1522,7 @@ where
             phase,
             outcome,
             timestamp_unix_millis: self.clock.now_unix_millis(),
+            change,
         };
         self.audit.record(&record)
     }
@@ -1474,7 +1535,7 @@ struct ValidatedTarget {
 }
 
 impl ValidatedTarget {
-    fn open(operation: &BrokerOperation) -> Result<Self, BrokerError> {
+    fn open(operation: &BrokerOperation) -> Result<Self, TargetRefusal> {
         if let BrokerOperation::ChangeOwnership { items, .. } = operation {
             return Self::open_ownership_items(items);
         }
@@ -1487,13 +1548,13 @@ impl ValidatedTarget {
         if matches!(operation, BrokerOperation::RunExecutable { .. })
             && (!metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0)
         {
-            return Err(BrokerError::NotExecutable);
+            return Err(BrokerError::NotExecutable.into());
         }
         if matches!(operation, BrokerOperation::RunExecutable { .. })
             && (!executable_mode_is_trusted(metadata.uid(), metadata.permissions().mode())
                 || executable_has_access_acl(&file)?)
         {
-            return Err(BrokerError::UnsafeExecutable);
+            return Err(BrokerError::UnsafeExecutable.into());
         }
         Ok(Self {
             identity: FileIdentity::from_metadata(&metadata),
@@ -1505,11 +1566,13 @@ impl ValidatedTarget {
 impl ValidatedTarget {
     /// Opens every item of an ownership change as it is, a symbolic link as
     /// the link, and checks that each is still the file the user reviewed on
-    /// a filesystem with POSIX ownership. The first item is the target.
-    fn open_ownership_items(items: &[OwnershipItem]) -> Result<Self, BrokerError> {
+    /// a filesystem with POSIX ownership. The first item is the target; the
+    /// first item that fails is named.
+    fn open_ownership_items(items: &[OwnershipItem]) -> Result<Self, TargetRefusal> {
         let mut first = None;
         for item in items {
-            let (file, metadata) = open_ownership_item(item)?;
+            let (file, metadata) = open_ownership_item(item)
+                .map_err(|error| TargetRefusal::Item(OwnershipFailure::new(item.path(), &error)))?;
             if first.is_none() {
                 first = Some(Self {
                     identity: FileIdentity::from_metadata(&metadata),
@@ -1517,7 +1580,33 @@ impl ValidatedTarget {
                 });
             }
         }
-        first.ok_or(BrokerError::InvalidRequest)
+        first.ok_or(TargetRefusal::Error(BrokerError::InvalidRequest))
+    }
+}
+
+/// Why a request's target was refused. An ownership change names the item
+/// it stopped at, as its report, so the user can tell which one it was
+/// (SYS-037).
+enum TargetRefusal {
+    Error(BrokerError),
+    Item(OwnershipFailure),
+}
+
+impl From<BrokerError> for TargetRefusal {
+    fn from(error: BrokerError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl TargetRefusal {
+    fn into_result(self) -> Result<BrokerOutput, BrokerError> {
+        match self {
+            Self::Error(error) => Err(error),
+            Self::Item(failure) => Ok(BrokerOutput::OwnershipChanged(OwnershipReport::new(
+                0,
+                Some(failure),
+            ))),
+        }
     }
 }
 
@@ -1544,6 +1633,36 @@ fn open_ownership_item(item: &OwnershipItem) -> Result<(File, std::fs::Metadata)
     Ok((file, metadata))
 }
 
+/// Whether an ownership change touches an entry of this type: files,
+/// folders and symbolic links. Sockets, pipes and devices are left as they
+/// are, as the Permissions page says (SEARCH-019).
+fn ownership_changes_kind(metadata: &std::fs::Metadata) -> bool {
+    let kind = metadata.file_type();
+    kind.is_file() || kind.is_dir() || kind.is_symlink()
+}
+
+/// The mount a file is on: its mount ID where the kernel reports one, as
+/// the local store tells mounts apart, else its device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MountIdentity {
+    Mount(u64),
+    Device(u64),
+}
+
+fn mount_identity(file: &File, metadata: &std::fs::Metadata) -> MountIdentity {
+    rustix::fs::statx(
+        file,
+        "",
+        rustix::fs::AtFlags::EMPTY_PATH,
+        rustix::fs::StatxFlags::MNT_ID,
+    )
+    .ok()
+    .filter(|statx| statx.stx_mask & rustix::fs::StatxFlags::MNT_ID.bits() != 0)
+    .map_or(MountIdentity::Device(metadata.dev()), |statx| {
+        MountIdentity::Mount(statx.stx_mnt_id)
+    })
+}
+
 /// The owner and group an ownership change sets; `None` keeps one.
 #[derive(Clone, Copy, Debug)]
 struct OwnershipChange {
@@ -1552,154 +1671,284 @@ struct OwnershipChange {
 }
 
 impl OwnershipChange {
-    /// Changes `file`, opened without following a link, and never its mode:
-    /// the kernel alone clears setuid and setgid bits on an owner change.
-    fn apply(self, file: &File) -> Result<(), BrokerError> {
+    /// Changes `file`, opened without following a link, when its owner or
+    /// group differs from the one asked for, and returns whether it did. An
+    /// entry that already matches is not touched: any chown would make the
+    /// kernel clear its setuid and setgid bits and file capabilities. The
+    /// broker never changes a mode itself.
+    fn apply(self, file: &File, metadata: &std::fs::Metadata) -> Result<bool, BrokerError> {
+        let owner = self.owner.filter(|owner| *owner != metadata.uid());
+        let group = self.group.filter(|group| *group != metadata.gid());
+        if owner.is_none() && group.is_none() {
+            return Ok(false);
+        }
         rustix::fs::chownat(
             file,
             "",
-            self.owner.map(rustix::fs::Uid::from_raw),
-            self.group.map(rustix::fs::Gid::from_raw),
+            owner.map(rustix::fs::Uid::from_raw),
+            group.map(rustix::fs::Gid::from_raw),
             rustix::fs::AtFlags::EMPTY_PATH,
         )
-        .map_err(map_open_error)
+        .map_err(map_open_error)?;
+        Ok(true)
     }
 }
 
-/// Changes each item, then what its folders contain when `contents` says
-/// so, and stops at the first item it cannot change. Items changed before
-/// that stay changed.
-fn change_ownership(
-    items: &[OwnershipItem],
+/// How often an ownership change reports how far it got.
+const OWNERSHIP_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Hears how many items an ownership change changed so far and the item it
+/// is at, at most once each [`OWNERSHIP_PROGRESS_INTERVAL`], so Musheen can
+/// tell a long change from a stalled one and say where it stopped.
+pub type OwnershipProgress = Arc<dyn Fn(u64, &Path) + Send + Sync>;
+
+/// One ownership change as it walks: what it sets, its scope, its report so
+/// far and where progress goes.
+struct OwnershipWalk<'a> {
     change: OwnershipChange,
     contents: Option<OwnershipContents>,
-) -> OwnershipReport {
-    let mut report = OwnershipReport::new(0, None);
-    for item in items {
-        let changed = open_ownership_item(item)
-            .map_err(|error| (item.path().to_path_buf(), error))
-            .and_then(|(file, metadata)| {
-                change
-                    .apply(&file)
-                    .map_err(|error| (item.path().to_path_buf(), error))?;
-                report.changed += 1;
-                match contents {
-                    Some(contents) if metadata.is_dir() => change_contents(
-                        &file,
-                        item.path(),
-                        metadata.dev(),
-                        change,
-                        contents,
-                        &mut report,
-                    ),
-                    _ => Ok(()),
-                }
-            });
-        if let Err((path, error)) = changed {
-            report.failure = Some(OwnershipFailure::new(path, &error));
-            break;
-        }
-    }
-    report
+    report: OwnershipReport,
+    progress: Option<&'a OwnershipProgress>,
+    reported: Option<Instant>,
 }
 
-/// Changes everything inside `folder`, depth first. It opens each entry
-/// without following a link, so a link is changed itself and never leads
-/// anywhere, and it leaves out a nested mount, and all it holds, unless
-/// `contents` includes nested mounts.
-fn change_contents(
-    folder: &File,
-    path: &Path,
-    device: u64,
-    change: OwnershipChange,
-    contents: OwnershipContents,
-    report: &mut OwnershipReport,
-) -> Result<(), (PathBuf, BrokerError)> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let failed = |error| (path.to_path_buf(), error);
-    let listing = File::from(
-        openat(
-            folder,
-            ".",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(map_open_error)
-        .map_err(failed)?,
-    );
-    let mut names = Vec::new();
-    for entry in rustix::fs::Dir::read_from(&listing).map_err(|_| failed(BrokerError::Io))? {
-        let entry = entry.map_err(|_| failed(BrokerError::Io))?;
-        let name = entry.file_name();
-        if name != c"." && name != c".." {
-            names.push(name.to_owned());
+impl OwnershipWalk<'_> {
+    /// Changes `file` at `path` if it needs it, and reports progress.
+    fn visit(
+        &mut self,
+        file: &File,
+        metadata: &std::fs::Metadata,
+        path: &Path,
+    ) -> Result<(), (PathBuf, BrokerError)> {
+        if self
+            .change
+            .apply(file, metadata)
+            .map_err(|error| (path.to_path_buf(), error))?
+        {
+            self.report.changed += 1;
         }
+        if let Some(progress) = self.progress {
+            let now = Instant::now();
+            if self
+                .reported
+                .is_none_or(|reported| now.duration_since(reported) >= OWNERSHIP_PROGRESS_INTERVAL)
+            {
+                self.reported = Some(now);
+                progress(self.report.changed, path);
+            }
+        }
+        Ok(())
     }
-    for name in names {
-        let entry_path = path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
-        let failed = |error| (entry_path.clone(), error);
-        let entry = File::from(
+
+    /// Changes everything inside `folder`, depth first. It opens each entry
+    /// without following a link, so a link is changed itself and never
+    /// leads anywhere; it leaves sockets, pipes and devices as they are; and
+    /// it leaves out a nested mount, and all it holds, unless the scope
+    /// includes nested mounts.
+    fn contents(
+        &mut self,
+        folder: &File,
+        path: &Path,
+        mount: MountIdentity,
+    ) -> Result<(), (PathBuf, BrokerError)> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let Some(contents) = self.contents else {
+            return Ok(());
+        };
+        let failed = |error| (path.to_path_buf(), error);
+        let listing = File::from(
             openat(
-                &listing,
-                name.as_c_str(),
-                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                folder,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(map_open_error)
             .map_err(failed)?,
         );
-        let metadata = entry.metadata().map_err(|_| failed(BrokerError::Io))?;
-        if metadata.dev() != device {
-            if !contents.nested_mounts {
+        let mut names = Vec::new();
+        for entry in rustix::fs::Dir::read_from(&listing).map_err(|_| failed(BrokerError::Io))? {
+            let entry = entry.map_err(|_| failed(BrokerError::Io))?;
+            let name = entry.file_name();
+            if name != c"." && name != c".." {
+                names.push(name.to_owned());
+            }
+        }
+        for name in names {
+            let entry_path = path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+            let failed = |error| (entry_path.clone(), error);
+            let entry = File::from(
+                openat(
+                    &listing,
+                    name.as_c_str(),
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(map_open_error)
+                .map_err(failed)?,
+            );
+            let metadata = entry.metadata().map_err(|_| failed(BrokerError::Io))?;
+            if !ownership_changes_kind(&metadata) {
                 continue;
             }
-            ownership_supported(&entry).map_err(failed)?;
+            let entry_mount = mount_identity(&entry, &metadata);
+            if entry_mount != mount {
+                if !contents.nested_mounts {
+                    continue;
+                }
+                ownership_supported(&entry).map_err(failed)?;
+            }
+            self.visit(&entry, &metadata, &entry_path)?;
+            if metadata.is_dir() {
+                self.contents(&entry, &entry_path, entry_mount)?;
+            }
         }
-        change.apply(&entry).map_err(failed)?;
-        report.changed += 1;
-        if metadata.is_dir() {
-            change_contents(
-                &entry,
-                &entry_path,
-                metadata.dev(),
-                change,
-                contents,
-                report,
-            )?;
-        }
+        Ok(())
     }
-    Ok(())
 }
 
-/// Refuses filesystems whose ownership is not POSIX or not on this
-/// machine: network filesystems, FUSE, and FAT, exFAT, NTFS, ISO 9660 and
-/// UDF. The Permissions page is read-only on them; this is the broker's
-/// own check.
+/// Changes each item, then what its folders contain when `contents` says
+/// so, and stops at the first item it cannot change. Items changed before
+/// that stay changed; items that already match, and sockets, pipes and
+/// devices, are left as they are.
+fn change_ownership(
+    items: &[OwnershipItem],
+    change: OwnershipChange,
+    contents: Option<OwnershipContents>,
+    progress: Option<&OwnershipProgress>,
+) -> OwnershipReport {
+    let mut walk = OwnershipWalk {
+        change,
+        contents,
+        report: OwnershipReport::new(0, None),
+        progress,
+        reported: None,
+    };
+    for item in items {
+        let changed = open_ownership_item(item)
+            .map_err(|error| (item.path().to_path_buf(), error))
+            .and_then(|(file, metadata)| {
+                if !ownership_changes_kind(&metadata) {
+                    return Ok(());
+                }
+                walk.visit(&file, &metadata, item.path())?;
+                if metadata.is_dir() {
+                    let mount = mount_identity(&file, &metadata);
+                    walk.contents(&file, item.path(), mount)?;
+                }
+                Ok(())
+            });
+        if let Err((path, error)) = changed {
+            walk.report.failure = Some(OwnershipFailure::new(path, &error));
+            break;
+        }
+    }
+    walk.report
+}
+
+/// One progress line: the count, then the path as unpadded URL-safe
+/// base64, as request paths are sent, so any file name fits on the line.
+#[must_use]
+pub fn encode_ownership_progress(changed: u64, path: &Path) -> String {
+    format!(
+        "{BROKER_PROGRESS_FRAME}{changed} {}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path.as_os_str().as_bytes())
+    )
+}
+
+/// The count and path of a progress line, when `line` is one.
+pub(crate) fn decode_ownership_progress(line: &str) -> Option<(u64, PathBuf)> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let (changed, path) = line.strip_prefix(BROKER_PROGRESS_FRAME)?.split_once(' ')?;
+    let path = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(path.trim())
+        .ok()?;
+    Some((
+        changed.parse().ok()?,
+        PathBuf::from(std::ffi::OsString::from_vec(path)),
+    ))
+}
+
+/// What Musheen heard of an ownership change while it waited: how far it
+/// got. When the wait ends without an answer, the change is reported as
+/// stopped at the last item it reached, so the failure names its item.
+#[derive(Debug, Default)]
+pub(crate) struct OwnershipProgressSeen {
+    last: Option<(u64, PathBuf)>,
+}
+
+impl OwnershipProgressSeen {
+    /// Records `line` when it is a progress line, and says whether it was.
+    pub(crate) fn see(&mut self, line: &str) -> bool {
+        match decode_ownership_progress(line) {
+            Some(progress) => {
+                self.last = Some(progress);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The report for a change that ended with `error` after it reported
+    /// progress, or the error when it reported none.
+    pub(crate) fn ended(self, error: BrokerError) -> Result<BrokerOutput, BrokerError> {
+        match self.last {
+            Some((changed, path)) => Ok(BrokerOutput::OwnershipChanged(OwnershipReport::new(
+                changed,
+                Some(OwnershipFailure::new(path, &error)),
+            ))),
+            None => Err(error),
+        }
+    }
+}
+
+/// The local filesystems with POSIX ownership an ownership change may
+/// touch, by their statfs type: ext2, ext3 and ext4, XFS, Btrfs, bcachefs,
+/// F2FS, ZFS, JFS, ReiserFS, NILFS, tmpfs, ramfs and overlayfs.
+const OWNERSHIP_FILESYSTEMS: [u64; 12] = [
+    0xef53,      // ext2, ext3, ext4
+    0x5846_5342, // XFS
+    0x9123_683e, // Btrfs
+    0xca45_1a4e, // bcachefs
+    0xf2f5_2010, // F2FS
+    0x2fc1_2fc1, // ZFS
+    0x3153_464a, // JFS
+    0x5265_4973, // ReiserFS
+    0x3434,      // NILFS
+    0x0102_1994, // tmpfs
+    0x8584_58f6, // ramfs
+    0x794c_7630, // overlayfs
+];
+
+/// Refuses a filesystem whose ownership is not POSIX or not on this
+/// machine. The Permissions page asks [`ownership_supported_at`] the same
+/// question before it offers an ownership change as administrator.
 fn ownership_supported(file: &File) -> Result<(), BrokerError> {
-    const REFUSED: [u64; 14] = [
-        0x6969,      // NFS
-        0x517b,      // SMB
-        0xff53_4d42, // CIFS
-        0xfe53_4d42, // SMB2
-        0x6573_5546, // FUSE
-        0x00c3_6400, // Ceph
-        0x5346_414f, // AFS
-        0x0102_1997, // 9P
-        0x4d44,      // FAT
-        0x2011_bab0, // exFAT
-        0x7366_746e, // NTFS (ntfs3)
-        0x5346_544e, // NTFS
-        0x9660,      // ISO 9660
-        0x1501_3346, // UDF
-    ];
     let filesystem = rustix::fs::fstatfs(file).map_err(|_| BrokerError::Io)?;
     #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
     let kind = filesystem.f_type as u64;
-    if REFUSED.contains(&kind) {
-        return Err(BrokerError::FilesystemUnsupported);
+    if OWNERSHIP_FILESYSTEMS.contains(&kind) {
+        Ok(())
+    } else {
+        Err(BrokerError::FilesystemUnsupported)
     }
-    Ok(())
+}
+
+/// Whether the broker would change the owner of `path`, a symbolic link as
+/// the link: whether it is on a local filesystem with POSIX ownership. The
+/// Permissions page asks this off the UI thread (SYS-037).
+#[must_use]
+pub fn ownership_supported_at(path: &Path) -> bool {
+    rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()
+    .map(File::from)
+    .is_some_and(|file| ownership_supported(&file).is_ok())
 }
 
 const fn executable_mode_is_trusted(owner: u32, mode: u32) -> bool {
@@ -1947,15 +2196,28 @@ fn scrub_environment(environment: BTreeMap<String, String>) -> BTreeMap<String, 
         .collect()
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct SystemOperationRunner {
     timeout: Duration,
+    /// Where an ownership change reports how far it got (SYS-037).
+    progress: Option<OwnershipProgress>,
+}
+
+impl fmt::Debug for SystemOperationRunner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SystemOperationRunner")
+            .field("timeout", &self.timeout)
+            .field("progress", &self.progress.is_some())
+            .finish()
+    }
 }
 
 impl Default for SystemOperationRunner {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            progress: None,
         }
     }
 }
@@ -1963,7 +2225,17 @@ impl Default for SystemOperationRunner {
 impl SystemOperationRunner {
     #[must_use]
     pub fn with_timeout(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            progress: None,
+        }
+    }
+
+    /// Reports an ownership change's progress to `progress`.
+    #[must_use]
+    pub fn with_progress(mut self, progress: OwnershipProgress) -> Self {
+        self.progress = Some(progress);
+        self
     }
 }
 
@@ -1997,7 +2269,10 @@ impl OperationRunner for SystemOperationRunner {
                 }
                 let change = OwnershipChange { owner, group };
                 Ok(BrokerOutput::OwnershipChanged(change_ownership(
-                    &items, change, contents,
+                    &items,
+                    change,
+                    contents,
+                    self.progress.as_ref(),
                 )))
             }
             BrokerOperation::RunExecutable { arguments, .. } => {

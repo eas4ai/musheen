@@ -1144,10 +1144,34 @@ fn change_ownership_scenario_child() {
             let item = reviewed(&file);
             fs::write(root.join("new"), b"new").unwrap();
             fs::rename(root.join("new"), &file).unwrap();
-            let refused = change_ownership(&authorizer, vec![item], Some(1000), None, None);
-            assert_eq!(refused, Err(BrokerError::TargetReplaced));
+            let refused =
+                change_ownership(&authorizer, vec![item], Some(1000), None, None).unwrap();
+            assert_eq!(refused.changed(), 0);
+            let failure = refused.failure().expect("a replaced item is refused");
+            assert_eq!(failure.path(), file, "the refusal names its item");
+            assert_eq!(failure.error(), BrokerError::TargetReplaced);
             assert_eq!(ownership(&file).0, 0);
             assert_eq!(authorizations(), 0, "refused before it asks");
+
+            // With several items, the one replaced is named, and none changes.
+            let (first, second) = (root.join("h1"), root.join("h2"));
+            fs::write(&first, b"1").unwrap();
+            fs::write(&second, b"2").unwrap();
+            let items = vec![reviewed(&first), reviewed(&second)];
+            fs::write(root.join("h2.new"), b"new").unwrap();
+            fs::rename(root.join("h2.new"), &second).unwrap();
+            let refused = change_ownership(&authorizer, items, Some(1000), None, None).unwrap();
+            assert_eq!(refused.changed(), 0);
+            assert_eq!(
+                refused.failure().map(|failure| failure.path()),
+                Some(second.as_path())
+            );
+            assert_eq!(
+                ownership(&first).0,
+                0,
+                "nothing changes before every item is checked"
+            );
+            assert_eq!(authorizations(), 0);
 
             // Replaced while authorization was asked.
             let second = root.join("g");
@@ -1173,7 +1197,14 @@ fn change_ownership_scenario_child() {
                 NoopAudit,
                 SystemClock,
             );
-            assert_eq!(broker.handle(request), Err(BrokerError::TargetReplaced));
+            match broker.handle(request) {
+                Ok(BrokerOutput::OwnershipChanged(report)) => {
+                    let failure = report.failure().expect("the swapped item is refused");
+                    assert_eq!(failure.path(), second);
+                    assert_eq!(failure.error(), BrokerError::TargetReplaced);
+                }
+                other => panic!("a swapped item answered {other:?}"),
+            }
             assert_eq!(ownership(&second).0, 0);
         }
         "scope" => {
@@ -1184,6 +1215,18 @@ fn change_ownership_scenario_child() {
             fs::create_dir(&mounted).unwrap();
             mount(&["-t", "tmpfs", "none", mounted.to_str().unwrap()]);
             fs::write(mounted.join("z"), b"z").unwrap();
+            // A bind mount of the same filesystem keeps its folder's device;
+            // it is still a nested mount.
+            let elsewhere = root.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            fs::write(elsewhere.join("w"), b"w").unwrap();
+            let bound = folder.join("bound");
+            fs::create_dir(&bound).unwrap();
+            mount(&[
+                "--bind",
+                elsewhere.to_str().unwrap(),
+                bound.to_str().unwrap(),
+            ]);
 
             let alone =
                 change_ownership(&authorizer, vec![reviewed(&folder)], Some(1000), None, None)
@@ -1208,11 +1251,13 @@ fn change_ownership_scenario_child() {
             assert_eq!(
                 without_mounts.changed(),
                 2,
-                "d and d/x; not the nested mount"
+                "d and d/x; not the nested mounts"
             );
             assert_eq!(ownership(&folder.join("x")).0, 1001);
-            assert_eq!(ownership(&mounted).0, 0, "the nested mount is left out");
+            assert_eq!(ownership(&mounted).0, 0, "the tmpfs is left out");
             assert_eq!(ownership(&mounted.join("z")).0, 0);
+            assert_eq!(ownership(&bound).0, 0, "the bind mount is left out");
+            assert_eq!(ownership(&elsewhere.join("w")).0, 0);
 
             let with_mounts = change_ownership(
                 &authorizer,
@@ -1224,8 +1269,113 @@ fn change_ownership_scenario_child() {
                 }),
             )
             .unwrap();
-            assert_eq!(with_mounts.changed(), 4);
+            assert_eq!(with_mounts.changed(), 6, "d, x, mnt, z, bound and w");
             assert_eq!(ownership(&mounted.join("z")).0, 1002);
+            assert_eq!(ownership(&elsewhere.join("w")).0, 1002);
+        }
+        "unchanged" => {
+            // Any chown would clear a setuid bit, so an item or entry that
+            // already has the owner and group asked for is not touched.
+            let file = root.join("s");
+            fs::write(&file, b"s").unwrap();
+            set_mode(&file, 0o4755);
+            let folder = root.join("d");
+            fs::create_dir(&folder).unwrap();
+            let inner = folder.join("t");
+            fs::write(&inner, b"t").unwrap();
+            set_mode(&inner, 0o4755);
+            let other = folder.join("u");
+            fs::write(&other, b"u").unwrap();
+            std::os::unix::fs::chown(&other, Some(1000), Some(1000)).unwrap();
+            let report = change_ownership(
+                &authorizer,
+                vec![reviewed(&file), reviewed(&folder)],
+                Some(0),
+                Some(0),
+                Some(OwnershipContents {
+                    nested_mounts: false,
+                }),
+            )
+            .unwrap();
+            assert_eq!(report.failure(), None);
+            assert_eq!(report.changed(), 1, "only d/u needed a change");
+            assert_eq!(
+                ownership(&file),
+                (0, 0, 0o4755),
+                "a matching item keeps setuid"
+            );
+            assert_eq!(
+                ownership(&inner),
+                (0, 0, 0o4755),
+                "a matching entry keeps setuid"
+            );
+            assert_eq!(ownership(&other).0, 0);
+        }
+        "special" => {
+            let folder = root.join("d");
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("f"), b"f").unwrap();
+            let pipe = folder.join("p");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            let socket = folder.join("s");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let report = change_ownership(
+                &authorizer,
+                vec![reviewed(&folder), reviewed(&pipe)],
+                Some(1000),
+                None,
+                Some(OwnershipContents {
+                    nested_mounts: false,
+                }),
+            )
+            .unwrap();
+            assert_eq!(report.failure(), None);
+            assert_eq!(report.changed(), 2, "d and d/f");
+            assert_eq!(ownership(&folder.join("f")).0, 1000);
+            assert_eq!(
+                ownership(&pipe).0,
+                0,
+                "a pipe, named or inside, is left as it is"
+            );
+            assert_eq!(ownership(&socket).0, 0, "a socket is left as it is");
+        }
+        "progress" => {
+            let folder = root.join("d");
+            fs::create_dir(&folder).unwrap();
+            for name in ["a", "b", "c"] {
+                fs::write(folder.join(name), name).unwrap();
+            }
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&seen);
+            let runner = SystemOperationRunner::default().with_progress(Arc::new(
+                move |changed, path: &Path| {
+                    recorded.lock().unwrap().push((changed, path.to_path_buf()));
+                },
+            ));
+            let broker = Broker::new(authorizer.clone(), runner, NoopAudit, SystemClock);
+            let request = BrokerRequest::change_ownership(
+                vec![reviewed(&folder)],
+                Some(1000),
+                None,
+                Some(OwnershipContents {
+                    nested_mounts: false,
+                }),
+            )
+            .unwrap();
+            match broker.handle(request) {
+                Ok(BrokerOutput::OwnershipChanged(report)) => assert_eq!(report.changed(), 4),
+                other => panic!("an ownership change answered {other:?}"),
+            }
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                seen.first(),
+                Some(&(1, folder.clone())),
+                "the first item reports at once"
+            );
         }
         "failure" => {
             let file = root.join("a");
@@ -1278,4 +1428,19 @@ fn change_ownership_stays_within_the_reviewed_scope() {
 #[test]
 fn change_ownership_names_the_item_that_failed() {
     run_ownership_scenario("failure");
+}
+
+#[test]
+fn change_ownership_leaves_items_that_match_as_they_are() {
+    run_ownership_scenario("unchanged");
+}
+
+#[test]
+fn change_ownership_leaves_sockets_pipes_and_devices_as_they_are() {
+    run_ownership_scenario("special");
+}
+
+#[test]
+fn change_ownership_reports_its_progress() {
+    run_ownership_scenario("progress");
 }
