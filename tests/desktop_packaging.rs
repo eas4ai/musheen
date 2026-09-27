@@ -119,6 +119,101 @@ fn native_installer_stages_app_workers_metadata_icons_and_broker_without_host_wr
     );
 }
 
+/// Stages the native installer's output with fixture binaries, and returns
+/// the staging directory.
+fn stage_native_install(temporary: &Path) -> std::path::PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let stage = temporary.join("stage");
+    let fake_bin = temporary.join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let mut binaries = Vec::new();
+    for name in [
+        "musheen",
+        "musheen-broker",
+        "musheen-archive-worker",
+        "musheen-thumbnail-worker",
+    ] {
+        let binary = temporary.join(name);
+        fs::write(&binary, b"fixture").unwrap();
+        binaries.push(binary);
+    }
+    let rasterizer = fake_bin.join("rsvg-convert");
+    fs::write(
+        &rasterizer,
+        "#!/bin/sh\nset -eu\nwhile [ \"$1\" != \"-o\" ]; do shift; done\nprintf 'png fixture' > \"$2\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&rasterizer, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
+    let output = Command::new(root.join("packaging/install-app.sh"))
+        .env("DESTDIR", &stage)
+        .env("MUSHEEN_APP_BINARY", &binaries[0])
+        .env("MUSHEEN_BROKER_BINARY", &binaries[1])
+        .env("MUSHEEN_ARCHIVE_WORKER_BINARY", &binaries[2])
+        .env("MUSHEEN_THUMBNAIL_WORKER_BINARY", &binaries[3])
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    stage
+}
+
+/// Every path under `directory`.
+fn staged_files(directory: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(staged_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[test]
+fn portal_backend_package_ships_the_portal_and_activation_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let stage = stage_native_install(temporary.path());
+    let portal =
+        fs::read_to_string(stage.join("usr/share/xdg-desktop-portal/portals/musheen.portal"))
+            .expect("the package ships musheen.portal");
+    assert!(portal.contains("[portal]\n"));
+    assert!(portal.contains(&format!(
+        "DBusName={}\n",
+        musheen_desktop::MUSHEEN_PORTAL_BACKEND
+    )));
+    assert!(portal.contains("Interfaces=org.freedesktop.impl.portal.FileChooser;\n"));
+    let service_path = stage.join(format!(
+        "usr/share/dbus-1/services/{}.service",
+        musheen_desktop::MUSHEEN_PORTAL_BACKEND
+    ));
+    let service = fs::read_to_string(&service_path).expect("the package ships the activation file");
+    assert!(service.contains("[D-BUS Service]\n"));
+    assert!(service.contains(&format!(
+        "Name={}\n",
+        musheen_desktop::MUSHEEN_PORTAL_BACKEND
+    )));
+    assert!(service.contains("Exec=/usr/bin/musheen --portal-backend\n"));
+    for path in [
+        stage.join("usr/share/xdg-desktop-portal/portals/musheen.portal"),
+        service_path,
+    ] {
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "{path:?}"
+        );
+    }
+    assert!(
+        !staged_files(&stage).iter().any(|path| path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with("portals.conf"))),
+        "the user turns the backend on with their own portals.conf"
+    );
+}
+
 #[test]
 fn native_installer_rejects_a_symlinked_destination_before_writing() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
