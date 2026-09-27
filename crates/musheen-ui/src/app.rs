@@ -27147,6 +27147,11 @@ mod tests {
                     BrokerOperation::RunExecutable { .. } => {
                         Box::pin(async { Ok(BrokerOutput::Exited(0)) })
                     }
+                    BrokerOperation::ChangeOwnership { .. } => Box::pin(async {
+                        Ok(BrokerOutput::OwnershipChanged(
+                            musheen_desktop::privilege::OwnershipReport::new(0, None),
+                        ))
+                    }),
                 }
             }
 
