@@ -1,5 +1,6 @@
 //! Linux desktop-service adapters, including XDG MIME-application integration.
 
+mod accounts;
 mod apps;
 pub mod archive;
 mod catalog;
@@ -27,6 +28,7 @@ mod thumbnail;
 mod updates;
 mod volumes;
 
+pub use accounts::{current_user_groups, effective_user, group_name, user_name};
 pub use apps::*;
 pub use archive::*;
 pub use catalog::*;

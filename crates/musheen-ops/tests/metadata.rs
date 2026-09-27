@@ -1,7 +1,7 @@
 use musheen_core::StorePath;
 use musheen_ops::{
     AclChange, AclEntry, AclQualifier, MetadataChange, MetadataEntry, MetadataEntryKind,
-    MetadataPlan, MetadataProvider, MetadataScope, MutationError, ResolvedMetadataChange,
+    MetadataPlan, MetadataProvider, MetadataScope, ModeEdit, MutationError, ResolvedMetadataChange,
 };
 
 #[derive(Default)]
@@ -151,6 +151,79 @@ fn empty_or_invalid_metadata_changes_never_reach_the_provider() {
         ),
         Err(MutationError::InvalidMetadata)
     );
+}
+
+#[test]
+fn mode_edits_apply_to_each_entry_and_skip_entries_they_leave_as_they_are() {
+    // Group: Can View; Others: No Access.
+    let edit = ModeEdit {
+        file_clear: 0o067,
+        file_set: 0o040,
+        directory_clear: 0o077,
+        directory_set: 0o050,
+        ..ModeEdit::default()
+    };
+    assert_eq!(edit.apply(MetadataEntryKind::File, 0o755), 0o750);
+    assert_eq!(edit.apply(MetadataEntryKind::File, 0o600), 0o640);
+    assert_eq!(edit.apply(MetadataEntryKind::Directory, 0o777), 0o750);
+    assert_eq!(edit.apply(MetadataEntryKind::SymbolicLink, 0o777), 0o777);
+
+    let executable = ModeEdit {
+        file_execute: Some(true),
+        ..ModeEdit::default()
+    };
+    assert_eq!(executable.apply(MetadataEntryKind::File, 0o640), 0o750);
+    assert_eq!(executable.apply(MetadataEntryKind::Directory, 0o700), 0o700);
+    let not_executable = ModeEdit {
+        file_execute: Some(false),
+        ..ModeEdit::default()
+    };
+    assert_eq!(
+        not_executable.apply(MetadataEntryKind::File, 0o4755),
+        0o4644
+    );
+    let sticky = ModeEdit {
+        bits_set: 0o1000,
+        bits_clear: 0o002,
+        ..ModeEdit::default()
+    };
+    assert_eq!(sticky.apply(MetadataEntryKind::Directory, 0o777), 0o1775);
+    assert!(ModeEdit::default().is_empty());
+
+    let mut provider = RecordingProvider {
+        preview: vec![
+            MetadataEntry::new(local("/a"), b"a".to_vec(), MetadataEntryKind::File, false)
+                .with_current_mode(0o640),
+            MetadataEntry::new(local("/b"), b"b".to_vec(), MetadataEntryKind::File, false)
+                .with_current_mode(0o600),
+        ],
+        ..RecordingProvider::default()
+    };
+    let plan = MetadataPlan::preflight(
+        &mut provider,
+        local("/a"),
+        b"a".to_vec(),
+        MetadataScope::Single,
+        MetadataChange::new().with_mode_edit(edit),
+    )
+    .unwrap();
+    plan.execute(&mut provider).unwrap();
+    assert_eq!(provider.applied.len(), 1, "/a already has the mode");
+    assert_eq!(provider.applied[0].0, local("/b"));
+    assert_eq!(provider.applied[0].1.mode(), Some(0o640));
+
+    provider.preview.truncate(1);
+    provider.applied.clear();
+    let plan = MetadataPlan::preflight(
+        &mut provider,
+        local("/a"),
+        b"a".to_vec(),
+        MetadataScope::Single,
+        MetadataChange::new().with_mode_edit(edit),
+    )
+    .expect("an item the edit leaves as it is does not fail");
+    plan.execute(&mut provider).unwrap();
+    assert!(provider.applied.is_empty());
 }
 
 fn local(path: &str) -> StorePath {

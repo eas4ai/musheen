@@ -11,8 +11,8 @@ use musheen_ops::{
 use posix_acl::{ACL_EXECUTE, ACL_READ, ACL_WRITE, PosixACL, Qualifier};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, CWD, Gid, Mode, OFlags, RenameFlags, StatxFlags, Uid, chownat, fchmod, fchown, fsync,
-    linkat, mkdirat, open, openat, renameat_with, statx, symlinkat, unlinkat,
+    AtFlags, CWD, Gid, Mode, OFlags, RenameFlags, StatxFlags, Uid, chownat, fsync, linkat, mkdirat,
+    open, openat, renameat_with, statx, symlinkat, unlinkat,
 };
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -1759,27 +1759,27 @@ impl MetadataProvider for LocalStore {
         }
         let proc_path = PathBuf::from(format!("/proc/self/fd/{}", target.as_raw_fd()));
 
+        // The target may be open only as a path (O_PATH), as a file whose
+        // mode denies the owner everything is (SEARCH-019): ownership then
+        // changes through the empty-path form, and the mode through the
+        // open file's /proc entry.
         if change.owner().is_some() || change.group().is_some() {
-            if entry.kind() == MetadataEntryKind::SymbolicLink {
-                chownat(
-                    &target,
-                    "",
-                    change.owner().map(Uid::from_raw),
-                    change.group().map(Gid::from_raw),
-                    AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .map_err(map_errno)?;
+            let flags = if entry.kind() == MetadataEntryKind::SymbolicLink {
+                AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW
             } else {
-                fchown(
-                    &target,
-                    change.owner().map(Uid::from_raw),
-                    change.group().map(Gid::from_raw),
-                )
-                .map_err(map_errno)?;
-            }
+                AtFlags::EMPTY_PATH
+            };
+            chownat(
+                &target,
+                "",
+                change.owner().map(Uid::from_raw),
+                change.group().map(Gid::from_raw),
+                flags,
+            )
+            .map_err(map_errno)?;
         }
         if let Some(mode) = change.mode() {
-            fchmod(&target, Mode::from_raw_mode(mode)).map_err(map_errno)?;
+            rustix::fs::chmod(&proc_path, Mode::from_raw_mode(mode)).map_err(map_errno)?;
         }
         if let Some(acl) = change.access_acl() {
             apply_acl(&proc_path, acl, false)?;
@@ -1804,13 +1804,22 @@ fn open_metadata_target(
     };
     match openat(&entry.parent, &entry.name, flags, Mode::empty()) {
         Ok(fd) => Ok(fd),
-        Err(rustix::io::Errno::ACCESS) if kind == MetadataEntryKind::File => openat(
-            &entry.parent,
-            &entry.name,
-            OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(map_errno),
+        // A file or folder whose mode denies its owner reading is opened as
+        // a path, so its owner can still change its mode back.
+        Err(rustix::io::Errno::ACCESS) if kind != MetadataEntryKind::SymbolicLink => {
+            let directory = if kind == MetadataEntryKind::Directory {
+                OFlags::DIRECTORY
+            } else {
+                OFlags::empty()
+            };
+            openat(
+                &entry.parent,
+                &entry.name,
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC | directory,
+                Mode::empty(),
+            )
+            .map_err(map_errno)
+        }
         Err(error) => Err(map_errno(error)),
     }
 }
@@ -2137,12 +2146,10 @@ fn metadata_entry(store: &mut LocalStore, path: &Path) -> Result<MetadataEntry, 
     let path = StorePath::from_unix_path(path.as_os_str());
     let identity = MutationProvider::identity(store, &path)?.ok_or(MutationError::Missing)?;
     let requires_privilege = metadata.uid() != rustix::process::geteuid().as_raw();
-    Ok(MetadataEntry::new(
-        path,
-        identity.to_vec(),
-        kind,
-        requires_privilege,
-    ))
+    Ok(
+        MetadataEntry::new(path, identity.to_vec(), kind, requires_privilege)
+            .with_current_mode(metadata.mode() & 0o7777),
+    )
 }
 
 fn apply_acl(path: &Path, change: &AclChange, default: bool) -> Result<(), MutationError> {

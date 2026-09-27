@@ -1,15 +1,17 @@
 use crate::i18n::Catalog;
 use crate::operations::{OperationHub, spawn_ready_hub_operations};
-use crate::{ApplicationIdentity, DropError, LocalOperationQueue, PermissionsPageModel};
+use crate::{
+    Access, AccessClass, Accounts, ApplicationIdentity, DropError, LocalOperationQueue, MODE_BITS,
+    PermissionsPageModel, Tristate,
+};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
+use gpui_kit::component::input::{Escape, Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{ActiveTheme, Disableable, Selectable, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, KeyBinding, Role, SharedString,
-    Subscription, Task, TestSupportExt, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
-    px, size,
+    Task, TestSupportExt, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, size,
 };
 use musheen_core::{
     CancellationToken, CapabilityKind, CapabilityMatrix, CapabilityState, CommandTargetRef,
@@ -30,7 +32,8 @@ use std::time::Duration;
 
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-type RefreshWorkResult = Result<(PropertyRefresh, Option<PropertySnapshot>), PropertyError>;
+type RefreshWorkResult =
+    Result<(PropertyRefresh, Option<(PropertySnapshot, Accounts)>), PropertyError>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumePropertiesModel {
@@ -374,6 +377,11 @@ fn properties_state(refresh: PropertyRefresh) -> PropertiesState {
 pub struct PropertiesDialogModel {
     snapshot: PropertySnapshot,
     permissions: PermissionsPageModel,
+    /// Names for the Permissions page, looked up once.
+    accounts: Accounts,
+    /// The filesystem's permission support; anything else makes the
+    /// Permissions page read-only (SEARCH-019).
+    permission_capability: CapabilityState,
     pages: Vec<PropertiesPage>,
     page: PropertiesPage,
     state: PropertiesState,
@@ -385,8 +393,24 @@ pub struct PropertiesDialogModel {
 }
 
 impl PropertiesDialogModel {
+    /// Loads the account names on the calling thread. The Properties window
+    /// loads them off the UI thread, in `PropertiesWindowData::load`.
     pub fn new(snapshot: PropertySnapshot) -> Self {
-        let permissions = PermissionsPageModel::from_snapshot(&snapshot);
+        let accounts = Accounts::load(&snapshot);
+        Self::with_accounts(snapshot, accounts, CapabilityState::Supported)
+    }
+
+    /// A model whose account names were loaded off the UI thread.
+    pub(crate) fn with_accounts(
+        snapshot: PropertySnapshot,
+        accounts: Accounts,
+        permission_capability: CapabilityState,
+    ) -> Self {
+        let permissions = PermissionsPageModel::from_snapshot(
+            &snapshot,
+            accounts.clone(),
+            &permission_capability,
+        );
         let mut pages = vec![
             PropertiesPage::General,
             PropertiesPage::Permissions,
@@ -403,6 +427,8 @@ impl PropertiesDialogModel {
         Self {
             snapshot,
             permissions,
+            accounts,
+            permission_capability,
             pages,
             page: PropertiesPage::General,
             state: PropertiesState::Ready,
@@ -440,6 +466,15 @@ impl PropertiesDialogModel {
 
     pub fn permissions(&self) -> &PermissionsPageModel {
         &self.permissions
+    }
+
+    /// Sets the filesystem's permission support: anything but supported
+    /// makes the Permissions page read-only, with the reason.
+    #[must_use]
+    pub fn with_permission_capability(mut self, capability: CapabilityState) -> Self {
+        self.permission_capability = capability;
+        self.clear_permission_edits();
+        self
     }
 
     pub fn permissions_mut(&mut self) -> &mut PermissionsPageModel {
@@ -550,11 +585,7 @@ impl PropertiesDialogModel {
             .iter()
             .map(|item| StorePath::from_unix_path(item.path().as_os_str()))
             .collect();
-        Ok((
-            roots,
-            self.permissions.scope(),
-            self.permissions.change().clone(),
-        ))
+        Ok((roots, self.permissions.scope(), self.permissions.change()))
     }
 
     pub fn refresh(&mut self) -> Result<PropertyRefresh, PropertyError> {
@@ -572,14 +603,16 @@ impl PropertiesDialogModel {
                 .map(|item| item.path().to_path_buf())
                 .collect::<Vec<_>>();
             self.snapshot = PropertySnapshot::load(&paths)?;
-            self.permissions = PermissionsPageModel::from_snapshot(&self.snapshot);
+            self.accounts = Accounts::load(&self.snapshot);
+            self.clear_permission_edits();
         }
         Ok(refresh)
     }
 
-    fn replace_snapshot(&mut self, snapshot: PropertySnapshot) {
+    fn replace_snapshot(&mut self, snapshot: PropertySnapshot, accounts: Accounts) {
         let selected_page = self.page;
-        let mut replacement = Self::new(snapshot);
+        let mut replacement =
+            Self::with_accounts(snapshot, accounts, self.permission_capability.clone());
         if replacement.pages.contains(&selected_page) {
             replacement.page = selected_page;
         }
@@ -587,7 +620,11 @@ impl PropertiesDialogModel {
     }
 
     fn clear_permission_edits(&mut self) {
-        self.permissions = PermissionsPageModel::from_snapshot(&self.snapshot);
+        self.permissions = PermissionsPageModel::from_snapshot(
+            &self.snapshot,
+            self.accounts.clone(),
+            &self.permission_capability,
+        );
     }
 }
 
@@ -1135,8 +1172,12 @@ fn provider_page_unavailable_message(
 
 pub struct PropertiesWindowData {
     snapshot: PropertySnapshot,
+    /// The names the Permissions page shows, loaded with the snapshot.
+    accounts: Accounts,
     filesystem_rows: Vec<(Box<str>, Box<str>)>,
     capability_rows: Vec<(Box<str>, Box<str>)>,
+    /// Whether every item's filesystem supports POSIX permissions.
+    permission_capability: CapabilityState,
     tags: BTreeSet<Box<str>>,
     mixed_tags: BTreeSet<Box<str>>,
     tag_writer: Option<TagWriter>,
@@ -1198,6 +1239,11 @@ impl PropertiesWindowData {
                     .collect(),
             ),
         };
+        let permission_capability = capability_matrices
+            .iter()
+            .map(|matrix| matrix.get(CapabilityKind::Permissions).clone())
+            .find(|state| *state != CapabilityState::Supported)
+            .unwrap_or(CapabilityState::Supported);
         let capability_rows = CapabilityKind::ALL
             .iter()
             .copied()
@@ -1213,9 +1259,11 @@ impl PropertiesWindowData {
             })
             .collect();
         Ok(Self {
+            accounts: Accounts::load(&snapshot),
             snapshot,
             filesystem_rows,
             capability_rows,
+            permission_capability,
             tags: BTreeSet::new(),
             mixed_tags: BTreeSet::new(),
             tag_writer: None,
@@ -1251,6 +1299,14 @@ impl PropertiesWindowData {
         self.catalog = catalog;
         self
     }
+
+    /// Replaces the filesystem's permission support the window reports.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_permission_capability(mut self, capability: CapabilityState) -> Self {
+        self.permission_capability = capability;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -1258,14 +1314,6 @@ struct PropertyRow {
     label: Box<str>,
     value: Box<str>,
     input: Entity<InputState>,
-}
-
-#[derive(Debug)]
-struct PermissionInputs {
-    owner: Entity<InputState>,
-    group: Entity<InputState>,
-    file_mode: Entity<InputState>,
-    directory_mode: Entity<InputState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1406,9 +1454,10 @@ pub(crate) struct PropertiesWindow {
     checksum: ChecksumState,
     checksum_cancellation: Option<CancellationToken>,
     close_requested: bool,
-    permission_inputs: PermissionInputs,
-    permission_inputs_need_sync: bool,
-    permission_subscriptions: Vec<Subscription>,
+    /// The Permissions page's group list is open.
+    group_picker_open: bool,
+    /// The Permissions page's Advanced section is open.
+    advanced_open: bool,
     operation_hub: OperationHub,
     permission_error: Option<Box<str>>,
     permission_batch: PermissionBatchState,
@@ -1437,38 +1486,17 @@ impl PropertiesWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let owner = editable_u32(data.snapshot.aggregate().owner());
-        let group = editable_u32(data.snapshot.aggregate().group());
-        let mode = editable_mode(data.snapshot.aggregate().mode());
-        let permission_inputs = PermissionInputs {
-            owner: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(owner)
-                    .placeholder("Numeric user ID")
-            }),
-            group: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(group)
-                    .placeholder("Numeric group ID")
-            }),
-            file_mode: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(mode.clone())
-                    .placeholder("0644")
-            }),
-            directory_mode: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(mode)
-                    .placeholder("0755")
-            }),
-        };
         let tag_name = data
             .catalog
             .message("catalog-tag-name")
             .expect("the tag-name catalog message exists")
             .to_owned();
         let tag_input = cx.new(|cx| InputState::new(window, cx).placeholder(tag_name));
-        let mut model = PropertiesDialogModel::new(data.snapshot);
+        let mut model = PropertiesDialogModel::with_accounts(
+            data.snapshot,
+            data.accounts,
+            data.permission_capability,
+        );
         model.set_tag_states(
             data.tags.iter().map(AsRef::as_ref),
             data.mixed_tags.iter().map(AsRef::as_ref),
@@ -1487,9 +1515,8 @@ impl PropertiesWindow {
             checksum: ChecksumState::Idle,
             checksum_cancellation: None,
             close_requested: false,
-            permission_inputs,
-            permission_inputs_need_sync: false,
-            permission_subscriptions: Vec::new(),
+            group_picker_open: false,
+            advanced_open: false,
             operation_hub,
             permission_error: None,
             permission_batch: PermissionBatchState::default(),
@@ -1499,7 +1526,6 @@ impl PropertiesWindow {
             tag_error: None,
             catalog: data.catalog,
         };
-        this.subscribe_permission_inputs(window, cx);
         this.sync_rows(window, cx);
         this.start_live_refresh(cx);
         this
@@ -1518,81 +1544,6 @@ impl PropertiesWindow {
         let mut this = Self::with_hub(data, operation_hub, window, cx);
         let _ = this.model.select_page(initial_page);
         this
-    }
-
-    fn subscribe_permission_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let owner = self.permission_inputs.owner.clone();
-        self.permission_subscriptions.push(cx.subscribe_in(
-            &owner,
-            window,
-            |this, input, event: &InputEvent, _, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                let value = input.read(cx).value().to_string();
-                this.model.permissions_mut().set_owner_text(&value);
-                cx.notify();
-            },
-        ));
-        let group = self.permission_inputs.group.clone();
-        self.permission_subscriptions.push(cx.subscribe_in(
-            &group,
-            window,
-            |this, input, event: &InputEvent, _, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                let value = input.read(cx).value().to_string();
-                this.model.permissions_mut().set_group_text(&value);
-                cx.notify();
-            },
-        ));
-        let file_mode = self.permission_inputs.file_mode.clone();
-        self.permission_subscriptions.push(cx.subscribe_in(
-            &file_mode,
-            window,
-            |this, input, event: &InputEvent, _, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                let value = input.read(cx).value().to_string();
-                this.model.permissions_mut().set_file_mode_text(&value);
-                cx.notify();
-            },
-        ));
-        let directory_mode = self.permission_inputs.directory_mode.clone();
-        self.permission_subscriptions.push(cx.subscribe_in(
-            &directory_mode,
-            window,
-            |this, input, event: &InputEvent, _, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                let value = input.read(cx).value().to_string();
-                this.model.permissions_mut().set_directory_mode_text(&value);
-                cx.notify();
-            },
-        ));
-    }
-
-    fn sync_pristine_permission_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let permissions = self.model.permissions();
-        if permissions.is_dirty() || permissions.edit_disabled_reason().is_some() {
-            return;
-        }
-        let owner = editable_u32(permissions.owner().clone());
-        let group = editable_u32(permissions.group().clone());
-        let mode = editable_mode(permissions.mode().clone());
-        for (input, value) in [
-            (&self.permission_inputs.owner, owner),
-            (&self.permission_inputs.group, group),
-            (&self.permission_inputs.file_mode, mode.clone()),
-            (&self.permission_inputs.directory_mode, mode),
-        ] {
-            if input.read(cx).value().as_ref() != value {
-                input.update(cx, |input, cx| input.set_value(value, window, cx));
-            }
-        }
     }
 
     fn apply_permissions(&mut self, cx: &mut Context<Self>) {
@@ -1687,7 +1638,9 @@ impl PropertiesWindow {
         Some(cx.background_spawn(async move {
             let refresh = probe.refresh_state()?;
             let replacement = if refresh == PropertyRefresh::MetadataChanged {
-                Some(PropertySnapshot::load(&paths)?)
+                let snapshot = PropertySnapshot::load(&paths)?;
+                let accounts = Accounts::load(&snapshot);
+                Some((snapshot, accounts))
             } else {
                 None
             };
@@ -1706,7 +1659,7 @@ impl PropertiesWindow {
                         "Invalidated because the file changed after calculation".into(),
                     );
                 }
-                if let Some(snapshot) = replacement {
+                if let Some((snapshot, accounts)) = replacement {
                     if self.model.permissions().is_dirty() {
                         self.model.state = PropertiesState::Replaced;
                         self.refresh_error = Some(
@@ -1714,8 +1667,7 @@ impl PropertiesWindow {
                                   .into(),
                           );
                     } else {
-                        self.model.replace_snapshot(snapshot);
-                        self.permission_inputs_need_sync = true;
+                        self.model.replace_snapshot(snapshot, accounts);
                         self.refresh_error = None;
                     }
                 } else {
@@ -1933,55 +1885,25 @@ impl PropertiesWindow {
 
     fn permission_rows(&self) -> Vec<(Box<str>, Box<str>)> {
         let permissions = self.model.permissions();
-        let mut rows = vec![
+        let accounts = permissions.accounts();
+        let named = |value: &AggregateValue<u32>, name: &dyn Fn(u32) -> String| match value {
+            AggregateValue::Same(id) => name(*id).into_boxed_str(),
+            other => self.localized_value(aggregate_u32(other)),
+        };
+        vec![
             (
                 self.message("properties-owner"),
-                self.localized_value(aggregate_u32(permissions.owner())),
+                named(permissions.owner(), &|uid| accounts.user_name(uid)),
             ),
             (
                 self.message("properties-group"),
-                self.localized_value(aggregate_u32(permissions.group())),
+                named(permissions.group(), &|gid| accounts.group_name(gid)),
             ),
             (
                 self.message("properties-mode"),
                 self.localized_value(aggregate_mode(permissions.mode())),
             ),
-            (
-                self.message("properties-editing"),
-                self.localized_value(
-                    permissions
-                        .edit_disabled_reason()
-                        .unwrap_or("Ready to edit"),
-                ),
-            ),
-        ];
-        for (index, item) in self.model.snapshot().items().iter().enumerate() {
-            rows.push((
-                indexed_label(
-                    self.catalog
-                        .message("properties-access-acl")
-                        .expect("the access ACL message exists"),
-                    index,
-                    self.model.snapshot().items().len(),
-                )
-                .into(),
-                self.localized_value(acl_state_label(item.permissions().acl())),
-            ));
-            if let Some(default_acl) = item.permissions().default_acl() {
-                rows.push((
-                    indexed_label(
-                        self.catalog
-                            .message("properties-default-acl")
-                            .expect("the default ACL message exists"),
-                        index,
-                        self.model.snapshot().items().len(),
-                    )
-                    .into(),
-                    self.localized_value(acl_state_label(default_acl)),
-                ));
-            }
-        }
-        rows
+        ]
     }
 
     fn open_with_rows(&self) -> Vec<(Box<str>, Box<str>)> {
@@ -2197,25 +2119,11 @@ impl PropertiesWindow {
     }
 
     fn render_permission_editor(&self, cx: &mut Context<Self>) -> AnyElement {
-        let disabled = self.model.state() != PropertiesState::Ready;
+        let disabled = self.model.state() != PropertiesState::Ready
+            || self.model.permissions().read_only_reason().is_some();
         let scope = self.model.permissions().scope();
         let recursive = scope.is_recursive();
         let review_needed = recursive && !scope.is_reviewed();
-        let field = |label: String, id: &'static str, input: &Entity<InputState>| {
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().text_xs().child(label.clone()))
-                .child(
-                    Input::new(input)
-                        .id(id)
-                        .aria_label(label)
-                        .disabled(disabled)
-                        .small(),
-                )
-        };
         div()
             .id("permissions-editor")
             .test_support()
@@ -2229,38 +2137,7 @@ impl PropertiesWindow {
             .flex()
             .flex_col()
             .gap_3()
-            .child(field(
-                self.catalog
-                    .message("properties-owner")
-                    .expect("the owner message exists")
-                    .to_owned(),
-                "permissions-owner",
-                &self.permission_inputs.owner,
-            ))
-            .child(field(
-                self.catalog
-                    .message("properties-group")
-                    .expect("the group message exists")
-                    .to_owned(),
-                "permissions-group",
-                &self.permission_inputs.group,
-            ))
-            .child(field(
-                self.catalog
-                    .message("properties-file-mode")
-                    .expect("the file-mode message exists")
-                    .to_owned(),
-                "permissions-file-mode",
-                &self.permission_inputs.file_mode,
-            ))
-            .child(field(
-                self.catalog
-                    .message("properties-directory-mode")
-                    .expect("the directory-mode message exists")
-                    .to_owned(),
-                "permissions-directory-mode",
-                &self.permission_inputs.directory_mode,
-            ))
+            .children(self.render_permission_controls(cx))
             .child(
                 div()
                     .flex()
@@ -2340,24 +2217,402 @@ impl PropertiesWindow {
                         ),
                 )
             })
-            .when_some(
-                self.model
-                    .permissions()
-                    .edit_disabled_reason()
-                    .or(self.permission_error.as_deref()),
-                |editor, message| {
-                    editor.child(
-                        div()
-                            .id("permissions-validation")
-                            .test_support()
-                            .role(Role::Alert)
-                            .aria_label(message.to_owned())
-                            .child(message.to_owned()),
-                    )
-                },
-            )
+            .when_some(self.permission_error.as_deref(), |editor, message| {
+                editor.child(
+                    div()
+                        .id("permissions-validation")
+                        .test_support()
+                        .role(Role::Alert)
+                        .aria_label(message.to_owned())
+                        .child(message.to_owned()),
+                )
+            })
             .child(div().mt_2().child(self.render_rows()))
             .into_any_element()
+    }
+
+    /// The Permissions page's controls (SEARCH-019): the access choices of
+    /// the three classes, the executable checkbox, the owner and group, and
+    /// the Advanced section.
+    fn render_permission_controls(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let permissions = self.model.permissions();
+        let editable = self.model.state() == PropertiesState::Ready
+            && permissions.read_only_reason().is_none();
+        let varies = self.message("permissions-varies").to_string();
+        let mut controls = Vec::new();
+        if let Some(reason) = permissions.read_only_reason() {
+            let reason = format!(
+                "{} {}",
+                self.message("permissions-read-only"),
+                self.catalog.localize_reason(reason)
+            );
+            controls.push(
+                div()
+                    .id("permissions-read-only")
+                    .test_support()
+                    .role(Role::Alert)
+                    .aria_label(reason.clone())
+                    .child(reason)
+                    .into_any_element(),
+            );
+        }
+        let folders = permissions.only_folders();
+        for class in AccessClass::ALL {
+            let shown = permissions.access(class);
+            let class_label = self.message(&format!("permissions-class-{}", class.key()));
+            let mut row = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(96.)).child(class_label.to_string()));
+            for access in Access::ALL {
+                let label = self.message(match (access, folders) {
+                    (Access::None, _) => "permissions-access-no-access",
+                    (Access::View, false) => "permissions-access-can-view",
+                    (Access::View, true) => "permissions-access-folder-can-view",
+                    (Access::Modify, false) => "permissions-access-can-modify",
+                    (Access::Modify, true) => "permissions-access-folder-can-modify",
+                });
+                row = row.child(
+                    Button::new(SharedString::from(format!(
+                        "permissions-{}-{}",
+                        class.key(),
+                        access.key()
+                    )))
+                    .label(label.to_string())
+                    .small()
+                    .selected(shown == Some(access))
+                    .disabled(!editable)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model.permissions_mut().set_access(class, access);
+                        cx.notify();
+                    })),
+                );
+            }
+            if shown.is_none() {
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "permissions-{}-varies",
+                            class.key()
+                        )))
+                        .test_support()
+                        .aria_label(varies.clone())
+                        .text_sm()
+                        .child(varies.clone()),
+                );
+            }
+            controls.push(row.into_any_element());
+        }
+        if permissions.has_files() {
+            let executable = permissions.executable();
+            controls.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("permissions-executable")
+                            .label(self.message("permissions-executable").to_string())
+                            .small()
+                            .selected(executable == Tristate::On)
+                            .disabled(!editable)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.model.permissions_mut().toggle_executable();
+                                cx.notify();
+                            })),
+                    )
+                    .when(executable == Tristate::Varies, |row| {
+                        row.child(
+                            div()
+                                .id("permissions-executable-varies")
+                                .test_support()
+                                .aria_label(varies.clone())
+                                .text_sm()
+                                .child(varies.clone()),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+        let owner = match permissions.owner() {
+            AggregateValue::Same(uid) => permissions.accounts().user_name(*uid),
+            _ => varies.clone(),
+        };
+        let needs_admin = self.message("permissions-owner-needs-admin").to_string();
+        controls.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(96.))
+                        .child(self.message("permissions-class-owner").to_string()),
+                )
+                .child(
+                    div()
+                        .id("permissions-owner-name")
+                        .test_support()
+                        .role(Role::Label)
+                        .aria_label(owner.clone())
+                        .child(owner),
+                )
+                .child(
+                    div()
+                        .id("permissions-owner-needs-admin")
+                        .test_support()
+                        .role(Role::Label)
+                        .aria_label(needs_admin.clone())
+                        .text_sm()
+                        .child(needs_admin),
+                )
+                .into_any_element(),
+        );
+        let group = permissions.shown_group().map_or_else(
+            || varies.clone(),
+            |gid| permissions.accounts().group_name(gid),
+        );
+        let group_editable = editable && permissions.group_editable();
+        let not_owner = self.message("permissions-group-not-owner").to_string();
+        controls.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(96.))
+                        .child(self.message("permissions-class-group").to_string()),
+                )
+                .child(
+                    div()
+                        .id("permissions-group-picker")
+                        .test_support()
+                        .role(Role::Button)
+                        .aria_label(self.message("permissions-group-choose").to_string())
+                        .px_2()
+                        .border_1()
+                        .rounded_md()
+                        .child(group)
+                        .when(group_editable, |picker| {
+                            picker.on_click(cx.listener(|this, _, _, cx| {
+                                this.group_picker_open = !this.group_picker_open;
+                                cx.notify();
+                            }))
+                        }),
+                )
+                .when(editable && !group_editable, |row| {
+                    row.child(
+                        div()
+                            .id("permissions-group-not-owner")
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_label(not_owner.clone())
+                            .text_sm()
+                            .child(not_owner),
+                    )
+                })
+                .into_any_element(),
+        );
+        if self.group_picker_open && group_editable {
+            let shown = permissions.shown_group();
+            let options = permissions.accounts().user_groups().to_vec();
+            controls.push(
+                div()
+                    .id("permissions-group-options")
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(options.into_iter().map(|(gid, name)| {
+                        Button::new(SharedString::from(format!(
+                            "permissions-group-option-{gid}"
+                        )))
+                        .label(name)
+                        .small()
+                        .selected(shown == Some(gid))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.permissions_mut().set_group(gid);
+                            this.group_picker_open = false;
+                            cx.notify();
+                        }))
+                    }))
+                    .into_any_element(),
+            );
+        }
+        controls.push(
+            Button::new("permissions-advanced")
+                .label(self.message("permissions-advanced").to_string())
+                .small()
+                .selected(self.advanced_open)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.advanced_open = !this.advanced_open;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        if self.advanced_open {
+            controls.push(self.render_permission_bits(editable, cx));
+            controls.extend(self.render_access_entries());
+        }
+        controls
+    }
+
+    /// The Advanced section's mode bits, each a toggle.
+    fn render_permission_bits(&self, editable: bool, cx: &mut Context<Self>) -> AnyElement {
+        let permissions = self.model.permissions();
+        div()
+            .id("permissions-bits")
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .children(MODE_BITS.into_iter().map(|bit| {
+                let label = match bit.key.split_once('-') {
+                    Some((class, kind)) => format!(
+                        "{} {}",
+                        self.message(&format!("permissions-class-{class}")),
+                        self.message(&format!("permissions-bit-{kind}"))
+                    ),
+                    None => self
+                        .message(&format!("permissions-bit-{}", bit.key))
+                        .to_string(),
+                };
+                let mask = bit.mask;
+                Button::new(SharedString::from(format!("permissions-bit-{}", bit.key)))
+                    .label(label)
+                    .small()
+                    .selected(permissions.bit(mask) == Tristate::On)
+                    .disabled(!editable)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model.permissions_mut().toggle_bit(mask);
+                        cx.notify();
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    /// The Advanced section's ACL entries, read-only and with names, and the
+    /// note that the Group row sets their mask.
+    fn render_access_entries(&self) -> Vec<AnyElement> {
+        let permissions = self.model.permissions();
+        let accounts = permissions.accounts();
+        let entry_label = |entry: &AclEntry| {
+            let qualifier = match entry.qualifier() {
+                AclQualifier::Owner => self.message("permissions-acl-owner").to_string(),
+                AclQualifier::OwningGroup => {
+                    self.message("permissions-acl-owning-group").to_string()
+                }
+                AclQualifier::Other => self.message("permissions-acl-other").to_string(),
+                AclQualifier::User(uid) => format!(
+                    "{} {}",
+                    self.message("permissions-acl-user"),
+                    accounts.user_name(*uid)
+                ),
+                AclQualifier::Group(gid) => format!(
+                    "{} {}",
+                    self.message("permissions-acl-group"),
+                    accounts.group_name(*gid)
+                ),
+                AclQualifier::Mask => self.message("permissions-acl-mask").to_string(),
+                AclQualifier::Unknown => self.message("permissions-acl-unknown").to_string(),
+            };
+            let bits = [
+                if entry.read() { 'r' } else { '-' },
+                if entry.write() { 'w' } else { '-' },
+                if entry.execute() { 'x' } else { '-' },
+            ]
+            .iter()
+            .collect::<String>();
+            format!("{qualifier}: {bits}")
+        };
+        let state_label = |state: &AclState| match state {
+            AclState::Available(entries) if entries.is_empty() => {
+                self.message("properties-no-acl").to_string()
+            }
+            AclState::Available(entries) => entries
+                .iter()
+                .map(entry_label)
+                .collect::<Vec<_>>()
+                .join(", "),
+            AclState::Unsupported(reason) => format!(
+                "{}: {}",
+                self.message("properties-unsupported"),
+                self.catalog.localize_reason(reason)
+            ),
+            AclState::Unavailable(reason) => format!(
+                "{}: {}",
+                self.message("properties-unavailable"),
+                self.catalog.localize_reason(reason)
+            ),
+        };
+        let mut named = false;
+        let mut rows = Vec::new();
+        for (index, item) in self.model.snapshot().items().iter().enumerate() {
+            let name = item
+                .path()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let AclState::Available(entries) = item.permissions().acl() {
+                named |= entries.iter().any(|entry| {
+                    matches!(
+                        entry.qualifier(),
+                        AclQualifier::User(_) | AclQualifier::Group(_)
+                    )
+                });
+            }
+            let mut text = format!(
+                "{name} — {}: {}",
+                self.message("properties-access-acl"),
+                state_label(item.permissions().acl())
+            );
+            if let Some(default_acl) = item.permissions().default_acl() {
+                text.push_str(&format!(
+                    "; {}: {}",
+                    self.message("properties-default-acl"),
+                    state_label(default_acl)
+                ));
+            }
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("permissions-acl-item-{index}")))
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(text.clone())
+                    .text_sm()
+                    .child(text)
+                    .into_any_element(),
+            );
+        }
+        let mut entries = vec![
+            div()
+                .id("permissions-acl-entries")
+                .test_support()
+                .role(Role::Region)
+                .aria_label(self.message("properties-access-acl").to_string())
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(rows)
+                .into_any_element(),
+        ];
+        if named {
+            let note = self.message("permissions-acl-mask-note").to_string();
+            entries.push(
+                div()
+                    .id("permissions-acl-mask-note")
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(note.clone())
+                    .text_sm()
+                    .child(note)
+                    .into_any_element(),
+            );
+        }
+        entries
     }
 
     fn render_tag_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2620,10 +2875,6 @@ impl Render for PropertiesWindow {
         if self.pending_focus {
             self.focus.focus(window, cx);
             self.pending_focus = false;
-        }
-        if self.permission_inputs_need_sync {
-            self.sync_pristine_permission_inputs(window, cx);
-            self.permission_inputs_need_sync = false;
         }
         self.sync_rows(window, cx);
         let title = identity_title(self.model.snapshot());
@@ -2997,25 +3248,11 @@ fn aggregate_u32(value: &AggregateValue<u32>) -> String {
     }
 }
 
-fn editable_u32(value: AggregateValue<u32>) -> String {
-    match value {
-        AggregateValue::Same(value) => value.to_string(),
-        AggregateValue::Mixed | AggregateValue::Unavailable => String::new(),
-    }
-}
-
 fn aggregate_mode(value: &AggregateValue<u32>) -> String {
     match value {
         AggregateValue::Same(value) => format!("{value:04o}"),
         AggregateValue::Mixed => "Mixed".to_owned(),
         AggregateValue::Unavailable => "Unavailable".to_owned(),
-    }
-}
-
-fn editable_mode(value: AggregateValue<u32>) -> String {
-    match value {
-        AggregateValue::Same(value) => format!("{value:04o}"),
-        AggregateValue::Mixed | AggregateValue::Unavailable => String::new(),
     }
 }
 
@@ -3054,39 +3291,6 @@ fn recursive_size_label(state: &RecursiveSizeState) -> String {
             }
         ),
     }
-}
-
-fn acl_state_label(state: &AclState) -> String {
-    match state {
-        AclState::Available(entries) if entries.is_empty() => "No ACL entries".to_owned(),
-        AclState::Available(entries) => entries
-            .iter()
-            .map(acl_entry_label)
-            .collect::<Vec<_>>()
-            .join(", "),
-        AclState::Unsupported(reason) => format!("Unsupported: {reason}"),
-        AclState::Unavailable(reason) => format!("Unavailable: {reason}"),
-    }
-}
-
-fn acl_entry_label(entry: &AclEntry) -> String {
-    let qualifier = match entry.qualifier() {
-        AclQualifier::Owner => "owner".to_owned(),
-        AclQualifier::OwningGroup => "group".to_owned(),
-        AclQualifier::Other => "other".to_owned(),
-        AclQualifier::User(id) => format!("user:{id}"),
-        AclQualifier::Group(id) => format!("group:{id}"),
-        AclQualifier::Mask => "mask".to_owned(),
-        AclQualifier::Unknown => "unknown".to_owned(),
-    };
-    let permissions = [
-        if entry.read() { 'r' } else { '-' },
-        if entry.write() { 'w' } else { '-' },
-        if entry.execute() { 'x' } else { '-' },
-    ]
-    .iter()
-    .collect::<String>();
-    format!("{qualifier}:{permissions}")
 }
 
 fn indexed_label(base: &str, index: usize, count: usize) -> String {
@@ -3132,6 +3336,7 @@ mod tests {
     use gpui_kit::TestAppContext;
     use gpui_kit::component::Root;
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use musheen_core::CapabilityReason;
     use standard_library::fs as filesystem;
     use std as standard_library;
     use std::cell::RefCell;
@@ -3343,10 +3548,19 @@ mod tests {
             );
             assert!(
                 window
-                    .find("property-value-4")
+                    .find("property-value-2")
                     .value()
                     .is_some_and(|value| !value.is_empty()),
-                "the access ACL is exposed as a readable value"
+                "the mode is exposed as a readable value"
+            );
+            window.click("permissions-advanced", cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("permissions-acl-item-0")
+                    .label()
+                    .is_some_and(|label| label.starts_with("notes.txt")),
+                "the access ACL is exposed as a readable label"
             );
             properties.update(cx, |state, cx| state.focus.focus(window, cx));
             window.render_frame(cx);
@@ -3411,8 +3625,8 @@ mod tests {
                 Some("محرر الأذونات والملكية")
             );
             assert_eq!(
-                window.find("permissions-owner").label(),
-                Some("المالك (UID)")
+                window.find("permissions-owner-can-modify").label(),
+                Some("يمكنه العرض والتعديل")
             );
             assert!(window.find("properties-close").visible());
         })
@@ -3463,7 +3677,7 @@ mod tests {
         filesystem::set_permissions(&child, filesystem::Permissions::from_mode(0o644)).unwrap();
         let data = PropertiesWindowData::load(std::slice::from_ref(&directory)).unwrap();
         let mut properties = None;
-        let handle = cx.open_window(size(px(760.), px(620.)), |window, cx| {
+        let handle = cx.open_window(size(px(900.), px(900.)), |window, cx| {
             let view = cx.new(|cx| PropertiesWindow::new(data, window, cx));
             properties = Some(view.clone());
             Root::new(view, window, cx)
@@ -3474,51 +3688,28 @@ mod tests {
             window.render_frame(cx);
             window.click("properties-page-permissions", cx);
             window.render_frame(cx);
-            assert!(window.find("permissions-file-mode").visible());
-            assert!(window.find("permissions-directory-mode").visible());
-            window.click("permissions-file-mode", cx);
+            assert!(window.find("permissions-group-no-access").visible());
+            assert!(window.find("permissions-others-no-access").visible());
         })
-        .expect("the Properties window remains open while focusing");
+        .expect("the Properties window remains open while opening the page");
         cx.update(|cx| {
             assert!(
                 !properties.read(cx).model.permissions().is_dirty(),
-                "focusing a permission field must not dirty the plan"
+                "opening the Permissions page must not dirty the plan"
             );
         });
 
         cx.update_window(handle.into(), |_, window, cx| {
-            window.press("ctrl-a", cx);
-            window.input("0600", cx);
-            window.click("permissions-directory-mode", cx);
-            window.press("ctrl-a", cx);
-            window.input("0700", cx);
+            window.click("permissions-group-no-access", cx);
+            window.render_frame(cx);
+            window.click("permissions-others-no-access", cx);
         })
         .expect("the Properties window remains open while editing");
 
         cx.update(|cx| {
-            assert_eq!(
-                properties
-                    .read(cx)
-                    .permission_inputs
-                    .file_mode
-                    .read(cx)
-                    .value()
-                    .as_ref(),
-                "0600"
-            );
-            assert_eq!(
-                properties
-                    .read(cx)
-                    .permission_inputs
-                    .directory_mode
-                    .read(cx)
-                    .value()
-                    .as_ref(),
-                "0700"
-            );
             assert!(
                 properties.read(cx).model.permissions().is_dirty(),
-                "editing the modes must dirty the permission plan"
+                "choosing an access must dirty the permission plan"
             );
         });
 
@@ -3544,7 +3735,6 @@ mod tests {
                 permissions.is_dirty(),
                 "permission changes must remain dirty"
             );
-            assert_eq!(permissions.edit_disabled_reason(), None);
             assert!(
                 permissions.is_valid(),
                 "permission changes must become valid"
@@ -3857,6 +4047,75 @@ mod tests {
 
     #[cfg(unix)]
     #[gpui_kit::test]
+    async fn permissions_page_no_access_takes_execute_away(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("tool");
+        filesystem::write(&file, b"#!/bin/sh\n").unwrap();
+        set_file_mode(&file, 0o751);
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&file), None, cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window.find("permissions-others-varies").visible(),
+                "execute without read is no choice"
+            );
+        })
+        .unwrap();
+        click_all(handle, &["permissions-others-no-access"], cx);
+        let checked = file.clone();
+        apply_until(handle, cx, move || file_mode(&checked) == 0o750).await;
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_is_read_only_without_posix_permissions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_properties_key_bindings(cx);
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("on-vfat.txt");
+        filesystem::write(&file, b"contents").unwrap();
+        set_file_mode(&file, 0o644);
+        let reason = CapabilityReason::new("the filesystem does not store POSIX permissions")
+            .expect("the reason is not empty");
+        let data = PropertiesWindowData::load(std::slice::from_ref(&file))
+            .expect("the item loads")
+            .with_permission_capability(CapabilityState::Unsupported(reason));
+        let mut properties = None;
+        let handle = cx.open_window(size(px(900.), px(900.)), |window, cx| {
+            let view = cx.new(|cx| PropertiesWindow::new(data, window, cx));
+            properties = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let properties = properties.expect("the Properties view is constructed");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("properties-page-permissions", cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("permissions-read-only")
+                    .label()
+                    .is_some_and(|label| label.contains("does not store POSIX permissions")),
+                "the page says why it is read-only"
+            );
+            window.click("permissions-others-no-access", cx);
+            window.click("permissions-executable", cx);
+            window.click("permissions-advanced", cx);
+            window.render_frame(cx);
+            window.click("permissions-bit-sticky", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("properties-apply").is_none());
+        })
+        .expect("the Properties window is open");
+        cx.update(|cx| {
+            assert!(!properties.read(cx).model.permissions().is_dirty());
+        });
+        assert_eq!(file_mode(&file), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
     async fn permissions_page_every_string_is_localized(cx: &mut TestAppContext) {
         let temporary = tempfile::tempdir().unwrap();
         let file = temporary.path().join("notes.txt");
@@ -3922,23 +4181,16 @@ mod tests {
 
         filesystem::set_permissions(&path, filesystem::Permissions::from_mode(0o600)).unwrap();
         cx.wait_for(handle.into(), Duration::from_secs(2), |_, cx| {
-            properties
-                .read(cx)
-                .permission_inputs
-                .file_mode
-                .read(cx)
-                .value()
-                .as_ref()
-                == "0600"
+            let permissions = properties.read(cx).model.permissions();
+            *permissions.mode() == AggregateValue::Same(0o600)
+                && permissions.access(AccessClass::Group) == Some(Access::None)
         })
         .await;
         assert!(cx.update(|cx| !properties.read(cx).model.permissions().is_dirty()));
 
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click("permissions-file-mode", cx);
-            window.press("ctrl-a", cx);
-            window.input("0640", cx);
+            window.click("permissions-group-can-view", cx);
         })
         .expect("the Properties window remains open while editing");
         assert!(cx.update(|cx| properties.read(cx).model.permissions().is_dirty()));
@@ -3952,12 +4204,11 @@ mod tests {
             assert_eq!(
                 properties
                     .read(cx)
-                    .permission_inputs
-                    .file_mode
-                    .read(cx)
-                    .value()
-                    .as_ref(),
-                "0640"
+                    .model
+                    .permissions()
+                    .access(AccessClass::Group),
+                Some(Access::View),
+                "the user's choice survives the external change"
             );
             assert!(window.try_find("properties-apply").is_none());
             assert_eq!(

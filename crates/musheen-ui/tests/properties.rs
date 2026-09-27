@@ -7,8 +7,8 @@ use musheen_desktop::{
     PropertySnapshot, RecursiveSize, XattrState,
 };
 use musheen_ui::{
-    ApplicationChoice, LocalOperationQueue, OpenWithIntent, OpenWithModel, PropertiesDialogModel,
-    PropertiesPage, PropertiesState, ProviderPropertiesDialogModel,
+    Access, AccessClass, ApplicationChoice, LocalOperationQueue, OpenWithIntent, OpenWithModel,
+    PropertiesDialogModel, PropertiesPage, PropertiesState, ProviderPropertiesDialogModel,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -148,6 +148,7 @@ fn properties_model_only_offers_apply_for_dirty_valid_reviewed_edits() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("selected");
     fs::write(&path, b"first").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     let snapshot = PropertySnapshot::load(std::slice::from_ref(&path)).unwrap();
     let mut model = PropertiesDialogModel::new(snapshot);
 
@@ -156,17 +157,13 @@ fn properties_model_only_offers_apply_for_dirty_valid_reviewed_edits() {
     assert!(model.pages().contains(&PropertiesPage::Permissions));
     assert!(model.pages().contains(&PropertiesPage::Checksums));
     assert!(!model.apply_visible());
-    assert!(model.permissions().edit_disabled_reason().is_none());
+    assert!(model.permissions().read_only_reason().is_none());
     model.select_page(PropertiesPage::Permissions).unwrap();
     assert_eq!(model.page(), PropertiesPage::Permissions);
-    model.permissions_mut().set_file_mode_text("not-octal");
-    assert_eq!(
-        model.permissions().edit_disabled_reason(),
-        Some("mode must be an octal number")
-    );
-    assert!(!model.apply_visible());
-    model.permissions_mut().set_file_mode_text("0640");
-    assert!(model.permissions().edit_disabled_reason().is_none());
+    model
+        .permissions_mut()
+        .set_access(AccessClass::Others, Access::None);
+    assert!(model.permissions().is_dirty());
     model.permissions_mut().set_recursive(false);
     assert!(!model.apply_visible());
     model.permissions_mut().review_recursive_scope();
@@ -265,7 +262,9 @@ fn properties_model_never_discards_dirty_permissions_during_refresh() {
     let snapshot = PropertySnapshot::load(std::slice::from_ref(&path)).unwrap();
     let mut model = PropertiesDialogModel::new(snapshot);
 
-    model.permissions_mut().set_file_mode_text("0600");
+    model
+        .permissions_mut()
+        .set_access(AccessClass::Group, Access::None);
     assert!(model.permissions().is_dirty());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
 
