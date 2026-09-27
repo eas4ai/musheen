@@ -406,7 +406,10 @@ enum StoreProbe {
 /// (SYS-035, SYS-036).
 #[derive(Clone, Debug, Default)]
 struct ExecutableFact {
+    /// Whether the current user may execute the file (the store's answer).
     state: Option<CapabilityState>,
+    /// Whether the file has any execute bit, as Run as Administrator needs.
+    marked_executable: bool,
     run_kind: Option<RunKind>,
 }
 
@@ -2797,6 +2800,14 @@ fn register_file_manager_window(view: &Entity<MusheenApp>, window: &mut Window, 
             retire_file_manager_window(window_id, close_binding.as_ref(), cx);
         }
     });
+    // A file running in the drawer is not ended with its window unasked
+    // (SYS-036): the close waits for the user to stop it.
+    let asking_view = view.downgrade();
+    window.on_window_should_close(cx, move |_, cx| {
+        asking_view
+            .upgrade()
+            .is_none_or(|view| view.update(cx, |state, cx| state.allow_window_close(cx)))
+    });
     let windows = cx.global_mut::<FileManagerWindows>();
     windows
         .entries
@@ -3306,10 +3317,19 @@ fn run_store_probe(
     match probe {
         StoreProbe::Executable { id, path } => StoreProbeResult::Executable {
             id,
-            fact: ExecutableFact {
-                state: store.executable_state(&path).ok(),
-                // Only a local file is read, and only its first bytes.
-                run_kind: path.as_unix_path().and_then(musheen_desktop::run_kind),
+            fact: {
+                let state = store.executable_state(&path).ok();
+                ExecutableFact {
+                    // Only a local file is read, and only its metadata and
+                    // first bytes; another store's file counts as marked
+                    // when the store says it may be executed.
+                    marked_executable: path.as_unix_path().map_or(
+                        state == Some(CapabilityState::Supported),
+                        musheen_desktop::marked_executable,
+                    ),
+                    run_kind: path.as_unix_path().and_then(musheen_desktop::run_kind),
+                    state,
+                }
             },
         },
         StoreProbe::Location { location, resolve } => {
@@ -3910,9 +3930,12 @@ struct MusheenApp {
     terminal_run_generation: u64,
     /// The user asked to close a file's session while it runs.
     pending_terminal_run_close: bool,
-    /// A file to run, and its folder, waiting until the user stops the one
-    /// that runs.
-    pending_terminal_run: Option<(PathBuf, PathBuf)>,
+    /// A reviewed file to run, and its path, waiting until the user stops
+    /// the one that runs; it is checked again when the user confirms.
+    pending_terminal_run: Option<(CommandTargetRef, PathBuf)>,
+    /// The window asked to close while a file ran in the drawer; it closes
+    /// once the user stops the file.
+    close_window_after_run: bool,
     /// The directories searched for programs a run needs: a desktop entry's
     /// and the system terminal (SYS-035, SYS-036).
     run_directories: Vec<PathBuf>,
@@ -4462,9 +4485,16 @@ impl MusheenApp {
                     "terminal-run-close-confirmation",
                     "terminal-run-stop-warning",
                     "terminal-run-stop",
-                    |this, cx| this.end_terminal_run(cx),
-                    |this, cx| {
+                    |this, window, cx| {
+                        let close_window = std::mem::take(&mut this.close_window_after_run);
+                        this.end_terminal_run(cx);
+                        if close_window {
+                            window.defer(cx, |window, _| window.remove_window());
+                        }
+                    },
+                    |this, _, cx| {
                         this.pending_terminal_run_close = false;
+                        this.close_window_after_run = false;
                         cx.notify();
                     },
                     cx,
@@ -4475,12 +4505,8 @@ impl MusheenApp {
                     "terminal-run-replace-confirmation",
                     "terminal-run-replace-warning",
                     "terminal-run-replace",
-                    |this, cx| {
-                        if let Some((path, folder)) = this.pending_terminal_run.take() {
-                            this.launch_terminal_run(path, folder, cx);
-                        }
-                    },
-                    |this, cx| {
+                    |this, _, cx| this.confirm_pending_terminal_run(cx),
+                    |this, _, cx| {
                         this.pending_terminal_run = None;
                         cx.notify();
                     },
@@ -4524,8 +4550,8 @@ impl MusheenApp {
         id: &'static str,
         warning: &str,
         action: &str,
-        confirm: fn(&mut Self, &mut Context<Self>),
-        cancel: fn(&mut Self, &mut Context<Self>),
+        confirm: fn(&mut Self, &mut Window, &mut Context<Self>),
+        cancel: fn(&mut Self, &mut Window, &mut Context<Self>),
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
@@ -4548,7 +4574,7 @@ impl MusheenApp {
                             .expect("the run action is localized"),
                     )
                     .small()
-                    .on_click(cx.listener(move |this, _, _, cx| confirm(this, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| confirm(this, window, cx))),
             )
             .child(
                 Button::new(SharedString::from(format!("{id}-cancel")))
@@ -4558,7 +4584,7 @@ impl MusheenApp {
                             .expect("the cancel label is localized"),
                     )
                     .small()
-                    .on_click(cx.listener(move |this, _, _, cx| cancel(this, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| cancel(this, window, cx))),
             )
             .into_any_element()
     }
@@ -4841,6 +4867,7 @@ impl MusheenApp {
             terminal_run_generation: 0,
             pending_terminal_run_close: false,
             pending_terminal_run: None,
+            close_window_after_run: false,
             run_directories,
             status_center_open: false,
             undo_available: HashSet::new(),
@@ -9336,7 +9363,7 @@ impl MusheenApp {
                 ItemKind::RegularFile
                     if executable_fact
                         .as_ref()
-                        .is_some_and(|fact| fact.state == Some(CapabilityState::Supported)) =>
+                        .is_some_and(|fact| fact.marked_executable) =>
                 {
                     CommandTarget::ExecutableFile
                 }
@@ -9521,6 +9548,9 @@ impl MusheenApp {
                 .as_ref()
                 .filter(|_| selection.len() == 1)
                 .and_then(|fact| fact.run_kind),
+            user_may_execute: executable_fact
+                .as_ref()
+                .is_some_and(|fact| fact.state == Some(CapabilityState::Supported)),
             capabilities,
             provider_actions,
             show_hidden: self
@@ -12956,11 +12986,84 @@ impl MusheenApp {
         let Some((target, path)) = self.run_target(targets, origin_tab, confirmed, cx) else {
             return;
         };
+        let system = cx
+            .try_global::<crate::settings::RuntimeSettings>()
+            .and_then(|runtime| runtime.0.value("files.run_in_terminal"))
+            .as_deref()
+            == Some("system");
+        if system {
+            self.run_in_system_terminal(target, path, cx);
+        } else {
+            self.run_in_drawer_checked(target, path, cx);
+        }
+    }
+
+    /// Checks the file and runs it in the system terminal, all off the UI
+    /// thread: the terminal is looked for in the run directories.
+    fn run_in_system_terminal(
+        &mut self,
+        target: CommandTargetRef,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         let store = Arc::clone(&self.store);
+        let runner = Arc::clone(&self.application_runner);
+        let directories = self.run_directories.clone();
+        let work = cx.background_spawn(async move {
+            let checked = check_run_target(
+                &*store,
+                &target,
+                &path,
+                &[RunKind::Program, RunKind::Script],
+            )?;
+            let folder = checked
+                .path()
+                .parent()
+                .ok_or(ExecutableRunError::NotRunnable)?;
+            let launch =
+                musheen_desktop::system_terminal_launch(&directories, checked.path(), folder)
+                    .map_err(ExecutableRunError::Launch)?;
+            runner
+                .spawn(&launch)
+                .map_err(LaunchError::Spawn)
+                .map_err(ExecutableRunError::Launch)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                state.operation_error = result.err().map(|error| match error {
+                    ExecutableRunError::Launch(LaunchError::TerminalUnavailable) => state
+                        .catalog
+                        .message("terminal-run-no-terminal")
+                        .expect("the missing-terminal message is localized")
+                        .into(),
+                    error => state.run_error_message(
+                        error,
+                        "only a local script or compiled program can run in a terminal",
+                    ),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Checks the file off the UI thread, then runs it in the drawer.
+    fn run_in_drawer_checked(
+        &mut self,
+        target: CommandTargetRef,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let store = Arc::clone(&self.store);
+        let checked_target = target.clone();
         let work = cx.background_spawn(async move {
             check_run_target(
                 &*store,
-                &target,
+                &checked_target,
                 &path,
                 &[RunKind::Program, RunKind::Script],
             )
@@ -12972,7 +13075,7 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| match result {
-                Ok(path) => state.run_in_chosen_terminal(path, cx),
+                Ok(path) => state.start_terminal_run(target, path, cx),
                 Err(error) => {
                     state.operation_error = Some(state.run_error_message(
                         error,
@@ -13011,59 +13114,49 @@ impl MusheenApp {
         }
     }
 
-    /// Runs a checked file where the Run in Terminal setting says: the
-    /// terminal drawer, the default, or the system terminal.
-    fn run_in_chosen_terminal(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(folder) = path.parent().map(Path::to_path_buf) else {
-            return;
-        };
-        let system = cx
-            .try_global::<crate::settings::RuntimeSettings>()
-            .and_then(|runtime| runtime.0.value("files.run-in-terminal"))
-            .as_deref()
-            == Some("system");
-        if !system {
-            self.start_terminal_run(path, folder, cx);
-            return;
-        }
-        let started =
-            musheen_desktop::system_terminal_launch(&self.run_directories, &path, &folder)
-                .and_then(|launch| {
-                    self.application_runner
-                        .spawn(&launch)
-                        .map_err(LaunchError::Spawn)
-                });
-        self.operation_error = started.err().map(|error| match error {
-            LaunchError::TerminalUnavailable => self
-                .catalog
-                .message("terminal-run-no-terminal")
-                .expect("the missing-terminal message is localized")
-                .into(),
-            error => self.run_error_message(ExecutableRunError::Launch(error), ""),
-        });
-        cx.notify();
-    }
-
-    /// Runs `path` in the drawer, in its own session in `folder`. While
-    /// another file still runs there, the user is asked first.
-    fn start_terminal_run(&mut self, path: PathBuf, folder: PathBuf, cx: &mut Context<Self>) {
+    /// Runs the checked file `path` in the drawer, in its own session. While
+    /// another file still runs there, the user is asked first, and the
+    /// reviewed `target` is checked again when they confirm.
+    fn start_terminal_run(
+        &mut self,
+        target: CommandTargetRef,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         self.show_terminal_drawer();
         if self
             .terminal_run
             .as_ref()
             .is_some_and(|run| run.exit.is_none())
         {
-            self.pending_terminal_run = Some((path, folder));
+            self.pending_terminal_run = Some((target, path));
             cx.notify();
             return;
         }
-        self.launch_terminal_run(path, folder, cx);
+        self.launch_terminal_run(path, cx);
     }
 
-    fn launch_terminal_run(&mut self, path: PathBuf, folder: PathBuf, cx: &mut Context<Self>) {
+    /// The user chose to stop the running file and run the waiting one: the
+    /// running file stops, and the waiting one is checked again first.
+    fn confirm_pending_terminal_run(&mut self, cx: &mut Context<Self>) {
+        let Some((target, path)) = self.pending_terminal_run.take() else {
+            return;
+        };
+        if let Some(mut run) = self.terminal_run.take() {
+            run.session.stop();
+        }
+        self.run_in_drawer_checked(target, path, cx);
+    }
+
+    fn launch_terminal_run(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(folder) = path.parent().map(Path::to_path_buf) else {
+            return;
+        };
         self.pending_terminal_run = None;
         self.pending_terminal_run_close = false;
-        self.terminal_run = None;
+        if let Some(mut run) = self.terminal_run.take() {
+            run.session.stop();
+        }
         self.terminal_run_generation = self.terminal_run_generation.wrapping_add(1);
         let generation = self.terminal_run_generation;
         let name = SharedString::from(
@@ -13169,14 +13262,33 @@ impl MusheenApp {
         cx.notify();
     }
 
-    /// Ends the file's session; the drawer shows the shell again.
+    /// Ends the file's session, stopping it if it still runs; the drawer
+    /// shows the shell again.
     fn end_terminal_run(&mut self, cx: &mut Context<Self>) {
         if let Some(mut run) = self.terminal_run.take() {
-            let _ = run.session.terminate();
+            run.session.stop();
         }
         self.pending_terminal_run_close = false;
         self.ensure_terminal_session(cx);
         cx.notify();
+    }
+
+    /// Whether the window may close now. While a file runs in the drawer it
+    /// may not: the drawer asks to stop it, and the window closes once the
+    /// user agrees (SYS-036).
+    fn allow_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self
+            .terminal_run
+            .as_ref()
+            .is_none_or(|run| run.exit.is_some())
+        {
+            return true;
+        }
+        self.show_terminal_drawer();
+        self.pending_terminal_run_close = true;
+        self.close_window_after_run = true;
+        cx.notify();
+        false
     }
 
     fn copyable_location_text(&self, path: &StorePath) -> Option<String> {
@@ -17546,6 +17658,7 @@ impl MusheenApp {
         let target = CommandTargetRef::new(item.id().clone(), path.clone()).ok();
         let context_target = target.clone();
         let context_location = parent_location.clone();
+        let activated = item.clone();
         let colors = cx.theme().colors;
         let icon = Icon::new(if kind == ItemKind::Directory {
             IconName::Folder
@@ -17583,15 +17696,10 @@ impl MusheenApp {
                         this.activate_tab(tab_id, cx);
                     }
                     this.navigate_with_column_parent(path.clone(), true, Some(parent_index), cx);
-                } else if event.click_count() == 2
-                    && let Some(target) = &target
-                {
-                    this.dispatch_local_target_command(
-                        &CommandAction::Open,
-                        &CommandParameters::targets(vec![target.clone()]),
-                        Some(tab_id),
-                        cx,
-                    );
+                } else if event.click_count() == 2 && target.is_some() {
+                    // A file here activates as in the current column, so the
+                    // executable-file preference applies (SYS-035).
+                    this.activate_resolved_directory_item(tab_id, activated.clone(), cx);
                 }
             }))
             .on_mouse_down(
@@ -25953,9 +26061,10 @@ mod tests {
     #[gpui_kit::test]
     async fn run_file_refuses_a_file_the_user_may_not_execute(cx: &mut TestAppContext) {
         let temporary = tempfile::tempdir().unwrap();
-        // The group may execute it, its owner, the current user, may not.
+        // The owner, the current user, may read it but not execute it; its
+        // group may execute it, so an execute bit is set.
         let program = temporary.path().join("group-only");
-        compiled_program(&program, 0o070);
+        compiled_program(&program, 0o654);
         let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
         let target = local_command_target(&program);
         let runner = Arc::new(RecordingApplicationRunner::default());
@@ -25969,6 +26078,10 @@ mod tests {
             MusheenApp::menu_entry_by_id(&menu, "file.run")
                 .is_none_or(|entry| !entry.state().is_enabled()),
             "Run is not offered for a file the current user may not execute"
+        );
+        assert!(
+            MusheenApp::menu_entry_by_id(&menu, "file.run_as_administrator").is_some(),
+            "Run as Administrator stays for a file with an execute bit"
         );
         run_confirmed(&app, &target, cx);
         activate_target(&app, &target, cx);
@@ -25985,10 +26098,17 @@ mod tests {
         let runner = Arc::new(RecordingApplicationRunner::default());
         app.update(cx, |state, _| state.application_runner = runner.clone());
 
-        // Open: the program opens like a document, with no review.
+        // Open: the program opens like a document, with no review, and the
+        // menu's Run is shown disabled.
         app.update(cx, |state, _| {
             state.executable_handling = ExecutableHandling::Open
         });
+        let menu = probed_item_menu(&app, &target, cx);
+        assert_eq!(
+            MusheenApp::menu_entry_by_id(&menu, "file.run").map(|entry| entry.state().is_enabled()),
+            Some(false),
+            "Open disables Run"
+        );
         activate_target(&app, &target, cx);
         assert!(!launched(&runner, &program), "Open does not run it");
         assert!(cx.read(|cx| app.read(cx).context_dialog_windows.is_empty()));
@@ -26152,8 +26272,22 @@ mod tests {
         file_with_mode(&script, b"#!/bin/sh\nexit 0\n", 0o755);
         let program = temporary.path().join("tool");
         compiled_program(&program, 0o755);
+        // Its owner, the current user, may read but not execute it; its
+        // group may execute it.
         let locked = temporary.path().join("locked.sh");
-        file_with_mode(&locked, b"#!/bin/sh\nexit 0\n", 0o644);
+        file_with_mode(&locked, b"#!/bin/sh\nexit 0\n", 0o654);
+        // Files the kernel would refuse, which a shell would otherwise run.
+        let fake_program = temporary.path().join("fake-program");
+        file_with_mode(&fake_program, b"\x7fELF\ntouch marker\n", 0o755);
+        let no_interpreter = temporary.path().join("no-interpreter");
+        file_with_mode(&no_interpreter, b"#!\ntouch marker\n", 0o755);
+        // A desktop entry may start with a comment line such as #!.
+        let commented_entry = temporary.path().join("commented.desktop");
+        file_with_mode(
+            &commented_entry,
+            b"#!/bin/sh\n[Desktop Entry]\nType=Application\nName=App\nExec=/usr/bin/true\n",
+            0o755,
+        );
         let entry = temporary.path().join("app.desktop");
         file_with_mode(
             &entry,
@@ -26186,6 +26320,17 @@ mod tests {
             "a script the user may not execute is shown disabled"
         );
         assert_eq!(offered(&entry, cx), None, "a desktop entry");
+        assert_eq!(offered(&commented_entry, cx), None, "a desktop entry");
+        assert_eq!(
+            offered(&fake_program, cx),
+            None,
+            "a file that only starts like an ELF"
+        );
+        assert_eq!(
+            offered(&no_interpreter, cx),
+            None,
+            "a #! line with no interpreter"
+        );
         assert_eq!(offered(&text, cx), None, "a file that is not a program");
         app.update(cx, |state, _| {
             state.executable_handling = ExecutableHandling::Open
@@ -26375,8 +26520,7 @@ mod tests {
                 "running another asks first"
             );
             assert!(run.session.is_running());
-            let (path, folder) = state.pending_terminal_run.take().unwrap();
-            state.launch_terminal_run(path, folder, cx);
+            state.confirm_pending_terminal_run(cx);
         });
         cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
             app.read(cx)
@@ -26385,13 +26529,79 @@ mod tests {
                 .is_some_and(|run| run.generation != first_generation)
         })
         .await;
+        let second_generation = app.update(cx, |state, _| {
+            let run = state.terminal_run.as_ref().unwrap();
+            assert_eq!(run.name.as_ref(), "second.sh");
+            run.generation
+        });
+
+        // A waiting file is checked again when the user confirms: one put in
+        // its place while the question was open does not run.
+        run_in_terminal_confirmed(&app, &local_command_target(&first), cx);
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            app.read(cx).pending_terminal_run.is_some()
+        })
+        .await;
+        filesystem::rename(&first, temporary.path().join("first.old")).unwrap();
+        file_with_mode(&first, b"echo not a program\n", 0o755);
+        app.update(cx, |state, cx| state.confirm_pending_terminal_run(cx));
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            app.read(cx).operation_error.is_some()
+        })
+        .await;
         app.update(cx, |state, cx| {
-            assert_eq!(
-                state.terminal_run.as_ref().unwrap().name.as_ref(),
-                "second.sh"
+            assert!(
+                state
+                    .terminal_run
+                    .as_ref()
+                    .is_none_or(|run| run.generation == second_generation),
+                "the replaced file did not start"
             );
             state.end_terminal_run(cx);
         });
+    }
+
+    #[gpui_kit::test]
+    async fn run_in_terminal_stop_ends_a_program_that_ignores_the_hangup(cx: &mut TestAppContext) {
+        // The terminal's reader threads wake the app from outside the test
+        // scheduler.
+        cx.executor().allow_parking();
+        let temporary = tempfile::tempdir().unwrap();
+        let stubborn = temporary.path().join("stubborn.sh");
+        file_with_mode(&stubborn, b"#!/bin/sh\ntrap '' HUP\nsleep 30\n", 0o755);
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        app.update(cx, |state, _| {
+            state.executable_handling = ExecutableHandling::Ask
+        });
+        run_in_terminal_confirmed(&app, &local_command_target(&stubborn), cx);
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            app.read(cx).terminal_run.is_some()
+        })
+        .await;
+        std::thread::sleep(Duration::from_millis(300));
+        let pid = app.update(cx, |state, cx| {
+            let pid = state
+                .terminal_run
+                .as_ref()
+                .and_then(|run| run.session.process_id())
+                .unwrap();
+            // Closing the window waits for the user to stop the file.
+            assert!(!state.allow_window_close(cx));
+            assert!(state.pending_terminal_run_close && state.close_window_after_run);
+            state.end_terminal_run(cx);
+            pid
+        });
+        let stopped = std::time::Instant::now();
+        while filesystem::metadata(format!("/proc/{pid}")).is_ok()
+            && stopped.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            filesystem::metadata(format!("/proc/{pid}")).is_err(),
+            "a program that ignores the hangup is stopped"
+        );
+        assert!(app.update(cx, |state, cx| state.allow_window_close(cx)));
     }
 
     #[gpui_kit::test]
@@ -26404,7 +26614,7 @@ mod tests {
         file_with_mode(&terminal, b"#!/bin/sh\nexit 0\n", 0o755);
         let mut settings = musheen_desktop::SettingsDocument::default();
         settings
-            .set_value("files.run-in-terminal", "system")
+            .set_value("files.run_in_terminal", "system")
             .unwrap();
         cx.update(|cx| cx.set_global(crate::settings::RuntimeSettings(settings)));
         let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;

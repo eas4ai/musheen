@@ -316,7 +316,7 @@ const SETTINGS: &[SettingSpec] = &[
         feature: SettingsFeature::Execution,
     },
     SettingSpec {
-        key: "files.run-in-terminal",
+        key: "files.run_in_terminal",
         page: SettingsPage::Files,
         label: "setting-files-run-in-terminal",
         group: "settings-group-files",

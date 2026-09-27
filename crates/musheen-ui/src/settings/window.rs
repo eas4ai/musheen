@@ -1083,11 +1083,11 @@ mod tests {
         init_settings_pointer_test(cx);
         assert_eq!(
             SettingsDocument::default()
-                .value("files.run-in-terminal")
+                .value("files.run_in_terminal")
                 .as_deref(),
             Some("embedded")
         );
-        assert!(editable_in_the_settings_window("files.run-in-terminal", cx));
+        assert!(editable_in_the_settings_window("files.run_in_terminal", cx));
     }
 
     #[gpui_kit::test]

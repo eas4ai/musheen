@@ -287,6 +287,11 @@ fn executable_run_state(context: &CommandContext) -> CommandState {
     if !context.executable_run_enabled {
         return CommandState::disabled("the executable run preference is disabled");
     }
+    if !context.user_may_execute {
+        return CommandState::disabled(
+            "you may not execute this file; its permissions in Properties can allow it",
+        );
+    }
     CommandState::enabled()
 }
 
@@ -304,7 +309,7 @@ fn terminal_run_state(context: &CommandContext) -> CommandState {
     if !context.executable_run_enabled {
         return CommandState::disabled("the executable run preference is disabled");
     }
-    if context.target != CommandTarget::ExecutableFile {
+    if !context.user_may_execute {
         return CommandState::disabled(
             "you may not execute this file; its permissions in Properties can allow it",
         );

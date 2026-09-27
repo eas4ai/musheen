@@ -836,6 +836,7 @@ fn target_and_saved_state_policies_are_mutually_exclusive() {
         target: CommandTarget::ExecutableFile,
         is_local: true,
         run_kind: Some(RunKind::Program),
+        user_may_execute: true,
         ..CommandContext::default()
     };
     assert!(
@@ -849,60 +850,40 @@ fn target_and_saved_state_policies_are_mutually_exclusive() {
         executable_run_enabled: true,
         ..executable.clone()
     };
-    let state = |id: &str, run_kind, target| {
-        registry
-            .get(id)
-            .unwrap()
-            .state(&CommandContext {
-                run_kind,
-                target,
-                ..enabled.clone()
-            })
-            .is_enabled()
+    let state = |id: &str, run_kind, user_may_execute| {
+        registry.get(id).unwrap().state(&CommandContext {
+            run_kind,
+            user_may_execute,
+            ..enabled.clone()
+        })
     };
     // SYS-035: Run takes a compiled program or a desktop entry the user may
     // execute; SYS-036: Run in Terminal takes a script or compiled program.
-    let executable_file = CommandTarget::ExecutableFile;
-    assert!(state("file.run", Some(RunKind::Program), executable_file));
-    assert!(state(
-        "file.run",
-        Some(RunKind::DesktopEntry),
-        executable_file
-    ));
-    assert!(!state("file.run", Some(RunKind::Script), executable_file));
-    assert!(!state("file.run", None, executable_file));
-    assert!(state(
-        "file.run_in_terminal",
-        Some(RunKind::Script),
-        executable_file
-    ));
-    assert!(state(
-        "file.run_in_terminal",
-        Some(RunKind::Program),
-        executable_file
-    ));
-    assert!(!state(
-        "file.run_in_terminal",
-        Some(RunKind::DesktopEntry),
-        executable_file
-    ));
-    assert!(!state("file.run_in_terminal", None, executable_file));
-    assert!(!state(
-        "file.run_in_terminal",
-        Some(RunKind::Script),
-        CommandTarget::File
-    ));
-    assert_eq!(
+    assert!(state("file.run", Some(RunKind::Program), true).is_enabled());
+    assert!(state("file.run", Some(RunKind::DesktopEntry), true).is_enabled());
+    assert!(!state("file.run", Some(RunKind::Script), true).is_enabled());
+    assert!(!state("file.run", None, true).is_enabled());
+    assert!(state("file.run_in_terminal", Some(RunKind::Script), true).is_enabled());
+    assert!(state("file.run_in_terminal", Some(RunKind::Program), true).is_enabled());
+    assert!(!state("file.run_in_terminal", Some(RunKind::DesktopEntry), true).is_enabled());
+    assert!(!state("file.run_in_terminal", None, true).is_enabled());
+    // A file whose execute bits do not reach the current user.
+    let refusal = Some("you may not execute this file; its permissions in Properties can allow it");
+    for id in ["file.run", "file.run_in_terminal"] {
+        let refused = state(id, Some(RunKind::Program), false);
+        assert!(!refused.is_enabled(), "{id}");
+        assert_eq!(refused.disabled_reason(), refusal, "{id}");
+    }
+    assert!(
         registry
-            .get("file.run_in_terminal")
+            .get("file.run_as_administrator")
             .unwrap()
             .state(&CommandContext {
-                run_kind: Some(RunKind::Script),
-                target: CommandTarget::File,
+                user_may_execute: false,
                 ..enabled.clone()
             })
-            .disabled_reason(),
-        Some("you may not execute this file; its permissions in Properties can allow it")
+            .is_enabled(),
+        "Run as Administrator needs an execute bit, not the current user's permission"
     );
     assert!(
         !registry
