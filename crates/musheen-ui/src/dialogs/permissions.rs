@@ -265,6 +265,49 @@ impl Accounts {
         &self.user_groups
     }
 
+    /// Loads the names for `snapshot` again, keeping the lists of every
+    /// account and group and the user's groups: a refresh that sees a
+    /// metadata change does not ask the account database for them again.
+    #[must_use]
+    pub fn reload_for(&self, snapshot: &PropertySnapshot) -> Self {
+        let mut accounts = self.clone();
+        for item in snapshot.items() {
+            let permissions = item.permissions();
+            let owner = permissions.owner();
+            if let std::collections::btree_map::Entry::Vacant(entry) = accounts.users.entry(owner)
+                && let Some(name) = musheen_desktop::user_name(owner)
+            {
+                entry.insert(name);
+            }
+            let group = permissions.group();
+            if let std::collections::btree_map::Entry::Vacant(entry) = accounts.groups.entry(group)
+                && let Some(name) = musheen_desktop::group_name(group)
+            {
+                entry.insert(name);
+            }
+        }
+        accounts
+    }
+
+    /// Accounts for a test: `effective_user`, their groups, and every user
+    /// and group listed.
+    #[cfg(test)]
+    pub(crate) fn fixed(
+        effective_user: u32,
+        user_groups: Vec<(u32, String)>,
+        all_users: Vec<(u32, String)>,
+        all_groups: Vec<(u32, String)>,
+    ) -> Self {
+        Self {
+            effective_user,
+            users: all_users.iter().cloned().collect(),
+            groups: all_groups.iter().cloned().collect(),
+            user_groups,
+            all_users,
+            all_groups,
+        }
+    }
+
     /// Every user account the system lists, by name.
     #[must_use]
     pub fn all_users(&self) -> &[(u32, String)] {
@@ -354,6 +397,9 @@ pub struct PermissionsPageModel {
     owner_edit: Option<u32>,
     group_edit: Option<u32>,
     scope: MetadataScope,
+    /// Whether every selected item is on a local filesystem with POSIX
+    /// ownership, where the broker makes owner and group changes (SYS-037).
+    admin_ownership: bool,
 }
 
 /// The owner and group change Apply makes as administrator (SYS-037);
@@ -447,6 +493,7 @@ impl PermissionsPageModel {
             owner_edit: None,
             group_edit: None,
             scope: MetadataScope::Single,
+            admin_ownership: true,
         }
     }
 
@@ -566,15 +613,14 @@ impl PermissionsPageModel {
             .map(|item| {
                 let ownership_changes = self.group_edit.is_some_and(|group| group != item.group)
                     || self.owner_edit.is_some_and(|owner| owner != item.owner);
-                // The kernel clears setuid and setgid bits on an owner or
-                // group change. The user's own group change comes before the
-                // mode change; one made as administrator comes after it.
-                let mode = if !ownership_changes {
-                    edit.apply(item.kind, item.mode)
-                } else if self.needs_administrator() {
-                    mode_after_ownership_change(item.kind, edit.apply(item.kind, item.mode))
+                // Apply changes the mode first and the owner and group after
+                // (SEARCH-019); the kernel then clears setuid and setgid bits
+                // where the owner or group changes.
+                let mode = edit.apply(item.kind, item.mode);
+                let mode = if ownership_changes {
+                    mode_after_ownership_change(item.kind, mode)
                 } else {
-                    edit.apply(item.kind, mode_after_ownership_change(item.kind, item.mode))
+                    mode
                 };
                 (item.kind, mode)
             })
@@ -748,18 +794,45 @@ impl PermissionsPageModel {
         }
     }
 
-    /// Whether the page offers the owner and group choosers: on every
-    /// filesystem with POSIX permissions, links and special files included.
-    /// A change the user may not make alone applies as administrator.
+    /// Marks whether the selected items are on filesystems where the broker
+    /// makes owner and group changes as administrator (SYS-037).
     #[must_use]
-    pub fn group_editable(&self) -> bool {
-        self.read_only.is_none() && !self.owners.is_empty()
+    pub fn with_admin_ownership(mut self, supported: bool) -> Self {
+        self.admin_ownership = supported;
+        self
     }
 
-    /// Whether the owner may be chosen; the same rule as the group.
+    /// Whether changes the user may not make alone can be made here: as the
+    /// superuser, or through the broker on a local filesystem with POSIX
+    /// ownership.
+    #[must_use]
+    pub fn admin_changes_available(&self) -> bool {
+        self.accounts.effective_user == 0 || self.admin_ownership
+    }
+
+    fn owns_every_item(&self) -> bool {
+        self.owners
+            .iter()
+            .all(|owner| *owner == self.accounts.effective_user)
+    }
+
+    /// Whether the page offers the group chooser: on every filesystem with
+    /// POSIX permissions, links and special files included. A change the
+    /// user may not make alone applies as administrator; where that is not
+    /// available, only the owner of every item may choose among their own
+    /// groups.
+    #[must_use]
+    pub fn group_editable(&self) -> bool {
+        self.read_only.is_none()
+            && !self.owners.is_empty()
+            && (self.admin_changes_available() || self.owns_every_item())
+    }
+
+    /// Whether the owner may be chosen: where changes the user may not make
+    /// alone are available.
     #[must_use]
     pub fn owner_editable(&self) -> bool {
-        self.group_editable()
+        self.read_only.is_none() && !self.owners.is_empty() && self.admin_changes_available()
     }
 
     /// Chooses owner `uid`, one of the system's user accounts.
@@ -769,17 +842,29 @@ impl PermissionsPageModel {
         }
     }
 
-    /// Chooses group `gid`, one of the system's groups.
+    /// Chooses group `gid`: any of the system's groups where changes the
+    /// user may not make alone are available, else one of the user's own.
     pub fn set_group(&mut self, gid: u32) {
-        if self.group_editable()
-            && (self.accounts.is_user_group(gid)
-                || self
+        let offered = self.accounts.is_user_group(gid)
+            || (self.admin_changes_available()
+                && self
                     .accounts
                     .all_groups
                     .iter()
-                    .any(|(group, _)| *group == gid))
-        {
+                    .any(|(group, _)| *group == gid));
+        if self.group_editable() && offered {
             self.group_edit = (self.group != AggregateValue::Same(gid)).then_some(gid);
+        }
+    }
+
+    /// The groups the chooser offers: every group, or the user's own where
+    /// changes the user may not make alone are not available.
+    #[must_use]
+    pub fn group_choices(&self) -> &[(u32, String)] {
+        if self.admin_changes_available() {
+            &self.accounts.all_groups
+        } else {
+            &self.accounts.user_groups
         }
     }
 
@@ -848,9 +933,18 @@ impl PermissionsPageModel {
     #[must_use]
     pub fn change(&self) -> MetadataChange {
         let change = MetadataChange::new().with_mode_edit(self.mode_edit());
+        if self.needs_administrator() {
+            return change;
+        }
+        // Without administrator rights the group is one the user may set,
+        // and an owner is chosen only by the superuser.
+        let change = match self.owner_edit {
+            Some(owner) => change.with_owner(owner),
+            None => change,
+        };
         match self.group_edit {
-            Some(group) if !self.needs_administrator() => change.with_group(group),
-            _ => change,
+            Some(group) => change.with_group(group),
+            None => change,
         }
     }
 

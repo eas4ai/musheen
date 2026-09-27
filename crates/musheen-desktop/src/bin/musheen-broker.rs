@@ -3,8 +3,8 @@ use musheen_desktop::privilege::{
     AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker,
     BrokerOperation, BrokerOutput, BrokerRequest, BrokerResponse, ELEVATED_SESSION_IDLE,
     JsonAuditLog, PrivilegeProvider, RequestLines, SUDO_BROKER_READY, SystemClock,
-    SystemOperationRunner, boot_clock, decode_broker_request, prepare_sudo_terminal, serve_session,
-    write_response,
+    SystemOperationRunner, boot_clock, decode_broker_request, encode_ownership_progress,
+    prepare_sudo_terminal, serve_session, write_response,
 };
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -97,13 +97,20 @@ fn main() {
         PrivilegeProvider::Polkit => ElevatedBrokerAuthorizer::Pkexec,
         PrivilegeProvider::Sudo => ElevatedBrokerAuthorizer::Sudo,
     };
-    let broker = Broker::new(
-        authorizer,
-        SystemOperationRunner::default(),
-        audit,
-        SystemClock,
-    )
-    .with_provider(provider);
+    // An ownership change reports its progress on the output, and stops
+    // at once when Musheen closes the input, as Musheen cannot signal a
+    // broker running as root (SYS-037).
+    let runner = if matches!(request.operation(), BrokerOperation::ChangeOwnership { .. }) {
+        requests.end_with_input();
+        SystemOperationRunner::default().with_progress(std::sync::Arc::new(|changed, path| {
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{}", encode_ownership_progress(changed, path));
+            let _ = stdout.flush();
+        }))
+    } else {
+        SystemOperationRunner::default()
+    };
+    let broker = Broker::new(authorizer, runner, audit, SystemClock).with_provider(provider);
     let mut stdout = std::io::stdout();
     match broker.handle(request) {
         Ok(BrokerOutput::RootReferenced(root)) => {

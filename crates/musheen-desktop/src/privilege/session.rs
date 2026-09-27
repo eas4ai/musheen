@@ -115,6 +115,14 @@ impl RequestLines {
         Ok(Self { lines, session })
     }
 
+    /// Makes the end of input, or the end line, end the process at once, as
+    /// in a session. An ownership change runs so, because closing the
+    /// broker's input is how Musheen, which cannot signal a broker running
+    /// as root, stops it (SYS-037).
+    pub fn end_with_input(&self) {
+        self.session.store(true, Ordering::SeqCst);
+    }
+
     /// The first request, however long it takes to arrive.
     #[must_use]
     pub fn first(&self) -> Option<Result<String, BrokerError>> {
@@ -312,6 +320,19 @@ impl BrokerChannel {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<String, ChannelError> {
+        self.next_response_seeing(deadline, Duration::ZERO, cancellation, &mut |_| false)
+    }
+
+    /// The broker's next response line, showing every other line to `seen`.
+    /// A line `seen` accepts moves the deadline to `extend_by` from then, so
+    /// an ownership change that reports progress is not cut short (SYS-037).
+    pub(crate) fn next_response_seeing(
+        &mut self,
+        mut deadline: Instant,
+        extend_by: Duration,
+        cancellation: &CancellationToken,
+        seen: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, ChannelError> {
         loop {
             if let Some(offset) = self.buffer[self.scanned..]
                 .iter()
@@ -326,6 +347,9 @@ impl BrokerChannel {
                 let line = line.trim_matches(['\r', '\n']);
                 if line.starts_with(BROKER_RESPONSE_FRAME) {
                     return Ok(line.to_owned());
+                }
+                if seen(line) {
+                    deadline = Instant::now() + extend_by;
                 }
                 continue;
             }
@@ -578,5 +602,74 @@ fn end_session(state: &mut SessionState, error: ChannelError) -> BrokerError {
         ChannelError::Ended => BrokerError::AuthorizationExpired,
         ChannelError::TimedOut => BrokerError::ExecutionTimedOut,
         ChannelError::Oversized | ChannelError::Cancelled => BrokerError::BrokerCrashed,
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::{BROKER_RESPONSE_FRAME, BrokerChannel, BrokerError, BrokerOutput, BrokerProcess};
+    use crate::privilege::broker::{OwnershipProgressSeen, encode_ownership_progress};
+    use musheen_core::CancellationToken;
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    struct Ended;
+
+    impl BrokerProcess for Ended {
+        fn end(self: Box<Self>, _graceful: bool) {}
+    }
+
+    #[test]
+    fn progress_lines_give_an_ownership_change_more_time() {
+        let (sender, chunks) = mpsc::channel();
+        let mut channel = BrokerChannel::new(
+            Box::new(std::io::sink()),
+            chunks,
+            Vec::new(),
+            Box::new(Ended),
+        );
+        std::thread::spawn(move || {
+            for changed in 0..4 {
+                std::thread::sleep(Duration::from_millis(150));
+                let line = encode_ownership_progress(changed, Path::new("/srv/tree/item"));
+                sender.send(format!("{line}\n").into_bytes()).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            sender
+                .send(format!("{BROKER_RESPONSE_FRAME}done\n").into_bytes())
+                .unwrap();
+        });
+        let mut progress = OwnershipProgressSeen::default();
+        // The answer comes after 750 ms, past the 400 ms deadline; each
+        // progress line gives it 400 ms more.
+        let response = channel.next_response_seeing(
+            Instant::now() + Duration::from_millis(400),
+            Duration::from_millis(400),
+            &CancellationToken::new(),
+            &mut |line| progress.see(line),
+        );
+        assert_eq!(response.unwrap(), format!("{BROKER_RESPONSE_FRAME}done"));
+    }
+
+    #[test]
+    fn an_ownership_change_that_stops_names_where_it_was() {
+        let mut progress = OwnershipProgressSeen::default();
+        assert!(progress.see(&encode_ownership_progress(3, Path::new("/srv/tree/deep"))));
+        assert!(!progress.see("other output"));
+        match progress.ended(BrokerError::ExecutionTimedOut) {
+            Ok(BrokerOutput::OwnershipChanged(report)) => {
+                assert_eq!(report.changed(), 3);
+                let failure = report.failure().expect("the stop names its item");
+                assert_eq!(failure.path(), Path::new("/srv/tree/deep"));
+                assert_eq!(failure.error(), BrokerError::ExecutionTimedOut);
+            }
+            other => panic!("a stalled change answered {other:?}"),
+        }
+        assert_eq!(
+            OwnershipProgressSeen::default().ended(BrokerError::ExecutionTimedOut),
+            Err(BrokerError::ExecutionTimedOut),
+            "with no progress, the error stays as it is"
+        );
     }
 }

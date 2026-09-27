@@ -298,20 +298,18 @@ impl MetadataChange {
         let group = self
             .group
             .filter(|group| entry.current_group != Some(*group));
-        let ownership = self.owner.is_some() || group.is_some();
-        // A mode edit reaches an entry whose mode it would change, or one
-        // whose ownership changes, as that may clear bits the edit keeps.
-        // The provider applies it to the mode it finds when it applies it.
+        // A mode edit reaches an entry whose mode it would change. The
+        // provider applies it to the mode it finds when it applies it, and
+        // before any owner or group change (SEARCH-019).
         let mode_edit = self
             .mode_edit
             .as_ref()
             .filter(|edit| {
                 mode.is_none()
                     && kind != MetadataEntryKind::SymbolicLink
-                    && (ownership
-                        || entry
-                            .current_mode
-                            .is_none_or(|current| edit.apply(kind, current) != current & 0o7777))
+                    && entry
+                        .current_mode
+                        .is_none_or(|current| edit.apply(kind, current) != current & 0o7777)
             })
             .cloned();
         ResolvedMetadataChange {
