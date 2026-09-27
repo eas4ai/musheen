@@ -33,12 +33,13 @@ The move for each action wake can name:
 - `resolve SLUG N`: finding N is yours to decide. Fix it as its own work, commit, then `sudus resolve SLUG N "<how>"`; or decline it with its reason: `sudus decline SLUG N "<why>"`. A finding of any severity may be declined; the reason is what the developer reads.
 - `build DECISION`: build what the decision says, commit, then `sudus realize <id> --subject "<what was built>"`.
 - `done SLUG`: `sudus done SLUG`. It prints the review report: every finding, its severity and what you did with it. Show the developer that report as printed before you promote a backlog item or start the next feature.
+- `fold ITEM`: `sudus fold`. It appends to the log the items another clone captured into its inbox while the commitment was open.
 - `promote`: choose one backlog item by judgment; `sudus promote <item>`. Promotion never Agrees text. When other work already delivered the item, escalate with `--commitment <the finished slug> --concern retire:<item sha>` instead; the developer's `ok` retires it. To let the next feature go first, escalate with `--concern wait:<item sha>` per item instead; `ok` lets Done stand while they wait until the next Done.
 - `reply SLUG`: `sudus reply SLUG "<explanation>"`; an `ask` answer authorizes an explanation only.
 
 When Sudus itself is wrong -- a command crashes, a message contradicts the manual, or wake keeps naming an action whose predicate already holds -- follow the report-sudus-issue skill: it drafts an issue for eas4ai/sudus, files it only after the developer's `ok`, and updates the plugin when the fix is released.
 
-Out of scope is captured, never built: `sudus item --backlog`, `--next-feature`, or `--defect --from <REQ>`. A defect against this commitment's requirement is worked here, not captured.
+Out of scope is captured, never built: `sudus item --backlog`, `--next-feature`, or `--defect --from <REQ>`. Capture a next-feature item only for a change the developer asked for or one a real bug needs; never capture an edge case or a ceremony step. When the developer drops backlog or next-feature items in conversation, record their words once: `sudus retire <item>... --quote "<their words>"`. A defect against this commitment's requirement is worked here, not captured.
 
 Decide by level: Routine and Judged leave no record; Blocking is `sudus escalate` and stops.
 
