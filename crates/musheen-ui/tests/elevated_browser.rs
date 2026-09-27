@@ -986,6 +986,12 @@ fn run_ownership_scenario(scenario: &str) {
         .env(OWNERSHIP_ROOT, root.path())
         .output()
         .unwrap();
+    // The scenario gave files to other owners, which this user cannot
+    // remove; inside a namespace again, every one belongs to this user.
+    let _ = std::process::Command::new("unshare")
+        .args(["--map-auto", "--map-root-user", "rm", "-rf", "--"])
+        .arg(root.path())
+        .status();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
