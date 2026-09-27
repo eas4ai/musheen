@@ -31,7 +31,6 @@ tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-ashpd.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }
 opendal.workspace = true
 posix-acl.workspace = true
