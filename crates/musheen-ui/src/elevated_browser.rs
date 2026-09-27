@@ -279,9 +279,8 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
                 .iter()
                 .skip(offset)
                 .take(request.page_size())
-                .cloned()
-                .map(|(name, identity, entry_kind, size, modified)| {
-                    let path = root.join(&relative).join(&name);
+                .map(|&(ref name, identity, entry_kind, size, modified)| {
+                    let path = root.join(&relative).join(name);
                     let kind = match entry_kind {
                         RootedEntryKind::Directory => ItemKind::Directory,
                         RootedEntryKind::RegularFile => ItemKind::RegularFile,
