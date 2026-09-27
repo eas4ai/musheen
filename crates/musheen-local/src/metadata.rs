@@ -72,6 +72,24 @@ fn item_from_path_with_metadata(
     })
 }
 
+/// The local provider's identity for an open file: the item ID a listing
+/// or `resolve_item` gives the file it names, so a caller can check that a
+/// file it opened is the item it was shown.
+pub fn item_id_of_open_file(
+    provider: &ProviderId,
+    path: &Path,
+    file: &std::fs::File,
+) -> Result<ItemId, StoreError> {
+    let metadata = file.metadata().map_err(|error| {
+        io_error(
+            "read open file metadata",
+            Some(StorePath::from_unix_path(path.as_os_str())),
+            error,
+        )
+    })?;
+    local_item_id(provider, path, &metadata)
+}
+
 fn local_item_id(
     provider: &ProviderId,
     path: &Path,

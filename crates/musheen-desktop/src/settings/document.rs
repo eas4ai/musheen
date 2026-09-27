@@ -45,6 +45,8 @@ impl SettingsPage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsFeature {
     None,
+    /// Single-click activation, which no window reads yet.
+    Click,
     Terminal,
     Remote,
     Privilege,
@@ -124,7 +126,7 @@ const SETTINGS: &[SettingSpec] = &[
         default: "double",
         kind: SettingKind::Choice(&["single", "double"]),
         restart_required: true,
-        feature: SettingsFeature::Execution,
+        feature: SettingsFeature::Click,
     },
     SettingSpec {
         key: "general.restore_session",
@@ -311,6 +313,17 @@ const SETTINGS: &[SettingSpec] = &[
         default: "ask",
         kind: SettingKind::Choice(&["ask", "open", "run"]),
         restart_required: true,
+        feature: SettingsFeature::Execution,
+    },
+    SettingSpec {
+        key: "files.run-in-terminal",
+        page: SettingsPage::Files,
+        label: "setting-files-run-in-terminal",
+        group: "settings-group-files",
+        aliases: "run terminal script console drawer",
+        default: "embedded",
+        kind: SettingKind::Choice(&["embedded", "system"]),
+        restart_required: false,
         feature: SettingsFeature::Execution,
     },
     SettingSpec {

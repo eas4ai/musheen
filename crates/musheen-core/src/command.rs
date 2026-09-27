@@ -1,6 +1,6 @@
 use crate::{
     CapabilityKind, CapabilityState, CommandContext, CommandParameters, CommandTarget,
-    OpenWithIntent, ProviderAction,
+    OpenWithIntent, ProviderAction, RunKind,
 };
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -271,15 +271,43 @@ fn pin_state(context: &CommandContext, target_is_pinned: bool) -> CommandState {
     CommandState::enabled()
 }
 
+/// Run: a compiled program or desktop entry the user may execute
+/// (SYS-035). Scripts run only through Run in Terminal.
 fn executable_run_state(context: &CommandContext) -> CommandState {
     if context.selection_count != 1
         || !context.is_local
         || context.target != CommandTarget::ExecutableFile
+        || !matches!(
+            context.run_kind,
+            Some(RunKind::Program | RunKind::DesktopEntry)
+        )
     {
         return CommandState::disabled("only local executable files can run");
     }
     if !context.executable_run_enabled {
         return CommandState::disabled("the executable run preference is disabled");
+    }
+    CommandState::enabled()
+}
+
+/// Run in Terminal: a script or compiled program (SYS-036). One the user
+/// may not execute is shown disabled, with where to allow it.
+fn terminal_run_state(context: &CommandContext) -> CommandState {
+    if context.selection_count != 1
+        || !context.is_local
+        || !matches!(context.run_kind, Some(RunKind::Program | RunKind::Script))
+    {
+        return CommandState::disabled(
+            "only a local script or compiled program can run in a terminal",
+        );
+    }
+    if !context.executable_run_enabled {
+        return CommandState::disabled("the executable run preference is disabled");
+    }
+    if context.target != CommandTarget::ExecutableFile {
+        return CommandState::disabled(
+            "you may not execute this file; its permissions in Properties can allow it",
+        );
     }
     CommandState::enabled()
 }
@@ -418,9 +446,10 @@ pub enum CommandAction {
     EmptyTrash,
     CustomAction,
     ExtractHere,
+    RunInTerminal,
 }
 impl CommandAction {
-    pub const ALL: [Self; 84] = [
+    pub const ALL: [Self; 85] = [
         Self::NavigateBack,
         Self::NavigateForward,
         Self::NavigateParent,
@@ -505,6 +534,7 @@ impl CommandAction {
         Self::EmptyTrash,
         Self::CustomAction,
         Self::ExtractHere,
+        Self::RunInTerminal,
     ];
 }
 
@@ -798,6 +828,7 @@ pub enum CommandPredicate {
     PinnedDirectory,
     UnpinnedDirectory,
     ExecutableRun,
+    TerminalRun,
     DirectoryOrMount,
     Tag,
 }
@@ -1015,6 +1046,7 @@ impl CommandPredicate {
             Self::PinnedDirectory => Some(pin_state(context, true)),
             Self::UnpinnedDirectory => Some(pin_state(context, false)),
             Self::ExecutableRun => Some(executable_run_state(context)),
+            Self::TerminalRun => Some(terminal_run_state(context)),
             Self::DirectoryOrMount => Some(directory_or_mount_state(context)),
             _ => None,
         }
@@ -2085,6 +2117,16 @@ fn built_in_commands() -> Vec<CommandDefinition> {
             &[],
             P::ExecutableRun,
             A::Run,
+            G::Open,
+            D::Review,
+        ),
+        command(
+            "file.run_in_terminal",
+            "command.run-in-terminal",
+            "terminal",
+            &[],
+            P::TerminalRun,
+            A::RunInTerminal,
             G::Open,
             D::Review,
         ),

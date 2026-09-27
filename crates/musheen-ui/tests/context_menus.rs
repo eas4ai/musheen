@@ -2,7 +2,7 @@ use musheen_core::{
     CapabilityKind, CapabilityMatrix, CapabilityReason, CapabilityState, CommandAction,
     CommandContext, CommandDispatchError, CommandDispatcher, CommandParameters, CommandRegistry,
     CommandTarget, CommandTargetRef, ItemId, OpenWithIntent, ProviderActionMatrix, ProviderId,
-    ShortcutMap, StorePath, ToolbarLayout, canonical_chord,
+    RunKind, ShortcutMap, StorePath, ToolbarLayout, canonical_chord,
 };
 use musheen_desktop::{
     ActionArgument, ActionConfirmation, ActionExecution, CustomAction, WorkingDirectory,
@@ -42,6 +42,7 @@ fn supported_context(target: CommandTarget, selected: usize) -> CommandContext {
         is_local: true,
         has_dot_name_semantics: true,
         executable_run_enabled: true,
+        run_kind: (target == CommandTarget::ExecutableFile).then_some(RunKind::Program),
         capabilities: CapabilityMatrix::new(|_| CapabilityState::Supported),
         provider_actions: ProviderActionMatrix::from_states(
             CapabilityState::Supported,
@@ -129,7 +130,11 @@ fn target_matrix_projects_only_registry_commands_in_stable_groups() {
                 MenuTarget::Item,
                 vec![executable],
             ),
-            vec!["file.run", "file.run_as_administrator"],
+            vec![
+                "file.run",
+                "file.run_in_terminal",
+                "file.run_as_administrator",
+            ],
         ),
         (
             "trash",
@@ -1478,6 +1483,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "clipboard.move_to",
         "file.preview",
         "file.run",
+        "file.run_in_terminal",
         "file.run_as_administrator",
         "file.compress",
         "file.rename",
@@ -1587,6 +1593,7 @@ fn applicability_oracles() -> ([ApplicabilityOracle; 15], BTreeSet<&'static str>
         "file.rename",
         "file.run",
         "file.run_as_administrator",
+        "file.run_in_terminal",
         "file.set_default_application",
         "file.unhide",
         "item.copy_location",

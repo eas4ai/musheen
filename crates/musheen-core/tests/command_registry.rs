@@ -3,7 +3,7 @@ use musheen_core::{
     CommandContext, CommandContributionPolicy, CommandDispatchError, CommandDispatcher,
     CommandParameterContract, CommandParameters, CommandRegistry, CommandSubmenu, CommandTarget,
     CommandTargetRef, DangerLevel, ItemId, ProviderAction, ProviderActionMatrix, ProviderId,
-    ResolvedDestination, StorePath, TargetCardinality,
+    ResolvedDestination, RunKind, StorePath, TargetCardinality,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -369,6 +369,7 @@ fn registry_audit_snapshots_stable_public_ids() {
         "file.preview",
         "archive.browse",
         "file.run",
+        "file.run_in_terminal",
         "mount.mount",
         "mount.unmount",
         "mount.eject",
@@ -834,6 +835,7 @@ fn target_and_saved_state_policies_are_mutually_exclusive() {
         selection_count: 1,
         target: CommandTarget::ExecutableFile,
         is_local: true,
+        run_kind: Some(RunKind::Program),
         ..CommandContext::default()
     };
     assert!(
@@ -843,15 +845,75 @@ fn target_and_saved_state_policies_are_mutually_exclusive() {
             .state(&executable)
             .is_enabled()
     );
-    assert!(
+    let enabled = CommandContext {
+        executable_run_enabled: true,
+        ..executable.clone()
+    };
+    let state = |id: &str, run_kind, target| {
         registry
-            .get("file.run")
+            .get(id)
             .unwrap()
             .state(&CommandContext {
-                executable_run_enabled: true,
-                ..executable
+                run_kind,
+                target,
+                ..enabled.clone()
             })
             .is_enabled()
+    };
+    // SYS-035: Run takes a compiled program or a desktop entry the user may
+    // execute; SYS-036: Run in Terminal takes a script or compiled program.
+    let executable_file = CommandTarget::ExecutableFile;
+    assert!(state("file.run", Some(RunKind::Program), executable_file));
+    assert!(state(
+        "file.run",
+        Some(RunKind::DesktopEntry),
+        executable_file
+    ));
+    assert!(!state("file.run", Some(RunKind::Script), executable_file));
+    assert!(!state("file.run", None, executable_file));
+    assert!(state(
+        "file.run_in_terminal",
+        Some(RunKind::Script),
+        executable_file
+    ));
+    assert!(state(
+        "file.run_in_terminal",
+        Some(RunKind::Program),
+        executable_file
+    ));
+    assert!(!state(
+        "file.run_in_terminal",
+        Some(RunKind::DesktopEntry),
+        executable_file
+    ));
+    assert!(!state("file.run_in_terminal", None, executable_file));
+    assert!(!state(
+        "file.run_in_terminal",
+        Some(RunKind::Script),
+        CommandTarget::File
+    ));
+    assert_eq!(
+        registry
+            .get("file.run_in_terminal")
+            .unwrap()
+            .state(&CommandContext {
+                run_kind: Some(RunKind::Script),
+                target: CommandTarget::File,
+                ..enabled.clone()
+            })
+            .disabled_reason(),
+        Some("you may not execute this file; its permissions in Properties can allow it")
+    );
+    assert!(
+        !registry
+            .get("file.run_in_terminal")
+            .unwrap()
+            .state(&CommandContext {
+                run_kind: Some(RunKind::Script),
+                ..executable
+            })
+            .is_enabled(),
+        "the Open preference disables Run in Terminal"
     );
 }
 

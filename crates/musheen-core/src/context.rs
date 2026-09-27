@@ -21,6 +21,18 @@ pub enum CommandTarget {
     Sidebar,
 }
 
+/// What a local regular file could run as, read from its first bytes
+/// (SYS-035, SYS-036). Whether the user may execute it is a separate fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunKind {
+    /// A compiled program: an ELF file.
+    Program,
+    /// A desktop entry of type Application.
+    DesktopEntry,
+    /// A script: a file that starts with `#!`.
+    Script,
+}
+
 /// The active presentation layout, kept in the command context so radio menu
 /// state is a registry projection rather than renderer-local policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -124,6 +136,8 @@ pub struct CommandContext {
     pub target_is_hidden: bool,
     pub target_is_pinned: bool,
     pub executable_run_enabled: bool,
+    /// What the single selected local file could run as, when known.
+    pub run_kind: Option<RunKind>,
     pub supports_provider_uris: bool,
     pub capabilities: CapabilityMatrix,
     pub provider_actions: ProviderActionMatrix,
@@ -165,6 +179,7 @@ impl Default for CommandContext {
             target_is_hidden: false,
             target_is_pinned: false,
             executable_run_enabled: false,
+            run_kind: None,
             supports_provider_uris: false,
             capabilities: CapabilityMatrix::new(|_| {
                 CapabilityState::Unknown(

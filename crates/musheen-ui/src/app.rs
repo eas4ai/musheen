@@ -79,9 +79,9 @@ use musheen_core::{
     CommandAction, CommandContext, CommandDispatchError, CommandDispatcher, CommandId,
     CommandParameters, CommandTarget, CommandTargetRef, DirectoryWatch, DisplayPath, ItemId,
     ItemKind, OpenWithIntent as CoreOpenWithIntent, Page, ProviderActionMatrix, ProviderId,
-    ResourceLimits, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch, SearchCompletion,
-    SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem, StorePath,
-    WatchEvent,
+    ResourceLimits, RunKind, SEARCH_RESULT_LIMIT, SEARCH_RETAINED_RESULTS, SearchBatch,
+    SearchCompletion, SearchQuery, SearchScopeError, SearchStream, Store, StoreError, StoreItem,
+    StorePath, WatchEvent,
 };
 use musheen_desktop::{
     ApplicationIconProvider, ArchiveFormat, ArchiveLimits, ArchiveStore, BrokerError, BrokerOutput,
@@ -89,9 +89,9 @@ use musheen_desktop::{
     ConflictDecisionStore, DesktopEntryCatalog, DesktopEntryLauncher, DesktopEntryTerminalLauncher,
     DesktopPaths, ExternalTerminalCommand, FolderIdentity, FreedesktopIconProvider, LaunchError,
     LaunchTarget, MimeAppsError, MimeAppsResolver, MimeAppsSnapshot, MimeDetector, MountOperation,
-    OperationReservation, OperationUsage, OperationUse, PreparedLaunch, PreviewDocument,
-    PrivilegeProvider, ProcessRunner, PtyEvent, SecretBuffer, SessionStore, SystemClock,
-    SystemFileClipboard, SystemProcessRunner, TagMoveOutcome, TerminalCommand, TerminalError,
+    OperationReservation, OperationUsage, OperationUse, PreviewDocument, PrivilegeProvider,
+    ProcessRunner, PtyEvent, SecretBuffer, SessionStore, SystemClock, SystemFileClipboard,
+    SystemProcessRunner, TagMoveOutcome, TerminalCommand, TerminalError, TerminalExit,
     TerminalModel, TerminalProfile, TerminalSession, TerminalSize, ThumbnailCache, ThumbnailLimits,
     ThumbnailLookup, ThumbnailMode, ThumbnailRequest, ThumbnailService, ThumbnailSize,
     UsageResolution, VolumeAction, VolumeError, VolumeId, VolumeRuntime,
@@ -401,11 +401,20 @@ enum StoreProbe {
     Location { location: StorePath, resolve: bool },
 }
 
+/// What a background probe found about a regular file: whether the current
+/// user may execute it, and, for a local file, what it could run as
+/// (SYS-035, SYS-036).
+#[derive(Clone, Debug, Default)]
+struct ExecutableFact {
+    state: Option<CapabilityState>,
+    run_kind: Option<RunKind>,
+}
+
 /// The store's answer to a probe, applied to the caches on the UI thread.
 enum StoreProbeResult {
     Executable {
         id: ItemId,
-        state: Option<CapabilityState>,
+        fact: ExecutableFact,
     },
     Location {
         location: StorePath,
@@ -1829,6 +1838,8 @@ impl Render for ContextDestinationDialog {
 #[derive(Clone, Copy)]
 enum ContextReviewEvent {
     Confirmed,
+    /// Open the reviewed file instead of running it (SYS-035's Ask).
+    OpenInstead,
     Cancelled,
 }
 
@@ -1838,6 +1849,7 @@ struct ContextReviewDialog {
     targets: Vec<String>,
     cancellation_warning: Option<String>,
     privilege_provider: Option<String>,
+    open_instead: Option<String>,
     sudo_password: Option<Entity<InputState>>,
     submitted_secret: Option<SecretBuffer>,
     strings: ContextDialogStrings,
@@ -1848,6 +1860,9 @@ struct ContextReviewDialog {
 struct ContextReviewAuthorization {
     cancellation_warning: Option<String>,
     privilege_provider: Option<String>,
+    /// The label of an Open choice beside Run, when a double-click on a
+    /// program asked for this review.
+    open_instead: Option<String>,
 }
 
 impl EventEmitter<ContextReviewEvent> for ContextReviewDialog {}
@@ -1877,6 +1892,7 @@ impl ContextReviewDialog {
             targets,
             cancellation_warning: authorization.cancellation_warning,
             privilege_provider: authorization.privilege_provider,
+            open_instead: authorization.open_instead,
             sudo_password,
             submitted_secret: None,
             strings,
@@ -1994,9 +2010,25 @@ impl Render for ContextReviewDialog {
                                 window.defer(cx, |window, _| window.remove_window());
                             })),
                     )
+                    .when_some(self.open_instead.clone(), |buttons, label| {
+                        buttons.child(
+                            Button::new("context-review-open-instead")
+                                .label(label)
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    cx.emit(ContextReviewEvent::OpenInstead);
+                                    window.defer(cx, |window, _| window.remove_window());
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("context-review-confirm")
-                            .label(self.strings.continue_action.clone())
+                            // Beside Open, the confirmation names the command
+                            // it runs (SYS-035's Run, Open and Cancel).
+                            .label(if self.open_instead.is_some() {
+                                self.command.clone()
+                            } else {
+                                self.strings.continue_action.clone()
+                            })
                             .primary()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submitted_secret =
@@ -3240,6 +3272,31 @@ fn resolve_targets(
     Ok(resolved)
 }
 
+/// Checks, off the UI thread, that `target` still names the reviewed regular
+/// file, then opens it and checks the open file (SYS-035, SYS-036).
+fn check_run_target(
+    store: &dyn Store,
+    target: &CommandTargetRef,
+    path: &Path,
+    allowed: &[RunKind],
+) -> Result<musheen_desktop::CheckedFile, ExecutableRunError> {
+    let current = store
+        .resolve_item(target.path())
+        .map_err(|_| ExecutableRunError::TargetChanged)?;
+    if !current.is_some_and(|item| {
+        item.id() == target.id()
+            && item.path() == target.path()
+            && item.kind() == ItemKind::RegularFile
+    }) {
+        return Err(ExecutableRunError::TargetChanged);
+    }
+    musheen_desktop::check_file_to_run(path, target.id(), allowed).map_err(|error| match error {
+        musheen_desktop::RunCheckError::Changed => ExecutableRunError::TargetChanged,
+        musheen_desktop::RunCheckError::NotExecutable => ExecutableRunError::NotExecutable,
+        musheen_desktop::RunCheckError::NotRunnable => ExecutableRunError::NotRunnable,
+    })
+}
+
 /// Asks the store one of a menu's questions. Runs on a background thread.
 fn run_store_probe(
     store: &dyn Store,
@@ -3249,7 +3306,11 @@ fn run_store_probe(
     match probe {
         StoreProbe::Executable { id, path } => StoreProbeResult::Executable {
             id,
-            state: store.executable_state(&path).ok(),
+            fact: ExecutableFact {
+                state: store.executable_state(&path).ok(),
+                // Only a local file is read, and only its first bytes.
+                run_kind: path.as_unix_path().and_then(musheen_desktop::run_kind),
+            },
         },
         StoreProbe::Location { location, resolve } => {
             let capabilities = store.capabilities(&location);
@@ -3742,7 +3803,20 @@ enum ExecutableHandling {
 enum ExecutableRunError {
     TargetChanged,
     NotExecutable,
+    /// The file is not of a kind that may run this way (SYS-035, SYS-036).
+    NotRunnable,
     Launch(LaunchError),
+}
+
+/// A file run in the terminal drawer (SYS-036): its own session, shown in
+/// place of the shell's, which keeps running behind it. Its output and exit
+/// stay until the user closes it.
+struct TerminalRun {
+    name: SharedString,
+    session: TerminalSession,
+    model: TerminalModel,
+    generation: u64,
+    exit: Option<TerminalExit>,
 }
 
 struct MusheenApp {
@@ -3831,6 +3905,17 @@ struct MusheenApp {
     pending_terminal_paste: Option<String>,
     pending_terminal_close: bool,
     pending_terminal_focus: bool,
+    /// The file running, or run, in the drawer through Run in Terminal.
+    terminal_run: Option<TerminalRun>,
+    terminal_run_generation: u64,
+    /// The user asked to close a file's session while it runs.
+    pending_terminal_run_close: bool,
+    /// A file to run, and its folder, waiting until the user stops the one
+    /// that runs.
+    pending_terminal_run: Option<(PathBuf, PathBuf)>,
+    /// The directories searched for programs a run needs: a desktop entry's
+    /// and the system terminal (SYS-035, SYS-036).
+    run_directories: Vec<PathBuf>,
     status_center_open: bool,
     undo_available: HashSet<JobId>,
     undo_availability_checked_at: Option<Instant>,
@@ -3869,8 +3954,8 @@ struct MusheenApp {
     /// Counts the sidebar menus opened; a place's resolution is probed once
     /// per menu.
     sidebar_menu_generation: u64,
-    /// Executable states by item, answered by background probes.
-    executable_facts: HashMap<ItemId, Option<CapabilityState>>,
+    /// Executable facts by item, answered by background probes.
+    executable_facts: HashMap<ItemId, ExecutableFact>,
     /// Location facts by location, answered by background probes.
     location_facts: HashMap<StorePath, LocationFacts>,
     /// The store questions queued by the menu being composed, by frames
@@ -4058,7 +4143,9 @@ impl MusheenApp {
     }
 
     fn sync_terminal_location(&mut self, location: &StorePath, cx: &mut Context<Self>) {
-        if !self.terminal_drawer.is_open() {
+        // While a file's run is shown, the shell behind it keeps running as
+        // it was (SYS-036); it follows again once the run is closed.
+        if !self.terminal_drawer.is_open() || self.terminal_run.is_some() {
             return;
         }
         let next = location.as_unix_path();
@@ -4094,10 +4181,8 @@ impl MusheenApp {
             if request.requires_confirmation() {
                 self.pending_terminal_paste = Some(request.text().to_owned());
                 cx.notify();
-            } else if let Some(session) = &self.terminal_session {
-                let bytes = self
-                    .terminal_model
-                    .encode_paste(request.text(), self.terminal_model.bracketed_paste());
+            } else if let Some((session, model)) = self.focused_terminal() {
+                let bytes = model.encode_paste(request.text(), model.bracketed_paste());
                 let _ = session.write(&bytes);
             }
             return true;
@@ -4131,9 +4216,21 @@ impl MusheenApp {
         } else {
             return false;
         };
-        self.terminal_session
-            .as_ref()
-            .is_some_and(|session| session.write(bytes).is_ok())
+        self.focused_terminal()
+            .is_some_and(|(session, _)| session.write(bytes).is_ok())
+    }
+
+    /// The session keys and pastes go to, with its model: a file running in
+    /// the drawer, otherwise the shell.
+    fn focused_terminal(&self) -> Option<(&TerminalSession, &TerminalModel)> {
+        match &self.terminal_run {
+            Some(run) if run.exit.is_none() => Some((&run.session, &run.model)),
+            Some(_) => None,
+            None => self
+                .terminal_session
+                .as_ref()
+                .map(|session| (session, &self.terminal_model)),
+        }
     }
 
     fn render_terminal_drawer(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -4142,8 +4239,15 @@ impl MusheenApp {
             .catalog
             .message("terminal-drawer-label")
             .expect("the terminal drawer label is localized");
-        let title = self.terminal_model.title().unwrap_or(label).to_owned();
-        let rows = project_terminal_cells(&self.terminal_model.cells())
+        // A file run through Run in Terminal shows in place of the shell,
+        // which keeps running behind it (SYS-036).
+        let run = self.terminal_run.as_ref();
+        let title = match run {
+            Some(run) => format!("{} — {}", run.name, self.terminal_run_status(run)),
+            None => self.terminal_model.title().unwrap_or(label).to_owned(),
+        };
+        let model = run.map_or(&self.terminal_model, |run| &run.model);
+        let rows = project_terminal_cells(&model.cells())
             .into_iter()
             .map(|line| {
                 div()
@@ -4174,66 +4278,85 @@ impl MusheenApp {
                     .child(Icon::new(IconName::Terminal))
                     .child(SharedString::from(title))
                     .child(div().flex_grow(1.0))
-                    .when(self.terminal_drawer.restart_available(), |header| {
+                    .when(run.is_some(), |header| {
                         header.child(
-                            Button::new("terminal-restart")
+                            Button::new("terminal-run-close")
                                 .label(
                                     self.catalog
-                                        .message("terminal-restart")
-                                        .expect("the terminal restart label is localized"),
+                                        .message("terminal-run-close")
+                                        .expect("the run close label is localized"),
                                 )
                                 .small()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(session) = this.terminal_session.as_mut()
-                                        && session.restart().is_ok()
-                                    {
-                                        this.terminal_model =
-                                            TerminalModel::new(TerminalSize::default());
-                                        this.terminal_drawer.mark_restarted();
-                                        let events = session.events();
-                                        this.terminal_generation =
-                                            this.terminal_generation.wrapping_add(1);
-                                        this.start_terminal_events(
-                                            this.terminal_generation,
-                                            events,
-                                            cx,
-                                        );
+                                    this.close_terminal_run(cx);
+                                })),
+                        )
+                    })
+                    .when(
+                        run.is_none() && self.terminal_drawer.restart_available(),
+                        |header| {
+                            header.child(
+                                Button::new("terminal-restart")
+                                    .label(
+                                        self.catalog
+                                            .message("terminal-restart")
+                                            .expect("the terminal restart label is localized"),
+                                    )
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(session) = this.terminal_session.as_mut()
+                                            && session.restart().is_ok()
+                                        {
+                                            this.terminal_model =
+                                                TerminalModel::new(TerminalSize::default());
+                                            this.terminal_drawer.mark_restarted();
+                                            let events = session.events();
+                                            this.terminal_generation =
+                                                this.terminal_generation.wrapping_add(1);
+                                            this.start_terminal_events(
+                                                this.terminal_generation,
+                                                events,
+                                                cx,
+                                            );
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    )
+                    .when(run.is_none(), |header| {
+                        header.child(
+                            Button::new("terminal-close")
+                                .label(
+                                    self.catalog
+                                        .message("terminal-close")
+                                        .expect("the terminal close label is localized"),
+                                )
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.terminal_drawer.mark_foreground_job(
+                                        this.terminal_session
+                                            .as_ref()
+                                            .is_some_and(TerminalSession::has_foreground_job),
+                                    );
+                                    match this.terminal_drawer.request_close() {
+                                        TerminalDrawerAction::RestoreBrowserFocus => {
+                                            this.shell.set_terminal_visible(false);
+                                            this.pending_restored_focus = this
+                                                .browser_focus
+                                                .clone()
+                                                .or_else(|| Some(this.content_focus.clone()));
+                                        }
+                                        TerminalDrawerAction::ConfirmTerminate => {
+                                            this.pending_terminal_close = true;
+                                        }
+                                        TerminalDrawerAction::None
+                                        | TerminalDrawerAction::FocusTerminal => {}
                                     }
                                     cx.notify();
                                 })),
                         )
-                    })
-                    .child(
-                        Button::new("terminal-close")
-                            .label(
-                                self.catalog
-                                    .message("terminal-close")
-                                    .expect("the terminal close label is localized"),
-                            )
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.terminal_drawer.mark_foreground_job(
-                                    this.terminal_session
-                                        .as_ref()
-                                        .is_some_and(TerminalSession::has_foreground_job),
-                                );
-                                match this.terminal_drawer.request_close() {
-                                    TerminalDrawerAction::RestoreBrowserFocus => {
-                                        this.shell.set_terminal_visible(false);
-                                        this.pending_restored_focus = this
-                                            .browser_focus
-                                            .clone()
-                                            .or_else(|| Some(this.content_focus.clone()));
-                                    }
-                                    TerminalDrawerAction::ConfirmTerminate => {
-                                        this.pending_terminal_close = true;
-                                    }
-                                    TerminalDrawerAction::None
-                                    | TerminalDrawerAction::FocusTerminal => {}
-                                }
-                                cx.notify();
-                            })),
-                    ),
+                    }),
             )
             .when_some(self.pending_terminal_paste.clone(), |drawer, text| {
                 drawer.child(
@@ -4258,11 +4381,9 @@ impl MusheenApp {
                                 )
                                 .small()
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(session) = &this.terminal_session {
-                                        let bytes = this.terminal_model.encode_paste(
-                                            &text,
-                                            this.terminal_model.bracketed_paste(),
-                                        );
+                                    if let Some((session, model)) = this.focused_terminal() {
+                                        let bytes =
+                                            model.encode_paste(&text, model.bracketed_paste());
                                         let _ = session.write(&bytes);
                                     }
                                     this.pending_terminal_paste = None;
@@ -4336,6 +4457,36 @@ impl MusheenApp {
                         ),
                 )
             })
+            .when(self.pending_terminal_run_close, |drawer| {
+                drawer.child(self.render_terminal_run_confirmation(
+                    "terminal-run-close-confirmation",
+                    "terminal-run-stop-warning",
+                    "terminal-run-stop",
+                    |this, cx| this.end_terminal_run(cx),
+                    |this, cx| {
+                        this.pending_terminal_run_close = false;
+                        cx.notify();
+                    },
+                    cx,
+                ))
+            })
+            .when(self.pending_terminal_run.is_some(), |drawer| {
+                drawer.child(self.render_terminal_run_confirmation(
+                    "terminal-run-replace-confirmation",
+                    "terminal-run-replace-warning",
+                    "terminal-run-replace",
+                    |this, cx| {
+                        if let Some((path, folder)) = this.pending_terminal_run.take() {
+                            this.launch_terminal_run(path, folder, cx);
+                        }
+                    },
+                    |this, cx| {
+                        this.pending_terminal_run = None;
+                        cx.notify();
+                    },
+                    cx,
+                ))
+            })
             .child(
                 div()
                     .id("terminal-content")
@@ -4345,6 +4496,69 @@ impl MusheenApp {
                     .px_3()
                     .font_family("monospace")
                     .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// What a file run in the drawer is doing: running, or how it ended.
+    fn terminal_run_status(&self, run: &TerminalRun) -> String {
+        let message = |id: &str| {
+            self.catalog
+                .message(id)
+                .expect("the run status is localized")
+                .to_owned()
+        };
+        match run.exit {
+            None => message("terminal-run-running"),
+            Some(TerminalExit::Code(code)) => {
+                format!("{}: {code}", message("terminal-run-exit-code"))
+            }
+            Some(TerminalExit::Signal) => message("terminal-run-ended"),
+        }
+    }
+
+    /// A confirmation in the drawer about the running file: `warning`, a
+    /// button `action` that `confirm` carries out, and Cancel.
+    fn render_terminal_run_confirmation(
+        &self,
+        id: &'static str,
+        warning: &str,
+        action: &str,
+        confirm: fn(&mut Self, &mut Context<Self>),
+        cancel: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .test_support()
+            .role(Role::Alert)
+            .px_3()
+            .py_2()
+            .child(SharedString::from(
+                self.catalog
+                    .message(warning)
+                    .expect("the run warning is localized")
+                    .to_owned(),
+            ))
+            .child(
+                Button::new(SharedString::from(format!("{id}-confirm")))
+                    .label(
+                        self.catalog
+                            .message(action)
+                            .expect("the run action is localized"),
+                    )
+                    .small()
+                    .on_click(cx.listener(move |this, _, _, cx| confirm(this, cx))),
+            )
+            .child(
+                Button::new(SharedString::from(format!("{id}-cancel")))
+                    .label(
+                        self.catalog
+                            .message("dialog-cancel")
+                            .expect("the cancel label is localized"),
+                    )
+                    .small()
+                    .on_click(cx.listener(move |this, _, _, cx| cancel(this, cx))),
             )
             .into_any_element()
     }
@@ -4508,6 +4722,10 @@ impl MusheenApp {
             settings.value("terminal.program").as_deref() == Some("embedded")
         });
         let desktop_paths = DesktopPaths::from_environment().ok();
+        let run_directories = desktop_paths
+            .as_ref()
+            .map(|paths| paths.executable_dirs().to_vec())
+            .unwrap_or_default();
         let desktop_terminal_launcher = settings
             .as_ref()
             .and_then(|settings| settings.value("terminal.program"))
@@ -4619,6 +4837,11 @@ impl MusheenApp {
             pending_terminal_paste: None,
             pending_terminal_close: false,
             pending_terminal_focus: false,
+            terminal_run: None,
+            terminal_run_generation: 0,
+            pending_terminal_run_close: false,
+            pending_terminal_run: None,
+            run_directories,
             status_center_open: false,
             undo_available: HashSet::new(),
             undo_availability_checked_at: None,
@@ -7595,12 +7818,96 @@ impl MusheenApp {
             }
             self.navigate(item.path().clone(), true, cx);
         } else if let Ok(target) = CommandTargetRef::new(item.id().clone(), item.path().clone()) {
-            self.dispatch_local_target_command(
+            if item.kind() == ItemKind::RegularFile
+                && self.executable_handling != ExecutableHandling::Open
+                && item.path().as_unix_path().is_some()
+            {
+                self.activate_file(tab_id, target, cx);
+            } else {
+                self.dispatch_local_target_command(
+                    &CommandAction::Open,
+                    &CommandParameters::targets(vec![target]),
+                    Some(tab_id),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Activates a local regular file (SYS-035). A compiled program or
+    /// desktop entry the user may execute runs at once under the Run
+    /// preference and is reviewed, with Open beside Run, under Ask; every
+    /// other file opens in its default application.
+    fn activate_file(&mut self, tab_id: TabId, target: CommandTargetRef, cx: &mut Context<Self>) {
+        let store = Arc::clone(&self.store);
+        let probe = StoreProbe::Executable {
+            id: target.id().clone(),
+            path: target.path().clone(),
+        };
+        let work = cx.background_spawn(async move { run_store_probe(&*store, probe, "") });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                let StoreProbeResult::Executable { id, fact } = result else {
+                    return;
+                };
+                let runnable = fact.state == Some(CapabilityState::Supported)
+                    && matches!(
+                        fact.run_kind,
+                        Some(RunKind::Program | RunKind::DesktopEntry)
+                    );
+                state.executable_facts.insert(id, fact);
+                match state.executable_handling {
+                    ExecutableHandling::Run if runnable => state.dispatch_run_command(
+                        std::slice::from_ref(&target),
+                        Some(tab_id),
+                        true,
+                        cx,
+                    ),
+                    ExecutableHandling::Ask if runnable => {
+                        state.review_run_on_activation(tab_id, target, cx);
+                    }
+                    _ => state.dispatch_local_target_command(
+                        &CommandAction::Open,
+                        &CommandParameters::targets(vec![target]),
+                        Some(tab_id),
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Reviews a double-clicked program through the menu's own Run entry,
+    /// offering Open beside Run.
+    fn review_run_on_activation(
+        &mut self,
+        tab_id: TabId,
+        target: CommandTargetRef,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.context_dialog_windows.is_empty() {
+            return;
+        }
+        let menu = self.compose_context_menu(tab_id, MenuTarget::Item, vec![target.clone()]);
+        let invocation = Self::menu_entry_by_id(&menu, "file.run").map(|entry| {
+            let surface = self.shell.context_menus().clone();
+            surface.invoke(entry, &mut AppMenuDispatcher::default())
+        });
+        match invocation {
+            Some(MenuInvocation::NeedsConfirmation(pending)) => {
+                self.open_context_review_with(MenuInvocation::NeedsConfirmation(pending), true, cx);
+            }
+            _ => self.dispatch_local_target_command(
                 &CommandAction::Open,
                 &CommandParameters::targets(vec![target]),
                 Some(tab_id),
                 cx,
-            );
+            ),
         }
     }
 
@@ -8346,8 +8653,8 @@ impl MusheenApp {
         }
         for result in results {
             match result {
-                StoreProbeResult::Executable { id, state } => {
-                    self.executable_facts.insert(id, state);
+                StoreProbeResult::Executable { id, fact } => {
+                    self.executable_facts.insert(id, fact);
                 }
                 StoreProbeResult::Location { location, facts } => {
                     let facts = *facts;
@@ -8976,10 +9283,10 @@ impl MusheenApp {
         });
         // The store is asked off the UI thread: a fact the caches hold is
         // used at once; a missing one is probed and the menu composed again.
-        let executable_state = selected_item
+        let executable_fact = selected_item
             .filter(|item| item.kind() == ItemKind::RegularFile)
             .and_then(|item| match self.executable_facts.get(item.id()) {
-                Some(state) => state.clone(),
+                Some(fact) => Some(fact.clone()),
                 None => {
                     self.queue_store_probe(
                         StoreProbe::Executable {
@@ -9027,7 +9334,9 @@ impl MusheenApp {
             match item.kind() {
                 ItemKind::Directory => CommandTarget::Directory,
                 ItemKind::RegularFile
-                    if matches!(executable_state, Some(CapabilityState::Supported)) =>
+                    if executable_fact
+                        .as_ref()
+                        .is_some_and(|fact| fact.state == Some(CapabilityState::Supported)) =>
                 {
                     CommandTarget::ExecutableFile
                 }
@@ -9204,8 +9513,14 @@ impl MusheenApp {
             has_dot_name_semantics: is_local,
             target_is_hidden: selected_item.is_some_and(|item| is_hidden_path(item.path())),
             target_is_pinned: selected_is_pinned,
-            executable_run_enabled: self.executable_handling != ExecutableHandling::Open
-                && matches!(executable_state, Some(CapabilityState::Supported)),
+            // The preference alone: whether the user may execute the file is
+            // the ExecutableFile target, so Run in Terminal can say which one
+            // stands in the way (SYS-036).
+            executable_run_enabled: self.executable_handling != ExecutableHandling::Open,
+            run_kind: executable_fact
+                .as_ref()
+                .filter(|_| selection.len() == 1)
+                .and_then(|fact| fact.run_kind),
             capabilities,
             provider_actions,
             show_hidden: self
@@ -9749,6 +10064,18 @@ impl MusheenApp {
     }
 
     fn open_context_review(&mut self, invocation: MenuInvocation, cx: &mut Context<Self>) {
+        self.open_context_review_with(invocation, false, cx);
+    }
+
+    /// Opens the review of a pending command. With `offer_open`, the review
+    /// also offers to open the reviewed file instead, as a double-click on a
+    /// program under the Ask preference does (SYS-035).
+    fn open_context_review_with(
+        &mut self,
+        invocation: MenuInvocation,
+        offer_open: bool,
+        cx: &mut Context<Self>,
+    ) {
         let MenuInvocation::NeedsConfirmation(pending) = &invocation else {
             return;
         };
@@ -9790,6 +10117,12 @@ impl MusheenApp {
             "directory.open_as_administrator" | "file.run_as_administrator"
         )
         .then(|| self.privilege_backend.provider().as_str().to_owned());
+        let open_instead = offer_open.then(|| {
+            self.catalog
+                .message("command-open")
+                .expect("the Open label is localized")
+                .to_owned()
+        });
         let strings = ContextDialogStrings::from_catalog(&self.catalog);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(580.), px(360.)), cx)),
@@ -9811,6 +10144,7 @@ impl MusheenApp {
                         ContextReviewAuthorization {
                             cancellation_warning,
                             privilege_provider,
+                            open_instead,
                         },
                         strings,
                         window,
@@ -9834,6 +10168,16 @@ impl MusheenApp {
                     authentication,
                     cx,
                 );
+            }
+            ContextReviewEvent::OpenInstead => {
+                if let MenuInvocation::NeedsConfirmation(pending) = &invocation {
+                    this.dispatch_local_target_command(
+                        &CommandAction::Open,
+                        &CommandParameters::targets(pending.selection().to_vec()),
+                        pending.origin_tab(),
+                        cx,
+                    );
+                }
             }
             ContextReviewEvent::Cancelled => {
                 cx.notify();
@@ -10014,6 +10358,9 @@ impl MusheenApp {
             }
             (CommandAction::Run, CommandParameters::Targets(targets)) => {
                 self.dispatch_run_command(targets, origin_tab, confirmed, cx);
+            }
+            (CommandAction::RunInTerminal, CommandParameters::Targets(targets)) => {
+                self.dispatch_run_in_terminal_command(targets, origin_tab, confirmed, cx);
             }
             (
                 create_action @ (CommandAction::NewDirectory | CommandAction::NewEmptyFile),
@@ -12483,6 +12830,64 @@ impl MusheenApp {
         );
     }
 
+    /// The one local file a confirmed Run or Run in Terminal names, with its
+    /// path, once the command's own checks pass; `None` after reporting why
+    /// not.
+    fn run_target(
+        &mut self,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        confirmed: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<(CommandTargetRef, PathBuf)> {
+        let refuse = |state: &mut Self, message: &str, cx: &mut Context<Self>| {
+            state.operation_error = Some(
+                state
+                    .catalog
+                    .message(message)
+                    .expect("run refusals are localized")
+                    .into(),
+            );
+            cx.notify();
+        };
+        if !confirmed {
+            refuse(self, "context.run-review-required", cx);
+            return None;
+        }
+        if self.executable_handling == ExecutableHandling::Open {
+            refuse(self, "context.backend-unavailable", cx);
+            return None;
+        }
+        let Some(tab_id) = origin_tab else {
+            refuse(self, "context.origin-unavailable", cx);
+            return None;
+        };
+        if self.navigation.focused_tab().id() != tab_id || !self.directories.contains_key(&tab_id) {
+            refuse(self, "context.origin-unavailable", cx);
+            return None;
+        }
+        let [target] = targets else {
+            refuse(self, "context.backend-unavailable", cx);
+            return None;
+        };
+        // The background task resolves the target and checks the file
+        // itself; only the directory model is checked here.
+        if let Err(error) = self.check_cached_targets(origin_tab, targets) {
+            self.operation_error = Some(error);
+            cx.notify();
+            return None;
+        }
+        let Some(path) = target.path().as_unix_path().map(Path::to_path_buf) else {
+            refuse(self, "context.backend-unavailable", cx);
+            return None;
+        };
+        self.operation_error = None;
+        cx.notify();
+        Some((target.clone(), path))
+    }
+
+    /// Run (SYS-035): a compiled program runs from the file Musheen opened
+    /// and checked; a desktop entry starts the program its Exec line names.
     fn dispatch_run_command(
         &mut self,
         targets: &[CommandTargetRef],
@@ -12490,97 +12895,34 @@ impl MusheenApp {
         confirmed: bool,
         cx: &mut Context<Self>,
     ) {
-        if !confirmed {
-            self.operation_error = Some(
-                self.catalog
-                    .message("context.run-review-required")
-                    .expect("run review refusal is localized")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        }
-        if self.executable_handling == ExecutableHandling::Open {
-            self.operation_error = Some(
-                self.catalog
-                    .message("context.backend-unavailable")
-                    .expect("backend refusal is localized")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        }
-        let Some(tab_id) = origin_tab else {
-            self.operation_error = Some(
-                self.catalog
-                    .message("context.origin-unavailable")
-                    .expect("origin refusal is localized")
-                    .into(),
-            );
-            cx.notify();
+        let Some((target, path)) = self.run_target(targets, origin_tab, confirmed, cx) else {
             return;
         };
-        if self.navigation.focused_tab().id() != tab_id || !self.directories.contains_key(&tab_id) {
-            self.operation_error = Some(
-                self.catalog
-                    .message("context.origin-unavailable")
-                    .expect("origin refusal is localized")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        }
-        let [target] = targets else {
-            self.operation_error = Some(
-                self.catalog
-                    .message("context.backend-unavailable")
-                    .expect("backend refusal is localized")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        };
-        // The background task below resolves the target and its executable
-        // state itself; only the directory model is checked here.
-        if let Err(error) = self.check_cached_targets(origin_tab, targets) {
-            self.operation_error = Some(error);
-            cx.notify();
-            return;
-        }
-        let Some(path) = target.path().as_unix_path().map(Path::to_path_buf) else {
-            self.operation_error = Some(
-                self.catalog
-                    .message("context.backend-unavailable")
-                    .expect("backend refusal is localized")
-                    .into(),
-            );
-            cx.notify();
-            return;
-        };
-        let target = target.clone();
         let store = Arc::clone(&self.store);
         let runner = Arc::clone(&self.application_runner);
-        self.operation_error = None;
-        cx.notify();
+        let launcher = DesktopEntryLauncher::new(self.run_directories.clone());
+        let terminal = self.terminal_command.clone();
         let work = cx.background_spawn(async move {
-            let current = store
-                .resolve_item(target.path())
-                .map_err(|_| ExecutableRunError::TargetChanged)?;
-            if !current.is_some_and(|item| {
-                item.id() == target.id()
-                    && item.path() == target.path()
-                    && item.kind() == ItemKind::RegularFile
-            }) {
-                return Err(ExecutableRunError::TargetChanged);
+            let checked = check_run_target(
+                &*store,
+                &target,
+                &path,
+                &[RunKind::Program, RunKind::DesktopEntry],
+            )?;
+            if checked.kind() == RunKind::DesktopEntry {
+                let application = checked
+                    .desktop_application()
+                    .ok_or(ExecutableRunError::NotRunnable)?;
+                let prepared = launcher
+                    .prepare(&application, &[], terminal.as_ref())
+                    .map_err(ExecutableRunError::Launch)?;
+                return launcher
+                    .launch(&prepared, runner.as_ref())
+                    .map_err(ExecutableRunError::Launch);
             }
-            if !matches!(
-                store.executable_state(target.path()),
-                Ok(CapabilityState::Supported)
-            ) {
-                return Err(ExecutableRunError::NotExecutable);
-            }
-            let launch =
-                PreparedLaunch::for_executable_file(&path).map_err(ExecutableRunError::Launch)?;
+            let launch = checked
+                .program_launch()
+                .map_err(ExecutableRunError::Launch)?;
             runner
                 .spawn(&launch)
                 .map_err(LaunchError::Spawn)
@@ -12592,30 +12934,249 @@ impl MusheenApp {
                 return;
             };
             this.update(cx, |state, cx| {
-                state.operation_error = result.err().map(|error| match error {
-                    ExecutableRunError::TargetChanged => state
-                        .catalog
-                        .message("context.target-changed")
-                        .expect("target refusal is localized")
-                        .into(),
-                    ExecutableRunError::NotExecutable => state
-                        .catalog
-                        .message("context.backend-unavailable")
-                        .expect("backend refusal is localized")
-                        .into(),
-                    ExecutableRunError::Launch(error) => format!(
-                        "{}: {error}",
-                        state
-                            .catalog
-                            .message("context.run-failed")
-                            .expect("run failure is localized")
-                    )
-                    .into_boxed_str(),
+                state.operation_error = result.err().map(|error| {
+                    state.run_error_message(error, "only local executable files can run")
                 });
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Run in Terminal (SYS-036): a script or compiled program the user may
+    /// execute runs in the drawer, or in the system terminal when the Run
+    /// in Terminal setting chooses it.
+    fn dispatch_run_in_terminal_command(
+        &mut self,
+        targets: &[CommandTargetRef],
+        origin_tab: Option<TabId>,
+        confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((target, path)) = self.run_target(targets, origin_tab, confirmed, cx) else {
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        let work = cx.background_spawn(async move {
+            check_run_target(
+                &*store,
+                &target,
+                &path,
+                &[RunKind::Program, RunKind::Script],
+            )
+            .map(|checked| checked.path().to_path_buf())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| match result {
+                Ok(path) => state.run_in_chosen_terminal(path, cx),
+                Err(error) => {
+                    state.operation_error = Some(state.run_error_message(
+                        error,
+                        "only a local script or compiled program can run in a terminal",
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn run_error_message(&self, error: ExecutableRunError, not_runnable: &str) -> Box<str> {
+        match error {
+            ExecutableRunError::TargetChanged => self
+                .catalog
+                .message("context.target-changed")
+                .expect("target refusal is localized")
+                .into(),
+            ExecutableRunError::NotExecutable => self
+                .catalog
+                .localize_reason(
+                    "you may not execute this file; its permissions in Properties can allow it",
+                )
+                .into_boxed_str(),
+            ExecutableRunError::NotRunnable => {
+                self.catalog.localize_reason(not_runnable).into_boxed_str()
+            }
+            ExecutableRunError::Launch(error) => format!(
+                "{}: {error}",
+                self.catalog
+                    .message("context.run-failed")
+                    .expect("run failure is localized")
+            )
+            .into_boxed_str(),
+        }
+    }
+
+    /// Runs a checked file where the Run in Terminal setting says: the
+    /// terminal drawer, the default, or the system terminal.
+    fn run_in_chosen_terminal(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(folder) = path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let system = cx
+            .try_global::<crate::settings::RuntimeSettings>()
+            .and_then(|runtime| runtime.0.value("files.run-in-terminal"))
+            .as_deref()
+            == Some("system");
+        if !system {
+            self.start_terminal_run(path, folder, cx);
+            return;
+        }
+        let started =
+            musheen_desktop::system_terminal_launch(&self.run_directories, &path, &folder)
+                .and_then(|launch| {
+                    self.application_runner
+                        .spawn(&launch)
+                        .map_err(LaunchError::Spawn)
+                });
+        self.operation_error = started.err().map(|error| match error {
+            LaunchError::TerminalUnavailable => self
+                .catalog
+                .message("terminal-run-no-terminal")
+                .expect("the missing-terminal message is localized")
+                .into(),
+            error => self.run_error_message(ExecutableRunError::Launch(error), ""),
+        });
+        cx.notify();
+    }
+
+    /// Runs `path` in the drawer, in its own session in `folder`. While
+    /// another file still runs there, the user is asked first.
+    fn start_terminal_run(&mut self, path: PathBuf, folder: PathBuf, cx: &mut Context<Self>) {
+        self.show_terminal_drawer();
+        if self
+            .terminal_run
+            .as_ref()
+            .is_some_and(|run| run.exit.is_none())
+        {
+            self.pending_terminal_run = Some((path, folder));
+            cx.notify();
+            return;
+        }
+        self.launch_terminal_run(path, folder, cx);
+    }
+
+    fn launch_terminal_run(&mut self, path: PathBuf, folder: PathBuf, cx: &mut Context<Self>) {
+        self.pending_terminal_run = None;
+        self.pending_terminal_run_close = false;
+        self.terminal_run = None;
+        self.terminal_run_generation = self.terminal_run_generation.wrapping_add(1);
+        let generation = self.terminal_run_generation;
+        let name = SharedString::from(
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+        let location = StorePath::from_unix_path(folder.as_os_str());
+        let work = cx.background_spawn(async move {
+            // The file itself, by its path so a script sees its own path,
+            // with no arguments and no shell.
+            let profile = TerminalProfile::new("run", path, std::iter::empty::<&str>())?;
+            TerminalSession::spawn(profile, &location, TerminalSize::default())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| {
+                if state.terminal_run_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(session) => {
+                        let events = session.events();
+                        state.terminal_run = Some(TerminalRun {
+                            name,
+                            session,
+                            model: TerminalModel::new(TerminalSize::default()),
+                            generation,
+                            exit: None,
+                        });
+                        state.start_terminal_run_events(generation, events, cx);
+                    }
+                    Err(error) => {
+                        state.operation_error =
+                            Some(localized_terminal_error(&state.catalog, &error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_terminal_run_events(
+        &self,
+        generation: u64,
+        events: async_channel::Receiver<PtyEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                let keep_listening = this.update(cx, |state, cx| {
+                    let Some(run) = state
+                        .terminal_run
+                        .as_mut()
+                        .filter(|run| run.generation == generation)
+                    else {
+                        return false;
+                    };
+                    match event {
+                        PtyEvent::Output(bytes) => run.model.feed(&bytes),
+                        PtyEvent::Exited(exit) => run.exit = Some(exit),
+                        PtyEvent::ReadFailed => {}
+                    }
+                    cx.notify();
+                    true
+                });
+                if !keep_listening {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Shows the drawer without touching its shell session.
+    fn show_terminal_drawer(&mut self) {
+        if !self.terminal_drawer.is_open()
+            && self.terminal_drawer.toggle() == TerminalDrawerAction::FocusTerminal
+        {
+            self.shell.set_terminal_visible(true);
+            self.pending_terminal_focus = true;
+        }
+    }
+
+    /// Closes the file's session in the drawer, asking first while it runs.
+    fn close_terminal_run(&mut self, cx: &mut Context<Self>) {
+        if self
+            .terminal_run
+            .as_ref()
+            .is_some_and(|run| run.exit.is_none())
+        {
+            self.pending_terminal_run_close = true;
+        } else {
+            self.end_terminal_run(cx);
+        }
+        cx.notify();
+    }
+
+    /// Ends the file's session; the drawer shows the shell again.
+    fn end_terminal_run(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut run) = self.terminal_run.take() {
+            let _ = run.session.terminate();
+        }
+        self.pending_terminal_run_close = false;
+        self.ensure_terminal_session(cx);
+        cx.notify();
     }
 
     fn copyable_location_text(&self, path: &StorePath) -> Option<String> {
@@ -12707,6 +13268,7 @@ impl MusheenApp {
                 | CommandAction::CopyLocation
                 | CommandAction::Preview
                 | CommandAction::Run
+                | CommandAction::RunInTerminal
                 | CommandAction::Cut
                 | CommandAction::PasteInto
                 | CommandAction::MoveToTrash
@@ -18837,6 +19399,7 @@ fn is_contextual_command(action: CommandAction) -> bool {
             | CommandAction::OpenTerminalHere
             | CommandAction::OpenAsAdministrator
             | CommandAction::Run
+            | CommandAction::RunInTerminal
             | CommandAction::RunAsAdministrator
             | CommandAction::Copy
             | CommandAction::Cut
@@ -23742,6 +24305,7 @@ mod tests {
             CommandAction::CopyLocation,
             CommandAction::Preview,
             CommandAction::Run,
+            CommandAction::RunInTerminal,
             CommandAction::NewFromTemplate,
             CommandAction::Hide,
             CommandAction::Unhide,
@@ -25139,13 +25703,9 @@ mod tests {
     async fn run_context_action_needs_review_and_spawns_one_exact_local_program(
         cx: &mut TestAppContext,
     ) {
-        use std::os::unix::fs::PermissionsExt;
-
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("run $(touch escaped); echo hi");
-        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
-        filesystem::set_permissions(&executable, filesystem::Permissions::from_mode(0o755))
-            .unwrap();
+        compiled_program(&executable, 0o755);
         let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
         let target = local_command_target(&executable);
         let runner = Arc::new(RecordingApplicationRunner::default());
@@ -25211,13 +25771,9 @@ mod tests {
     async fn run_context_action_obeys_open_policy_and_refuses_a_replaced_target(
         cx: &mut TestAppContext,
     ) {
-        use std::os::unix::fs::PermissionsExt;
-
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("tool");
-        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
-        filesystem::set_permissions(&executable, filesystem::Permissions::from_mode(0o755))
-            .unwrap();
+        compiled_program(&executable, 0o755);
         let (app, _browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
         let target = local_command_target(&executable);
         let runner = Arc::new(RecordingApplicationRunner::default());
@@ -25247,7 +25803,7 @@ mod tests {
         assert!(runner.0.lock().unwrap().is_empty());
 
         filesystem::rename(&executable, temporary.path().join("old-tool")).unwrap();
-        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        compiled_program(&executable, 0o755);
         app.update(cx, |state, cx| {
             state.executable_handling = ExecutableHandling::Run;
             state.dispatch_typed_context_command(
@@ -25291,9 +25847,7 @@ mod tests {
 
         let temporary = tempfile::tempdir().unwrap();
         let executable = temporary.path().join("tool");
-        filesystem::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
-        filesystem::set_permissions(&executable, filesystem::Permissions::from_mode(0o755))
-            .unwrap();
+        compiled_program(&executable, 0o755);
         let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
         let target = local_command_target(&executable);
         let runner = Arc::new(RecordingApplicationRunner::default());
@@ -25643,6 +26197,9 @@ mod tests {
     async fn run_in_terminal_runs_the_file_in_its_folder_without_arguments(
         cx: &mut TestAppContext,
     ) {
+        // The terminal's reader threads wake the app from outside the test
+        // scheduler.
+        cx.executor().allow_parking();
         let temporary = tempfile::tempdir().unwrap();
         let report = temporary.path().join("report");
         let script = temporary.path().join("script.sh");
@@ -25679,6 +26236,196 @@ mod tests {
             filesystem::read_to_string(&report).unwrap(),
             format!("{} 0", temporary.path().display())
         );
+    }
+
+    /// Runs `target` through Run in Terminal, as confirmed after its review.
+    fn run_in_terminal_confirmed(
+        app: &Entity<MusheenApp>,
+        target: &CommandTargetRef,
+        cx: &mut TestAppContext,
+    ) {
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::RunInTerminal,
+                CommandParameters::targets(vec![target.clone()]),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                true,
+                cx,
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn run_in_terminal_keeps_the_shell_and_shows_the_output_and_exit_code(
+        cx: &mut TestAppContext,
+    ) {
+        // The terminal's reader threads wake the app from outside the test
+        // scheduler.
+        cx.executor().allow_parking();
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("report.sh");
+        file_with_mode(
+            &script,
+            b"#!/bin/sh\necho hello from the script\nexit 3\n",
+            0o755,
+        );
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let target = local_command_target(&script);
+        let shell_generation = app.update(cx, |state, _| {
+            state.executable_handling = ExecutableHandling::Ask;
+            let location = state.navigation.focused_tab().location().clone();
+            state.terminal_session = Some(
+                TerminalSession::spawn(
+                    TerminalProfile::system(),
+                    &location,
+                    TerminalSize::default(),
+                )
+                .unwrap(),
+            );
+            state.terminal_generation
+        });
+
+        run_in_terminal_confirmed(&app, &target, cx);
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            app.read(cx)
+                .terminal_run
+                .as_ref()
+                .is_some_and(|run| run.exit.is_some())
+        })
+        .await;
+        cx.run_until_parked();
+        app.update(cx, |state, cx| {
+            assert!(state.terminal_drawer.is_open(), "the drawer shows the run");
+            let run = state.terminal_run.as_ref().unwrap();
+            assert_eq!(run.exit, Some(TerminalExit::Code(3)));
+            assert!(
+                project_terminal_cells(&run.model.cells())
+                    .iter()
+                    .any(|line| line.text().contains("hello from the script")),
+                "the output stays after the file exits"
+            );
+            assert!(state.terminal_run_status(run).contains('3'));
+            assert_eq!(state.terminal_generation, shell_generation);
+            assert!(
+                state
+                    .terminal_session
+                    .as_ref()
+                    .is_some_and(TerminalSession::is_running),
+                "the shell keeps running behind the run"
+            );
+
+            // Closing an ended run returns to the same shell.
+            state.close_terminal_run(cx);
+            assert!(state.terminal_run.is_none());
+            assert!(!state.pending_terminal_run_close);
+            assert_eq!(state.terminal_generation, shell_generation);
+            assert!(
+                state
+                    .terminal_session
+                    .as_ref()
+                    .is_some_and(TerminalSession::is_running)
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn run_in_terminal_asks_before_closing_or_replacing_a_running_file(
+        cx: &mut TestAppContext,
+    ) {
+        // The terminal's reader threads wake the app from outside the test
+        // scheduler.
+        cx.executor().allow_parking();
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first.sh");
+        file_with_mode(&first, b"#!/bin/sh\nsleep 30\n", 0o755);
+        let second = temporary.path().join("second.sh");
+        file_with_mode(&second, b"#!/bin/sh\nsleep 30\n", 0o755);
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        app.update(cx, |state, _| {
+            state.executable_handling = ExecutableHandling::Ask
+        });
+
+        run_in_terminal_confirmed(&app, &local_command_target(&first), cx);
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            app.read(cx).terminal_run.is_some()
+        })
+        .await;
+        let first_generation = app.update(cx, |state, cx| {
+            state.close_terminal_run(cx);
+            assert!(
+                state.pending_terminal_run_close,
+                "closing a running file asks"
+            );
+            let run = state.terminal_run.as_ref().unwrap();
+            assert!(run.exit.is_none() && run.session.is_running());
+            state.pending_terminal_run_close = false;
+            run.generation
+        });
+
+        run_in_terminal_confirmed(&app, &local_command_target(&second), cx);
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            app.read(cx).pending_terminal_run.is_some()
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            let run = state.terminal_run.as_ref().unwrap();
+            assert_eq!(
+                run.generation, first_generation,
+                "running another asks first"
+            );
+            assert!(run.session.is_running());
+            let (path, folder) = state.pending_terminal_run.take().unwrap();
+            state.launch_terminal_run(path, folder, cx);
+        });
+        cx.wait_for(browser, Duration::from_secs(5), |_, cx| {
+            app.read(cx)
+                .terminal_run
+                .as_ref()
+                .is_some_and(|run| run.generation != first_generation)
+        })
+        .await;
+        app.update(cx, |state, cx| {
+            assert_eq!(
+                state.terminal_run.as_ref().unwrap().name.as_ref(),
+                "second.sh"
+            );
+            state.end_terminal_run(cx);
+        });
+    }
+
+    #[gpui_kit::test]
+    async fn run_in_terminal_uses_the_system_terminal_when_chosen(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let script = temporary.path().join("script.sh");
+        file_with_mode(&script, b"#!/bin/sh\nexit 0\n", 0o755);
+        let bin = tempfile::tempdir().unwrap();
+        let terminal = bin.path().join("xdg-terminal-exec");
+        file_with_mode(&terminal, b"#!/bin/sh\nexit 0\n", 0o755);
+        let mut settings = musheen_desktop::SettingsDocument::default();
+        settings
+            .set_value("files.run-in-terminal", "system")
+            .unwrap();
+        cx.update(|cx| cx.set_global(crate::settings::RuntimeSettings(settings)));
+        let (app, browser) = open_selected_directory(temporary.path(), Layout::List, cx).await;
+        let runner = Arc::new(RecordingApplicationRunner::default());
+        app.update(cx, |state, _| {
+            state.executable_handling = ExecutableHandling::Ask;
+            state.application_runner = runner.clone();
+            state.run_directories = vec![bin.path().to_path_buf()];
+        });
+
+        run_in_terminal_confirmed(&app, &local_command_target(&script), cx);
+        cx.wait_for(browser, Duration::from_secs(5), |_, _| {
+            !runner.0.lock().unwrap().is_empty()
+        })
+        .await;
+        let launches = runner.0.lock().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(launches[0].program(), terminal.as_os_str());
+        assert_eq!(launches[0].arguments(), [script.clone().into_os_string()]);
+        assert_eq!(launches[0].working_directory(), Some(temporary.path()));
+        assert!(cx.read(|cx| app.read(cx).terminal_run.is_none()));
     }
 
     #[gpui_kit::test]

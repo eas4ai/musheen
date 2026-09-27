@@ -1,10 +1,12 @@
 use super::{DesktopApplication, executable_available};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 /// A local path or already encoded URI selected for launch.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,7 +62,23 @@ pub struct PreparedLaunch {
     program: OsString,
     arguments: Vec<OsString>,
     working_directory: Option<PathBuf>,
+    /// For a checked program, the file that was opened and checked; the
+    /// program runs from it, not from `program`, its path (SYS-035).
+    checked: Option<CheckedExecutable>,
 }
+
+/// The open file a checked program runs from. Two launches are equal only
+/// when they hold the same open file.
+#[derive(Clone, Debug)]
+struct CheckedExecutable(Arc<OwnedFd>);
+
+impl PartialEq for CheckedExecutable {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CheckedExecutable {}
 
 impl PreparedLaunch {
     /// Execute one absolute local file directly, with no shell or implicit arguments.
@@ -76,6 +94,40 @@ impl PreparedLaunch {
             program: path.as_os_str().to_os_string(),
             arguments: Vec::new(),
             working_directory: Some(working_directory.to_path_buf()),
+            checked: None,
+        })
+    }
+
+    /// Run the compiled program open as `file`, whose path is `path`, from
+    /// that open file, with no shell or implicit arguments and its folder
+    /// as the working directory (SYS-035). The program's name is `path`.
+    pub(crate) fn for_checked_program(path: &Path, file: OwnedFd) -> Result<Self, LaunchError> {
+        Ok(Self {
+            checked: Some(CheckedExecutable(Arc::new(file))),
+            ..Self::for_executable_file(path)?
+        })
+    }
+
+    /// Run `program` with `arguments` in `working_directory`, as given.
+    pub(crate) fn command(
+        program: &Path,
+        arguments: Vec<OsString>,
+        working_directory: &Path,
+    ) -> Result<Self, LaunchError> {
+        if !program.is_absolute()
+            || !valid_os_argument(program.as_os_str())
+            || arguments
+                .iter()
+                .any(|argument| !valid_os_argument(argument))
+        {
+            return Err(LaunchError::InvalidExecutable(program.to_path_buf()));
+        }
+        validate_working_directory(Some(working_directory))?;
+        Ok(Self {
+            program: program.as_os_str().to_os_string(),
+            arguments,
+            working_directory: Some(working_directory.to_path_buf()),
+            checked: None,
         })
     }
 
@@ -117,7 +169,24 @@ pub struct SystemProcessRunner;
 
 impl ProcessRunner for SystemProcessRunner {
     fn spawn(&self, launch: &PreparedLaunch) -> io::Result<()> {
-        let mut command = Command::new(&launch.program);
+        // A checked program runs from its open file, through a duplicate the
+        // child inherits (a duplicate has no close-on-exec flag), so a file
+        // put at its path after the check cannot run. A child another thread
+        // starts at the same moment may inherit the duplicate too; it only
+        // holds the program's file open for reading.
+        let inherited = launch
+            .checked
+            .as_ref()
+            .map(|checked| rustix::io::dup(&*checked.0).map_err(io::Error::from))
+            .transpose()?;
+        let mut command = match &inherited {
+            Some(file) => {
+                let mut command = Command::new(format!("/proc/self/fd/{}", file.as_raw_fd()));
+                command.arg0(&launch.program);
+                command
+            }
+            None => Command::new(&launch.program),
+        };
         command
             .args(&launch.arguments)
             .stdin(Stdio::null())
@@ -235,6 +304,7 @@ fn build_launch(
         program,
         arguments: argv,
         working_directory: application.working_directory().map(Path::to_path_buf),
+        checked: None,
     };
     if application.terminal() {
         let terminal = terminal.ok_or(LaunchError::TerminalUnavailable)?;
@@ -245,6 +315,7 @@ fn build_launch(
             program: terminal.program.clone(),
             arguments,
             working_directory: launch.working_directory,
+            checked: None,
         };
     }
     Ok(launch)
