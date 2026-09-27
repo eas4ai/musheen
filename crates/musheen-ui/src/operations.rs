@@ -1,7 +1,8 @@
 pub use musheen_local::{
     ArchiveOperationExecution, ArchiveOperationRoute, DropAction, DropError, FileDragPayload,
     LocalFailureDisposition, LocalOperationFailure, LocalOperationOutcome, LocalOperationQueue,
-    LocalStore, ProviderTransferRoute, ReadyLocalOperation, TransferOutcome,
+    LocalStore, OwnershipOperationRoute, ProviderTransferRoute, ReadyLocalOperation,
+    TransferOutcome,
 };
 
 use crate::providers::ProviderRuntime;
@@ -688,6 +689,35 @@ impl OperationHub {
         drop(status);
         self.persist_status();
         Ok(ids)
+    }
+
+    /// Queues an owner and group change that `route` makes as administrator
+    /// (SYS-037), shown in the status center like any job.
+    pub fn submit_ownership(
+        &self,
+        items: Vec<StorePath>,
+        route: Arc<dyn OwnershipOperationRoute>,
+    ) -> Result<JobId, OperationHubError> {
+        let location = items
+            .first()
+            .cloned()
+            .ok_or(OperationHubError::Queue(DropError::EmptySelection))?;
+        let submitted = items.clone();
+        let id = self.with_unreserved_queue(items.iter(), |queue| {
+            queue.submit_ownership(submitted, route)
+        })?;
+        self.status
+            .lock()
+            .map_err(|_| OperationHubError::StatusLock)?
+            .register(
+                id,
+                musheen_ops::EventGeneration::new(0),
+                musheen_ops::OperationKind::SetOwnership,
+                location,
+                Some(1),
+            )?;
+        self.persist_status();
+        Ok(id)
     }
 
     pub fn submit_create(&self, request: CreateRequest) -> Result<JobId, OperationHubError> {

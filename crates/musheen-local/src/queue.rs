@@ -133,6 +133,12 @@ enum LocalOperation {
         plan: ArchiveOperationPlan,
         route: Arc<dyn ArchiveOperationRoute>,
     },
+    /// An owner and group change made as administrator by the route the
+    /// window built for it (SYS-037); `items` are the reviewed items.
+    Ownership {
+        items: Vec<StorePath>,
+        route: Arc<dyn OwnershipOperationRoute>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -334,6 +340,7 @@ impl LocalOperation {
             Self::Restore { .. } => OperationKind::Restore,
             Self::PermanentDelete { .. } => OperationKind::PermanentDelete,
             Self::Archive { plan, .. } => plan.kind(),
+            Self::Ownership { .. } => OperationKind::SetOwnership,
         }
     }
 
@@ -351,6 +358,7 @@ impl LocalOperation {
             Self::Restore { receipt, .. } => receipt.original_path(),
             Self::PermanentDelete { request, .. } => request.location(),
             Self::Archive { plan, .. } => plan.destination(),
+            Self::Ownership { items, .. } => &items[0],
         }
     }
 
@@ -386,6 +394,7 @@ impl LocalOperation {
                 .cloned()
                 .chain(std::iter::once(plan.destination().clone()))
                 .collect(),
+            Self::Ownership { items, .. } => items.clone(),
         }
     }
 }
@@ -422,6 +431,7 @@ pub enum LocalOperationOutcome {
     Mutation,
     Trash(TrashReceipt),
     Archive,
+    Ownership,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -456,6 +466,17 @@ impl<'a> ArchiveOperationExecution<'a> {
 
 pub trait ArchiveOperationRoute: fmt::Debug + Send + Sync {
     fn execute_archive(&self, execution: ArchiveOperationExecution<'_>) -> Result<(), Box<str>>;
+}
+
+/// Makes one reviewed owner and group change as administrator (SYS-037).
+/// The window builds a route for each change, holding what the user
+/// reviewed and how to authorize it; the queue runs it like any job.
+pub trait OwnershipOperationRoute: fmt::Debug + Send + Sync {
+    /// Makes the change, or says which item failed and why.
+    fn execute_ownership(
+        &self,
+        cancellation: &musheen_core::CancellationToken,
+    ) -> Result<(), Box<str>>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -852,6 +873,10 @@ impl ReadyLocalOperation {
                     cancellation: &self.cancellation,
                 })
                 .map(|()| LocalOperationOutcome::Archive)
+                .map_err(LocalOperationFailure::failed),
+            LocalOperation::Ownership { route, .. } => route
+                .execute_ownership(&self.cancellation)
+                .map(|()| LocalOperationOutcome::Ownership)
                 .map_err(LocalOperationFailure::failed),
         }
     }
@@ -1256,6 +1281,28 @@ impl LocalOperationQueue {
             LocalOperation::Archive { plan, route },
         )])
         .map(|mut ids| ids.remove(0))
+    }
+
+    /// Queues an owner and group change of `items` that `route` makes as
+    /// administrator (SYS-037).
+    pub fn submit_ownership(
+        &mut self,
+        items: Vec<StorePath>,
+        route: Arc<dyn OwnershipOperationRoute>,
+    ) -> Result<JobId, DropError> {
+        let Some(root) = items.first().cloned() else {
+            return Err(DropError::EmptySelection);
+        };
+        let store = LocalStore::new();
+        let plan = OperationPlan::new(
+            OperationKind::SetOwnership,
+            provider_snapshot(&store, &root),
+            None,
+            root,
+        )
+        .map_err(|error| DropError::Plan(error.to_string().into()))?;
+        self.enqueue_planned(vec![(plan, LocalOperation::Ownership { items, route })])
+            .map(|mut ids| ids.remove(0))
     }
 
     pub fn start_ready(&mut self) -> Result<Vec<ReadyLocalOperation>, DropError> {

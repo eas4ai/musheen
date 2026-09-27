@@ -4,8 +4,8 @@ use musheen_desktop::privilege::{
     AuditOutcome, AuditPhase, AuditRecord, AuditSink, AuthorizationError, AuthorizationGrant,
     AuthorizationRequest, Authorizer, Broker, BrokerError, BrokerLaunch, BrokerOperation,
     BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, Clock, ElevatedRootReference,
-    JsonAuditLog, OperationRunner, PrivilegeProvider, ProcessBrokerTransport, RootGrant,
-    RootedStore, SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest,
+    JsonAuditLog, OperationRunner, OwnershipReport, PrivilegeProvider, ProcessBrokerTransport,
+    RootGrant, RootedStore, SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest,
     encode_broker_response,
 };
 use std::collections::BTreeMap;
@@ -110,6 +110,9 @@ impl OperationRunner for RecordingRunner {
             }
             BrokerOperation::RunExecutable { .. } => BrokerOutput::Exited(0),
             BrokerOperation::ReadDirectory { .. } => BrokerOutput::DirectoryEntries(Vec::new()),
+            BrokerOperation::ChangeOwnership { .. } => {
+                BrokerOutput::OwnershipChanged(OwnershipReport::new(0, None))
+            }
         })
     }
 }

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use super::session::{BrokerChannel, BrokerProcess, ChannelError, spawn_output_reader};
 use super::{
     BrokerOperation, BrokerRequest, BrokerSession, ElevatedRootReference,
-    MAX_SESSION_LISTING_BYTES, PrivilegeProvider, RequestSubject, RootGrant, RootedDirectoryEntry,
-    RootedEntryKind, RootedStore,
+    MAX_SESSION_LISTING_BYTES, OwnershipContents, OwnershipItem, PrivilegeProvider, RequestSubject,
+    RootGrant, RootedDirectoryEntry, RootedEntryKind, RootedStore,
 };
 use crate::SecretBuffer;
 use musheen_core::CancellationToken;
@@ -203,6 +203,63 @@ pub enum BrokerOutput {
     RootReferenced(ElevatedRootReference),
     DirectoryEntries(Vec<BrokerDirectoryEntry>),
     Exited(i32),
+    OwnershipChanged(OwnershipReport),
+}
+
+/// What an ownership change did: how many items it changed, and the item
+/// it stopped at, if one failed. Items changed before a failure stay changed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipReport {
+    changed: u64,
+    failure: Option<OwnershipFailure>,
+}
+
+impl OwnershipReport {
+    #[must_use]
+    pub const fn new(changed: u64, failure: Option<OwnershipFailure>) -> Self {
+        Self { changed, failure }
+    }
+
+    #[must_use]
+    pub const fn changed(&self) -> u64 {
+        self.changed
+    }
+
+    #[must_use]
+    pub const fn failure(&self) -> Option<&OwnershipFailure> {
+        self.failure.as_ref()
+    }
+}
+
+/// The item an ownership change could not change, and why.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipFailure {
+    #[serde(with = "super::request::path_bytes")]
+    path: PathBuf,
+    reason: Box<str>,
+}
+
+impl OwnershipFailure {
+    #[must_use]
+    pub fn new(path: impl AsRef<Path>, error: &BrokerError) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            reason: error.code().into(),
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The broker error, when the reason is one Musheen knows.
+    #[must_use]
+    pub fn error(&self) -> BrokerError {
+        BrokerError::from_code(&self.reason).unwrap_or(BrokerError::Io)
+    }
 }
 
 /// One entry of a folder listing. It goes as a [`WireEntry`].
@@ -1197,6 +1254,8 @@ pub enum BrokerError {
     ExecutionTimedOut,
     InvalidRequest,
     Io,
+    /// A filesystem without POSIX ownership, or not on this machine.
+    FilesystemUnsupported,
     /// A folder's listing passed [`MAX_SESSION_LISTING_BYTES`].
     ListingTooLarge,
     NotExecutable,
@@ -1219,6 +1278,9 @@ impl fmt::Display for BrokerError {
             Self::ExecutionTimedOut => "the privileged command timed out",
             Self::InvalidRequest => "the privilege request is invalid",
             Self::Io => "the privilege operation failed",
+            Self::FilesystemUnsupported => {
+                "the filesystem has no POSIX ownership or is not on this machine"
+            }
             Self::ListingTooLarge => "the folder's listing is larger than 64 MiB",
             Self::NotExecutable => "the selected target is not executable",
             Self::ScopeEscape => "the path leaves the authorized root",
@@ -1245,6 +1307,7 @@ impl BrokerError {
             Self::ExecutionTimedOut => "execution-timed-out",
             Self::InvalidRequest => "invalid-request",
             Self::Io => "io-failed",
+            Self::FilesystemUnsupported => "filesystem-unsupported",
             Self::ListingTooLarge => "listing-too-large",
             Self::NotExecutable => "not-executable",
             Self::ScopeEscape => "scope-escape",
@@ -1266,6 +1329,7 @@ impl BrokerError {
             "execution-timed-out" => Self::ExecutionTimedOut,
             "invalid-request" => Self::InvalidRequest,
             "io-failed" => Self::Io,
+            "filesystem-unsupported" => Self::FilesystemUnsupported,
             "listing-too-large" => Self::ListingTooLarge,
             "not-executable" => Self::NotExecutable,
             "scope-escape" => Self::ScopeEscape,
@@ -1411,6 +1475,9 @@ struct ValidatedTarget {
 
 impl ValidatedTarget {
     fn open(operation: &BrokerOperation) -> Result<Self, BrokerError> {
+        if let BrokerOperation::ChangeOwnership { items, .. } = operation {
+            return Self::open_ownership_items(items);
+        }
         let directory = matches!(
             operation,
             BrokerOperation::OpenDirectory { .. } | BrokerOperation::ReadDirectory { .. }
@@ -1433,6 +1500,206 @@ impl ValidatedTarget {
             file,
         })
     }
+}
+
+impl ValidatedTarget {
+    /// Opens every item of an ownership change as it is, a symbolic link as
+    /// the link, and checks that each is still the file the user reviewed on
+    /// a filesystem with POSIX ownership. The first item is the target.
+    fn open_ownership_items(items: &[OwnershipItem]) -> Result<Self, BrokerError> {
+        let mut first = None;
+        for item in items {
+            let (file, metadata) = open_ownership_item(item)?;
+            if first.is_none() {
+                first = Some(Self {
+                    identity: FileIdentity::from_metadata(&metadata),
+                    file,
+                });
+            }
+        }
+        first.ok_or(BrokerError::InvalidRequest)
+    }
+}
+
+/// Opens `item` without following any symbolic link, the last one
+/// included, and checks it is the reviewed file on a supported filesystem.
+fn open_ownership_item(item: &OwnershipItem) -> Result<(File, std::fs::Metadata), BrokerError> {
+    let parent = item.path().parent().ok_or(BrokerError::InvalidRequest)?;
+    let name = item.path().file_name().ok_or(BrokerError::InvalidRequest)?;
+    let parent = open_absolute_no_symlinks(parent, true)?;
+    let file = File::from(
+        openat(
+            &parent,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_open_error)?,
+    );
+    let metadata = file.metadata().map_err(|_| BrokerError::Io)?;
+    if metadata.dev() != item.device() || metadata.ino() != item.inode() {
+        return Err(BrokerError::TargetReplaced);
+    }
+    ownership_supported(&file)?;
+    Ok((file, metadata))
+}
+
+/// The owner and group an ownership change sets; `None` keeps one.
+#[derive(Clone, Copy, Debug)]
+struct OwnershipChange {
+    owner: Option<u32>,
+    group: Option<u32>,
+}
+
+impl OwnershipChange {
+    /// Changes `file`, opened without following a link, and never its mode:
+    /// the kernel alone clears setuid and setgid bits on an owner change.
+    fn apply(self, file: &File) -> Result<(), BrokerError> {
+        rustix::fs::chownat(
+            file,
+            "",
+            self.owner.map(rustix::fs::Uid::from_raw),
+            self.group.map(rustix::fs::Gid::from_raw),
+            rustix::fs::AtFlags::EMPTY_PATH,
+        )
+        .map_err(map_open_error)
+    }
+}
+
+/// Changes each item, then what its folders contain when `contents` says
+/// so, and stops at the first item it cannot change. Items changed before
+/// that stay changed.
+fn change_ownership(
+    items: &[OwnershipItem],
+    change: OwnershipChange,
+    contents: Option<OwnershipContents>,
+) -> OwnershipReport {
+    let mut report = OwnershipReport::new(0, None);
+    for item in items {
+        let changed = open_ownership_item(item)
+            .map_err(|error| (item.path().to_path_buf(), error))
+            .and_then(|(file, metadata)| {
+                change
+                    .apply(&file)
+                    .map_err(|error| (item.path().to_path_buf(), error))?;
+                report.changed += 1;
+                match contents {
+                    Some(contents) if metadata.is_dir() => change_contents(
+                        &file,
+                        item.path(),
+                        metadata.dev(),
+                        change,
+                        contents,
+                        &mut report,
+                    ),
+                    _ => Ok(()),
+                }
+            });
+        if let Err((path, error)) = changed {
+            report.failure = Some(OwnershipFailure::new(path, &error));
+            break;
+        }
+    }
+    report
+}
+
+/// Changes everything inside `folder`, depth first. It opens each entry
+/// without following a link, so a link is changed itself and never leads
+/// anywhere, and it leaves out a nested mount, and all it holds, unless
+/// `contents` includes nested mounts.
+fn change_contents(
+    folder: &File,
+    path: &Path,
+    device: u64,
+    change: OwnershipChange,
+    contents: OwnershipContents,
+    report: &mut OwnershipReport,
+) -> Result<(), (PathBuf, BrokerError)> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let failed = |error| (path.to_path_buf(), error);
+    let listing = File::from(
+        openat(
+            folder,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_open_error)
+        .map_err(failed)?,
+    );
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(&listing).map_err(|_| failed(BrokerError::Io))? {
+        let entry = entry.map_err(|_| failed(BrokerError::Io))?;
+        let name = entry.file_name();
+        if name != c"." && name != c".." {
+            names.push(name.to_owned());
+        }
+    }
+    for name in names {
+        let entry_path = path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        let failed = |error| (entry_path.clone(), error);
+        let entry = File::from(
+            openat(
+                &listing,
+                name.as_c_str(),
+                OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)
+            .map_err(failed)?,
+        );
+        let metadata = entry.metadata().map_err(|_| failed(BrokerError::Io))?;
+        if metadata.dev() != device {
+            if !contents.nested_mounts {
+                continue;
+            }
+            ownership_supported(&entry).map_err(failed)?;
+        }
+        change.apply(&entry).map_err(failed)?;
+        report.changed += 1;
+        if metadata.is_dir() {
+            change_contents(
+                &entry,
+                &entry_path,
+                metadata.dev(),
+                change,
+                contents,
+                report,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuses filesystems whose ownership is not POSIX or not on this
+/// machine: network filesystems, FUSE, and FAT, exFAT, NTFS, ISO 9660 and
+/// UDF. The Permissions page is read-only on them; this is the broker's
+/// own check.
+fn ownership_supported(file: &File) -> Result<(), BrokerError> {
+    const REFUSED: [u64; 14] = [
+        0x6969,      // NFS
+        0x517b,      // SMB
+        0xff53_4d42, // CIFS
+        0xfe53_4d42, // SMB2
+        0x6573_5546, // FUSE
+        0x00c3_6400, // Ceph
+        0x5346_414f, // AFS
+        0x0102_1997, // 9P
+        0x4d44,      // FAT
+        0x2011_bab0, // exFAT
+        0x7366_746e, // NTFS (ntfs3)
+        0x5346_544e, // NTFS
+        0x9660,      // ISO 9660
+        0x1501_3346, // UDF
+    ];
+    let filesystem = rustix::fs::fstatfs(file).map_err(|_| BrokerError::Io)?;
+    #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+    let kind = filesystem.f_type as u64;
+    if REFUSED.contains(&kind) {
+        return Err(BrokerError::FilesystemUnsupported);
+    }
+    Ok(())
 }
 
 const fn executable_mode_is_trusted(owner: u32, mode: u32) -> bool {
@@ -1718,6 +1985,20 @@ impl OperationRunner for SystemOperationRunner {
                 let store = RootedStore::new(grant, SystemClock);
                 let entries = list_directory(&store, &relative, MAX_SESSION_LISTING_BYTES)?;
                 Ok(BrokerOutput::DirectoryEntries(entries))
+            }
+            BrokerOperation::ChangeOwnership {
+                items,
+                owner,
+                group,
+                contents,
+            } => {
+                if owner == Some(u32::MAX) || group == Some(u32::MAX) {
+                    return Err(BrokerError::InvalidRequest);
+                }
+                let change = OwnershipChange { owner, group };
+                Ok(BrokerOutput::OwnershipChanged(change_ownership(
+                    &items, change, contents,
+                )))
             }
             BrokerOperation::RunExecutable { arguments, .. } => {
                 use std::os::fd::AsRawFd as _;

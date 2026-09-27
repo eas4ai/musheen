@@ -28,7 +28,9 @@ mod thumbnail;
 mod updates;
 mod volumes;
 
-pub use accounts::{current_user_groups, effective_user, group_name, user_name};
+pub use accounts::{
+    all_groups, all_users, current_user_groups, effective_user, group_name, user_name,
+};
 pub use apps::*;
 pub use archive::*;
 pub use catalog::*;
