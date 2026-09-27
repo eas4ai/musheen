@@ -35399,7 +35399,7 @@ mod tests {
         backend: &Arc<PortalBackend>,
         options: ashpd::desktop::file_chooser::OpenFileOptions,
         cx: &mut TestAppContext,
-    ) -> Task<PortalResult> {
+    ) -> gpui_kit::Task<PortalResult> {
         use ashpd::backend::file_chooser::FileChooserImpl as _;
 
         let backend = Arc::clone(backend);
@@ -35421,7 +35421,7 @@ mod tests {
         backend: &Arc<PortalBackend>,
         options: ashpd::desktop::file_chooser::SaveFileOptions,
         cx: &mut TestAppContext,
-    ) -> Task<PortalResult> {
+    ) -> gpui_kit::Task<PortalResult> {
         use ashpd::backend::file_chooser::FileChooserImpl as _;
 
         let backend = Arc::clone(backend);
@@ -35443,7 +35443,7 @@ mod tests {
         backend: &Arc<PortalBackend>,
         options: ashpd::desktop::file_chooser::SaveFilesOptions,
         cx: &mut TestAppContext,
-    ) -> Task<PortalResult> {
+    ) -> gpui_kit::Task<PortalResult> {
         use ashpd::backend::file_chooser::FileChooserImpl as _;
 
         let backend = Arc::clone(backend);
@@ -35490,7 +35490,7 @@ mod tests {
     }
 
     #[cfg(feature = "portal-backend")]
-    async fn portal_uris(task: Task<PortalResult>) -> Vec<String> {
+    async fn portal_uris(task: gpui_kit::Task<PortalResult>) -> Vec<String> {
         task.await
             .expect("the request returns a selection")
             .uris()
@@ -35508,9 +35508,9 @@ mod tests {
     #[cfg(feature = "portal-backend")]
     fn portal_fixture() -> tempfile::TempDir {
         let temporary = tempfile::tempdir().unwrap();
-        fs::write(temporary.path().join("notes.txt"), b"notes").unwrap();
-        fs::write(temporary.path().join("photo.png"), b"png").unwrap();
-        fs::create_dir(temporary.path().join("sub")).unwrap();
+        std::fs::write(temporary.path().join("notes.txt"), b"notes").unwrap();
+        std::fs::write(temporary.path().join("photo.png"), b"png").unwrap();
+        std::fs::create_dir(temporary.path().join("sub")).unwrap();
         temporary
     }
 
