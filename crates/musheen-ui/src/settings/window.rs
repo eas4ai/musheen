@@ -1044,6 +1044,48 @@ mod tests {
         });
     }
 
+    /// Whether the Settings window users open can change `key`.
+    fn editable_in_the_settings_window(key: &str, cx: &mut TestAppContext) -> bool {
+        let spec = settings_schema()
+            .iter()
+            .find(|spec| spec.key == key)
+            .unwrap_or_else(|| panic!("{key} is a setting"));
+        let root = tempfile::tempdir().unwrap();
+        cx.update(|cx| open_settings_at(SettingsStore::from_config_home(root.path()), None, cx));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = cx
+                .global::<SettingsWindowOwner>()
+                .view
+                .as_ref()
+                .and_then(gpui_kit::WeakEntity::upgrade)
+                .expect("Settings opened");
+            view.read(cx).backends.supports(spec.feature)
+        })
+    }
+
+    #[gpui_kit::test]
+    async fn run_file_settings_window_can_change_the_executable_preference(
+        cx: &mut TestAppContext,
+    ) {
+        init_settings_pointer_test(cx);
+        assert!(editable_in_the_settings_window("files.executable", cx));
+    }
+
+    #[gpui_kit::test]
+    async fn run_in_terminal_setting_defaults_to_the_drawer_and_is_editable(
+        cx: &mut TestAppContext,
+    ) {
+        init_settings_pointer_test(cx);
+        assert_eq!(
+            SettingsDocument::default()
+                .value("files.run-in-terminal")
+                .as_deref(),
+            Some("embedded")
+        );
+        assert!(editable_in_the_settings_window("files.run-in-terminal", cx));
+    }
+
     #[gpui_kit::test]
     async fn settings_pointer_tests_use_stable_dialog_geometry(cx: &mut TestAppContext) {
         init_settings_pointer_test(cx);
