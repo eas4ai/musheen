@@ -131,13 +131,14 @@ impl RequestLines {
     }
 }
 
-/// Writes one response line. A listing over [`MAX_SESSION_LISTING_BYTES`]
-/// becomes an error response, so the window gets a typed answer.
+/// Writes one response line. The broker stops a listing over
+/// [`MAX_SESSION_LISTING_BYTES`] while it reads the folder; a response that
+/// still does not fit the line becomes that same typed error.
 pub fn write_response(output: &mut dyn Write, response: &BrokerResponse) -> std::io::Result<()> {
     let mut frame =
         encode_broker_response(response).map_err(|_| std::io::Error::other("response"))?;
     if frame.len() > MAX_RESPONSE_LINE_BYTES {
-        frame = encode_broker_response(&BrokerResponse::failure(&BrokerError::Io))
+        frame = encode_broker_response(&BrokerResponse::failure(&BrokerError::ListingTooLarge))
             .map_err(|_| std::io::Error::other("response"))?;
     }
     output.write_all(frame.as_bytes())?;

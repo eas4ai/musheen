@@ -284,6 +284,7 @@ privilege-error-busy = Another administrator request is already in progress
 privilege-error-timeout = The administrator action timed out
 privilege-error-audit = The administrator action could not be audited
 privilege-error-io = The administrator action failed
+privilege-error-listing-too-large = The folder is too large to list as administrator: an elevated window lists at most 64 MiB
 settings-title = Settings
 settings-search = Search settings
 settings-apply = Apply

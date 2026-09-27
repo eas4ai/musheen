@@ -261,6 +261,9 @@ impl<C: Clock> RootedFilesystemStore<C> {
             BrokerError::ScopeEscape => "the location leaves the elevated root",
             BrokerError::SymlinkRefused => "a symbolic link requires new authorization",
             BrokerError::TargetReplaced => "the elevated root was replaced",
+            BrokerError::ListingTooLarge => {
+                "the folder is too large to list as administrator: an elevated window lists at most 64 MiB"
+            }
             _ => "the elevated broker could not read this location",
         };
         StoreError::Backend(reason.into())

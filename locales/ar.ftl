@@ -52,6 +52,7 @@ privilege-error-busy = هناك طلب مسؤول آخر قيد التنفيذ
 privilege-error-timeout = انتهت مهلة إجراء المسؤول
 privilege-error-audit = تعذر تدقيق إجراء المسؤول
 privilege-error-io = فشل إجراء المسؤول
+privilege-error-listing-too-large = المجلد أكبر من أن يُسرد بصلاحيات المسؤول: تسرد النافذة المرتفعة الصلاحيات 64 ميبيبايت على الأكثر
 dialog-command = الأمر
 dialog-targets = العناصر
 dialog-move-review = يتم النقل عبر سجل العمليات ومعالجة التعارضات.
