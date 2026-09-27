@@ -22,5 +22,6 @@ pub use rooted_store::{
 };
 pub use session::{
     BROKER_END_FRAME, BrokerSession, ELEVATED_SESSION_IDLE, MAX_REQUEST_LINE_BYTES,
-    MAX_SESSION_LISTING_BYTES, RequestLines, prepare_sudo_terminal, serve_session, write_response,
+    MAX_SESSION_LISTING_BYTES, RequestLines, boot_clock, prepare_sudo_terminal, serve_session,
+    write_response,
 };
