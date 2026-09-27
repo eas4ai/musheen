@@ -60,7 +60,7 @@ jiff = "0.2.35"
 md-5 = "0.10"
 miniz_oxide = "=0.9.1"
 musheen-zstd-budget = { path = "crates/musheen-zstd-budget" }
-nix = { version = "0.31", features = ["fs", "poll"] }
+nix = { version = "0.31", features = ["fs", "poll", "user"] }
 notify = "8"
 notify-rust = "4"
 open = "5"
