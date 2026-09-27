@@ -362,15 +362,17 @@ fn selection_from_uris(uris: &[String]) -> Result<PortalSelection, PortalError> 
 #[cfg(feature = "portal-backend")]
 mod backend {
     use super::*;
+    use crate::NameMimeTypes;
     use ashpd::backend::file_chooser::FileChooserImpl;
     use ashpd::backend::request::RequestImpl;
     use ashpd::desktop::HandleToken;
     use ashpd::desktop::file_chooser::{
-        FileFilter, OpenFileOptions, SaveFileOptions, SaveFilesOptions, SelectedFiles,
+        Choice, FileFilter, OpenFileOptions, SaveFileOptions, SaveFilesOptions, SelectedFiles,
     };
     use ashpd::{MaybeAppID, WindowIdentifierType};
     use std::collections::HashMap;
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,21 +388,38 @@ mod backend {
         kind: BackendChooserKind,
         title: Box<str>,
         app_id: Option<Box<str>>,
+        accept_label: Option<Box<str>>,
         multiple: bool,
         directory: bool,
         current_folder: Option<PathBuf>,
-        current_name: Option<Box<str>>,
+        current_name: Option<OsString>,
         files: Vec<PathBuf>,
         filters: Vec<ChooserFilter>,
         current_filter: Option<usize>,
+        choices: Vec<ChooserChoice>,
     }
 
     impl BackendChooserRequest {
+        /// A request to open one file, titled `title`, as Musheen makes for
+        /// itself when its backend is on.
+        #[must_use]
+        pub fn open(title: &str) -> Self {
+            Self::new(BackendChooserKind::Open, title, None)
+        }
+
+        /// Starts the chooser in `folder`.
+        #[must_use]
+        pub fn with_current_folder(mut self, folder: PathBuf) -> Self {
+            self.current_folder = Some(folder);
+            self
+        }
+
         fn new(kind: BackendChooserKind, title: &str, app_id: Option<&MaybeAppID>) -> Self {
             Self {
                 kind,
                 title: title.into(),
                 app_id: app_id.map(|id| id.to_string().into_boxed_str()),
+                accept_label: None,
                 multiple: false,
                 directory: false,
                 current_folder: None,
@@ -408,6 +427,7 @@ mod backend {
                 files: Vec::new(),
                 filters: Vec::new(),
                 current_filter: None,
+                choices: Vec::new(),
             }
         }
 
@@ -429,6 +449,12 @@ mod backend {
             self
         }
 
+        fn with_choices(mut self, choices: &[Choice], accept_label: Option<&str>) -> Self {
+            self.choices = choices.iter().map(ChooserChoice::from).collect();
+            self.accept_label = accept_label.map(Into::into);
+            self
+        }
+
         #[must_use]
         pub const fn kind(&self) -> BackendChooserKind {
             self.kind
@@ -442,6 +468,12 @@ mod backend {
         #[must_use]
         pub fn app_id(&self) -> Option<&str> {
             self.app_id.as_deref()
+        }
+
+        /// The label the request asks for on the accept button.
+        #[must_use]
+        pub fn accept_label(&self) -> Option<&str> {
+            self.accept_label.as_deref()
         }
 
         /// Whether Open may return several files.
@@ -458,13 +490,13 @@ mod backend {
 
         /// The folder the chooser starts in, when the request names one.
         #[must_use]
-        pub fn current_folder(&self) -> Option<&std::path::Path> {
+        pub fn current_folder(&self) -> Option<&Path> {
             self.current_folder.as_deref()
         }
 
-        /// The name Save suggests.
+        /// The name Save suggests, exactly as the request gave it.
         #[must_use]
-        pub fn current_name(&self) -> Option<&str> {
+        pub fn current_name(&self) -> Option<&OsStr> {
             self.current_name.as_deref()
         }
 
@@ -483,6 +515,78 @@ mod backend {
         #[must_use]
         pub const fn current_filter(&self) -> Option<usize> {
             self.current_filter
+        }
+
+        /// The choices the request offers beside the list.
+        #[must_use]
+        pub fn choices(&self) -> &[ChooserChoice] {
+            &self.choices
+        }
+    }
+
+    /// A choice a request offers: a checkbox when it has no options, or one
+    /// option of several.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ChooserChoice {
+        id: Box<str>,
+        label: Box<str>,
+        options: Vec<(Box<str>, Box<str>)>,
+        initial: Box<str>,
+    }
+
+    impl ChooserChoice {
+        #[must_use]
+        pub fn id(&self) -> &str {
+            &self.id
+        }
+
+        #[must_use]
+        pub fn label(&self) -> &str {
+            &self.label
+        }
+
+        /// Each option's ID and label; none for a checkbox.
+        #[must_use]
+        pub fn options(&self) -> &[(Box<str>, Box<str>)] {
+            &self.options
+        }
+
+        /// The value the choice starts with: an option's ID, or `true` or
+        /// `false` for a checkbox.
+        #[must_use]
+        pub fn initial(&self) -> &str {
+            &self.initial
+        }
+    }
+
+    impl From<&Choice> for ChooserChoice {
+        fn from(choice: &Choice) -> Self {
+            let options: Vec<(Box<str>, Box<str>)> = choice
+                .pairs()
+                .into_iter()
+                .map(|(id, label)| (id.into(), label.into()))
+                .collect();
+            let initial = if options.is_empty() {
+                if choice.initial_selection() == "true" {
+                    "true"
+                } else {
+                    "false"
+                }
+                .into()
+            } else if options
+                .iter()
+                .any(|(id, _)| id.as_ref() == choice.initial_selection())
+            {
+                choice.initial_selection().into()
+            } else {
+                options[0].0.clone()
+            };
+            Self {
+                id: choice.id().into(),
+                label: choice.label().into(),
+                options,
+                initial,
+            }
         }
     }
 
@@ -508,25 +612,39 @@ mod backend {
         }
 
         /// Whether a file named `name`, whose name suggests `mime_type`,
-        /// matches: a pattern matches the name, or a MIME type matches the
-        /// file's (`image/*` matches every image type).
+        /// matches: a pattern (wax syntax) matches the name, or the file's
+        /// MIME type is one of the filter's, an alias of one or a subclass
+        /// of one, as `types` knows them (`text/x-csrc` is a `text/plain`;
+        /// `image/*` takes every image type). Without `types`, only equal
+        /// types and families match.
         #[must_use]
-        pub fn matches(&self, name: &OsStr, mime_type: Option<&str>) -> bool {
-            use std::os::unix::ffi::OsStrExt as _;
-
+        pub fn matches(
+            &self,
+            name: &OsStr,
+            mime_type: Option<&str>,
+            types: Option<&NameMimeTypes>,
+        ) -> bool {
             self.patterns
                 .iter()
-                .any(|pattern| glob_matches(pattern.as_bytes(), name.as_bytes()))
+                .any(|pattern| glob_matches(pattern, name))
                 || mime_type.is_some_and(|mime_type| {
-                    self.mime_types.iter().any(|wanted| {
-                        wanted.eq_ignore_ascii_case(mime_type)
-                            || wanted.strip_suffix("/*").is_some_and(|family| {
-                                mime_type
-                                    .split_once('/')
-                                    .is_some_and(|(kind, _)| kind.eq_ignore_ascii_case(family))
-                            })
+                    self.mime_types.iter().any(|wanted| match types {
+                        Some(types) => types.is_a(mime_type, wanted),
+                        None => NameMimeTypes::same_or_family(mime_type, wanted),
                     })
                 })
+        }
+
+        fn to_file_filter(&self) -> FileFilter {
+            let filter = self
+                .patterns
+                .iter()
+                .fold(FileFilter::new(&self.label), |filter, pattern| {
+                    filter.glob(pattern)
+                });
+            self.mime_types
+                .iter()
+                .fold(filter, |filter, mime_type| filter.mimetype(mime_type))
         }
     }
 
@@ -548,90 +666,29 @@ mod backend {
         }
     }
 
-    /// Whether `name` matches the shell pattern `pattern`: `*` matches any
-    /// run, `?` one byte, and `[...]` one byte of a set or range, `!` or `^`
-    /// first negating it.
-    fn glob_matches(pattern: &[u8], name: &[u8]) -> bool {
-        let (mut p, mut n) = (0, 0);
-        let mut backtrack: Option<(usize, usize)> = None;
-        while n < name.len() {
-            if p < pattern.len() {
-                match pattern[p] {
-                    b'*' => {
-                        backtrack = Some((p, n));
-                        p += 1;
-                        continue;
-                    }
-                    b'?' => {
-                        p += 1;
-                        n += 1;
-                        continue;
-                    }
-                    b'[' => {
-                        if let Some((matched, end)) = class_matches(&pattern[p..], name[n]) {
-                            if matched {
-                                p += end;
-                                n += 1;
-                                continue;
-                            }
-                        } else if name[n] == b'[' {
-                            p += 1;
-                            n += 1;
-                            continue;
-                        }
-                    }
-                    byte if byte == name[n] => {
-                        p += 1;
-                        n += 1;
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            match backtrack {
-                Some((star, taken)) => {
-                    p = star + 1;
-                    n = taken + 1;
-                    backtrack = Some((star, taken + 1));
-                }
-                None => return false,
-            }
-        }
-        pattern[p..].iter().all(|byte| *byte == b'*')
+    /// Whether `name` matches the shell pattern `pattern`, as wax reads it
+    /// (DEP-008). A pattern wax refuses matches nothing.
+    fn glob_matches(pattern: &str, name: &OsStr) -> bool {
+        use wax::Program as _;
+
+        wax::Glob::new(pattern).is_ok_and(|glob| glob.is_match(Path::new(name)))
     }
 
-    /// Whether `byte` is in the class at the start of `pattern`, and the
-    /// class's length; `None` when the class is not closed.
-    fn class_matches(pattern: &[u8], byte: u8) -> Option<(bool, usize)> {
-        let mut index = 1;
-        let negated = matches!(pattern.get(index), Some(b'!' | b'^'));
-        if negated {
-            index += 1;
-        }
-        let mut matched = false;
-        let mut first = true;
-        while let Some(&start) = pattern.get(index) {
-            if start == b']' && !first {
-                return Some((matched != negated, index + 1));
-            }
-            first = false;
-            if pattern.get(index + 1) == Some(&b'-')
-                && let Some(&end) = pattern.get(index + 2)
-                && end != b']'
-            {
-                matched |= (start..=end).contains(&byte);
-                index += 3;
-            } else {
-                matched |= start == byte;
-                index += 1;
-            }
-        }
-        None
+    /// The user's confirmed selection, with the filter and choice values
+    /// they left chosen.
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub struct ChooserSelection {
+        pub paths: Vec<PathBuf>,
+        /// The index of the chosen filter in the request's filters.
+        pub filter: Option<usize>,
+        /// Each choice's ID and chosen value.
+        pub choices: Vec<(Box<str>, Box<str>)>,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum BackendChooserDecision {
         Confirmed(Vec<PathBuf>),
+        Selected(ChooserSelection),
         Cancelled,
     }
 
@@ -646,6 +703,8 @@ mod backend {
     pub struct AshpdFileChooserBackend<U> {
         ui: Arc<U>,
         own_app_id: Box<str>,
+        /// Pending requests by their full handle: a token is unique only
+        /// for the app that chose it.
         cancellations: Mutex<HashMap<Box<str>, CancellationToken>>,
     }
 
@@ -658,12 +717,130 @@ mod backend {
                 cancellations: Mutex::new(HashMap::new()),
             }
         }
+
+        fn cancel(&self, key: &str) {
+            if let Ok(cancellations) = self.cancellations.lock()
+                && let Some(cancellation) = cancellations.get(key)
+            {
+                cancellation.cancel();
+            }
+        }
+    }
+
+    fn open_request(
+        title: &str,
+        app_id: Option<&MaybeAppID>,
+        options: &OpenFileOptions,
+    ) -> BackendChooserRequest {
+        let mut request = BackendChooserRequest::new(BackendChooserKind::Open, title, app_id)
+            .with_filters(options.filters(), options.current_filter())
+            .with_choices(options.choices(), options.accept_label());
+        request.multiple = options.multiple().unwrap_or(false);
+        request.directory = options.directory().unwrap_or(false);
+        request.current_folder = options
+            .current_folder()
+            .map(|folder| AsRef::<Path>::as_ref(folder).to_path_buf());
+        request
+    }
+
+    fn save_request(
+        title: &str,
+        app_id: Option<&MaybeAppID>,
+        options: &SaveFileOptions,
+    ) -> BackendChooserRequest {
+        let mut request = BackendChooserRequest::new(BackendChooserKind::Save, title, app_id)
+            .with_filters(options.filters(), options.current_filter())
+            .with_choices(options.choices(), options.accept_label());
+        // A current file names both the folder and the name.
+        let current_file = options
+            .current_file()
+            .map(|file| AsRef::<Path>::as_ref(file).to_path_buf());
+        request.current_folder = options
+            .current_folder()
+            .map(|folder| AsRef::<Path>::as_ref(folder).to_path_buf())
+            .or_else(|| {
+                current_file
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            });
+        request.current_name = options.current_name().map(OsString::from).or_else(|| {
+            current_file
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(OsStr::to_os_string)
+        });
+        request
+    }
+
+    fn save_many_request(
+        title: &str,
+        app_id: Option<&MaybeAppID>,
+        options: &SaveFilesOptions,
+    ) -> ashpd::backend::Result<BackendChooserRequest> {
+        let mut request = BackendChooserRequest::new(BackendChooserKind::SaveMany, title, app_id)
+            .with_choices(options.choices(), options.accept_label());
+        request.current_folder = options
+            .current_folder()
+            .map(|folder| AsRef::<Path>::as_ref(folder).to_path_buf());
+        // Only plain names: a name with a folder in it could leave the
+        // chosen folder.
+        request.files = options
+            .files()
+            .iter()
+            .map(|file| AsRef::<Path>::as_ref(file).to_path_buf())
+            .filter(|file| {
+                let mut components = file.components();
+                matches!(
+                    (components.next(), components.next()),
+                    (Some(std::path::Component::Normal(_)), None)
+                )
+            })
+            .collect();
+        if request.files.len() != options.files().len() || request.files.is_empty() {
+            return Err(ashpd::PortalError::InvalidArgument(
+                "Save Many needs plain file names".into(),
+            ));
+        }
+        Ok(request)
+    }
+
+    /// Whether `paths` is what a request of `kind` asked for: one file for
+    /// Open unless `multiple`, one path for Save, and one path per name for
+    /// Save Many.
+    fn counts_fit(
+        kind: BackendChooserKind,
+        multiple: bool,
+        names: usize,
+        paths: &[PathBuf],
+    ) -> bool {
+        !paths.is_empty()
+            && match kind {
+                BackendChooserKind::Open => multiple || paths.len() == 1,
+                BackendChooserKind::Save => paths.len() == 1,
+                BackendChooserKind::SaveMany => paths.len() == names,
+            }
+    }
+
+    /// Whether each path is the kind of item the request asked for: a
+    /// folder for a folder request; a file, not a folder, to open; and, to
+    /// save, a path that is not a folder, in a folder that exists.
+    fn kinds_fit(kind: BackendChooserKind, directory: bool, paths: &[PathBuf]) -> bool {
+        let is_folder = |path: &Path| std::fs::metadata(path).is_ok_and(|item| item.is_dir());
+        paths.iter().all(|path| match kind {
+            BackendChooserKind::Open if directory => is_folder(path),
+            BackendChooserKind::Open => std::fs::metadata(path).is_ok_and(|item| !item.is_dir()),
+            BackendChooserKind::Save | BackendChooserKind::SaveMany => {
+                path.parent().is_some_and(is_folder) && !is_folder(path)
+            }
+        })
     }
 
     impl<U: BackendChooserUi> AshpdFileChooserBackend<U> {
+        /// Answers `request`, known by `key`, the full request handle.
         async fn handle(
             &self,
-            token: HandleToken,
+            key: Box<str>,
             request: BackendChooserRequest,
         ) -> ashpd::backend::Result<SelectedFiles> {
             if request.app_id() == Some(self.own_app_id.as_ref()) {
@@ -671,13 +848,25 @@ mod backend {
                     "Musheen cannot route its portal client into its own backend".into(),
                 ));
             }
-            let key = token.to_string().into_boxed_str();
             let cancellation = CancellationToken::new();
-            self.cancellations
-                .lock()
-                .map_err(|_| ashpd::PortalError::Failed("request state is unavailable".into()))?
-                .insert(key.clone(), cancellation.clone());
-            let (kind, multiple, names) = (request.kind, request.multiple, request.files.len());
+            {
+                let mut cancellations = self.cancellations.lock().map_err(|_| {
+                    ashpd::PortalError::Failed("request state is unavailable".into())
+                })?;
+                if cancellations.contains_key(&key) {
+                    return Err(ashpd::PortalError::InvalidArgument(
+                        "the request handle is already in use".into(),
+                    ));
+                }
+                cancellations.insert(key.clone(), cancellation.clone());
+            }
+            let (kind, multiple, directory, names) = (
+                request.kind,
+                request.multiple,
+                request.directory,
+                request.files.len(),
+            );
+            let filters = request.filters.clone();
             let decision = self.ui.choose(request, cancellation.clone()).await;
             self.cancellations
                 .lock()
@@ -688,49 +877,55 @@ mod backend {
                     "the user cancelled the chooser".into(),
                 ));
             }
+            let selection = match decision {
+                Ok(BackendChooserDecision::Confirmed(paths)) => ChooserSelection {
+                    paths,
+                    ..ChooserSelection::default()
+                },
+                Ok(BackendChooserDecision::Selected(selection)) => selection,
+                Ok(BackendChooserDecision::Cancelled) | Err(PortalError::Cancelled) => {
+                    return Err(ashpd::PortalError::Cancelled(
+                        "the user cancelled the chooser".into(),
+                    ));
+                }
+                Err(error) => return Err(ashpd::PortalError::Failed(error.to_string())),
+            };
             // The chooser returns what the request asked for; anything else
             // is refused rather than passed on.
-            let fits = |paths: &[PathBuf]| match kind {
-                BackendChooserKind::Open => multiple || paths.len() == 1,
-                BackendChooserKind::Save => paths.len() == 1,
-                BackendChooserKind::SaveMany => paths.len() == names,
-            };
-            match decision {
-                Ok(BackendChooserDecision::Confirmed(paths))
-                    if !paths.is_empty() && fits(&paths) =>
-                {
-                    let mut selected = SelectedFiles::default();
-                    for path in paths {
-                        let uri = path_to_uri(&path).map_err(|error| {
-                            ashpd::PortalError::InvalidArgument(error.to_string())
-                        })?;
-                        selected = selected.uri(ashpd::Uri::parse(&uri).map_err(|error| {
-                            ashpd::PortalError::InvalidArgument(error.to_string())
-                        })?);
-                    }
-                    Ok(selected)
-                }
-                Ok(BackendChooserDecision::Confirmed(_)) => {
-                    Err(ashpd::PortalError::InvalidArgument(
-                        "the selection does not fit the request".into(),
-                    ))
-                }
-                Ok(BackendChooserDecision::Cancelled) | Err(PortalError::Cancelled) => Err(
-                    ashpd::PortalError::Cancelled("the user cancelled the chooser".into()),
-                ),
-                Err(error) => Err(ashpd::PortalError::Failed(error.to_string())),
+            if !counts_fit(kind, multiple, names, &selection.paths)
+                || !kinds_fit(kind, directory, &selection.paths)
+            {
+                return Err(ashpd::PortalError::InvalidArgument(
+                    "the selection does not fit the request".into(),
+                ));
             }
+            let mut selected = SelectedFiles::default();
+            for path in &selection.paths {
+                let uri = path_to_uri(path)
+                    .map_err(|error| ashpd::PortalError::InvalidArgument(error.to_string()))?;
+                selected = selected.uri(
+                    ashpd::Uri::parse(&uri)
+                        .map_err(|error| ashpd::PortalError::InvalidArgument(error.to_string()))?,
+                );
+            }
+            // A file the user opens through Musheen may be saved back.
+            if kind == BackendChooserKind::Open && !directory {
+                selected = selected.writable(true);
+            }
+            if let Some(filter) = selection.filter.and_then(|index| filters.get(index)) {
+                selected = selected.current_filter(filter.to_file_filter());
+            }
+            for (id, value) in &selection.choices {
+                selected = selected.choice(id, value);
+            }
+            Ok(selected)
         }
     }
 
     #[ashpd::async_trait::async_trait]
     impl<U: BackendChooserUi> RequestImpl for AshpdFileChooserBackend<U> {
         async fn close(&self, token: HandleToken) {
-            if let Ok(cancellations) = self.cancellations.lock()
-                && let Some(cancellation) = cancellations.get(token.to_string().as_str())
-            {
-                cancellation.cancel();
-            }
+            self.cancel(&token.to_string());
         }
     }
 
@@ -744,15 +939,8 @@ mod backend {
             title: &str,
             options: OpenFileOptions,
         ) -> ashpd::backend::Result<SelectedFiles> {
-            let mut request =
-                BackendChooserRequest::new(BackendChooserKind::Open, title, app_id.as_ref())
-                    .with_filters(options.filters(), options.current_filter());
-            request.multiple = options.multiple().unwrap_or(false);
-            request.directory = options.directory().unwrap_or(false);
-            request.current_folder = options
-                .current_folder()
-                .map(|folder| AsRef::<std::path::Path>::as_ref(folder).to_path_buf());
-            self.handle(token, request).await
+            let request = open_request(title, app_id.as_ref(), &options);
+            self.handle(token.to_string().into(), request).await
         }
 
         async fn save_file(
@@ -763,29 +951,8 @@ mod backend {
             title: &str,
             options: SaveFileOptions,
         ) -> ashpd::backend::Result<SelectedFiles> {
-            let mut request =
-                BackendChooserRequest::new(BackendChooserKind::Save, title, app_id.as_ref())
-                    .with_filters(options.filters(), options.current_filter());
-            // A current file names both the folder and the name.
-            let current_file = options
-                .current_file()
-                .map(|file| AsRef::<std::path::Path>::as_ref(file).to_path_buf());
-            request.current_folder = options
-                .current_folder()
-                .map(|folder| AsRef::<std::path::Path>::as_ref(folder).to_path_buf())
-                .or_else(|| {
-                    current_file
-                        .as_deref()
-                        .and_then(std::path::Path::parent)
-                        .map(std::path::Path::to_path_buf)
-                });
-            request.current_name = options.current_name().map(Into::into).or_else(|| {
-                current_file
-                    .as_deref()
-                    .and_then(std::path::Path::file_name)
-                    .map(|name| name.to_string_lossy().into())
-            });
-            self.handle(token, request).await
+            let request = save_request(title, app_id.as_ref(), &options);
+            self.handle(token.to_string().into(), request).await
         }
 
         async fn save_files(
@@ -796,31 +963,8 @@ mod backend {
             title: &str,
             options: SaveFilesOptions,
         ) -> ashpd::backend::Result<SelectedFiles> {
-            let mut request =
-                BackendChooserRequest::new(BackendChooserKind::SaveMany, title, app_id.as_ref());
-            request.current_folder = options
-                .current_folder()
-                .map(|folder| AsRef::<std::path::Path>::as_ref(folder).to_path_buf());
-            // Only plain names: a name with a folder in it could leave the
-            // chosen folder.
-            request.files = options
-                .files()
-                .iter()
-                .map(|file| AsRef::<std::path::Path>::as_ref(file).to_path_buf())
-                .filter(|file| {
-                    let mut components = file.components();
-                    matches!(
-                        (components.next(), components.next()),
-                        (Some(std::path::Component::Normal(_)), None)
-                    )
-                })
-                .collect();
-            if request.files.len() != options.files().len() || request.files.is_empty() {
-                return Err(ashpd::PortalError::InvalidArgument(
-                    "Save Many needs plain file names".into(),
-                ));
-            }
-            self.handle(token, request).await
+            let request = save_many_request(title, app_id.as_ref(), &options)?;
+            self.handle(token.to_string().into(), request).await
         }
     }
 
@@ -830,7 +974,7 @@ mod backend {
 
     struct FileChooserBackendRequest<U> {
         backend: Arc<AshpdFileChooserBackend<U>>,
-        token: HandleToken,
+        key: Box<str>,
     }
 
     /// Refuses a call from anyone but the portal service: the connection
@@ -866,8 +1010,40 @@ mod backend {
             #[zbus(connection)] connection: &zbus::Connection,
         ) -> ashpd::backend::Result<()> {
             require_portal_service(connection, &header).await?;
-            self.backend.close(self.token.clone()).await;
+            self.backend.cancel(&self.key);
             Ok(())
+        }
+    }
+
+    impl<U: BackendChooserUi> FileChooserBackendInterface<U> {
+        /// Serves one request: exports its Request object at `handle` for
+        /// Close, answers it, and removes the object again.
+        async fn serve(
+            &self,
+            handle: zbus::zvariant::OwnedObjectPath,
+            request: ashpd::backend::Result<BackendChooserRequest>,
+            server: &zbus::ObjectServer,
+        ) -> ashpd::backend::Result<ashpd::desktop::Response<SelectedFiles>> {
+            let request = request?;
+            let key: Box<str> = handle.as_str().into();
+            server
+                .at(
+                    handle.clone(),
+                    FileChooserBackendRequest {
+                        backend: Arc::clone(&self.backend),
+                        key: key.clone(),
+                    },
+                )
+                .await?;
+            let result = self.backend.handle(key, request).await;
+            server
+                .remove::<FileChooserBackendRequest<U>, _>(&handle)
+                .await?;
+            match result {
+                Ok(selected) => Ok(ashpd::desktop::Response::ok(selected)),
+                Err(ashpd::PortalError::Cancelled(_)) => Ok(ashpd::desktop::Response::cancelled()),
+                Err(error) => Err(error),
+            }
         }
     }
 
@@ -886,7 +1062,7 @@ mod backend {
             &self,
             handle: zbus::zvariant::OwnedObjectPath,
             app_id: ashpd::zvariant::Optional<MaybeAppID>,
-            window_identifier: ashpd::zvariant::Optional<WindowIdentifierType>,
+            _window_identifier: ashpd::zvariant::Optional<WindowIdentifierType>,
             title: String,
             options: OpenFileOptions,
             #[zbus(object_server)] server: &zbus::ObjectServer,
@@ -894,35 +1070,9 @@ mod backend {
             #[zbus(connection)] connection: &zbus::Connection,
         ) -> ashpd::backend::Result<ashpd::desktop::Response<SelectedFiles>> {
             require_portal_service(connection, &header).await?;
-            let token = HandleToken::try_from(&handle)
-                .map_err(|error| ashpd::PortalError::InvalidArgument(error.to_string()))?;
-            server
-                .at(
-                    handle.clone(),
-                    FileChooserBackendRequest {
-                        backend: Arc::clone(&self.backend),
-                        token: token.clone(),
-                    },
-                )
-                .await?;
-            let result = self
-                .backend
-                .open_file(
-                    token,
-                    app_id.into(),
-                    window_identifier.into(),
-                    &title,
-                    options,
-                )
-                .await;
-            server
-                .remove::<FileChooserBackendRequest<U>, _>(&handle)
-                .await?;
-            match result {
-                Ok(selected) => Ok(ashpd::desktop::Response::ok(selected)),
-                Err(ashpd::PortalError::Cancelled(_)) => Ok(ashpd::desktop::Response::cancelled()),
-                Err(error) => Err(error),
-            }
+            let app_id: Option<MaybeAppID> = app_id.into();
+            let request = open_request(&title, app_id.as_ref(), &options);
+            self.serve(handle, Ok(request), server).await
         }
 
         // The D-Bus signature fixes five arguments; zbus passes the object
@@ -933,7 +1083,7 @@ mod backend {
             &self,
             handle: zbus::zvariant::OwnedObjectPath,
             app_id: ashpd::zvariant::Optional<MaybeAppID>,
-            window_identifier: ashpd::zvariant::Optional<WindowIdentifierType>,
+            _window_identifier: ashpd::zvariant::Optional<WindowIdentifierType>,
             title: String,
             options: SaveFileOptions,
             #[zbus(object_server)] server: &zbus::ObjectServer,
@@ -941,35 +1091,9 @@ mod backend {
             #[zbus(connection)] connection: &zbus::Connection,
         ) -> ashpd::backend::Result<ashpd::desktop::Response<SelectedFiles>> {
             require_portal_service(connection, &header).await?;
-            let token = HandleToken::try_from(&handle)
-                .map_err(|error| ashpd::PortalError::InvalidArgument(error.to_string()))?;
-            server
-                .at(
-                    handle.clone(),
-                    FileChooserBackendRequest {
-                        backend: Arc::clone(&self.backend),
-                        token: token.clone(),
-                    },
-                )
-                .await?;
-            let result = self
-                .backend
-                .save_file(
-                    token,
-                    app_id.into(),
-                    window_identifier.into(),
-                    &title,
-                    options,
-                )
-                .await;
-            server
-                .remove::<FileChooserBackendRequest<U>, _>(&handle)
-                .await?;
-            match result {
-                Ok(selected) => Ok(ashpd::desktop::Response::ok(selected)),
-                Err(ashpd::PortalError::Cancelled(_)) => Ok(ashpd::desktop::Response::cancelled()),
-                Err(error) => Err(error),
-            }
+            let app_id: Option<MaybeAppID> = app_id.into();
+            let request = save_request(&title, app_id.as_ref(), &options);
+            self.serve(handle, Ok(request), server).await
         }
 
         // The D-Bus signature fixes five arguments; zbus passes the object
@@ -980,7 +1104,7 @@ mod backend {
             &self,
             handle: zbus::zvariant::OwnedObjectPath,
             app_id: ashpd::zvariant::Optional<MaybeAppID>,
-            window_identifier: ashpd::zvariant::Optional<WindowIdentifierType>,
+            _window_identifier: ashpd::zvariant::Optional<WindowIdentifierType>,
             title: String,
             options: SaveFilesOptions,
             #[zbus(object_server)] server: &zbus::ObjectServer,
@@ -988,35 +1112,9 @@ mod backend {
             #[zbus(connection)] connection: &zbus::Connection,
         ) -> ashpd::backend::Result<ashpd::desktop::Response<SelectedFiles>> {
             require_portal_service(connection, &header).await?;
-            let token = HandleToken::try_from(&handle)
-                .map_err(|error| ashpd::PortalError::InvalidArgument(error.to_string()))?;
-            server
-                .at(
-                    handle.clone(),
-                    FileChooserBackendRequest {
-                        backend: Arc::clone(&self.backend),
-                        token: token.clone(),
-                    },
-                )
-                .await?;
-            let result = self
-                .backend
-                .save_files(
-                    token,
-                    app_id.into(),
-                    window_identifier.into(),
-                    &title,
-                    options,
-                )
-                .await;
-            server
-                .remove::<FileChooserBackendRequest<U>, _>(&handle)
-                .await?;
-            match result {
-                Ok(selected) => Ok(ashpd::desktop::Response::ok(selected)),
-                Err(ashpd::PortalError::Cancelled(_)) => Ok(ashpd::desktop::Response::cancelled()),
-                Err(error) => Err(error),
-            }
+            let app_id: Option<MaybeAppID> = app_id.into();
+            let request = save_many_request(&title, app_id.as_ref(), &options);
+            self.serve(handle, request, server).await
         }
     }
 

@@ -2605,10 +2605,18 @@ pub fn portal_backend_enabled(settings: &musheen_desktop::SettingsDocument) -> b
     settings.value("integrations.portal").as_deref() == Some("musheen")
 }
 
+/// Marks a start for the portal alone.
+#[cfg(feature = "portal-backend")]
+struct PortalOnly;
+
+#[cfg(feature = "portal-backend")]
+impl Global for PortalOnly {}
+
 /// Runs Musheen for xdg-desktop-portal, as its D-Bus activation file starts
 /// it (SYS-027). With the Integrations setting on, it serves the
 /// FileChooser backend, opens only chooser windows, and keeps running when
-/// they close, as other portal backends do. With the setting off, or
+/// they close, as other portal backends do; it reads the setting again for
+/// each request and ends once the setting is off. With the setting off, or
 /// without the backend built, it returns at once without a window.
 pub fn run_portal_backend() {
     let settings = musheen_desktop::SettingsStore::for_current_user()
@@ -2627,6 +2635,7 @@ pub fn run_portal_backend() {
         .run(move |cx| {
             gpui_kit::init(cx);
             cx.set_quit_mode(gpui_kit::QuitMode::Explicit);
+            cx.set_global(PortalOnly);
             install_native_theme(cx);
             if std::env::var_os("MUSHEEN_THEME_PREVIEW").is_none() {
                 crate::settings::apply_appearance(&settings, cx);
@@ -2663,6 +2672,8 @@ fn install_desktop_portals(settings: &musheen_desktop::SettingsDocument, cx: &mu
 struct PortalChooserEnvelope {
     request: musheen_desktop::BackendChooserRequest,
     response: async_channel::Sender<musheen_desktop::BackendChooserDecision>,
+    /// Fires when the portal closes the request.
+    cancellation: CancellationToken,
 }
 
 #[cfg(feature = "portal-backend")]
@@ -2684,7 +2695,11 @@ impl musheen_desktop::BackendChooserUi for GpuiPortalChooser {
         Box::pin(async move {
             let (response, decision) = async_channel::bounded(1);
             requests
-                .try_send(PortalChooserEnvelope { request, response })
+                .try_send(PortalChooserEnvelope {
+                    request,
+                    response,
+                    cancellation: cancellation.clone(),
+                })
                 .map_err(|error| {
                     musheen_desktop::PortalError::Unavailable(error.to_string().into())
                 })?;
@@ -2720,6 +2735,7 @@ impl musheen_desktop::BackendChooserUi for GpuiPortalChooser {
 /// chooser window of its own (SYS-027).
 #[cfg(feature = "portal-backend")]
 fn portal_chooser_ui(cx: &mut App) -> GpuiPortalChooser {
+    crate::dialogs::bind_portal_chooser_keys(cx);
     let (requests, receiver) = async_channel::bounded(16);
     cx.spawn(async move |cx| {
         while let Ok(envelope) = receiver.recv().await {
@@ -2785,7 +2801,88 @@ fn install_portal_backend(alone: bool, cx: &mut App) {
 
 #[cfg(feature = "portal-backend")]
 fn route_portal_chooser(envelope: PortalChooserEnvelope, cx: &mut App) {
-    crate::dialogs::open_portal_chooser(envelope.request, envelope.response, cx);
+    if !cx.has_global::<PortalOnly>() {
+        crate::dialogs::open_portal_chooser(
+            envelope.request,
+            envelope.response,
+            envelope.cancellation,
+            cx,
+        );
+        return;
+    }
+    // Started for the portal alone, Musheen reads the setting again for
+    // each request, off the UI thread, and ends once it is off.
+    let settings = cx.background_spawn(async {
+        musheen_desktop::SettingsStore::for_current_user()
+            .load()
+            .is_ok_and(|settings| portal_backend_enabled(&settings))
+    });
+    cx.spawn(async move |cx| {
+        let enabled = settings.await;
+        cx.update(|cx| {
+            if enabled {
+                crate::dialogs::open_portal_chooser(
+                    envelope.request,
+                    envelope.response,
+                    envelope.cancellation,
+                    cx,
+                );
+            } else {
+                let _ = envelope
+                    .response
+                    .try_send(musheen_desktop::BackendChooserDecision::Cancelled);
+                eprintln!("Musheen's portal backend is off in its Integrations settings");
+                cx.quit();
+            }
+        });
+    })
+    .detach();
+}
+
+/// Asks the user for one file. With Musheen's portal backend on, Musheen's
+/// own chooser asks in-process: through the desktop portal the request would
+/// come back into Musheen's backend (SYS-027).
+fn prompt_for_one_file(
+    prompt: String,
+    start: Option<PathBuf>,
+    cx: &mut App,
+) -> futures_lite::future::Boxed<Result<Option<Vec<PathBuf>>, &'static str>> {
+    #[cfg(feature = "portal-backend")]
+    if cx
+        .try_global::<crate::settings::RuntimeSettings>()
+        .is_some_and(|settings| portal_backend_enabled(&settings.0))
+    {
+        let (response, decision) = async_channel::bounded(1);
+        let request = musheen_desktop::BackendChooserRequest::open(&prompt);
+        let request = match start {
+            Some(start) => request.with_current_folder(start),
+            None => request,
+        };
+        crate::dialogs::open_portal_chooser(request, response, CancellationToken::new(), cx);
+        return Box::pin(async move {
+            Ok(match decision.recv().await {
+                Ok(musheen_desktop::BackendChooserDecision::Selected(selection)) => {
+                    Some(selection.paths)
+                }
+                Ok(musheen_desktop::BackendChooserDecision::Confirmed(paths)) => Some(paths),
+                Ok(musheen_desktop::BackendChooserDecision::Cancelled) | Err(_) => None,
+            })
+        });
+    }
+    #[cfg(not(feature = "portal-backend"))]
+    let _ = start;
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some(prompt.into()),
+    });
+    Box::pin(async move {
+        receiver
+            .await
+            .map_err(|_| "template-picker-failed")?
+            .map_err(|_| "template-picker-failed")
+    })
 }
 
 fn install_file_manager1(cx: &mut App) {
@@ -12093,23 +12190,15 @@ impl MusheenApp {
             return;
         }
         let tab_id = origin_tab.expect("the origin was checked above");
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(
-                self.catalog
-                    .message("command.new-from-template")
-                    .expect("the template command is localized")
-                    .into(),
-            ),
-        });
+        let prompt = self
+            .catalog
+            .message("command.new-from-template")
+            .expect("the template command is localized")
+            .to_owned();
+        let start = destination.as_unix_path().map(Path::to_path_buf);
+        let chosen = prompt_for_one_file(prompt, start, cx);
         let work = cx.background_spawn(async move {
-            let paths = receiver
-                .await
-                .map_err(|_| "template-picker-failed")?
-                .map_err(|_| "template-picker-failed")?;
-            let Some(paths) = paths else {
+            let Some(paths) = chosen.await? else {
                 return Ok(None);
             };
             let [source] = paths.try_into().map_err(|_| "template-source-invalid")?;
@@ -35739,5 +35828,248 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert!(matches!(task.await, Err(ashpd::PortalError::Cancelled(_))));
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_folder_request_cannot_return_a_path_it_could_not_read(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(&fixture.path().join("notes.txt")))
+            .set_directory(true);
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find("portal-chooser-unreadable").visible());
+        })
+        .unwrap();
+        portal_click(
+            window,
+            &["portal-chooser-accept", "portal-chooser-cancel"],
+            cx,
+        );
+        assert!(
+            matches!(task.await, Err(ashpd::PortalError::Cancelled(_))),
+            "Accept did nothing in a folder that could not be read"
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_portal_close_closes_the_chooser(cx: &mut TestAppContext) {
+        use ashpd::backend::request::RequestImpl as _;
+
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()));
+        let task = portal_open(&backend, options, cx);
+        portal_chooser_window(cx);
+        let closing = Arc::clone(&backend);
+        cx.background_spawn(async move { closing.close("open".parse().unwrap()).await })
+            .await;
+        cx.run_until_parked();
+        assert!(matches!(task.await, Err(ashpd::PortalError::Cancelled(_))));
+        let open = cx.update(|cx| {
+            cx.windows().into_iter().any(|handle| {
+                handle
+                    .update(cx, |_, window, _| {
+                        window.try_find("portal-chooser").is_some()
+                    })
+                    .unwrap_or(false)
+            })
+        });
+        assert!(!open, "the chooser closes with the request");
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_escape_cancels_and_choices_come_back(cx: &mut TestAppContext) {
+        use ashpd::desktop::file_chooser::Choice;
+
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()));
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(matches!(task.await, Err(ashpd::PortalError::Cancelled(_))));
+
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_choices([Choice::new("encoding", "Encoding", "utf8")
+                .insert("utf8", "UTF-8")
+                .insert("latin1", "Latin-1")]);
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        portal_click(
+            window,
+            &[
+                "portal-chooser-choice-encoding-latin1",
+                "portal-chooser-entry-notes.txt",
+                "portal-chooser-accept",
+            ],
+            cx,
+        );
+        let selected = task.await.expect("the request returns a selection");
+        assert_eq!(
+            selected.choices(),
+            [("encoding".to_owned(), "latin1".to_owned())]
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_lists_only_what_it_can_return(cx: &mut TestAppContext) {
+        let fixture = portal_fixture();
+        std::fs::create_dir(fixture.path().join(".hidden")).unwrap();
+        std::os::unix::fs::symlink("missing", fixture.path().join("broken")).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(fixture.path().join("socket")).unwrap();
+        std::os::unix::fs::symlink("socket", fixture.path().join("socket-link")).unwrap();
+        std::os::unix::fs::symlink("sub", fixture.path().join("sub-link")).unwrap();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()));
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        cx.update_window(window, |_, window, _| {
+            for gone in ["broken", "socket", "socket-link", ".hidden"] {
+                assert!(
+                    window
+                        .try_find(SharedString::from(format!("portal-chooser-entry-{gone}")))
+                        .is_none(),
+                    "{gone} is not offered"
+                );
+            }
+            assert!(window.find("portal-chooser-entry-sub-link").visible());
+        })
+        .unwrap();
+        portal_click(window, &["portal-chooser-cancel"], cx);
+        let _ = task.await;
+
+        // A hidden folder chosen and then hidden again is not returned.
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_directory(true);
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        portal_click(
+            window,
+            &[
+                "portal-chooser-hidden",
+                "portal-chooser-entry-.hidden",
+                "portal-chooser-hidden",
+                "portal-chooser-accept",
+            ],
+            cx,
+        );
+        assert_eq!(portal_uris(task).await, [file_uri(fixture.path())]);
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_save_question_names_the_file_and_follows_the_name(
+        cx: &mut TestAppContext,
+    ) {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let fixture = portal_fixture();
+        let raw = std::ffi::OsString::from_vec(b"caf\xe9.txt".to_vec());
+        std::fs::write(fixture.path().join(&raw), b"raw").unwrap();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::SaveFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_current_name("notes.txt");
+        let task = portal_save(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        portal_click(window, &["portal-chooser-accept"], cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window
+                    .find("portal-chooser-replace-question")
+                    .label()
+                    .is_some_and(|label| label.contains("notes.txt")),
+                "the question names the file"
+            );
+        })
+        .unwrap();
+        // Clicking another file takes its exact name and drops the question.
+        let entry = cx
+            .update_window(window, |_, window, _| {
+                (0..8)
+                    .map(|index| format!("portal-chooser-entry-caf\u{FFFD}.txt-{index}"))
+                    .find(|id| window.try_find(SharedString::from(id.clone())).is_some())
+            })
+            .unwrap()
+            .expect("the name that is not UTF-8 is listed");
+        portal_click(window, &[entry.as_str()], cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.try_find("portal-chooser-replace-question").is_none());
+        })
+        .unwrap();
+        portal_click(
+            window,
+            &["portal-chooser-accept", "portal-chooser-replace"],
+            cx,
+        );
+        assert_eq!(
+            portal_uris(task).await,
+            [format!("file://{}/caf%E9.txt", fixture.path().display())]
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_musheen_prompts_use_its_own_chooser(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("destination");
+        let templates = destination.join("Templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("Letter.txt"), b"Dear recipient,\n").unwrap();
+        let (app, browser) = open_selected_directory(&destination, Layout::List, cx).await;
+        cx.update(|cx| {
+            let mut settings = musheen_desktop::SettingsDocument::default();
+            settings
+                .set_value("integrations.portal", "musheen")
+                .expect("the setting accepts musheen");
+            cx.set_global(crate::settings::RuntimeSettings(settings));
+        });
+        app.update(cx, |state, cx| {
+            state.dispatch_typed_context_command(
+                CommandAction::NewFromTemplate,
+                CommandParameters::Location(StorePath::from_unix_path(destination.as_os_str())),
+                Some(state.navigation.focused_tab().id()),
+                None,
+                false,
+                cx,
+            );
+        });
+        assert!(
+            !cx.did_prompt_for_paths(),
+            "Musheen does not ask the desktop portal, which would route to itself"
+        );
+        let window = portal_chooser_window(cx);
+        portal_click(
+            window,
+            &[
+                "portal-chooser-entry-Templates",
+                "portal-chooser-entry-Letter.txt",
+                "portal-chooser-accept",
+            ],
+            cx,
+        );
+        let copied = destination.join("Letter.txt");
+        cx.wait_for(browser, Duration::from_secs(4), move |_, _| copied.exists())
+            .await;
     }
 }

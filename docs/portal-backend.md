@@ -42,8 +42,13 @@ line, or set the setting back to **System**.
 The package installs `musheen.portal` and a D-Bus activation file. When an
 app asks for a file and Musheen is not running, the portal starts
 `musheen --portal-backend`, which opens only the chooser and keeps running for
-later requests. When Musheen is already running with the setting on, it
+later requests. It reads the setting again for each request, and ends once
+the setting is off. When Musheen is already running with the setting on, it
 serves the requests itself.
+
+With the backend on, Musheen's own file prompts, such as New from Template,
+use its chooser directly, so they never go through the portal back to
+Musheen.
 
 Only the portal service may call the backend. Musheen refuses calls from any
 other program on the session bus.

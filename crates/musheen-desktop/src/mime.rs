@@ -183,6 +183,34 @@ impl NameMimeTypes {
     }
 }
 
+impl NameMimeTypes {
+    /// Whether `mime_type` is `wanted`, an alias of it or a subclass of it
+    /// (`text/x-csrc` is a `text/plain`); `wanted` may name a family, such
+    /// as `image/*`.
+    #[must_use]
+    pub fn is_a(&self, mime_type: &str, wanted: &str) -> bool {
+        match (
+            mime_type.parse::<mime::Mime>(),
+            wanted.parse::<mime::Mime>(),
+        ) {
+            (Ok(mime_type), Ok(wanted)) => self.database.mime_type_subclass(&mime_type, &wanted),
+            _ => Self::same_or_family(mime_type, wanted),
+        }
+    }
+
+    /// Whether `mime_type` is `wanted`, or in its family (`image/*`),
+    /// without the database's aliases and subclasses.
+    #[must_use]
+    pub fn same_or_family(mime_type: &str, wanted: &str) -> bool {
+        wanted.eq_ignore_ascii_case(mime_type)
+            || wanted.strip_suffix("/*").is_some_and(|family| {
+                mime_type
+                    .split_once('/')
+                    .is_some_and(|(kind, _)| kind.eq_ignore_ascii_case(family))
+            })
+    }
+}
+
 impl Default for NameMimeTypes {
     fn default() -> Self {
         Self::new()

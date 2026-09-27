@@ -63,6 +63,7 @@ tokio.workspace = true
 tree_magic_mini.workspace = true
 ureq.workspace = true
 walkdir.workspace = true
+mime.workspace = true
 wax.workspace = true
 xattr.workspace = true
 xdg-mime.workspace = true
