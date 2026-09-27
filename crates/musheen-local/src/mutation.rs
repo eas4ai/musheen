@@ -1719,9 +1719,11 @@ impl MetadataProvider for LocalStore {
         let root_filesystem = LinkProvider::filesystem_id(self, root)?;
         let mut entries = Vec::new();
 
+        // Sockets, pipes and devices are left as they are (SEARCH-019): the
+        // Permissions page offers choices only for files, folders and links.
         match scope {
             MetadataScope::Single => {
-                entries.push(metadata_entry(self, root_path)?);
+                entries.extend(metadata_entry(self, root_path)?);
             }
             MetadataScope::Recursive { .. } => {
                 let mut traversal = WalkDir::new(root_path).follow_links(false).into_iter();
@@ -1736,8 +1738,12 @@ impl MetadataProvider for LocalStore {
                         traversal.skip_current_dir();
                         continue;
                     }
-                    entries.push(metadata_entry(self, entry.path())?);
+                    entries.extend(metadata_entry(self, entry.path())?);
                 }
+                // Each folder comes after what it contains: a change that
+                // takes the owner's read or search from a folder must not stop
+                // its contents from being changed.
+                entries.reverse();
             }
         }
         Ok(entries)
@@ -1762,8 +1768,14 @@ impl MetadataProvider for LocalStore {
         // The target may be open only as a path (O_PATH), as a file whose
         // mode denies the owner everything is (SEARCH-019): ownership then
         // changes through the empty-path form, and the mode through the
-        // open file's /proc entry.
-        if change.owner().is_some() || change.group().is_some() {
+        // open file's /proc entry. Owner, group and mode are decided from
+        // the opened file, so a change made since the preview is kept and an
+        // entry that already matches is left as it is.
+        let found = rustix::fs::fstat(&target).map_err(map_errno)?;
+        let owner = change.owner_for(found.st_uid);
+        let group = change.group_for(found.st_gid);
+        let mut current = found.st_mode;
+        if owner.is_some() || group.is_some() {
             let flags = if entry.kind() == MetadataEntryKind::SymbolicLink {
                 AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW
             } else {
@@ -1772,13 +1784,15 @@ impl MetadataProvider for LocalStore {
             chownat(
                 &target,
                 "",
-                change.owner().map(Uid::from_raw),
-                change.group().map(Gid::from_raw),
+                owner.map(Uid::from_raw),
+                group.map(Gid::from_raw),
                 flags,
             )
             .map_err(map_errno)?;
+            // The kernel may have cleared set-user-ID or set-group-ID.
+            current = rustix::fs::fstat(&target).map_err(map_errno)?.st_mode;
         }
-        if let Some(mode) = change.mode() {
+        if let Some(mode) = change.mode_for(current & 0o7777) {
             rustix::fs::chmod(&proc_path, Mode::from_raw_mode(mode)).map_err(map_errno)?;
         }
         if let Some(acl) = change.access_acl() {
@@ -2132,7 +2146,12 @@ fn supported_capability(
         .map_err(|error| MutationError::Provider(error.to_string().into()))
 }
 
-fn metadata_entry(store: &mut LocalStore, path: &Path) -> Result<MetadataEntry, MutationError> {
+/// The metadata entry for `path`, or `None` for a socket, pipe or device,
+/// which a metadata change leaves as it is.
+fn metadata_entry(
+    store: &mut LocalStore,
+    path: &Path,
+) -> Result<Option<MetadataEntry>, MutationError> {
     let metadata = fs::symlink_metadata(path).map_err(map_io_error)?;
     let kind = if metadata.file_type().is_symlink() {
         MetadataEntryKind::SymbolicLink
@@ -2141,15 +2160,16 @@ fn metadata_entry(store: &mut LocalStore, path: &Path) -> Result<MetadataEntry, 
     } else if metadata.is_file() {
         MetadataEntryKind::File
     } else {
-        return Err(MutationError::Unsupported);
+        return Ok(None);
     };
     let path = StorePath::from_unix_path(path.as_os_str());
     let identity = MutationProvider::identity(store, &path)?.ok_or(MutationError::Missing)?;
     let requires_privilege = metadata.uid() != rustix::process::geteuid().as_raw();
-    Ok(
+    Ok(Some(
         MetadataEntry::new(path, identity.to_vec(), kind, requires_privilege)
-            .with_current_mode(metadata.mode() & 0o7777),
-    )
+            .with_current_mode(metadata.mode() & 0o7777)
+            .with_current_group(metadata.gid()),
+    ))
 }
 
 fn apply_acl(path: &Path, change: &AclChange, default: bool) -> Result<(), MutationError> {

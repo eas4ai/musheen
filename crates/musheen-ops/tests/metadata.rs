@@ -1,7 +1,8 @@
 use musheen_core::StorePath;
 use musheen_ops::{
     AclChange, AclEntry, AclQualifier, MetadataChange, MetadataEntry, MetadataEntryKind,
-    MetadataPlan, MetadataProvider, MetadataScope, ModeEdit, MutationError, ResolvedMetadataChange,
+    MetadataPlan, MetadataProvider, MetadataScope, ModeEdit, ModeStep, MutationError,
+    ResolvedMetadataChange, executes_where_readable, mode_after_ownership_change,
 };
 
 #[derive(Default)]
@@ -153,56 +154,104 @@ fn empty_or_invalid_metadata_changes_never_reach_the_provider() {
     );
 }
 
+fn access(shift: u32, file_bits: u32, folder_bits: u32) -> ModeStep {
+    ModeStep::Access {
+        shift,
+        file_bits,
+        folder_bits,
+    }
+}
+
 #[test]
-fn mode_edits_apply_to_each_entry_and_skip_entries_they_leave_as_they_are() {
+fn mode_edits_apply_steps_in_order_to_each_entry() {
     // Group: Can View; Others: No Access.
-    let edit = ModeEdit {
-        file_clear: 0o067,
-        file_set: 0o040,
-        directory_clear: 0o077,
-        directory_set: 0o050,
-        ..ModeEdit::default()
-    };
+    let edit = ModeEdit::new(vec![access(3, 0o4, 0o5), access(0, 0, 0)]);
     assert_eq!(edit.apply(MetadataEntryKind::File, 0o755), 0o750);
     assert_eq!(edit.apply(MetadataEntryKind::File, 0o600), 0o640);
+    assert_eq!(edit.apply(MetadataEntryKind::File, 0o644), 0o640);
     assert_eq!(edit.apply(MetadataEntryKind::Directory, 0o777), 0o750);
     assert_eq!(edit.apply(MetadataEntryKind::SymbolicLink, 0o777), 0o777);
+    assert!(ModeEdit::default().is_empty());
 
-    let executable = ModeEdit {
-        file_execute: Some(true),
-        ..ModeEdit::default()
-    };
+    // Execute follows read while every reader executes, and stays otherwise.
+    assert_eq!(edit.apply(MetadataEntryKind::File, 0o700), 0o750);
+    assert_eq!(edit.apply(MetadataEntryKind::File, 0o744), 0o740);
+
+    let executable = ModeEdit::new(vec![ModeStep::Executable(true)]);
     assert_eq!(executable.apply(MetadataEntryKind::File, 0o640), 0o750);
     assert_eq!(executable.apply(MetadataEntryKind::Directory, 0o700), 0o700);
-    let not_executable = ModeEdit {
-        file_execute: Some(false),
-        ..ModeEdit::default()
-    };
+    let not_executable = ModeEdit::new(vec![ModeStep::Executable(false)]);
     assert_eq!(
         not_executable.apply(MetadataEntryKind::File, 0o4755),
         0o4644
     );
-    let sticky = ModeEdit {
-        bits_set: 0o1000,
-        bits_clear: 0o002,
-        ..ModeEdit::default()
-    };
-    assert_eq!(sticky.apply(MetadataEntryKind::Directory, 0o777), 0o1775);
-    assert!(ModeEdit::default().is_empty());
 
+    // A later step wins over an earlier one.
+    let others_read = ModeStep::Bit {
+        mask: 0o004,
+        on: true,
+        files: true,
+        folders: true,
+    };
+    let latest = ModeEdit::new(vec![others_read, access(0, 0, 0)]);
+    assert_eq!(latest.apply(MetadataEntryKind::File, 0o600), 0o600);
+    let owner_execute = ModeStep::Bit {
+        mask: 0o100,
+        on: true,
+        files: true,
+        folders: true,
+    };
+    let cleared = ModeEdit::new(vec![owner_execute, ModeStep::Executable(false)]);
+    assert_eq!(cleared.apply(MetadataEntryKind::File, 0o644), 0o644);
+
+    // A bit reaches only the kinds it was chosen on.
+    let setgid = ModeEdit::new(vec![ModeStep::Bit {
+        mask: 0o2000,
+        on: true,
+        files: false,
+        folders: true,
+    }]);
+    assert_eq!(setgid.apply(MetadataEntryKind::Directory, 0o755), 0o2755);
+    assert_eq!(setgid.apply(MetadataEntryKind::File, 0o755), 0o755);
+
+    assert!(executes_where_readable(0o755));
+    assert!(!executes_where_readable(0o744));
+    assert!(!executes_where_readable(0o644));
+    assert_eq!(
+        mode_after_ownership_change(MetadataEntryKind::File, 0o6755),
+        0o755
+    );
+    assert_eq!(
+        mode_after_ownership_change(MetadataEntryKind::File, 0o6745),
+        0o2745
+    );
+    assert_eq!(
+        mode_after_ownership_change(MetadataEntryKind::Directory, 0o2775),
+        0o2775
+    );
+}
+
+#[test]
+fn mode_edits_and_groups_skip_entries_they_leave_as_they_are() {
+    let edit = ModeEdit::new(vec![access(3, 0o4, 0o5), access(0, 0, 0)]);
+    let entry = |path: &str, mode: u32, group: u32| {
+        MetadataEntry::new(
+            local(path),
+            path.as_bytes().to_vec(),
+            MetadataEntryKind::File,
+            false,
+        )
+        .with_current_mode(mode)
+        .with_current_group(group)
+    };
     let mut provider = RecordingProvider {
-        preview: vec![
-            MetadataEntry::new(local("/a"), b"a".to_vec(), MetadataEntryKind::File, false)
-                .with_current_mode(0o640),
-            MetadataEntry::new(local("/b"), b"b".to_vec(), MetadataEntryKind::File, false)
-                .with_current_mode(0o600),
-        ],
+        preview: vec![entry("/a", 0o640, 10), entry("/b", 0o600, 10)],
         ..RecordingProvider::default()
     };
     let plan = MetadataPlan::preflight(
         &mut provider,
         local("/a"),
-        b"a".to_vec(),
+        b"/a".to_vec(),
         MetadataScope::Single,
         MetadataChange::new().with_mode_edit(edit),
     )
@@ -210,19 +259,45 @@ fn mode_edits_apply_to_each_entry_and_skip_entries_they_leave_as_they_are() {
     plan.execute(&mut provider).unwrap();
     assert_eq!(provider.applied.len(), 1, "/a already has the mode");
     assert_eq!(provider.applied[0].0, local("/b"));
-    assert_eq!(provider.applied[0].1.mode(), Some(0o640));
+    let resolved = &provider.applied[0].1;
+    assert_eq!(resolved.mode(), None, "no fixed mode");
+    assert_eq!(resolved.mode_for(0o600), Some(0o640));
+    assert_eq!(
+        resolved.mode_for(0o666),
+        Some(0o640),
+        "the edit applies to the mode found when applying"
+    );
+    assert_eq!(resolved.mode_for(0o640), None);
 
-    provider.preview.truncate(1);
+    // A group change skips an entry already in the group, and does not fail.
+    provider.preview = vec![entry("/a", 0o640, 10), entry("/b", 0o4755, 20)];
     provider.applied.clear();
     let plan = MetadataPlan::preflight(
         &mut provider,
         local("/a"),
-        b"a".to_vec(),
+        b"/a".to_vec(),
         MetadataScope::Single,
-        MetadataChange::new().with_mode_edit(edit),
+        MetadataChange::new().with_group(20),
     )
-    .expect("an item the edit leaves as it is does not fail");
+    .unwrap();
     plan.execute(&mut provider).unwrap();
+    assert_eq!(provider.applied.len(), 1, "/b is already in group 20");
+    assert_eq!(provider.applied[0].0, local("/a"));
+    assert_eq!(provider.applied[0].1.group_for(10), Some(20));
+    assert_eq!(provider.applied[0].1.group_for(20), None);
+
+    provider.preview = vec![entry("/b", 0o4755, 20)];
+    provider.applied.clear();
+    MetadataPlan::preflight(
+        &mut provider,
+        local("/b"),
+        b"/b".to_vec(),
+        MetadataScope::Single,
+        MetadataChange::new().with_group(20),
+    )
+    .expect("an item already in the group does not fail")
+    .execute(&mut provider)
+    .unwrap();
     assert!(provider.applied.is_empty());
 }
 

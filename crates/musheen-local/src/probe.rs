@@ -120,9 +120,10 @@ pub(crate) fn probe(path: &StorePath) -> Result<LocalFilesystemInfo, StoreError>
 pub(crate) fn capabilities(path: &StorePath) -> CapabilityMatrix {
     match probe(path) {
         Ok(info) => info.capabilities(),
-        Err(error) => {
-            let reason = CapabilityReason::new(format!("filesystem probe failed: {error}"))
-                .expect("a formatted probe error is visible");
+        // A fixed reason, which the interface can translate.
+        Err(_) => {
+            let reason = CapabilityReason::new("the filesystem could not be probed")
+                .expect("the probe reason is not empty");
             CapabilityMatrix::new(|_| CapabilityState::Unknown(reason.clone()))
         }
     }

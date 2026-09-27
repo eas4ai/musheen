@@ -117,10 +117,11 @@ fn read_acl(path: &Path, default: bool) -> AclState {
                 })
                 .collect(),
         ),
+        // Fixed reasons, which the interface can translate.
         Err(error) if error.kind() == ErrorKind::Unsupported => {
-            AclState::Unsupported(error.to_string().into())
+            AclState::Unsupported("the filesystem does not support POSIX ACLs".into())
         }
-        Err(error) => AclState::Unavailable(error.to_string().into()),
+        Err(_) => AclState::Unavailable("the ACL could not be read".into()),
     }
 }
 

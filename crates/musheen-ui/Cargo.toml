@@ -33,6 +33,7 @@ tokio.workspace = true
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
 opendal.workspace = true
+posix-acl.workspace = true
 rustix.workspace = true
 xattr.workspace = true
 

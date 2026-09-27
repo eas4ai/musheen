@@ -57,55 +57,134 @@ pub enum AclChange {
     Remove,
 }
 
-/// A change to mode bits that each entry applies to its own current mode
-/// (SEARCH-019), so a selection whose items differ keeps what the user did
-/// not change. In order: the bits in `file_clear` or `directory_clear` are
-/// cleared and those in `file_set` or `directory_set` set, by the entry's
-/// kind; then `file_execute`, for a file, adds execute for each class that
-/// may read it (`Some(true)`) or clears execute for all three
-/// (`Some(false)`); then `bits_clear` and `bits_set` apply to every entry.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// One step of a mode edit (SEARCH-019).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModeStep {
+    /// Sets one class's access; `shift` places the class (6 owner, 3 group,
+    /// 0 others). A file gets `file_bits` (0, 4 or 6) as its read and write
+    /// bits. Its execute bit is cleared with No Access; it follows read when
+    /// the file's execute bits followed its read bits before the step (the
+    /// executable checkbox was on); otherwise it stays. A folder gets
+    /// `folder_bits` (0, 5 or 7).
+    Access {
+        shift: u32,
+        file_bits: u32,
+        folder_bits: u32,
+    },
+    /// The executable checkbox: `true` adds execute for each class that may
+    /// read a file, `false` clears execute for all three. Folders keep theirs.
+    Executable(bool),
+    /// An Advanced bit, set or cleared only on the kinds of entry it was
+    /// chosen on, so a bit chosen on a folder does not reach its files.
+    Bit {
+        mask: u32,
+        on: bool,
+        files: bool,
+        folders: bool,
+    },
+}
+
+impl ModeStep {
+    fn apply(self, kind: MetadataEntryKind, mode: u32) -> u32 {
+        match (self, kind) {
+            (
+                Self::Access {
+                    shift, file_bits, ..
+                },
+                MetadataEntryKind::File,
+            ) => {
+                let execute = if file_bits == 0 {
+                    0
+                } else if executes_where_readable(mode) {
+                    1
+                } else {
+                    (mode >> shift) & 1
+                };
+                (mode & !(0o7 << shift)) | ((file_bits | execute) << shift)
+            }
+            (
+                Self::Access {
+                    shift, folder_bits, ..
+                },
+                MetadataEntryKind::Directory,
+            ) => (mode & !(0o7 << shift)) | (folder_bits << shift),
+            (Self::Executable(true), MetadataEntryKind::File) => mode | ((mode & 0o444) >> 2),
+            (Self::Executable(false), MetadataEntryKind::File) => mode & !0o111,
+            (
+                Self::Bit {
+                    mask,
+                    on,
+                    files,
+                    folders,
+                },
+                kind,
+            ) if (files && kind == MetadataEntryKind::File)
+                || (folders && kind == MetadataEntryKind::Directory) =>
+            {
+                if on {
+                    mode | mask
+                } else {
+                    mode & !mask
+                }
+            }
+            _ => mode,
+        }
+    }
+}
+
+/// Whether a file's execute bits are exactly its read bits, and not none:
+/// the state the executable checkbox shows as checked.
+#[must_use]
+pub const fn executes_where_readable(mode: u32) -> bool {
+    let execute = mode & 0o111;
+    execute != 0 && execute == (mode & 0o444) >> 2
+}
+
+/// The mode a non-folder keeps after a change of owner or group: the kernel
+/// clears set-user-ID, and set-group-ID when the group may execute.
+#[must_use]
+pub const fn mode_after_ownership_change(kind: MetadataEntryKind, mode: u32) -> u32 {
+    match kind {
+        MetadataEntryKind::File => {
+            let setgid = if mode & 0o010 != 0 { 0o2000 } else { 0 };
+            mode & !(0o4000 | setgid)
+        }
+        MetadataEntryKind::Directory | MetadataEntryKind::SymbolicLink => mode,
+    }
+}
+
+/// A change that each entry applies to its own mode (SEARCH-019), step by
+/// step in the order the user made them, so a later step wins and a
+/// selection whose items differ keeps what the user did not change.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModeEdit {
-    pub file_clear: u32,
-    pub file_set: u32,
-    pub directory_clear: u32,
-    pub directory_set: u32,
-    pub file_execute: Option<bool>,
-    pub bits_clear: u32,
-    pub bits_set: u32,
+    steps: Vec<ModeStep>,
 }
 
 impl ModeEdit {
     #[must_use]
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+    pub const fn new(steps: Vec<ModeStep>) -> Self {
+        Self { steps }
     }
 
-    /// The mode an entry of `kind` whose mode is `mode` gets.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    #[must_use]
+    pub fn steps(&self) -> &[ModeStep] {
+        &self.steps
+    }
+
+    /// The mode an entry of `kind` whose mode is `mode` gets. A link keeps
+    /// its mode.
     #[must_use]
     pub fn apply(&self, kind: MetadataEntryKind, mode: u32) -> u32 {
-        let mut mode = mode & 0o7777;
-        match kind {
-            MetadataEntryKind::File => {
-                mode = (mode & !self.file_clear) | self.file_set;
-                match self.file_execute {
-                    Some(true) => {
-                        for (read, execute) in [(0o400, 0o100), (0o040, 0o010), (0o004, 0o001)] {
-                            if mode & read != 0 {
-                                mode |= execute;
-                            }
-                        }
-                    }
-                    Some(false) => mode &= !0o111,
-                    None => {}
-                }
-            }
-            MetadataEntryKind::Directory => {
-                mode = (mode & !self.directory_clear) | self.directory_set;
-            }
-            MetadataEntryKind::SymbolicLink => return mode,
-        }
-        ((mode & !self.bits_clear) | self.bits_set) & 0o7777
+        self.steps
+            .iter()
+            .fold(mode & 0o7777, |mode, step| step.apply(kind, mode))
+            & 0o7777
     }
 }
 
@@ -146,8 +225,8 @@ impl MetadataChange {
     }
 
     #[must_use]
-    pub const fn mode_edit(&self) -> Option<ModeEdit> {
-        self.mode_edit
+    pub const fn mode_edit(&self) -> Option<&ModeEdit> {
+        self.mode_edit.as_ref()
     }
 
     #[must_use]
@@ -213,18 +292,34 @@ impl MetadataChange {
             MetadataEntryKind::File => self.file_mode,
             MetadataEntryKind::Directory => self.directory_mode,
             MetadataEntryKind::SymbolicLink => None,
-        }
-        .or_else(|| {
-            // A mode edit changes only an entry whose mode it would change.
-            let edit = self.mode_edit?;
-            let current = entry.current_mode?;
-            let mode = edit.apply(kind, current);
-            (kind != MetadataEntryKind::SymbolicLink && mode != current & 0o7777).then_some(mode)
-        });
+        };
+        // An entry already in the chosen group is left as it is: a chown
+        // would still clear its set-user-ID bit, and fails for a non-owner.
+        let group = self
+            .group
+            .filter(|group| entry.current_group != Some(*group));
+        let ownership = self.owner.is_some() || group.is_some();
+        // A mode edit reaches an entry whose mode it would change, or one
+        // whose ownership changes, as that may clear bits the edit keeps.
+        // The provider applies it to the mode it finds when it applies it.
+        let mode_edit = self
+            .mode_edit
+            .as_ref()
+            .filter(|edit| {
+                mode.is_none()
+                    && kind != MetadataEntryKind::SymbolicLink
+                    && (ownership
+                        || entry
+                            .current_mode
+                            .is_none_or(|current| edit.apply(kind, current) != current & 0o7777))
+            })
+            .cloned();
         ResolvedMetadataChange {
+            kind,
             mode,
+            mode_edit,
             owner: self.owner,
-            group: self.group,
+            group,
             access_acl: (kind != MetadataEntryKind::SymbolicLink)
                 .then(|| self.access_acl.clone())
                 .flatten(),
@@ -302,8 +397,10 @@ pub struct MetadataEntry {
     expected_identity: Box<[u8]>,
     kind: MetadataEntryKind,
     requires_privilege: bool,
-    /// The entry's mode when previewed, which a mode edit starts from.
+    /// The entry's mode when previewed.
     current_mode: Option<u32>,
+    /// The entry's group when previewed.
+    current_group: Option<u32>,
 }
 
 impl MetadataEntry {
@@ -320,12 +417,19 @@ impl MetadataEntry {
             kind,
             requires_privilege,
             current_mode: None,
+            current_group: None,
         }
     }
 
     #[must_use]
     pub const fn with_current_mode(mut self, mode: u32) -> Self {
         self.current_mode = Some(mode);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_current_group(mut self, group: u32) -> Self {
+        self.current_group = Some(group);
         self
     }
 
@@ -347,7 +451,9 @@ impl MetadataEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedMetadataChange {
+    kind: MetadataEntryKind,
     mode: Option<u32>,
+    mode_edit: Option<ModeEdit>,
     owner: Option<u32>,
     group: Option<u32>,
     access_acl: Option<AclChange>,
@@ -357,15 +463,34 @@ pub struct ResolvedMetadataChange {
 impl ResolvedMetadataChange {
     fn is_dirty(&self) -> bool {
         self.mode.is_some()
+            || self.mode_edit.is_some()
             || self.owner.is_some()
             || self.group.is_some()
             || self.access_acl.is_some()
             || self.default_acl.is_some()
     }
 
+    /// The one mode the change sets, when it sets one.
     #[must_use]
     pub const fn mode(&self) -> Option<u32> {
         self.mode
+    }
+
+    #[must_use]
+    pub const fn mode_edit(&self) -> Option<&ModeEdit> {
+        self.mode_edit.as_ref()
+    }
+
+    /// The mode to set on the entry, whose mode is now `current`, or `None`
+    /// to leave it: a mode edit is applied to the mode found when applying,
+    /// so a change made after Apply is kept.
+    #[must_use]
+    pub fn mode_for(&self, current: u32) -> Option<u32> {
+        if self.mode.is_some() {
+            return self.mode;
+        }
+        let mode = self.mode_edit.as_ref()?.apply(self.kind, current);
+        (mode != current & 0o7777).then_some(mode)
     }
 
     #[must_use]
@@ -376,6 +501,18 @@ impl ResolvedMetadataChange {
     #[must_use]
     pub const fn group(&self) -> Option<u32> {
         self.group
+    }
+
+    /// The owner to set on the entry, whose owner is now `current`.
+    #[must_use]
+    pub fn owner_for(&self, current: u32) -> Option<u32> {
+        self.owner.filter(|owner| *owner != current)
+    }
+
+    /// The group to set on the entry, whose group is now `current`.
+    #[must_use]
+    pub fn group_for(&self, current: u32) -> Option<u32> {
+        self.group.filter(|group| *group != current)
     }
 
     #[must_use]
@@ -449,9 +586,13 @@ impl MetadataPlan {
             })
             .filter(|(_, change)| change.is_dirty())
             .collect();
-        // A mode edit may leave every entry of a root as it is, which is
-        // not a failure: the selection's other roots still change.
-        if entries.is_empty() && change.mode_edit.is_none() {
+        // A mode edit or a group may leave every entry of a root as it is,
+        // which is not a failure: the selection's other roots still change.
+        if entries.is_empty()
+            && change.mode_edit.is_none()
+            && change.owner.is_none()
+            && change.group.is_none()
+        {
             return Err(MutationError::InvalidMetadata);
         }
         let requires_permissions = change.requires_permissions();

@@ -96,8 +96,16 @@ impl Catalog {
     /// Translate owned domain refusals without changing provider error detail.
     #[must_use]
     pub fn localize_reason(&self, reason: &str) -> String {
+        self.localize_known_reason(reason)
+            .unwrap_or_else(|| reason.to_owned())
+    }
+
+    /// `reason` in this catalog's language, when `reason` is a message ID or
+    /// the English text of a message; `None` for any other text.
+    #[must_use]
+    pub fn localize_known_reason(&self, reason: &str) -> Option<String> {
         if let Ok(message) = self.message(reason) {
-            return message.to_owned();
+            return Some(message.to_owned());
         }
         static ENGLISH: std::sync::LazyLock<BTreeMap<Box<str>, Box<str>>> =
             std::sync::LazyLock::new(|| parse_catalog(EN_US).expect("English catalog is valid"));
@@ -105,8 +113,16 @@ impl Catalog {
             .iter()
             .find(|(_, value)| value.as_ref() == reason)
             .and_then(|(id, _)| self.message(id).ok())
-            .unwrap_or(reason)
-            .to_owned()
+            .map(str::to_owned)
+    }
+
+    /// The separator between the items of a list in this language.
+    #[must_use]
+    pub const fn list_separator(&self) -> &'static str {
+        match self.locale {
+            Locale::Ar => "، ",
+            _ => ", ",
+        }
     }
 
     #[must_use]

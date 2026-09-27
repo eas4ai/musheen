@@ -1,7 +1,8 @@
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, FileType, OpenOptions};
 use std::io::{self, Read};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -66,6 +67,12 @@ impl MimeDetector {
         if metadata.file_type().is_symlink() {
             return Ok(detected("inode/symlink", MimeSource::FileType, 0));
         }
+        // A socket, pipe or device is named by its type and never opened:
+        // opening a pipe waits for a writer, and opening a device may act on
+        // it.
+        if let Some(mime_type) = special_mime_type(metadata.file_type()) {
+            return Ok(detected(mime_type, MimeSource::FileType, 0));
+        }
 
         if let Some(value) = path
             .file_name()
@@ -79,7 +86,12 @@ impl MimeDetector {
             });
         }
 
-        let mut file = File::open(path).map_err(MimeError::Open)?;
+        // Non-blocking, in case a pipe replaced the file since it was checked.
+        let mut file: File = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(path)
+            .map_err(MimeError::Open)?;
         let mut content = Vec::with_capacity(MIME_SNIFF_BYTES);
         file.by_ref()
             .take(MIME_SNIFF_BYTES as u64)
@@ -111,6 +123,21 @@ impl MimeDetector {
         }
 
         Ok(detected(GENERIC_MIME, MimeSource::Fallback, bytes_read))
+    }
+}
+
+/// The shared-mime-info name of a socket, pipe or device.
+fn special_mime_type(file_type: FileType) -> Option<&'static str> {
+    if file_type.is_fifo() {
+        Some("inode/fifo")
+    } else if file_type.is_socket() {
+        Some("inode/socket")
+    } else if file_type.is_char_device() {
+        Some("inode/chardevice")
+    } else if file_type.is_block_device() {
+        Some("inode/blockdevice")
+    } else {
+        None
     }
 }
 
