@@ -35347,4 +35347,399 @@ mod tests {
             }
         });
     }
+
+    #[cfg(feature = "portal-backend")]
+    type PortalBackend = musheen_desktop::AshpdFileChooserBackend<GpuiPortalChooser>;
+
+    #[cfg(feature = "portal-backend")]
+    type PortalResult = ashpd::backend::Result<ashpd::desktop::file_chooser::SelectedFiles>;
+
+    /// `path` as the portal sends it.
+    #[cfg(feature = "portal-backend")]
+    fn portal_file_path(path: &Path) -> ashpd::FilePath {
+        use serde::Deserialize as _;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut bytes = path.as_os_str().as_bytes().to_vec();
+        bytes.push(0);
+        ashpd::FilePath::deserialize(serde::de::value::SeqDeserializer::<
+            _,
+            serde::de::value::Error,
+        >::new(bytes.into_iter()))
+        .unwrap()
+    }
+
+    /// Musheen's portal backend as the app installs it, without the bus:
+    /// each request reaches the app as it would from xdg-desktop-portal.
+    #[cfg(feature = "portal-backend")]
+    fn portal_backend(cx: &mut TestAppContext) -> Arc<PortalBackend> {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            if !cx.has_global::<FileManagerWindows>() {
+                cx.set_global(FileManagerWindows::default());
+            }
+        });
+        let (requests, receiver) = async_channel::bounded(16);
+        cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                while let Ok(envelope) = receiver.recv().await {
+                    cx.update(|cx| route_portal_chooser(envelope, cx));
+                }
+            })
+            .detach();
+        });
+        Arc::new(musheen_desktop::AshpdFileChooserBackend::new(
+            Arc::new(GpuiPortalChooser { requests }),
+            ApplicationIdentity::ID,
+        ))
+    }
+
+    #[cfg(feature = "portal-backend")]
+    fn portal_open(
+        backend: &Arc<PortalBackend>,
+        options: ashpd::desktop::file_chooser::OpenFileOptions,
+        cx: &mut TestAppContext,
+    ) -> gpui_kit::Task<PortalResult> {
+        use ashpd::backend::file_chooser::FileChooserImpl as _;
+
+        let backend = Arc::clone(backend);
+        cx.background_spawn(async move {
+            backend
+                .open_file(
+                    "open".parse().unwrap(),
+                    Some(ashpd::MaybeAppID::from("org.example.Caller")),
+                    None,
+                    "Open a file",
+                    options,
+                )
+                .await
+        })
+    }
+
+    #[cfg(feature = "portal-backend")]
+    fn portal_save(
+        backend: &Arc<PortalBackend>,
+        options: ashpd::desktop::file_chooser::SaveFileOptions,
+        cx: &mut TestAppContext,
+    ) -> gpui_kit::Task<PortalResult> {
+        use ashpd::backend::file_chooser::FileChooserImpl as _;
+
+        let backend = Arc::clone(backend);
+        cx.background_spawn(async move {
+            backend
+                .save_file(
+                    "save".parse().unwrap(),
+                    Some(ashpd::MaybeAppID::from("org.example.Caller")),
+                    None,
+                    "Save a file",
+                    options,
+                )
+                .await
+        })
+    }
+
+    #[cfg(feature = "portal-backend")]
+    fn portal_save_many(
+        backend: &Arc<PortalBackend>,
+        options: ashpd::desktop::file_chooser::SaveFilesOptions,
+        cx: &mut TestAppContext,
+    ) -> gpui_kit::Task<PortalResult> {
+        use ashpd::backend::file_chooser::FileChooserImpl as _;
+
+        let backend = Arc::clone(backend);
+        cx.background_spawn(async move {
+            backend
+                .save_files(
+                    "save_many".parse().unwrap(),
+                    Some(ashpd::MaybeAppID::from("org.example.Caller")),
+                    None,
+                    "Save files",
+                    options,
+                )
+                .await
+        })
+    }
+
+    /// The chooser window the pending request opened.
+    #[cfg(feature = "portal-backend")]
+    fn portal_chooser_window(cx: &mut TestAppContext) -> AnyWindowHandle {
+        cx.run_until_parked();
+        cx.update(|cx| {
+            cx.windows().into_iter().find(|handle| {
+                handle
+                    .update(cx, |_, window, _| {
+                        window.try_find("portal-chooser").is_some()
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .expect("the request opens a chooser window")
+    }
+
+    /// Clicks each of `ids` in the chooser window, in order.
+    #[cfg(feature = "portal-backend")]
+    fn portal_click(window: AnyWindowHandle, ids: &[&str], cx: &mut TestAppContext) {
+        for id in ids {
+            cx.update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.click(SharedString::from(id.to_string()), cx);
+            })
+            .expect("the chooser window is open");
+            cx.run_until_parked();
+        }
+    }
+
+    #[cfg(feature = "portal-backend")]
+    async fn portal_uris(task: gpui_kit::Task<PortalResult>) -> Vec<String> {
+        task.await
+            .expect("the request returns a selection")
+            .uris()
+            .iter()
+            .map(|uri| uri.as_str().to_owned())
+            .collect()
+    }
+
+    #[cfg(feature = "portal-backend")]
+    fn file_uri(path: &Path) -> String {
+        format!("file://{}", path.display())
+    }
+
+    /// A folder with a text file, an image and a subfolder.
+    #[cfg(feature = "portal-backend")]
+    fn portal_fixture() -> tempfile::TempDir {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::write(temporary.path().join("notes.txt"), b"notes").unwrap();
+        std::fs::write(temporary.path().join("photo.png"), b"png").unwrap();
+        std::fs::create_dir(temporary.path().join("sub")).unwrap();
+        temporary
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_request_opens_its_own_chooser_window(cx: &mut TestAppContext) {
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()));
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        assert_eq!(
+            cx.update(|cx| cx.windows().len()),
+            1,
+            "only the chooser opens, no file-manager window"
+        );
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(
+                window.find("portal-chooser-location").label(),
+                Some(fixture.path().to_str().unwrap())
+            );
+        })
+        .unwrap();
+        portal_click(window, &["portal-chooser-cancel"], cx);
+        assert!(matches!(task.await, Err(ashpd::PortalError::Cancelled(_))));
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_open_returns_one_confirmed_file(cx: &mut TestAppContext) {
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()));
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        // Accept does nothing until a file is chosen; a folder is entered.
+        portal_click(
+            window,
+            &[
+                "portal-chooser-accept",
+                "portal-chooser-entry-sub",
+                "portal-chooser-up",
+                "portal-chooser-entry-photo.png",
+                "portal-chooser-entry-notes.txt",
+                "portal-chooser-accept",
+            ],
+            cx,
+        );
+        assert_eq!(
+            portal_uris(task).await,
+            [file_uri(&fixture.path().join("notes.txt"))]
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_open_many_files_or_a_folder(cx: &mut TestAppContext) {
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_multiple(true);
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        portal_click(
+            window,
+            &[
+                "portal-chooser-entry-notes.txt",
+                "portal-chooser-entry-photo.png",
+                "portal-chooser-accept",
+            ],
+            cx,
+        );
+        assert_eq!(
+            portal_uris(task).await,
+            [
+                file_uri(&fixture.path().join("notes.txt")),
+                file_uri(&fixture.path().join("photo.png")),
+            ]
+        );
+
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_directory(true);
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.try_find("portal-chooser-entry-notes.txt").is_none(),
+                "a folder request lists only folders"
+            );
+        })
+        .unwrap();
+        portal_click(
+            window,
+            &["portal-chooser-entry-sub", "portal-chooser-accept"],
+            cx,
+        );
+        assert_eq!(
+            portal_uris(task).await,
+            [file_uri(&fixture.path().join("sub"))]
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_save_names_the_file_and_asks_before_replacing(cx: &mut TestAppContext) {
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::SaveFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_current_name("report.txt");
+        let task = portal_save(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        cx.update_window(window, |_, window, _| {
+            assert_eq!(
+                window.find("portal-chooser-name").value(),
+                Some("report.txt")
+            );
+        })
+        .unwrap();
+        portal_click(window, &["portal-chooser-accept"], cx);
+        assert_eq!(
+            portal_uris(task).await,
+            [file_uri(&fixture.path().join("report.txt"))]
+        );
+
+        let options = ashpd::desktop::file_chooser::SaveFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_current_name("notes.txt");
+        let task = portal_save(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        portal_click(window, &["portal-chooser-accept"], cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find("portal-chooser-replace").visible());
+        })
+        .unwrap();
+        portal_click(window, &["portal-chooser-replace"], cx);
+        assert_eq!(
+            portal_uris(task).await,
+            [file_uri(&fixture.path().join("notes.txt"))]
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_save_many_returns_each_file_in_the_folder(cx: &mut TestAppContext) {
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::SaveFilesOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_files([
+                portal_file_path(Path::new("a.txt")),
+                portal_file_path(Path::new("notes.txt")),
+            ]);
+        let task = portal_save_many(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        portal_click(window, &["portal-chooser-accept"], cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(
+                window.find("portal-chooser-replace").visible(),
+                "notes.txt exists"
+            );
+        })
+        .unwrap();
+        portal_click(window, &["portal-chooser-replace"], cx);
+        assert_eq!(
+            portal_uris(task).await,
+            [
+                file_uri(&fixture.path().join("a.txt")),
+                file_uri(&fixture.path().join("notes.txt")),
+            ]
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_filters_limit_the_list(cx: &mut TestAppContext) {
+        use ashpd::desktop::file_chooser::FileFilter;
+
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let text = FileFilter::new("Text").glob("*.txt");
+        let images = FileFilter::new("Images").mimetype("image/png");
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()))
+            .set_filters([text.clone(), images])
+            .set_current_filter(text);
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find("portal-chooser-entry-notes.txt").visible());
+            assert!(window.find("portal-chooser-entry-sub").visible());
+            assert!(window.try_find("portal-chooser-entry-photo.png").is_none());
+            assert_eq!(window.find("portal-chooser-filter-0").label(), Some("Text"));
+        })
+        .unwrap();
+        portal_click(window, &["portal-chooser-filter-1"], cx);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.find("portal-chooser-entry-photo.png").visible());
+            assert!(window.try_find("portal-chooser-entry-notes.txt").is_none());
+        })
+        .unwrap();
+        portal_click(
+            window,
+            &["portal-chooser-entry-photo.png", "portal-chooser-accept"],
+            cx,
+        );
+        assert_eq!(
+            portal_uris(task).await,
+            [file_uri(&fixture.path().join("photo.png"))]
+        );
+    }
+
+    #[cfg(feature = "portal-backend")]
+    #[gpui_kit::test]
+    async fn portal_backend_closing_the_chooser_returns_cancelled(cx: &mut TestAppContext) {
+        let fixture = portal_fixture();
+        let backend = portal_backend(cx);
+        let options = ashpd::desktop::file_chooser::OpenFileOptions::default()
+            .set_current_folder(portal_file_path(fixture.path()));
+        let task = portal_open(&backend, options, cx);
+        let window = portal_chooser_window(cx);
+        portal_click(window, &["portal-chooser-entry-notes.txt"], cx);
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert!(matches!(task.await, Err(ashpd::PortalError::Cancelled(_))));
+    }
 }

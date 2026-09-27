@@ -189,7 +189,7 @@ fn cancellation_is_preserved_as_a_typed_result() {
 }
 
 #[test]
-fn client_refuses_to_route_into_its_own_optional_backend() {
+fn portal_backend_client_never_routes_into_its_own_backend() {
     let transport = FakePortal {
         result: Arc::new(Mutex::new(Some(Ok(PortalSelection::new(
             vec![PathBuf::from("/tmp/file")],
@@ -406,7 +406,7 @@ mod backend {
     }
 
     #[test]
-    fn backend_returns_only_confirmed_selection_and_refuses_self_call() {
+    fn portal_backend_returns_only_confirmed_selection_and_refuses_self_call() {
         let backend =
             AshpdFileChooserBackend::new(Arc::new(ConfirmingUi), "com.github.musheen.Musheen");
         let token: HandleToken = "confirmed".parse().unwrap();
@@ -564,6 +564,182 @@ mod backend {
                 .deserialize::<ashpd::desktop::Response<ashpd::desktop::file_chooser::SelectedFiles>>()
                 .unwrap();
             assert!(matches!(response, ashpd::desktop::Response::Err(_)));
+        });
+    }
+
+    /// Confirms `/tmp/a b.txt` once `confirm` receives, unless the request is
+    /// cancelled first.
+    struct SignalledUi {
+        started: async_channel::Sender<()>,
+        confirm: async_channel::Receiver<()>,
+    }
+
+    impl BackendChooserUi for SignalledUi {
+        fn choose(
+            &self,
+            _request: BackendChooserRequest,
+            cancellation: CancellationToken,
+        ) -> BoxFuture<'static, Result<BackendChooserDecision, PortalError>> {
+            let (started, confirm) = (self.started.clone(), self.confirm.clone());
+            Box::pin(async move {
+                let _ = started.try_send(());
+                futures_lite::future::race(
+                    async move {
+                        let _ = confirm.recv().await;
+                        Ok(BackendChooserDecision::Confirmed(vec![PathBuf::from(
+                            "/tmp/a b.txt",
+                        )]))
+                    },
+                    async move {
+                        poll_fn(move |context| {
+                            if cancellation.is_cancelled() {
+                                Poll::Ready(())
+                            } else {
+                                cancellation.register_waker(context.waker());
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                        Ok(BackendChooserDecision::Cancelled)
+                    },
+                )
+                .await
+            })
+        }
+    }
+
+    const PORTAL_SERVICE: &str = "org.freedesktop.portal.Desktop";
+    const BACKEND: &str = "org.example.MusheenPortal";
+    const NOT_ALLOWED: &str = "org.freedesktop.portal.Error.NotAllowed";
+
+    /// A connection to `bus`; with `portal`, it owns the portal service's
+    /// name, as xdg-desktop-portal does.
+    #[cfg(unix)]
+    async fn bus_caller(bus: &PrivateBus, portal: bool) -> zbus::Connection {
+        let builder = zbus::connection::Builder::address(bus.address.as_str()).unwrap();
+        let builder = if portal {
+            builder.name(PORTAL_SERVICE).unwrap()
+        } else {
+            builder
+        };
+        builder.build().await.unwrap()
+    }
+
+    #[cfg(unix)]
+    fn request_handle(name: &str) -> zbus::zvariant::OwnedObjectPath {
+        format!("/org/freedesktop/portal/desktop/request/test/{name}")
+            .try_into()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn call_open_file(
+        connection: &zbus::Connection,
+        name: &str,
+    ) -> zbus::Result<zbus::Message> {
+        zbus::Proxy::new(
+            connection,
+            BACKEND,
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.impl.portal.FileChooser",
+        )
+        .await
+        .unwrap()
+        .call_method(
+            "OpenFile",
+            &(
+                request_handle(name),
+                ashpd::zvariant::Optional::from(Some(MaybeAppID::from("org.example.Caller"))),
+                ashpd::zvariant::Optional::<ashpd::WindowIdentifierType>::default(),
+                "Open",
+                OpenFileOptions::default(),
+            ),
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    fn refused(result: &zbus::Result<zbus::Message>) -> bool {
+        matches!(result, Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == NOT_ALLOWED)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portal_backend_answers_only_the_portal_service() {
+        let bus = PrivateBus::start();
+        futures_lite::future::block_on(async {
+            let _service = musheen_desktop::serve_file_chooser_backend(
+                Some(&bus.address),
+                Arc::new(ConfirmingUi),
+                BACKEND,
+                "com.github.musheen.Musheen",
+            )
+            .await
+            .unwrap();
+            let stranger = bus_caller(&bus, false).await;
+            let answer = call_open_file(&stranger, "stranger").await;
+            assert!(refused(&answer), "a stranger is refused: {answer:?}");
+
+            let portal = bus_caller(&bus, true).await;
+            let reply = call_open_file(&portal, "portal").await.unwrap();
+            let response = reply
+                .body()
+                .deserialize::<ashpd::desktop::Response<ashpd::desktop::file_chooser::SelectedFiles>>()
+                .unwrap();
+            let ashpd::desktop::Response::Ok(selected) = response else {
+                panic!("the portal service is answered");
+            };
+            assert_eq!(selected.uris()[0].as_str(), "file:///tmp/a%20b.txt");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portal_backend_refuses_close_from_other_callers() {
+        let bus = PrivateBus::start();
+        futures_lite::future::block_on(async {
+            let (started_tx, started_rx) = async_channel::bounded(1);
+            let (confirm_tx, confirm_rx) = async_channel::bounded(1);
+            let _service = musheen_desktop::serve_file_chooser_backend(
+                Some(&bus.address),
+                Arc::new(SignalledUi {
+                    started: started_tx,
+                    confirm: confirm_rx,
+                }),
+                BACKEND,
+                "com.github.musheen.Musheen",
+            )
+            .await
+            .unwrap();
+            let portal = bus_caller(&bus, true).await;
+            let stranger = bus_caller(&bus, false).await;
+            let call = call_open_file(&portal, "pending");
+            let close = async {
+                started_rx.recv().await.unwrap();
+                let closed = zbus::Proxy::new(
+                    &stranger,
+                    BACKEND,
+                    request_handle("pending"),
+                    "org.freedesktop.impl.portal.Request",
+                )
+                .await
+                .unwrap()
+                .call_method("Close", &())
+                .await;
+                confirm_tx.send(()).await.unwrap();
+                closed
+            };
+            let (reply, closed) = futures_lite::future::zip(call, close).await;
+            assert!(refused(&closed), "a stranger may not close: {closed:?}");
+            let response = reply
+                .unwrap()
+                .body()
+                .deserialize::<ashpd::desktop::Response<ashpd::desktop::file_chooser::SelectedFiles>>()
+                .unwrap();
+            assert!(
+                matches!(response, ashpd::desktop::Response::Ok(_)),
+                "the request was not cancelled"
+            );
         });
     }
 }
