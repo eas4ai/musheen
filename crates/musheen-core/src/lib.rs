@@ -20,7 +20,7 @@ pub use command::*;
 pub use context::{
     ActiveLayout, CommandContext, CommandParameterError, CommandParameters, CommandTarget,
     CommandTargetRef, DesktopApplicationId, OpenWithIntent, ProviderAction, ProviderActionMatrix,
-    ResolvedDestination,
+    ResolvedDestination, RunKind,
 };
 pub use customization::*;
 pub use error::CoreError;

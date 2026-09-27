@@ -531,7 +531,26 @@ fn is_presentable(
             return false;
         }
         "file.compress" if target == CommandTarget::Archive => return false,
-        "file.run" | "file.run_as_administrator" if target != CommandTarget::ExecutableFile => {
+        // Run takes a compiled program or desktop entry, Run in Terminal a
+        // script or compiled program (SYS-035, SYS-036).
+        "file.run"
+            if target != CommandTarget::ExecutableFile
+                || !matches!(
+                    request.context().run_kind,
+                    Some(musheen_core::RunKind::Program | musheen_core::RunKind::DesktopEntry)
+                ) =>
+        {
+            return false;
+        }
+        "file.run_in_terminal"
+            if !matches!(
+                request.context().run_kind,
+                Some(musheen_core::RunKind::Program | musheen_core::RunKind::Script)
+            ) =>
+        {
+            return false;
+        }
+        "file.run_as_administrator" if target != CommandTarget::ExecutableFile => {
             return false;
         }
         "directory.open_as_administrator"
@@ -592,6 +611,10 @@ fn is_presentable(
         | CommandPredicate::DestinationMove
         | CommandPredicate::DestinationExtract
         | CommandPredicate::ProviderAction(_) => true,
+        // Run in Terminal stays, disabled, for a script or compiled program
+        // the user may not execute, so its reason says how to allow it
+        // (SYS-036); `is_presentable` above already requires such a file.
+        CommandPredicate::TerminalRun => true,
         CommandPredicate::PinnedDirectory => request.context().target_is_pinned,
         CommandPredicate::UnpinnedDirectory => !request.context().target_is_pinned,
         _ => false,
@@ -1097,6 +1120,7 @@ const ITEM: &[&str] = &[
     "file.open",
     "file.open_with",
     "file.run",
+    "file.run_in_terminal",
     "file.run_as_administrator",
     "directory.open_as_administrator",
     "directory.open_new_tab",

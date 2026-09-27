@@ -4,11 +4,13 @@ mod desktop_entry;
 mod icon;
 mod launch;
 mod mimeapps;
+mod run;
 
 pub use desktop_entry::*;
 pub use icon::*;
 pub use launch::*;
 pub use mimeapps::*;
+pub use run::*;
 
 use std::path::{Path, PathBuf};
 

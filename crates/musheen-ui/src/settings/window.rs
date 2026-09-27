@@ -109,7 +109,11 @@ fn open_settings_at(
         let view = cx.new(|cx| {
             let mut settings = SettingsWindow::new(
                 store,
-                SettingsBackends::default().with(SettingsFeature::Catalog),
+                // Execution: the executable-file preference and Run in
+                // Terminal's terminal (SYS-035, SYS-036).
+                SettingsBackends::default()
+                    .with(SettingsFeature::Catalog)
+                    .with(SettingsFeature::Execution),
                 catalog,
                 window,
                 cx,

@@ -23,6 +23,7 @@ use musheen_ops::{MetadataKind, SourceMetadata};
 use posix_acl::{ACL_EXECUTE, ACL_WRITE, PosixACL, Qualifier};
 use std::path::PathBuf;
 
+pub use metadata::item_id_of_open_file;
 pub use mutation::LocalTrashEntry;
 pub use probe::{LocalFilesystemInfo, mount_point_of};
 pub use queue::{
@@ -183,18 +184,22 @@ impl Store for LocalStore {
                     .expect("the executable-state reason is valid"),
             ));
         };
-        use std::os::unix::fs::PermissionsExt;
         let metadata = std::fs::metadata(path).map_err(|error| StoreError::Io {
             operation: "read executable metadata",
             kind: error.kind(),
             path: Some(StorePath::from_unix_path(path.as_os_str())),
             message: error.to_string().into(),
         })?;
-        if metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0 {
+        // The kernel's own answer for the current user (SYS-035): the owner,
+        // group or other bits that apply to this user, ACL entries, and a
+        // noexec mount, not merely whether any execute bit is set.
+        if metadata.file_type().is_file()
+            && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
+        {
             Ok(CapabilityState::Supported)
         } else {
             Ok(CapabilityState::Unsupported(
-                CapabilityReason::new("the item is not marked executable by its provider metadata")
+                CapabilityReason::new("the current user may not execute this item")
                     .expect("the executable-state reason is valid"),
             ))
         }

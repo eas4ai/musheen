@@ -8,6 +8,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const MAX_DESKTOP_ENTRIES: usize = 32_768;
+/// The largest desktop entry read from a file the user runs.
+const MAX_RUN_ENTRY_BYTES: u64 = 64 * 1024;
 const MAX_DIRECTORY_DEPTH: usize = 16;
 
 /// Musheen-owned projection of a freedesktop application entry.
@@ -311,6 +313,29 @@ fn parse_record(
         hidden: false,
         source_rank,
     }
+}
+
+/// The desktop entry in `file`, an open file named `path`, read through the
+/// open file itself (`/proc/self/fd`), so it is that file's content even if
+/// the path now names another. `None` unless it is an Application entry
+/// with a name and an Exec line, or when it is larger than 64 KiB.
+pub(crate) fn application_from_open_file(
+    file: &fs::File,
+    path: &Path,
+) -> Option<DesktopApplication> {
+    use std::os::fd::AsRawFd as _;
+
+    if file.metadata().ok()?.len() > MAX_RUN_ENTRY_BYTES {
+        return None;
+    }
+    let desktop_id = path.file_name()?.to_str()?.into();
+    let open_file = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    parse_record(desktop_id, open_file, 0, &[])
+        .application
+        .map(|mut application| {
+            application.desktop_file = path.to_path_buf();
+            application
+        })
 }
 
 fn desktop_visible(entry: &ApplicationEntry, desktops: &[Box<str>]) -> bool {
