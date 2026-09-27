@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: run-files
+Current: permissions-page
 
 ## 1. Foundation
 
@@ -303,3 +303,21 @@ when the sys-035 and sys-036 checks pass on the final tree, the
 workspace tests, cargo fmt --check and clippy with warnings denied are
 clean, and every finding of the review and the report is resolved or
 declined.
+
+## permissions-page
+
+Requirements: SEARCH-019
+
+Rebuild the Properties Permissions page like Dolphin's. Owner, Group and
+Others each choose an access level; files get an Allow executing file as
+program checkbox; the owner shows by name and the group is chosen by name
+from the user's groups; Advanced Permissions shows the mode bits and the
+ACL entries; Varies marks what a selection does not share; Apply to
+contents follows the scope review; nothing changes before Apply, which
+runs through the operations queue; No Access on the user's own file can
+be undone; a filesystem without POSIX permissions gets a read-only page;
+and every string is localized. Changing the owner as administrator and
+editing ACL entries come later. Done when the search-019 check passes on
+the final tree, the workspace tests, cargo fmt --check and clippy with
+warnings denied are clean, and every finding of the review and the report
+is resolved or declined.
