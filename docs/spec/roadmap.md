@@ -339,3 +339,20 @@ installs no portals.conf. Done when the sys-027 check passes on the final
 tree, the workspace tests, cargo fmt --check and clippy with warnings
 denied are clean, and every finding of the review and the report is
 resolved or declined.
+
+## compact-broker-listings
+
+Requirements: SYS-034
+
+Let a listing of up to 64 MiB reach an elevated window whole (backlog
+item compact-broker-listings, elevated-session report finding 5). The
+broker sends each byte of a name as a JSON number, about four bytes for
+each byte, so a folder whose names total about 16 MiB is refused. Names
+and identities go as base64 text instead, so the 64 MiB bound counts
+close to what the folder holds. The broker counts the listing's size as
+it reads the folder and stops at 64 MiB without reading the rest, and
+the window says that the folder is too large to list as administrator,
+naming the limit, instead of a general failure. Done when the sys-034
+check passes on the final tree, the workspace tests, cargo fmt --check
+and clippy with warnings denied are clean, and every finding of the
+review and the report is resolved or declined.
