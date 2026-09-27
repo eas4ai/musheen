@@ -1,6 +1,0 @@
-# A checkout's own settings, such as where it builds, go in the untracked
-# config.local.toml beside this file.
-include = [{ path = "config.local.toml", optional = true }]
-
-[build]
-jobs = 8

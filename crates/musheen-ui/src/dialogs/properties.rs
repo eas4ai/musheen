@@ -4027,9 +4027,7 @@ mod tests {
 
     #[cfg(unix)]
     #[gpui_kit::test]
-    async fn permissions_page_shows_the_owner_by_name_and_offers_only_the_users_groups(
-        cx: &mut TestAppContext,
-    ) {
+    async fn permissions_page_offers_every_account_and_group(cx: &mut TestAppContext) {
         use std::os::unix::fs::MetadataExt;
 
         let temporary = tempfile::tempdir().unwrap();
@@ -4037,46 +4035,173 @@ mod tests {
         filesystem::write(&file, b"notes").unwrap();
         let (handle, _) = open_permissions_page(std::slice::from_ref(&file), None, cx);
         let user = command_output("/usr/bin/id", &["-un"]);
-        let groups = command_output("/usr/bin/id", &["-G"])
+        let ids = |database: &str| -> Vec<u32> {
+            command_output("/usr/bin/getent", &[database])
+                .lines()
+                .filter_map(|line| line.split(':').nth(2)?.parse().ok())
+                .collect()
+        };
+        let (users, groups) = (ids("passwd"), ids("group"));
+        assert!(users.contains(&0) && groups.contains(&0));
+        let own_groups = command_output("/usr/bin/id", &["-G"])
             .split_whitespace()
             .map(|gid| gid.parse::<u32>().unwrap())
             .collect::<Vec<_>>();
         let current = filesystem::metadata(&file).unwrap().gid();
         cx.update_window(handle.into(), |_, window, cx| {
             assert_eq!(
-                window.find("permissions-owner-name").label(),
+                window.find("permissions-owner-picker").label(),
                 Some(user.as_str())
             );
-            assert!(window.find("permissions-owner-needs-admin").visible());
-            assert!(
-                window.try_find("permissions-owner").is_none(),
-                "the owner is not editable"
-            );
+            window.click("permissions-owner-picker", cx);
+            window.render_frame(cx);
+            for uid in &users {
+                assert!(
+                    window
+                        .try_find(SharedString::from(format!(
+                            "permissions-owner-option-{uid}"
+                        )))
+                        .is_some(),
+                    "user {uid} is offered as the owner"
+                );
+            }
             window.click("permissions-group-picker", cx);
             window.render_frame(cx);
             for gid in &groups {
                 assert!(
                     window
-                        .find(SharedString::from(format!(
+                        .try_find(SharedString::from(format!(
                             "permissions-group-option-{gid}"
                         )))
-                        .visible()
+                        .is_some(),
+                    "group {gid} is offered"
                 );
             }
-            if !groups.contains(&0) {
-                assert!(window.try_find("permissions-group-option-0").is_none());
-            }
+            assert!(
+                window.try_find("permissions-needs-admin").is_none(),
+                "nothing chosen yet needs administrator rights"
+            );
         })
         .unwrap();
-        if let Some(other) = groups.iter().copied().find(|gid| *gid != current) {
+        // One of the user's own groups on their own file still applies
+        // without authorization, as before.
+        if let Some(other) = own_groups.iter().copied().find(|gid| *gid != current) {
             let option = format!("permissions-group-option-{other}");
             click_all(handle, &[option.as_str()], cx);
+            cx.update_window(handle.into(), |_, window, _| {
+                assert!(window.try_find("permissions-needs-admin").is_none());
+            })
+            .unwrap();
             let checked = file.clone();
             apply_until(handle, cx, move || {
                 filesystem::metadata(&checked).unwrap().gid() == other
             })
             .await;
         }
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_says_when_a_change_needs_administrator(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("notes.txt");
+        filesystem::write(&file, b"notes").unwrap();
+        let (handle, properties) = open_permissions_page(std::slice::from_ref(&file), None, cx);
+        let english = Catalog::load(crate::Locale::EnUs).unwrap();
+        let apply_as_administrator = english
+            .message("properties-apply-as-administrator")
+            .unwrap()
+            .to_owned();
+        let needs_admin = english
+            .message("permissions-needs-admin")
+            .unwrap()
+            .to_owned();
+        click_all(
+            handle,
+            &["permissions-owner-picker", "permissions-owner-option-0"],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, _| {
+            assert_eq!(
+                window.find("permissions-needs-admin").label(),
+                Some(needs_admin.as_str()),
+                "the page says the owner change needs administrator rights before Apply"
+            );
+            assert_eq!(
+                window.find("properties-apply").label(),
+                Some(apply_as_administrator.as_str())
+            );
+        })
+        .unwrap();
+        assert!(is_dirty(&properties, cx));
+        assert!(
+            owned_by_user(&file),
+            "choosing an owner changes nothing before Apply"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn change_ownership_review_shows_each_item_before_authorization(cx: &mut TestAppContext) {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first.txt");
+        let second = temporary.path().join("second.txt");
+        filesystem::write(&first, b"first").unwrap();
+        filesystem::write(&second, b"second").unwrap();
+        let (handle, _) = open_permissions_page(&[first.clone(), second.clone()], None, cx);
+        let user = command_output("/usr/bin/id", &["-un"]);
+        let group = command_output("/usr/bin/id", &["-gn"]);
+        let root_user = command_output("/usr/bin/getent", &["passwd", "0"])
+            .split(':')
+            .next()
+            .unwrap()
+            .to_owned();
+        let root_group = command_output("/usr/bin/getent", &["group", "0"])
+            .split(':')
+            .next()
+            .unwrap()
+            .to_owned();
+        click_all(
+            handle,
+            &[
+                "permissions-owner-picker",
+                "permissions-owner-option-0",
+                "permissions-group-picker",
+                "permissions-group-option-0",
+                "properties-apply",
+            ],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(
+                window.find("ownership-review").visible(),
+                "Apply as Administrator shows the review before it asks for authorization"
+            );
+            for (index, path) in [&first, &second].into_iter().enumerate() {
+                let row = window
+                    .find(SharedString::from(format!("ownership-review-item-{index}")))
+                    .label()
+                    .unwrap_or_default()
+                    .to_owned();
+                for part in [
+                    path.display().to_string(),
+                    user.clone(),
+                    group.clone(),
+                    root_user.clone(),
+                    root_group.clone(),
+                ] {
+                    assert!(row.contains(&part), "{row:?} names {part:?}");
+                }
+            }
+            window.click("ownership-review-cancel", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("ownership-review").is_none());
+        })
+        .unwrap();
+        assert!(
+            owned_by_user(&first) && owned_by_user(&second),
+            "Cancel changes nothing"
+        );
     }
 
     #[cfg(unix)]
@@ -4372,18 +4497,22 @@ mod tests {
                 accounts,
                 &CapabilityState::Supported,
             );
-            assert!(!permissions.group_editable(), "{other:?} is another user's");
-            let groups = permissions.accounts().user_groups().to_vec();
-            for (gid, _) in groups {
-                permissions.set_group(gid);
-            }
             permissions.set_access(AccessClass::Others, Access::None);
             let expected = other.is_dir().then_some(crate::ModeLock::NotOwner);
             assert_eq!(permissions.mode_lock(), expected, "{other:?}");
             assert_eq!(
                 permissions.is_dirty(),
                 expected.is_none(),
-                "only the user's own file may change"
+                "a mode change reaches only the user's own items"
+            );
+            assert!(
+                permissions.group_editable(),
+                "{other:?}: another user's item takes a group as administrator"
+            );
+            permissions.set_group(0);
+            assert!(
+                permissions.is_dirty(),
+                "{other:?}: the group changes as administrator"
             );
         }
     }
