@@ -922,3 +922,30 @@ fn elevated_session_pages_each_listing_from_its_own_snapshot() {
         );
     }
 }
+
+// SYS-037: owner and group changes as administrator.
+
+#[test]
+fn change_ownership_policy_always_asks_for_an_administrator_password() {
+    let policy = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packaging/polkit/org.musheen.Musheen.policy"
+    ))
+    .unwrap();
+    let action = policy
+        .split("<action id=\"org.musheen.change-ownership-as-administrator\">")
+        .nth(1)
+        .expect("the policy declares the change-ownership action");
+    let action = &action[..action.find("</action>").unwrap()];
+    for rule in [
+        "<allow_any>no</allow_any>",
+        "<allow_inactive>no</allow_inactive>",
+        "<allow_active>auth_admin</allow_active>",
+    ] {
+        assert!(action.contains(rule), "the action has {rule}");
+    }
+    assert!(
+        musheen_desktop::privilege::ADMIN_ACTION_IDS
+            .contains(&"org.musheen.change-ownership-as-administrator")
+    );
+}
