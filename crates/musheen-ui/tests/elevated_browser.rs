@@ -528,6 +528,31 @@ fn elevated_session_lists_more_than_the_pipe_holds() {
 }
 
 #[test]
+fn elevated_session_lists_long_names_up_to_the_limit() {
+    // 64,000 names of 255 bytes, about 16 MiB of names: a listing that
+    // sends each byte of a name as a JSON number passes 64 MiB.
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..64_000 {
+        fs::File::create(root.path().join(format!("{index:05}{}", "x".repeat(250)))).unwrap();
+    }
+    for provider in PROVIDERS {
+        let fake = FakeElevation::new(provider, IDLE);
+        let backend = fake.backend();
+        let (store, _session) = open_window(&fake, &backend, root.path());
+
+        let started = std::time::Instant::now();
+        let names = list_all(&store, root.path(), 1_000)
+            .unwrap_or_else(|error| panic!("{provider:?} lists 64,000 long names: {error}"));
+        assert_eq!(names.len(), 64_000, "{provider:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{provider:?} took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[test]
 fn elevated_session_lists_a_folder_whose_path_fits_the_limit() {
     for provider in PROVIDERS {
         let fake = FakeElevation::new(provider, IDLE);
