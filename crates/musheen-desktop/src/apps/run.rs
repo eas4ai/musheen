@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 /// What the file at `path` could run as, read from its first bytes: a
@@ -158,18 +159,110 @@ fn open_file_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
+/// What the open `file`, named `path`, could run as. A desktop entry is
+/// looked for first: its parser skips comment lines, so one may start with
+/// `#!`. A compiled program must be an ELF executable for this machine, and
+/// a script's `#!` line must name an interpreter the user may execute, so
+/// the kernel starts either one itself; a file it would refuse is never
+/// left to the shell the C library falls back to (SYS-035, SYS-036).
 fn kind_of(file: &File, path: &Path) -> Option<RunKind> {
-    let mut start = [0_u8; 4];
-    let read = rustix::io::pread(file, &mut start, 0).ok()?;
-    let start = &start[..read];
-    if start.starts_with(b"\x7fELF") {
-        return Some(RunKind::Program);
-    }
-    if start.starts_with(b"#!") {
-        return Some(RunKind::Script);
-    }
     let desktop = path
         .extension()
         .is_some_and(|extension| extension == "desktop");
-    (desktop && application_from_open_file(file, path).is_some()).then_some(RunKind::DesktopEntry)
+    if desktop && application_from_open_file(file, path).is_some() {
+        return Some(RunKind::DesktopEntry);
+    }
+    let mut start = [0_u8; INTERPRETER_LINE_BYTES];
+    let read = rustix::io::pread(file, &mut start, 0).ok()?;
+    let start = &start[..read];
+    if native_elf(start) {
+        return Some(RunKind::Program);
+    }
+    runnable_script(start).then_some(RunKind::Script)
+}
+
+/// The most of a `#!` line the kernel reads.
+const INTERPRETER_LINE_BYTES: usize = 256;
+
+/// Whether `header`, a file's first bytes, is an ELF executable or shared
+/// object the kernel loads on this machine: this build's class, byte order
+/// and machine, ELF version 1, type ET_EXEC or ET_DYN, and program headers
+/// of the native entry size.
+fn native_elf(header: &[u8]) -> bool {
+    const CLASS: u8 = if cfg!(target_pointer_width = "64") {
+        2
+    } else {
+        1
+    };
+    const DATA: u8 = if cfg!(target_endian = "little") { 1 } else { 2 };
+    const MACHINE: u16 = if cfg!(target_arch = "x86_64") {
+        62
+    } else if cfg!(target_arch = "aarch64") {
+        183
+    } else if cfg!(target_arch = "riscv64") {
+        243
+    } else if cfg!(target_arch = "x86") {
+        3
+    } else if cfg!(target_arch = "arm") {
+        40
+    } else {
+        0
+    };
+    let (size, entry_size, type_at, machine_at, entry_size_at, count_at) = if CLASS == 2 {
+        (64, 56, 16, 18, 54, 56)
+    } else {
+        (52, 32, 16, 18, 42, 44)
+    };
+    if MACHINE == 0
+        || header.len() < size
+        || !header.starts_with(b"\x7fELF")
+        || header[4] != CLASS
+        || header[5] != DATA
+        || header[6] != 1
+    {
+        return false;
+    }
+    let half = |at: usize| {
+        let bytes = [header[at], header[at + 1]];
+        if DATA == 1 {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    };
+    matches!(half(type_at), 2 | 3)
+        && half(machine_at) == MACHINE
+        && half(entry_size_at) == entry_size
+        && half(count_at) > 0
+}
+
+/// Whether `start` begins with a `#!` line that names, by an absolute path,
+/// an interpreter that is a regular file the current user may execute.
+fn runnable_script(start: &[u8]) -> bool {
+    let Some(line) = start
+        .strip_prefix(b"#!")
+        .and_then(|rest| rest.split(|byte| *byte == b'\n').next())
+        .filter(|_| start.contains(&b'\n'))
+    else {
+        return false;
+    };
+    let interpreter = line
+        .split(|byte| *byte == b' ' || *byte == b'\t')
+        .find(|word| !word.is_empty());
+    let Some(interpreter) = interpreter.filter(|word| word.first() == Some(&b'/')) else {
+        return false;
+    };
+    let interpreter = Path::new(std::ffi::OsStr::from_bytes(interpreter));
+    interpreter.is_file() && rustix::fs::access(interpreter, Access::EXEC_OK).is_ok()
+}
+
+/// Whether `path` names a regular file with any execute bit set, whoever may
+/// use it. Run as Administrator is offered for such a file even when only
+/// root may execute it.
+#[must_use]
+pub fn marked_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }

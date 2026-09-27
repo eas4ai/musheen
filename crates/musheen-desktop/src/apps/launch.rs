@@ -169,19 +169,15 @@ pub struct SystemProcessRunner;
 
 impl ProcessRunner for SystemProcessRunner {
     fn spawn(&self, launch: &PreparedLaunch) -> io::Result<()> {
-        // A checked program runs from its open file, through a duplicate the
-        // child inherits (a duplicate has no close-on-exec flag), so a file
-        // put at its path after the check cannot run. A child another thread
-        // starts at the same moment may inherit the duplicate too; it only
-        // holds the program's file open for reading.
-        let inherited = launch
-            .checked
-            .as_ref()
-            .map(|checked| rustix::io::dup(&*checked.0).map_err(io::Error::from))
-            .transpose()?;
-        let mut command = match &inherited {
-            Some(file) => {
-                let mut command = Command::new(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        // A checked program runs from its open file, so a file put at its
+        // path after the check cannot run. The kernel opens /proc/self/fd/N
+        // before it closes close-on-exec descriptors, so the checked
+        // descriptor keeps its close-on-exec flag: it does not leak into the
+        // program, and a shell the C library might fall back to for a file
+        // the kernel refuses finds it closed and runs nothing.
+        let mut command = match &launch.checked {
+            Some(checked) => {
+                let mut command = Command::new(format!("/proc/self/fd/{}", checked.0.as_raw_fd()));
                 command.arg0(&launch.program);
                 command
             }

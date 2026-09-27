@@ -611,10 +611,11 @@ fn is_presentable(
         | CommandPredicate::DestinationMove
         | CommandPredicate::DestinationExtract
         | CommandPredicate::ProviderAction(_) => true,
-        // Run in Terminal stays, disabled, for a script or compiled program
-        // the user may not execute, so its reason says how to allow it
-        // (SYS-036); `is_presentable` above already requires such a file.
-        CommandPredicate::TerminalRun => true,
+        // Run and Run in Terminal stay, disabled, for a file they apply to
+        // that the preference or the file's permissions hold back, so the
+        // reason shows (SYS-035, SYS-036); `is_presentable` above already
+        // requires such a file.
+        CommandPredicate::ExecutableRun | CommandPredicate::TerminalRun => true,
         CommandPredicate::PinnedDirectory => request.context().target_is_pinned,
         CommandPredicate::UnpinnedDirectory => !request.context().target_is_pinned,
         _ => false,

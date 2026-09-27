@@ -160,6 +160,34 @@ impl TerminalSession {
             .map_err(|error| TerminalError::Io(error.to_string().into()))
     }
 
+    /// Stops the child: a hangup first, as closing a terminal sends; then,
+    /// if the child still leads its process group two seconds later, SIGKILL
+    /// to that group, so a program that ignores the hangup does not keep
+    /// running out of view.
+    pub fn stop(&mut self) {
+        let _ = self.terminate();
+        let Some(pid) = self.child_pid.and_then(|pid| i32::try_from(pid).ok()) else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("musheen-terminal-stop".to_owned())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if leads_live_process_group(pid)
+                    && let Some(group) = rustix::process::Pid::from_raw(pid)
+                {
+                    let _ =
+                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                }
+            });
+    }
+
+    /// The child's process ID, while it is known.
+    #[must_use]
+    pub const fn process_id(&self) -> Option<u32> {
+        self.child_pid
+    }
+
     pub fn restart(&mut self) -> Result<(), TerminalError> {
         let _ = self.terminate();
         let replacement = Self::spawn_inner(self.profile.clone(), self.cwd.clone(), self.size)?;
@@ -190,6 +218,21 @@ impl TerminalSession {
         let foreground_group = fields.get(5).and_then(|value| value.parse::<i64>().ok());
         matches!((process_group, foreground_group), (Some(shell), Some(active)) if active > 0 && active != shell)
     }
+}
+
+/// Whether process `pid` still runs, not yet reaped or a zombie, and leads its
+/// own process group, so its group may be signalled without reaching a
+/// process that took over a reused ID.
+fn leads_live_process_group(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let fields = fields.split_whitespace().collect::<Vec<_>>();
+    fields.first() != Some(&"Z")
+        && fields.get(2).and_then(|group| group.parse::<i32>().ok()) == Some(pid)
 }
 
 impl Drop for TerminalSession {

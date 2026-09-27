@@ -43,6 +43,7 @@ fn supported_context(target: CommandTarget, selected: usize) -> CommandContext {
         has_dot_name_semantics: true,
         executable_run_enabled: true,
         run_kind: (target == CommandTarget::ExecutableFile).then_some(RunKind::Program),
+        user_may_execute: target == CommandTarget::ExecutableFile,
         capabilities: CapabilityMatrix::new(|_| CapabilityState::Supported),
         provider_actions: ProviderActionMatrix::from_states(
             CapabilityState::Supported,

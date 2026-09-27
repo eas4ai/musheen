@@ -138,6 +138,10 @@ pub struct CommandContext {
     pub executable_run_enabled: bool,
     /// What the single selected local file could run as, when known.
     pub run_kind: Option<RunKind>,
+    /// Whether the kernel's execute check lets the current user execute the
+    /// single selected file (SYS-035). `ExecutableFile` means only that the
+    /// file has an execute bit, as Run as Administrator needs.
+    pub user_may_execute: bool,
     pub supports_provider_uris: bool,
     pub capabilities: CapabilityMatrix,
     pub provider_actions: ProviderActionMatrix,
@@ -180,6 +184,7 @@ impl Default for CommandContext {
             target_is_pinned: false,
             executable_run_enabled: false,
             run_kind: None,
+            user_may_execute: false,
             supports_provider_uris: false,
             capabilities: CapabilityMatrix::new(|_| {
                 CapabilityState::Unknown(
