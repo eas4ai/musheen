@@ -25765,6 +25765,10 @@ mod tests {
                 &self.root
             }
 
+            fn is_open(&self) -> bool {
+                true
+            }
+
             fn read_directory<'a>(
                 &'a self,
                 root: ElevatedRootReference,

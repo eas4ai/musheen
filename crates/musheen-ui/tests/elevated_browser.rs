@@ -4,7 +4,7 @@ use musheen_desktop::privilege::{
     AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker, BrokerLaunch,
     BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, ELEVATED_SESSION_IDLE,
     ElevatedRootReference, NoopAudit, ProcessBrokerTransport, RequestLines, SUDO_BROKER_READY,
-    SudoPtyBrokerTransport, SystemClock, SystemOperationRunner, decode_broker_request,
+    SudoPtyBrokerTransport, SystemClock, SystemOperationRunner, boot_clock, decode_broker_request,
     prepare_sudo_terminal, serve_session, write_response,
 };
 use musheen_desktop::{Clock, PrivilegeProvider, RootGrant, RootedStore};
@@ -114,6 +114,8 @@ const BROKER_ARGUMENTS: &str = "MUSHEEN_SESSION_BROKER_ARGUMENTS";
 const BROKER_PIDS: &str = "MUSHEEN_SESSION_BROKER_PIDS";
 const BROKER_IDLE_MILLIS: &str = "MUSHEEN_SESSION_BROKER_IDLE_MILLIS";
 const BROKER_PROBES: &str = "MUSHEEN_SESSION_BROKER_PROBES";
+const BROKER_LISTINGS: &str = "MUSHEEN_SESSION_BROKER_LISTINGS";
+const BROKER_SUSPEND: &str = "MUSHEEN_SESSION_BROKER_SUSPEND";
 const PASSWORD: &[u8] = b"correct horse";
 
 /// Allows the invoking user, as pkexec or sudo does once it authenticated.
@@ -246,8 +248,43 @@ fn elevated_session_broker_child() {
         ),
     )
     .unwrap();
+    // Each listing is counted. With BROKER_SUSPEND, the machine is suspended
+    // as the first listing arrives: the boot clock jumps past the idle limit
+    // while the monotonic clock does not move.
+    let listings = std::env::var(BROKER_LISTINGS).ok();
+    let suspend = std::env::var(BROKER_SUSPEND).is_ok_and(|value| value == "1");
+    let suspended = std::sync::atomic::AtomicBool::new(false);
+    let session_bind = |request: &mut BrokerRequest| {
+        if let Some(listings) = &listings {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(listings)
+                .unwrap();
+            writeln!(file, "listing").unwrap();
+        }
+        if suspend {
+            suspended.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        bind(request)
+    };
+    let clock = || {
+        if suspended.load(std::sync::atomic::Ordering::SeqCst) {
+            boot_clock() + ELEVATED_SESSION_IDLE + Duration::from_secs(60)
+        } else {
+            boot_clock()
+        }
+    };
     if let Ok(BrokerOutput::RootReferenced(root)) = opened {
-        serve_session(&broker, &root, &requests, &mut output, &bind, idle);
+        serve_session(
+            &broker,
+            &root,
+            &requests,
+            &mut output,
+            &session_bind,
+            idle,
+            &clock,
+        );
     }
 }
 
@@ -269,20 +306,33 @@ struct FakeElevation {
 
 impl FakeElevation {
     fn new(provider: PrivilegeProvider, idle: Duration) -> Self {
+        Self::with_suspend(provider, idle, false)
+    }
+
+    /// A fake whose broker sees the machine suspended past its idle limit
+    /// right after its first listing.
+    fn suspending(provider: PrivilegeProvider) -> Self {
+        Self::with_suspend(provider, IDLE, true)
+    }
+
+    fn with_suspend(provider: PrivilegeProvider, idle: Duration, suspend: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let runs = directory.path().join("runs");
         let pids = directory.path().join("pids");
         let probes = directory.path().join("probes");
+        let listings = directory.path().join("listings");
         let broker = executable_script(
             directory.path(),
             "broker",
             &format!(
                 "{BROKER_ARGUMENTS}=\"$*\" {BROKER_PIDS}='{}' {BROKER_PROBES}='{}' \
-                 {BROKER_IDLE_MILLIS}='{}' '{}' \
+                 {BROKER_LISTINGS}='{}' {BROKER_SUSPEND}='{}' {BROKER_IDLE_MILLIS}='{}' '{}' \
                  elevated_session_broker_child --exact --nocapture --test-threads=1 \
                  | /usr/bin/grep --line-buffered -o 'MUSHEEN_.*'",
                 pids.display(),
                 probes.display(),
+                listings.display(),
+                if suspend { "1" } else { "0" },
                 idle.as_millis(),
                 std::env::current_exe().unwrap().display(),
             ),
@@ -334,6 +384,13 @@ impl FakeElevation {
         fs::read_to_string(self.directory.path().join("pids"))
             .map(|pids| pids.lines().map(|pid| pid.parse().unwrap()).collect())
             .unwrap_or_default()
+    }
+
+    /// How many folder listings the brokers served.
+    fn listings(&self) -> usize {
+        fs::read_to_string(self.directory.path().join("listings"))
+            .map(|listings| listings.lines().count())
+            .unwrap_or(0)
     }
 
     /// What the brokers' probes found, one `probe=result` line each.
@@ -581,10 +638,20 @@ fn elevated_session_ends_with_its_window_and_after_idle() {
             "{provider:?}: the broker stops within 5 seconds of its window closing"
         );
 
+        for index in 0..3 {
+            fs::write(root.path().join(format!("{index}.txt")), b"").unwrap();
+        }
         let fake = FakeElevation::new(provider, Duration::from_millis(500));
         let backend = fake.backend();
         let (store, _session) = open_window(&fake, &backend, root.path());
         list_all(&store, root.path(), 100).unwrap();
+        let location = StorePath::from_unix_path(root.path().as_os_str());
+        let first = futures_lite::future::block_on(store.read_directory(
+            &location,
+            PageRequest::new(2, None).unwrap(),
+            CancellationToken::new(),
+        ))
+        .unwrap();
         std::thread::sleep(Duration::from_millis(1_500));
         let expired = list_all(&store, root.path(), 100);
         assert!(
@@ -593,6 +660,176 @@ fn elevated_session_ends_with_its_window_and_after_idle() {
                 .is_err_and(|error| error.to_string().contains("authorization expired")),
             "{provider:?}: an idle broker serves nothing: {expired:?}"
         );
+        let continued = futures_lite::future::block_on(store.read_directory(
+            &location,
+            first.next_request().expect("a second page"),
+            CancellationToken::new(),
+        ));
+        assert!(
+            continued
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("authorization expired")),
+            "{provider:?}: a fetched listing's later pages end with the session: {:?}",
+            continued.map(|page| page.items().len())
+        );
         assert_eq!(fake.runs(), 1, "{provider:?}");
+    }
+}
+
+#[test]
+fn elevated_session_counts_idle_time_across_a_suspend() {
+    for provider in PROVIDERS {
+        let fake = FakeElevation::suspending(provider);
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        let (store, _session) = open_window(&fake, &backend, root.path());
+        list_all(&store, root.path(), 100).unwrap();
+
+        // The machine was suspended past the idle limit after that listing.
+        let after = list_all(&store, root.path(), 100);
+        assert!(
+            after
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("authorization expired")),
+            "{provider:?}: a broker idle across a suspend serves nothing: {after:?}"
+        );
+        assert_eq!(fake.runs(), 1, "{provider:?}");
+    }
+}
+
+#[test]
+fn elevated_session_keeps_reading_after_a_cancelled_listing() {
+    for provider in PROVIDERS {
+        let fake = FakeElevation::new(provider, Duration::from_secs(1));
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..5_000 {
+            fs::write(
+                root.path().join(format!(
+                    "a-file-with-a-long-name-for-the-listing-{index:05}"
+                )),
+                b"",
+            )
+            .unwrap();
+        }
+        let (_store, session) = open_window(&fake, &backend, root.path());
+        let brokers = fake.broker_pids();
+
+        // Cancelled once sent: its answer, larger than the socket or terminal
+        // buffers, is never asked for.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let answer = futures_lite::future::block_on(session.read_directory(
+            session.root_reference().clone(),
+            PathBuf::new(),
+            cancelled,
+        ));
+        assert!(answer.is_err(), "{provider:?}");
+
+        // The broker still delivers the answer, goes idle and ends.
+        let cancelled_at = std::time::Instant::now();
+        while brokers.iter().any(|pid| running(*pid))
+            && cancelled_at.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !brokers.iter().any(|pid| running(*pid)),
+            "{provider:?}: a cancelled listing leaves the broker able to go idle"
+        );
+    }
+}
+
+#[test]
+fn elevated_session_holds_its_granted_folder() {
+    for provider in PROVIDERS {
+        let fake = FakeElevation::new(provider, IDLE);
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        let (store, _session) = open_window(&fake, &backend, root.path());
+        list_all(&store, root.path(), 100).unwrap();
+
+        // An open descriptor keeps the folder's inode allocated, so a folder
+        // created again at its path cannot take its inode number.
+        let held = fake.broker_pids().iter().any(|pid| {
+            fs::read_dir(format!("/proc/{pid}/fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|descriptor| {
+                    fs::read_link(descriptor.path()).is_ok_and(|target| target == root.path())
+                })
+        });
+        assert!(
+            held,
+            "{provider:?}: the broker holds the granted folder open"
+        );
+    }
+}
+
+#[test]
+fn elevated_session_pages_each_listing_from_its_own_snapshot() {
+    for provider in PROVIDERS {
+        let fake = FakeElevation::new(provider, IDLE);
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        for folder in ["a", "b"] {
+            fs::create_dir(root.path().join(folder)).unwrap();
+            for index in 0..25 {
+                fs::write(
+                    root.path()
+                        .join(folder)
+                        .join(format!("{folder}-{index:02}")),
+                    b"",
+                )
+                .unwrap();
+            }
+        }
+        let (store, _session) = open_window(&fake, &backend, root.path());
+
+        // Two tabs page through two folders in turn; a file added after
+        // their first pages belongs to neither listing.
+        let locations = ["a", "b"]
+            .map(|folder| StorePath::from_unix_path(root.path().join(folder).into_os_string()));
+        let mut requests = [0, 1].map(|_| Some(PageRequest::new(10, None).unwrap()));
+        let mut names = [Vec::new(), Vec::new()];
+        let mut first_round = true;
+        while requests.iter().any(Option::is_some) {
+            for ((request, location), names) in
+                requests.iter_mut().zip(&locations).zip(names.iter_mut())
+            {
+                let Some(pending) = request.take() else {
+                    continue;
+                };
+                let page = futures_lite::future::block_on(store.read_directory(
+                    location,
+                    pending,
+                    CancellationToken::new(),
+                ))
+                .unwrap_or_else(|error| panic!("{provider:?} pages {location:?}: {error}"));
+                names.extend(
+                    page.items()
+                        .iter()
+                        .map(|item| item.display_name().as_str().to_owned()),
+                );
+                *request = page.next_request();
+            }
+            if first_round {
+                fs::write(root.path().join("a").join("a-added"), b"").unwrap();
+                first_round = false;
+            }
+        }
+        for (index, folder) in ["a", "b"].into_iter().enumerate() {
+            names[index].sort();
+            let expected = (0..25)
+                .map(|entry| format!("{folder}-{entry:02}"))
+                .collect::<Vec<_>>();
+            assert_eq!(names[index], expected, "{provider:?}");
+        }
+        assert_eq!(
+            fake.listings(),
+            2,
+            "{provider:?}: one listing for each folder, whatever the paging order"
+        );
     }
 }

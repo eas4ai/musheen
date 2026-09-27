@@ -3,7 +3,7 @@ use musheen_desktop::privilege::{
     AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker,
     BrokerOperation, BrokerOutput, BrokerRequest, BrokerResponse, ELEVATED_SESSION_IDLE,
     JsonAuditLog, PrivilegeProvider, RequestLines, SUDO_BROKER_READY, SystemClock,
-    SystemOperationRunner, decode_broker_request, prepare_sudo_terminal, serve_session,
+    SystemOperationRunner, boot_clock, decode_broker_request, prepare_sudo_terminal, serve_session,
     write_response,
 };
 use std::io::Write as _;
@@ -119,6 +119,7 @@ fn main() {
                     &mut stdout,
                     &bind,
                     ELEVATED_SESSION_IDLE,
+                    &boot_clock,
                 );
             }
             // The input thread may still wait on stdin.

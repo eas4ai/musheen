@@ -410,9 +410,12 @@ impl JsonAuditLog {
 
 impl AuditSink for JsonAuditLog {
     fn record(&self, record: &AuditRecord) -> Result<(), BrokerError> {
+        // One write per record: brokers of several windows append to the same
+        // log, and a session broker can end the process between two writes.
+        let mut line = serde_json::to_vec(record).map_err(|_| BrokerError::AuditFailed)?;
+        line.push(b'\n');
         let mut file = self.file.lock().map_err(|_| BrokerError::AuditFailed)?;
-        serde_json::to_writer(&mut *file, record).map_err(|_| BrokerError::AuditFailed)?;
-        file.write_all(b"\n")
+        file.write_all(&line)
             .and_then(|()| file.sync_data())
             .map_err(|_| BrokerError::AuditFailed)
     }

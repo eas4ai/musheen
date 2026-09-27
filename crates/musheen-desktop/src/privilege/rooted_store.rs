@@ -38,6 +38,18 @@ impl ElevatedRootReference {
         &self.root
     }
 
+    /// Opens the root and checks that it is still the folder this reference
+    /// names. While the returned file stays open, the folder's inode stays
+    /// allocated, so no folder created later can take its inode number.
+    pub fn hold(&self) -> Result<File, BrokerError> {
+        let file = open_absolute_no_symlinks(&self.root, true)?;
+        let metadata = file.metadata().map_err(|_| BrokerError::Io)?;
+        if metadata.dev() != self.device || metadata.ino() != self.inode {
+            return Err(BrokerError::TargetReplaced);
+        }
+        Ok(file)
+    }
+
     #[must_use]
     pub fn identity(&self) -> [u8; 16] {
         let mut identity = [0_u8; 16];

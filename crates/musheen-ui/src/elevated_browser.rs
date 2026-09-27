@@ -9,6 +9,7 @@ use musheen_desktop::{
     BrokerTransport, Clock, ElevatedRootReference, INSTALLED_BROKER_PATH, PrivilegeProvider,
     ProcessBrokerTransport, RootedEntryKind, RootedStore, SecretBuffer, SudoPtyBrokerTransport,
 };
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
@@ -82,9 +83,74 @@ pub struct RootedFilesystemStore<C> {
     root_identity: Box<[u8]>,
     store: Option<Arc<RootedStore<C>>>,
     session: Option<Arc<dyn ElevatedSession>>,
-    /// The last listing fetched through the session, which serves that
-    /// folder's later pages without asking the broker again.
-    listing: Mutex<Option<(PathBuf, Arc<[ListedEntry]>)>>,
+    /// Listings fetched through the session whose later pages are still to
+    /// be served.
+    listings: Mutex<SessionListings>,
+}
+
+/// How many session listings a window keeps for their later pages. Each is
+/// dropped once its last page is served, so only listings still loading, or
+/// left unfinished by a closed tab, count.
+const OPEN_LISTINGS: usize = 8;
+
+/// The session listings of one elevated window, oldest first. A listing's
+/// continuation names its generation and offset, so all its pages come from
+/// the snapshot its first page fetched, whatever other tabs list meanwhile.
+#[derive(Default)]
+struct SessionListings {
+    next_generation: u64,
+    open: VecDeque<(u64, PathBuf, Arc<[ListedEntry]>)>,
+}
+
+impl SessionListings {
+    fn find(&self, generation: u64, folder: &Path) -> Option<Arc<[ListedEntry]>> {
+        self.open
+            .iter()
+            .find(|(open, listed, _)| *open == generation && listed == folder)
+            .map(|(_, _, entries)| Arc::clone(entries))
+    }
+
+    /// Keeps a listing whose later pages will be asked for.
+    fn keep(&mut self, generation: u64, folder: &Path, entries: &Arc<[ListedEntry]>) {
+        if self.open.iter().any(|(open, _, _)| *open == generation) {
+            return;
+        }
+        if self.open.len() == OPEN_LISTINGS {
+            self.open.pop_front();
+        }
+        self.open
+            .push_back((generation, folder.to_path_buf(), Arc::clone(entries)));
+    }
+
+    fn drop_listing(&mut self, generation: u64) {
+        self.open.retain(|(open, _, _)| *open != generation);
+    }
+}
+
+/// A session listing's continuation: its generation, then the offset of the
+/// next page, each as eight big-endian bytes.
+fn session_continuation(generation: u64, offset: usize) -> musheen_core::Continuation {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&generation.to_be_bytes());
+    bytes[8..].copy_from_slice(&(offset as u64).to_be_bytes());
+    musheen_core::Continuation::new(bytes.to_vec())
+        .expect("a 16-byte continuation fits the continuation limit")
+}
+
+fn decode_session_continuation(
+    continuation: &musheen_core::Continuation,
+) -> Result<(u64, usize), StoreError> {
+    let bytes: [u8; 16] = continuation
+        .as_bytes()
+        .try_into()
+        .map_err(|_| StoreError::InvalidContinuation)?;
+    let (generation, offset) = bytes.split_at(8);
+    let generation = u64::from_be_bytes(generation.try_into().expect("eight bytes"));
+    let offset = u64::from_be_bytes(offset.try_into().expect("eight bytes"));
+    Ok((
+        generation,
+        usize::try_from(offset).map_err(|_| StoreError::InvalidContinuation)?,
+    ))
 }
 
 impl<C: Clock> RootedFilesystemStore<C> {
@@ -98,7 +164,7 @@ impl<C: Clock> RootedFilesystemStore<C> {
             root_identity,
             store: Some(Arc::new(store)),
             session: None,
-            listing: Mutex::new(None),
+            listings: Mutex::new(SessionListings::default()),
         }
     }
 
@@ -112,29 +178,38 @@ impl<C: Clock> RootedFilesystemStore<C> {
             root: root_reference.root().to_path_buf(),
             root_identity: root_reference.identity().to_vec().into_boxed_slice(),
             store: None,
-            listing: Mutex::new(None),
+            listings: Mutex::new(SessionListings::default()),
             session: Some(session),
         }
     }
 
-    /// Lists `relative` through the session. A continuation page of the
-    /// folder listed last comes from that listing.
+    /// The listing a page of `relative` comes from, its generation, and the
+    /// page's offset. A first page fetches a new listing through the
+    /// session; a later page comes from the listing its continuation names,
+    /// while the session is still open.
     async fn session_listing(
         &self,
         session: &Arc<dyn ElevatedSession>,
         relative: &Path,
-        continued: bool,
+        continuation: Option<&musheen_core::Continuation>,
         cancellation: CancellationToken,
-    ) -> Result<Arc<[ListedEntry]>, StoreError> {
-        if continued
-            && let Some((listed, entries)) = self
-                .listing
+    ) -> Result<(u64, Arc<[ListedEntry]>, usize), StoreError> {
+        if let Some(continuation) = continuation {
+            let (generation, offset) = decode_session_continuation(continuation)?;
+            if !session.is_open() {
+                return Err(Self::map_error(BrokerError::AuthorizationExpired));
+            }
+            let entries = self
+                .listings
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-            && listed == relative
-        {
-            return Ok(Arc::clone(entries));
+                .find(generation, relative)
+                .ok_or_else(|| {
+                    StoreError::Backend(
+                        "the elevated listing is no longer held; reload the folder".into(),
+                    )
+                })?;
+            return Ok((generation, entries, offset));
         }
         let entries = session
             .read_directory(
@@ -155,9 +230,10 @@ impl<C: Clock> RootedFilesystemStore<C> {
                 )
             })
             .collect::<Arc<[_]>>();
-        *self.listing.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((relative.to_path_buf(), Arc::clone(&entries)));
-        Ok(entries)
+        let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+        let generation = listings.next_generation;
+        listings.next_generation += 1;
+        Ok((generation, entries, 0))
     }
 
     #[must_use]
@@ -239,8 +315,10 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
         Box::pin(async move {
             cancellation.check()?;
             let relative = self.relative(location)?;
-            let entries: Arc<[ListedEntry]> = if let Some(store) = &self.store {
-                store
+            // A session listing names its generation in its continuation; a
+            // listing of the local store pages by offset alone.
+            let (generation, entries, offset) = if let Some(store) = &self.store {
+                let entries: Arc<[ListedEntry]> = store
                     .read_directory(&relative)
                     .map_err(Self::map_error)?
                     .into_iter()
@@ -253,24 +331,27 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
                             entry.modified_unix_seconds(),
                         )
                     })
-                    .collect()
+                    .collect();
+                let offset = request
+                    .continuation()
+                    .map_or(Ok(0), musheen_core::Continuation::decode_usize)?;
+                (None, entries, offset)
             } else {
                 let session = self
                     .session
                     .as_ref()
                     .ok_or_else(|| StoreError::Backend("missing elevated broker".into()))?;
-                self.session_listing(
-                    session,
-                    &relative,
-                    request.continuation().is_some(),
-                    cancellation.clone(),
-                )
-                .await?
+                let (generation, entries, offset) = self
+                    .session_listing(
+                        session,
+                        &relative,
+                        request.continuation(),
+                        cancellation.clone(),
+                    )
+                    .await?;
+                (Some(generation), entries, offset)
             };
             let total = entries.len();
-            let offset = request
-                .continuation()
-                .map_or(Ok(0), musheen_core::Continuation::decode_usize)?;
             if offset > total {
                 return Err(StoreError::InvalidContinuation);
             }
@@ -303,8 +384,19 @@ impl<C: Clock> Store for RootedFilesystemStore<C> {
                 })
                 .collect::<Vec<_>>();
             let next_offset = offset.saturating_add(items.len());
-            let next =
-                (next_offset < total).then(|| musheen_core::Continuation::from_usize(next_offset));
+            let more = next_offset < total;
+            let next = match generation {
+                None => more.then(|| musheen_core::Continuation::from_usize(next_offset)),
+                Some(generation) => {
+                    let mut listings = self.listings.lock().unwrap_or_else(PoisonError::into_inner);
+                    if more {
+                        listings.keep(generation, &relative, &entries);
+                    } else {
+                        listings.drop_listing(generation);
+                    }
+                    more.then(|| session_continuation(generation, next_offset))
+                }
+            };
             Page::try_new(&request, items, next, TotalHint::Exact(total as u64))
         })
     }
@@ -379,6 +471,10 @@ impl ElevatedChrome<'_> {
 pub trait ElevatedSession: Send + Sync + 'static {
     fn root_reference(&self) -> &ElevatedRootReference;
 
+    /// Whether the session still serves listings. A session whose broker
+    /// ended, on its own or after a failure, is not open.
+    fn is_open(&self) -> bool;
+
     fn read_directory<'a>(
         &'a self,
         root: ElevatedRootReference,
@@ -390,6 +486,10 @@ pub trait ElevatedSession: Send + Sync + 'static {
 impl ElevatedSession for BrokerSession {
     fn root_reference(&self) -> &ElevatedRootReference {
         BrokerSession::root_reference(self)
+    }
+
+    fn is_open(&self) -> bool {
+        BrokerSession::is_open(self)
     }
 
     fn read_directory<'a>(
