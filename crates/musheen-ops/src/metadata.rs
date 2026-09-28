@@ -458,18 +458,25 @@ impl MetadataChange {
         let group = self
             .group
             .filter(|group| entry.current_group != Some(*group));
+        let access_acl = (kind != MetadataEntryKind::SymbolicLink)
+            .then(|| self.access_acl.as_ref().map(|acl| acl.for_entry(entry)))
+            .flatten();
         // A mode edit reaches an entry whose mode it would change. The
-        // provider applies it to the mode it finds when it applies it, and
-        // before any owner or group change (SEARCH-019).
+        // provider applies it to the mode it finds when it applies it, after
+        // any ACL change and before any owner or group change (SEARCH-019,
+        // SEARCH-020). An access ACL change may set the mask, which is the
+        // group bits, so with one the edit is kept and the provider decides
+        // against the mode the ACL change leaves.
         let mode_edit = self
             .mode_edit
             .as_ref()
             .filter(|edit| {
                 mode.is_none()
                     && kind != MetadataEntryKind::SymbolicLink
-                    && entry
-                        .current_mode
-                        .is_none_or(|current| edit.apply(kind, current) != current & 0o7777)
+                    && (access_acl.is_some()
+                        || entry
+                            .current_mode
+                            .is_none_or(|current| edit.apply(kind, current) != current & 0o7777))
             })
             .cloned();
         ResolvedMetadataChange {
@@ -478,9 +485,7 @@ impl MetadataChange {
             mode_edit,
             owner: self.owner,
             group,
-            access_acl: (kind != MetadataEntryKind::SymbolicLink)
-                .then(|| self.access_acl.as_ref().map(|acl| acl.for_entry(entry)))
-                .flatten(),
+            access_acl,
             default_acl: (kind == MetadataEntryKind::Directory)
                 .then(|| self.default_acl.as_ref().map(|acl| acl.for_entry(entry)))
                 .flatten(),
@@ -756,10 +761,15 @@ impl MetadataPlan {
             })
             .filter(|(_, change)| change.is_dirty())
             .collect();
-        // A mode edit or a group may leave every entry of a root as it is,
-        // which is not a failure: the selection's other roots still change.
+        // A mode edit, an ACL edit or a group may leave every entry of a
+        // root as it is, such as a link or a special file, which is not a
+        // failure: the selection's other roots still change.
+        let acl_edit = [&change.access_acl, &change.default_acl]
+            .into_iter()
+            .any(|acl| matches!(acl, Some(AclChange::Edit(_))));
         if entries.is_empty()
             && change.mode_edit.is_none()
+            && !acl_edit
             && change.owner.is_none()
             && change.group.is_none()
         {

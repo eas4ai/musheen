@@ -1684,6 +1684,10 @@ pub(crate) struct PropertiesWindow {
     advanced_open: bool,
     /// The ACL list whose add chooser is open (SEARCH-020).
     acl_add_open: Option<AclList>,
+    /// This window's own Apply ended, so the next refresh loads the items
+    /// again even when their mode and times are as they were: an ACL change
+    /// leaves them so (SEARCH-020).
+    reload_after_apply: bool,
     operation_hub: OperationHub,
     permission_error: Option<PermissionError>,
     permission_batch: PermissionBatchState,
@@ -1749,6 +1753,7 @@ impl PropertiesWindow {
             privilege_backend: data.privilege_backend,
             advanced_open: false,
             acl_add_open: None,
+            reload_after_apply: false,
             operation_hub,
             permission_error: None,
             permission_batch: PermissionBatchState::default(),
@@ -1986,6 +1991,8 @@ impl PropertiesWindow {
                 }
                 if outcome == PermissionBatchOutcome::Succeeded {
                     state.model.clear_permission_edits();
+                    state.reload_after_apply = true;
+                    state.refresh_now(cx);
                 }
                 state.pump_operation_queue(cx);
                 cx.notify();
@@ -2015,6 +2022,23 @@ impl PropertiesWindow {
         .detach();
     }
 
+    /// Starts a refresh now instead of at the next tick; one that is
+    /// running already picks up a reload requested meanwhile at the next
+    /// tick.
+    fn refresh_now(&mut self, cx: &mut Context<Self>) {
+        let Some(work) = self.begin_live_refresh(cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let Some(this) = this.upgrade() else {
+                return;
+            };
+            this.update(cx, |state, cx| state.finish_live_refresh(result, cx));
+        })
+        .detach();
+    }
+
     fn begin_live_refresh(&mut self, cx: &mut Context<Self>) -> Option<Task<RefreshWorkResult>> {
         if self.refreshing
             || matches!(
@@ -2026,6 +2050,7 @@ impl PropertiesWindow {
         }
 
         self.refreshing = true;
+        let reload = std::mem::take(&mut self.reload_after_apply);
         let probe = self.model.snapshot().refresh_probe();
         let paths = self
             .model
@@ -2039,7 +2064,9 @@ impl PropertiesWindow {
         let known = self.model.permissions().accounts().clone();
         Some(cx.background_spawn(async move {
             let refresh = probe.refresh_state()?;
-            let replacement = if refresh == PropertyRefresh::MetadataChanged {
+            let replacement = if refresh == PropertyRefresh::MetadataChanged
+                || (reload && refresh == PropertyRefresh::Current)
+            {
                 let snapshot = PropertySnapshot::load(&paths)?;
                 let accounts = known.reload_for(&snapshot);
                 Some((snapshot, accounts))
@@ -5891,13 +5918,19 @@ mod tests {
             return;
         };
         let root = PathBuf::from(root);
-        let mounted = std::process::Command::new("mount")
-            .args(["-t", "ramfs", "none"])
-            .arg(&root)
-            .status()
-            .unwrap();
-        assert!(mounted.success(), "ramfs mounts");
-        let file = root.join("notes.txt");
+        let inner = root.join("inner");
+        let mount = |kind: &str, path: &std::path::Path| {
+            let mounted = std::process::Command::new("mount")
+                .args(["-t", kind, "none"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(mounted.success(), "{kind} mounts");
+        };
+        mount("tmpfs", &root);
+        filesystem::create_dir(&inner).unwrap();
+        mount("ramfs", &inner);
+        let file = inner.join("notes.txt");
         filesystem::write(&file, b"notes").unwrap();
         set_file_mode(&file, 0o644);
         cx.update(|cx| {
@@ -5931,6 +5964,35 @@ mod tests {
             }
         })
         .unwrap();
+
+        // Apply to contents reaches the ramfs through a nested mount: an
+        // edit that only removes entries leaves its items as they are, and
+        // one that adds an entry fails there.
+        let run = |step: musheen_ops::AclEditStep| {
+            use musheen_ops::MutationProvider as _;
+
+            let mut store = LocalStore::new();
+            let target = StorePath::from_unix_path(root.as_os_str());
+            let identity = store.identity(&target).unwrap().unwrap();
+            musheen_ops::MetadataPlan::preflight(
+                &mut store,
+                target,
+                identity.to_vec(),
+                MetadataScope::recursive(true, true),
+                MetadataChange::new().with_access_acl(musheen_ops::AclChange::Edit(
+                    musheen_ops::AclEdit::new(vec![step]),
+                )),
+            )
+            .and_then(|plan| plan.execute(&mut store))
+        };
+        let named = musheen_ops::AclQualifier::User(12_345);
+        assert_eq!(run(musheen_ops::AclEditStep::Remove(named.clone())), Ok(()));
+        assert_eq!(
+            run(musheen_ops::AclEditStep::Set(musheen_ops::AclEntry::new(
+                named, true, false, false
+            ))),
+            Err(MutationError::Unsupported)
+        );
     }
 
     #[cfg(unix)]
@@ -5982,6 +6044,156 @@ mod tests {
         click_all(handle, &["permissions-advanced"], cx);
         cx.update_window(handle.into(), |_, window, _| {
             localized(window, "permissions-acl-access-varies");
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn acl_editing_keeps_a_group_row_set_back_to_the_value_it_had(cx: &mut TestAppContext) {
+        use posix_acl::{ACL_READ, ACL_WRITE, Qualifier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("shared.txt");
+        filesystem::write(&file, b"shared").unwrap();
+        set_file_mode(&file, 0o640);
+        set_named_acl(&file, &[(Qualifier::User(12_345), ACL_READ)]);
+        // The edit widens the mask to rw-; the Group row sets it back to
+        // r--, the value the group bits had.
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&file), None, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-advanced",
+                "permissions-acl-access-user-12345-write",
+                "permissions-group-can-view",
+            ],
+            cx,
+        );
+        let checked = file.clone();
+        apply_until(handle, cx, move || {
+            acl_right(&checked, false, Qualifier::User(12_345)) == Some(ACL_READ | ACL_WRITE)
+                && acl_right(&checked, false, Qualifier::Mask) == Some(ACL_READ)
+        })
+        .await;
+        assert_eq!(file_mode(&file), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn acl_editing_leaves_links_in_the_selection_as_they_are(cx: &mut TestAppContext) {
+        use posix_acl::{ACL_READ, Qualifier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("notes.txt");
+        let link = temporary.path().join("link");
+        filesystem::write(&file, b"notes").unwrap();
+        std::os::unix::fs::symlink("notes.txt", &link).unwrap();
+        let (handle, properties) = open_permissions_page(&[file.clone(), link], None, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-advanced",
+                "permissions-acl-access-add",
+                "permissions-acl-access-add-user-0",
+            ],
+            cx,
+        );
+        let checked = file.clone();
+        apply_until(handle, cx, move || {
+            acl_right(&checked, false, Qualifier::User(0)) == Some(ACL_READ)
+        })
+        .await;
+        cx.update(|cx| {
+            assert!(
+                properties.read(cx).permission_error.is_none(),
+                "the link the edit does not reach does not fail it"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn acl_editing_shows_what_its_own_apply_left(cx: &mut TestAppContext) {
+        use posix_acl::{ACL_EXECUTE, ACL_READ, ACL_WRITE, Qualifier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("shared.txt");
+        filesystem::write(&file, b"shared").unwrap();
+        set_file_mode(&file, 0o660);
+        set_named_acl(&file, &[(Qualifier::User(12_345), ACL_READ)]);
+        // Write for 12345 leaves the mask rw- and the mode 0660, so only the
+        // ACL changes.
+        let (handle, properties) = open_permissions_page(std::slice::from_ref(&file), None, cx);
+        click_all(
+            handle,
+            &[
+                "permissions-advanced",
+                "permissions-acl-access-user-12345-write",
+            ],
+            cx,
+        );
+        let checked = file.clone();
+        apply_until(handle, cx, move || {
+            acl_right(&checked, false, Qualifier::User(12_345)) == Some(ACL_READ | ACL_WRITE)
+        })
+        .await;
+        let shown = properties.clone();
+        cx.wait_for(handle.into(), Duration::from_secs(2), move |_, cx| {
+            shown
+                .read(cx)
+                .model
+                .permissions()
+                .acl_entries(AclList::Access)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|(name, rights)| *name == AclName::User(12_345) && rights.write)
+                })
+        })
+        .await;
+        // The next edit starts from what the Apply left.
+        click_all(handle, &["permissions-acl-access-user-12345-execute"], cx);
+        let checked = file.clone();
+        apply_until(handle, cx, move || {
+            acl_right(&checked, false, Qualifier::User(12_345))
+                .is_some_and(|rights| rights & ACL_EXECUTE != 0)
+        })
+        .await;
+        assert_eq!(
+            acl_right(&file, false, Qualifier::User(12_345)),
+            Some(ACL_READ | ACL_WRITE | ACL_EXECUTE)
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn permissions_page_says_the_group_row_sets_the_mask_of_a_new_entry(
+        cx: &mut TestAppContext,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("notes.txt");
+        filesystem::write(&file, b"notes").unwrap();
+        set_file_mode(&file, 0o640);
+        let (handle, _) = open_permissions_page(std::slice::from_ref(&file), None, cx);
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(window.try_find("permissions-acl-mask-note").is_none());
+        })
+        .unwrap();
+        click_all(
+            handle,
+            &[
+                "permissions-advanced",
+                "permissions-acl-access-add",
+                "permissions-acl-access-add-user-0",
+            ],
+            cx,
+        );
+        cx.update_window(handle.into(), |_, window, _| {
+            assert!(
+                window.find("permissions-acl-mask-note").visible(),
+                "the first named entry makes the Group row set the mask"
+            );
         })
         .unwrap();
     }

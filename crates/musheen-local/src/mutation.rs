@@ -2212,7 +2212,18 @@ fn apply_acl(
             }
         }
         AclChange::Edit(edit) => {
-            let entries = read_acl_entries(path, default)?;
+            let executable = kind == MetadataEntryKind::Directory || mode & 0o111 != 0;
+            let entries = match read_acl_entries(path, default) {
+                Ok(entries) => entries,
+                // A filesystem without ACLs has no named entries, so an edit
+                // that only removes some leaves the item as it is, which does
+                // not fail the change (SEARCH-019). Apply to contents may
+                // reach one through a nested mount.
+                Err(MutationError::Unsupported) if edit.apply(&[], &[], executable).is_empty() => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
             // A folder without default entries takes the owner, owning group
             // and others entries of its access ACL, as setfacl does.
             let base = if default && entries.is_empty() {
@@ -2220,7 +2231,6 @@ fn apply_acl(
             } else {
                 Vec::new()
             };
-            let executable = kind == MetadataEntryKind::Directory || mode & 0o111 != 0;
             let edited = edit.apply(&entries, &base, executable);
             if edited == entries {
                 return Ok(false);

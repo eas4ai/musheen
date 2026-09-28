@@ -723,10 +723,14 @@ impl PermissionsPageModel {
     }
 
     /// Whether a selected item has ACL entries for named users or groups,
-    /// so the Group row sets their mask.
+    /// or gets one from the user's edit, so the Group row sets their mask.
     #[must_use]
     pub fn has_named_acl(&self) -> bool {
         self.named_acl
+            || self.items.iter().any(|item| {
+                self.edited_acl(item, AclList::Access)
+                    .is_some_and(|entries| entries.iter().any(musheen_ops::AclEntry::is_named))
+            })
     }
 
     /// Whether every selected item is a folder, so the access choices use
