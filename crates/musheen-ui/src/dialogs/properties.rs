@@ -5645,10 +5645,11 @@ mod tests {
             ],
             cx,
         );
-        let (roots, scope, change) = cx
-            .update(|cx| properties.read(cx).model.permission_request())
-            .ok()
-            .expect("the page has a change to apply");
+        let Ok((roots, scope, change)) =
+            cx.update(|cx| properties.read(cx).model.permission_request())
+        else {
+            panic!("the page has a change to apply");
+        };
         // Another program adds an entry after the page read the item.
         set_named_acl(&file, &[(Qualifier::Group(23_456), ACL_READ | ACL_EXECUTE)]);
         let mut store = LocalStore::new();
