@@ -396,3 +396,19 @@ shows the entries read-only and says why. Done when the search-019 and
 search-020 checks pass on the final tree, the workspace tests, cargo fmt
 --check and clippy with warnings denied are clean, and every finding of the
 review and the report is resolved or declined.
+
+## broker-protocol-version
+
+Requirements: SYS-034
+
+Give Musheen and its administrator broker a shared protocol version
+(backlog item broker-protocol-version, finding 4 of adversary report
+78c7cc31). Before it asks for authorization, Musheen runs the installed
+broker without privileges to read its version, and the broker's first
+answer names it again. On a mismatch, as after a package upgrade while
+Musheen runs, the window says to restart Musheen instead of a general
+error, and no broker stays running. An answer the window cannot decode
+ends the session and says so. Done when the sys-034 check passes on the
+final tree, the workspace tests, cargo fmt --check and clippy with
+warnings denied are clean, and every finding of the review and the
+report is resolved or declined.
