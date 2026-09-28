@@ -49,12 +49,172 @@ impl AclEntry {
     pub const fn execute(&self) -> bool {
         self.execute
     }
+
+    /// Whether the entry is for a named user or group.
+    #[must_use]
+    pub const fn is_named(&self) -> bool {
+        matches!(
+            self.qualifier,
+            AclQualifier::User(_) | AclQualifier::Group(_)
+        )
+    }
+
+    /// Whether the entry is the owner, owning group or others entry.
+    const fn is_base(&self) -> bool {
+        matches!(
+            self.qualifier,
+            AclQualifier::Owner | AclQualifier::OwningGroup | AclQualifier::Other
+        )
+    }
+
+    /// The place of the entry in an ACL, as getfacl lists it.
+    const fn order(&self) -> (u8, u32) {
+        match self.qualifier {
+            AclQualifier::Owner => (0, 0),
+            AclQualifier::User(uid) => (1, uid),
+            AclQualifier::OwningGroup => (2, 0),
+            AclQualifier::Group(gid) => (3, gid),
+            AclQualifier::Mask => (4, 0),
+            AclQualifier::Other => (5, 0),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AclChange {
     Replace(Vec<AclEntry>),
     Remove,
+    /// Changes named user and group entries and keeps the others
+    /// (SEARCH-020).
+    Edit(AclEdit),
+}
+
+impl AclChange {
+    /// The change as `entry` takes it: inside a folder that Apply to
+    /// contents reaches, an edit gives execute only to folders and to files
+    /// that already have an execute bit.
+    fn for_entry(&self, entry: &MetadataEntry) -> Self {
+        match self {
+            Self::Edit(edit) if entry.contents => Self::Edit(AclEdit {
+                execute_where_executable: true,
+                ..edit.clone()
+            }),
+            change => change.clone(),
+        }
+    }
+}
+
+/// One change to a named user or group entry of an ACL (SEARCH-020).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AclEditStep {
+    /// Adds the entry, or sets its rights when it exists.
+    Set(AclEntry),
+    /// Removes the entry of this user or group.
+    Remove(AclQualifier),
+}
+
+/// Changes to the named user and group entries of an ACL (SEARCH-020).
+/// Each item applies them to the entries it has when the change applies,
+/// so an entry the user did not edit stays as it is.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AclEdit {
+    steps: Vec<AclEditStep>,
+    /// Whether execute reaches a file only when it already has an execute
+    /// bit, as setfacl's X does. Set for what Apply to contents reaches.
+    execute_where_executable: bool,
+}
+
+impl AclEdit {
+    #[must_use]
+    pub const fn new(steps: Vec<AclEditStep>) -> Self {
+        Self {
+            steps,
+            execute_where_executable: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    #[must_use]
+    pub fn steps(&self) -> &[AclEditStep] {
+        &self.steps
+    }
+
+    /// The entries `entries` become. An empty list, the default ACL of a
+    /// folder without one, starts from the owner, owning group and others
+    /// entries of `base`, the access ACL, as setfacl does. `executable` says
+    /// whether the item is a folder or a file with an execute bit. When the
+    /// edit changes the named entries, the mask, if the result has one or
+    /// has named entries, becomes the union of the owning group and named
+    /// entries, as setfacl sets it; otherwise the entries stay as they are.
+    #[must_use]
+    pub fn apply(
+        &self,
+        entries: &[AclEntry],
+        base: &[AclEntry],
+        executable: bool,
+    ) -> Vec<AclEntry> {
+        let named = |entries: &[AclEntry]| -> Vec<AclEntry> {
+            let mut named: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.is_named())
+                .cloned()
+                .collect();
+            named.sort_by_key(AclEntry::order);
+            named
+        };
+        let mut edited = entries.to_vec();
+        for step in &self.steps {
+            match step {
+                AclEditStep::Set(entry) => {
+                    let mut entry = entry.clone();
+                    entry.execute &= executable || !self.execute_where_executable;
+                    match edited
+                        .iter_mut()
+                        .find(|kept| kept.qualifier == entry.qualifier)
+                    {
+                        Some(kept) => *kept = entry,
+                        None => edited.push(entry),
+                    }
+                }
+                AclEditStep::Remove(qualifier) => {
+                    edited.retain(|kept| kept.qualifier != *qualifier);
+                }
+            }
+        }
+        if named(&edited) == named(entries) {
+            return entries.to_vec();
+        }
+        if entries.is_empty() {
+            edited.extend(base.iter().filter(|entry| entry.is_base()).cloned());
+        }
+        if edited
+            .iter()
+            .any(|entry| entry.is_named() || entry.qualifier == AclQualifier::Mask)
+        {
+            let group_class = edited
+                .iter()
+                .filter(|entry| entry.is_named() || entry.qualifier == AclQualifier::OwningGroup);
+            let mask = group_class.fold(
+                AclEntry::new(AclQualifier::Mask, false, false, false),
+                |mask, entry| {
+                    AclEntry::new(
+                        AclQualifier::Mask,
+                        mask.read || entry.read,
+                        mask.write || entry.write,
+                        mask.execute || entry.execute,
+                    )
+                },
+            );
+            edited.retain(|entry| entry.qualifier != AclQualifier::Mask);
+            edited.push(mask);
+        }
+        edited.sort_by_key(AclEntry::order);
+        edited
+    }
 }
 
 /// One step of a mode edit (SEARCH-019).
@@ -319,10 +479,10 @@ impl MetadataChange {
             owner: self.owner,
             group,
             access_acl: (kind != MetadataEntryKind::SymbolicLink)
-                .then(|| self.access_acl.clone())
+                .then(|| self.access_acl.as_ref().map(|acl| acl.for_entry(entry)))
                 .flatten(),
             default_acl: (kind == MetadataEntryKind::Directory)
-                .then(|| self.default_acl.clone())
+                .then(|| self.default_acl.as_ref().map(|acl| acl.for_entry(entry)))
                 .flatten(),
         }
     }
@@ -399,6 +559,9 @@ pub struct MetadataEntry {
     current_mode: Option<u32>,
     /// The entry's group when previewed.
     current_group: Option<u32>,
+    /// Whether the entry is inside a selected folder, reached by Apply to
+    /// contents, rather than selected itself.
+    contents: bool,
 }
 
 impl MetadataEntry {
@@ -416,7 +579,16 @@ impl MetadataEntry {
             requires_privilege,
             current_mode: None,
             current_group: None,
+            contents: false,
         }
+    }
+
+    /// Marks the entry as one that Apply to contents reaches inside a
+    /// selected folder.
+    #[must_use]
+    pub const fn as_contents(mut self) -> Self {
+        self.contents = true;
+        self
     }
 
     #[must_use]

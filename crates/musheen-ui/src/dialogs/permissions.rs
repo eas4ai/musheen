@@ -1,13 +1,14 @@
 //! The Properties window's Permissions page (SEARCH-019): access choices as
 //! Dolphin names them, the executable checkbox, the group, and the mode
-//! bits. Every value the page shows is what Apply would leave: each selected
-//! item's mode with the user's edits applied to it.
+//! bits, and the ACL entries of SEARCH-020. Every value the page shows is
+//! what Apply would leave: each selected item's mode and ACL entries with the
+//! user's edits applied to them.
 
 use musheen_core::{CapabilityState, ItemKind};
 use musheen_desktop::{AclQualifier, AclState, AggregateValue, PropertySnapshot};
 use musheen_ops::{
-    MetadataChange, MetadataEntryKind, MetadataScope, ModeEdit, ModeStep, executes_where_readable,
-    mode_after_ownership_change,
+    AclChange, AclEdit, AclEditStep, MetadataChange, MetadataEntryKind, MetadataScope, ModeEdit,
+    ModeStep, executes_where_readable, mode_after_ownership_change,
 };
 use std::collections::BTreeMap;
 
@@ -170,6 +171,173 @@ pub enum Tristate {
     Varies,
 }
 
+/// A list of ACL entries the Advanced section edits (SEARCH-020).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AclList {
+    /// The entries that decide access to the item itself.
+    Access,
+    /// A folder's default entries, which new items inside it inherit.
+    Default,
+}
+
+impl AclList {
+    /// The name used in element IDs.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Access => "access",
+            Self::Default => "default",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Access => 0,
+            Self::Default => 1,
+        }
+    }
+}
+
+/// The user or group a named ACL entry is for.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AclName {
+    User(u32),
+    Group(u32),
+}
+
+impl AclName {
+    /// The name used in element IDs, such as `user-1000`.
+    #[must_use]
+    pub fn key(self) -> String {
+        match self {
+            Self::User(uid) => format!("user-{uid}"),
+            Self::Group(gid) => format!("group-{gid}"),
+        }
+    }
+
+    const fn qualifier(self) -> musheen_ops::AclQualifier {
+        match self {
+            Self::User(uid) => musheen_ops::AclQualifier::User(uid),
+            Self::Group(gid) => musheen_ops::AclQualifier::Group(gid),
+        }
+    }
+
+    const fn of(qualifier: &musheen_ops::AclQualifier) -> Option<Self> {
+        match *qualifier {
+            musheen_ops::AclQualifier::User(uid) => Some(Self::User(uid)),
+            musheen_ops::AclQualifier::Group(gid) => Some(Self::Group(gid)),
+            _ => None,
+        }
+    }
+}
+
+/// A right an ACL entry gives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AclRight {
+    Read,
+    Write,
+    Execute,
+}
+
+impl AclRight {
+    pub const ALL: [Self; 3] = [Self::Read, Self::Write, Self::Execute];
+
+    /// The name used in element IDs and message keys.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+/// The rights of an ACL entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AclRights {
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+}
+
+impl AclRights {
+    #[must_use]
+    pub const fn has(self, right: AclRight) -> bool {
+        match right {
+            AclRight::Read => self.read,
+            AclRight::Write => self.write,
+            AclRight::Execute => self.execute,
+        }
+    }
+
+    const fn toggled(self, right: AclRight) -> Self {
+        match right {
+            AclRight::Read => Self {
+                read: !self.read,
+                ..self
+            },
+            AclRight::Write => Self {
+                write: !self.write,
+                ..self
+            },
+            AclRight::Execute => Self {
+                execute: !self.execute,
+                ..self
+            },
+        }
+    }
+
+    fn of(entry: &musheen_ops::AclEntry) -> Self {
+        Self {
+            read: entry.read(),
+            write: entry.write(),
+            execute: entry.execute(),
+        }
+    }
+}
+
+/// A selected item's ACL: its entries, or why they could not be read.
+type ItemAcl = Result<Vec<musheen_ops::AclEntry>, Box<str>>;
+
+/// The ACL the page read, in the operations layer's terms, or why it cannot
+/// be edited: an entry of an unknown kind makes it unreadable.
+fn item_acl(state: &AclState) -> ItemAcl {
+    match state {
+        AclState::Available(entries) => entries
+            .iter()
+            .map(|entry| {
+                let qualifier = match entry.qualifier() {
+                    AclQualifier::Owner => musheen_ops::AclQualifier::Owner,
+                    AclQualifier::OwningGroup => musheen_ops::AclQualifier::OwningGroup,
+                    AclQualifier::Other => musheen_ops::AclQualifier::Other,
+                    AclQualifier::User(uid) => musheen_ops::AclQualifier::User(*uid),
+                    AclQualifier::Group(gid) => musheen_ops::AclQualifier::Group(*gid),
+                    AclQualifier::Mask => musheen_ops::AclQualifier::Mask,
+                    AclQualifier::Unknown => return Err("the ACL could not be read".into()),
+                };
+                Ok(musheen_ops::AclEntry::new(
+                    qualifier,
+                    entry.read(),
+                    entry.write(),
+                    entry.execute(),
+                ))
+            })
+            .collect(),
+        AclState::Unsupported(reason) | AclState::Unavailable(reason) => Err(reason.clone()),
+    }
+}
+
+/// The named entries of `entries`, sorted.
+fn named_entries(entries: &[musheen_ops::AclEntry]) -> Vec<(AclName, AclRights)> {
+    let mut named: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| Some((AclName::of(entry.qualifier())?, AclRights::of(entry))))
+        .collect();
+    named.sort_by_key(|(name, _)| *name);
+    named
+}
+
 /// Names the page shows for users and groups, and the current user's
 /// identity and groups. Loading them may ask a directory service, so it runs
 /// off the UI thread, with the snapshot.
@@ -326,12 +494,17 @@ impl Accounts {
 }
 
 /// One selected file or folder as the page sees it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ItemMode {
+    /// The item's place in the snapshot.
+    index: usize,
     kind: MetadataEntryKind,
     mode: u32,
     owner: u32,
     group: u32,
+    /// The access ACL, and a folder's default ACL (SEARCH-020).
+    acl: ItemAcl,
+    default_acl: Option<ItemAcl>,
 }
 
 /// One change the user made, kept in the order made so a later change wins.
@@ -400,6 +573,9 @@ pub struct PermissionsPageModel {
     /// Whether every selected item is on a local filesystem with POSIX
     /// ownership, where the broker makes owner and group changes (SYS-037).
     admin_ownership: bool,
+    /// The user's edits to the named ACL entries of each list, access
+    /// first; `None` removes the entry (SEARCH-020).
+    acl_edits: [BTreeMap<AclName, Option<AclRights>>; 2],
 }
 
 /// The owner and group change Apply makes as administrator (SYS-037);
@@ -422,17 +598,22 @@ impl PermissionsPageModel {
         let items: Vec<ItemMode> = snapshot
             .items()
             .iter()
-            .filter_map(|item| {
+            .enumerate()
+            .filter_map(|(index, item)| {
                 let kind = match item.kind() {
                     ItemKind::RegularFile => MetadataEntryKind::File,
                     ItemKind::Directory => MetadataEntryKind::Directory,
                     ItemKind::SymbolicLink | ItemKind::Other => return None,
                 };
+                let permissions = item.permissions();
                 Some(ItemMode {
+                    index,
                     kind,
-                    mode: item.permissions().mode() & 0o7777,
-                    owner: item.permissions().owner(),
-                    group: item.permissions().group(),
+                    mode: permissions.mode() & 0o7777,
+                    owner: permissions.owner(),
+                    group: permissions.group(),
+                    acl: item_acl(permissions.acl()),
+                    default_acl: permissions.default_acl().map(item_acl),
                 })
             })
             .collect();
@@ -494,6 +675,7 @@ impl PermissionsPageModel {
             group_edit: None,
             scope: MetadataScope::Single,
             admin_ownership: true,
+            acl_edits: [BTreeMap::new(), BTreeMap::new()],
         }
     }
 
@@ -610,21 +792,41 @@ impl PermissionsPageModel {
         let edit = self.edit_of(steps);
         self.items
             .iter()
-            .map(|item| {
-                let ownership_changes = self.group_edit.is_some_and(|group| group != item.group)
-                    || self.owner_edit.is_some_and(|owner| owner != item.owner);
-                // Apply changes the mode first and the owner and group after
-                // (SEARCH-019); the kernel then clears setuid and setgid bits
-                // where the owner or group changes.
-                let mode = edit.apply(item.kind, item.mode);
-                let mode = if ownership_changes {
-                    mode_after_ownership_change(item.kind, mode)
-                } else {
-                    mode
-                };
-                (item.kind, mode)
-            })
+            .map(|item| (item.kind, self.projected_mode(item, &edit)))
             .collect()
+    }
+
+    /// `item`'s mode as Apply would leave it with `edit`.
+    fn projected_mode(&self, item: &ItemMode, edit: &ModeEdit) -> u32 {
+        let ownership_changes = self.group_edit.is_some_and(|group| group != item.group)
+            || self.owner_edit.is_some_and(|owner| owner != item.owner);
+        // Apply changes the ACL entries first (SEARCH-020): a changed mask
+        // shows as the group bits, and the mode edit starts from it. The
+        // mode changes next and the owner and group last (SEARCH-019); the
+        // kernel then clears setuid and setgid bits where the owner or group
+        // changes.
+        let mask = self
+            .edited_acl(item, AclList::Access)
+            .and_then(|entries| {
+                entries
+                    .into_iter()
+                    .find(|entry| *entry.qualifier() == musheen_ops::AclQualifier::Mask)
+            })
+            .map(|mask| {
+                (u32::from(mask.read()) << 2)
+                    | (u32::from(mask.write()) << 1)
+                    | u32::from(mask.execute())
+            });
+        let mode = match mask {
+            Some(mask) => (item.mode & !0o070) | (mask << 3),
+            None => item.mode,
+        };
+        let mode = edit.apply(item.kind, mode);
+        if ownership_changes {
+            mode_after_ownership_change(item.kind, mode)
+        } else {
+            mode
+        }
     }
 
     /// The steps without the one that sets the same control as `step`.
@@ -896,6 +1098,238 @@ impl PermissionsPageModel {
         })
     }
 
+    /// Why the selected items' ACL entries cannot be edited, when the
+    /// filesystem does not support ACLs or they could not be read.
+    #[must_use]
+    pub fn acl_read_only_reason(&self) -> Option<&str> {
+        self.items.iter().find_map(|item| {
+            std::iter::once(&item.acl)
+                .chain(item.default_acl.as_ref())
+                .find_map(|acl| acl.as_ref().err())
+                .map(AsRef::as_ref)
+        })
+    }
+
+    /// Whether the page shows `list`: default entries only for a selection
+    /// of folders.
+    #[must_use]
+    pub fn acl_list_shown(&self, list: AclList) -> bool {
+        match list {
+            AclList::Access => !self.items.is_empty(),
+            AclList::Default => self.only_folders(),
+        }
+    }
+
+    /// The entries of `list` of `item`, as the page read them.
+    fn read_acl(item: &ItemMode, list: AclList) -> Option<&[musheen_ops::AclEntry]> {
+        match list {
+            AclList::Access => item.acl.as_deref().ok(),
+            AclList::Default => item.default_acl.as_ref()?.as_deref().ok(),
+        }
+    }
+
+    /// The named entries of `list` that every selected item has, or `None`
+    /// when they differ or cannot be read.
+    fn shared_named(&self, list: AclList) -> Option<Vec<(AclName, AclRights)>> {
+        if !self.acl_list_shown(list) {
+            return None;
+        }
+        let mut shared = None;
+        for item in &self.items {
+            let named = named_entries(Self::read_acl(item, list)?);
+            if shared.as_ref().is_some_and(|shared| *shared != named) {
+                return None;
+            }
+            shared = Some(named);
+        }
+        shared
+    }
+
+    /// Whether the entries of `list` differ across the selection, so the
+    /// page shows Varies and leaves them as they are.
+    #[must_use]
+    pub fn acl_varies(&self, list: AclList) -> bool {
+        self.acl_list_shown(list)
+            && self.acl_read_only_reason().is_none()
+            && self.shared_named(list).is_none()
+    }
+
+    /// Whether the entries of `list` may change: the user may change the
+    /// modes, the filesystem supports ACLs, and every selected item has the
+    /// same entries.
+    #[must_use]
+    pub fn acl_editable(&self, list: AclList) -> bool {
+        self.modes_editable()
+            && self.acl_read_only_reason().is_none()
+            && self.shared_named(list).is_some()
+    }
+
+    /// The named entries of `list` as Apply would leave them, or `None`
+    /// when they differ across the selection.
+    #[must_use]
+    pub fn acl_entries(&self, list: AclList) -> Option<Vec<(AclName, AclRights)>> {
+        let mut entries = self.shared_named(list)?;
+        for (name, edit) in &self.acl_edits[list.index()] {
+            entries.retain(|(kept, _)| kept != name);
+            if let Some(rights) = edit {
+                entries.push((*name, *rights));
+            }
+        }
+        entries.sort_by_key(|(name, _)| *name);
+        Some(entries)
+    }
+
+    fn acl_rights(&self, list: AclList, name: AclName) -> Option<AclRights> {
+        self.acl_entries(list)?
+            .into_iter()
+            .find_map(|(kept, rights)| (kept == name).then_some(rights))
+    }
+
+    /// The accounts the page offers to add to `list`: every user and group
+    /// the system lists that has no entry there yet.
+    #[must_use]
+    pub fn acl_choices(&self, list: AclList) -> Vec<(AclName, String)> {
+        let entries = self.acl_entries(list).unwrap_or_default();
+        let listed = |name: AclName| entries.iter().all(|(kept, _)| *kept != name);
+        let users = self
+            .accounts
+            .all_users
+            .iter()
+            .map(|(uid, user)| (AclName::User(*uid), user.clone()));
+        let groups = self
+            .accounts
+            .all_groups
+            .iter()
+            .map(|(gid, group)| (AclName::Group(*gid), group.clone()));
+        users
+            .chain(groups)
+            .filter(|(name, _)| listed(*name))
+            .collect()
+    }
+
+    /// Adds an entry to `list` for `name`, one of the system's accounts,
+    /// that may view: read for files, read and execute for folders.
+    pub fn add_acl_entry(&mut self, list: AclList, name: AclName) {
+        if !self.acl_editable(list)
+            || !self
+                .acl_choices(list)
+                .iter()
+                .any(|(offered, _)| *offered == name)
+        {
+            return;
+        }
+        let folders = list == AclList::Default || self.only_folders();
+        self.set_acl_edit(
+            list,
+            name,
+            Some(AclRights {
+                read: true,
+                write: false,
+                execute: folders,
+            }),
+        );
+    }
+
+    /// Gives or takes `right` in the entry of `list` for `name`.
+    pub fn toggle_acl_right(&mut self, list: AclList, name: AclName, right: AclRight) {
+        if !self.acl_editable(list) {
+            return;
+        }
+        if let Some(rights) = self.acl_rights(list, name) {
+            self.set_acl_edit(list, name, Some(rights.toggled(right)));
+        }
+    }
+
+    /// Removes the entry of `list` for `name`.
+    pub fn remove_acl_entry(&mut self, list: AclList, name: AclName) {
+        if self.acl_editable(list) && self.acl_rights(list, name).is_some() {
+            self.set_acl_edit(list, name, None);
+        }
+    }
+
+    /// Records `edit` for `name`, dropping one that gives back what the
+    /// items have.
+    fn set_acl_edit(&mut self, list: AclList, name: AclName, edit: Option<AclRights>) {
+        let shared = self
+            .shared_named(list)
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|(kept, rights)| (kept == name).then_some(rights));
+        let edits = &mut self.acl_edits[list.index()];
+        if edit == shared {
+            edits.remove(&name);
+        } else {
+            edits.insert(name, edit);
+        }
+    }
+
+    /// The edit Apply makes to the entries of `list`, if any.
+    fn acl_edit(&self, list: AclList) -> Option<AclEdit> {
+        let edits = &self.acl_edits[list.index()];
+        (!edits.is_empty()).then(|| {
+            AclEdit::new(
+                edits
+                    .iter()
+                    .map(|(name, edit)| match edit {
+                        Some(rights) => AclEditStep::Set(musheen_ops::AclEntry::new(
+                            name.qualifier(),
+                            rights.read,
+                            rights.write,
+                            rights.execute,
+                        )),
+                        None => AclEditStep::Remove(name.qualifier()),
+                    })
+                    .collect(),
+            )
+        })
+    }
+
+    /// The entries of `list` of `item` after the edit, when it changes them.
+    fn edited_acl(&self, item: &ItemMode, list: AclList) -> Option<Vec<musheen_ops::AclEntry>> {
+        let edit = self.acl_edit(list)?;
+        let entries = Self::read_acl(item, list)?;
+        let base = Self::read_acl(item, AclList::Access).unwrap_or_default();
+        let edited = edit.apply(entries, base, true);
+        (edited != entries).then_some(edited)
+    }
+
+    /// The entries of `list` of the snapshot's item `index` as Apply would
+    /// leave them, or `None` for a link or special file, or entries that
+    /// could not be read. The mode's classes show in the owner, others and
+    /// mask entries, or in the owning group's without a mask, as the kernel
+    /// keeps them.
+    #[must_use]
+    pub fn projected_acl(&self, index: usize, list: AclList) -> Option<Vec<musheen_ops::AclEntry>> {
+        use musheen_ops::{AclEntry, AclQualifier as Qualifier};
+
+        let item = self.items.iter().find(|item| item.index == index)?;
+        let entries = self
+            .edited_acl(item, list)
+            .or_else(|| Self::read_acl(item, list).map(<[_]>::to_vec))?;
+        if list == AclList::Default {
+            return Some(entries);
+        }
+        let mode = self.projected_mode(item, &self.mode_edit());
+        let has_mask = entries
+            .iter()
+            .any(|entry| *entry.qualifier() == Qualifier::Mask);
+        let class = |qualifier: Qualifier, bits: u32| {
+            AclEntry::new(qualifier, bits & 0o4 != 0, bits & 0o2 != 0, bits & 0o1 != 0)
+        };
+        Some(
+            entries
+                .into_iter()
+                .map(|entry| match entry.qualifier() {
+                    Qualifier::Owner => class(Qualifier::Owner, mode >> 6),
+                    Qualifier::Mask => class(Qualifier::Mask, mode >> 3),
+                    Qualifier::OwningGroup if !has_mask => class(Qualifier::OwningGroup, mode >> 3),
+                    Qualifier::Other => class(Qualifier::Other, mode),
+                    _ => entry,
+                })
+                .collect(),
+        )
+    }
+
     pub fn set_single(&mut self) {
         self.scope = MetadataScope::Single;
     }
@@ -912,7 +1346,12 @@ impl PermissionsPageModel {
     /// whether a mode or the group would differ; with Apply to contents,
     /// whether the user made any change, as the contents may differ.
     pub fn is_dirty(&self) -> bool {
-        if self.group_edit.is_some() || self.owner_edit.is_some() {
+        // An ACL edit that gives back the shared entries is dropped, so one
+        // that is kept changes every selected item.
+        if self.group_edit.is_some()
+            || self.owner_edit.is_some()
+            || self.acl_edits.iter().any(|edits| !edits.is_empty())
+        {
             return true;
         }
         if self.scope.is_recursive() {
@@ -933,6 +1372,14 @@ impl PermissionsPageModel {
     #[must_use]
     pub fn change(&self) -> MetadataChange {
         let change = MetadataChange::new().with_mode_edit(self.mode_edit());
+        let change = match self.acl_edit(AclList::Access) {
+            Some(edit) => change.with_access_acl(AclChange::Edit(edit)),
+            None => change,
+        };
+        let change = match self.acl_edit(AclList::Default) {
+            Some(edit) => change.with_default_acl(AclChange::Edit(edit)),
+            None => change,
+        };
         if self.needs_administrator() {
             return change;
         }

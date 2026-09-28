@@ -1,8 +1,8 @@
 use musheen_core::StorePath;
 use musheen_ops::{
-    AclChange, AclEntry, AclQualifier, MetadataChange, MetadataEntry, MetadataEntryKind,
-    MetadataPlan, MetadataProvider, MetadataScope, ModeEdit, ModeStep, MutationError,
-    ResolvedMetadataChange, executes_where_readable, mode_after_ownership_change,
+    AclChange, AclEdit, AclEditStep, AclEntry, AclQualifier, MetadataChange, MetadataEntry,
+    MetadataEntryKind, MetadataPlan, MetadataProvider, MetadataScope, ModeEdit, ModeStep,
+    MutationError, ResolvedMetadataChange, executes_where_readable, mode_after_ownership_change,
 };
 
 #[derive(Default)]
@@ -303,4 +303,178 @@ fn mode_edits_and_groups_skip_entries_they_leave_as_they_are() {
 
 fn local(path: &str) -> StorePath {
     StorePath::from_unix_path(path)
+}
+
+fn acl(entries: &[(AclQualifier, &str)]) -> Vec<AclEntry> {
+    entries
+        .iter()
+        .map(|(qualifier, rights)| {
+            AclEntry::new(
+                qualifier.clone(),
+                rights.contains('r'),
+                rights.contains('w'),
+                rights.contains('x'),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn acl_edit_changes_named_entries_and_sets_the_mask_as_setfacl_does() {
+    let file = acl(&[
+        (AclQualifier::Owner, "rw"),
+        (AclQualifier::User(7), "r"),
+        (AclQualifier::OwningGroup, "r"),
+        (AclQualifier::Group(9), "rx"),
+        (AclQualifier::Mask, "r"),
+        (AclQualifier::Other, ""),
+    ]);
+    let edit = AclEdit::new(vec![
+        AclEditStep::Set(AclEntry::new(AclQualifier::User(8), true, true, false)),
+        AclEditStep::Remove(AclQualifier::User(7)),
+    ]);
+    assert_eq!(
+        edit.apply(&file, &[], false),
+        acl(&[
+            (AclQualifier::Owner, "rw"),
+            (AclQualifier::User(8), "rw"),
+            (AclQualifier::OwningGroup, "r"),
+            (AclQualifier::Group(9), "rx"),
+            (AclQualifier::Mask, "rwx"),
+            (AclQualifier::Other, ""),
+        ]),
+        "the group entry the edit did not touch stays, and the mask is the union"
+    );
+
+    // An edit that leaves the named entries as they are keeps the mask.
+    let same = AclEdit::new(vec![AclEditStep::Set(AclEntry::new(
+        AclQualifier::User(7),
+        true,
+        false,
+        false,
+    ))]);
+    assert_eq!(same.apply(&file, &[], false), file);
+
+    // Removing the last named entry keeps the mask, now the owning
+    // group's rights.
+    let minimal = acl(&[
+        (AclQualifier::Owner, "rw"),
+        (AclQualifier::User(7), "rw"),
+        (AclQualifier::OwningGroup, "r"),
+        (AclQualifier::Mask, "rw"),
+        (AclQualifier::Other, ""),
+    ]);
+    let remove = AclEdit::new(vec![AclEditStep::Remove(AclQualifier::User(7))]);
+    assert_eq!(
+        remove.apply(&minimal, &[], false),
+        acl(&[
+            (AclQualifier::Owner, "rw"),
+            (AclQualifier::OwningGroup, "r"),
+            (AclQualifier::Mask, "r"),
+            (AclQualifier::Other, ""),
+        ])
+    );
+}
+
+#[test]
+fn acl_edit_starts_default_entries_from_the_access_acl() {
+    let access = acl(&[
+        (AclQualifier::Owner, "rwx"),
+        (AclQualifier::OwningGroup, "rx"),
+        (AclQualifier::Other, ""),
+    ]);
+    let edit = AclEdit::new(vec![AclEditStep::Set(AclEntry::new(
+        AclQualifier::Group(9),
+        true,
+        false,
+        true,
+    ))]);
+    assert_eq!(
+        edit.apply(&[], &access, true),
+        acl(&[
+            (AclQualifier::Owner, "rwx"),
+            (AclQualifier::OwningGroup, "rx"),
+            (AclQualifier::Group(9), "rx"),
+            (AclQualifier::Mask, "rx"),
+            (AclQualifier::Other, ""),
+        ])
+    );
+    let remove = AclEdit::new(vec![AclEditStep::Remove(AclQualifier::Group(9))]);
+    assert!(
+        remove.apply(&[], &access, true).is_empty(),
+        "removing from an empty list adds nothing"
+    );
+}
+
+#[test]
+fn acl_edit_gives_contents_execute_only_where_an_execute_bit_is() {
+    let edit = AclEdit::new(vec![AclEditStep::Set(AclEntry::new(
+        AclQualifier::User(8),
+        true,
+        true,
+        true,
+    ))]);
+    let change = MetadataChange::new()
+        .with_access_acl(AclChange::Edit(edit.clone()))
+        .with_default_acl(AclChange::Edit(edit));
+    let mut provider = RecordingProvider {
+        preview: vec![
+            MetadataEntry::new(
+                local("/root/file"),
+                b"file".to_vec(),
+                MetadataEntryKind::File,
+                false,
+            )
+            .as_contents(),
+            MetadataEntry::new(
+                local("/root"),
+                b"root".to_vec(),
+                MetadataEntryKind::Directory,
+                false,
+            ),
+        ],
+        ..RecordingProvider::default()
+    };
+    let plan = MetadataPlan::preflight(
+        &mut provider,
+        local("/root"),
+        b"root".to_vec(),
+        MetadataScope::recursive(false, true),
+        change,
+    )
+    .unwrap();
+    plan.execute(&mut provider).unwrap();
+    let file = acl(&[
+        (AclQualifier::Owner, "rw"),
+        (AclQualifier::OwningGroup, "r"),
+        (AclQualifier::Other, "r"),
+    ]);
+    let edited = |change: &ResolvedMetadataChange, executable: bool| match change.access_acl() {
+        Some(AclChange::Edit(edit)) => edit
+            .apply(&file, &[], executable)
+            .into_iter()
+            .find(|entry| *entry.qualifier() == AclQualifier::User(8)),
+        other => panic!("an ACL edit, not {other:?}"),
+    };
+    let (_, contents) = &provider.applied[0];
+    assert!(
+        contents.default_acl().is_none(),
+        "a file has no default ACL"
+    );
+    assert_eq!(
+        edited(contents, false),
+        Some(AclEntry::new(AclQualifier::User(8), true, true, false)),
+        "a file inside the folder without an execute bit does not take execute"
+    );
+    assert_eq!(
+        edited(contents, true),
+        Some(AclEntry::new(AclQualifier::User(8), true, true, true))
+    );
+    let (_, selected) = &provider.applied[1];
+    assert!(selected.default_acl().is_some());
+    assert_eq!(
+        edited(selected, false),
+        Some(AclEntry::new(AclQualifier::User(8), true, true, true)),
+        "a selected item takes the rights as chosen"
+    );
 }
