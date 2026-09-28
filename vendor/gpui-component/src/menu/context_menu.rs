@@ -700,6 +700,40 @@ mod tests {
         cx.update(|cx| cx.assert_no_new_leaks(&before));
     }
 
+    /// Dismissing a context menu releases its `PopupMenu` entity and the
+    /// dismiss subscription at once, while the window stays open. (Musheen
+    /// patch: upstream only marks the menu closed and keeps both until the
+    /// next open.)
+    #[gpui::test]
+    fn dismiss_releases_the_menu_entity(cx: &mut TestAppContext) {
+        cx.update(|cx| crate::init(cx));
+        let (_, cx) = cx.add_window_view(|_, _| RowsRoot {
+            clicked: Rc::new(Cell::new(0)),
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let before = cx.update(|_, cx| cx.leak_detector_snapshot());
+
+        // Right-click the first row; the menu is built, drawn and focused.
+        let press = point(px(10.), px(10.));
+        cx.simulate_mouse_down(press, MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(press, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        // Escape dismisses the menu; the window stays open.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        cx.update(|_, cx| cx.assert_no_new_leaks(&before));
+    }
+
     #[gpui::test]
     fn shortcut_hint_is_painted_on_the_frame_the_menu_opens(cx: &mut TestAppContext) {
         cx.update(|cx| {
