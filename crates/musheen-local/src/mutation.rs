@@ -1738,7 +1738,12 @@ impl MetadataProvider for LocalStore {
                         traversal.skip_current_dir();
                         continue;
                     }
-                    entries.extend(metadata_entry(self, entry.path())?);
+                    let found = metadata_entry(self, entry.path())?;
+                    entries.extend(if entry.depth() > 0 {
+                        found.map(MetadataEntry::as_contents)
+                    } else {
+                        found
+                    });
                 }
                 // Each folder comes after what it contains: a change that
                 // takes the owner's read or search from a folder must not stop
@@ -1774,6 +1779,21 @@ impl MetadataProvider for LocalStore {
         // before the owner and group, as SEARCH-019 says; the kernel may
         // then clear set-user-ID or set-group-ID, which the page shows.
         let found = rustix::fs::fstat(&target).map_err(map_errno)?;
+        // ACL entries change first (SEARCH-020): an ACL's mask shows as the
+        // mode's group bits, so the mode edit starts from the mode the ACL
+        // change left, and a Group row set in the same Apply sets the mask.
+        let mut acl_changed = false;
+        if let Some(acl) = change.access_acl() {
+            acl_changed |= apply_acl(&proc_path, acl, false, entry.kind(), found.st_mode)?;
+        }
+        if let Some(acl) = change.default_acl() {
+            acl_changed |= apply_acl(&proc_path, acl, true, entry.kind(), found.st_mode)?;
+        }
+        let found = if acl_changed {
+            rustix::fs::fstat(&target).map_err(map_errno)?
+        } else {
+            found
+        };
         let owner = change.owner_for(found.st_uid);
         let group = change.group_for(found.st_gid);
         if let Some(mode) = change.mode_for(found.st_mode & 0o7777) {
@@ -1793,12 +1813,6 @@ impl MetadataProvider for LocalStore {
                 flags,
             )
             .map_err(map_errno)?;
-        }
-        if let Some(acl) = change.access_acl() {
-            apply_acl(&proc_path, acl, false)?;
-        }
-        if let Some(acl) = change.default_acl() {
-            apply_acl(&proc_path, acl, true)?;
         }
         fsync(&parent.parent).map_err(map_errno)
     }
@@ -2171,7 +2185,16 @@ fn metadata_entry(
     ))
 }
 
-fn apply_acl(path: &Path, change: &AclChange, default: bool) -> Result<(), MutationError> {
+/// Applies `change` to the access or default ACL of `path`, an entry of
+/// `kind` whose mode is `mode`, and says whether it wrote the ACL. An edit
+/// that leaves the entries as they are writes nothing.
+fn apply_acl(
+    path: &Path,
+    change: &AclChange,
+    default: bool,
+    kind: MetadataEntryKind,
+    mode: u32,
+) -> Result<bool, MutationError> {
     let acl = match change {
         AclChange::Replace(entries) => {
             let mut acl = PosixACL::empty();
@@ -2188,8 +2211,64 @@ fn apply_acl(path: &Path, change: &AclChange, default: bool) -> Result<(), Mutat
                 PosixACL::new(mode)
             }
         }
+        AclChange::Edit(edit) => {
+            let entries = read_acl_entries(path, default)?;
+            // A folder without default entries takes the owner, owning group
+            // and others entries of its access ACL, as setfacl does.
+            let base = if default && entries.is_empty() {
+                read_acl_entries(path, false)?
+            } else {
+                Vec::new()
+            };
+            let executable = kind == MetadataEntryKind::Directory || mode & 0o111 != 0;
+            let edited = edit.apply(&entries, &base, executable);
+            if edited == entries {
+                return Ok(false);
+            }
+            let mut acl = PosixACL::empty();
+            for entry in &edited {
+                acl.set(map_acl_qualifier(entry.qualifier()), acl_permissions(entry));
+            }
+            acl
+        }
     };
-    write_acl(path, acl, default)
+    write_acl(path, acl, default)?;
+    Ok(true)
+}
+
+/// The entries of the access or default ACL of `path`, in the order getfacl
+/// lists them.
+fn read_acl_entries(path: &Path, default: bool) -> Result<Vec<AclEntry>, MutationError> {
+    let acl = if default {
+        PosixACL::read_default_acl(path)
+    } else {
+        PosixACL::read_acl(path)
+    }
+    .map_err(|error| acl_error(&error))?;
+    acl.entries()
+        .into_iter()
+        .map(|entry| {
+            let qualifier = match entry.qual {
+                Qualifier::UserObj => AclQualifier::Owner,
+                Qualifier::GroupObj => AclQualifier::OwningGroup,
+                Qualifier::Other => AclQualifier::Other,
+                Qualifier::User(uid) => AclQualifier::User(uid),
+                Qualifier::Group(gid) => AclQualifier::Group(gid),
+                Qualifier::Mask => AclQualifier::Mask,
+                Qualifier::Undefined => {
+                    return Err(MutationError::Provider(
+                        "the ACL holds an entry of an unknown kind".into(),
+                    ));
+                }
+            };
+            Ok(AclEntry::new(
+                qualifier,
+                entry.perm & ACL_READ != 0,
+                entry.perm & ACL_WRITE != 0,
+                entry.perm & ACL_EXECUTE != 0,
+            ))
+        })
+        .collect()
 }
 
 fn write_acl(path: &Path, mut acl: PosixACL, default: bool) -> Result<(), MutationError> {
@@ -2198,11 +2277,15 @@ fn write_acl(path: &Path, mut acl: PosixACL, default: bool) -> Result<(), Mutati
     } else {
         acl.write_acl(path)
     };
-    result.map_err(|error| match error.kind() {
+    result.map_err(|error| acl_error(&error))
+}
+
+fn acl_error(error: &posix_acl::ACLError) -> MutationError {
+    match error.kind() {
         std::io::ErrorKind::PermissionDenied => MutationError::PermissionDenied,
         std::io::ErrorKind::Unsupported => MutationError::Unsupported,
         _ => MutationError::Provider(error.to_string().into()),
-    })
+    }
 }
 
 fn map_acl_qualifier(qualifier: &AclQualifier) -> Qualifier {

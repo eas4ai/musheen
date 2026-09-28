@@ -1,8 +1,9 @@
 use crate::i18n::Catalog;
 use crate::operations::{OperationHub, spawn_ready_hub_operations};
 use crate::{
-    Access, AccessClass, Accounts, ApplicationIdentity, DropError, LocalOperationQueue, MODE_BITS,
-    OwnershipEdit, PermissionsPageModel, PrivilegeBackend, Tristate,
+    Access, AccessClass, Accounts, AclList, AclName, AclRight, ApplicationIdentity, DropError,
+    LocalOperationQueue, MODE_BITS, OwnershipEdit, PermissionsPageModel, PrivilegeBackend,
+    Tristate,
 };
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Escape, Input, InputState};
@@ -1681,6 +1682,8 @@ pub(crate) struct PropertiesWindow {
     privilege_backend: Option<Arc<dyn PrivilegeBackend>>,
     /// The Permissions page's Advanced section is open.
     advanced_open: bool,
+    /// The ACL list whose add chooser is open (SEARCH-020).
+    acl_add_open: Option<AclList>,
     operation_hub: OperationHub,
     permission_error: Option<PermissionError>,
     permission_batch: PermissionBatchState,
@@ -1745,6 +1748,7 @@ impl PropertiesWindow {
             ownership_job: None,
             privilege_backend: data.privilege_backend,
             advanced_open: false,
+            acl_add_open: None,
             operation_hub,
             permission_error: None,
             permission_batch: PermissionBatchState::default(),
@@ -1883,6 +1887,7 @@ impl PropertiesWindow {
         });
         self.owner_picker_open = false;
         self.group_picker_open = false;
+        self.acl_add_open = None;
         // Apply, which had focus, is hidden now; the window takes it, so
         // Escape closes the review.
         self.focus.focus(window, cx);
@@ -2918,7 +2923,7 @@ impl PropertiesWindow {
         );
         if self.advanced_open {
             controls.push(self.render_permission_bits(editable, cx));
-            controls.push(self.render_access_entries());
+            controls.push(self.render_access_entries(cx));
         }
         controls
     }
@@ -3065,49 +3070,87 @@ impl PropertiesWindow {
             .into_any_element()
     }
 
-    /// The Advanced section's ACL entries, read-only and with names.
-    fn render_access_entries(&self) -> AnyElement {
+    /// The name of the user or group of a named ACL entry, as the page
+    /// shows it.
+    fn acl_name_label(&self, name: AclName) -> String {
+        let accounts = self.model.permissions().accounts();
+        match name {
+            AclName::User(uid) => format!(
+                "{} {}",
+                self.message("permissions-acl-user"),
+                accounts.user_name(uid)
+            ),
+            AclName::Group(gid) => format!(
+                "{} {}",
+                self.message("permissions-acl-group"),
+                accounts.group_name(gid)
+            ),
+        }
+    }
+
+    /// The Advanced section's ACL entries (SEARCH-020): an editor for the
+    /// named entries every selected item shares, and each item's entries as
+    /// Apply would leave them, with names.
+    fn render_access_entries(&self, cx: &mut Context<Self>) -> AnyElement {
         let permissions = self.model.permissions();
-        let accounts = permissions.accounts();
         let separator = self.catalog.list_separator();
-        let entry_label = |entry: &AclEntry| {
+        let rights = |read: bool, write: bool, execute: bool| {
+            [
+                if read { 'r' } else { '-' },
+                if write { 'w' } else { '-' },
+                if execute { 'x' } else { '-' },
+            ]
+            .iter()
+            .collect::<String>()
+        };
+        let desktop_label = |entry: &AclEntry| {
             let qualifier = match entry.qualifier() {
                 AclQualifier::Owner => self.message("permissions-acl-owner").to_string(),
                 AclQualifier::OwningGroup => {
                     self.message("permissions-acl-owning-group").to_string()
                 }
                 AclQualifier::Other => self.message("permissions-acl-other").to_string(),
-                AclQualifier::User(uid) => format!(
-                    "{} {}",
-                    self.message("permissions-acl-user"),
-                    accounts.user_name(*uid)
-                ),
-                AclQualifier::Group(gid) => format!(
-                    "{} {}",
-                    self.message("permissions-acl-group"),
-                    accounts.group_name(*gid)
-                ),
+                AclQualifier::User(uid) => self.acl_name_label(AclName::User(*uid)),
+                AclQualifier::Group(gid) => self.acl_name_label(AclName::Group(*gid)),
                 AclQualifier::Mask => self.message("permissions-acl-mask").to_string(),
                 AclQualifier::Unknown => self.message("permissions-acl-unknown").to_string(),
             };
-            let bits = [
-                if entry.read() { 'r' } else { '-' },
-                if entry.write() { 'w' } else { '-' },
-                if entry.execute() { 'x' } else { '-' },
-            ]
-            .iter()
-            .collect::<String>();
-            format!("{qualifier}: {bits}")
+            format!(
+                "{qualifier}: {}",
+                rights(entry.read(), entry.write(), entry.execute())
+            )
+        };
+        let projected_label = |entry: &musheen_ops::AclEntry| {
+            let qualifier = match entry.qualifier() {
+                musheen_ops::AclQualifier::Owner => {
+                    self.message("permissions-acl-owner").to_string()
+                }
+                musheen_ops::AclQualifier::OwningGroup => {
+                    self.message("permissions-acl-owning-group").to_string()
+                }
+                musheen_ops::AclQualifier::Other => {
+                    self.message("permissions-acl-other").to_string()
+                }
+                musheen_ops::AclQualifier::User(uid) => self.acl_name_label(AclName::User(*uid)),
+                musheen_ops::AclQualifier::Group(gid) => self.acl_name_label(AclName::Group(*gid)),
+                musheen_ops::AclQualifier::Mask => self.message("permissions-acl-mask").to_string(),
+            };
+            format!(
+                "{qualifier}: {}",
+                rights(entry.read(), entry.write(), entry.execute())
+            )
+        };
+        let entries_label = |labels: Vec<String>| {
+            if labels.is_empty() {
+                self.message("properties-no-acl").to_string()
+            } else {
+                labels.join(separator)
+            }
         };
         let state_label = |state: &AclState| match state {
-            AclState::Available(entries) if entries.is_empty() => {
-                self.message("properties-no-acl").to_string()
+            AclState::Available(entries) => {
+                entries_label(entries.iter().map(desktop_label).collect())
             }
-            AclState::Available(entries) => entries
-                .iter()
-                .map(entry_label)
-                .collect::<Vec<_>>()
-                .join(separator),
             AclState::Unsupported(reason) => format!(
                 "{}: {}",
                 self.message("properties-unsupported"),
@@ -3119,7 +3162,31 @@ impl PropertiesWindow {
                 self.catalog.localize_reason(reason)
             ),
         };
-        let mut rows = Vec::new();
+        let list_label = |index: usize, list: AclList, state: &AclState| {
+            permissions.projected_acl(index, list).map_or_else(
+                || state_label(state),
+                |entries| entries_label(entries.iter().map(projected_label).collect()),
+            )
+        };
+        let mut sections = Vec::new();
+        if let Some(reason) = permissions.acl_read_only_reason()
+            && permissions.read_only_reason().is_none()
+        {
+            sections.push(permission_note(
+                "permissions-acl-read-only",
+                format!(
+                    "{}: {}",
+                    self.message("permissions-acl-read-only"),
+                    self.catalog.localize_reason(reason)
+                ),
+                Role::Label,
+            ));
+        }
+        for list in [AclList::Access, AclList::Default] {
+            if permissions.acl_editable(list) || permissions.acl_varies(list) {
+                sections.push(self.render_acl_list(list, cx));
+            }
+        }
         for (index, item) in self.model.snapshot().items().iter().enumerate() {
             let name = item
                 .path()
@@ -3129,16 +3196,16 @@ impl PropertiesWindow {
             let mut text = format!(
                 "{name}{separator}{}: {}",
                 self.message("properties-access-acl"),
-                state_label(item.permissions().acl())
+                list_label(index, AclList::Access, item.permissions().acl())
             );
             if let Some(default_acl) = item.permissions().default_acl() {
                 text.push_str(&format!(
                     "{separator}{}: {}",
                     self.message("properties-default-acl"),
-                    state_label(default_acl)
+                    list_label(index, AclList::Default, default_acl)
                 ));
             }
-            rows.push(
+            sections.push(
                 div()
                     .id(SharedString::from(format!("permissions-acl-item-{index}")))
                     .test_support()
@@ -3157,8 +3224,113 @@ impl PropertiesWindow {
             .flex()
             .flex_col()
             .gap_1()
-            .children(rows)
+            .children(sections)
             .into_any_element()
+    }
+
+    /// The editor of one ACL list: each named entry with its rights and a
+    /// remove button, and the chooser that adds one, or Varies when the
+    /// selected items' entries differ (SEARCH-020).
+    fn render_acl_list(&self, list: AclList, cx: &mut Context<Self>) -> AnyElement {
+        let permissions = self.model.permissions();
+        let key = list.key();
+        let title = self
+            .message(match list {
+                AclList::Access => "properties-access-acl",
+                AclList::Default => "properties-default-acl",
+            })
+            .to_string();
+        let mut rows = vec![div().text_sm().child(title.clone()).into_any_element()];
+        let Some(entries) = permissions.acl_entries(list) else {
+            rows.push(varies_mark(
+                format!("permissions-acl-{key}-varies"),
+                &self.message("permissions-varies"),
+            ));
+            return acl_list_region(key, title, rows);
+        };
+        let editable = permissions.acl_editable(list);
+        for (name, shown) in entries {
+            let id = format!("permissions-acl-{key}-{}", name.key());
+            let label = self.acl_name_label(name);
+            let mut row = div().flex().flex_wrap().items_center().gap_1().child(
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_label(label.clone())
+                    .w(px(160.))
+                    .child(label),
+            );
+            for right in AclRight::ALL {
+                row = row.child(
+                    Button::new(SharedString::from(format!("{id}-{}", right.key())))
+                        .label(
+                            self.message(&format!("permissions-bit-{}", right.key()))
+                                .to_string(),
+                        )
+                        .small()
+                        .selected(shown.has(right))
+                        .disabled(!editable)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model
+                                .permissions_mut()
+                                .toggle_acl_right(list, name, right);
+                            cx.notify();
+                        })),
+                );
+            }
+            row = row.child(
+                Button::new(SharedString::from(format!("{id}-remove")))
+                    .label(self.message("permissions-acl-remove").to_string())
+                    .small()
+                    .disabled(!editable)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model.permissions_mut().remove_acl_entry(list, name);
+                        cx.notify();
+                    })),
+            );
+            rows.push(row.into_any_element());
+        }
+        if editable {
+            rows.push(
+                Button::new(SharedString::from(format!("permissions-acl-{key}-add")))
+                    .label(self.message("permissions-acl-add").to_string())
+                    .small()
+                    .selected(self.acl_add_open == Some(list))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.acl_add_open = (this.acl_add_open != Some(list)).then_some(list);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if editable && self.acl_add_open == Some(list) {
+            rows.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "permissions-acl-{key}-add-options"
+                    )))
+                    .test_support()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(permissions.acl_choices(list).into_iter().map(|(name, _)| {
+                        Button::new(SharedString::from(format!(
+                            "permissions-acl-{key}-add-{}",
+                            name.key()
+                        )))
+                        .label(self.acl_name_label(name))
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.model.permissions_mut().add_acl_entry(list, name);
+                            this.acl_add_open = None;
+                            cx.notify();
+                        }))
+                    }))
+                    .into_any_element(),
+            );
+        }
+        acl_list_region(key, title, rows)
     }
 
     /// The page's error line, in the window's language.
@@ -3849,6 +4021,20 @@ fn permission_note(id: impl Into<SharedString>, text: String, role: Role) -> Any
 /// The Varies mark beside a control whose selected items differ.
 fn varies_mark(id: impl Into<SharedString>, varies: &str) -> AnyElement {
     permission_note(id, varies.to_owned(), Role::Label)
+}
+
+/// The region of one ACL list's editor, labelled `title`.
+fn acl_list_region(key: &str, title: String, rows: Vec<AnyElement>) -> AnyElement {
+    div()
+        .id(SharedString::from(format!("permissions-acl-{key}")))
+        .test_support()
+        .role(Role::Region)
+        .aria_label(title)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(rows)
+        .into_any_element()
 }
 
 fn aggregate_u32(value: &AggregateValue<u32>) -> String {
@@ -5797,6 +5983,80 @@ mod tests {
             localized(window, "permissions-acl-access-varies");
         })
         .unwrap();
+    }
+
+    /// The page's model for `file`, owned by the user, with a named entry
+    /// for user 12345, as `effective_user` sees it.
+    fn acl_page(file: &std::path::Path, effective_user: u32) -> PermissionsPageModel {
+        let snapshot = PropertySnapshot::load(&[file.to_path_buf()]).unwrap();
+        let accounts = Accounts::fixed(
+            effective_user,
+            Vec::new(),
+            vec![(0, "root".into()), (12_345, "alice".into())],
+            vec![(0, "root".into())],
+        );
+        PermissionsPageModel::from_snapshot(&snapshot, accounts, &CapabilityState::Supported)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acl_editing_offers_another_users_items_only_to_the_superuser() {
+        use posix_acl::{ACL_READ, Qualifier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("shared.txt");
+        filesystem::write(&file, b"shared").unwrap();
+        set_named_acl(&file, &[(Qualifier::User(12_345), ACL_READ)]);
+        let owner = musheen_desktop::effective_user();
+
+        // Another user sees the entries and changes none.
+        let mut other = acl_page(&file, owner + 1);
+        assert!(!other.acl_editable(AclList::Access));
+        other.add_acl_entry(AclList::Access, AclName::User(0));
+        other.toggle_acl_right(AclList::Access, AclName::User(12_345), AclRight::Write);
+        other.remove_acl_entry(AclList::Access, AclName::User(12_345));
+        assert!(!other.is_dirty());
+        assert!(!other.change().is_dirty());
+
+        // The superuser edits any item.
+        let mut superuser = acl_page(&file, 0);
+        assert!(superuser.acl_editable(AclList::Access));
+        superuser.toggle_acl_right(AclList::Access, AclName::User(12_345), AclRight::Write);
+        assert!(superuser.is_dirty());
+        assert!(superuser.change().requires_permissions());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acl_editing_shows_the_mask_an_edit_leaves_in_the_group_row() {
+        use posix_acl::{ACL_READ, Qualifier};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("shared.txt");
+        filesystem::write(&file, b"shared").unwrap();
+        set_file_mode(&file, 0o640);
+        set_named_acl(&file, &[(Qualifier::User(12_345), ACL_READ)]);
+        let mut page = acl_page(&file, musheen_desktop::effective_user());
+        assert!(
+            !page
+                .acl_choices(AclList::Access)
+                .iter()
+                .any(|(name, _)| *name == AclName::User(12_345)),
+            "an account with an entry is not offered again"
+        );
+        page.add_acl_entry(AclList::Access, AclName::User(0));
+        page.toggle_acl_right(AclList::Access, AclName::User(0), AclRight::Write);
+        assert_eq!(
+            page.access(AccessClass::Group),
+            Some(Access::Modify),
+            "the Group row shows the mask the new entry gives"
+        );
+        assert_eq!(page.bit(0o020), Tristate::On);
+
+        // Removing the new entry gives back what the file has.
+        page.remove_acl_entry(AclList::Access, AclName::User(0));
+        assert!(!page.is_dirty());
+        assert_eq!(page.access(AccessClass::Group), Some(Access::View));
     }
 
     /// Whether `path` is owned by the current user.
