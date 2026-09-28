@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: admin-ownership-changes
+Current: acl-editing
 
 ## 1. Foundation
 
@@ -374,5 +374,25 @@ reviewed scope, entering nested mounts only when the scope includes them.
 Mode changes stay the user's own and run first. The change runs in the
 operations queue, and a failure names its item. Done when the search-019
 and sys-037 checks pass on the final tree, the workspace tests, cargo fmt
+--check and clippy with warnings denied are clean, and every finding of the
+review and the report is resolved or declined.
+
+## acl-editing
+
+Requirements: SEARCH-019, SEARCH-020
+
+Let the Advanced section of the Permissions page edit ACL entries (item
+acl-editing). On items the user owns, or on any item when Musheen runs as
+the superuser, the user adds a named user or group entry chosen from the
+system's accounts, changes its read, write and execute rights, and removes
+it; a folder's default entries are edited the same way. A selection whose
+entries differ shows Varies and stays as it is. Apply edits each item's
+entries as they are at that moment, then its mode, so a Group row set in
+the same Apply decides the mask; otherwise the mask becomes the union of
+the group-class entries, as setfacl sets it. Apply to contents gives files
+the access entries and folders the access and default entries, with
+execute only where an execute bit exists. A filesystem without ACL support
+shows the entries read-only and says why. Done when the search-019 and
+search-020 checks pass on the final tree, the workspace tests, cargo fmt
 --check and clippy with warnings denied are clean, and every finding of the
 review and the report is resolved or declined.
