@@ -1,10 +1,14 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use gpui::{
-    Anchor, AnyElement, App, Context, DismissEvent, Element, ElementId, Entity, FocusHandle,
-    Focusable, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, StyleRefinement,
-    Styled, Subscription, Window, anchored, deferred, div, prelude::FluentBuilder, px,
+    Anchor, AnyElement, App, Bounds, Context, DismissEvent, Element, ElementId, Entity,
+    FocusHandle, Focusable, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    Point, Position, Style, StyleRefinement, Styled, Subscription, Window, anchored, deferred, div,
+    px,
 };
 
 use crate::menu::PopupMenu;
@@ -128,6 +132,14 @@ struct ContextMenuSharedState {
 
 pub struct ContextMenuState {
     element: Option<AnyElement>,
+    /// Whether this trigger draws the open menu this frame.
+    ///
+    /// Triggers without an `ElementId` fall back to their code location, so
+    /// rows rendered from one call site share the element state and all see
+    /// the menu as open. Only the trigger that was pressed draws it: stacked
+    /// copies of one `PopupMenu` share an item's pending-click state, and the
+    /// covered copies clear it on mouse up before the visible one fires.
+    draws_menu: Rc<Cell<bool>>,
     shared_state: Rc<RefCell<ContextMenuSharedState>>,
 }
 
@@ -135,6 +147,7 @@ impl Default for ContextMenuState {
     fn default() -> Self {
         Self {
             element: None,
+            draws_menu: Rc::default(),
             shared_state: Rc::new(RefCell::new(ContextMenuSharedState {
                 menu_view: None,
                 open: false,
@@ -142,6 +155,118 @@ impl Default for ContextMenuState {
                 trigger_focus_handle: None,
                 _subscription: None,
             })),
+        }
+    }
+}
+
+/// The deferred menu layer of one trigger.
+///
+/// Every trigger that shares the open state carries one, but only the trigger
+/// whose bounds contain the press builds and lays out the menu, so an open
+/// menu is rendered once per frame rather than once per row.
+struct DeferredMenu {
+    draws: Rc<Cell<bool>>,
+    menu_view: Entity<PopupMenu>,
+    position: Point<Pixels>,
+    anchor: Anchor,
+    menu: Option<AnyElement>,
+}
+
+impl DeferredMenu {
+    fn build_menu(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        // Focus the menu, so that can be handle the action.
+        let focus_handle = self.menu_view.focus_handle(cx);
+        if !focus_handle.contains_focused(window, cx) {
+            focus_handle.focus(window, cx);
+        }
+
+        deferred(
+            anchored().child(
+                div()
+                    .w(window.bounds().size.width)
+                    .h(window.bounds().size.height)
+                    .on_scroll_wheel(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        anchored()
+                            .position(self.position)
+                            .snap_to_window_with_margin(px(8.))
+                            .anchor(self.anchor)
+                            .child(self.menu_view.clone()),
+                    ),
+            ),
+        )
+        .with_priority(gpui_base::POPUP_PRIORITY)
+        .into_any()
+    }
+}
+
+impl IntoElement for DeferredMenu {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for DeferredMenu {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        // An empty absolute placeholder, where the menu's `anchored` root used
+        // to sit, so the trigger's own layout is unchanged.
+        let style = Style {
+            position: Position::Absolute,
+            ..Style::default()
+        };
+        (window.request_layout(style, None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if !self.draws.get() {
+            return;
+        }
+        let mut menu = self.build_menu(window, cx);
+        menu.prepaint_as_root(bounds.origin, window.viewport_size().into(), window, cx);
+        self.menu = Some(menu);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(menu) = &mut self.menu {
+            menu.paint(window, cx);
         }
     }
 }
@@ -182,47 +307,16 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                     .trigger_focus_handle
                     .get_or_insert_with(|| cx.focus_handle());
                 let menu_view = state.shared_state.borrow().menu_view.clone();
-                let mut menu_element = None;
-                if open {
-                    let has_menu_item = menu_view
-                        .as_ref()
-                        .map(|menu| !menu.read(cx).is_empty())
-                        .unwrap_or(false);
-
-                    if has_menu_item {
-                        menu_element = Some(
-                            deferred(
-                                anchored().child(
-                                    div()
-                                        .w(window.bounds().size.width)
-                                        .h(window.bounds().size.height)
-                                        .on_scroll_wheel(|_, _, cx| {
-                                            cx.stop_propagation();
-                                        })
-                                        .child(
-                                            anchored()
-                                                .position(position)
-                                                .snap_to_window_with_margin(px(8.))
-                                                .anchor(anchor)
-                                                .when_some(menu_view, |this, menu| {
-                                                    // Focus the menu, so that can be handle the action.
-                                                    if !menu
-                                                        .focus_handle(cx)
-                                                        .contains_focused(window, cx)
-                                                    {
-                                                        menu.focus_handle(cx).focus(window, cx);
-                                                    }
-
-                                                    this.child(menu.clone())
-                                                }),
-                                        ),
-                                ),
-                            )
-                            .with_priority(gpui_base::POPUP_PRIORITY)
-                            .into_any(),
-                        );
-                    }
-                }
+                let draws_menu = Rc::new(Cell::new(false));
+                let menu_element = menu_view
+                    .filter(|menu| open && !menu.read(cx).is_empty())
+                    .map(|menu_view| DeferredMenu {
+                        draws: draws_menu.clone(),
+                        menu_view,
+                        position,
+                        anchor,
+                        menu: None,
+                    });
 
                 let mut element = this
                     .element
@@ -237,6 +331,7 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                     layout_id,
                     ContextMenuState {
                         element: Some(element),
+                        draws_menu,
                         shared_state: state.shared_state.clone(),
                     },
                 )
@@ -261,6 +356,8 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
         {
             window.set_focus_handle(trigger_focus, cx);
         }
+        let position = request_layout.shared_state.borrow().position;
+        request_layout.draws_menu.set(bounds.contains(&position));
         if let Some(element) = &mut request_layout.element {
             element.prepaint(window, cx);
         }
@@ -338,7 +435,12 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                                     menu.set_previous_focus(previous_focus_handle, cx);
                                 });
 
-                                // Set up the subscription for dismiss handling
+                                // Set up the subscription for dismiss handling.
+                                // Hold a Weak here, not a strong clone: the closure
+                                // would otherwise close the cycle
+                                // `shared_state -> _subscription -> closure ->
+                                // shared_state`, so a menu left open when the window
+                                // closes leaks its PopupMenu entity.
                                 let _subscription = window.subscribe(&menu, cx, {
                                     let shared_state = Rc::downgrade(&shared_state);
                                     move |_, _: &DismissEvent, window, _cx| {
@@ -371,6 +473,7 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::menu::PopupMenuItem;
     use crate::theme::Theme;
     use gpui::{
         Context, FocusHandle, IntoElement, KeyBinding, Render, TestAppContext, VisualTestContext,
@@ -498,6 +601,103 @@ mod tests {
                 )
                 .child(div().child("Status"))
         }
+    }
+
+    /// The issue shape (#3134): rows rendered from one call site without an
+    /// `ElementId` share the context menu's element state.
+    struct RowsRoot {
+        clicked: Rc<Cell<usize>>,
+    }
+
+    impl Render for RowsRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().children((0..3).map(|_| {
+                let clicked = self.clicked.clone();
+                div()
+                    .w(px(100.))
+                    .h(px(30.))
+                    .context_menu(move |menu, _, _| {
+                        let clicked = clicked.clone();
+                        menu.item(
+                            PopupMenuItem::new("Favorite")
+                                .on_click(move |_, _, _| clicked.set(clicked.get() + 1)),
+                        )
+                    })
+            }))
+        }
+    }
+
+    #[gpui::test]
+    fn item_click_fires_once_from_rows_without_an_id(cx: &mut TestAppContext) {
+        cx.update(|cx| crate::init(cx));
+        let clicked = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let clicked = clicked.clone();
+            move |_, _| RowsRoot { clicked }
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        // Right-click the second row; the menu opens at the press position.
+        let press = point(px(10.), px(40.));
+        cx.simulate_mouse_down(press, MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(press, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+
+        // Click the first item, which sits inside the menu's content padding.
+        let item = point(press.x + px(30.), press.y + px(17.));
+        cx.simulate_mouse_move(item, None, Default::default());
+        cx.simulate_click(item, Default::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            clicked.get(),
+            1,
+            "the item's on_click must fire exactly once"
+        );
+    }
+
+    /// Opening a context menu and closing the window without dismissing the
+    /// menu must release the `PopupMenu` entity (#3223): the dismiss
+    /// subscription used to capture a strong `Rc` clone of `shared_state`,
+    /// and the app-global listener registry kept that clone alive even after
+    /// the window (and its element state) was gone, so the menu entity
+    /// survived the window. The subscription now holds a `Weak` instead.
+    #[gpui::test]
+    fn open_without_dismiss_releases_the_menu_entity(cx: &mut TestAppContext) {
+        cx.update(|cx| crate::init(cx));
+        let before = cx.update(|cx| cx.leak_detector_snapshot());
+
+        {
+            let (_, cx) = cx.add_window_view(|_, _| RowsRoot {
+                clicked: Rc::new(Cell::new(0)),
+            });
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+
+            // Right-click the first row; the menu opens and is left open.
+            let press = point(px(10.), px(10.));
+            cx.simulate_mouse_down(press, MouseButton::Right, Default::default());
+            cx.simulate_mouse_up(press, MouseButton::Right, Default::default());
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+            });
+
+            // Close the window without dismissing the menu.
+            cx.update(|window, _| window.remove_window());
+            cx.run_until_parked();
+        }
+
+        // The app itself is still alive here, so the global listener registry
+        // (which held the subscription's strong `Rc` clone) is too: any entity
+        // leaked by the old cycle is still reachable and detected.
+        cx.update(|cx| cx.assert_no_new_leaks(&before));
     }
 
     #[gpui::test]

@@ -1,4 +1,15 @@
 _version: 2
+Attachment:
+  Remove:
+    en: Remove
+    zh-CN: 移除
+    zh-HK: 移除
+    zh-TW: 移除
+  Retry:
+    en: Retry
+    zh-CN: 重试
+    zh-HK: 重試
+    zh-TW: 重試
 Calendar:
   week.0:
     en: Su
@@ -121,6 +132,10 @@ DatePicker:
     zh-HK: 選擇日期
     zh-TW: 選取日期
     it: "Seleziona data"
+  time:
+    en: Time
+    zh-CN: 时间
+    zh-HK: 時間
 Select:
   placeholder:
     en: "Please select"
@@ -381,3 +396,39 @@ Chart:
     zh-CN: 收盘
     zh-HK: 收市
     zh-TW: 收盤
+Questionnaire:
+  progress:
+    en: Question %{current} of %{total}
+    zh-CN: 第 %{current} 题，共 %{total} 题
+    zh-HK: 第 %{current} 題，共 %{total} 題
+    zh-TW: 第 %{current} 題，共 %{total} 題
+  previous:
+    en: Previous
+    zh-CN: 上一题
+    zh-HK: 上一題
+    zh-TW: 上一題
+  next:
+    en: Next
+    zh-CN: 下一题
+    zh-HK: 下一題
+    zh-TW: 下一題
+  skip:
+    en: Skip
+    zh-CN: 跳过
+    zh-HK: 跳過
+    zh-TW: 跳過
+  submit:
+    en: Submit
+    zh-CN: 提交
+    zh-HK: 提交
+    zh-TW: 提交
+  error.required:
+    en: Choose an answer to continue.
+    zh-CN: 请选择一个答案后继续。
+    zh-HK: 請選擇一個答案後繼續。
+    zh-TW: 請選擇一個答案後繼續。
+  error.optional:
+    en: Choose an answer or skip this question.
+    zh-CN: 请选择一个答案，或跳过此题。
+    zh-HK: 請選擇一個答案，或跳過此題。
+    zh-TW: 請選擇一個答案，或跳過此題。
