@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: broker-protocol-version
+Current: gpui-kit-0.7
 
 ## 1. Foundation
 
@@ -412,3 +412,38 @@ ends the session and says so. Done when the sys-034 check passes on the
 final tree, the workspace tests, cargo fmt --check and clippy with
 warnings denied are clean, and every finding of the review and the
 report is resolved or declined.
+
+## native-look
+
+Requirements: ICON-002, UIV-007, UIV-025, BROWSE-024
+
+Make Musheen look like a Plasma file manager (items linux-native-look and
+desktop-entry-display). Files get file-type icons: the type comes from
+shared-mime-info by name, the icon from the active icon theme and the
+themes it inherits under its icon-naming name, then the bundled vivid
+file-icon-vectors icon for the file's extension, then a Lucide family
+glyph. Selection, the current tab, the current breadcrumb, the sidebar
+selection and menu highlights use the desktop's accent, or Plasma's scheme
+selection colour when the scheme sets none. Text places glyphs on whole
+pixels as Qt does, by vendoring gpui-pre-wgpu with cosmic-text's metrics
+hinting on. A trusted desktop entry shows its localized name and icon; an
+untrusted one keeps its file name. Done when the icon-002, uiv-007,
+uiv-025 and browse-024 checks pass on the final tree, the workspace tests,
+cargo fmt --check and clippy with warnings denied are clean, and every
+finding of the review and the report is resolved or declined.
+
+## gpui-kit-0.7
+
+Requirements: DEP-023
+
+Move to GPUI Kit 0.7.0 and the GPUI 0.3.7 crates it pins (Shawn's ruling
+of 2026-09-28). Re-apply Musheen's changes to the vendored gpui-pre,
+gpui-pre-linux and gpui-component on their new versions, adapt the
+vendored native-theme-gpui to gpui-component 0.7, and drop the one
+removed overlay-layer call in the Settings window. docs/vendor.md records
+every vendored crate, its base version and each change with its reason.
+Behaviour stays as it is: every existing check still passes. Done when
+the dep-023 check passes on the final tree, the workspace tests, cargo
+fmt --check and clippy with warnings denied are clean, and every finding
+of the review and the report is resolved or declined.
+

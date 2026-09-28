@@ -13,10 +13,11 @@ Falsifier: a Musheen command renders a glyph from Evil Icons, TheSVG, SVGL, an e
 Mechanism: registry provenance test plus rendered icon inventory review.
 Status: Draft
 
-[ICON-002] File, directory, MIME, application, device, and mount identity uses the active freedesktop icon theme resolved by the desktop icon service. Missing native content icons fall back to the matching Lucide file, folder, drive, network, or cloud glyph.
-Falsifier: a missing system icon produces a blank item or substitutes a second command-icon family.
-Mechanism: icon-theme fixtures with complete, partial, broken, and missing themes.
-Status: Draft
+[ICON-002] File, directory, MIME, application, device, and mount identity uses the active freedesktop icon theme. A file's type comes from shared-mime-info by its name, without reading its content. Its icon is the theme's icon for that type, named as the icon naming specification names it (image/png as image-png), then the type's generic icon (such as image-x-generic), each looked up in the theme, the themes it inherits, and hicolor. A type no theme has an icon for shows the bundled file-type icon for the file's extension, from the vivid style of file-icon-vectors (MIT), then the Lucide file-type glyph of its family (text, image, audio, video, archive, document, spreadsheet, presentation, code, or executable), and only a file that matches none of them shows the plain file glyph. Missing folder, drive, network, or cloud icons fall back to their Lucide glyphs.
+Falsifier: a file whose type, or whose type's generic icon, the active theme or a theme it inherits has an icon for shows another icon; a file whose type no theme has an icon for shows something other than the bundled icon for its extension when one exists; a file in one of the listed families shows the plain file glyph; finding a file's icon reads its content; or a missing icon produces a blank item or a second command-icon family.
+Mechanism: icon-002
+Rationale: Shawn's rulings of 2026-09-28 (item linux-native-look): file-type icons at least, monochrome is fine, and the vivid file-icon-vectors set he chose for types the theme lacks. The list asked the theme for image/png instead of image-png, so every file fell back to one generic glyph.
+Status: Agreed 2026-09-28
 
 [ICON-003] The icon registry maps semantic roles to Lucide names once; views request a role and never load an SVG path or choose a near-duplicate directly.
 Falsifier: two views map the same command to different glyphs or embed a raw command SVG outside the registry.
