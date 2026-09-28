@@ -168,6 +168,7 @@ fn theme_color_to_config_colors(tc: &gpui_component::theme::ThemeColor) -> Theme
     colors.success_active = h(tc.success_active);
     colors.chart_bullish = h(tc.chart_bullish);
     colors.chart_bearish = h(tc.chart_bearish);
+    colors.chart_grid = h(tc.chart_grid);
     colors.switch = h(tc.switch);
     colors.switch_thumb = h(tc.switch_thumb);
     colors.tab = h(tc.tab);
@@ -306,7 +307,7 @@ mod tests {
     /// §5.3: the config copy carries every new field, so `Theme::change`
     /// reproduces the solid button surfaces instead of upstream's tint.
     #[test]
-    fn theme_config_colors_cover_the_0_6_fields() {
+    fn theme_config_colors_cover_the_0_7_fields() {
         let resolved = test_resolved();
         let config = to_theme_config(
             &resolved,
@@ -327,6 +328,7 @@ mod tests {
             ("button_warning", &c.button_warning),
             ("chart_bullish", &c.chart_bullish),
             ("chart_bearish", &c.chart_bearish),
+            ("chart_grid", &c.chart_grid),
             ("status_bar", &c.status_bar),
             ("status_bar_border", &c.status_bar_border),
             ("table_foot", &c.table_foot),
