@@ -135,7 +135,7 @@ pub fn icon_name(role: IconRole) -> Option<IconName> {
 /// Returns the kebab-case Lucide name for use with
 /// [`native_theme::icons::LucideLoader::new`].
 ///
-/// Covers all 101 gpui-component 0.6.0 `IconName` variants. Returns `None`
+/// Covers all 104 gpui-component 0.7.0 `IconName` variants. Returns `None`
 /// where Lucide has no equivalent (today only `StarFill`, spec §10.2); every
 /// `Some` is Lucide's own file name (`LucideLoader::new(name)` resolves it).
 #[must_use]
@@ -153,6 +153,7 @@ pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::BatteryLow => "battery-low",
         IconName::BatteryMedium => "battery-medium",
         IconName::BatteryWarning => "battery-warning",
+        IconName::Ban => "ban",
         IconName::Bell => "bell",
         IconName::BookOpen => "book-open",
         IconName::Bot => "bot",
@@ -166,6 +167,7 @@ pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::ChevronRight => "chevron-right",
         IconName::ChevronsUpDown => "chevrons-up-down",
         IconName::ChevronUp => "chevron-up",
+        IconName::CircleAlert => "circle-alert",
         IconName::CircleCheck => "circle-check",
         IconName::CircleUser => "circle-user",
         IconName::CircleX => "circle-x",
@@ -219,6 +221,7 @@ pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::Plus => "plus",
         IconName::Redo => "redo",
         IconName::Redo2 => "redo-2",
+        IconName::RefreshCw => "refresh-cw",
         IconName::Replace => "replace",
         IconName::ResizeCorner => "grip",
         IconName::RotateCw => "rotate-cw",
@@ -254,7 +257,7 @@ pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
 /// Returns the snake_case Material Symbols name for use with
 /// [`native_theme::icons::MaterialLoader`].
 ///
-/// Covers all 101 gpui-component 0.6.0 `IconName` variants. Returns `None`
+/// Covers all 104 gpui-component 0.7.0 `IconName` variants. Returns `None`
 /// where Material Symbols has no equivalent (today only `StarOff`); every
 /// `Some` is a bundled Material Symbols Outlined 24px file.
 ///
@@ -285,6 +288,7 @@ pub fn material_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::BatteryLow => "battery_2_bar", // close: one of three bars <-> two of six
         IconName::BatteryMedium => "battery_4_bar", // close: two of three <-> four of six
         IconName::BatteryWarning => "battery_alert", // exact
+        IconName::Ban => "block",
         IconName::Bell => "notifications",
         IconName::BookOpen => "menu_book",
         IconName::Bot => "smart_toy",
@@ -298,6 +302,7 @@ pub fn material_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::ChevronRight => "chevron_right",
         IconName::ChevronsUpDown => "unfold_more",
         IconName::ChevronUp => "expand_less",
+        IconName::CircleAlert => "error",
         IconName::CircleCheck => "check_circle",
         IconName::CircleUser => "account_circle",
         IconName::CircleX => "cancel",
@@ -350,6 +355,7 @@ pub fn material_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::Play => "play_arrow", // exact
         IconName::Plus => "add",
         IconName::Redo => "redo",
+        IconName::RefreshCw => "refresh",
         IconName::Redo2 => "redo",
         IconName::Replace => "find_replace",
         IconName::ResizeCorner => "drag_indicator",
@@ -398,7 +404,7 @@ pub fn material_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
 /// - `close`: same concept, minor visual difference
 /// - `approximate`: best available match, different metaphor
 ///
-/// Covers all 101 gpui-component 0.6.0 `IconName` variants. Returns `None`
+/// Covers all 104 gpui-component 0.7.0 `IconName` variants. Returns `None`
 /// where the freedesktop icon naming specification has no name for the
 /// concept (today every variant has one, some only as a labelled `close` or
 /// `approximate` substitute: `StarOff` and `HeartOff` both take
@@ -430,6 +436,8 @@ pub fn freedesktop_name_for_gpui_icon(
         IconName::ChevronLeft => "go-previous", // close
         IconName::ChevronRight => "go-next", // close
         IconName::ChevronUp => "go-up",     // close
+        IconName::Ban => "action-unavailable", // exact
+        IconName::CircleAlert => "dialog-error", // close
         IconName::CircleX => "dialog-error", // close
         IconName::Copy => "edit-copy",      // exact
         IconName::Dash => "list-remove",    // exact
@@ -454,6 +462,7 @@ pub fn freedesktop_name_for_gpui_icon(
         IconName::Play => "media-playback-start", // exact
         IconName::Plus => "list-add",       // exact
         IconName::Redo => "edit-redo",      // exact
+        IconName::RefreshCw => "view-refresh", // exact
         IconName::Redo2 => "edit-redo",     // exact
         IconName::Replace => "edit-find-replace", // exact
         IconName::RotateCw => "object-rotate-right", // exact

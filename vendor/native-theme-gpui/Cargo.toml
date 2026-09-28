@@ -57,25 +57,25 @@ name = "native_theme_gpui"
 path = "src/lib.rs"
 
 [dependencies.gpui]
-version = "0.3.3"
+version = "0.3.7"
 package = "gpui-pre"
 
 [dependencies.gpui-base]
-version = "0.6.0"
+version = "0.7.0"
 
 [dependencies.gpui-component]
-version = "0.6.0"
+version = "0.7.0"
 
 [dependencies.native-theme]
 version = "0.5.8"
 
 [dev-dependencies.gpui]
-version = "0.3.3"
+version = "0.3.7"
 features = ["test-support"]
 package = "gpui-pre"
 
 [dev-dependencies.gpui-kit]
-version = "0.6.0"
+version = "0.7.0"
 
 [dev-dependencies.native-theme]
 version = "0.5.8"

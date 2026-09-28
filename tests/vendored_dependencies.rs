@@ -82,7 +82,8 @@ fn vendored_dependencies_follow_gpui_kit_0_7() {
         .expect("docs/vendor.md lists the vendored crates");
     for (name, version) in &vendored {
         assert!(
-            list.lines().any(|line| line.trim() == format!("## {name} {version}")),
+            list.lines()
+                .any(|line| line.trim() == format!("## {name} {version}")),
             "docs/vendor.md has the heading `## {name} {version}`"
         );
     }

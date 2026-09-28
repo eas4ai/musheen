@@ -870,7 +870,6 @@ impl Render for SettingsWindow {
                         })),
                 ),
         )
-        .children(Root::render_dialog_layer(window, cx))
     }
 }
 
