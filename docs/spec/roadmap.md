@@ -447,3 +447,18 @@ the dep-023 check passes on the final tree, the workspace tests, cargo
 fmt --check and clippy with warnings denied are clean, and every finding
 of the review and the report is resolved or declined.
 
+
+## elevated-listing-test-timing
+
+Requirements: SYS-034
+
+The SYS-034 test that lists 170,000 names as administrator failed once on
+2026-09-28 while another project built on the machine, and passed on three
+reruns (backlog item elevated-listing-test-timing). Find which broker error
+it was and whether the listing or the test was at fault. The listing tests
+stop running their large listings at the same time as each other, so they
+compete less for the machine; SYS-034's 10-second bound stays as it is. Done
+when the
+sys-034 check passes on the final tree, the workspace tests, cargo fmt
+--check and clippy with warnings denied are clean, and every finding of the
+review and the report is resolved or declined.
