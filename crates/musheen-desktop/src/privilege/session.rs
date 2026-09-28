@@ -573,6 +573,17 @@ fn exchange(
     let mut failure = None;
     while failure.is_none() && state.unanswered > 0 {
         match channel.next_response(deadline, cancellation) {
+            // A cancelled request's answer is read past, but one Musheen
+            // cannot read still ends the session (SYS-034).
+            Ok(response)
+                if matches!(
+                    decode_broker_response(&response),
+                    Err(BrokerError::AnswerUnreadable)
+                ) =>
+            {
+                stop_channel(state);
+                return Err(BrokerError::AnswerUnreadable);
+            }
             Ok(_) => state.unanswered -= 1,
             Err(ChannelError::Cancelled) => return Err(BrokerError::AuthorizationCancelled),
             Err(error) => failure = Some(error),
@@ -603,7 +614,8 @@ fn end_session(state: &mut SessionState, error: ChannelError) -> BrokerError {
     match error {
         ChannelError::Ended => BrokerError::AuthorizationExpired,
         ChannelError::TimedOut => BrokerError::ExecutionTimedOut,
-        ChannelError::Oversized | ChannelError::Cancelled => BrokerError::BrokerCrashed,
+        ChannelError::Oversized => BrokerError::AnswerUnreadable,
+        ChannelError::Cancelled => BrokerError::BrokerCrashed,
     }
 }
 

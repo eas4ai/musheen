@@ -67,6 +67,12 @@ fn main() {
             return fail("broker transport unavailable", 3);
         }
     }
+    // The broker names its protocol version before it reads anything, so
+    // Musheen refuses a broker that replaced the one it checked before it
+    // sends a request (SYS-034).
+    if write_protocol_version(&mut std::io::stdout().lock(), BROKER_PROTOCOL_VERSION).is_err() {
+        return fail("broker transport unavailable", 3);
+    }
     let Ok(requests) = RequestLines::spawn(std::io::stdin()) else {
         return fail("broker transport unavailable", 3);
     };
@@ -122,13 +128,7 @@ fn main() {
     };
     let broker = Broker::new(authorizer, runner, audit, SystemClock).with_provider(provider);
     let mut stdout = std::io::stdout();
-    let outcome = broker.handle(request);
-    // The first answer names the protocol version again, so a broker that
-    // replaced the one Musheen checked before authorization is refused.
-    if write_protocol_version(&mut stdout, BROKER_PROTOCOL_VERSION).is_err() {
-        return fail("broker transport unavailable", 3);
-    }
-    match outcome {
+    match broker.handle(request) {
         Ok(BrokerOutput::RootReferenced(root)) => {
             let answered = write_response(
                 &mut stdout,

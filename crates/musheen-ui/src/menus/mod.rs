@@ -267,6 +267,22 @@ pub struct PendingInvocation {
 }
 
 impl PendingInvocation {
+    /// A pending command on `selection`, as a menu builds one, for a test.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        id: &str,
+        selection: Vec<musheen_core::CommandTargetRef>,
+        origin_tab: Option<crate::navigation::TabId>,
+    ) -> Self {
+        Self {
+            id: musheen_core::CommandId::new(id).expect("a valid command ID"),
+            context: musheen_core::CommandContext::default(),
+            selection: selection.clone().into(),
+            parameters: CommandParameters::targets(selection),
+            origin_tab,
+        }
+    }
+
     pub(crate) fn custom_action_id(&self) -> Option<&str> {
         match &self.parameters {
             CommandParameters::CustomAction { action_id, .. } => action_id.as_deref(),

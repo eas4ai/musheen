@@ -473,15 +473,18 @@ impl BrokerResponse {
         }
     }
 
+    /// The output or the broker's own error. A response that carries
+    /// neither, or an error code Musheen does not know, cannot be read
+    /// (SYS-034).
     fn into_result(self) -> Result<BrokerOutput, BrokerError> {
         if self.ok {
-            self.result.ok_or(BrokerError::BrokerCrashed)
+            self.result.ok_or(BrokerError::AnswerUnreadable)
         } else {
             Err(self
                 .error
                 .as_deref()
                 .and_then(BrokerError::from_code)
-                .unwrap_or(BrokerError::BrokerCrashed))
+                .unwrap_or(BrokerError::AnswerUnreadable))
         }
     }
 }
@@ -546,9 +549,14 @@ fn protocol_version_of(line: &str) -> Option<u32> {
 /// Runs the installed broker without privileges and reads the protocol
 /// version it names, so a broker that a package upgrade replaced while
 /// Musheen runs is refused before authorization is asked for (SYS-034). A
-/// broker too old to name one, or one that names another, is
-/// [`BrokerError::ProtocolMismatch`].
-fn check_installed_broker(launch: &BrokerLaunch) -> Result<(), BrokerError> {
+/// broker that names another version, or ends without naming one as a
+/// broker from before the protocol version does, is
+/// [`BrokerError::ProtocolMismatch`]; one that names nothing within
+/// [`PROTOCOL_CHECK_TIMEOUT`] is [`BrokerError::ExecutionTimedOut`].
+pub fn check_installed_broker(
+    launch: &BrokerLaunch,
+    cancellation: &CancellationToken,
+) -> Result<(), BrokerError> {
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
@@ -572,17 +580,61 @@ fn check_installed_broker(launch: &BrokerLaunch) -> Result<(), BrokerError> {
         let _ = stdout.take(4096).read_to_end(&mut output);
         let _ = sender.send(output);
     });
-    let output = receiver.recv_timeout(PROTOCOL_CHECK_TIMEOUT);
+    let deadline = Instant::now() + PROTOCOL_CHECK_TIMEOUT;
+    let output = loop {
+        if cancellation.is_cancelled() {
+            break Err(BrokerError::AuthorizationCancelled);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break Err(BrokerError::ExecutionTimedOut);
+        }
+        match receiver.recv_timeout((deadline - now).min(Duration::from_millis(20))) {
+            Ok(output) => break Ok(output),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Ok(Vec::new()),
+        }
+    };
     kill_and_reap_process_group(&mut child);
-    let version = output.ok().and_then(|output| {
-        String::from_utf8_lossy(&output)
-            .lines()
-            .find_map(protocol_version_of)
-    });
+    let version = String::from_utf8_lossy(&output?)
+        .lines()
+        .find_map(protocol_version_of);
     if version == Some(BROKER_PROTOCOL_VERSION) {
         Ok(())
     } else {
         Err(BrokerError::ProtocolMismatch)
+    }
+}
+
+/// Waits for the protocol line a broker writes before it reads anything,
+/// and refuses a broker of another version before Musheen sends it a
+/// request (SYS-034). A broker that ends first names no version, as one
+/// that pkexec or sudo did not start does not.
+fn await_protocol_version(
+    channel: &mut BrokerChannel,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<(), BrokerError> {
+    loop {
+        let ended = channel.receive_chunk(Duration::from_millis(20)).is_err();
+        for line in channel.take_lines() {
+            if let Some(version) = protocol_version_of(&line) {
+                return if version == BROKER_PROTOCOL_VERSION {
+                    Ok(())
+                } else {
+                    Err(BrokerError::ProtocolMismatch)
+                };
+            }
+        }
+        if ended {
+            return Err(BrokerError::BrokerCrashed);
+        }
+        if cancellation.is_cancelled() {
+            return Err(BrokerError::AuthorizationCancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(BrokerError::ExecutionTimedOut);
+        }
     }
 }
 
@@ -813,6 +865,13 @@ impl BrokerLaunch {
 pub trait BrokerTransport: Send + Sync + 'static {
     fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError>;
 
+    /// Reads the installed broker's protocol version, as Musheen does before
+    /// a review that may ask for a password opens (SYS-034).
+    fn check_broker(&self, cancellation: &CancellationToken) -> Result<(), BrokerError> {
+        let _ = cancellation;
+        Ok(())
+    }
+
     fn perform_cancellable(
         &self,
         request: &BrokerRequest,
@@ -867,21 +926,13 @@ fn session_from(
     }
 }
 
-/// The broker's first answer, which counts only after the broker named
-/// Musheen's protocol version (SYS-034).
-fn first_answer(version: Option<u32>, response: &str) -> Result<BrokerOutput, BrokerError> {
-    if version != Some(BROKER_PROTOCOL_VERSION) {
-        return Err(BrokerError::ProtocolMismatch);
-    }
-    decode_broker_response(response)
-}
-
 /// Maps a channel that gave no first answer to the transport's error.
 const fn start_error(error: ChannelError) -> BrokerError {
     match error {
         ChannelError::Cancelled => BrokerError::AuthorizationCancelled,
         ChannelError::TimedOut => BrokerError::ExecutionTimedOut,
-        ChannelError::Ended | ChannelError::Oversized => BrokerError::BrokerCrashed,
+        ChannelError::Ended => BrokerError::BrokerCrashed,
+        ChannelError::Oversized => BrokerError::AnswerUnreadable,
     }
 }
 
@@ -938,7 +989,7 @@ impl ProcessBrokerTransport {
             return Err(BrokerError::AuthorizationUnavailable);
         }
         let encoded = encode_broker_request(request)?;
-        check_installed_broker(&self.launch)?;
+        check_installed_broker(&self.launch, cancellation)?;
         let deadline = Instant::now() + self.timeout;
         // A socket pair, not pipes: another process of the same user can
         // reopen a pipe through /proc/<pid>/fd and write into the session,
@@ -974,25 +1025,26 @@ impl ProcessBrokerTransport {
             Vec::new(),
             Box::new(PolkitBroker(child)),
         );
+        // The broker names its protocol version before it reads its request,
+        // so one of another version is refused before it handles anything
+        // (SYS-034).
+        if let Err(error) = await_protocol_version(&mut channel, deadline, cancellation) {
+            channel.stop_now();
+            return Err(error);
+        }
         if channel.send(&encoded).is_err() {
             channel.stop_now();
             return Err(BrokerError::BrokerCrashed);
         }
         // An ownership change reports progress while it walks; each report
-        // gives it the full timeout again (SYS-037). The broker names its
-        // protocol version before its first answer (SYS-034).
+        // gives it the full timeout again (SYS-037).
         let mut progress = OwnershipProgressSeen::default();
-        let mut version = None;
         let answer =
             channel.next_response_seeing(deadline, self.timeout, cancellation, &mut |line| {
-                if let Some(named) = protocol_version_of(line) {
-                    version = Some(named);
-                    return false;
-                }
                 progress.see(line)
             });
         match answer {
-            Ok(response) => match first_answer(version, &response) {
+            Ok(response) => match decode_broker_response(&response) {
                 Ok(output) => Ok((output, channel)),
                 Err(error) => {
                     channel.stop_now();
@@ -1013,6 +1065,10 @@ impl ProcessBrokerTransport {
 impl BrokerTransport for ProcessBrokerTransport {
     fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError> {
         self.perform_cancellable(request, &CancellationToken::new())
+    }
+
+    fn check_broker(&self, cancellation: &CancellationToken) -> Result<(), BrokerError> {
+        check_installed_broker(&self.launch, cancellation)
     }
 
     fn perform_cancellable(
@@ -1140,7 +1196,7 @@ impl SudoPtyBrokerTransport {
             return Err(BrokerError::InvalidRequest);
         }
         let encoded = encode_broker_request(request)?;
-        check_installed_broker(&self.launch)?;
+        check_installed_broker(&self.launch, cancellation)?;
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize::default())
             .map_err(|_| BrokerError::AuthorizationUnavailable)?;
@@ -1188,7 +1244,8 @@ impl SudoPtyBrokerTransport {
         let mut request_sent = false;
         let mut authentication_sent = false;
         let mut denied = false;
-        let mut version = None;
+        let mut ready = false;
+        let mut version_named = false;
         let result = 'handshake: loop {
             if cancellation.is_cancelled() {
                 break Err(BrokerError::AuthorizationCancelled);
@@ -1228,18 +1285,26 @@ impl SudoPtyBrokerTransport {
             }
             for line in channel.take_lines() {
                 if !request_sent && line == SUDO_BROKER_READY {
+                    ready = true;
+                } else if line.contains("Sorry, try again.") {
+                    denied = true;
+                } else if let Some(named) = protocol_version_of(&line) {
+                    // The broker names its protocol version after it is ready
+                    // and before it reads its request (SYS-034).
+                    if named != BROKER_PROTOCOL_VERSION {
+                        break 'handshake Err(BrokerError::ProtocolMismatch);
+                    }
+                    version_named = true;
+                } else if request_sent && progress.see(&line) {
+                    deadline = Instant::now() + self.timeout;
+                } else if request_sent && line.starts_with(BROKER_RESPONSE_FRAME) {
+                    break 'handshake decode_broker_response(&line);
+                }
+                if ready && version_named && !request_sent {
                     if channel.send(&encoded).is_err() {
                         break 'handshake Err(BrokerError::BrokerCrashed);
                     }
                     request_sent = true;
-                } else if line.contains("Sorry, try again.") {
-                    denied = true;
-                } else if let Some(named) = protocol_version_of(&line) {
-                    version = Some(named);
-                } else if request_sent && progress.see(&line) {
-                    deadline = Instant::now() + self.timeout;
-                } else if request_sent && line.starts_with(BROKER_RESPONSE_FRAME) {
-                    break 'handshake first_answer(version, &line);
                 }
             }
         };
@@ -1259,6 +1324,10 @@ impl SudoPtyBrokerTransport {
 impl BrokerTransport for SudoPtyBrokerTransport {
     fn perform(&self, request: &BrokerRequest) -> Result<BrokerOutput, BrokerError> {
         self.perform_cancellable(request, &CancellationToken::new())
+    }
+
+    fn check_broker(&self, cancellation: &CancellationToken) -> Result<(), BrokerError> {
+        check_installed_broker(&self.launch, cancellation)
     }
 
     fn perform_cancellable(

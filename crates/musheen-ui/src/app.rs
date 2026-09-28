@@ -10196,8 +10196,46 @@ impl MusheenApp {
 
     /// Opens the review of a pending command. With `offer_open`, the review
     /// also offers to open the reviewed file instead, as a double-click on a
-    /// program under the Ask preference does (SYS-035).
+    /// program under the Ask preference does (SYS-035). Before a review that
+    /// asks for the sudo password, Musheen reads the installed broker's
+    /// protocol version, so a broker that a package upgrade replaced is
+    /// refused before the password is asked for (SYS-034).
     fn open_context_review_with(
+        &mut self,
+        invocation: MenuInvocation,
+        offer_open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let MenuInvocation::NeedsConfirmation(pending) = &invocation else {
+            return;
+        };
+        if is_administrator_command(pending.command_id())
+            && self.privilege_backend.provider() == PrivilegeProvider::Sudo
+        {
+            let backend = Arc::clone(&self.privilege_backend);
+            let check =
+                cx.background_spawn(
+                    async move { backend.check_broker(CancellationToken::new()).await },
+                );
+            cx.spawn(async move |this, cx| {
+                let checked = check.await;
+                let _ = this.update(cx, |this, cx| match checked {
+                    Ok(()) => this.open_checked_context_review(invocation, offer_open, cx),
+                    Err(error) => {
+                        this.operation_error =
+                            Some(localized_privilege_error(&this.catalog, &error));
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        self.open_checked_context_review(invocation, offer_open, cx);
+    }
+
+    /// Opens the review window of a pending command.
+    fn open_checked_context_review(
         &mut self,
         invocation: MenuInvocation,
         offer_open: bool,
@@ -10239,11 +10277,8 @@ impl MusheenApp {
         let approved_volume_users = cancellation_review
             .map(|(_, operations)| operations)
             .unwrap_or_default();
-        let privilege_provider = matches!(
-            pending.command_id(),
-            "directory.open_as_administrator" | "file.run_as_administrator"
-        )
-        .then(|| self.privilege_backend.provider().as_str().to_owned());
+        let privilege_provider = is_administrator_command(pending.command_id())
+            .then(|| self.privilege_backend.provider().as_str().to_owned());
         let open_instead = offer_open.then(|| {
             self.catalog
                 .message("command-open")
@@ -19523,6 +19558,14 @@ fn localized_volume_error(catalog: &Catalog, error: &VolumeError) -> Box<str> {
     }
 }
 
+/// Whether the command runs as administrator through the broker.
+fn is_administrator_command(id: &str) -> bool {
+    matches!(
+        id,
+        "directory.open_as_administrator" | "file.run_as_administrator"
+    )
+}
+
 pub(crate) fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) -> Box<str> {
     let key = match error {
         BrokerError::AuthorizationCancelled => "privilege-error-cancelled",
@@ -27138,6 +27181,140 @@ mod tests {
         })
         .await;
         assert_eq!(filesystem::read(existing).unwrap(), b"keep existing");
+    }
+
+    #[gpui_kit::test]
+    async fn administrator_review_with_sudo_reads_the_broker_version_before_the_password(
+        cx: &mut TestAppContext,
+    ) {
+        /// A sudo backend whose installed broker names Musheen's protocol
+        /// version, or another, and that counts what runs as administrator.
+        struct SudoCheckBackend {
+            version_matches: bool,
+            calls: Arc<Mutex<usize>>,
+        }
+
+        impl PrivilegeBackend for SudoCheckBackend {
+            fn provider(&self) -> PrivilegeProvider {
+                PrivilegeProvider::Sudo
+            }
+
+            fn perform<'a>(
+                &'a self,
+                _request: &'a BrokerRequest,
+                _cancellation: CancellationToken,
+                _authentication: Option<SecretBuffer>,
+            ) -> musheen_core::BoxFuture<'a, Result<BrokerOutput, BrokerError>> {
+                *self.calls.lock().unwrap() += 1;
+                Box::pin(async { Err(BrokerError::AuthorizationDenied) })
+            }
+
+            fn open_window<'a>(
+                &'a self,
+                _request: &'a BrokerRequest,
+                _cancellation: CancellationToken,
+                _authentication: Option<SecretBuffer>,
+            ) -> musheen_core::BoxFuture<'a, Result<Arc<dyn ElevatedSession>, BrokerError>>
+            {
+                *self.calls.lock().unwrap() += 1;
+                Box::pin(async { Err(BrokerError::AuthorizationDenied) })
+            }
+
+            fn check_broker(
+                &self,
+                _cancellation: CancellationToken,
+            ) -> musheen_core::BoxFuture<'_, Result<(), BrokerError>> {
+                let matches = self.version_matches;
+                Box::pin(async move {
+                    if matches {
+                        Ok(())
+                    } else {
+                        Err(BrokerError::ProtocolMismatch)
+                    }
+                })
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_navigation_key_bindings(cx);
+        });
+        for version_matches in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let protected = temporary.path().join("protected");
+            filesystem::create_dir(&protected).unwrap();
+            let calls = Arc::new(Mutex::new(0));
+            let backend = SudoCheckBackend {
+                version_matches,
+                calls: Arc::clone(&calls),
+            };
+            let mut app = None;
+            let handle = cx.open_window(size(px(960.), px(760.)), |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut state = MusheenApp::new_with_session_store(
+                        temporary.path().to_path_buf(),
+                        None,
+                        cx,
+                    );
+                    state.privilege_backend = Arc::new(backend);
+                    state
+                });
+                app = Some(view.clone());
+                Root::new(view, window, cx)
+            });
+            let app = app.unwrap();
+            let browser: AnyWindowHandle = handle.into();
+            cx.wait_for(browser, Duration::from_secs(2), |_, cx| {
+                app.read(cx).focused_directory().state() == &DirectoryState::Ready
+            })
+            .await;
+            let windows = cx.windows().len();
+            cx.update_window(browser, |_, _, cx| {
+                app.update(cx, |state, cx| {
+                    let tab = state.navigation.focused_tab().id();
+                    let item = state
+                        .focused_directory()
+                        .view()
+                        .items()
+                        .iter()
+                        .find(|item| item.path().as_unix_path() == Some(protected.as_path()))
+                        .unwrap();
+                    let target =
+                        CommandTargetRef::new(item.id().clone(), item.path().clone()).unwrap();
+                    state.open_context_review(
+                        MenuInvocation::NeedsConfirmation(
+                            crate::menus::PendingInvocation::for_test(
+                                "directory.open_as_administrator",
+                                vec![target],
+                                Some(tab),
+                            ),
+                        ),
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+            if version_matches {
+                assert_eq!(cx.windows().len(), windows + 1, "the review opens");
+            } else {
+                assert_eq!(
+                    cx.windows().len(),
+                    windows,
+                    "no review asks for the password"
+                );
+                cx.update(|cx| {
+                    assert_eq!(
+                        app.read(cx).operation_error.as_deref(),
+                        Some(
+                            "Musheen was updated while it was running. Restart Musheen to use \
+                             administrator actions"
+                        )
+                    );
+                });
+            }
+            assert_eq!(*calls.lock().unwrap(), 0, "nothing runs as administrator");
+        }
     }
 
     #[gpui_kit::test]
