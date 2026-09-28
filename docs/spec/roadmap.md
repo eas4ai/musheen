@@ -5,7 +5,7 @@ The roadmap orders implementation so later UI and operations build on
 proved storage and command boundaries. A commitment advances only when its
 listed requirements have executable checks and those checks pass.
 
-Current: gpui-kit-0.7
+Current: gpui-kit-upgrade
 
 ## 1. Foundation
 
@@ -432,7 +432,7 @@ uiv-025 and browse-024 checks pass on the final tree, the workspace tests,
 cargo fmt --check and clippy with warnings denied are clean, and every
 finding of the review and the report is resolved or declined.
 
-## gpui-kit-0.7
+## gpui-kit-upgrade
 
 Requirements: DEP-023
 
