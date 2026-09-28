@@ -28,6 +28,18 @@ pub const BROKER_RESPONSE_FRAME: &str = "MUSHEEN_RESPONSE ";
 /// changed so far and the item it reached (SYS-037).
 pub const BROKER_PROGRESS_FRAME: &str = "MUSHEEN_PROGRESS ";
 pub const INSTALLED_BROKER_PATH: &str = "/usr/lib/musheen/musheen-broker";
+/// The version of the protocol between Musheen and its broker. Both must
+/// share it: after a package upgrade replaced the broker, a Musheen still
+/// running is refused and told to restart (SYS-034).
+pub const BROKER_PROTOCOL_VERSION: u32 = 1;
+/// The line in which a broker names its protocol version: alone when run
+/// with [`BROKER_PROTOCOL_ARGUMENT`], and before its first answer.
+pub const BROKER_PROTOCOL_FRAME: &str = "MUSHEEN_PROTOCOL ";
+/// The broker's only argument when Musheen reads its version, without
+/// privileges, before it asks for authorization.
+pub const BROKER_PROTOCOL_ARGUMENT: &str = "--protocol-version";
+/// How long Musheen waits for the installed broker to name its version.
+const PROTOCOL_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BROKER_OUTPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -500,16 +512,78 @@ pub fn encode_broker_response(response: &BrokerResponse) -> Result<String, Broke
     ))
 }
 
+/// Decodes a response line. A line that is not a response Musheen can read
+/// is [`BrokerError::AnswerUnreadable`]; any other error is the broker's own.
 pub fn decode_broker_response(frame: &str) -> Result<BrokerOutput, BrokerError> {
     let payload = frame
         .strip_prefix(BROKER_RESPONSE_FRAME)
-        .ok_or(BrokerError::BrokerCrashed)?;
+        .ok_or(BrokerError::AnswerUnreadable)?;
     let payload = base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(payload)
-        .map_err(|_| BrokerError::BrokerCrashed)?;
+        .map_err(|_| BrokerError::AnswerUnreadable)?;
     serde_json::from_slice::<BrokerResponse>(&payload)
-        .map_err(|_| BrokerError::BrokerCrashed)?
+        .map_err(|_| BrokerError::AnswerUnreadable)?
         .into_result()
+}
+
+/// Writes the line that names protocol `version` (SYS-034).
+pub fn write_protocol_version(
+    output: &mut dyn std::io::Write,
+    version: u32,
+) -> std::io::Result<()> {
+    writeln!(output, "{BROKER_PROTOCOL_FRAME}{version}")?;
+    output.flush()
+}
+
+/// The protocol version a broker's line names, if it is that line.
+fn protocol_version_of(line: &str) -> Option<u32> {
+    line.strip_prefix(BROKER_PROTOCOL_FRAME)?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Runs the installed broker without privileges and reads the protocol
+/// version it names, so a broker that a package upgrade replaced while
+/// Musheen runs is refused before authorization is asked for (SYS-034). A
+/// broker too old to name one, or one that names another, is
+/// [`BrokerError::ProtocolMismatch`].
+fn check_installed_broker(launch: &BrokerLaunch) -> Result<(), BrokerError> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(launch.broker())
+        .arg(BROKER_PROTOCOL_ARGUMENT)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|_| BrokerError::BrokerCrashed)?;
+    let Some(stdout) = child.stdout.take() else {
+        kill_and_reap_process_group(&mut child);
+        return Err(BrokerError::BrokerCrashed);
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = stdout.take(4096).read_to_end(&mut output);
+        let _ = sender.send(output);
+    });
+    let output = receiver.recv_timeout(PROTOCOL_CHECK_TIMEOUT);
+    kill_and_reap_process_group(&mut child);
+    let version = output.ok().and_then(|output| {
+        String::from_utf8_lossy(&output)
+            .lines()
+            .find_map(protocol_version_of)
+    });
+    if version == Some(BROKER_PROTOCOL_VERSION) {
+        Ok(())
+    } else {
+        Err(BrokerError::ProtocolMismatch)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -632,11 +706,15 @@ pub struct BrokerLaunch {
     program: PathBuf,
     arguments: Box<[std::ffi::OsString]>,
     provider: PrivilegeProvider,
+    /// The broker program itself, which Musheen runs without privileges to
+    /// read its protocol version.
+    broker: PathBuf,
 }
 
 impl BrokerLaunch {
     #[must_use]
     pub fn new(broker: impl AsRef<Path>, provider: PrivilegeProvider) -> Self {
+        let broker_path = broker.as_ref().to_path_buf();
         let broker = broker.as_ref().as_os_str().to_owned();
         let provider_argument = format!("--provider={}", provider.as_str());
         let (program, arguments) = match provider {
@@ -663,6 +741,7 @@ impl BrokerLaunch {
             program,
             arguments: arguments.into_boxed_slice(),
             provider,
+            broker: broker_path,
         }
     }
 
@@ -681,6 +760,7 @@ impl BrokerLaunch {
             ]
             .into_boxed_slice(),
             provider: PrivilegeProvider::Sudo,
+            broker: broker.as_ref().to_path_buf(),
         }
     }
 
@@ -696,12 +776,19 @@ impl BrokerLaunch {
             ]
             .into_boxed_slice(),
             provider: PrivilegeProvider::Polkit,
+            broker: broker.as_ref().to_path_buf(),
         }
     }
 
     #[must_use]
     pub fn program(&self) -> &Path {
         &self.program
+    }
+
+    /// The broker program that the elevation program starts.
+    #[must_use]
+    pub fn broker(&self) -> &Path {
+        &self.broker
     }
 
     #[must_use]
@@ -780,6 +867,15 @@ fn session_from(
     }
 }
 
+/// The broker's first answer, which counts only after the broker named
+/// Musheen's protocol version (SYS-034).
+fn first_answer(version: Option<u32>, response: &str) -> Result<BrokerOutput, BrokerError> {
+    if version != Some(BROKER_PROTOCOL_VERSION) {
+        return Err(BrokerError::ProtocolMismatch);
+    }
+    decode_broker_response(response)
+}
+
 /// Maps a channel that gave no first answer to the transport's error.
 const fn start_error(error: ChannelError) -> BrokerError {
     match error {
@@ -841,8 +937,9 @@ impl ProcessBrokerTransport {
         if self.launch.provider() != PrivilegeProvider::Polkit {
             return Err(BrokerError::AuthorizationUnavailable);
         }
-        let deadline = Instant::now() + self.timeout;
         let encoded = encode_broker_request(request)?;
+        check_installed_broker(&self.launch)?;
+        let deadline = Instant::now() + self.timeout;
         // A socket pair, not pipes: another process of the same user can
         // reopen a pipe through /proc/<pid>/fd and write into the session,
         // but it cannot reopen a socket (SYS-034).
@@ -882,14 +979,26 @@ impl ProcessBrokerTransport {
             return Err(BrokerError::BrokerCrashed);
         }
         // An ownership change reports progress while it walks; each report
-        // gives it the full timeout again (SYS-037).
+        // gives it the full timeout again (SYS-037). The broker names its
+        // protocol version before its first answer (SYS-034).
         let mut progress = OwnershipProgressSeen::default();
+        let mut version = None;
         let answer =
             channel.next_response_seeing(deadline, self.timeout, cancellation, &mut |line| {
+                if let Some(named) = protocol_version_of(line) {
+                    version = Some(named);
+                    return false;
+                }
                 progress.see(line)
             });
         match answer {
-            Ok(response) => Ok((decode_broker_response(&response)?, channel)),
+            Ok(response) => match first_answer(version, &response) {
+                Ok(output) => Ok((output, channel)),
+                Err(error) => {
+                    channel.stop_now();
+                    Err(error)
+                }
+            },
             Err(error) => {
                 channel.stop_now();
                 match progress.ended(start_error(error)) {
@@ -1031,6 +1140,7 @@ impl SudoPtyBrokerTransport {
             return Err(BrokerError::InvalidRequest);
         }
         let encoded = encode_broker_request(request)?;
+        check_installed_broker(&self.launch)?;
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize::default())
             .map_err(|_| BrokerError::AuthorizationUnavailable)?;
@@ -1078,6 +1188,7 @@ impl SudoPtyBrokerTransport {
         let mut request_sent = false;
         let mut authentication_sent = false;
         let mut denied = false;
+        let mut version = None;
         let result = 'handshake: loop {
             if cancellation.is_cancelled() {
                 break Err(BrokerError::AuthorizationCancelled);
@@ -1123,10 +1234,12 @@ impl SudoPtyBrokerTransport {
                     request_sent = true;
                 } else if line.contains("Sorry, try again.") {
                     denied = true;
+                } else if let Some(named) = protocol_version_of(&line) {
+                    version = Some(named);
                 } else if request_sent && progress.see(&line) {
                     deadline = Instant::now() + self.timeout;
                 } else if request_sent && line.starts_with(BROKER_RESPONSE_FRAME) {
-                    break 'handshake decode_broker_response(&line);
+                    break 'handshake first_answer(version, &line);
                 }
             }
         };
@@ -1274,6 +1387,8 @@ impl Drop for TransportAdmission<'_> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrokerError {
+    /// Musheen could not read the broker's answer, so the session ended.
+    AnswerUnreadable,
     AuditFailed,
     AuthorizationCancelled,
     AuthorizationDenied,
@@ -1289,6 +1404,9 @@ pub enum BrokerError {
     /// A folder's listing passed [`MAX_SESSION_LISTING_BYTES`].
     ListingTooLarge,
     NotExecutable,
+    /// The broker is from another version of Musheen, as after a package
+    /// upgrade while Musheen runs (SYS-034).
+    ProtocolMismatch,
     ScopeEscape,
     SymlinkRefused,
     TargetReplaced,
@@ -1298,6 +1416,9 @@ pub enum BrokerError {
 impl fmt::Display for BrokerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::AnswerUnreadable => {
+                "the administrator session ended because Musheen could not read the broker's answer"
+            }
             Self::AuditFailed => "privilege audit failed",
             Self::AuthorizationCancelled => "authorization was cancelled",
             Self::AuthorizationDenied => "authorization was denied",
@@ -1313,6 +1434,9 @@ impl fmt::Display for BrokerError {
             }
             Self::ListingTooLarge => "the folder's listing is larger than 64 MiB",
             Self::NotExecutable => "the selected target is not executable",
+            Self::ProtocolMismatch => {
+                "the administrator broker is from another version of Musheen; restart Musheen"
+            }
             Self::ScopeEscape => "the path leaves the authorized root",
             Self::SymlinkRefused => "symbolic links require new authorization",
             Self::TargetReplaced => "the target changed during authorization",
@@ -1327,6 +1451,7 @@ impl BrokerError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::AnswerUnreadable => "answer-unreadable",
             Self::AuditFailed => "audit-failed",
             Self::AuthorizationCancelled => "authorization-cancelled",
             Self::AuthorizationDenied => "authorization-denied",
@@ -1340,6 +1465,7 @@ impl BrokerError {
             Self::FilesystemUnsupported => "filesystem-unsupported",
             Self::ListingTooLarge => "listing-too-large",
             Self::NotExecutable => "not-executable",
+            Self::ProtocolMismatch => "protocol-mismatch",
             Self::ScopeEscape => "scope-escape",
             Self::SymlinkRefused => "symlink-refused",
             Self::TargetReplaced => "target-replaced",
@@ -1349,6 +1475,7 @@ impl BrokerError {
 
     fn from_code(code: &str) -> Option<Self> {
         Some(match code {
+            "answer-unreadable" => Self::AnswerUnreadable,
             "audit-failed" => Self::AuditFailed,
             "authorization-cancelled" => Self::AuthorizationCancelled,
             "authorization-denied" => Self::AuthorizationDenied,
@@ -1362,6 +1489,7 @@ impl BrokerError {
             "filesystem-unsupported" => Self::FilesystemUnsupported,
             "listing-too-large" => Self::ListingTooLarge,
             "not-executable" => Self::NotExecutable,
+            "protocol-mismatch" => Self::ProtocolMismatch,
             "scope-escape" => Self::ScopeEscape,
             "symlink-refused" => Self::SymlinkRefused,
             "target-replaced" => Self::TargetReplaced,

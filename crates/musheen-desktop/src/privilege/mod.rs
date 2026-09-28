@@ -5,13 +5,15 @@ mod session;
 
 pub use broker::{
     AuditOutcome, AuditPhase, AuditRecord, AuditSink, AuthorizationError, AuthorizationGrant,
-    AuthorizationRequest, Authorizer, BROKER_PROGRESS_FRAME, BROKER_REQUEST_FRAME,
-    BROKER_RESPONSE_FRAME, Broker, BrokerDirectoryEntry, BrokerError, BrokerLaunch, BrokerOutput,
-    BrokerResponse, BrokerTransport, Clock, INSTALLED_BROKER_PATH, JsonAuditLog, NoopAudit,
-    OperationRunner, OwnershipFailure, OwnershipProgress, OwnershipReport, ProcessBrokerTransport,
+    AuthorizationRequest, Authorizer, BROKER_PROGRESS_FRAME, BROKER_PROTOCOL_ARGUMENT,
+    BROKER_PROTOCOL_FRAME, BROKER_PROTOCOL_VERSION, BROKER_REQUEST_FRAME, BROKER_RESPONSE_FRAME,
+    Broker, BrokerDirectoryEntry, BrokerError, BrokerLaunch, BrokerOutput, BrokerResponse,
+    BrokerTransport, Clock, INSTALLED_BROKER_PATH, JsonAuditLog, NoopAudit, OperationRunner,
+    OwnershipFailure, OwnershipProgress, OwnershipReport, ProcessBrokerTransport,
     SUDO_BROKER_READY, SudoPtyBrokerTransport, SystemClock, SystemOperationRunner,
     ValidatedRequest, decode_broker_request, decode_broker_response, encode_broker_request,
     encode_broker_response, encode_ownership_progress, ownership_supported_at,
+    write_protocol_version,
 };
 pub use request::{
     ADMIN_ACTION_IDS, BrokerOperation, BrokerRequest, CHANGE_OWNERSHIP_ACTION_ID,

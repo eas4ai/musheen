@@ -19542,6 +19542,8 @@ pub(crate) fn localized_privilege_error(catalog: &Catalog, error: &BrokerError) 
         BrokerError::Io => "privilege-error-io",
         BrokerError::ListingTooLarge => "privilege-error-listing-too-large",
         BrokerError::FilesystemUnsupported => "privilege-error-filesystem-unsupported",
+        BrokerError::ProtocolMismatch => "privilege-error-protocol-mismatch",
+        BrokerError::AnswerUnreadable => "privilege-error-answer-unreadable",
     };
     catalog
         .message(key)
@@ -20001,6 +20003,29 @@ mod tests {
     };
     use musheen_local::{ProviderTransferExecution, ProviderTransferRoute};
     use musheen_ops::{ProviderLimits, ProviderSnapshot};
+
+    #[test]
+    fn localized_privilege_error_says_to_restart_after_an_upgrade_and_names_an_ended_session() {
+        let english = Catalog::load(Locale::EnUs).unwrap();
+        assert_eq!(
+            &*localized_privilege_error(&english, &BrokerError::ProtocolMismatch),
+            "Musheen was updated while it was running. Restart Musheen to use administrator actions"
+        );
+        assert_eq!(
+            &*localized_privilege_error(&english, &BrokerError::AnswerUnreadable),
+            "The administrator session ended because Musheen could not read the broker's answer"
+        );
+        for locale in [Locale::EnXa, Locale::Ar] {
+            let catalog = Catalog::load(locale).unwrap();
+            for error in [BrokerError::ProtocolMismatch, BrokerError::AnswerUnreadable] {
+                assert_ne!(
+                    localized_privilege_error(&catalog, &error),
+                    localized_privilege_error(&english, &error),
+                    "{locale:?} localizes {error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn indexed_viewport_keeps_at_most_its_capacity() {

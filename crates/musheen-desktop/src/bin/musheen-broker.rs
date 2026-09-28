@@ -1,10 +1,11 @@
 use musheen_desktop::Clock as _;
 use musheen_desktop::privilege::{
-    AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker,
-    BrokerOperation, BrokerOutput, BrokerRequest, BrokerResponse, ELEVATED_SESSION_IDLE,
-    JsonAuditLog, PrivilegeProvider, RequestLines, SUDO_BROKER_READY, SystemClock,
-    SystemOperationRunner, boot_clock, decode_broker_request, encode_ownership_progress,
-    prepare_sudo_terminal, serve_session, write_response,
+    AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer,
+    BROKER_PROTOCOL_ARGUMENT, BROKER_PROTOCOL_VERSION, Broker, BrokerOperation, BrokerOutput,
+    BrokerRequest, BrokerResponse, ELEVATED_SESSION_IDLE, JsonAuditLog, PrivilegeProvider,
+    RequestLines, SUDO_BROKER_READY, SystemClock, SystemOperationRunner, boot_clock,
+    decode_broker_request, encode_ownership_progress, prepare_sudo_terminal, serve_session,
+    write_protocol_version, write_response,
 };
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -42,6 +43,15 @@ impl Authorizer for ElevatedBrokerAuthorizer {
 }
 
 fn main() {
+    // Musheen runs the installed broker without privileges to read its
+    // protocol version before it asks for authorization (SYS-034).
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new(BROKER_PROTOCOL_ARGUMENT))
+        && arguments.next().is_none()
+    {
+        let _ = write_protocol_version(&mut std::io::stdout().lock(), BROKER_PROTOCOL_VERSION);
+        return;
+    }
     let invocation = match parse_invocation() {
         Some(invocation) => invocation,
         None => return fail("invalid broker invocation", 2),
@@ -112,7 +122,13 @@ fn main() {
     };
     let broker = Broker::new(authorizer, runner, audit, SystemClock).with_provider(provider);
     let mut stdout = std::io::stdout();
-    match broker.handle(request) {
+    let outcome = broker.handle(request);
+    // The first answer names the protocol version again, so a broker that
+    // replaced the one Musheen checked before authorization is refused.
+    if write_protocol_version(&mut stdout, BROKER_PROTOCOL_VERSION).is_err() {
+        return fail("broker transport unavailable", 3);
+    }
+    match outcome {
         Ok(BrokerOutput::RootReferenced(root)) => {
             let answered = write_response(
                 &mut stdout,

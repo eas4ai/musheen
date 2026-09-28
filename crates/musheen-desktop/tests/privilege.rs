@@ -2,11 +2,11 @@ use musheen_core::CancellationToken;
 use musheen_desktop::SecretBuffer;
 use musheen_desktop::privilege::{
     AuditOutcome, AuditPhase, AuditRecord, AuditSink, AuthorizationError, AuthorizationGrant,
-    AuthorizationRequest, Authorizer, Broker, BrokerError, BrokerLaunch, BrokerOperation,
-    BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, Clock, ElevatedRootReference,
-    JsonAuditLog, OperationRunner, OwnershipContents, OwnershipItem, OwnershipReport,
-    PrivilegeProvider, ProcessBrokerTransport, RootGrant, RootedStore, SudoPtyBrokerTransport,
-    SystemOperationRunner, ValidatedRequest, encode_broker_response,
+    AuthorizationRequest, Authorizer, BROKER_PROTOCOL_VERSION, Broker, BrokerError, BrokerLaunch,
+    BrokerOperation, BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, Clock,
+    ElevatedRootReference, JsonAuditLog, OperationRunner, OwnershipContents, OwnershipItem,
+    OwnershipReport, PrivilegeProvider, ProcessBrokerTransport, RootGrant, RootedStore,
+    SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest, encode_broker_response,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -504,6 +504,21 @@ fn executable_script(directory: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// A broker that names Musheen's protocol version when Musheen reads it
+/// before authorization (SYS-034).
+fn versioned_broker(directory: &Path) -> PathBuf {
+    executable_script(
+        directory,
+        "musheen-broker",
+        &format!("printf 'MUSHEEN_PROTOCOL {BROKER_PROTOCOL_VERSION}\\n'"),
+    )
+}
+
+/// The line a broker writes before its first answer.
+fn protocol_line() -> String {
+    format!("printf 'MUSHEEN_PROTOCOL {BROKER_PROTOCOL_VERSION}\\n'\n")
+}
+
 fn system_executable(name: &str) -> PathBuf {
     fs::canonicalize(Path::new("/usr/bin").join(name)).unwrap()
 }
@@ -519,11 +534,12 @@ fn sudo_transport_uses_a_readiness_gated_pty_and_returns_typed_results() {
         temporary.path(),
         "recording-sudo",
         &format!(
-            "printf 'MUSHEEN_BROKER_READY\\n'\nIFS= read -r request\nprintf '%s\\n' '{}'",
+            "printf 'MUSHEEN_BROKER_READY\\n'\nIFS= read -r request\n{}printf '%s\\n' '{}'",
+            protocol_line(),
             response
         ),
     );
-    let launch = BrokerLaunch::sudo_with_program(&recorder, "/fixed/musheen-broker");
+    let launch = BrokerLaunch::sudo_with_program(&recorder, versioned_broker(temporary.path()));
     let transport = SudoPtyBrokerTransport::new(launch).with_timeout(Duration::from_secs(1));
 
     assert_eq!(
@@ -545,20 +561,15 @@ fn sudo_transport_maps_denial_and_cancel_without_exposing_terminal_output() {
     fs::create_dir(&target).unwrap();
     let request = BrokerRequest::open_directory(&target).unwrap();
 
-    let denied = SudoPtyBrokerTransport::new(BrokerLaunch::sudo_with_program(
-        denied,
-        "/fixed/musheen-broker",
-    ))
-    .with_timeout(Duration::from_secs(1))
-    .perform(&request);
+    let broker = versioned_broker(temporary.path());
+    let denied = SudoPtyBrokerTransport::new(BrokerLaunch::sudo_with_program(denied, &broker))
+        .with_timeout(Duration::from_secs(1))
+        .perform(&request);
     assert_eq!(denied, Err(BrokerError::AuthorizationDenied));
 
-    let cancelled = SudoPtyBrokerTransport::new(BrokerLaunch::sudo_with_program(
-        stalled,
-        "/fixed/musheen-broker",
-    ))
-    .with_timeout(Duration::from_millis(50))
-    .perform(&request);
+    let cancelled = SudoPtyBrokerTransport::new(BrokerLaunch::sudo_with_program(stalled, &broker))
+        .with_timeout(Duration::from_millis(50))
+        .perform(&request);
     assert_eq!(cancelled, Err(BrokerError::ExecutionTimedOut));
 }
 
@@ -573,14 +584,15 @@ fn sudo_password_prompt_is_bounded_masked_and_cancellable() {
         temporary.path(),
         "password-sudo",
         &format!(
-            "stty -echo\nprintf 'MUSHEEN_SUDO_PASSWORD:'\nIFS= read -r password\nstty echo\nif [ \"$password\" = 'correct horse' ]; then\n  printf 'MUSHEEN_BROKER_READY\\n'\n  IFS= read -r request\n  printf '%s\\n' '{}'\nelse\n  printf 'MUSHEEN_SUDO_PASSWORD:'\n  sleep 10\nfi",
+            "stty -echo\nprintf 'MUSHEEN_SUDO_PASSWORD:'\nIFS= read -r password\nstty echo\nif [ \"$password\" = 'correct horse' ]; then\n  printf 'MUSHEEN_BROKER_READY\\n'\n  IFS= read -r request\n  {}  printf '%s\\n' '{}'\nelse\n  printf 'MUSHEEN_SUDO_PASSWORD:'\n  sleep 10\nfi",
+            protocol_line(),
             response
         ),
     );
     let request = BrokerRequest::open_directory(&target).unwrap();
     let transport = SudoPtyBrokerTransport::new(BrokerLaunch::sudo_with_program(
         &recorder,
-        "/fixed/musheen-broker",
+        versioned_broker(temporary.path()),
     ))
     .with_timeout(Duration::from_secs(1));
 
@@ -737,7 +749,7 @@ fn transport_admission_and_owner_cancellation_are_bounded() {
     let transport = Arc::new(
         SudoPtyBrokerTransport::new(BrokerLaunch::sudo_with_program(
             script,
-            "/fixed/musheen-broker",
+            versioned_broker(temporary.path()),
         ))
         .with_timeout(Duration::from_secs(5)),
     );
@@ -778,8 +790,9 @@ fn production_polkit_transport_dispatches_only_the_bound_pkexec_request() {
         temporary.path(),
         "recording-pkexec",
         &format!(
-            "IFS= read -r request\nprintf '%s' \"$request\" > '{}'\nprintf '%s\\n' '{}'",
+            "IFS= read -r request\nprintf '%s' \"$request\" > '{}'\n{}printf '%s\\n' '{}'",
             captured.display(),
+            protocol_line(),
             response
         ),
     );
@@ -787,7 +800,7 @@ fn production_polkit_transport_dispatches_only_the_bound_pkexec_request() {
     let request = BrokerRequest::run_executable(&executable, ["--exact", "semi;colon"]).unwrap();
     let transport = ProcessBrokerTransport::new(BrokerLaunch::polkit_with_program(
         helper,
-        "/fixed/musheen-broker",
+        versioned_broker(temporary.path()),
     ))
     .with_timeout(Duration::from_secs(1));
 
@@ -953,4 +966,29 @@ fn audit_records_an_ownership_changes_owner_group_scope_and_items() {
             assert!(change.contains(part), "{change} has {part}");
         }
     }
+}
+
+#[test]
+fn transports_refuse_a_broker_that_names_no_version_before_authorization() {
+    let temporary = tempfile::tempdir().unwrap();
+    let asked = temporary.path().join("asked");
+    // A broker from before the protocol version exits without naming one.
+    let old_broker = executable_script(temporary.path(), "old-broker", "exit 2");
+    let elevation = executable_script(
+        temporary.path(),
+        "elevation",
+        &format!("touch '{}'\nexit 1", asked.display()),
+    );
+    let target = temporary.path().join("protected");
+    fs::create_dir(&target).unwrap();
+    let request = BrokerRequest::open_directory(&target).unwrap();
+    let polkit =
+        ProcessBrokerTransport::new(BrokerLaunch::polkit_with_program(&elevation, &old_broker))
+            .with_timeout(Duration::from_secs(1));
+    assert_eq!(polkit.perform(&request), Err(BrokerError::ProtocolMismatch));
+    let sudo =
+        SudoPtyBrokerTransport::new(BrokerLaunch::sudo_with_program(&elevation, &old_broker))
+            .with_timeout(Duration::from_secs(1));
+    assert_eq!(sudo.perform(&request), Err(BrokerError::ProtocolMismatch));
+    assert!(!asked.exists(), "no authorization is asked for");
 }
