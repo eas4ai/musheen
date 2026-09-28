@@ -16,7 +16,7 @@ use musheen_ui::{
 };
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -536,6 +536,11 @@ fn list_all(
 }
 
 const PROVIDERS: [PrivilegeProvider; 2] = [PrivilegeProvider::Polkit, PrivilegeProvider::Sudo];
+
+/// Held by each test that lists tens of megabytes, so those listings do not
+/// run at the same time and slow each other past SYS-034's 10-second bound.
+static LARGE_LISTINGS: Mutex<()> = Mutex::new(());
+
 const IDLE: Duration = Duration::from_secs(60);
 
 #[test]
@@ -585,8 +590,12 @@ fn elevated_session_lists_more_than_the_pipe_holds() {
         let (store, _session) = open_window(&fake, &backend, root.path());
 
         let started = std::time::Instant::now();
-        let names = list_all(&store, root.path(), 1_000)
-            .unwrap_or_else(|error| panic!("{provider:?} lists 2,000 entries: {error}"));
+        let names = list_all(&store, root.path(), 1_000).unwrap_or_else(|error| {
+            panic!(
+                "{provider:?} lists 2,000 entries: {error} after {:?}",
+                started.elapsed()
+            )
+        });
         assert_eq!(names.len(), 2_000, "{provider:?}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -598,6 +607,9 @@ fn elevated_session_lists_more_than_the_pipe_holds() {
 
 #[test]
 fn elevated_session_lists_long_names_up_to_the_limit() {
+    let _one_at_a_time = LARGE_LISTINGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // 64,000 names of 255 bytes, about 16 MiB of names: a listing that
     // sends each byte of a name as a JSON number passes 64 MiB.
     let root = tempfile::tempdir().unwrap();
@@ -610,8 +622,12 @@ fn elevated_session_lists_long_names_up_to_the_limit() {
         let (store, _session) = open_window(&fake, &backend, root.path());
 
         let started = std::time::Instant::now();
-        let names = list_all(&store, root.path(), 1_000)
-            .unwrap_or_else(|error| panic!("{provider:?} lists 64,000 long names: {error}"));
+        let names = list_all(&store, root.path(), 1_000).unwrap_or_else(|error| {
+            panic!(
+                "{provider:?} lists 64,000 long names: {error} after {:?}",
+                started.elapsed()
+            )
+        });
         assert_eq!(names.len(), 64_000, "{provider:?}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -623,6 +639,9 @@ fn elevated_session_lists_long_names_up_to_the_limit() {
 
 #[test]
 fn elevated_session_lists_to_the_limit_and_names_it_beyond() {
+    let _one_at_a_time = LARGE_LISTINGS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // Each name of 255 bytes adds 385 bytes to a listing: 170,000 of them
     // make about 65.5 MB, just under 64 MiB, and 180,000 about 69.3 MB.
     let root = tempfile::tempdir().unwrap();
@@ -641,8 +660,12 @@ fn elevated_session_lists_to_the_limit_and_names_it_beyond() {
         let (store, _session) = open_window(&fake, &backend, root.path());
 
         let started = std::time::Instant::now();
-        let names = list_all(&store, root.path(), 1_000)
-            .unwrap_or_else(|error| panic!("{provider:?} lists up to the limit: {error}"));
+        let names = list_all(&store, root.path(), 1_000).unwrap_or_else(|error| {
+            panic!(
+                "{provider:?} lists up to the limit: {error} after {:?}",
+                started.elapsed()
+            )
+        });
         assert_eq!(names.len(), 170_001, "{provider:?}");
         assert!(
             started.elapsed() < Duration::from_secs(10),
