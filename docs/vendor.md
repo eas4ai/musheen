@@ -96,7 +96,11 @@ The connector between native-theme and GPUI Kit (DEP-001).
   0.7.0, the versions GPUI Kit 0.7 uses, instead of the 0.6 line; its
   tests use GPUI Kit 0.7.0.
 - `src/colors.rs`, `src/config.rs`: the `tiles` colour is not set, because
-  gpui-component, in 0.6 and in 0.7, has no such field.
+  gpui-component, in 0.6 and in 0.7, has no such field. The `chart_grid`
+  colour that gpui-component 0.7 adds is set and exported as the border
+  colour at 60% opacity, the same fallback gpui-component's own theme
+  loader uses; without it the colour stays transparent black and the
+  crate's own tests fail.
 - `src/lib.rs`: `resolved_variant` returns the stored resolved theme for
   dark or light, so the Appearance settings can preview a mode and roll it
   back without rebuilding the theme from a preset.

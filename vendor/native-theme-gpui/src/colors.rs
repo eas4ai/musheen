@@ -417,6 +417,9 @@ fn assign_charts(tc: &mut ThemeColor, c: &ResolvedColors) {
         s,
         ..c.accent
     };
+    // gpui-component 0.7 adds the chart grid colour; its own theme loader
+    // falls back to the border at 60% opacity, and so does this mapping.
+    tc.chart_grid = c.border.opacity(0.6);
 }
 
 fn assign_misc(
