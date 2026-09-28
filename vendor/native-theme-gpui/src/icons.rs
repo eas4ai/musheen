@@ -136,8 +136,9 @@ pub fn icon_name(role: IconRole) -> Option<IconName> {
 /// [`native_theme::icons::LucideLoader::new`].
 ///
 /// Covers all 104 gpui-component 0.7.0 `IconName` variants. Returns `None`
-/// where Lucide has no equivalent (today only `StarFill`, spec §10.2); every
-/// `Some` is Lucide's own file name (`LucideLoader::new(name)` resolves it).
+/// where Lucide has no equivalent (`StarFill`, spec §10.2) or native-theme's
+/// bundle lacks the file (`Ban`, `CircleAlert`); every `Some` is Lucide's own
+/// file name (`LucideLoader::new(name)` resolves it).
 #[must_use]
 pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
     Some(match icon {
@@ -153,7 +154,8 @@ pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::BatteryLow => "battery-low",
         IconName::BatteryMedium => "battery-medium",
         IconName::BatteryWarning => "battery-warning",
-        IconName::Ban => "ban",
+        // Lucide has `ban`, but native-theme 0.5.8 does not bundle it.
+        IconName::Ban => return None,
         IconName::Bell => "bell",
         IconName::BookOpen => "book-open",
         IconName::Bot => "bot",
@@ -167,7 +169,8 @@ pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::ChevronRight => "chevron-right",
         IconName::ChevronsUpDown => "chevrons-up-down",
         IconName::ChevronUp => "chevron-up",
-        IconName::CircleAlert => "circle-alert",
+        // Lucide has `circle-alert`, but native-theme 0.5.8 does not bundle it.
+        IconName::CircleAlert => return None,
         IconName::CircleCheck => "circle-check",
         IconName::CircleUser => "circle-user",
         IconName::CircleX => "circle-x",
@@ -258,8 +261,9 @@ pub fn lucide_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
 /// [`native_theme::icons::MaterialLoader`].
 ///
 /// Covers all 104 gpui-component 0.7.0 `IconName` variants. Returns `None`
-/// where Material Symbols has no equivalent (today only `StarOff`); every
-/// `Some` is a bundled Material Symbols Outlined 24px file.
+/// where Material Symbols has no equivalent (`StarOff`) or native-theme's
+/// bundle lacks the file (`Ban`); every `Some` is a bundled Material Symbols
+/// Outlined 24px file.
 ///
 /// Material icon name collisions (multiple IconName variants -> same name):
 /// - ArrowUp, SortAscending -> "arrow_upward"
@@ -288,7 +292,8 @@ pub fn material_name_for_gpui_icon(icon: IconName) -> Option<&'static str> {
         IconName::BatteryLow => "battery_2_bar", // close: one of three bars <-> two of six
         IconName::BatteryMedium => "battery_4_bar", // close: two of three <-> four of six
         IconName::BatteryWarning => "battery_alert", // exact
-        IconName::Ban => "block",
+        // Material Symbols has `block`, but native-theme 0.5.8 does not bundle it.
+        IconName::Ban => return None,
         IconName::Bell => "notifications",
         IconName::BookOpen => "menu_book",
         IconName::Bot => "smart_toy",
@@ -1372,6 +1377,7 @@ mod tests {
         IconName::BatteryLow,
         IconName::BatteryMedium,
         IconName::BatteryWarning,
+        IconName::Ban,
         IconName::Bell,
         IconName::BookOpen,
         IconName::Bot,
@@ -1384,6 +1390,7 @@ mod tests {
         IconName::ChevronLeft,
         IconName::ChevronRight,
         IconName::ChevronsUpDown,
+        IconName::CircleAlert,
         IconName::ChevronUp,
         IconName::CircleCheck,
         IconName::CircleUser,
@@ -1438,6 +1445,7 @@ mod tests {
         IconName::Plus,
         IconName::Redo,
         IconName::Redo2,
+        IconName::RefreshCw,
         IconName::Replace,
         IconName::ResizeCorner,
         IconName::RotateCw,
@@ -1471,12 +1479,27 @@ mod tests {
     /// Variants a set legitimately lacks (spec §10.1). Every `None` a table
     /// returns must be listed here with its reason; a missing mapping cannot
     /// hide as an intentional one.
-    const LUCIDE_NONE_ALLOWED: &[(IconName, &str)] = &[(
-        IconName::StarFill,
-        "Lucide has no filled star; gpui-kit's star-fill.svg is Lucide's star with fill added",
-    )];
-    const MATERIAL_NONE_ALLOWED: &[(IconName, &str)] =
-        &[(IconName::StarOff, "Material Symbols has no star-off glyph")];
+    const LUCIDE_NONE_ALLOWED: &[(IconName, &str)] = &[
+        (
+            IconName::StarFill,
+            "Lucide has no filled star; gpui-kit's star-fill.svg is Lucide's star with fill added",
+        ),
+        (
+            IconName::Ban,
+            "native-theme 0.5.8 does not bundle Lucide's ban.svg",
+        ),
+        (
+            IconName::CircleAlert,
+            "native-theme 0.5.8 does not bundle Lucide's circle-alert.svg",
+        ),
+    ];
+    const MATERIAL_NONE_ALLOWED: &[(IconName, &str)] = &[
+        (IconName::StarOff, "Material Symbols has no star-off glyph"),
+        (
+            IconName::Ban,
+            "native-theme 0.5.8 does not bundle Material Symbols' block.svg",
+        ),
+    ];
 
     #[test]
     fn every_none_is_an_allowed_gap() {
@@ -1700,15 +1723,15 @@ mod tests {
 
     // Issue 41: ALL_ICON_NAMES count tripwire test. `IconName` is generated by
     // `icon_named!` from gpui-kit-assets' icons directory with no `ALL` or
-    // iterator, so the list is audited by hand against gpui-component 0.6.0's
-    // 101 files. A *removed* variant breaks the list at compile time; an
+    // iterator, so the list is audited by hand against gpui-component 0.7.0's
+    // 104 files. A *removed* variant breaks the list at compile time; an
     // *added* one is not detected here and must be caught by re-auditing on
     // every gpui-component bump (ROADMAP: an iterable `IconName::ALL`).
     #[test]
     fn all_icon_names_count_matches_gpui_component() {
         assert_eq!(
             ALL_ICON_NAMES.len(),
-            101,
+            104,
             "ALL_ICON_NAMES count changed (got {}) -- update the list",
             ALL_ICON_NAMES.len()
         );
