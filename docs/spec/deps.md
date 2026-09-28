@@ -119,7 +119,7 @@ Falsifier: either checksum is implemented by hand or requires loading the whole 
 Mechanism: dependency check plus known-answer and bounded-memory tests.
 Status: Draft
 
-[DEP-021] Musheen uses the Lucide 1.43 catalog already bundled by GPUI Kit 0.6.2 as its sole command and chrome icon family. The app registers only its selected icons through GPUI Kit's asset macro and does not add a second icon crate.
+[DEP-021] Musheen uses the Lucide 1.43 catalog already bundled by GPUI Kit 0.7 as its sole command and chrome icon family. The app registers only its selected icons through GPUI Kit's asset macro and does not add a second icon crate.
 Falsifier: a command icon comes from another family or native builds embed the complete catalog without a measured need.
 Mechanism: dependency, asset-registration, and icon-registry checks.
 Status: Draft
@@ -129,3 +129,9 @@ Falsifier: musheen-desktop does not depend on `ssh2-config` 0.8.x, or app code p
 Mechanism: dep-022
 Rationale: `russh-config`, from the russh repository, does not follow Include and trails russh by five minor versions.
 Status: Agreed 2026-09-26
+
+[DEP-023] The workspace uses GPUI Kit 0.7.x. The GPUI crates Musheen vendors (gpui-pre, gpui-pre-linux and gpui-component) start from the versions GPUI Kit 0.7 resolves, and docs/vendor.md lists every vendored crate with the published version it starts from and each change Musheen makes to it, with the reason.
+Falsifier: the lockfile resolves a GPUI Kit other than 0.7.x; a vendored GPUI crate's version differs from the one GPUI Kit 0.7 resolves; or docs/vendor.md leaves out a vendored crate or names another version for it.
+Mechanism: dep-023
+Rationale: Shawn's ruling of 2026-09-28: move to GPUI Kit 0.7.0 before native-look, whose font fix vendors a GPUI crate that 0.7 replaces. The vendored forks had no record of their changes (docs/opus-audit-2.md C-N6).
+Status: Agreed 2026-09-28

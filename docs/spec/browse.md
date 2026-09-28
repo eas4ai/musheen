@@ -136,3 +136,9 @@ Falsifier: after scrolling, a drag rectangle selects rows other than the ones it
 Mechanism: browse-023
 Rationale: Observed on 2026-09-25 in docs/opus-audit-2.md section 4.2; the developer authorized the audit items ("You audit items are all authorized").
 Status: Agreed 2026-09-25
+
+[BROWSE-024] A desktop entry file in a folder shows the entry's name, in the user's language when the entry translates it, and the entry's icon, when the entry is trusted: the user may execute it, or it lies in an XDG applications folder. An untrusted entry shows its file name and the generic desktop-entry icon. The file name always shows in the item's tooltip and in the info pane, Rename changes the file name, and sorting by name uses the name shown. Musheen reads the entry from the file it opened and checked, and an icon the entry names by an absolute path is decoded by the thumbnail worker within its limits.
+Falsifier: an untrusted entry shows a name or icon taken from its content; a trusted entry shows its file name instead of its name; the file name is missing from the tooltip or the info pane; Rename changes the entry's name instead of the file name; or an icon named by an absolute path is decoded in the UI process.
+Mechanism: browse-024
+Rationale: Shawn's ruling of 2026-09-27 (item desktop-entry-display): Dolphin shows an entry's name and icon; only a trusted entry does here, so a downloaded file cannot pose as a document.
+Status: Agreed 2026-09-28

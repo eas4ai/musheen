@@ -64,10 +64,11 @@ Falsifier: an applicable state has no visual distinction from default.
 Mechanism: component-state gallery screenshots in light, dark, and high-contrast themes.
 Status: Draft
 
-[UIV-007] Selection uses the theme accent with a visible boundary that remains distinct from hover and keyboard focus.
-Falsifier: a selected item cannot be distinguished from hover or focus alone.
-Mechanism: contrast calculation plus item-state screenshot comparison.
-Status: Draft
+[UIV-007] Selection uses the theme accent with a visible boundary that remains distinct from hover and keyboard focus. The accent is the desktop's accent colour; on Plasma, when the colour scheme sets no accent colour, it is the scheme's selection background, as Plasma uses it. Selected items in every layout, the selected sidebar entry, the current tab, the current breadcrumb, and menu highlights all use it.
+Falsifier: a selected item cannot be distinguished from hover or focus alone; or one of those surfaces shows a colour other than the desktop's accent, such as a built-in blue while Plasma's scheme sets its selection colour.
+Mechanism: uiv-007
+Rationale: Shawn's report of 2026-09-27 (item linux-native-look): the context menu used his scheme's purple while the sidebar, tabs and path row used Breeze blue.
+Status: Agreed 2026-09-28
 
 [UIV-008] All command and chrome icons use the Lucide family defined in `icons.md`. Native content icons and reviewed provider marks stay within the role boundaries defined there. Unfamiliar and destructive symbols have accessible labels or tooltips.
 Falsifier: equivalent actions use conflicting icon styles, an exception appears outside its allowed role, or an ambiguous icon has no text alternative.
@@ -157,6 +158,12 @@ Status: Draft
 Falsifier: an elevated and ordinary surface are visually indistinguishable.
 Mechanism: paired screenshots in light, dark, and high-contrast themes.
 Status: Draft
+
+[UIV-025] Laid-out text places each glyph on a whole pixel, as Qt does on Plasma, so a word in the desktop's font takes the width it takes in Dolphin.
+Falsifier: a glyph of laid-out text starts at a fractional pixel, or a line's width differs from the sum of its glyphs' whole-pixel advances.
+Mechanism: uiv-025
+Rationale: Shawn's report of 2026-09-27 (item linux-native-look): the font looked different from Dolphin's. The same words had the same height in both but were about 10% narrower in Musheen, because GPUI shaped text with cosmic-text's metrics hinting off, which leaves glyphs at fractional positions.
+Status: Agreed 2026-09-28
 
 [UIV-024] The shell remains operable at the minimum supported width of 720 logical pixels and at 200 percent scale; narrower windows may refuse further resize rather than clipping required navigation, status, or recovery controls.
 Falsifier: a supported size clips or makes a required command unreachable.
