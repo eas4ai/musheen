@@ -172,3 +172,17 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# The elevated broker's codec (musheen-desktop, with base64 and serde_json)
+# is optimized in test and debug builds too. SYS-034 bounds a 64 MiB listing
+# at 10 seconds; unoptimized, that listing took about 10 seconds on a busy
+# machine and its test failed, while the optimized build passed under the
+# same load.
+[profile.dev.package.musheen-desktop]
+opt-level = 2
+
+[profile.dev.package.base64]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
