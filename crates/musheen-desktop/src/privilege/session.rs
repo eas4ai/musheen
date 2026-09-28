@@ -536,7 +536,8 @@ impl BrokerSession {
     /// Lists `relative` under `root` through the session's broker, which
     /// refuses any root but its own. After the session ended, because its
     /// broker ended or a request failed, every request fails with
-    /// [`BrokerError::AuthorizationExpired`].
+    /// [`BrokerError::AuthorizationExpired`]. An answer Musheen cannot read
+    /// ends the session with [`BrokerError::AnswerUnreadable`] (SYS-034).
     pub fn read_directory(
         &self,
         root: ElevatedRootReference,
@@ -547,9 +548,13 @@ impl BrokerSession {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let deadline = Instant::now() + self.timeout;
         let response = exchange(&mut state, &frame, deadline, cancellation)?;
-        match decode_broker_response(&response)? {
-            BrokerOutput::DirectoryEntries(entries) => Ok(entries),
-            _ => Err(BrokerError::BrokerCrashed),
+        match decode_broker_response(&response) {
+            Ok(BrokerOutput::DirectoryEntries(entries)) => Ok(entries),
+            Ok(_) | Err(BrokerError::AnswerUnreadable) => {
+                stop_channel(&mut state);
+                Err(BrokerError::AnswerUnreadable)
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -594,15 +599,20 @@ fn exchange(
 /// is told to stop at once: its input closes, which ends a session broker
 /// even during a listing, and a sudo broker's terminal hangs up.
 fn end_session(state: &mut SessionState, error: ChannelError) -> BrokerError {
-    if let Some(mut channel) = state.channel.take() {
-        channel.stop_now();
-    }
-    state.unanswered = 0;
+    stop_channel(state);
     match error {
         ChannelError::Ended => BrokerError::AuthorizationExpired,
         ChannelError::TimedOut => BrokerError::ExecutionTimedOut,
         ChannelError::Oversized | ChannelError::Cancelled => BrokerError::BrokerCrashed,
     }
+}
+
+/// Tells the session's broker to stop at once; every later request fails.
+fn stop_channel(state: &mut SessionState) {
+    if let Some(mut channel) = state.channel.take() {
+        channel.stop_now();
+    }
+    state.unanswered = 0;
 }
 
 #[cfg(test)]

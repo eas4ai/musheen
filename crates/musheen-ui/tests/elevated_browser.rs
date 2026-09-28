@@ -1,12 +1,13 @@
 use musheen_core::{CancellationToken, PageRequest, ResourceLimits, Store, StorePath};
 use musheen_desktop::SecretBuffer;
 use musheen_desktop::privilege::{
-    AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer, Broker, BrokerError,
-    BrokerLaunch, BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport,
-    ELEVATED_SESSION_IDLE, ElevatedRootReference, NoopAudit, OwnershipContents, OwnershipItem,
-    OwnershipReport, ProcessBrokerTransport, RequestLines, SUDO_BROKER_READY,
-    SudoPtyBrokerTransport, SystemClock, SystemOperationRunner, boot_clock, decode_broker_request,
-    prepare_sudo_terminal, serve_session, write_response,
+    AuthorizationError, AuthorizationGrant, AuthorizationRequest, Authorizer,
+    BROKER_PROTOCOL_VERSION, Broker, BrokerError, BrokerLaunch, BrokerOutput, BrokerRequest,
+    BrokerResponse, BrokerTransport, ELEVATED_SESSION_IDLE, ElevatedRootReference, NoopAudit,
+    OwnershipContents, OwnershipItem, OwnershipReport, ProcessBrokerTransport, RequestLines,
+    SUDO_BROKER_READY, SudoPtyBrokerTransport, SystemClock, SystemOperationRunner, boot_clock,
+    decode_broker_request, prepare_sudo_terminal, serve_session, write_protocol_version,
+    write_response,
 };
 use musheen_desktop::{Clock, PrivilegeProvider, RootGrant, RootedStore};
 use musheen_ui::{
@@ -201,10 +202,14 @@ fn elevated_session_broker_child() {
     };
     // Musheen reads the installed broker's version before it asks for
     // authorization, by running it without privileges.
+    let version = |variable: &str| {
+        std::env::var(variable)
+            .ok()
+            .and_then(|version| version.parse().ok())
+            .unwrap_or(BROKER_PROTOCOL_VERSION)
+    };
     if arguments.contains("--protocol-version") {
-        if let Ok(version) = std::env::var(BROKER_INSTALLED_PROTOCOL) {
-            println!("MUSHEEN_PROTOCOL {version}");
-        }
+        write_protocol_version(&mut std::io::stdout(), version(BROKER_INSTALLED_PROTOCOL)).unwrap();
         return;
     }
     let provider = if arguments.contains("--provider=sudo") {
@@ -238,9 +243,7 @@ fn elevated_session_broker_child() {
         prepare_sudo_terminal().unwrap();
         println!("{SUDO_BROKER_READY}");
     }
-    if let Ok(version) = std::env::var(BROKER_ANSWER_PROTOCOL) {
-        println!("MUSHEEN_PROTOCOL {version}");
-    }
+    write_protocol_version(&mut std::io::stdout(), version(BROKER_ANSWER_PROTOCOL)).unwrap();
     let requests = RequestLines::spawn(std::io::stdin()).unwrap();
     let first = requests.first().unwrap().unwrap();
     let mut request = decode_broker_request(first.trim()).unwrap();

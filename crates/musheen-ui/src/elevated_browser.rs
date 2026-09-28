@@ -266,6 +266,14 @@ impl<C: Clock> RootedFilesystemStore<C> {
             BrokerError::ListingTooLarge => {
                 "The folder is too large to list as administrator: an elevated window lists at most 64 MiB"
             }
+            // The English texts of privilege-error-answer-unreadable and
+            // privilege-error-protocol-mismatch (SYS-034).
+            BrokerError::AnswerUnreadable => {
+                "The administrator session ended because Musheen could not read the broker's answer"
+            }
+            BrokerError::ProtocolMismatch => {
+                "Musheen was updated while it was running. Restart Musheen to use administrator actions"
+            }
             _ => "the elevated broker could not read this location",
         };
         StoreError::Backend(reason.into())
