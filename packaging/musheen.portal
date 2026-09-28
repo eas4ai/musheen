@@ -1,0 +1,3 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.musheen
+Interfaces=org.freedesktop.impl.portal.FileChooser;
