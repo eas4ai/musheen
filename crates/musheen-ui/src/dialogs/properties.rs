@@ -1883,6 +1883,9 @@ impl PropertiesWindow {
         });
         self.owner_picker_open = false;
         self.group_picker_open = false;
+        // Apply, which had focus, is hidden now; the window takes it, so
+        // Escape closes the review.
+        self.focus.focus(window, cx);
         self.ownership_review = Some(OwnershipReview {
             rows,
             job: OwnershipJob {
@@ -3476,7 +3479,10 @@ impl Render for PropertiesWindow {
             .bg(colors.background)
             .text_color(colors.foreground)
             .on_action(cx.listener(|this, _: &ConfirmProperties, window, _| {
-                this.close(window);
+                // Enter does not close the window under an open review.
+                if this.ownership_review.is_none() {
+                    this.close(window);
+                }
             }))
             .on_action(cx.listener(|this, _: &CancelProperties, window, cx| {
                 if this.ownership_review.is_some() {
@@ -4926,13 +4932,18 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("properties-apply").is_none());
             window.dispatch_action(Box::new(CancelProperties), cx);
+        })
+        .unwrap();
+        // A dispatched action runs once the update ends.
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(
                 window.try_find("ownership-review").is_none(),
                 "Escape closes the review, not the window"
             );
         })
-        .unwrap();
+        .expect("the window stays open");
         cx.update(|cx| {
             let permissions = properties.read(cx).model.permissions();
             assert!(permissions.is_dirty());
