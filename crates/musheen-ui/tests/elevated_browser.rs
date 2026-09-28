@@ -117,6 +117,12 @@ const BROKER_IDLE_MILLIS: &str = "MUSHEEN_SESSION_BROKER_IDLE_MILLIS";
 const BROKER_PROBES: &str = "MUSHEEN_SESSION_BROKER_PROBES";
 const BROKER_LISTINGS: &str = "MUSHEEN_SESSION_BROKER_LISTINGS";
 const BROKER_SUSPEND: &str = "MUSHEEN_SESSION_BROKER_SUSPEND";
+/// The protocol version the installed broker reports before authorization.
+const BROKER_INSTALLED_PROTOCOL: &str = "MUSHEEN_SESSION_BROKER_INSTALLED_PROTOCOL";
+/// The protocol version the elevated broker names in its first answer.
+const BROKER_ANSWER_PROTOCOL: &str = "MUSHEEN_SESSION_BROKER_ANSWER_PROTOCOL";
+/// With "1", the broker's first listing answer cannot be decoded.
+const BROKER_GARBLE: &str = "MUSHEEN_SESSION_BROKER_GARBLE";
 const PASSWORD: &[u8] = b"correct horse";
 
 /// Allows the invoking user, as pkexec or sudo does once it authenticated.
@@ -193,6 +199,14 @@ fn elevated_session_broker_child() {
     let Ok(arguments) = std::env::var(BROKER_ARGUMENTS) else {
         return;
     };
+    // Musheen reads the installed broker's version before it asks for
+    // authorization, by running it without privileges.
+    if arguments.contains("--protocol-version") {
+        if let Ok(version) = std::env::var(BROKER_INSTALLED_PROTOCOL) {
+            println!("MUSHEEN_PROTOCOL {version}");
+        }
+        return;
+    }
     let provider = if arguments.contains("--provider=sudo") {
         PrivilegeProvider::Sudo
     } else {
@@ -223,6 +237,9 @@ fn elevated_session_broker_child() {
     if provider == PrivilegeProvider::Sudo {
         prepare_sudo_terminal().unwrap();
         println!("{SUDO_BROKER_READY}");
+    }
+    if let Ok(version) = std::env::var(BROKER_ANSWER_PROTOCOL) {
+        println!("MUSHEEN_PROTOCOL {version}");
     }
     let requests = RequestLines::spawn(std::io::stdin()).unwrap();
     let first = requests.first().unwrap().unwrap();
@@ -276,6 +293,11 @@ fn elevated_session_broker_child() {
             boot_clock()
         }
     };
+    let mut output = GarbleFirstLine {
+        inner: output,
+        line: Vec::new(),
+        done: std::env::var(BROKER_GARBLE).map_or(true, |garble| garble != "1"),
+    };
     if let Ok(BrokerOutput::RootReferenced(root)) = opened {
         serve_session(
             &broker,
@@ -286,6 +308,34 @@ fn elevated_session_broker_child() {
             idle,
             &clock,
         );
+    }
+}
+
+/// Passes the broker's output on, except that its first line becomes an
+/// answer that cannot be decoded, unless `done` is set.
+struct GarbleFirstLine<W: std::io::Write> {
+    inner: W,
+    line: Vec<u8>,
+    done: bool,
+}
+
+impl<W: std::io::Write> std::io::Write for GarbleFirstLine<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.done {
+            return self.inner.write(bytes);
+        }
+        self.line.extend_from_slice(bytes);
+        if let Some(newline) = self.line.iter().position(|byte| *byte == b'\n') {
+            self.done = true;
+            self.inner.write_all(b"MUSHEEN_RESPONSE {not an answer\n")?;
+            let rest = self.line.split_off(newline + 1);
+            self.inner.write_all(&rest)?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -317,6 +367,21 @@ impl FakeElevation {
     }
 
     fn with_suspend(provider: PrivilegeProvider, idle: Duration, suspend: bool) -> Self {
+        Self::build(provider, idle, suspend, "")
+    }
+
+    /// A fake whose broker also gets `environment`, as `NAME='value'`
+    /// assignments.
+    fn with_broker_environment(provider: PrivilegeProvider, environment: &str) -> Self {
+        Self::build(provider, IDLE, false, environment)
+    }
+
+    fn build(
+        provider: PrivilegeProvider,
+        idle: Duration,
+        suspend: bool,
+        environment: &str,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let runs = directory.path().join("runs");
         let pids = directory.path().join("pids");
@@ -326,7 +391,7 @@ impl FakeElevation {
             directory.path(),
             "broker",
             &format!(
-                "{BROKER_ARGUMENTS}=\"$*\" {BROKER_PIDS}='{}' {BROKER_PROBES}='{}' \
+                "{environment} {BROKER_ARGUMENTS}=\"$*\" {BROKER_PIDS}='{}' {BROKER_PROBES}='{}' \
                  {BROKER_LISTINGS}='{}' {BROKER_SUSPEND}='{}' {BROKER_IDLE_MILLIS}='{}' '{}' \
                  elevated_session_broker_child --exact --nocapture --test-threads=1 \
                  | /usr/bin/grep --line-buffered -o 'MUSHEEN_.*'",
@@ -925,6 +990,105 @@ fn elevated_session_pages_each_listing_from_its_own_snapshot() {
 }
 
 // SYS-037: owner and group changes as administrator.
+
+/// Opens `root` as administrator and returns why Open as Administrator
+/// refused.
+fn open_window_error(
+    fake: &FakeElevation,
+    backend: &Arc<SystemPrivilegeBackend>,
+    root: &Path,
+) -> BrokerError {
+    let request = BrokerRequest::open_directory(root).unwrap();
+    match futures_lite::future::block_on(backend.open_window(
+        &request,
+        CancellationToken::new(),
+        fake.password(),
+    )) {
+        Ok(_) => panic!("Open as Administrator refuses"),
+        Err(error) => error,
+    }
+}
+
+/// Waits up to 5 seconds for every broker `fake` started to stop.
+fn brokers_stop(fake: &FakeElevation) -> bool {
+    let started = std::time::Instant::now();
+    while fake.broker_pids().iter().any(|pid| running(*pid))
+        && started.elapsed() < Duration::from_secs(5)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    !fake.broker_pids().iter().any(|pid| running(*pid))
+}
+
+#[test]
+fn elevated_session_reads_the_installed_brokers_version_before_authorization() {
+    for provider in PROVIDERS {
+        let fake = FakeElevation::with_broker_environment(
+            provider,
+            &format!("{BROKER_INSTALLED_PROTOCOL}='999'"),
+        );
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        let error = open_window_error(&fake, &backend, root.path());
+        assert!(
+            error.to_string().contains("restart Musheen"),
+            "{provider:?}: {error}"
+        );
+        assert_eq!(
+            fake.runs(),
+            0,
+            "{provider:?}: no authorization is asked for"
+        );
+        assert!(
+            fake.broker_pids().is_empty(),
+            "{provider:?}: no broker starts"
+        );
+    }
+}
+
+#[test]
+fn elevated_session_refuses_a_broker_that_answers_with_another_version() {
+    for provider in PROVIDERS {
+        let fake = FakeElevation::with_broker_environment(
+            provider,
+            &format!("{BROKER_ANSWER_PROTOCOL}='999'"),
+        );
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        let error = open_window_error(&fake, &backend, root.path());
+        assert!(
+            error.to_string().contains("restart Musheen"),
+            "{provider:?}: {error}"
+        );
+        assert!(
+            brokers_stop(&fake),
+            "{provider:?}: the broker stops within 5 seconds of the mismatch"
+        );
+    }
+}
+
+#[test]
+fn elevated_session_ends_when_an_answer_cannot_be_read() {
+    for provider in PROVIDERS {
+        let fake =
+            FakeElevation::with_broker_environment(provider, &format!("{BROKER_GARBLE}='1'"));
+        let backend = fake.backend();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("notes.txt"), b"notes").unwrap();
+        let (store, _session) = open_window(&fake, &backend, root.path());
+        let error = list_all(&store, root.path(), 100)
+            .expect_err("an answer that cannot be decoded fails the listing");
+        assert!(
+            error.to_string().contains("session ended"),
+            "{provider:?}: the window says the session ended: {error}"
+        );
+        assert!(
+            brokers_stop(&fake),
+            "{provider:?}: the broker stops within 5 seconds"
+        );
+        assert_eq!(fake.runs(), 1, "{provider:?}");
+    }
+}
 
 #[test]
 fn change_ownership_policy_always_asks_for_an_administrator_password() {
