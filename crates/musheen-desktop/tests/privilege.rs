@@ -2,11 +2,13 @@ use musheen_core::CancellationToken;
 use musheen_desktop::SecretBuffer;
 use musheen_desktop::privilege::{
     AuditOutcome, AuditPhase, AuditRecord, AuditSink, AuthorizationError, AuthorizationGrant,
-    AuthorizationRequest, Authorizer, BROKER_PROTOCOL_VERSION, Broker, BrokerError, BrokerLaunch,
+    AuthorizationRequest, Authorizer, BROKER_PROGRESS_FRAME, BROKER_PROTOCOL_VERSION,
+    BROKER_REQUEST_FRAME, BROKER_RESPONSE_FRAME, Broker, BrokerError, BrokerLaunch,
     BrokerOperation, BrokerOutput, BrokerRequest, BrokerResponse, BrokerTransport, Clock,
-    ElevatedRootReference, JsonAuditLog, OperationRunner, OwnershipContents, OwnershipItem,
-    OwnershipReport, PrivilegeProvider, ProcessBrokerTransport, RootGrant, RootedStore,
-    SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest, encode_broker_response,
+    ElevatedRootReference, JsonAuditLog, OperationRunner, OwnershipContents, OwnershipFailure,
+    OwnershipItem, OwnershipReport, PrivilegeProvider, ProcessBrokerTransport, RootGrant,
+    RootedStore, SudoPtyBrokerTransport, SystemOperationRunner, ValidatedRequest,
+    encode_broker_request, encode_broker_response, encode_ownership_progress,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -514,7 +516,7 @@ fn versioned_broker(directory: &Path) -> PathBuf {
     )
 }
 
-/// The line a broker writes before its first answer.
+/// The line a broker writes before it reads its request.
 fn protocol_line() -> String {
     format!("printf 'MUSHEEN_PROTOCOL {BROKER_PROTOCOL_VERSION}\\n'\n")
 }
@@ -534,7 +536,7 @@ fn sudo_transport_uses_a_readiness_gated_pty_and_returns_typed_results() {
         temporary.path(),
         "recording-sudo",
         &format!(
-            "printf 'MUSHEEN_BROKER_READY\\n'\nIFS= read -r request\n{}printf '%s\\n' '{}'",
+            "printf 'MUSHEEN_BROKER_READY\\n'\n{}IFS= read -r request\nprintf '%s\\n' '{}'",
             protocol_line(),
             response
         ),
@@ -584,7 +586,7 @@ fn sudo_password_prompt_is_bounded_masked_and_cancellable() {
         temporary.path(),
         "password-sudo",
         &format!(
-            "stty -echo\nprintf 'MUSHEEN_SUDO_PASSWORD:'\nIFS= read -r password\nstty echo\nif [ \"$password\" = 'correct horse' ]; then\n  printf 'MUSHEEN_BROKER_READY\\n'\n  IFS= read -r request\n  {}  printf '%s\\n' '{}'\nelse\n  printf 'MUSHEEN_SUDO_PASSWORD:'\n  sleep 10\nfi",
+            "stty -echo\nprintf 'MUSHEEN_SUDO_PASSWORD:'\nIFS= read -r password\nstty echo\nif [ \"$password\" = 'correct horse' ]; then\n  printf 'MUSHEEN_BROKER_READY\\n'\n  {}  IFS= read -r request\n  printf '%s\\n' '{}'\nelse\n  printf 'MUSHEEN_SUDO_PASSWORD:'\n  sleep 10\nfi",
             protocol_line(),
             response
         ),
@@ -742,7 +744,8 @@ fn transport_admission_and_owner_cancellation_are_bounded() {
         temporary.path(),
         "slow-sudo",
         &format!(
-            "printf 'MUSHEEN_BROKER_READY\\n'\nIFS= read -r request\ntouch '{}'\nsleep 10",
+            "printf 'MUSHEEN_BROKER_READY\\n'\n{}IFS= read -r request\ntouch '{}'\nsleep 10",
+            protocol_line(),
             started.display()
         ),
     );
@@ -790,9 +793,9 @@ fn production_polkit_transport_dispatches_only_the_bound_pkexec_request() {
         temporary.path(),
         "recording-pkexec",
         &format!(
-            "IFS= read -r request\nprintf '%s' \"$request\" > '{}'\n{}printf '%s\\n' '{}'",
-            captured.display(),
+            "{}IFS= read -r request\nprintf '%s' \"$request\" > '{}'\nprintf '%s\\n' '{}'",
             protocol_line(),
+            captured.display(),
             response
         ),
     );
@@ -992,3 +995,99 @@ fn transports_refuse_a_broker_that_names_no_version_before_authorization() {
     assert_eq!(sudo.perform(&request), Err(BrokerError::ProtocolMismatch));
     assert!(!asked.exists(), "no authorization is asked for");
 }
+
+/// The JSON shape of a frame's payload: each value replaced by its type.
+fn frame_shape(frame: &str, prefix: &str) -> serde_json::Value {
+    use base64::Engine as _;
+
+    fn shape(value: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), shape(value)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(shape).collect()),
+            Value::String(_) => Value::from("string"),
+            Value::Number(_) => Value::from("number"),
+            Value::Bool(_) => Value::from("bool"),
+            Value::Null => Value::Null,
+        }
+    }
+    let payload = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(frame.strip_prefix(prefix).expect("a framed line"))
+        .expect("a base64 payload");
+    shape(&serde_json::from_slice(&payload).expect("a JSON payload"))
+}
+
+/// The frames Musheen and its broker exchange, pinned to the protocol
+/// version (SYS-034). A change to any of them changes what a broker of
+/// another build reads: raise BROKER_PROTOCOL_VERSION and pin the new
+/// shapes together.
+#[test]
+fn wire_frames_are_pinned_to_the_protocol_version() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("protected");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("visible.txt"), b"visible").unwrap();
+    let reference = ElevatedRootReference::capture(&root).unwrap();
+    let service = Broker::new(
+        FakeAuthorizer::granting(u64::MAX),
+        SystemOperationRunner::with_timeout(Duration::from_secs(1)),
+        RecordingAudit::default(),
+        FixedClock::new(100),
+    );
+    let listing = service
+        .handle(BrokerRequest::read_directory(reference.clone(), "").unwrap())
+        .unwrap();
+    let requests = [
+        BrokerRequest::open_directory(&root).unwrap(),
+        BrokerRequest::read_directory(reference.clone(), "inner").unwrap(),
+        BrokerRequest::run_executable("/usr/bin/true", ["--flag"]).unwrap(),
+        BrokerRequest::change_ownership(
+            vec![OwnershipItem::reviewed(&root).unwrap()],
+            Some(0),
+            Some(0),
+            Some(OwnershipContents {
+                nested_mounts: false,
+            }),
+        )
+        .unwrap(),
+    ];
+    let responses = [
+        BrokerResponse::success(BrokerOutput::RootReferenced(reference)),
+        BrokerResponse::success(listing),
+        BrokerResponse::success(BrokerOutput::Exited(0)),
+        BrokerResponse::success(BrokerOutput::OwnershipChanged(OwnershipReport::new(
+            1, None,
+        ))),
+        BrokerResponse::success(BrokerOutput::OwnershipChanged(OwnershipReport::new(
+            0,
+            Some(OwnershipFailure::new(&root, &BrokerError::Io)),
+        ))),
+        BrokerResponse::failure(&BrokerError::ScopeEscape),
+    ];
+    let shapes = serde_json::json!({
+        "requests": requests
+            .iter()
+            .map(|request| frame_shape(&encode_broker_request(request).unwrap(), BROKER_REQUEST_FRAME))
+            .collect::<Vec<_>>(),
+        "responses": responses
+            .iter()
+            .map(|response| frame_shape(&encode_broker_response(response).unwrap(), BROKER_RESPONSE_FRAME))
+            .collect::<Vec<_>>(),
+    });
+    let progress = encode_ownership_progress(3, Path::new("/protected/item"));
+    assert!(progress.starts_with(BROKER_PROGRESS_FRAME));
+    let pinned: serde_json::Value = serde_json::from_str(PINNED_FRAME_SHAPES).unwrap_or_default();
+    assert_eq!(
+        (BROKER_PROTOCOL_VERSION, &shapes, progress.as_str()),
+        (1, &pinned, PINNED_PROGRESS_FRAME),
+        "the wire format changed: raise BROKER_PROTOCOL_VERSION and pin these frames:\n{shapes}\n{progress}"
+    );
+}
+
+const PINNED_FRAME_SHAPES: &str = r#"{"requests":[{"id":"string","operation":{"kind":"string","target":"string"},"subject":{"pid":"number","start_time":"number","uid":"number"}},{"id":"string","operation":{"kind":"string","relative":"string","root":{"device":"number","inode":"number","root":"string"}},"subject":{"pid":"number","start_time":"number","uid":"number"}},{"id":"string","operation":{"arguments":["string"],"kind":"string","target":"string"},"subject":{"pid":"number","start_time":"number","uid":"number"}},{"id":"string","operation":{"contents":{"nested_mounts":"bool"},"group":"number","items":[{"device":"number","inode":"number","path":"string"}],"kind":"string","owner":"number"},"subject":{"pid":"number","start_time":"number","uid":"number"}}],"responses":[{"error":null,"ok":"bool","result":{"root-referenced":{"device":"number","inode":"number","root":"string"}}},{"error":null,"ok":"bool","result":{"directory-entries":[["string","string","number","number","number"]]}},{"error":null,"ok":"bool","result":{"exited":"number"}},{"error":null,"ok":"bool","result":{"ownership-changed":{"changed":"number","failure":null}}},{"error":null,"ok":"bool","result":{"ownership-changed":{"changed":"number","failure":{"path":"string","reason":"string"}}}},{"error":"string","ok":"bool","result":null}]}"#;
+const PINNED_PROGRESS_FRAME: &str = "MUSHEEN_PROGRESS 3 L3Byb3RlY3RlZC9pdGVt";

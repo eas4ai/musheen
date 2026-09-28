@@ -1684,6 +1684,9 @@ pub(crate) struct PropertiesWindow {
     advanced_open: bool,
     /// The ACL list whose add chooser is open (SEARCH-020).
     acl_add_open: Option<AclList>,
+    /// The broker version check that runs before a review asks for the sudo
+    /// password (SYS-034).
+    broker_check: Option<Task<()>>,
     /// This window's own Apply ended, so the next refresh loads the items
     /// again even when their mode and times are as they were: an ACL change
     /// leaves them so (SEARCH-020).
@@ -1753,6 +1756,7 @@ impl PropertiesWindow {
             privilege_backend: data.privilege_backend,
             advanced_open: false,
             acl_add_open: None,
+            broker_check: None,
             reload_after_apply: false,
             operation_hub,
             permission_error: None,
@@ -1784,11 +1788,14 @@ impl PropertiesWindow {
     }
 
     fn apply_permissions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.permission_batch.is_active() || self.ownership_review.is_some() {
+        if self.permission_batch.is_active()
+            || self.ownership_review.is_some()
+            || self.broker_check.is_some()
+        {
             return;
         }
         if self.model.permissions().ownership_edit().is_some() {
-            self.open_ownership_review(window, cx);
+            self.review_ownership_after_broker_check(window, cx);
             return;
         }
         self.submit_user_permissions(cx);
@@ -1825,6 +1832,39 @@ impl PropertiesWindow {
     /// Shows each selected item with its current and new owner and group
     /// before Apply as Administrator asks for authorization (SYS-037). The
     /// page's edits stay as they are until the review ends.
+    /// Opens the review of an ownership change. Before a review that asks
+    /// for the sudo password, Musheen reads the installed broker's protocol
+    /// version, so a broker that a package upgrade replaced is refused with
+    /// a message to restart Musheen before the password is asked for
+    /// (SYS-034).
+    fn review_ownership_after_broker_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(backend) = self
+            .privilege_backend
+            .clone()
+            .filter(|backend| backend.provider() == PrivilegeProvider::Sudo)
+        else {
+            self.open_ownership_review(window, cx);
+            return;
+        };
+        let check = cx
+            .background_spawn(async move { backend.check_broker(CancellationToken::new()).await });
+        self.broker_check = Some(cx.spawn_in(window, async move |this, cx| {
+            let checked = check.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.broker_check = None;
+                match checked {
+                    Ok(()) => this.open_ownership_review(window, cx),
+                    Err(error) => {
+                        this.permission_error = Some(PermissionError::Localized(
+                            crate::app::localized_privilege_error(&this.catalog, &error),
+                        ));
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
     fn open_ownership_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let permissions = self.model.permissions();
         let Some(edit) = permissions.ownership_edit() else {
@@ -4684,7 +4724,7 @@ mod tests {
 
     fn open_permissions_page_with_backend(
         paths: &[PathBuf],
-        backend: RecordingBackend,
+        backend: impl PrivilegeBackend,
         cx: &mut TestAppContext,
     ) -> (gpui_kit::WindowHandle<Root>, Entity<PropertiesWindow>) {
         cx.update(|cx| {
@@ -4710,6 +4750,115 @@ mod tests {
             handle,
             properties.expect("the Properties view is constructed"),
         )
+    }
+
+    /// A sudo backend that records like [`RecordingBackend`] and whose
+    /// installed broker names Musheen's protocol version, or another.
+    struct SudoBackend {
+        recording: RecordingBackend,
+        version_matches: bool,
+    }
+
+    impl PrivilegeBackend for SudoBackend {
+        fn provider(&self) -> PrivilegeProvider {
+            PrivilegeProvider::Sudo
+        }
+
+        fn perform<'a>(
+            &'a self,
+            request: &'a BrokerRequest,
+            cancellation: CancellationToken,
+            authentication: Option<SecretBuffer>,
+        ) -> musheen_core::BoxFuture<
+            'a,
+            Result<BrokerOutput, musheen_desktop::privilege::BrokerError>,
+        > {
+            self.recording
+                .perform(request, cancellation, authentication)
+        }
+
+        fn open_window<'a>(
+            &'a self,
+            request: &'a BrokerRequest,
+            cancellation: CancellationToken,
+            authentication: Option<SecretBuffer>,
+        ) -> musheen_core::BoxFuture<
+            'a,
+            Result<Arc<dyn crate::ElevatedSession>, musheen_desktop::privilege::BrokerError>,
+        > {
+            self.recording
+                .open_window(request, cancellation, authentication)
+        }
+
+        fn check_broker(
+            &self,
+            _cancellation: CancellationToken,
+        ) -> musheen_core::BoxFuture<'_, Result<(), musheen_desktop::privilege::BrokerError>>
+        {
+            let matches = self.version_matches;
+            Box::pin(async move {
+                if matches {
+                    Ok(())
+                } else {
+                    Err(musheen_desktop::privilege::BrokerError::ProtocolMismatch)
+                }
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[gpui_kit::test]
+    async fn change_ownership_with_sudo_reads_the_broker_version_before_the_password(
+        cx: &mut TestAppContext,
+    ) {
+        for version_matches in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let file = temporary.path().join("notes.txt");
+            filesystem::write(&file, b"notes").unwrap();
+            let recording = RecordingBackend::new(None);
+            let backend = SudoBackend {
+                recording: recording.clone(),
+                version_matches,
+            };
+            let (handle, _) =
+                open_permissions_page_with_backend(std::slice::from_ref(&file), backend, cx);
+            click_all(
+                handle,
+                &[
+                    "permissions-owner-picker",
+                    "permissions-owner-option-0",
+                    "properties-apply",
+                ],
+                cx,
+            );
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                if version_matches {
+                    assert!(
+                        window.find("ownership-review-password").visible(),
+                        "the review asks for the password after the check"
+                    );
+                } else {
+                    assert!(
+                        window.try_find("ownership-review").is_none(),
+                        "no review asks for the password"
+                    );
+                    assert!(
+                        window
+                            .find("permissions-validation")
+                            .label()
+                            .is_some_and(|label| label.contains("Restart Musheen")),
+                        "the page says to restart Musheen"
+                    );
+                }
+            })
+            .unwrap();
+            assert!(
+                recording.requests().is_empty(),
+                "nothing runs as administrator"
+            );
+        }
     }
 
     /// Clicks each of `ids` on the page, in order.

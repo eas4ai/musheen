@@ -535,6 +535,16 @@ pub trait PrivilegeBackend: Send + Sync + 'static {
         cancellation: CancellationToken,
         authentication: Option<SecretBuffer>,
     ) -> BoxFuture<'a, Result<Arc<dyn ElevatedSession>, BrokerError>>;
+
+    /// Reads the installed broker's protocol version, which Musheen does
+    /// before a review asks for the sudo password (SYS-034).
+    fn check_broker(
+        &self,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<(), BrokerError>> {
+        let _ = cancellation;
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub struct SystemPrivilegeBackend {
@@ -597,5 +607,12 @@ impl PrivilegeBackend for SystemPrivilegeBackend {
                 .open_session(request, &cancellation, authentication)?;
             Ok(Arc::new(session) as Arc<dyn ElevatedSession>)
         })
+    }
+
+    fn check_broker(
+        &self,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<(), BrokerError>> {
+        Box::pin(async move { self.transport.check_broker(&cancellation) })
     }
 }
